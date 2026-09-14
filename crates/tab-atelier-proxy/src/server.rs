@@ -2211,8 +2211,19 @@ fn save_provider(state: &Arc<State>, field: &dyn Fn(&str) -> String, body: &Byte
         .iter()
         .find(|p| p.id() == field("preset").as_str())
         .copied();
+    // A second key for a provider that already has one. The preset names a
+    // single provider, so a plain save would be an edit of the row already
+    // there — the key pasted last would land on top of the one before it, and
+    // the operator would be left holding one credential while believing they
+    // had two. `dup` is them saying they mean a separate entry, which gets a
+    // free name; that name is also what gives it its own key file.
+    let duplicate = flag_from(body, &field("dup")).unwrap_or(false);
     let mut new = if let Some(p) = preset {
-        p.provider(&dir)
+        if duplicate {
+            p.provider_for(&dir, reg.providers.iter().map(|x| x.id.as_str()))
+        } else {
+            p.provider(&dir)
+        }
     } else {
         {
             let id = field("id");

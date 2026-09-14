@@ -563,16 +563,42 @@ impl Preset {
     /// Peak is 01:00–04:00 and 06:00–10:00 UTC, Monday to Friday, at double.
     #[must_use]
     pub fn provider(self, config_dir: &Path) -> Provider {
+        self.provider_named(config_dir, self.id())
+    }
+
+    /// The next free provider for this preset among `taken`.
+    ///
+    /// Two keys for one provider coexist only if their ids differ — and the id
+    /// is also what gives each key its own file on disk. Reusing a name would
+    /// be an edit of the entry already there, silently replacing the key
+    /// stored at that path.
+    #[must_use]
+    pub fn provider_for<'a>(self, config_dir: &Path, taken: impl IntoIterator<Item = &'a str>) -> Provider {
+        let taken: Vec<&str> = taken.into_iter().collect();
+        let base = self.id();
+        let mut id = base.to_owned();
+        let mut n = 1;
+        while taken.iter().any(|t| *t == id) {
+            n += 1;
+            id = format!("{base}-{n}");
+        }
+        self.provider_named(config_dir, &id)
+    }
+
+    /// The body of [`Preset::provider`], with the name supplied rather than
+    /// derived from the preset.
+    #[must_use]
+    pub fn provider_named(self, config_dir: &Path, id: &str) -> Provider {
         match self {
             Self::Deepseek => Provider {
-                id: self.id().to_owned(),
+                id: id.to_owned(),
                 wire: Wire::Anthropic,
                 // The ANTHROPIC-shaped endpoint. DeepSeek also serves an
                 // OpenAI-shaped one on the bare host; pointing at it would
                 // produce a 404 or a silently mangled tool call per request.
                 base_url: "https://api.deepseek.com/anthropic".to_owned(),
                 auth: Auth::ApiKeyFile {
-                    path: provider_key_path(config_dir, self.id()).display().to_string(),
+                    path: provider_key_path(config_dir, id).display().to_string(),
                 },
                 // After the subscription: the subscription is already paid
                 // for, so it is only worth leaving when it is out of capacity.
@@ -628,11 +654,11 @@ impl Preset {
             // in `cache_read_input_tokens`, but `relative_cost` models only
             // input and output, exactly as it does for every other provider.
             Self::Openai => Provider {
-                id: self.id().to_owned(),
+                id: id.to_owned(),
                 wire: Wire::Openai,
                 base_url: "https://api.openai.com/v1".to_owned(),
                 auth: Auth::ApiKeyFile {
-                    path: provider_key_path(config_dir, self.id()).display().to_string(),
+                    path: provider_key_path(config_dir, id).display().to_string(),
                 },
                 // The same reasoning as DeepSeek: the subscription is already
                 // paid for, so a metered provider is only worth leaving to when
@@ -1135,6 +1161,65 @@ mod tests {
         assert_eq!(Class::Heavy.cheaper(), Some(Class::Balanced));
         assert_eq!(Class::Balanced.cheaper(), Some(Class::Fast));
         assert_eq!(Class::Fast.cheaper(), None);
+    }
+
+    /// The file a provider reads its key from.
+    fn key_path(p: &Provider) -> String {
+        match &p.auth {
+            Auth::ApiKeyFile { path } => path.clone(),
+            _ => panic!("every preset authenticates from a key file"),
+        }
+    }
+
+    /// Two API keys for the same provider coexist, each with its own file.
+    ///
+    /// The multi-key case: one key's quota is not enough, so the operator adds
+    /// a second and pins one account to each. The ids must differ, because the
+    /// id is what gives each key a file of its own — one id is one path, and
+    /// the key written last would be the only one left.
+    #[test]
+    fn a_second_preset_key_gets_its_own_id_and_key_file() {
+        let dir = Path::new("/var/lib/tab-atelier-proxy");
+        let mut registry = Registry::default();
+
+        let first = Preset::Deepseek.provider(dir);
+        let first_key = key_path(&first);
+        registry.upsert(first);
+
+        // Told the plain name is taken, the second request takes the next one.
+        let second = Preset::Deepseek.provider_for(dir, registry.providers.iter().map(|p| p.id.as_str()));
+        let second_key = key_path(&second);
+        registry.upsert(second);
+
+        // The default registry already holds `anthropic`, so filter to the
+        // entries this test actually made.
+        let both: Vec<&str> = registry
+            .providers
+            .iter()
+            .map(|p| p.id.as_str())
+            .filter(|id| id.starts_with("deepseek"))
+            .collect();
+        assert_eq!(both, ["deepseek", "deepseek-2"], "the second key joined the first");
+        assert_ne!(first_key, second_key, "one path for two keys means the last write wins");
+    }
+
+    /// Numbering steps over the names already in use, not just the first.
+    #[test]
+    fn a_further_key_skips_the_names_in_use() {
+        let dir = Path::new("/var/lib/tab-atelier-proxy");
+        let third = Preset::Deepseek.provider_for(dir, ["deepseek", "deepseek-2"]);
+        assert_eq!(third.id, "deepseek-3");
+        assert!(
+            key_path(&third).ends_with("provider-deepseek-3.key"),
+            "the file is named after the id, so distinct ids keep keys apart"
+        );
+    }
+
+    /// An unclaimed name is used as-is, so the first entry stays plain.
+    #[test]
+    fn an_unclaimed_preset_keeps_its_plain_id() {
+        let p = Preset::Deepseek.provider_for(Path::new("/tmp"), std::iter::empty::<&str>());
+        assert_eq!(p.id, "deepseek");
     }
 
     /// `DeepSeek`'s published schedule, against real instants.
