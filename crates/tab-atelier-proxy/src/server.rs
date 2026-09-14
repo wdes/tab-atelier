@@ -23,12 +23,13 @@ use hyper::body::{Frame, Incoming};
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response};
 
-use crate::users::{self, Account, Store, constant_time_eq};
+use crate::users::{Account, Store, constant_time_eq};
 use crate::{account, classifier, egress, inspect, openai, provider, qos, routing, transport, usage};
 
 /// The request/reply pair every handler speaks, so the API is not welded to
 /// hyper. See [`crate::transport`].
-use crate::transport::{InReq, Reply};
+use crate::http::resources;
+use crate::transport::{InReq, Reply, json_of};
 
 type Body = http_body_util::combinators::BoxBody<Bytes, Infallible>;
 
@@ -87,61 +88,6 @@ pub fn now_ms() -> u64 {
 fn split_key_path(path: &str) -> (&str, &str) {
     let rest = path.trim_start_matches("/api/users/");
     rest.split_once("/keys/").unwrap_or((rest, ""))
-}
-
-/// One key, without its hash.
-fn key_json(k: &users::Key) -> serde_json::Value {
-    serde_json::json!({
-        "id": k.id,
-        "name": k.name,
-        "created_at": k.created_at,
-        "first_used_at": k.first_used_at,
-        "last_used_at": k.last_used_at,
-        "last_used_ip": k.last_used_ip,
-        "disabled": k.disabled,
-    })
-}
-
-fn account_json(a: &Account) -> serde_json::Value {
-    // Never the key hash. It is not a secret you can use, but it is the input
-    // to an offline guess, and the UI has no reason to hold it.
-    serde_json::json!({
-        "id": a.id,
-        "first_name": a.first_name,
-        "last_name": a.last_name,
-        "email": a.email,
-        "created_at": a.created_at,
-        "disabled": a.disabled,
-        "weight": a.weight,
-        // The pin, so a row can say where this person's work goes.
-        "provider": a.provider,
-        // The model pin, which outranks the provider pin: choosing a model
-        // chooses the hop that serves it. This is also what makes a model
-        // selectable per person, since routing resolves the id to a provider.
-        "model": a.model,
-        // This person's compaction level. Per ACCOUNT, not per provider — see
-        // `set_user_compact` for why the two axes meet there.
-        "compact": a.compact.as_str(),
-        // The whole policy, not a summary of it: the UI edits it field by
-        // field, so it needs the parts it is not currently changing.
-        "tools": a.tools,
-        // Every key, each with its own history. The hash is never included:
-        // it is not a usable secret, but it is the input to an offline guess
-        // and the UI has no reason to hold it.
-        "keys": a.keys.iter().map(|k| serde_json::json!({
-            "id": k.id,
-            "name": k.name,
-            "created_at": k.created_at,
-            "first_used_at": k.first_used_at,
-            "last_used_at": k.last_used_at,
-            "last_used_ip": k.last_used_ip,
-            "disabled": k.disabled,
-        })).collect::<Vec<_>>(),
-        // The account's most recent activity across all its keys, for the
-        // row summary.
-        "last_used_at": a.keys.iter().filter_map(|k| k.last_used_at).max(),
-        "has_key": a.keys.iter().any(users::Key::active),
-    })
 }
 
 /// Pull a bearer-ish credential out of any header a client might use.
@@ -893,76 +839,26 @@ fn usage_report(state: &Arc<State>, store: &Store, query: &str) -> Reply {
     // `usage_json` would re-read the clock, and a response that straddled an
     // hour boundary would answer its totals and its series for two different
     // windows.
-    let window = path_window(query).unwrap_or(usage::Window::Hours(24 * 7));
+    let window = resources::path_window(query).unwrap_or(usage::Window::Hours(24 * 7));
     let span = window.span(now);
     let body = {
         let u = state.usage.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let per_user: Vec<_> = store
-            .accounts()
-            .iter()
-            .map(|a| {
-                let mut v = usage_json(&u, &a.id, span, now);
-                if let Some(o) = v.as_object_mut() {
-                    o.insert("user".to_owned(), account_json(a));
-                }
-                v
-            })
-            .collect();
-        serde_json::json!({
-            "window": window.token(),
-            "hours": span.hours(),
-            "window_start": crate::now_rfc3339_at(span.first),
-            "window_end": crate::now_rfc3339_at(span.last),
-            "users": per_user,
-        })
-        .to_string()
+        resources::UsageReportResource {
+            window: window.token(),
+            hours: span.hours(),
+            window_start: crate::now_rfc3339_at(span.first),
+            window_end: crate::now_rfc3339_at(span.last),
+            users: store
+                .accounts()
+                .iter()
+                .map(|a| resources::UserUsageResource {
+                    user: resources::AccountResource::from(a),
+                    usage: resources::UsageResource::of(&u, &a.id, span, now),
+                })
+                .collect(),
+        }
     };
-    json(200, &body)
-}
-
-/// What the dashboard shows about pressure: what the plan says about itself,
-/// and what the scheduler is doing about it.
-fn pressure_json(state: &Arc<State>) -> Reply {
-    let now = now_ms();
-    // One tiny scope per lock: both are on the request path, so neither is
-    // held across the other or across building the response.
-    let plan = {
-        let acct = state.account.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        serde_json::json!({
-            // The honest signal — upstream's own report about the shared plan,
-            // not an inference from our accounting. `null` when the monitor
-            // has gone quiet: `health` says why, and the UI must show that
-            // rather than the last number it happened to see.
-            "utilization": acct.utilization(),
-            "latest": acct.latest(),
-            "health": acct.health(usage::now_secs()),
-            // What upstream claims about the weekly window, and what we
-            // actually watched it do. They disagree, routinely — see
-            // `Sample::seven_day_resets` — so the UI shows both rather than
-            // choosing one to present as fact.
-            "weekly_last_drop": acct.last_weekly_drop().map(|(ts, from, to)| serde_json::json!({
-                "ts": ts, "from": from, "to": to,
-            })),
-            "history": acct.recent(),
-        })
-    };
-    let scheduler = {
-        let sched = state.sched.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        sched.snapshot(now)
-    };
-    json(
-        200,
-        &serde_json::json!({
-            "plan": plan,
-            "scheduler": scheduler,
-            // The point above which a provider stops being first choice.
-            // Routing prefers moving the work to another provider at this
-            // level; only when none is left does the class step down.
-            "strained_above": routing::STRAINED_ABOVE,
-                "providers": state.registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner).summary(),
-        })
-        .to_string(),
-    )
+    json_of(200, &body)
 }
 
 /// Wait for the scheduler to let this call through.
@@ -1584,83 +1480,6 @@ fn record(state: &State, account_id: &str, model: Option<&str>, tokens: usage::T
 
 // ── an account's own statistics ─────────────────────────────────────
 
-/// `?window=` off a query string, if present and sane.
-///
-/// An unrecognised token falls back to the default rather than 400ing: this is
-/// a GET the dashboard re-issues on a timer, and a stale bookmark naming a
-/// window that was removed should show a graph, not an error page.
-fn path_window(query: &str) -> Option<usage::Window> {
-    query
-        .split('&')
-        .find_map(|kv| kv.strip_prefix("window="))
-        .and_then(usage::Window::parse)
-}
-
-/// Render one account's usage as JSON.
-///
-/// `now` is passed rather than read here, so the requested window and the two
-/// fixed ones are resolved from one reading of the clock.
-fn usage_json(u: &usage::Store, id: &str, span: usage::Span, now: u64) -> serde_json::Value {
-    let tok = |t: &usage::Tokens| {
-        serde_json::json!({
-            "input": t.input,
-            "output": t.output,
-            "cache_read": t.cache_read,
-            "cache_write": t.cache_write,
-            // The rest of the upstream's usage block. Carried through rather
-            // than summed away: the cache-write TTL split and the server-tool
-            // counts each explain part of a bill the four token figures do not.
-            "cache_write_5m": t.cache_write_5m,
-            "cache_write_1h": t.cache_write_1h,
-            "web_search": t.web_search,
-            "web_fetch": t.web_fetch,
-            "service_tier": t.service_tier,
-            "total": t.total(),
-        })
-    };
-    let window = |w: usage::Window| {
-        let (calls, errors, t) = u.totals(id, w.span(now));
-        serde_json::json!({ "calls": calls, "errors": errors, "tokens": tok(&t) })
-    };
-    let series: Vec<_> = u
-        .series(id, span)
-        .into_iter()
-        .map(|b| {
-            serde_json::json!({
-                "hour": b.hour,
-                "calls": b.calls,
-                "errors": b.errors,
-                "input": b.tokens.input,
-                "output": b.tokens.output,
-                "cache_read": b.tokens.cache_read,
-                "cache_write": b.tokens.cache_write,
-            })
-        })
-        .collect();
-    let by_model: serde_json::Value = u.for_account(id).map_or_else(
-        || serde_json::json!({}),
-        |a| a.by_model.iter().map(|(m, t)| (m.clone(), tok(t))).collect(),
-    );
-    serde_json::json!({
-        // The two fixed windows stay: they are what the account table and the
-        // "average tokens per call" column read, and they must mean the same
-        // thing whatever the graph is currently zoomed to. `span` is the
-        // caller's requested window, carried separately.
-        "window": {
-            "start": crate::now_rfc3339_at(span.first),
-            "end": crate::now_rfc3339_at(span.last),
-            "hours": span.hours(),
-        },
-        "all_time": window(usage::Window::All),
-        "last_24h": window(usage::Window::Hours(24)),
-        "last_7d": window(usage::Window::Hours(24 * 7)),
-        "by_model": by_model,
-        // Dense hourly buckets, oldest first, ending at the current hour.
-        "series_hourly": series,
-        "retained_hours": usage::RETAIN_HOURS,
-    })
-}
-
 /// `GET /me/usage` — the account's own numbers, opened by its own key.
 ///
 /// This is the route a person gives to their agent, so it is shaped to be
@@ -1684,21 +1503,21 @@ fn me_usage(req: &InReq, state: &State) -> Reply {
         );
     };
     let now = usage::now_secs();
-    let window = path_window(&req.query).unwrap_or(usage::Window::Hours(24 * 7));
-    let mut body = {
+    let window = resources::path_window(&req.query).unwrap_or(usage::Window::Hours(24 * 7));
+    let usage = {
         let u = state.usage.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        usage_json(&u, &account.id, window.span(now), now)
+        resources::UsageResource::of(&u, &account.id, window.span(now), now)
     };
-    if let Some(obj) = body.as_object_mut() {
-        obj.insert(
-            "account".to_owned(),
-            serde_json::json!({
-                "name": account.display_name(),
-                "email": account.email,
-            }),
-        );
-    }
-    json(200, &body.to_string())
+    json_of(
+        200,
+        &resources::MeUsageResource {
+            account: resources::AccountSummary {
+                name: account.display_name(),
+                email: account.email,
+            },
+            usage,
+        },
+    )
 }
 
 /// `POST /me/credentials` — repair the proxy's Claude login over the network.
@@ -1809,10 +1628,10 @@ fn admin(req: &InReq, state: &Arc<State>) -> Reply {
     // Reports first: they take their own locks, so they must not run while the
     // account store is held for a mutation.
     match (&method, path.as_str()) {
-        (&Method::GET, "/api/pressure") => return pressure_json(state),
+        (&Method::GET, "/api/pressure") => return resources::pressure_json(state),
         // Provider configuration. Read-only here; mutations go through
         // `mutate`, which holds the registry lock for the whole edit.
-        (&Method::GET, "/api/providers") => return providers_json(state),
+        (&Method::GET, "/api/providers") => return json_of(200, &resources::providers_json(state)),
         (&Method::GET, "/api/usage") => {
             let store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             return usage_report(state, &store, &req.query);
@@ -1871,90 +1690,6 @@ fn admin(req: &InReq, state: &Arc<State>) -> Reply {
         _ => {}
     }
     mutate(state, &method, &path, &body)
-}
-
-/// Everything the providers panel needs, and no credential anywhere in it.
-fn providers_json(state: &State) -> Reply {
-    // Everything is lifted out and the registry lock released before the
-    // response is built: it is a std Mutex on a request path, and holding it
-    // across a JSON allocation buys nothing.
-    let (presets, list, mappings) = {
-        let reg = state.registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let now = usage::now_secs();
-        let presets: Vec<_> = provider::Preset::ALL
-            .iter()
-            .map(|p| {
-                serde_json::json!({
-                    "id": p.id(),
-                    "label": p.label(),
-                    // Shown before anyone commits to adding it, so the endpoint
-                    // and the models are visible up front.
-                    "base_url": p.provider(std::path::Path::new("/")).base_url,
-                    "configured": reg.get(p.id()).is_some(),
-                })
-            })
-            .collect();
-        let list: Vec<_> = reg
-            .providers
-            .iter()
-            .map(|p| {
-                serde_json::json!({
-                    "id": p.id,
-                    "base_url": p.base_url,
-                    // Which API this hop speaks. The UI reads it to offer the
-                    // two flavours of a reasoning-capable model: on the OpenAI
-                    // wire a request carrying tools must have reasoning forced
-                    // off, so "tools" and "reasoning" are alternatives rather
-                    // than both-at-once.
-                    "wire": p.wire,
-                    "preference": p.preference,
-                    "enabled": p.enabled,
-                    "peak_now": p.peak_now(now),
-                    "peak_until": p.peak_until(now),
-                    "peak": p.peak,
-                    // Whether the UI may offer anything but `none` for traffic
-                    // through here, and why not. Level-independent: the harm
-                    // is a property of the HOP, so any non-none level meets it
-                    // equally, and the account's level is what decides whether
-                    // the warning is shown. Sent so the reason is the server's,
-                    // not a second copy of the rule in TypeScript.
-                    "compact_refusal": p.compact_refusal(crate::compact::Compact::Tools),
-                    // Whether the credential resolves — never the credential.
-                    "ready": p.credential_ready(),
-                    "auth": match &p.auth {
-                        provider::Auth::ClaudeOauth => "claude_oauth",
-                        provider::Auth::ApiKeyEnv { .. } => "api_key_env",
-                        provider::Auth::ApiKeyFile { .. } => "api_key_file",
-                    },
-                    "models": p.models.iter().map(|m| serde_json::json!({
-                        "id": m.id,
-                        "class": m.class,
-                        "relative_cost": m.relative_cost,
-                        "cost_now": p.cost_at(m, now),
-                        "deprecated": m.deprecated,
-                        "note": m.note,
-                    })).collect::<Vec<_>>(),
-                })
-            })
-            .collect();
-        (presets, list, reg.mappings.clone())
-    };
-    json(
-        200,
-        &serde_json::json!({
-            "providers": list,
-            "presets": presets,
-            "mappings": mappings,
-            // The compaction levels and their labels come from the server so
-            // the wording lives in one place — the enum the routing reads is
-            // the same one the UI renders.
-            "compact_levels": crate::compact::Compact::ALL
-                .into_iter()
-                .map(|c| serde_json::json!({"value": c.as_str(), "label": c.label()}))
-                .collect::<Vec<_>>(),
-        })
-        .to_string(),
-    )
 }
 
 /// Rotate one provider's key, leaving everything else alone.
@@ -2091,7 +1826,7 @@ fn set_user_compact(state: &Arc<State>, store: &mut Store, who: &str, wanted: &s
         return json(400, &serde_json::json!({ "error": why }).to_string());
     }
     match store.set_compact(who, level) {
-        Ok(a) => json(200, &serde_json::json!({ "user": account_json(&a) }).to_string()),
+        Ok(a) => json_of(200, &resources::AccountEnvelope::from(&a)),
         Err(e) => json(404, &serde_json::json!({ "error": e.to_string() }).to_string()),
     }
 }
@@ -2144,7 +1879,7 @@ fn set_user_tools(store: &mut Store, who: &str, incoming: Option<&serde_json::Va
         return json(400, &serde_json::json!({ "error": e }).to_string());
     }
     match store.set_tools(who, policy) {
-        Ok(a) => json(200, &serde_json::json!({ "user": account_json(&a) }).to_string()),
+        Ok(a) => json_of(200, &resources::AccountEnvelope::from(&a)),
         Err(e) => json(404, &serde_json::json!({ "error": e.to_string() }).to_string()),
     }
 }
@@ -2177,7 +1912,7 @@ fn set_user_provider(state: &Arc<State>, store: &mut Store, who: &str, wanted: &
         }
     }
     match store.set_provider(who, (!wanted.is_empty()).then_some(wanted)) {
-        Ok(a) => json(200, &serde_json::json!({ "user": account_json(&a) }).to_string()),
+        Ok(a) => json_of(200, &resources::AccountEnvelope::from(&a)),
         Err(e) => json(404, &serde_json::json!({ "error": e.to_string() }).to_string()),
     }
 }
@@ -2210,7 +1945,7 @@ fn set_user_model(state: &Arc<State>, store: &mut Store, who: &str, wanted: &str
         }
     }
     match store.set_model(who, (!wanted.is_empty()).then_some(wanted)) {
-        Ok(a) => json(200, &serde_json::json!({ "user": account_json(&a) }).to_string()),
+        Ok(a) => json_of(200, &resources::AccountEnvelope::from(&a)),
         Err(e) => json(404, &serde_json::json!({ "error": e.to_string() }).to_string()),
     }
 }
@@ -2331,7 +2066,7 @@ fn registry_dir(state: &State) -> std::path::PathBuf {
 /// unnamed. The UI asks for a place and calls `POST /keys` next.
 fn add_user(store: &mut Store, field: &dyn Fn(&str) -> String) -> Reply {
     match store.add(&field("first_name"), &field("last_name"), &field("email")) {
-        Ok(a) => json(201, &serde_json::json!({ "user": account_json(&a) }).to_string()),
+        Ok(a) => json_of(201, &resources::AccountEnvelope::from(&a)),
         Err(e) => json(400, &serde_json::json!({ "error": e.to_string() }).to_string()),
     }
 }
@@ -2383,9 +2118,12 @@ fn key_route(
             let name = field("name");
             let name = if name.is_empty() { "new" } else { &name };
             match store.add_key(&owner("/keys"), name) {
-                Ok((k, secret)) => json(
+                Ok((k, secret)) => json_of(
                     201,
-                    &serde_json::json!({ "key": key_json(&k), "secret": secret }).to_string(),
+                    &resources::NewKeyResource {
+                        key: resources::KeyResource::from(&k),
+                        secret,
+                    },
                 ),
                 Err(e) => json(400, &serde_json::json!({ "error": e.to_string() }).to_string()),
             }
@@ -2393,7 +2131,7 @@ fn key_route(
         KeyAction::Remove => {
             let (owner, key_ref) = split_key_path(path);
             match store.remove_key(owner, key_ref) {
-                Ok(k) => json(200, &serde_json::json!({ "removed": key_json(&k) }).to_string()),
+                Ok(k) => json_of(200, &resources::RemovedKeyEnvelope::from(&k)),
                 Err(e) => json(404, &serde_json::json!({ "error": e.to_string() }).to_string()),
             }
         }
@@ -2404,7 +2142,7 @@ fn key_route(
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(true);
             match store.set_key_disabled(owner, key_ref, disabled) {
-                Ok(k) => json(200, &serde_json::json!({ "key": key_json(&k) }).to_string()),
+                Ok(k) => json_of(200, &resources::KeyEnvelope::from(&k)),
                 Err(e) => json(404, &serde_json::json!({ "error": e.to_string() }).to_string()),
             }
         }
@@ -2439,10 +2177,7 @@ fn mutate(state: &Arc<State>, method: &Method, path: &str, body: &Bytes) -> Repl
     let mut store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
     match (method, path) {
-        (&Method::GET, "/api/users") => {
-            let list: Vec<_> = store.accounts().iter().map(account_json).collect();
-            json(200, &serde_json::json!({ "users": list }).to_string())
-        }
+        (&Method::GET, "/api/users") => json_of(200, &resources::AccountsResource::of(store.accounts())),
         // Add or update a provider. Either a preset (one field: which) or a
         // hand-written one — base URL, models, key.
         (&Method::POST, "/api/providers") => save_provider(state, &field, body),
@@ -2500,7 +2235,7 @@ fn mutate(state: &Arc<State>, method: &Method, path: &str, body: &Bytes) -> Repl
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(true);
             match store.set_disabled(&who("/disabled"), disabled) {
-                Ok(a) => json(200, &serde_json::json!({ "user": account_json(&a) }).to_string()),
+                Ok(a) => json_of(200, &resources::AccountEnvelope::from(&a)),
                 Err(e) => json(404, &serde_json::json!({ "error": e.to_string() }).to_string()),
             }
         }
@@ -2511,7 +2246,7 @@ fn mutate(state: &Arc<State>, method: &Method, path: &str, body: &Bytes) -> Repl
                 .and_then(|w| u32::try_from(w).ok())
                 .unwrap_or(1);
             match store.set_weight(&who("/weight"), weight) {
-                Ok(a) => json(200, &serde_json::json!({ "user": account_json(&a) }).to_string()),
+                Ok(a) => json_of(200, &resources::AccountEnvelope::from(&a)),
                 Err(e) => json(404, &serde_json::json!({ "error": e.to_string() }).to_string()),
             }
         }
@@ -2526,7 +2261,7 @@ fn mutate(state: &Arc<State>, method: &Method, path: &str, body: &Bytes) -> Repl
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .forget(&a.id);
-                    json(200, &serde_json::json!({ "removed": account_json(&a) }).to_string())
+                    json_of(200, &resources::RemovedAccountEnvelope::from(&a))
                 }
                 Err(e) => json(404, &serde_json::json!({ "error": e.to_string() }).to_string()),
             }
@@ -3150,7 +2885,7 @@ mod tests {
             last_name: "Lovelace".to_owned(),
             email: "ada@example.org".to_owned(),
             created_at: 1,
-            keys: vec![users::Key {
+            keys: vec![crate::users::Key {
                 id: "k-1".to_owned(),
                 name: "laptop".to_owned(),
                 hash: "deadbeef".to_owned(),
@@ -3167,7 +2902,7 @@ mod tests {
             disabled: false,
             weight: 1,
         };
-        let json = account_json(&a).to_string();
+        let json = serde_json::to_string(&resources::AccountResource::from(&a)).unwrap();
         assert!(
             !json.contains("deadbeef"),
             "no key hash may reach the UI, on the account or on any of its keys: {json}"

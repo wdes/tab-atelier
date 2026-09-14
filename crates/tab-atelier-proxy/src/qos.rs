@@ -357,26 +357,58 @@ impl Sched {
     }
 
     /// Diagnostics for the dashboard.
+    ///
+    /// A struct rather than a `json!` literal: the same definition feeds the
+    /// dashboard, the `OpenAPI` document and the tests, so a field cannot be
+    /// added to the scheduler and lost from the UI.
     #[must_use]
-    pub fn snapshot(&self, now_ms: u64) -> serde_json::Value {
-        serde_json::json!({
-            "budget_tokens": self.budget,
-            "window_resets_in": self.window_reset_ms.saturating_sub(now_ms) / 1000,
-            "backoff_for": self.backoff_until_ms.saturating_sub(now_ms) / 1000,
-            "rate_per_sec": self.rate(now_ms),
-            "admitted": self.admitted,
-            "rejected": self.rejected,
-            "accounts": self.accounts.iter().map(|(id, a)| {
-                serde_json::json!({
-                    "id": id,
-                    "weight": a.weight,
-                    "credit": a.credit.round(),
-                    "inflight": a.inflight,
-                    "active": a.active(now_ms),
+    pub fn snapshot(&self, now_ms: u64) -> SchedSnapshot {
+        SchedSnapshot {
+            budget_tokens: self.budget,
+            window_resets_in: self.window_reset_ms.saturating_sub(now_ms) / 1000,
+            backoff_for: self.backoff_until_ms.saturating_sub(now_ms) / 1000,
+            rate_per_sec: self.rate(now_ms),
+            admitted: self.admitted,
+            rejected: self.rejected,
+            accounts: self
+                .accounts
+                .iter()
+                .map(|(id, a)| SchedAccountSnapshot {
+                    id: id.clone(),
+                    weight: a.weight,
+                    credit: a.credit.round(),
+                    inflight: a.inflight,
+                    active: a.active(now_ms),
                 })
-            }).collect::<Vec<_>>(),
-        })
+                .collect(),
+        }
     }
+}
+
+/// The scheduler's state, as the dashboard sees it.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SchedSnapshot {
+    /// Tokens upstream says are left; `null` until it has said.
+    pub budget_tokens: Option<u64>,
+    pub window_resets_in: u64,
+    pub backoff_for: u64,
+    /// `null` while the budget is unknown — nothing is being spread yet.
+    pub rate_per_sec: Option<f64>,
+    pub admitted: u64,
+    pub rejected: u64,
+    pub accounts: Vec<SchedAccountSnapshot>,
+}
+
+/// One account's standing in the scheduler.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SchedAccountSnapshot {
+    pub id: String,
+    /// The weight from the routing table, as a number, not the name for it.
+    pub weight: u32,
+    /// Rounded: the exact figure carries sub-token noise from settling.
+    pub credit: f64,
+    pub inflight: u64,
+    pub active: bool,
 }
 
 /// Guess what a request will cost, before upstream has said.

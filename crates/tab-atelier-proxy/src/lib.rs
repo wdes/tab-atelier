@@ -34,6 +34,7 @@ pub mod account;
 pub mod classifier;
 pub mod compact;
 pub mod egress;
+pub mod http;
 pub mod identity;
 pub mod inspect;
 pub mod localtool;
