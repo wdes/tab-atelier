@@ -332,9 +332,13 @@
             <div class="card-body">
               <div class="d-flex align-items-baseline mb-1">
                 <h2 class="h6 mb-0 flex-grow-1">
-                  Tokens per hour
+                  {{ unitName }} per hour
                   <span class="text-body-secondary fw-normal">· {{ scopeLabel }}</span>
                 </h2>
+                <select class="form-select form-select-sm w-auto me-2" v-model="unit"
+                        aria-label="What the chart counts">
+                  <option v-for="u in tokenUnits" :key="u.id" :value="u.id">{{ u.label }}</option>
+                </select>
                 <!-- Two series, so a legend is always shown. -->
                 <span class="small text-body-secondary">
                   <span class="ta-key ta-bg-1"></span>input
@@ -346,7 +350,8 @@
                 <busy-button class="ms-3" :busy="usageBusy" label="Refresh"
                              busy-label="Refreshing…" @click="reloadUsage"></busy-button>
               </div>
-              <tokens-chart :points="series"></tokens-chart>
+              <tokens-chart :points="series" :unit="unit"></tokens-chart>
+              <div class="small text-body-secondary mt-1">{{ unitNote }}</div>
             </div>
           </div>
 
@@ -442,7 +447,7 @@
                       <!-- Peak is the provider's own schedule, so it is shown
                            per provider and changes with the clock. -->
                       <div v-if="p.peak && p.peak_now" class="text-warning" style="font-size:.75rem">
-                        peak pricing now (×{{ p.peak.multiplier_percent / 100 }})
+                        peak pricing now (×{{ p.peak.multiplier_percent / 100 }}){{ peakUntil(p) }}
                       </div>
                     </td>
                     <td class="small font-monospace text-truncate" style="max-width: 20rem">{{ p.base_url }}</td>

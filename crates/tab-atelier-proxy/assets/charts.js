@@ -21,6 +21,69 @@
     const PAD = { top: 10, right: 10, bottom: 22, left: 48 };
     const W = 720;
     const H = 200;
+    // ── Units for the token chart ───────────────────────────────────────────────
+    //
+    // The token chart counts tokens. The toggle in its header asks a different
+    // question — what those tokens cost in energy — and answers it with a published
+    // ESTIMATE, not a measurement. Two consequences run through everything below:
+    // the source is carried into the UI wherever a converted figure appears, and a
+    // conversion never touches a provider's own token numbers.
+    /** What the token chart's y-axis and totals are expressed in. */
+    const TOKEN_UNITS = ["tokens", "wh", "joule", "gco2", "ml"];
+    const UNIT_LABEL = {
+        tokens: "tokens",
+        wh: "Wh",
+        joule: "J",
+        gco2: "gCO₂e",
+        ml: "mL",
+    };
+    /** The same labels as an ordered list, for the `<select>` in the header. */
+    const UNIT_OPTIONS = TOKEN_UNITS.map((id) => ({ id, label: UNIT_LABEL[id] }));
+    // Energy per token. Google's May 2025 Gemini inference disclosure puts a median
+    // text prompt at 0.24 Wh of datacenter energy, 0.03 gCO₂e of emissions and
+    // 0.26 mL of water — all per PROMPT. The median prompt's token count is not
+    // published, so these are that measurement divided by 1,000 tokens: a round
+    // working assumption, not a measured per-token figure. Read every converted
+    // value as an order of magnitude, and show SOURCE_ENERGY beside it.
+    const WH_PER_TOKEN = 0.00024;
+    const SOURCE_ENERGY = {
+        value: "0.24 Wh, 0.03 gCO₂e and 0.26 mL",
+        unit: "per median Gemini text prompt",
+        source: "Google, “Measuring the environmental impact of AI inference”, May 2025",
+    };
+    /** The full caveat, shown verbatim beside every converted figure. */
+    function energyNote() {
+        return (`Estimated from token counts using ${SOURCE_ENERGY.value} ${SOURCE_ENERGY.unit} ` +
+            `(${SOURCE_ENERGY.source}). The prompt's token count is not published, so ` +
+            `1,000 tokens is assumed — read these as an order of magnitude.`);
+    }
+    /** Multiplier from Wh to each energy unit: Wh→J is exact, the rest are ratios
+     *  within Google's own figures (0.03 g and 0.26 mL per 0.24 Wh). */
+    const ENERGY_SCALE = {
+        wh: 1,
+        joule: 3600,
+        gco2: 0.03 / 0.24,
+        ml: 0.26 / 0.24,
+    };
+    /** Convert a token count into `unit`; `tokens` passes straight through. */
+    function convertTokens(tokens, unit) {
+        const scale = ENERGY_SCALE[unit];
+        return scale === undefined ? tokens : tokens * WH_PER_TOKEN * scale;
+    }
+    /** A compact count for a chart axis, where `1.2k` beats five digits. */
+    function fmtCount(n) {
+        if (n >= 1e9)
+            return `${(n / 1e9).toFixed(1)}B`;
+        if (n >= 1e6)
+            return `${(n / 1e6).toFixed(1)}M`;
+        if (n >= 1e3)
+            return `${(n / 1e3).toFixed(1)}k`;
+        // Converted values land here as fractions where a raw count never does, and
+        // `0.00001` is noise on an axis rather than information.
+        if (!Number.isInteger(n))
+            return n < 1 ? n.toFixed(2) : n.toFixed(1);
+        return String(n);
+    }
     // Shared by both charts: mouse position → bucket index, the crosshair, and the
     // tooltip. Hover is not optional decoration — an hourly series is unreadable
     // without a way to ask "which hour is that, exactly".
@@ -68,13 +131,7 @@
                 return d.toLocaleString([], { month: "short", day: "numeric", hour: "2-digit" });
             },
             fmt(n) {
-                if (n >= 1e9)
-                    return `${(n / 1e9).toFixed(1)}B`;
-                if (n >= 1e6)
-                    return `${(n / 1e6).toFixed(1)}M`;
-                if (n >= 1e3)
-                    return `${(n / 1e3).toFixed(1)}k`;
-                return String(n);
+                return fmtCount(n);
             },
             // A rounded top on a "nice" number, so gridlines land on values a person
             // would have chosen.
@@ -285,7 +342,13 @@
      */
     const TokensChart = Vue.defineComponent({
         mixins: [hoverable, xLabels],
-        props: { points: { type: Array, required: true } },
+        props: {
+            points: { type: Array, required: true },
+            // Set by the header's toggle. The bars keep plotting raw tokens — only the
+            // numbers beside them are converted, so a switch of unit never redraws the
+            // shape of the data, just its scale labels.
+            unit: { type: String, default: "tokens" },
+        },
         computed: {
             // The mixins declare `points` as the union they can plot, and Vue
             // merges their props ahead of this component's. `pts` undoes that
@@ -318,8 +381,17 @@
                 // 2px of surface between neighbours, and never a sliver.
                 return Math.max(1, this.plotW / this.points.length - 2);
             },
+            unitName() {
+                return UNIT_LABEL[this.unit] ?? UNIT_LABEL.tokens;
+            },
         },
         methods: {
+            // Overrides the mixin's: every number this chart prints is a token count
+            // until `unit` says otherwise, so converting here keeps the axis, the panel
+            // totals and the tooltip on one unit without each call site knowing.
+            fmt(n) {
+                return fmtCount(convertTokens(n, this.unit));
+            },
             // The two scales, kept as separate functions rather than one parameterised
             // by a panel index — mixing them up would silently plot output against
             // input's axis, which is the bug this whole change exists to avoid.
@@ -345,7 +417,7 @@
         template: `
     <div class="ta-chart">
       <svg :viewBox="'0 0 ' + ${W} + ' ' + ${H}" @mousemove="onMove" @mouseleave="onLeave" role="img"
-           aria-label="Input and output tokens per hour, on separate scales">
+           :aria-label="'Input and output ' + unitName + ' per hour, on separate scales'">
         <!-- Input -->
         <g class="ta-grid">
           <line v-for="t in ticks(maxIn)" :key="'gi'+t"
@@ -537,5 +609,5 @@
       </div>
     </div>`,
     });
-    window.TaCharts = { CallsChart, TokensChart, PressureChart };
+    window.TaCharts = { CallsChart, TokensChart, PressureChart, UNIT_OPTIONS, convertTokens, fmtCount, energyNote };
 })();

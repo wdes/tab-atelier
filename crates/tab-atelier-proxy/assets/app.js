@@ -198,6 +198,10 @@ const AdminApp = Vue.defineComponent({
             // total drills in, which is the only question the summed charts cannot
             // answer ("who is that spike?").
             focus: null,
+            // What the token charts count. "tokens" is the provider's own number;
+            // every other unit is an estimate (see TaCharts.SOURCE_ENERGY), and the
+            // UI says so wherever one is shown.
+            unit: "tokens",
             // The shared plan, as Anthropic reports it. Real data even when the
             // per-person numbers are seeded — this one is not ours to invent.
             pressure: null,
@@ -320,6 +324,18 @@ const AdminApp = Vue.defineComponent({
             const u = this.users.find((x) => x.id === this.focus);
             return u ? `${u.first_name} ${u.last_name}` : "unknown";
         },
+        tokenUnits() {
+            return window.TaCharts.UNIT_OPTIONS;
+        },
+        unitName() {
+            const u = this.tokenUnits.find((x) => x.id === this.unit);
+            return u ? u.label : "tokens";
+        },
+        unitNote() {
+            if (this.unit === "tokens")
+                return "";
+            return window.TaCharts.energyNote();
+        },
         // The series the charts draw: one account's, or every account's summed
         // hour by hour. Summing here rather than server-side keeps /api/usage a
         // plain per-account dump that the drill-down can reuse without refetching.
@@ -441,6 +457,14 @@ const AdminApp = Vue.defineComponent({
                 { label: "Tokens", value: this.fmt(input + output + cache), sub: "input + output + cache" },
                 { label: "Input", value: this.fmt(input), sub: cache ? `${this.fmt(cache)} from cache` : "no cache hits" },
                 { label: "Output", value: this.fmt(output), sub: this.scopeLabel },
+                {
+                    label: "Energy",
+                    value: `${window.TaCharts.fmtCount(window.TaCharts.convertTokens(input + output + cache, "wh"))} Wh`,
+                    // Deliberately not a bare number: the conversion is a published
+                    // estimate over an assumed prompt size, and the chart carries the
+                    // citation. A tile that reads as measured would be a lie.
+                    sub: "estimated · see the token chart note",
+                },
             ];
         },
         meUrl() {
@@ -898,7 +922,7 @@ const AdminApp = Vue.defineComponent({
             const pct = k.bytes_before ? Math.round((1 - k.bytes_after / k.bytes_before) * 100) : 0;
             return `compacted ${this.fmt(k.bytes_before)} → ${this.fmt(k.bytes_after)} (−${pct}%)`;
         },
-        // "12 tool results, 4 thinking, 2 banners" — what the level actually did,
+        // "12 tool results, 4 thinking, 2 notices" — what the level actually did,
         // which is not the same as what it is set to.
         compactionDetail(c) {
             const k = c.compaction;
@@ -915,20 +939,61 @@ const AdminApp = Vue.defineComponent({
             // reads as a bug in the counter rather than a count of one.
             if (k.writes_elided)
                 parts.push(`${k.writes_elided} write ${k.writes_elided === 1 ? "payload" : "payloads"}`);
-            if (k.banners_dropped)
-                parts.push(`${k.banners_dropped} banners`);
+            if (k.notices_dropped)
+                parts.push(`${k.notices_dropped} notices`);
             return parts.length ? `${k.level}: ${parts.join(", ")}` : `${k.level}: nothing to remove`;
         },
-        // "in 12 · out 340 · cache 1.2k" — the four numbers that answer "why was
-        // that turn expensive", beside the request that produced them.
+        // The provider's schedule is written in UTC; the person reading it is not.
+        // "peak pricing now" without an end is a warning nobody can plan around,
+        // so show when it lifts — on their own clock, with the zone named. The
+        // zone label is what makes the time unambiguous rather than local-looking.
+        peakUntil(p) {
+            if (!p.peak_until)
+                return "";
+            const end = new Date(p.peak_until * 1000);
+            const now = new Date();
+            const sameDay = end.getFullYear() === now.getFullYear() &&
+                end.getMonth() === now.getMonth() &&
+                end.getDate() === now.getDate();
+            const time = end.toLocaleTimeString(undefined, {
+                hour: "2-digit",
+                minute: "2-digit",
+                timeZoneName: "short",
+                ...(sameDay ? {} : { weekday: "short" }),
+            });
+            return ` until ${time}`;
+        },
+        // Everything the provider reported for the request, not a summary of it:
+        // the cache split says whether a charge was a write or a read, the tier
+        // says which queue served it, and the server-tool counter says whether the
+        // call fetched anything. Those are the numbers that explain a surprising
+        // bill, and the API already sent them.
         tokenSummary(c) {
             const t = c.tokens;
             if (!t)
                 return "—";
             const parts = [`in ${this.fmt(t.input)}`, `out ${this.fmt(t.output)}`];
-            const cached = t.cache_read + t.cache_write;
-            if (cached)
-                parts.push(`cache ${this.fmt(cached)}`);
+            if (t.cache_read)
+                parts.push(`cache read ${this.fmt(t.cache_read)}`);
+            if (t.cache_write) {
+                let w = `cache write ${this.fmt(t.cache_write)}`;
+                if (t.cache_write_5m || t.cache_write_1h) {
+                    const split = [
+                        `5m ${this.fmt(t.cache_write_5m ?? 0)}`,
+                        `1h ${this.fmt(t.cache_write_1h ?? 0)}`,
+                    ];
+                    w += ` (${split.join(" · ")})`;
+                }
+                parts.push(w);
+            }
+            // Named, not bare: "priority" alone reads as a queue position, which is
+            // the wrong idea — it is the rate the call was billed at.
+            if (t.service_tier)
+                parts.push(`tier ${t.service_tier}`);
+            if (t.web_search)
+                parts.push(`web search ×${this.fmt(t.web_search)}`);
+            if (t.web_fetch)
+                parts.push(`web fetch ×${this.fmt(t.web_fetch)}`);
             return parts.join(" · ");
         },
         async loadInspect() {
