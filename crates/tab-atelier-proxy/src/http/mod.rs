@@ -25,6 +25,7 @@
 //! bodies, [`responder`] writes replies, and [`refusal`] carries a guard's
 //! wording to its catcher.
 
+pub mod auth;
 pub mod body;
 pub mod catchers;
 pub mod controllers;

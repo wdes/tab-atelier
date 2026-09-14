@@ -65,6 +65,10 @@ sha2 = { version = "0.10", default-features = false }
 # Subresource Integrity, which mandates base64 — hex cannot stand in for it.
 # Already in this crate's graph via ureq, so declaring it costs no compile unit.
 base64 = "0.22"
+# The nonce is an HMAC over its own issue time, which is what makes it
+# stateless to verify and impossible to mint without this process's secret.
+# SHA-256 comes from `sha2`, already a dependency for the same reason.
+hmac = "0.12"
 uuid = { version = "1", features = ["v4"] }
 # Timestamp parsing for the usage log. Spelled exactly as env_logger declares
 # it, so this is the same rlib the proxy already builds via env_logger's
@@ -113,6 +117,11 @@ assets = [
     ["assets/app.js", "/usr/share/tab-atelier-proxy/web/", "644"],
     ["assets/charts.js", "/usr/share/tab-atelier-proxy/web/", "644"],
     ["assets/robots.txt", "/usr/share/tab-atelier-proxy/web/", "644"],
+    # Copied from the web viewer's own icon so a tab shows the same mark
+    # whichever of the two it is pointed at. Served without a credential, like
+    # robots.txt: a browser asks for it before anybody has signed in, and an
+    # icon carries nothing worth protecting.
+    ["assets/favicon.ico", "/usr/share/tab-atelier-proxy/web/", "644"],
     ["assets/vendor/vue.global.prod.js", "/usr/share/tab-atelier-proxy/web/vendor/", "644"],
     ["systemd/tab-atelier-proxy.service", "/usr/lib/systemd/system/", "644"],
     ["README.md", "/usr/share/doc/tab-atelier-proxy/", "644"],
