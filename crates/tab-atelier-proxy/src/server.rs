@@ -1588,6 +1588,14 @@ fn usage_json(u: &usage::Store, id: &str, span: usage::Span, now: u64) -> serde_
             "output": t.output,
             "cache_read": t.cache_read,
             "cache_write": t.cache_write,
+            // The rest of the upstream's usage block. Carried through rather
+            // than summed away: the cache-write TTL split and the server-tool
+            // counts each explain part of a bill the four token figures do not.
+            "cache_write_5m": t.cache_write_5m,
+            "cache_write_1h": t.cache_write_1h,
+            "web_search": t.web_search,
+            "web_fetch": t.web_fetch,
+            "service_tier": t.service_tier,
             "total": t.total(),
         })
     };

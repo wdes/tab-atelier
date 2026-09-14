@@ -54,6 +54,38 @@ pub struct Tokens {
     pub cache_read: u64,
     #[serde(default)]
     pub cache_write: u64,
+    /// Requests the server ran on the model's behalf. Counts, not tokens: a
+    /// `web_search` is billed per request, which is why the four token figures
+    /// could never add up to the invoice on their own.
+    #[serde(default)]
+    pub web_search: u64,
+    #[serde(default)]
+    pub web_fetch: u64,
+    /// `cache_creation` split by TTL. The two sum to `cache_write`; the split
+    /// is what says which of them expires on the 5-minute clock and which on
+    /// the hour, and so which call paid full price to refresh.
+    #[serde(default)]
+    pub cache_write_5m: u64,
+    #[serde(default)]
+    pub cache_write_1h: u64,
+    /// Present only when an upstream reported a tier. Absent and `standard`
+    /// are different facts — one is "not told", the other is "billed at the
+    /// default rate" — so this stays an `Option`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<Tier>,
+}
+
+/// The `service_tier` an upstream billed a call under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Tier {
+    Standard,
+    Priority,
+    Batch,
+    /// A tier this build does not name. Kept rather than folded into
+    /// `Standard`, because an unknown tier billed as standard is a silent lie
+    /// about the price.
+    Other,
 }
 
 impl Tokens {
@@ -62,11 +94,24 @@ impl Tokens {
         self.input + self.output + self.cache_read + self.cache_write
     }
 
-    const fn add(&mut self, o: Self) {
+    fn add(&mut self, o: Self) {
         self.input += o.input;
         self.output += o.output;
         self.cache_read += o.cache_read;
         self.cache_write += o.cache_write;
+        self.web_search += o.web_search;
+        self.web_fetch += o.web_fetch;
+        self.cache_write_5m += o.cache_write_5m;
+        self.cache_write_1h += o.cache_write_1h;
+        // Tiers cannot be summed the way counts can. The incoming one is taken
+        // when it is off-standard — that is the case whose price differs, and
+        // what a window billed at is worth surfacing — or when nothing is held
+        // yet, so a lone standard call is still recorded as standard. A later
+        // standard call therefore cannot downgrade a priority one.
+        let incoming_matters = o.service_tier.is_some_and(|t| t != Tier::Standard);
+        if incoming_matters || self.service_tier.is_none() {
+            self.service_tier = o.service_tier;
+        }
     }
 
     #[must_use]
@@ -699,6 +744,47 @@ impl Sniffer {
         if cw > 0 {
             self.tokens.cache_write = cw;
         }
+        // The counts above are the whole of what the panel used to show. These
+        // are the rest of the same block, and each was being discarded on
+        // arrival: two server-tool request counts, the cache-write TTL split,
+        // and the billing tier.
+        let nested = |parent: &str, key: &str| {
+            counts
+                .get(parent)
+                .and_then(|p| p.get(key))
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+        };
+        let (ws, wf) = (
+            nested("server_tool_use", "web_search_requests"),
+            nested("server_tool_use", "web_fetch_requests"),
+        );
+        if ws > 0 {
+            self.tokens.web_search = ws;
+        }
+        if wf > 0 {
+            self.tokens.web_fetch = wf;
+        }
+        let (c5, c1) = (
+            nested("cache_creation", "ephemeral_5m_input_tokens"),
+            nested("cache_creation", "ephemeral_1h_input_tokens"),
+        );
+        if c5 > 0 {
+            self.tokens.cache_write_5m = c5;
+        }
+        if c1 > 0 {
+            self.tokens.cache_write_1h = c1;
+        }
+        // Named or not, a tier we were told about is kept: `or` so a later
+        // frame without one cannot erase what the first reported.
+        if let Some(tier) = counts.get("service_tier").and_then(serde_json::Value::as_str) {
+            self.tokens.service_tier = Some(match tier {
+                "standard" => Tier::Standard,
+                "priority" => Tier::Priority,
+                "batch" => Tier::Batch,
+                _ => Tier::Other,
+            });
+        }
     }
 
     /// What the response reported.
@@ -717,6 +803,77 @@ impl Sniffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The response `usage` block carries more than the four token counts, and
+    /// every one of the rest used to be discarded on arrival. This pins them.
+    #[test]
+    fn the_rest_of_the_usage_block_is_recorded() {
+        let mut s = Sniffer::new(Some("application/json"));
+        s.feed(
+            br#"{"usage":{
+                "input_tokens": 10, "output_tokens": 5,
+                "cache_read_input_tokens": 3, "cache_creation_input_tokens": 7,
+                "server_tool_use": {"web_search_requests": 2, "web_fetch_requests": 1},
+                "cache_creation": {"ephemeral_5m_input_tokens": 4, "ephemeral_1h_input_tokens": 3},
+                "service_tier": "batch"
+            }}"#,
+        );
+        let (_, t) = s.finish();
+        assert_eq!(t.total(), 25, "the four counts are unchanged");
+        assert_eq!((t.web_search, t.web_fetch), (2, 1));
+        assert_eq!((t.cache_write_5m, t.cache_write_1h), (4, 3));
+        assert_eq!(t.service_tier, Some(Tier::Batch));
+    }
+
+    /// A tier this build does not name is kept as `Other`, not folded into
+    /// `Standard` — naming it standard would misstate its price.
+    #[test]
+    fn an_unrecognised_tier_is_kept_as_other() {
+        let mut s = Sniffer::new(Some("application/json"));
+        s.feed(br#"{"usage":{"input_tokens":1,"service_tier":"flex"}}"#);
+        assert_eq!(s.finish().1.service_tier, Some(Tier::Other));
+    }
+
+    /// A window keeps the off-standard tier, and a later standard call cannot
+    /// downgrade it — that call did not change what the window was billed at.
+    #[test]
+    fn a_window_keeps_the_off_standard_tier() {
+        fn tok(tier: Option<Tier>) -> Tokens {
+            Tokens {
+                input: 1,
+                service_tier: tier,
+                ..Tokens::default()
+            }
+        }
+        let mut sum = Tokens::default();
+        sum.add(tok(Some(Tier::Standard)));
+        assert_eq!(
+            sum.service_tier,
+            Some(Tier::Standard),
+            "a lone standard call is recorded"
+        );
+        sum.add(tok(Some(Tier::Priority)));
+        sum.add(tok(Some(Tier::Standard)));
+        assert_eq!(sum.service_tier, Some(Tier::Priority), "not downgraded");
+        sum.add(tok(Some(Tier::Other)));
+        assert_eq!(
+            sum.service_tier,
+            Some(Tier::Other),
+            "an unknown tier is not overwritten"
+        );
+    }
+
+    /// When the upstream sent no TTL split, the totals must not invent one; the
+    /// sum of two absent parts is not the whole.
+    #[test]
+    fn an_absent_split_leaves_the_ttl_counts_at_zero() {
+        let mut s = Sniffer::new(Some("application/json"));
+        s.feed(br#"{"usage":{"input_tokens":1,"cache_creation_input_tokens":9}}"#);
+        let (_, t) = s.finish();
+        assert_eq!(t.cache_write, 9);
+        assert_eq!((t.cache_write_5m, t.cache_write_1h), (0, 0));
+        assert_eq!(t.service_tier, None, "absent and standard are different facts");
+    }
 
     /// Monday 00:00 UTC is the start of the week, and the epoch is the case a
     /// hand-rolled `secs / 86_400 % 7` gets wrong: 1970-01-01 was a THURSDAY,
