@@ -43,6 +43,7 @@ pub mod qos;
 pub mod routing;
 pub mod server;
 pub mod tools;
+pub mod transport;
 pub mod usage;
 pub mod users;
 

@@ -18,13 +18,17 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full, StreamBody};
+use http_body_util::{BodyExt, StreamBody};
 use hyper::body::{Frame, Incoming};
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response};
 
 use crate::users::{self, Account, Store, constant_time_eq};
-use crate::{account, classifier, egress, inspect, openai, provider, qos, routing, usage};
+use crate::{account, classifier, egress, inspect, openai, provider, qos, routing, transport, usage};
+
+/// The request/reply pair every handler speaks, so the API is not welded to
+/// hyper. See [`crate::transport`].
+use crate::transport::{InReq, Reply};
 
 type Body = http_body_util::combinators::BoxBody<Bytes, Infallible>;
 
@@ -61,23 +65,15 @@ pub struct State {
     pub web_root: Option<std::path::PathBuf>,
 }
 
-fn text(code: u16, msg: &str) -> Response<Body> {
-    Response::builder()
-        .status(code)
-        .header("content-type", "text/plain; charset=utf-8")
-        .body(Full::new(Bytes::from(msg.to_owned())).boxed())
-        .unwrap_or_else(|_| Response::new(Full::new(Bytes::new()).boxed()))
+/// A plain-text reply. Delegates to [`transport`] so the wire format is
+/// described in one place rather than at each handler.
+fn text(code: u16, msg: &str) -> Reply {
+    transport::text(code, msg)
 }
 
-fn json(code: u16, body: &str) -> Response<Body> {
-    Response::builder()
-        .status(code)
-        .header("content-type", "application/json")
-        // The admin API is same-origin only: no CORS headers, so a page on
-        // another origin cannot read a response even if it can send a request.
-        .header("cache-control", "no-store")
-        .body(Full::new(Bytes::from(body.to_owned())).boxed())
-        .unwrap_or_else(|_| Response::new(Full::new(Bytes::new()).boxed()))
+/// A JSON reply. See [`transport::json`] for why there are no CORS headers.
+fn json(code: u16, body: &str) -> Reply {
+    transport::json(code, body)
 }
 
 #[must_use]
@@ -153,9 +149,9 @@ fn account_json(a: &Account) -> serde_json::Value {
 /// A claude client sends `x-api-key`; our own forwarding hop and the web UI
 /// send `Authorization: Bearer`. Accepting both avoids the class of bug where
 /// the credential is right and the envelope is not.
-fn presented(req: &Request<Incoming>) -> String {
+fn presented(req: &InReq) -> String {
     let header = |name: &str| {
-        req.headers()
+        req.headers
             .get(name)
             .and_then(|v| v.to_str().ok())
             .map(|v| v.trim().to_owned())
@@ -163,7 +159,7 @@ fn presented(req: &Request<Incoming>) -> String {
     };
     header("x-api-key")
         .or_else(|| {
-            req.headers()
+            req.headers
                 .get(hyper::header::AUTHORIZATION)
                 .and_then(|v| v.to_str().ok())
                 .and_then(|v| v.strip_prefix("Bearer "))
@@ -185,30 +181,62 @@ pub async fn handle(
     state: Arc<State>,
     peer: std::net::IpAddr,
 ) -> Result<Response<Body>, Infallible> {
-    let path = req.uri().path().to_owned();
-    let method = req.method().clone();
+    // The body is read once, here, so no handler has to think about it and the
+    // transport-neutral dispatcher can take a complete request. A body that
+    // cannot be read at all is answered as an empty one rather than dropped, so
+    // a malformed request still gets a reply instead of a closed connection.
+    let (parts, body) = req.into_parts();
+    let body = body
+        .collect()
+        .await
+        .map(http_body_util::Collected::to_bytes)
+        .unwrap_or_default();
+    let query = parts.uri.query().unwrap_or_default().to_owned();
+    let req = InReq {
+        method: parts.method,
+        path: parts.uri.path().to_owned(),
+        query,
+        headers: parts.headers,
+        body,
+        peer,
+    };
+
+    // Collecting the reply before converting keeps the dispatcher free of
+    // transport types. Only the final conversion names hyper.
+    Ok(route(&req, &state).await.into_hyper())
+}
+
+/// Send a request to the handler that owns its path.
+///
+/// The dispatch is by prefix and exact match, which is also the order the
+/// routes are declared in — a request is claimed by the first line that matches
+/// it. Everything below this point answers a [`Reply`] and knows nothing about
+/// hyper, which is what lets a second server be added without touching a
+/// handler.
+async fn route(req: &InReq, state: &Arc<State>) -> Reply {
+    let path = req.path.as_str();
 
     if path.starts_with("/relay/anthropic") {
-        return Ok(anthropic(req, state, peer).await);
+        return anthropic(req, state).await;
     }
     // The account's own statistics, opened by the account's own key — the
     // route a person hands to their agent. Deliberately NOT under /api/,
     // which is the admin surface: this one is meant to be given away.
     if path == "/me/usage" {
-        return Ok(me_usage(&req, &state, peer));
+        return me_usage(req, state);
     }
     // Repair the shared Claude login from a machine that still has a working
     // one. Body-carrying, so it is handled async like the proxy path.
     if path == "/me/credentials" {
-        return Ok(me_credentials(req, &state, peer).await);
+        return me_credentials(req, state).await;
     }
     if path.starts_with("/api/") {
-        return Ok(admin(req, state).await);
+        return admin(req, state);
     }
-    if method == Method::GET || method == Method::HEAD {
-        return Ok(web(&path, &state));
+    if req.method == Method::GET || req.method == Method::HEAD {
+        return web(path, state);
     }
-    Ok(text(404, "not found"))
+    text(404, "not found")
 }
 
 // ── the proxied path ────────────────────────────────────────────────
@@ -313,36 +341,30 @@ const fn is_trusted_hop(peer: std::net::IpAddr) -> bool {
 ///
 /// Split out of `anthropic` because it is the whole decision and reads better
 /// as one unit.
-fn reachability_probe(sub: &str, method: &Method) -> Option<Response<Body>> {
+fn reachability_probe(sub: &str, method: &Method) -> Option<Reply> {
     if sub != "/api/hello" || !matches!(*method, Method::HEAD | Method::GET) {
         return None;
     }
     let body = if *method == Method::HEAD { "" } else { "{}" };
-    Some(
-        Response::builder()
-            .status(200)
-            .header("content-type", "application/json")
-            .body(Full::new(Bytes::from(body)).boxed())
-            .unwrap_or_else(|_| Response::new(Full::new(Bytes::new()).boxed())),
-    )
+    Some(json(200, body))
 }
 
-async fn anthropic(req: Request<Incoming>, state: Arc<State>, peer: std::net::IpAddr) -> Response<Body> {
-    let method = req.method().clone();
-    let sub = req
-        .uri()
-        .path()
-        .strip_prefix("/relay/anthropic")
-        .unwrap_or("")
-        .to_owned();
-    let sub_pq = req.uri().query().map_or_else(|| sub.clone(), |q| format!("{sub}?{q}"));
+async fn anthropic(req: &InReq, state: &Arc<State>) -> Reply {
+    let method = req.method.clone();
+    let sub = req.path.strip_prefix("/relay/anthropic").unwrap_or("").to_owned();
+    let sub_pq = if req.query.is_empty() {
+        sub.clone()
+    } else {
+        format!("{sub}?{}", req.query)
+    };
 
     if let Some(probe) = reachability_probe(&sub, &method) {
         return probe;
     }
 
-    let key = presented(&req);
-    let ip = client_ip(req.headers(), peer);
+    let key = presented(req);
+    let peer = req.peer;
+    let ip = client_ip(&req.headers, peer);
     // Kept alongside the resolved answer, because "what did we record" and
     // "why" are different questions and only the first one was answerable.
     // Built here, where the raw headers and the socket peer are both in hand.
@@ -350,10 +372,10 @@ async fn anthropic(req: Request<Incoming>, state: Arc<State>, peer: std::net::Ip
         peer: peer.to_string(),
         peer_trusted: is_trusted_hop(peer),
         client_ip: ip.clone(),
-        x_real_ip: header_of(req.headers(), "x-real-ip"),
-        x_forwarded_for: header_of(req.headers(), "x-forwarded-for"),
+        x_real_ip: header_of(&req.headers, "x-real-ip"),
+        x_forwarded_for: header_of(&req.headers, "x-forwarded-for"),
     };
-    let who = authenticate_and_stamp(&state, &key, &ip);
+    let who = authenticate_and_stamp(state, &key, &ip);
     let Some(account) = who else {
         // Say which of the two credentials was wrong without printing either.
         // "unauthorized" alone leaves an operator guessing between a revoked
@@ -378,28 +400,27 @@ async fn anthropic(req: Request<Incoming>, state: Arc<State>, peer: std::net::Ip
     );
 
     let client_beta = req
-        .headers()
+        .headers
         .get("anthropic-beta")
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
-    let client_headers = passthrough_headers(req.headers());
+    let client_headers = passthrough_headers(&req.headers);
     let content_type = req
-        .headers()
+        .headers
         .get(hyper::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/json")
         .to_owned();
     let is_post = method == Method::POST;
-    let (_parts, body) = req.into_parts();
-    let body = match body.collect().await {
-        Ok(c) => c.to_bytes(),
-        Err(_) => return text(400, "bad request body"),
-    };
+    // Already read at the edge into `InReq`, so the relay gets its bytes
+    // without owning the request. Cloned because shaping takes it by value and
+    // the capture path still needs the original below.
+    let body = req.body.clone();
 
     // Only /v1/messages spends tokens; a metadata call should not queue
     // behind a fleet's generations.
     let metered = is_post && sub.contains("/messages");
-    let (body, route, compaction, local_tools) = match shape_and_admit(&state, &account, body, metered).await {
+    let (body, route, compaction, local_tools) = match shape_and_admit(state, &account, body, metered).await {
         Ok(quad) => quad,
         Err(resp) => return resp,
     };
@@ -431,7 +452,7 @@ async fn anthropic(req: Request<Incoming>, state: Arc<State>, peer: std::net::Ip
         metered,
         local_tools,
         route: route.clone(),
-        state: Arc::clone(&state),
+        state: Arc::clone(state),
     };
     // Bridge ureq's blocking reader to an async hyper stream: the blocking task
     // sends (status, content-type) over a oneshot, then pumps chunks over an
@@ -457,15 +478,15 @@ async fn anthropic(req: Request<Incoming>, state: Arc<State>, peer: std::net::Ip
 /// Never route silently: a caller that got something other than what it asked
 /// for is entitled to know which provider and model answered, or results stop
 /// being reproducible and a bug report names the wrong model.
-fn streamed<S>(meta: (u16, Option<String>), stream: S, route: &routing::Route) -> Response<Body>
+fn streamed<S>(meta: (u16, Option<String>), stream: S, route: &routing::Route) -> Reply
 where
     S: futures_util::Stream<Item = Result<Frame<Bytes>, Infallible>> + Send + Sync + 'static,
 {
-    let mut builder = Response::builder().status(meta.0);
+    let mut reply = Reply::stream(meta.0, StreamBody::new(stream).boxed());
     if let Some(ct) = meta.1 {
-        builder = builder.header("content-type", ct);
+        reply = reply.with_header("content-type", ct);
     }
-    builder = builder.header(
+    reply = reply.with_header(
         "x-tab-atelier-proxy-route",
         format!("{}/{}", route.provider_id, route.model_id),
     );
@@ -476,11 +497,9 @@ where
             "degraded" => "x-tab-atelier-proxy-degraded",
             _ => "x-tab-atelier-proxy-rerouted",
         };
-        builder = builder.header(name, from.clone());
+        reply = reply.with_header(name, from.clone());
     }
-    builder
-        .body(StreamBody::new(stream).boxed())
-        .unwrap_or_else(|_| Response::new(Full::new(Bytes::new()).boxed()))
+    reply
 }
 
 /// Degrade the request if the plan is tight, then wait for a turn.
@@ -536,7 +555,7 @@ async fn shape_and_admit(
     account: &Account,
     body: Bytes,
     metered: bool,
-) -> Result<(Bytes, routing::Route, Option<inspect::Compaction>, Vec<String>), Response<Body>> {
+) -> Result<(Bytes, routing::Route, Option<inspect::Compaction>, Vec<String>), Reply> {
     if !metered {
         // Not a generation: it still has to go somewhere, but no class
         // reasoning applies. The pin still does — an account routed to a
@@ -674,13 +693,11 @@ async fn shape_and_admit(
             "proxy: 429 for {} after waiting — retry in {retry_after}s",
             account.display_name()
         );
-        let mut resp = text(
+        let resp = text(
             429,
             &format!("tab-atelier-proxy: the shared quota is saturated; retry in {retry_after}s"),
-        );
-        if let Ok(v) = hyper::header::HeaderValue::from_str(&retry_after.to_string()) {
-            resp.headers_mut().insert(hyper::header::RETRY_AFTER, v);
-        }
+        )
+        .with_header("retry-after", retry_after.to_string());
         // A refused call still happened, and an operator looking at a quiet
         // graph should see the refusals.
         record(state, &account.id, None, usage::Tokens::default(), 429);
@@ -870,7 +887,7 @@ fn provider_health(state: &Arc<State>) -> impl Fn(&str) -> routing::Health + '_ 
 }
 
 /// Per-account usage for the dashboard.
-fn usage_report(state: &Arc<State>, store: &Store, query: &str) -> Response<Body> {
+fn usage_report(state: &Arc<State>, store: &Store, query: &str) -> Reply {
     let now = usage::now_secs();
     // One resolution for the whole response. Calling `span` again inside
     // `usage_json` would re-read the clock, and a response that straddled an
@@ -905,7 +922,7 @@ fn usage_report(state: &Arc<State>, store: &Store, query: &str) -> Response<Body
 
 /// What the dashboard shows about pressure: what the plan says about itself,
 /// and what the scheduler is doing about it.
-fn pressure_json(state: &Arc<State>) -> Response<Body> {
+fn pressure_json(state: &Arc<State>) -> Reply {
     let now = now_ms();
     // One tiny scope per lock: both are on the request path, so neither is
     // held across the other or across building the response.
@@ -1651,15 +1668,15 @@ fn usage_json(u: &usage::Store, id: &str, span: usage::Span, now: u64) -> serde_
 /// per-model breakdown, and a dense hourly series. It answers for the caller
 /// and nobody else — the key names the account, so there is no id to pass and
 /// no way to ask about someone else.
-fn me_usage(req: &Request<Incoming>, state: &State, peer: std::net::IpAddr) -> Response<Body> {
-    if req.method() != Method::GET {
+fn me_usage(req: &InReq, state: &State) -> Reply {
+    if req.method != Method::GET {
         return json(405, r#"{"error":"GET only"}"#);
     }
     let key = presented(req);
     // Reading your own statistics is a use of the key like any other, and an
     // agent polling this is exactly the traffic someone reviewing access wants
     // to see.
-    let account = authenticate_and_stamp(state, &key, &client_ip(req.headers(), peer));
+    let account = authenticate_and_stamp(state, &key, &client_ip(&req.headers, req.peer));
     let Some(account) = account else {
         return json(
             401,
@@ -1667,7 +1684,7 @@ fn me_usage(req: &Request<Incoming>, state: &State, peer: std::net::IpAddr) -> R
         );
     };
     let now = usage::now_secs();
-    let window = path_window(req.uri().query().unwrap_or_default()).unwrap_or(usage::Window::Hours(24 * 7));
+    let window = path_window(&req.query).unwrap_or(usage::Window::Hours(24 * 7));
     let mut body = {
         let u = state.usage.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         usage_json(&u, &account.id, window.span(now), now)
@@ -1701,23 +1718,21 @@ fn me_usage(req: &Request<Incoming>, state: &State, peer: std::net::IpAddr) -> R
 ///
 /// The credential itself is never logged. What IS logged is who did it, which
 /// is the part worth being able to review afterwards.
-async fn me_credentials(req: Request<Incoming>, state: &Arc<State>, peer: std::net::IpAddr) -> Response<Body> {
-    if req.method() != Method::POST {
+async fn me_credentials(req: &InReq, state: &Arc<State>) -> Reply {
+    if req.method != Method::POST {
         return json(405, r#"{"error":"POST only"}"#);
     }
-    let key = presented(&req);
-    let ip = client_ip(req.headers(), peer);
+    let key = presented(req);
+    let ip = client_ip(&req.headers, req.peer);
     let Some(account) = authenticate_and_stamp(state, &key, &ip) else {
         return json(
             401,
             r#"{"error":"present your proxy key (x-api-key or Authorization: Bearer)"}"#,
         );
     };
-    let body = match req.into_body().collect().await {
-        Ok(c) => c.to_bytes(),
-        Err(_) => return json(400, r#"{"error":"unreadable body"}"#),
-    };
-    let Ok(raw) = String::from_utf8(body.to_vec()) else {
+    // The edge already read the body into memory, so there is nothing to
+    // collect here — only to decode.
+    let Ok(raw) = String::from_utf8(req.body.to_vec()) else {
         return json(400, r#"{"error":"body is not UTF-8"}"#);
     };
 
@@ -1754,11 +1769,11 @@ async fn me_credentials(req: Request<Incoming>, state: &Arc<State>, peer: std::n
 
 // ── the admin API ───────────────────────────────────────────────────
 
-async fn admin(req: Request<Incoming>, state: Arc<State>) -> Response<Body> {
+fn admin(req: &InReq, state: &Arc<State>) -> Reply {
     if state.admin_token.is_empty() {
         return json(503, r#"{"error":"no admin token configured"}"#);
     }
-    let offered = presented(&req);
+    let offered = presented(req);
     if !constant_time_eq(offered.as_bytes(), state.admin_token.as_bytes()) {
         // "admin token required" alone leaves an operator with nothing to act
         // on — the same unhelpful 401 the proxy path deliberately avoids. Say
@@ -1785,25 +1800,22 @@ async fn admin(req: Request<Incoming>, state: Arc<State>) -> Response<Body> {
             &serde_json::json!({ "error": format!("admin token required: {why}") }).to_string(),
         );
     }
-    let method = req.method().clone();
-    let path = req.uri().path().to_owned();
-    let query = req.uri().query().unwrap_or_default().to_owned();
-    let (_parts, body) = req.into_parts();
-    let body = match body.collect().await {
-        Ok(c) => c.to_bytes(),
-        Err(_) => return json(400, r#"{"error":"bad body"}"#),
-    };
+    // The method, path and body already arrived complete in `InReq`; the
+    // dispatcher below works on those three and does not need the request.
+    let method = req.method.clone();
+    let path = req.path.clone();
+    let body = req.body.clone();
 
     // Reports first: they take their own locks, so they must not run while the
     // account store is held for a mutation.
     match (&method, path.as_str()) {
-        (&Method::GET, "/api/pressure") => return pressure_json(&state),
+        (&Method::GET, "/api/pressure") => return pressure_json(state),
         // Provider configuration. Read-only here; mutations go through
         // `mutate`, which holds the registry lock for the whole edit.
-        (&Method::GET, "/api/providers") => return providers_json(&state),
+        (&Method::GET, "/api/providers") => return providers_json(state),
         (&Method::GET, "/api/usage") => {
             let store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            return usage_report(&state, &store, &query);
+            return usage_report(state, &store, &req.query);
         }
         // Inspection. Admin-only, like everything under /api — a capture is a
         // prompt, so a user key must never be able to read one, not even its
@@ -1858,11 +1870,11 @@ async fn admin(req: Request<Incoming>, state: Arc<State>) -> Response<Body> {
         }
         _ => {}
     }
-    mutate(&state, &method, &path, &body)
+    mutate(state, &method, &path, &body)
 }
 
 /// Everything the providers panel needs, and no credential anywhere in it.
-fn providers_json(state: &State) -> Response<Body> {
+fn providers_json(state: &State) -> Reply {
     // Everything is lifted out and the registry lock released before the
     // response is built: it is a std Mutex on a request path, and holding it
     // across a JSON allocation buys nothing.
@@ -1946,7 +1958,7 @@ fn providers_json(state: &State) -> Response<Body> {
 }
 
 /// Rotate one provider's key, leaving everything else alone.
-fn rotate_provider_key(state: &Arc<State>, id: &str, key: &str) -> Response<Body> {
+fn rotate_provider_key(state: &Arc<State>, id: &str, key: &str) -> Reply {
     if key.trim().is_empty() {
         return json(400, r#"{"error":"no key given"}"#);
     }
@@ -1987,7 +1999,7 @@ fn rotate_provider_key(state: &Arc<State>, id: &str, key: &str) -> Response<Body
 /// Leaving pins behind would strand those accounts on a provider that no
 /// longer exists — a 503 on their next request, caused by an admin action
 /// somewhere else entirely.
-fn remove_provider(state: &Arc<State>, store: &mut Store, id: &str) -> Response<Body> {
+fn remove_provider(state: &Arc<State>, store: &mut Store, id: &str) -> Reply {
     let pinned_here: Vec<String> = store
         .accounts()
         .iter()
@@ -2019,7 +2031,7 @@ fn remove_provider(state: &Arc<State>, store: &mut Store, id: &str) -> Response<
 }
 
 /// "When someone asks for X, use Y."
-fn add_mapping(state: &Arc<State>, from: &str, to: &str, note: &str) -> Response<Body> {
+fn add_mapping(state: &Arc<State>, from: &str, to: &str, note: &str) -> Reply {
     if from.is_empty() || to.is_empty() {
         return json(400, r#"{"error":"a mapping needs both a from and a to"}"#);
     }
@@ -2038,7 +2050,7 @@ fn add_mapping(state: &Arc<State>, from: &str, to: &str, note: &str) -> Response
     json(200, r#"{"ok":true}"#)
 }
 
-fn remove_mapping(state: &Arc<State>, from: &str) -> Response<Body> {
+fn remove_mapping(state: &Arc<State>, from: &str) -> Reply {
     let mut reg = state.registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if !reg.remove_mapping(from) {
         return json(404, r#"{"error":"no such mapping"}"#);
@@ -2060,7 +2072,7 @@ fn remove_mapping(state: &Arc<State>, from: &str) -> Response<Body> {
 /// is affordable, so a level there costs money and buys nothing. The two axes
 /// meet here because this is the one place that knows both — the person being
 /// configured, and every place their traffic could actually go.
-fn set_user_compact(state: &Arc<State>, store: &mut Store, who: &str, wanted: &str) -> Response<Body> {
+fn set_user_compact(state: &Arc<State>, store: &mut Store, who: &str, wanted: &str) -> Reply {
     let Some(level) = crate::compact::Compact::ALL
         .into_iter()
         .find(|c| c.as_str() == wanted.trim())
@@ -2111,7 +2123,7 @@ fn compact_refusal_for(state: &Arc<State>, store: &Store, who: &str) -> Option<S
 /// `mode: allow` with no list is `none` wearing a different name — so replacing
 /// the lot is the only edit that cannot leave a half-applied policy behind.
 /// The UI sends the whole object on every save, so there is nothing to merge.
-fn set_user_tools(store: &mut Store, who: &str, incoming: Option<&serde_json::Value>) -> Response<Body> {
+fn set_user_tools(store: &mut Store, who: &str, incoming: Option<&serde_json::Value>) -> Reply {
     let Some(value) = incoming else {
         return json(400, &serde_json::json!({ "error": "missing `tools`" }).to_string());
     };
@@ -2137,7 +2149,7 @@ fn set_user_tools(store: &mut Store, who: &str, incoming: Option<&serde_json::Va
     }
 }
 
-fn set_user_provider(state: &Arc<State>, store: &mut Store, who: &str, wanted: &str) -> Response<Body> {
+fn set_user_provider(state: &Arc<State>, store: &mut Store, who: &str, wanted: &str) -> Reply {
     let wanted = wanted.trim();
     // Validated HERE, where the registry is in hand, rather than in users.rs
     // which knows about people and not about destinations. A pin to a typo
@@ -2181,7 +2193,7 @@ fn set_user_provider(state: &Arc<State>, store: &mut Store, who: &str, wanted: &
 /// refused here, where there is a message to give. The pin is a statement about
 /// a model, not about a provider — `pick_exact` finds whichever provider serves
 /// it and takes its wire, its key and its base URL from there.
-fn set_user_model(state: &Arc<State>, store: &mut Store, who: &str, wanted: &str) -> Response<Body> {
+fn set_user_model(state: &Arc<State>, store: &mut Store, who: &str, wanted: &str) -> Reply {
     let wanted = wanted.trim();
     if !wanted.is_empty() {
         let known = {
@@ -2203,7 +2215,7 @@ fn set_user_model(state: &Arc<State>, store: &mut Store, who: &str, wanted: &str
     }
 }
 
-fn save_provider(state: &Arc<State>, field: &dyn Fn(&str) -> String, body: &Bytes) -> Response<Body> {
+fn save_provider(state: &Arc<State>, field: &dyn Fn(&str) -> String, body: &Bytes) -> Reply {
     let dir = registry_dir(state);
     let mut reg = state.registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
@@ -2317,7 +2329,7 @@ fn registry_dir(state: &State) -> std::path::PathBuf {
 /// Create an account. Mints no key, on purpose: a key is named for the place
 /// it will be used, and one handed out at signup is the one that gets deployed
 /// unnamed. The UI asks for a place and calls `POST /keys` next.
-fn add_user(store: &mut Store, field: &dyn Fn(&str) -> String) -> Response<Body> {
+fn add_user(store: &mut Store, field: &dyn Fn(&str) -> String) -> Reply {
     match store.add(&field("first_name"), &field("last_name"), &field("email")) {
         Ok(a) => json(201, &serde_json::json!({ "user": account_json(&a) }).to_string()),
         Err(e) => json(400, &serde_json::json!({ "error": e.to_string() }).to_string()),
@@ -2360,7 +2372,7 @@ fn key_route(
     path: &str,
     field: &dyn Fn(&str) -> String,
     parsed: &serde_json::Value,
-) -> Response<Body> {
+) -> Reply {
     let owner = |suffix: &str| {
         path.trim_start_matches("/api/users/")
             .trim_end_matches(suffix)
@@ -2416,7 +2428,7 @@ fn tools_body(body: &serde_json::Value) -> Option<&serde_json::Value> {
     body.is_object().then_some(body)
 }
 
-fn mutate(state: &Arc<State>, method: &Method, path: &str, body: &Bytes) -> Response<Body> {
+fn mutate(state: &Arc<State>, method: &Method, path: &str, body: &Bytes) -> Reply {
     let parsed = serde_json::from_slice::<serde_json::Value>(body).unwrap_or(serde_json::Value::Null);
     let field = |k: &str| parsed.get(k).and_then(|x| x.as_str()).unwrap_or("").to_owned();
     let who = |suffix: &str| {
@@ -2664,7 +2676,7 @@ fn served_index(root: &std::path::Path) -> &'static str {
     })
 }
 
-fn web(path: &str, state: &State) -> Response<Body> {
+fn web(path: &str, state: &State) -> Reply {
     let Some(root) = state.web_root.as_ref() else {
         return text(404, "web UI not installed");
     };
@@ -2705,17 +2717,14 @@ fn web(path: &str, state: &State) -> Response<Body> {
     } else {
         Bytes::from(bytes)
     };
-    Response::builder()
-        .status(200)
-        .header("content-type", ctype)
-        .header("cache-control", cache)
+    Reply::bytes(200, body)
+        .with_header("content-type", ctype.to_owned())
+        .with_header("cache-control", cache.to_owned())
         // The UI holds an admin token in memory; keep it out of any embedding
         // page and out of a referrer.
-        .header("x-content-type-options", "nosniff")
-        .header("x-frame-options", "DENY")
-        .header("referrer-policy", "no-referrer")
-        .body(Full::new(body).boxed())
-        .unwrap_or_else(|_| Response::new(Full::new(Bytes::new()).boxed()))
+        .with_header("x-content-type-options", "nosniff".to_owned())
+        .with_header("x-frame-options", "DENY".to_owned())
+        .with_header("referrer-policy", "no-referrer".to_owned())
 }
 
 /// Run until Ctrl-C.
@@ -3097,9 +3106,9 @@ mod tests {
         ] {
             let resp = web(attack, &state);
             assert!(
-                resp.status() == 400 || resp.status() == 404,
+                resp.status == 400 || resp.status == 404,
                 "{attack} was not refused: {}",
-                resp.status()
+                resp.status
             );
         }
     }
