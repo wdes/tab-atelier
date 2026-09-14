@@ -464,6 +464,10 @@ pub fn tokens_of(usage: Option<&Value>) -> Tokens {
         output: usage.get("completion_tokens").and_then(Value::as_u64).unwrap_or(0),
         cache_read: cached,
         cache_write: 0,
+        // OpenAI's `usage` reports none of the Anthropic-only fields, so they
+        // stay zero — which the panel shows as "not reported" rather than as a
+        // measured nought.
+        ..Tokens::default()
     }
 }
 
