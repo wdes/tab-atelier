@@ -29,25 +29,23 @@
     // the source is carried into the UI wherever a converted figure appears, and a
     // conversion never touches a provider's own token numbers.
     /** What the token chart's y-axis and totals are expressed in. */
-    const TOKEN_UNITS = ["tokens", "wh", "joule", "gco2", "ml"];
+    const TOKEN_UNITS = ["tokens", "wh", "gco2"];
     const UNIT_LABEL = {
         tokens: "tokens",
         wh: "Wh",
-        joule: "J",
         gco2: "gCO₂e",
-        ml: "mL",
     };
     /** The same labels as an ordered list, for the `<select>` in the header. */
     const UNIT_OPTIONS = TOKEN_UNITS.map((id) => ({ id, label: UNIT_LABEL[id] }));
     // Energy per token. Google's May 2025 Gemini inference disclosure puts a median
-    // text prompt at 0.24 Wh of datacenter energy, 0.03 gCO₂e of emissions and
-    // 0.26 mL of water — all per PROMPT. The median prompt's token count is not
-    // published, so these are that measurement divided by 1,000 tokens: a round
-    // working assumption, not a measured per-token figure. Read every converted
-    // value as an order of magnitude, and show SOURCE_ENERGY beside it.
+    // text prompt at 0.24 Wh of datacenter energy and 0.03 gCO₂e of emissions — per
+    // PROMPT. The median prompt's token count is not published, so these are that
+    // measurement divided by 1,000 tokens: a round working assumption, not a
+    // measured per-token figure. Read every converted value as an order of
+    // magnitude, and show SOURCE_ENERGY beside it.
     const WH_PER_TOKEN = 0.00024;
     const SOURCE_ENERGY = {
-        value: "0.24 Wh, 0.03 gCO₂e and 0.26 mL",
+        value: "0.24 Wh and 0.03 gCO₂e",
         unit: "per median Gemini text prompt",
         source: "Google, “Measuring the environmental impact of AI inference”, May 2025",
     };
@@ -57,13 +55,11 @@
             `(${SOURCE_ENERGY.source}). The prompt's token count is not published, so ` +
             `1,000 tokens is assumed — read these as an order of magnitude.`);
     }
-    /** Multiplier from Wh to each energy unit: Wh→J is exact, the rest are ratios
-     *  within Google's own figures (0.03 g and 0.26 mL per 0.24 Wh). */
+    /** Multiplier from Wh to each energy unit: Wh→gCO₂e is a ratio within Google's
+     *  own figures (0.03 g per 0.24 Wh). */
     const ENERGY_SCALE = {
         wh: 1,
-        joule: 3600,
         gco2: 0.03 / 0.24,
-        ml: 0.26 / 0.24,
     };
     /** Convert a token count into `unit`; `tokens` passes straight through. */
     function convertTokens(tokens, unit) {
@@ -84,7 +80,48 @@
             return n < 1 ? n.toFixed(2) : n.toFixed(1);
         return String(n);
     }
-    // Shared by both charts: mouse position → bucket index, the crosshair, and the
+    /**
+     * How each unit steps up, largest first. Spelled out per unit rather than
+     * derived from the SI rules, because the prefix belongs to the *unit*
+     * (`566.8 kWh`, never `566.8k Wh`). `t` is the metric tonne (1e6 g), the
+     * step above `kgCO₂e`.
+     */
+    const UNIT_STEPS = {
+        wh: [[1e9, "GWh"], [1e6, "MWh"], [1e3, "kWh"]],
+        gco2: [[1e6, "tCO₂e"], [1e3, "kgCO₂e"]],
+    };
+    /** A quantity with its unit, magnitude folded into the unit: `566.8 kWh`. */
+    function withUnit(n, unit) {
+        if (unit === "tokens")
+            return `${fmtCount(n)} tokens`;
+        const u = unit;
+        const step = UNIT_STEPS[u]?.find(([m]) => Math.abs(n) >= m);
+        return step === undefined
+            ? `${fmtCount(n)} ${UNIT_LABEL[u] ?? unit}`
+            : `${fmtCount(n / step[0])} ${step[1]}`;
+    }
+    /** `v` rounded up to one significant figure — the top of a chart's axis. */
+    function niceNumber(v) {
+        if (v <= 0)
+            return 1;
+        const mag = 10 ** Math.floor(Math.log10(v));
+        return Math.ceil(v / mag) * mag;
+    }
+    /**
+     * The unit a chart prints for a series whose tallest bucket is `max` **tokens**,
+     * with the magnitude folded in: `kWh`, never `k Wh`. Takes the raw token count
+     * and converts here, because that is what every series holds until this function
+     * names the unit; the label and the numbers it labels must be chosen from the
+     * same converted maximum or the axis reads `566.8` under a `Wh` heading.
+     */
+    function unitSuffix(max, unit) {
+        const label = UNIT_LABEL[unit] ?? UNIT_LABEL.tokens;
+        const steps = UNIT_STEPS[unit];
+        if (!steps)
+            return label;
+        const top = Math.abs(convertTokens(niceNumber(max), unit));
+        return steps.find(([m]) => top >= m)?.[1] ?? label;
+    }
     // tooltip. Hover is not optional decoration — an hourly series is unreadable
     // without a way to ask "which hour is that, exactly".
     const hoverable = Vue.defineComponent({
@@ -102,6 +139,14 @@
             },
             plotH() {
                 return H - PAD.top - PAD.bottom;
+            },
+            // `hover` is an index into a prop the parent swaps wholesale — a new hour
+            // bucket, a changed focus, refreshed usage. Between that swap and the next
+            // mousemove the old index can point past the end of the new array, and
+            // every `points[hover].…` below would dereference undefined. Gate on this,
+            // never on `hover >= 0` alone.
+            hovering() {
+                return this.hover >= 0 && this.hover < this.points.length;
             },
         },
         methods: {
@@ -136,10 +181,7 @@
             // A rounded top on a "nice" number, so gridlines land on values a person
             // would have chosen.
             niceMax(v) {
-                if (v <= 0)
-                    return 1;
-                const mag = 10 ** Math.floor(Math.log10(v));
-                return Math.ceil(v / mag) * mag;
+                return niceNumber(v);
             },
             ticks(max) {
                 return [0, 0.5, 1].map((f) => Math.round(max * f));
@@ -268,7 +310,7 @@
           <text v-for="t in ticks(max)" :key="'l'+t" :x="${PAD.left - 8}" :y="yOf(t) + 4"
                 text-anchor="end">{{ fmt(t) }}</text>
         </g>
-        <g v-if="hover >= 0">
+        <g v-if="hovering">
           <line class="ta-crosshair" :x1="xOf(hover)" :x2="xOf(hover)" :y1="${PAD.top}" :y2="${H - PAD.bottom}" />
         </g>
         <!-- One series per account, or the single summed one when focused. -->
@@ -280,7 +322,7 @@
           <path :d="area" class="ta-area-1" />
           <path :d="line" class="ta-line-1" />
         </template>
-        <g v-if="hover >= 0">
+        <g v-if="hovering">
           <template v-if="multi">
             <circle v-for="s in seriesPaths" :key="'d'+s.key"
                     :cx="xOf(hover)" :cy="yOf(s.points[hover]?.calls ?? 0)" r="3.5"
@@ -301,7 +343,7 @@
           <span class="ta-key" :style="{ background: stroke(s.slot) }"></span>{{ s.name }}
         </span>
       </div>
-      <div v-if="hover >= 0" class="ta-tip" :style="tipStyle(hover)">
+      <div v-if="hovering" class="ta-tip" :style="tipStyle(hover)">
         <div class="ta-tip-h">{{ hourLabel(points[hover].hour) }}</div>
         <template v-if="multi">
           <div v-for="r in hoverRows" :key="r.name">
@@ -381,16 +423,32 @@
                 // 2px of surface between neighbours, and never a sliver.
                 return Math.max(1, this.plotW / this.points.length - 2);
             },
+            // One step for the whole chart. Choosing per-value would label ticks on the
+            // same axis "900 kWh" and "1.2 MWh"; the tallest value picks, every tick
+            // obeys, and the axis name carries the prefix the numbers dropped.
+            unitStep() {
+                const top = Math.max(this.maxIn, this.maxOut);
+                return UNIT_STEPS[this.unit]?.find(([m]) => Math.abs(convertTokens(top, this.unit)) >= m);
+            },
             unitName() {
-                return UNIT_LABEL[this.unit] ?? UNIT_LABEL.tokens;
+                return unitSuffix(Math.max(this.maxIn, this.maxOut), this.unit);
             },
         },
         methods: {
             // Overrides the mixin's: every number this chart prints is a token count
             // until `unit` says otherwise, so converting here keeps the axis, the panel
-            // totals and the tooltip on one unit without each call site knowing.
+            // totals and the tooltip on one unit without each call site knowing. The
+            // magnitude moves into the axis name, so `566.8` + `kWh` — never `566.8k`
+            // + `Wh`, which reads as a different number.
             fmt(n) {
-                return fmtCount(convertTokens(n, this.unit));
+                const v = convertTokens(n, this.unit);
+                const step = this.unitStep;
+                return step === undefined ? fmtCount(v) : fmtCount(v / step[0]);
+            },
+            // The panel totals label themselves rather than borrowing the axis name:
+            // a window total can sit a step above the tallest single hour.
+            amt(n) {
+                return withUnit(convertTokens(n, this.unit), this.unit);
             },
             // The two scales, kept as separate functions rather than one parameterised
             // by a panel index — mixing them up would silently plot output against
@@ -426,7 +484,7 @@
                 text-anchor="end">{{ fmt(t) }}</text>
         </g>
         <text class="ta-panel-title" :x="${PAD.left + 4}" :y="${PAD.top + 10}">
-          <tspan class="ta-key ta-bg-1"></tspan>input · {{ fmt(totalIn) }}
+          <tspan class="ta-key ta-bg-1"></tspan>input · {{ amt(totalIn) }}
         </text>
         <g v-for="(p, i) in pts" :key="'bi'+i">
           <rect v-if="p.input" v-bind="barIn(i, p.input)" class="ta-bar-1" rx="4" />
@@ -440,21 +498,21 @@
                 text-anchor="end">{{ fmt(t) }}</text>
         </g>
         <text class="ta-panel-title" :x="${PAD.left + 4}" :y="yOut(maxOut) + 10">
-          <tspan class="ta-key ta-bg-2"></tspan>output · {{ fmt(totalOut) }}
+          <tspan class="ta-key ta-bg-2"></tspan>output · {{ amt(totalOut) }}
         </text>
         <g v-for="(p, i) in pts" :key="'bo'+i">
           <rect v-if="p.output" v-bind="barOut(i, p.output)" class="ta-bar-2" rx="4" />
         </g>
 
         <!-- One crosshair across both, because the x axis is shared. -->
-        <line v-if="hover >= 0" class="ta-crosshair" :x1="xOf(hover)" :x2="xOf(hover)"
+        <line v-if="hovering" class="ta-crosshair" :x1="xOf(hover)" :x2="xOf(hover)"
               :y1="${PAD.top}" :y2="${H - PAD.bottom}" />
         <g class="ta-axis">
           <text v-for="l in labels" :key="'x'+l.i"
                 :x="xOf(l.i)" :y="${H - 6}" text-anchor="middle">{{ hourLabel(l.p.hour) }}</text>
         </g>
       </svg>
-      <div v-if="hover >= 0" class="ta-tip" :style="tipStyle(hover)">
+      <div v-if="hovering" class="ta-tip" :style="tipStyle(hover)">
         <div class="ta-tip-h">{{ hourLabel(points[hover].hour) }}</div>
         <div><span class="ta-key ta-bg-1"></span>{{ fmt(points[hover].input) }} in</div>
         <div><span class="ta-key ta-bg-2"></span>{{ fmt(points[hover].output) }} out</div>
@@ -583,7 +641,7 @@
             fallback above {{ pct(threshold) }}
           </text>
         </g>
-        <g v-if="hover >= 0">
+        <g v-if="hovering">
           <line class="ta-crosshair" :x1="xOf(hover)" :x2="xOf(hover)" :y1="${PAD.top}" :y2="${H - PAD.bottom}" />
           <circle v-if="points[hover].seven_day != null" :cx="xOf(hover)"
                   :cy="yOf(points[hover].seven_day)" r="4" class="ta-dot-2" />
@@ -600,7 +658,7 @@
         <span v-if="hasWeekly" class="me-3"><span class="ta-key ta-key-dash ta-bg-2"></span>weekly</span>
         <span v-if="sessionResets.length"><span class="ta-key ta-key-rule"></span>session reset</span>
       </div>
-      <div v-if="hover >= 0" class="ta-tip" :style="tipStyle(hover)">
+      <div v-if="hovering" class="ta-tip" :style="tipStyle(hover)">
         <div class="ta-tip-h">{{ points[hover].label }}</div>
         <div><span class="ta-key ta-bg-1"></span>{{ pct(points[hover].util) }} session (5 h)</div>
         <div v-if="points[hover].seven_day != null">
@@ -609,5 +667,5 @@
       </div>
     </div>`,
     });
-    window.TaCharts = { CallsChart, TokensChart, PressureChart, UNIT_OPTIONS, convertTokens, fmtCount, energyNote };
+    window.TaCharts = { CallsChart, TokensChart, PressureChart, UNIT_OPTIONS, convertTokens, fmtCount, withUnit, unitSuffix, energyNote };
 })();

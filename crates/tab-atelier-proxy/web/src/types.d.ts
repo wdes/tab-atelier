@@ -353,6 +353,7 @@ interface CaptureCompaction {
     bytes_after: number;
     tool_results_elided: number;
     tool_results_kept_for_error: number;
+    tool_results_kept_small: number;
     thinking_dropped: number;
     /**
      * Layer D: file bodies stubbed inside old `Write`/`Edit` inputs.
@@ -593,6 +594,14 @@ interface Window {
         /** Convert a token count into a unit; `"tokens"` passes through. */
         convertTokens: (tokens: number, unit: string) => number;
         fmtCount: (n: number) => string;
+        /** Format a quantity with its unit, magnitude folded in: `566.8 kWh`. */
+        withUnit: (n: number, unit: string) => string;
+        /**
+         * The rendered unit for a series peaking at `max`: the base unit when a
+         * bare number fits, else the next one up (`max` 566 800 Wh → `"kWh"`).
+         * Carries the prefix, so callers must not print a separate suffix.
+         */
+        unitSuffix: (max: number, unit: string) => string;
         /** The estimate's citation and caveat, shown beside converted figures. */
         energyNote: () => string;
     };

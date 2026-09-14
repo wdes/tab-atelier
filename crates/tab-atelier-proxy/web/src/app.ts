@@ -320,8 +320,11 @@ const AdminApp = Vue.defineComponent({
       return window.TaCharts.UNIT_OPTIONS;
     },
     unitName(): string {
-      const u = this.tokenUnits.find((x) => x.id === this.unit);
-      return u ? u.label : "tokens";
+      // The header names the chart's unit, so it must agree with the axis and
+      // with the tiles below it: derive it from the same tallest bucket rather
+      // than echoing the select's base label (`Wh` beside numbers in `kWh`).
+      const top = this.series.reduce((m, s) => Math.max(m, s.input, s.output), 1);
+      return window.TaCharts.unitSuffix(top, this.unit);
     },
     unitNote(): string {
       if (this.unit === "tokens") return "";
@@ -448,7 +451,10 @@ const AdminApp = Vue.defineComponent({
         { label: "Output", value: this.fmt(output), sub: this.scopeLabel },
         {
           label: "Energy",
-          value: `${window.TaCharts.fmtCount(window.TaCharts.convertTokens(input + output + cache, "wh"))} Wh`,
+          value: window.TaCharts.withUnit(
+            window.TaCharts.convertTokens(input + output + cache, "wh"),
+            "wh",
+          ),
           // Deliberately not a bare number: the conversion is a published
           // estimate over an assumed prompt size, and the chart carries the
           // citation. A tile that reads as measured would be a lie.
@@ -888,6 +894,7 @@ const AdminApp = Vue.defineComponent({
       const parts: string[] = [];
       if (k.tool_results_elided) parts.push(`${k.tool_results_elided} tool results`);
       if (k.tool_results_kept_for_error) parts.push(`${k.tool_results_kept_for_error} errors kept`);
+      if (k.tool_results_kept_small) parts.push(`${k.tool_results_kept_small} too small to save`);
       if (k.thinking_dropped) parts.push(`${k.thinking_dropped} thinking`);
       // Singular/plural matters here more than elsewhere: "1 write payloads"
       // reads as a bug in the counter rather than a count of one.
