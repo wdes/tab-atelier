@@ -216,15 +216,6 @@ fn already_elided(content: &serde_json::Value) -> bool {
 /// the model still needs; a false negative costs bytes.
 const WRITE_TOOLS: [&str; 4] = ["Write", "Edit", "MultiEdit", "NotebookEdit"];
 
-/// The shell tool, whose `input.command` is the same bulk seen on the other
-/// side: a heredoc or a long pipeline is a file body wearing a command's name.
-///
-/// Kept in its own list rather than folded into [`WRITE_TOOLS`] so the stub can
-/// say "command" instead of "file content" — the byte count is the same, but
-/// the label is read by whoever is debugging a body later, and misnaming what
-/// was dropped there is its own small bug.
-const SHELL_TOOLS: [&str; 1] = ["Bash"];
-
 /// The smallest string worth replacing.
 ///
 /// Well above the length of a path, a hash or a flag, and well below a file
@@ -235,13 +226,6 @@ const MIN_WRITE_BYTES: usize = 200;
 /// The marker every write stub begins with — see [`ELIDED_PREFIX`] for why the
 /// pass needs one at all.
 const WRITE_ELIDED_PREFIX: &str = "[file content elided by tab-atelier-proxy: ";
-
-/// The marker a stub on a shell command begins with.
-const COMMAND_ELIDED_PREFIX: &str = "[command elided by tab-atelier-proxy: ";
-
-/// Every marker this pass writes, so a second pass can recognise a stub
-/// whichever family left it — see [`elide_long_strings`].
-const ELISION_PREFIXES: [&str; 2] = [WRITE_ELIDED_PREFIX, COMMAND_ELIDED_PREFIX];
 
 /// The stub that replaces a long string inside a `tool_use` `input`.
 ///
@@ -460,9 +444,11 @@ fn errored_call_ids(messages: &[serde_json::Value]) -> Vec<String> {
 
 /// The stub marker for a call whose payload this layer shrinks, if it does.
 ///
-/// Returns the prefix rather than a bool because the two families read
-/// differently in the body — a stub saying "file content" on a shell command
-/// would misname what was dropped.
+/// Only file-writing tools are shrunk. A `Bash` command is the model's own
+/// intent rather than a payload — stubbing it left agents unable to see what
+/// they had run and reasoning about commands they could not read — so shell
+/// calls are never elided, however long they are. The bulk of a shell call is
+/// its output, which layer A already bounds.
 fn elidable_prefix(block: &serde_json::Value) -> Option<&'static str> {
     if block_type(block) != Some("tool_use") {
         return None;
@@ -470,9 +456,6 @@ fn elidable_prefix(block: &serde_json::Value) -> Option<&'static str> {
     let name = block.get("name").and_then(serde_json::Value::as_str)?;
     if WRITE_TOOLS.contains(&name) {
         return Some(WRITE_ELIDED_PREFIX);
-    }
-    if SHELL_TOOLS.contains(&name) {
-        return Some(COMMAND_ELIDED_PREFIX);
     }
     None
 }
@@ -517,9 +500,7 @@ fn elide_strings_under(value: &mut serde_json::Value, prefix: &str, key: Option<
             // it — but that would make the pass idempotent by arithmetic
             // coincidence rather than by rule, and a second pass would then
             // recompute the byte count from the stub, losing the original.
-            // Every family's marker is checked, not just this call's: a Bash
-            // block must not re-stub a body a previous Write pass left.
-            if ELISION_PREFIXES.iter().any(|p| s.starts_with(p)) {
+            if s.starts_with(WRITE_ELIDED_PREFIX) {
                 return 0;
             }
             if s.len() < MIN_WRITE_BYTES {
@@ -1381,9 +1362,9 @@ mod tests {
         assert_eq!(before, after, "a small edit must not grow");
     }
 
-    /// The gate is the tool NAME, not the shape of `input`. A tool outside both
-    /// families is left alone however long its strings are — `Bash` used to
-    /// stand here, and moved out when shell commands joined the stub set.
+    /// The gate is the tool NAME, not the shape of `input`. A tool outside the
+    /// write family is left alone however long its strings are — reading tools
+    /// like `Grep` and shell calls both pass through untouched.
     #[test]
     fn layer_d_does_not_touch_tools_that_are_not_elidable() {
         let pattern = "echo".to_owned() + &" a".repeat(4000);
@@ -1403,11 +1384,13 @@ mod tests {
         );
     }
 
-    /// `Bash` is its own family, and the stub it leaves says so: a shell command
-    /// is not file content, and a body that said "file content elided" over a
-    /// command the model ran would misname what it dropped.
+    /// A shell command is the model's own intent, not a payload. Stubbing it
+    /// left agents unable to read what they had run and quoting values out of
+    /// commands they could not see, so `Bash` is never elided however long the
+    /// command is. The bulk of a shell call is its output, which layer A
+    /// bounds on the other side of the exchange.
     #[test]
-    fn layer_d_stubs_long_shell_commands_and_names_them() {
+    fn layer_d_never_stubs_shell_commands() {
         let command = "echo".to_owned() + &" a".repeat(4000);
         let mut b = turns(TURNS + 2, |_| {
             json!({
@@ -1416,27 +1399,22 @@ mod tests {
             })
         });
         let stats = apply(&mut b, Compact::Writes);
-        assert_eq!(stats.writes_elided, TURNS + 2 - KEEP_TURNS);
+        assert_eq!(stats.writes_elided, 0);
 
         let input = &write_inputs(&b)[0];
-        let stub = input["command"].as_str().expect("string");
-        assert!(stub.starts_with(COMMAND_ELIDED_PREFIX), "{stub}");
-        assert!(
-            !stub.contains(WRITE_ELIDED_PREFIX),
-            "a command is not file content: {stub}"
-        );
-        // The small fields are still the model's to read.
-        assert_eq!(input["description"], "long but short");
+        assert_eq!(input["command"], command, "the model keeps its own command");
     }
 
-    /// A `Bash` block must not re-stub a body a `Write` pass left, and vice
-    /// versa: the families share one marker list, not one marker.
+    /// Shell calls and write calls can share one request. The write stub must
+    /// survive a second pass while the shell command beside it stays untouched
+    /// in both passes.
     #[test]
-    fn layer_d_is_idempotent_across_the_two_families() {
+    fn layer_d_elides_writes_beside_shell_calls_and_stays_idempotent() {
+        let command = "x".repeat(5000);
         let mut b = turns(TURNS + 2, |i| {
             if i % 2 == 0 {
                 json!({"type": "tool_use", "id": "call", "name": "Bash",
-                       "input": {"command": "x".repeat(5000)}})
+                       "input": {"command": command}})
             } else {
                 json!({"type": "tool_use", "id": "call", "name": "Write",
                        "input": {"file_path": "/tmp/f.rs", "content": "y".repeat(5000)}})
@@ -1447,11 +1425,16 @@ mod tests {
         let stats = apply(&mut twice, Compact::Writes);
         assert_eq!(serialized(&twice), serialized(&b), "idempotent");
         assert_eq!(stats.writes_elided, 0, "and reports nothing to do");
-        let first = &write_inputs(&twice)[0];
-        assert!(
-            first["command"].as_str().expect("s").starts_with(COMMAND_ELIDED_PREFIX),
-            "the shell stub survived the second pass"
-        );
+        for input in write_inputs(&twice) {
+            if input.get("command").is_some() {
+                assert_eq!(input["command"], command, "a shell command is never stubbed");
+            } else {
+                assert!(
+                    input["content"].as_str().expect("s").starts_with(WRITE_ELIDED_PREFIX),
+                    "the write stub survived the second pass"
+                );
+            }
+        }
     }
 
     /// The same rule as every other layer: a retry, or a second route change
