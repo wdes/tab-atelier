@@ -329,13 +329,23 @@ fn rewrite_trailer(text: &str, replacement: &str) -> String {
 /// convention and is left alone. Every address has an `@`, so requiring one
 /// costs no real trailer and buys back the false positive the second bracket
 /// would otherwise introduce.
+///
+/// The search does not stop at the first bracket pair, because the first pair
+/// need not be the address. A `Bash` description shipped by a later client
+/// reads `Claude Opus 5 (1M context) <noreply@anthropic.com>` — name, then a
+/// note about context, then the mail. Anchoring on the first pair found no `@`
+/// in `(1M context)` and gave up, leaving the very trailer this exists to
+/// remove. A bracket pair with no address is skipped, not terminal.
 fn closing_bracket(rest: &str) -> Option<usize> {
-    let open = rest.find(['<', '('])?;
-    let close = rest[open..].find(['>', ')'])?;
-    if !rest[open + 1..open + close].contains('@') {
-        return None;
+    let mut from = 0;
+    while let Some(open) = rest[from..].find(['<', '(']).map(|o| o + from) {
+        let close = rest[open..].find(['>', ')'])?;
+        if rest[open + 1..open + close].contains('@') {
+            return Some(open + close + 1);
+        }
+        from = open + 1;
     }
-    Some(open + close + 1)
+    None
 }
 
 fn find_ignoring_ascii_case(haystack: &str, needle: &[u8]) -> Option<usize> {
@@ -541,7 +551,7 @@ mod tests {
                 "description": concat!(
                     "Runs a command.\n",
                     "- End git commit messages with:\n",
-                    "Co-Authored-By: Claude 4.8 (noreply@anthropic.com)\n",
+                    "Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>\n",
                     "- End PR bodies with:\n",
                     "🤖 Generated with [Claude Code](https://claude.com/claude-code)",
                 ),
@@ -556,6 +566,35 @@ mod tests {
         assert!(!text.contains("anthropic"), "{text:?}");
         assert!(!text.contains("Generated with"), "{text:?}");
         assert!(text.contains("Runs a command."), "{text:?}");
+    }
+
+    #[test]
+    fn a_note_between_the_name_and_the_mail_does_not_hide_the_trailer() {
+        // Every bracket shape a client has shipped, and one line that is prose
+        // rather than a trailer. The `(1M context)` shape is why this is a scan
+        // and not a single `find`: the first bracket pair wraps a note, so a
+        // matcher that stops at the first pair finds no address, reports no
+        // trailer, and leaves `Co-Authored-By: Claude` in the body — the exact
+        // failure this was meant to prevent.
+        let cases = [
+            (
+                "Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>",
+                true,
+            ),
+            ("Co-Authored-By: Claude 4.8 <noreply@anthropic.com>", true),
+            ("Co-Authored-By: Claude (noreply@anthropic.com)", true),
+            ("Co-Authored-By: (see the docs)", false),
+        ];
+        for (line, rewritten) in cases {
+            let mut body = json!({ "tools": [{ "name": "Bash", "description": line }] });
+            apply(&mut body, Vendor::Deepseek, "deepseek-flash");
+            let text = body["tools"][0]["description"].as_str().unwrap();
+            if rewritten {
+                assert_eq!(text, "Co-authored-by: DeepSeek <noreply@deepseek.com>", "{line:?}");
+            } else {
+                assert_eq!(text, line, "prose about the trailer was rewritten: {line:?}");
+            }
+        }
     }
 
     #[test]
