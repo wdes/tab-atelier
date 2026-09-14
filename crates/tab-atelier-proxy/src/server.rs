@@ -13,22 +13,11 @@
 //! A user key rejected by `/api/users` is not a mistake to smooth over; it is
 //! the boundary working.
 
-use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
-use bytes::Bytes;
-use http_body_util::BodyExt;
-use hyper::body::Incoming;
-use hyper::service::service_fn;
-use hyper::{Request, Response};
-
 use crate::users::Store;
 use crate::{account, inspect, provider, qos, usage};
-
-use crate::transport::{InReq, Reply};
-
-type Body = http_body_util::combinators::BoxBody<Bytes, Infallible>;
 
 /// Everything a request handler needs.
 pub struct State {
@@ -81,7 +70,21 @@ impl State {
     #[cfg(test)]
     #[must_use]
     pub fn for_tests(admin_token: String) -> Self {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/for-tests");
+        // A directory per call, not one shared by every test. The store is
+        // persisted on every write, so tests running in parallel against one
+        // file clobber each other's accounts and the failure looks like a bug
+        // in the code under test. The integration tests already take a scratch
+        // directory each for the same reason; this brings the unit tests in
+        // line with them.
+        // The system temp directory, not `target/`: this is scratch state that
+        // is written on every store mutation, and a path inside the repository
+        // shows up as untracked noise in `git status` on every test run.
+        let dir = std::env::temp_dir().join("tab-atelier-tests").join(format!(
+            "{:?}-{}",
+            std::thread::current().id(),
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
         Self {
             store: Mutex::new(Store::load(dir.join("users.json")).expect("fresh store")),
             usage: Mutex::new(usage::Store::load(&dir)),
@@ -105,98 +108,54 @@ pub fn now_ms() -> u64 {
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
-/// Serve one request.
+/// Start the proxy, and serve until the process ends.
+///
+/// The socket belongs to Rocket now. That is the point of the change: the
+/// accept loop, the per-connection task, the header-read timeout and the HTTP
+/// version are the framework's business, and each one used to be a hand-written
+/// line here that no test covered. What stays in this module is the two things
+/// that are genuinely ours — the state the routes read and the reply type they
+/// return.
 ///
 /// # Errors
-/// Never — the `Result` is `Infallible`, and exists only because hyper's
-/// `service_fn` requires one. Failures become status codes, not errors: a
-/// proxy that drops a connection instead of answering 502 tells the client
-/// nothing about what went wrong.
-pub async fn handle(
-    req: Request<Incoming>,
-    state: Arc<State>,
-    peer: std::net::IpAddr,
-) -> Result<Response<Body>, Infallible> {
-    // The body is read once, here, so no handler has to think about it and the
-    // transport-neutral dispatcher can take a complete request. A body that
-    // cannot be read at all is answered as an empty one rather than dropped, so
-    // a malformed request still gets a reply instead of a closed connection.
-    let (parts, body) = req.into_parts();
-    let body = body
-        .collect()
-        .await
-        .map(http_body_util::Collected::to_bytes)
-        .unwrap_or_default();
-    let query = parts.uri.query().unwrap_or_default().to_owned();
-    let req = InReq {
-        method: parts.method,
-        path: parts.uri.path().to_owned(),
-        query,
-        headers: parts.headers,
-        body,
-        peer,
-    };
-
-    // Collecting the reply before converting keeps the dispatcher free of
-    // transport types. Only the final conversion names hyper.
-    Ok(route(&req, &state).await.into_hyper())
-}
-
-/// Listen on `addr` and serve until the process ends.
-///
-/// # Errors
-/// If the address cannot be bound — typically a port already in use, or one
-/// below 1024 without the privilege for it.
+/// If the address cannot be bound — a port already in use, or one below 1024
+/// without the privilege for it.
 pub async fn serve(addr: SocketAddr, state: Arc<State>) -> Result<(), String> {
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .map_err(|e| format!("bind {addr}: {e}"))?;
-    log::info!("tab-atelier-proxy listening on http://{addr}");
-    serve_on(listener, state).await
+    let rocket = rocket::custom(crate::http::config(addr))
+        .mount("/", crate::http::routes::all())
+        .register("/", crate::http::routes::catchers())
+        .manage(state);
+    rocket.launch().await.map(|_| ()).map_err(|e| format!("rocket: {e}"))
 }
 
-/// The same loop against a listener the caller already binds.
+/// Serve on a port the kernel picks, for the tests that drive the real socket.
 ///
-/// Taking a bound listener is what lets a test pick port 0, learn the port the
-/// kernel chose, and drive the real socket instead of a mock.
+/// Returns the address it actually got, which is what makes a test able to
+/// reach a socket on a shared machine without guessing at a free port.
 ///
 /// # Errors
-/// Never in the current loop: `accept` failures are logged and retried, since a
-/// per-connection failure (a reset, a file-descriptor spike) must not take the
-/// listener down with it.
-pub async fn serve_on(listener: tokio::net::TcpListener, state: Arc<State>) -> Result<(), String> {
-    loop {
-        let (stream, peer) = match listener.accept().await {
-            Ok(s) => s,
-            Err(e) => {
-                log::warn!("accept: {e}");
-                continue;
-            }
-        };
-        let state = Arc::clone(&state);
-        tokio::spawn(async move {
-            let io = hyper_util::rt::TokioIo::new(stream);
-            let svc = service_fn(move |req| handle(req, Arc::clone(&state), peer.ip()));
-            let _ = hyper::server::conn::http1::Builder::new()
-                .keep_alive(true)
-                .timer(hyper_util::rt::TokioTimer::new())
-                // Slow-loris guard: bound how long a client may take to dribble
-                // in its headers, or one byte every few seconds ties up a task
-                // forever and the accept loop spawns one per connection.
-                .header_read_timeout(std::time::Duration::from_secs(30))
-                .serve_connection(io, svc)
-                .await;
-        });
-    }
-}
-
-/// Send a request to the route table, which owns every path.
-///
-/// This module keeps the socket, the state and the shutdown; what answers a
-/// path lives in [`crate::http::routes`]. The seam is the transport types, not
-/// hyper, which is what lets the whole API be tested without a socket.
-async fn route(req: &InReq, state: &Arc<State>) -> Reply {
-    crate::http::routes::dispatch(req, state).await
+/// If the address cannot be bound, and from Rocket's own launch if it fails
+/// after binding.
+pub async fn serve_on(addr: SocketAddr, state: Arc<State>) -> Result<SocketAddr, String> {
+    // Rocket binds inside `launch`, which does not return until the server
+    // stops, so a caller asking for port 0 has no way to learn what it got.
+    // Asking the kernel first and handing Rocket the answer closes that: there
+    // is a window between the probe and the bind in which another process could
+    // take the port, which is why this is for tests and not for `serve`.
+    let addr = if addr.port() == 0 {
+        let probe = std::net::TcpListener::bind(addr).map_err(|e| format!("bind {addr}: {e}"))?;
+        let chosen = probe.local_addr().map_err(|e| format!("local_addr: {e}"))?;
+        drop(probe);
+        chosen
+    } else {
+        addr
+    };
+    log::info!("tab-atelier-proxy listening on http://{addr}");
+    let rocket = rocket::custom(crate::http::config(addr))
+        .mount("/", crate::http::routes::all())
+        .register("/", crate::http::routes::catchers())
+        .manage(state);
+    rocket.launch().await.map(|_| addr).map_err(|e| format!("rocket: {e}"))
 }
 
 #[cfg(test)]

@@ -13,57 +13,96 @@ use http_body_util::{BodyExt, StreamBody};
 use hyper::Method;
 use hyper::body::Frame;
 
-use crate::http::middleware::arrival::{client_ip, header_of, is_trusted_hop, presented};
-use crate::http::middleware::reachability::reachability_probe;
-use crate::http::middleware::user_key::authenticate_and_stamp;
+use crate::http::guards::Arrival;
+use crate::http::middleware::arrival::{header_of, is_trusted_hop};
 use crate::server::{State, now_ms};
-use crate::transport::{InReq, Reply, text};
-use crate::users::{Account, constant_time_eq};
+use crate::transport::{Reply, text};
+use crate::users::Account;
 use crate::{classifier, egress, inspect, openai, provider, qos, routing, usage};
 
-pub(crate) async fn anthropic(req: &InReq, state: &Arc<State>) -> Reply {
-    let method = req.method.clone();
-    let sub = req.path.strip_prefix("/relay/anthropic").unwrap_or("").to_owned();
-    let sub_pq = if req.query.is_empty() {
+/// One relayed request, already authenticated.
+///
+/// Grouped rather than passed one by one: the relay needs most of the request,
+/// and a function taking seven arguments is where a caller starts putting them
+/// in the wrong order. Everything here has already been through the guards —
+/// the account is authenticated, the arrival is recorded, the body is read — so
+/// there is nothing left for the relay to check before it forwards.
+pub(crate) struct Relay<'a> {
+    /// The account the presented key belongs to.
+    pub account: &'a Account,
+    /// Who called, and from where.
+    pub arrival: &'a Arrival,
+    /// The path below the relay's mount point, such as `/v1/messages`.
+    ///
+    /// A `String` rather than a slice because it is built from the route's path
+    /// fragment, and the relay needs to hold it across the upstream call.
+    pub sub_path: String,
+    /// The query string, without the `?`, or empty.
+    pub query: String,
+    /// The payload, verbatim.
+    pub body: Bytes,
+}
+
+impl<'a> Relay<'a> {
+    /// Gather one request from what the guards already produced.
+    ///
+    /// The verb and the query string come from the arrival rather than from the
+    /// route's typed parameters: this forwards a path, not a route, so what goes
+    /// upstream must be what the client asked for — including a query string
+    /// that nothing here parses.
+    #[must_use]
+    pub fn new(account: &'a Account, arrival: &'a Arrival, sub: &std::path::Path, body: Bytes) -> Self {
+        Self {
+            account,
+            arrival,
+            sub_path: format!("/{}", sub.display()),
+            query: target_query(&arrival.target),
+            body,
+        }
+    }
+}
+
+/// The query string of a target, or empty.
+///
+/// Split out because it is the one piece of path handling left: everything else
+/// about a path is Rocket's now.
+fn target_query(target: &str) -> String {
+    target.split_once('?').map_or_else(String::new, |(_, q)| q.to_owned())
+}
+
+/// Forward one request to a provider, and stream the answer back.
+///
+/// This is the whole point of the proxy: nothing here parses the conversation,
+/// because a relay that understands what it forwards breaks the day the
+/// envelope changes. What it does understand is the request's *shape* — which
+/// model was named, how large it is, which provider can take it — and that is
+/// what [`shape_and_admit`] decides.
+pub(crate) async fn anthropic(state: &Arc<State>, r: Relay<'_>) -> Reply {
+    let Relay {
+        account,
+        arrival,
+        sub_path: sub,
+        query,
+        body,
+    } = r;
+    let method = arrival.method.clone();
+    let headers = &arrival.headers;
+    let sub_pq = if query.is_empty() {
         sub.clone()
     } else {
-        format!("{sub}?{}", req.query)
+        format!("{sub}?{query}")
     };
-
-    if let Some(probe) = reachability_probe(&sub, &method) {
-        return probe;
-    }
-
-    let key = presented(req);
-    let peer = req.peer;
-    let ip = client_ip(&req.headers, peer);
+    let peer = arrival.peer;
+    let ip = arrival.ip.clone();
+    // Built here, where the raw headers and the socket peer are both in hand.
     // Kept alongside the resolved answer, because "what did we record" and
     // "why" are different questions and only the first one was answerable.
-    // Built here, where the raw headers and the socket peer are both in hand.
     let origin = inspect::Origin {
         peer: peer.to_string(),
         peer_trusted: is_trusted_hop(peer),
         client_ip: ip.clone(),
-        x_real_ip: header_of(&req.headers, "x-real-ip"),
-        x_forwarded_for: header_of(&req.headers, "x-forwarded-for"),
-    };
-    let who = authenticate_and_stamp(state, &key, &ip);
-    let Some(account) = who else {
-        // Say which of the two credentials was wrong without printing either.
-        // "unauthorized" alone leaves an operator guessing between a revoked
-        // account, a typo, and the admin token in the wrong place.
-        let diagnosis = if key.is_empty() {
-            "no key presented"
-        } else if constant_time_eq(key.as_bytes(), state.admin_token.as_bytes()) {
-            "that is the ADMIN token — the proxy path takes a user key"
-        } else {
-            "no active account has that key (revoked, disabled, or mistyped)"
-        };
-        log::warn!(
-            "proxy: 401 on {method} /relay/anthropic{sub} ({} chars presented): {diagnosis}",
-            key.chars().count()
-        );
-        return text(401, &format!("tab-atelier-proxy: unauthorized ({diagnosis})"));
+        x_real_ip: header_of(&arrival.headers, "x-real-ip"),
+        x_forwarded_for: header_of(&arrival.headers, "x-forwarded-for"),
     };
     log::info!(
         "proxy: {method} {sub} for {} <{}> from {ip}",
@@ -71,14 +110,12 @@ pub(crate) async fn anthropic(req: &InReq, state: &Arc<State>) -> Reply {
         account.email
     );
 
-    let client_beta = req
-        .headers
+    let client_beta = headers
         .get("anthropic-beta")
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
-    let client_headers = passthrough_headers(&req.headers);
-    let content_type = req
-        .headers
+    let client_headers = passthrough_headers(headers);
+    let content_type = headers
         .get(hyper::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/json")
@@ -87,12 +124,12 @@ pub(crate) async fn anthropic(req: &InReq, state: &Arc<State>) -> Reply {
     // Already read at the edge into `InReq`, so the relay gets its bytes
     // without owning the request. Cloned because shaping takes it by value and
     // the capture path still needs the original below.
-    let body = req.body.clone();
+    let body = body.clone();
 
     // Only /v1/messages spends tokens; a metadata call should not queue
     // behind a fleet's generations.
     let metered = is_post && sub.contains("/messages");
-    let (body, route, compaction, local_tools) = match shape_and_admit(state, &account, body, metered).await {
+    let (body, route, compaction, local_tools) = match shape_and_admit(state, account, body, metered).await {
         Ok(quad) => quad,
         Err(resp) => return resp,
     };

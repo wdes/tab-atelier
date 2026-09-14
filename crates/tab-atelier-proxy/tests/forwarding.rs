@@ -55,6 +55,33 @@ fn mock_upstream() -> (u16, std::sync::mpsc::Receiver<String>) {
     (port, rx)
 }
 
+/// Start the proxy on a free port, and wait until it answers.
+///
+/// Rocket binds inside `launch`, so it cannot be handed a listener the way the
+/// old hand-written accept loop could. Probing for a free port and then waiting
+/// for the socket to accept closes that gap and a second one besides: the old
+/// version spawned the server and connected immediately, which passed only
+/// because the bind happened to win the race.
+fn boot(rt: &tokio::runtime::Runtime, state: Arc<State>) -> u16 {
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("probe a free port")
+        .local_addr()
+        .expect("addr")
+        .port();
+    rt.spawn(async move {
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+        let _ = serve_on(addr, state).await;
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    panic!("the proxy never started on port {port}");
+}
+
 fn scratch(name: &str) -> std::path::PathBuf {
     let p = std::env::temp_dir().join(format!("ta-proxy-it-{name}-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&p).expect("mkdir");
@@ -117,12 +144,7 @@ fn a_users_key_is_exchanged_for_the_proxys_claude_token() {
         .enable_all()
         .build()
         .expect("runtime");
-    let listener = rt
-        .block_on(async { tokio::net::TcpListener::bind("127.0.0.1:0").await })
-        .expect("bind proxy");
-    let port = listener.local_addr().expect("addr").port();
-    let served = Arc::clone(&state);
-    rt.spawn(async move { serve_on(listener, served).await });
+    let port = boot(&rt, Arc::clone(&state));
 
     let payload = "{}";
     let resp = request(
@@ -232,11 +254,7 @@ fn a_revoked_key_stops_working_without_reaching_upstream() {
         .enable_all()
         .build()
         .expect("runtime");
-    let listener = rt
-        .block_on(async { tokio::net::TcpListener::bind("127.0.0.1:0").await })
-        .expect("bind");
-    let port = listener.local_addr().expect("addr").port();
-    rt.spawn(async move { serve_on(listener, state).await });
+    let port = boot(&rt, state);
 
     let resp = request(
         port,
@@ -335,11 +353,7 @@ fn a_429_moves_the_next_request_to_another_provider() {
         .enable_all()
         .build()
         .expect("runtime");
-    let listener = rt
-        .block_on(async { tokio::net::TcpListener::bind("127.0.0.1:0").await })
-        .expect("bind");
-    let port = listener.local_addr().expect("addr").port();
-    rt.spawn(async move { serve_on(listener, state).await });
+    let port = boot(&rt, state);
 
     let call = || {
         let payload = r#"{"model":"primary-balanced","max_tokens":1,"messages":[]}"#;
@@ -492,11 +506,7 @@ fn compaction_reaches_upstream_and_only_where_it_is_configured() {
         .enable_all()
         .build()
         .expect("runtime");
-    let listener = rt
-        .block_on(async { tokio::net::TcpListener::bind("127.0.0.1:0").await })
-        .expect("bind");
-    let port = listener.local_addr().expect("addr").port();
-    rt.spawn(async move { serve_on(listener, state).await });
+    let port = boot(&rt, state);
 
     // Ten tool-result turns, so six survive the window and four are elided —
     // the same shape the unit fixture uses.
@@ -632,11 +642,7 @@ fn the_auto_mode_classifier_is_not_retargeted_by_a_mapping() {
         .enable_all()
         .build()
         .expect("runtime");
-    let listener = rt
-        .block_on(async { tokio::net::TcpListener::bind("127.0.0.1:0").await })
-        .expect("bind");
-    let port = listener.local_addr().expect("addr").port();
-    rt.spawn(async move { serve_on(listener, state).await });
+    let port = boot(&rt, state);
 
     // The classifier exactly as Claude Code sends it, cut down to the parts
     // that decide routing and compaction. The transcript is a STRING inside the
@@ -865,12 +871,7 @@ fn serve(state: &Arc<State>) -> Leaked {
         .enable_all()
         .build()
         .expect("runtime");
-    let listener = rt
-        .block_on(async { tokio::net::TcpListener::bind("127.0.0.1:0").await })
-        .expect("bind");
-    let port = listener.local_addr().expect("addr").port();
-    let served = Arc::clone(state);
-    rt.spawn(async move { serve_on(listener, served).await });
+    let port = boot(&rt, Arc::clone(state));
     std::mem::forget(rt);
     Leaked { port }
 }
@@ -1067,11 +1068,7 @@ fn an_openai_upstream_receives_a_user_agent() {
         .enable_all()
         .build()
         .expect("runtime");
-    let listener = rt
-        .block_on(async { tokio::net::TcpListener::bind("127.0.0.1:0").await })
-        .expect("bind");
-    let port = listener.local_addr().expect("addr").port();
-    rt.spawn(async move { serve_on(listener, state).await });
+    let port = boot(&rt, state);
 
     let payload = r#"{"model":"oai-balanced","max_tokens":1,"messages":[]}"#;
     let response = request(

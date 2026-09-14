@@ -13,19 +13,17 @@
 //! shapes the JSON, and the admin API parses it. Reading it once at the edge
 //! keeps that decision in one place instead of at each call site.
 
-use std::convert::Infallible;
 use std::net::IpAddr;
 
 use bytes::Bytes;
-use http_body_util::combinators::BoxBody;
-use http_body_util::{BodyExt, Full};
 use hyper::http::HeaderMap;
 
-/// The response body type shared by every reply.
+/// The boxed body a streamed reply carries.
 ///
-/// A `BoxBody` because the two shapes differ: an admin reply is a `Full` buffer,
-/// while the relay answers with a stream that is still being produced.
-pub type Body = BoxBody<Bytes, Infallible>;
+/// Boxed because the concrete type is the relay's — an upstream response body
+/// — and naming it here would put the relay's transport choices in the
+/// transport layer, which is meant to be free of them.
+pub type Body = http_body_util::combinators::BoxBody<Bytes, std::convert::Infallible>;
 
 /// A request, with its body already in memory.
 #[derive(Debug)]
@@ -166,27 +164,6 @@ impl Reply {
         self.headers.push((name, value));
         self
     }
-
-    /// Convert into the hyper response the service returns.
-    ///
-    /// A failure here means a header name or value was not valid on the wire.
-    /// That is a bug in this crate rather than anything the caller did, and the
-    /// status is left as the handler set it so the client still learns what
-    /// happened; the body is dropped rather than sent half-formed.
-    #[must_use]
-    pub fn into_hyper(self) -> hyper::Response<Body> {
-        let mut builder = hyper::Response::builder().status(self.status);
-        for (name, value) in self.headers {
-            builder = builder.header(name, value);
-        }
-        let body: Body = match self.body {
-            ReplyBody::Bytes(b) => Full::new(b).boxed(),
-            ReplyBody::Stream(s) => s,
-        };
-        builder
-            .body(body)
-            .unwrap_or_else(|_| hyper::Response::new(Full::new(Bytes::new()).boxed()))
-    }
 }
 
 #[cfg(test)]
@@ -223,8 +200,11 @@ mod tests {
     }
 
     #[test]
-    fn a_bodyless_reply_converts_and_carries_its_status() {
-        let response = Reply::empty(204).into_hyper();
-        assert_eq!(response.status(), 204);
+    fn a_bodyless_reply_still_carries_its_status() {
+        // 204 with a body is a protocol error, so both the status and the
+        // emptiness are part of what this constructs.
+        let reply = Reply::empty(204);
+        assert_eq!(reply.status, 204);
+        assert!(matches!(reply.body, ReplyBody::Bytes(ref b) if b.is_empty()));
     }
 }
