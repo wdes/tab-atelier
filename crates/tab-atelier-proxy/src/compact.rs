@@ -250,6 +250,35 @@ fn payload_stub(prefix: &str, byte_count: u64) -> String {
     format!("{prefix}{byte_count} bytes]")
 }
 
+/// A path at or beyond this length is logged when a write call carries one.
+///
+/// Paths are never elided — see [`is_content_key`] — but they are still
+/// strings, and the first version of this pass stubbed them like content. That
+/// cost the model the filename it needed and was silent about it, so the guard
+/// is worth a log line: an operator seeing a long path named does not mean the
+/// pass is broken, but *not* seeing one named while a filename vanishes is the
+/// signal that the guard has stopped holding.
+///
+/// `NAME_MAX` is 255 bytes on Linux, so this sits below the legal maximum
+/// rather than at it: the interesting case is a path approaching the limit,
+/// not one that has reached it.
+const PATH_LOG_BYTES: usize = 120;
+
+/// Report any path-like field on a write or shell call that is long enough to
+/// matter. Observability only — it changes nothing about the body.
+fn log_long_paths(input: &serde_json::Value) {
+    let Some(fields) = input.as_object() else { return };
+    for (key, value) in fields {
+        if !key.ends_with("path") {
+            continue;
+        }
+        let Some(path) = value.as_str() else { continue };
+        if path.len() >= PATH_LOG_BYTES {
+            eprintln!("tab-atelier-proxy: long {key} ({} bytes): {path}", path.len());
+        }
+    }
+}
+
 /// The oldest message index still inside the trailing window.
 ///
 /// Counted from the end over messages that `qualifies` — that is, over the
@@ -382,6 +411,7 @@ fn elide_writes(messages: &mut [serde_json::Value], stats: &mut Stats) {
             // — a `tool_use` has no `is_error`, and a call that FAILED still
             // has its reason in the `tool_result`, which layer A treats.
             let Some(input) = block.get_mut("input") else { continue };
+            log_long_paths(input);
             stats.writes_elided += elide_long_strings(input, prefix);
         }
     }
