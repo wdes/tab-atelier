@@ -362,6 +362,7 @@ interface CaptureCompaction {
      * field existed, and a file that fails to parse costs the whole history.
      */
     writes_elided?: number;
+    writes_kept_for_error?: number;
     notices_dropped: number;
 }
 

@@ -838,6 +838,7 @@ fn shape_body(
             tool_results_kept_small: elided.tool_results_kept_small,
             thinking_dropped: elided.thinking_dropped,
             writes_elided: elided.writes_elided,
+            writes_kept_for_error: elided.writes_kept_for_error,
             notices_dropped: elided.notices_dropped,
         })
     };

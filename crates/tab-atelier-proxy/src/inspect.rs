@@ -197,6 +197,8 @@ pub struct Compaction {
     /// strings has done far less than one naming a single tool result.
     #[serde(default)]
     pub writes_elided: usize,
+    /// Write calls kept whole because their result was an error.
+    pub writes_kept_for_error: usize,
     pub notices_dropped: usize,
 }
 
