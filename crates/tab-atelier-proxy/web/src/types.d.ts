@@ -87,6 +87,14 @@ interface TokenTotals {
     output: number;
     cache_read: number;
     cache_write: number;
+    /** Cache writes split by TTL; the two sum to `cache_write`. */
+    cache_write_5m?: number;
+    cache_write_1h?: number;
+    /** Server-tool request counts — requests, not tokens. */
+    web_search?: number;
+    web_fetch?: number;
+    /** `null` when nothing in the window was billed under a named tier. */
+    service_tier?: TokenTier | null;
     total: number;
 }
 
@@ -227,7 +235,21 @@ interface CaptureTokens {
     output: number;
     cache_read: number;
     cache_write: number;
+    /**
+     * The rest of the upstream `usage` block. Optional so a capture written
+     * before these fields existed still parses — losing the whole inspection
+     * history to a new column would be a poor trade.
+     */
+    web_search?: number;
+    web_fetch?: number;
+    cache_write_5m?: number;
+    cache_write_1h?: number;
+    /** Absent when the upstream reported none; `null` in aggregate windows. */
+    service_tier?: TokenTier | null;
 }
+
+/** The `service_tier` a call was billed under. */
+type TokenTier = "standard" | "priority" | "batch" | "other";
 
 interface Capture {
     ts: string;
@@ -339,7 +361,7 @@ interface CaptureCompaction {
      * field existed, and a file that fails to parse costs the whole history.
      */
     writes_elided?: number;
-    banners_dropped: number;
+    notices_dropped: number;
 }
 
 /** One model a provider lists. */
@@ -367,6 +389,8 @@ interface ProviderView {
     preference: number;
     enabled: boolean;
     peak_now: boolean;
+    /** Unix seconds when the active peak ends; null when none is in force. */
+    peak_until?: number | null;
     peak?: { multiplier_percent: number; windows: unknown[] };
     ready: boolean;
     auth: string;
@@ -505,6 +529,8 @@ interface AppState {
      */
     usageWindow: string;
     focus: string | null;
+    /** What the token charts count; see `TaCharts.TOKEN_UNITS`. */
+    unit: string;
     pressure: Pressure | null;
     pressureTimer: ReturnType<typeof setInterval> | null;
     tiers: Tier[];
@@ -562,5 +588,12 @@ interface Window {
         CallsChart: import("vue").Component;
         TokensChart: import("vue").Component;
         PressureChart: import("vue").Component;
+        /** Units the token chart can be shown in; `"tokens"` is the default. */
+        UNIT_OPTIONS: { id: string; label: string }[];
+        /** Convert a token count into a unit; `"tokens"` passes through. */
+        convertTokens: (tokens: number, unit: string) => number;
+        fmtCount: (n: number) => string;
+        /** The estimate's citation and caveat, shown beside converted figures. */
+        energyNote: () => string;
     };
 }
