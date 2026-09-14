@@ -1405,33 +1405,65 @@ mod tests {
         assert_eq!(input["command"], command, "the model keeps its own command");
     }
 
-    /// Shell calls and write calls can share one request. The write stub must
-    /// survive a second pass while the shell command beside it stays untouched
-    /// in both passes.
+    /// A shell call and a write call can share one turn. Every write older than
+    /// the window is stubbed and the shell call beside it is not, and a second
+    /// pass changes none of it.
     #[test]
     fn layer_d_elides_writes_beside_shell_calls_and_stays_idempotent() {
         let command = "x".repeat(5000);
-        let mut b = turns(TURNS + 2, |i| {
-            if i % 2 == 0 {
-                json!({"type": "tool_use", "id": "call", "name": "Bash",
-                       "input": {"command": command}})
-            } else {
-                json!({"type": "tool_use", "id": "call", "name": "Write",
-                       "input": {"file_path": "/tmp/f.rs", "content": "y".repeat(5000)}})
-            }
-        });
-        let _ = apply(&mut b, Compact::Writes);
+        let content = "y".repeat(5000);
+        let mut b = turns(TURNS + 2, |_| json!(null));
+
+        // `turns` wraps a single block per assistant message, so the two calls a
+        // turn needs are spliced in afterwards.
+        let mut msgs = messages(&b).clone();
+        for i in 0..TURNS + 2 {
+            msgs[2 * i + 1]["content"] = json!([
+                {"type": "tool_use", "id": "shell", "name": "Bash",
+                 "input": {"command": command}},
+                {"type": "tool_use", "id": "write", "name": "Write",
+                 "input": {"file_path": "/tmp/f.rs", "content": content}},
+            ]);
+        }
+        b["messages"] = json!(msgs);
+
+        // Every turn carries a write, so the last `KEEP_TURNS` turns are exactly
+        // the writes that stay whole.
+        let first = apply(&mut b, Compact::Writes);
+        assert_eq!(
+            first.writes_elided,
+            TURNS + 2 - KEEP_TURNS,
+            "the writes older than the window, and only those"
+        );
+
         let mut twice = b.clone();
         let stats = apply(&mut twice, Compact::Writes);
         assert_eq!(serialized(&twice), serialized(&b), "idempotent");
         assert_eq!(stats.writes_elided, 0, "and reports nothing to do");
-        for input in write_inputs(&twice) {
-            if input.get("command").is_some() {
-                assert_eq!(input["command"], command, "a shell command is never stubbed");
-            } else {
+
+        // Two calls per turn, shell first: turn `t` is `inputs[2t]` (Bash) and
+        // `inputs[2t + 1]` (Write).
+        let inputs = write_inputs(&twice);
+        assert_eq!(inputs.len(), 2 * (TURNS + 2), "no call may be removed");
+        for turn in 0..TURNS + 2 {
+            assert_eq!(
+                inputs[2 * turn]["command"],
+                command,
+                "turn {turn}: a shell command is never stubbed"
+            );
+            if turn < TURNS + 2 - KEEP_TURNS {
                 assert!(
-                    input["content"].as_str().expect("s").starts_with(WRITE_ELIDED_PREFIX),
-                    "the write stub survived the second pass"
+                    inputs[2 * turn + 1]["content"]
+                        .as_str()
+                        .expect("content must stay a string")
+                        .starts_with(WRITE_ELIDED_PREFIX),
+                    "turn {turn} is older than the window, so its payload is elided"
+                );
+            } else {
+                assert_eq!(
+                    inputs[2 * turn + 1]["content"],
+                    content,
+                    "turn {turn} is inside the window"
                 );
             }
         }
