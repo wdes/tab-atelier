@@ -195,7 +195,7 @@ pub struct Compaction {
     /// strings has done far less than one naming a single tool result.
     #[serde(default)]
     pub writes_elided: usize,
-    pub banners_dropped: usize,
+    pub notices_dropped: usize,
 }
 
 impl Compaction {

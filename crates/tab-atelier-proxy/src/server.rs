@@ -806,7 +806,7 @@ fn shape_body(
     if elided.changed() {
         log::info!(
             "proxy: compacted {}/{} {before} → {} bytes: {} tool results elided ({} errors kept), \
-             {} thinking dropped, {} write payloads stubbed, {} banners dropped",
+             {} thinking dropped, {} write payloads stubbed, {} notices dropped",
             route.provider_id,
             route.model_id,
             encoded.len(),
@@ -814,7 +814,7 @@ fn shape_body(
             elided.tool_results_kept_for_error,
             elided.thinking_dropped,
             elided.writes_elided,
-            elided.banners_dropped
+            elided.notices_dropped
         );
     }
     // Recorded whenever a level was in force, even if it changed nothing:
@@ -837,7 +837,7 @@ fn shape_body(
             tool_results_kept_for_error: elided.tool_results_kept_for_error,
             thinking_dropped: elided.thinking_dropped,
             writes_elided: elided.writes_elided,
-            banners_dropped: elided.banners_dropped,
+            notices_dropped: elided.notices_dropped,
         })
     };
     (Bytes::from(encoded), record, governed.local)

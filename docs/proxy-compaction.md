@@ -75,7 +75,7 @@ choosing where 40 % of a small number beats the cache churn and the semantic
 loss below, not where 43 % of a large one does.
 
 
-## The three layers
+## The four layers
 
 Deterministic — identical input bytes produce identical output bytes, so the
 rewrite happens once and the cache (if any) re-warms on that one turn instead of
@@ -85,16 +85,20 @@ missing forever. That rules out anything time-based or random.
 |---|-------|--------------|---------------|
 | A | `tools` | replaces old `tool_result` **content** with a stub naming the byte count and `tool_use_id` | last **6** tool-result turns |
 | B | `+thinking` | drops `thinking` blocks on older assistant turns | last **6** assistant turns |
-| C | `+banners` | drops the stale `<total_tokens>…</total_tokens>` banner messages Claude Code re-injects each turn | the newest one |
+| C | `+notices` | drops stale injected system notices — the `<total_tokens>` banner, `[SYSTEM NOTIFICATION …]`, PostToolUse notes, "user sent a new message" | the newest banner, plus the last **6** notices |
+| D | `+writes` | replaces the long string arguments (`content`, `new_string`, `command`, …) of old write-tool calls (`Write`, `Edit`, `MultiEdit`, `NotebookEdit`, `Bash`) with a stub, keeping the key and the call's shape | write calls in the last **6** assistant turns |
 
 The stubs are the point of layer A: `"[tool result elided by tab-atelier-proxy:
 9073 bytes; tool_use_id=call_00_Xv1cviAjZqN6HSYLdu3g4425]"` keeps the block, its
 id and its position, and tells the model *that something was there* rather than
 pretending it was always empty.
 
-Layer C is worth almost nothing in bytes — 23 messages × 49 B ≈ 1.2 KB. It is
-worth keeping for a different reason: a stale token count re-read 23 times is
-noise, not context.
+Layer C is the biggest of the last two wins on a measured body: 51.7 KB of a
+353 KB request was injected system notices — harness notifications, PostToolUse
+notes, token banners — a class no earlier layer looked at. A stale notice is
+noise re-read on every later turn. Keeping the newest banner and the last six
+notices preserves the signal — what the harness said most recently, and what
+just happened — without paying for the rest of the history.
 
 ### What a "turn" is
 
@@ -128,7 +132,7 @@ in `users.json`:
   <option value="none">None</option>
   <option value="tools">Remove old tool results</option>
   <option value="tools_thinking">Remove old tool results and thinking</option>
-  <option value="all">Remove old tool results, thinking and banners</option>
+  <option value="all">Remove old tool results, thinking, write payloads and notices</option>
 </select>
 ```
 
@@ -181,7 +185,7 @@ added it should refuse to apply to a provider whose `auth.kind` is
 `claude_oauth` — a setting that cannot be correct is a setting that should not
 be offerable.
 
-That rule is enforced on the three levels that exist, not merely in the UI:
+That rule is enforced on the four levels that exist, not merely in the UI:
 `Provider::compact_refusal` is checked on the save path, so `POST
 /api/providers` answers 400 with the reason, and the UI shows the server's own
 words rather than keeping a second copy of the rule.
