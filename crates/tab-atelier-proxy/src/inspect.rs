@@ -187,6 +187,8 @@ pub struct Compaction {
     /// [`crate::compact`]. Reported so a pass that elided less than expected
     /// is explicable rather than mysterious.
     pub tool_results_kept_for_error: usize,
+    /// Tool results a stub would have lengthened — kept verbatim.
+    pub tool_results_kept_small: usize,
     pub thinking_dropped: usize,
     /// Layer D: file bodies stubbed inside old `Write`/`Edit` inputs.
     ///
