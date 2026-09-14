@@ -2217,7 +2217,7 @@ fn save_provider(state: &Arc<State>, field: &dyn Fn(&str) -> String, body: &Byte
     // the operator would be left holding one credential while believing they
     // had two. `dup` is them saying they mean a separate entry, which gets a
     // free name; that name is also what gives it its own key file.
-    let duplicate = flag_from(body, &field("dup")).unwrap_or(false);
+    let duplicate = flag_from(body, "dup").unwrap_or(false);
     let mut new = if let Some(p) = preset {
         if duplicate {
             p.provider_for(&dir, reg.providers.iter().map(|x| x.id.as_str()))
@@ -2269,7 +2269,7 @@ fn save_provider(state: &Arc<State>, field: &dyn Fn(&str) -> String, body: &Byte
     // `enabled` is the exception: the table DOES show it, so a request that
     // names it is taken at its word and one that does not is preserved. That
     // second half is what keeps the older form working.
-    let enabled = flag_from(body, &field("enabled"));
+    let enabled = flag_from(body, "enabled");
     if let Some(old) = reg.get(&new.id) {
         new.preference = old.preference;
         new.enabled = enabled.unwrap_or(old.enabled);
@@ -2330,17 +2330,18 @@ fn add_user(store: &mut Store, field: &dyn Fn(&str) -> String) -> Response<Body>
 /// the save path uses that difference to decide whether the request is setting
 /// the value or merely not mentioning it. Without it, every older caller that
 /// does not know about a new flag would silently reset it.
-fn flag_from(body: &Bytes, named: &str) -> Option<bool> {
-    if named == "true" {
-        return Some(true);
+///
+/// `key` is the field to read, and the value may be a JSON boolean or the
+/// strings `"true"`/`"false"`: the JSON API posts booleans, the HTML form posts
+/// text. Reading a fixed field name regardless of `key` is how the `dup` flag
+/// once went missing — the caller asked about `dup` and got `enabled`'s value.
+fn flag_from(body: &Bytes, key: &str) -> Option<bool> {
+    match serde_json::from_slice::<serde_json::Value>(body).ok()?.get(key)? {
+        serde_json::Value::Bool(b) => Some(*b),
+        serde_json::Value::String(s) if s == "true" => Some(true),
+        serde_json::Value::String(s) if s == "false" => Some(false),
+        _ => None,
     }
-    if named == "false" {
-        return Some(false);
-    }
-    serde_json::from_slice::<serde_json::Value>(body)
-        .ok()?
-        .get("enabled")
-        .and_then(serde_json::Value::as_bool)
 }
 
 /// Which of the three key routes is being taken.
@@ -2865,6 +2866,25 @@ mod tests {
         ] {
             assert!(tools_body(&body).is_none(), "{body}");
         }
+    }
+
+    /// `flag_from` must read the field it was asked about. It once read a fixed
+    /// `"enabled"` whatever the caller named, so `flag_from(body, "dup")` was
+    /// always `None` and "Add another `DeepSeek`" silently became an edit of the
+    /// existing row: the operator pasted a second key and the list came back
+    /// unchanged. Both post shapes are covered — the JSON API sends a boolean,
+    /// the HTML form sends text.
+    #[test]
+    fn a_flag_is_read_by_the_name_that_was_asked_for() {
+        let json = Bytes::from(r#"{"preset":"deepseek","dup":true}"#);
+        assert_eq!(flag_from(&json, "dup"), Some(true));
+        assert_eq!(flag_from(&json, "enabled"), None, "the field was not in the body");
+
+        let form = Bytes::from(r#"{"enabled":"false"}"#);
+        assert_eq!(flag_from(&form, "enabled"), Some(false));
+
+        let absent = Bytes::from("{}");
+        assert_eq!(flag_from(&absent, "dup"), None, "absent is not an explicit false");
     }
 
     /// SRI is worth nothing unless the advertised digest is the digest of the
