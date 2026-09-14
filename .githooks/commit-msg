@@ -8,13 +8,45 @@
 # silently instead of one a reviewer has to catch.
 #
 # Idempotent, so `--amend` and repeated commits are no-ops.
+#
+# The identity is never defaulted. A wrong co-author is worse than a missing
+# one, because it misattributes work and nothing downstream can tell. So the
+# hook reads it from configuration and, finding none, refuses the commit with
+# instructions rather than guessing:
+#
+#   git config coauthor.name  'Some Bot'
+#   git config coauthor.email 'bot@example.com'
+#
+# Environment variables of the same meaning win over the config, for a one-off
+# commit under a different identity.
 
 msg_file=$1
 [ -n "$msg_file" ] || exit 0
 [ -f "$msg_file" ] || exit 0
 
-# Already there? Match the trailer as a whole line, tolerating trailing spaces.
-if grep -qE '^Co-authored-by: DeepSeek <noreply@deepseek\.com>[[:space:]]*$' "$msg_file"; then
+name=${TA_COAUTHOR_NAME:-$(git config --get coauthor.name)}
+email=${TA_COAUTHOR_EMAIL:-$(git config --get coauthor.email)}
+
+if [ -z "$name" ] || [ -z "$email" ]; then
+	cat >&2 <<-'EOF'
+		commit-msg: no co-author identity configured.
+
+		Set one, once, in this repository:
+
+		  git config coauthor.name  'Some Bot'
+		  git config coauthor.email 'bot@example.com'
+
+		or export TA_COAUTHOR_NAME / TA_COAUTHOR_EMAIL for a single commit.
+		There is deliberately no built-in default.
+	EOF
+	exit 1
+fi
+
+trailer="Co-authored-by: $name <$email>"
+
+# Already there? Match the trailer as a whole line. Built from the same string
+# as the append below, so the check and the write cannot drift apart.
+if grep -qF "$trailer" "$msg_file"; then
 	exit 0
 fi
 
@@ -28,5 +60,5 @@ fi
 # Trailers belong in the final paragraph, blank-line separated, so append at
 # the end of the file. In `--edit` mode git strips the comment lines that may
 # follow; in `-m` mode there are none to begin with.
-printf '\nCo-authored-by: DeepSeek <noreply@deepseek.com>\n' >>"$msg_file"
+printf '\n%s\n' "$trailer" >>"$msg_file"
 exit 0
