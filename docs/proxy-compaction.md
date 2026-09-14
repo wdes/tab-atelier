@@ -86,7 +86,13 @@ missing forever. That rules out anything time-based or random.
 | A | `tools` | replaces old `tool_result` **content** with a stub naming the byte count and `tool_use_id` | last **6** tool-result turns |
 | B | `+thinking` | drops `thinking` blocks on older assistant turns | last **6** assistant turns |
 | C | `+notices` | drops stale injected system notices — the `<total_tokens>` banner, `[SYSTEM NOTIFICATION …]`, PostToolUse notes, "user sent a new message" | the newest banner, plus the last **6** notices |
-| D | `+writes` | replaces the long string arguments (`content`, `new_string`, `command`, …) of old write-tool calls (`Write`, `Edit`, `MultiEdit`, `NotebookEdit`, `Bash`) with a stub, keeping the key and the call's shape | write calls in the last **6** assistant turns |
+| D | `+writes` | replaces the long string arguments (`content`, `new_string`, `old_string`, …) of old write-tool calls (`Write`, `Edit`, `MultiEdit`, `NotebookEdit`) with a stub, keeping the key and the call's shape | write calls in the last **6** assistant turns |
+
+Layer D deliberately does **not** touch `Bash`. A shell command is the agent's
+stated intent, not a payload: `Bash` was once treated as a write tool and its
+`command` argument stubbed, which hid an agent's own shell history from it. The
+bulk of a `Bash` call is its output, and layer A already bounds that, so nothing
+is stubbed here and the command text is always preserved verbatim.
 
 The stubs are the point of layer A: `"[tool result elided by tab-atelier-proxy:
 9073 bytes; tool_use_id=call_00_Xv1cviAjZqN6HSYLdu3g4425]"` keeps the block, its
