@@ -2,7 +2,7 @@
 
 //! Model-name mappings.
 
-use super::Validated;
+use super::{Rejection, Validated};
 
 /// A mapping from a name a client asks for to the name the provider serves.
 ///
@@ -30,6 +30,10 @@ impl Validated for AddMapping {
             return Err("a mapping needs a `to` model".to_owned());
         }
         Ok(())
+    }
+
+    fn accept(body: &bytes::Bytes) -> Result<Self, Rejection> {
+        super::parse(body)
     }
 }
 

@@ -4,7 +4,7 @@
 
 use crate::provider::Preset;
 
-use super::{Validated, loose_bool};
+use super::{Rejection, Validated, loose_bool};
 
 /// A provider as the form sends it.
 ///
@@ -79,6 +79,10 @@ impl Validated for SaveProvider {
         }
         Ok(())
     }
+
+    fn accept(body: &bytes::Bytes) -> Result<Self, Rejection> {
+        super::parse(body)
+    }
 }
 
 /// Replacing one provider's key, and nothing else.
@@ -94,6 +98,10 @@ impl Validated for RotateProviderKey {
             return Err("no key given".to_owned());
         }
         Ok(())
+    }
+
+    fn accept(body: &bytes::Bytes) -> Result<Self, Rejection> {
+        super::parse(body)
     }
 }
 

@@ -2,7 +2,7 @@
 
 //! Accounts: creating one, and the four per-account switches.
 
-use super::{Validated, loose_bool};
+use super::{Rejection, Validated, loose_bool};
 
 /// Creating an account.
 ///
@@ -24,6 +24,10 @@ impl Validated for AddUser {
     fn validate(&self) -> Result<(), String> {
         Ok(())
     }
+
+    fn accept(body: &bytes::Bytes) -> Result<Self, Rejection> {
+        super::parse(body)
+    }
 }
 
 /// Pinning an account to one provider, or clearing the pin.
@@ -38,6 +42,10 @@ impl Validated for PinProvider {
     fn validate(&self) -> Result<(), String> {
         Ok(())
     }
+
+    fn accept(body: &bytes::Bytes) -> Result<Self, Rejection> {
+        super::parse(body)
+    }
 }
 
 /// Pinning an account to one model name, or clearing the pin.
@@ -50,6 +58,10 @@ pub struct PinModel {
 impl Validated for PinModel {
     fn validate(&self) -> Result<(), String> {
         Ok(())
+    }
+
+    fn accept(body: &bytes::Bytes) -> Result<Self, Rejection> {
+        super::parse(body)
     }
 }
 
@@ -71,6 +83,38 @@ impl SetDisabled {
 impl Validated for SetDisabled {
     fn validate(&self) -> Result<(), String> {
         Ok(())
+    }
+
+    fn accept(body: &bytes::Bytes) -> Result<Self, Rejection> {
+        super::parse(body)
+    }
+}
+
+/// The account's tool policy.
+///
+/// Read in either shape the callers use: the UI sends `{"tools": {...}}` and a
+/// script tends to send the policy bare. The envelope is checked first, because
+/// a bare policy deserialises from `{"tools": ...}` too — to all defaults —
+/// which would silently discard everything the caller asked for.
+#[derive(Debug)]
+pub struct SetTools {
+    pub policy: crate::tools::Policy,
+}
+
+impl Validated for SetTools {
+    fn validate(&self) -> Result<(), String> {
+        crate::tools::validate(&self.policy)
+    }
+
+    fn accept(body: &bytes::Bytes) -> Result<Self, Rejection> {
+        let value: serde_json::Value =
+            serde_json::from_slice(body).map_err(|e| Rejection::field("tools", &format!("not JSON: {e}")))?;
+        let inner = value.get("tools").cloned().unwrap_or(value);
+        let policy: crate::tools::Policy =
+            serde_json::from_value(inner).map_err(|e| Rejection::field("tools", &format!("bad tool policy: {e}")))?;
+        let parsed = Self { policy };
+        parsed.validate().map_err(|why| Rejection::field("tools", &why))?;
+        Ok(parsed)
     }
 }
 
@@ -95,6 +139,10 @@ impl SetWeight {
 impl Validated for SetWeight {
     fn validate(&self) -> Result<(), String> {
         Ok(())
+    }
+
+    fn accept(body: &bytes::Bytes) -> Result<Self, Rejection> {
+        super::parse(body)
     }
 }
 

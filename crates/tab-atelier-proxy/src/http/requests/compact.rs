@@ -4,7 +4,7 @@
 
 use crate::compact::Compact;
 
-use super::Validated;
+use super::{Rejection, Validated};
 
 /// Setting how much of an account's conversation the proxy may shed.
 ///
@@ -37,6 +37,10 @@ impl Validated for SetCompact {
             Some(_) => Ok(()),
             None => Err(format!("unknown compaction level {:?}", self.compact)),
         }
+    }
+
+    fn accept(body: &bytes::Bytes) -> Result<Self, Rejection> {
+        super::parse(body)
     }
 }
 

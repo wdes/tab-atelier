@@ -12,16 +12,20 @@
 //! thing looks like.
 
 pub mod account;
+pub mod inspect;
 pub mod pressure;
 pub mod provider;
+pub mod status;
 pub mod usage;
 
 pub(crate) use account::{
     AccountEnvelope, AccountResource, AccountsResource, KeyEnvelope, KeyResource, NewKeyResource,
     RemovedAccountEnvelope, RemovedKeyEnvelope,
 };
+pub(crate) use inspect::{InspectStateResource, InspectStatusResource};
 pub(crate) use pressure::pressure_json;
 pub(crate) use provider::providers_json;
+pub(crate) use status::{CredentialsResource, OkResource};
 pub(crate) use usage::{
     AccountSummary, MeUsageResource, UsageReportResource, UsageResource, UserUsageResource, path_window,
 };

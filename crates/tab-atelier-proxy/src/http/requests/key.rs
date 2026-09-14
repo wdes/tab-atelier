@@ -2,7 +2,7 @@
 
 //! Keys: minting one, and switching one off.
 
-use super::{Validated, loose_bool};
+use super::{Rejection, Validated, loose_bool};
 
 /// Minting a named key.
 ///
@@ -34,6 +34,10 @@ impl Validated for AddKey {
     fn validate(&self) -> Result<(), String> {
         Ok(())
     }
+
+    fn accept(body: &bytes::Bytes) -> Result<Self, Rejection> {
+        super::parse(body)
+    }
 }
 
 /// Switching one key off, or back on.
@@ -59,6 +63,10 @@ impl SetKeyDisabled {
 impl Validated for SetKeyDisabled {
     fn validate(&self) -> Result<(), String> {
         Ok(())
+    }
+
+    fn accept(body: &bytes::Bytes) -> Result<Self, Rejection> {
+        super::parse(body)
     }
 }
 
