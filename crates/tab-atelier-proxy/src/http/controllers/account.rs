@@ -182,3 +182,272 @@ pub(crate) fn set_weight(state: &Arc<State>, who: &str, req: &SetWeight) -> Repl
 fn failure(status: u16, why: &str) -> Reply {
     crate::http::problem(status, why.to_owned())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::http::requests::user::SetDisabled;
+    use crate::users::Store;
+
+    /// A state of this test's own, with the seeded account in it.
+    ///
+    /// The store path is named after the test because it is written to disk: a
+    /// shared one would have these tests inheriting each other's accounts, and
+    /// "unknown account" would stop meaning what the test thinks it means.
+    fn state_for(name: &str, email: &str) -> Arc<State> {
+        // Per run as well as per test. Some of what is checked here cannot be
+        // arranged from a store left over from a previous run — a key's
+        // plaintext is only readable once — so every test starts from empty and
+        // arranges exactly the state it needs.
+        let dir = std::env::temp_dir()
+            .join("tab-atelier-account-tests")
+            .join(format!("{name}-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let mut store = Store::load(dir.join("users.json")).expect("a fresh store");
+        store.add("Ada", "Lovelace", email).expect("add");
+        let state = Arc::new(State::for_tests("t".to_owned()));
+        *state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = store;
+        state
+    }
+
+    fn add_user(first: &str, last: &str, email: &str) -> AddUser {
+        AddUser {
+            first_name: first.to_owned(),
+            last_name: last.to_owned(),
+            email: email.to_owned(),
+        }
+    }
+
+    // ── listing and creating ────────────────────────────────────────────────
+
+    #[test]
+    fn the_table_lists_every_account() {
+        let state = state_for("list", "list@example.com");
+        assert_eq!(list(&state).status, 200);
+    }
+
+    #[test]
+    fn creating_an_account_answers_201() {
+        // 201 and not 200: the client needs the id from the body to do anything
+        // with the account it just made.
+        let state = state_for("create", "create-existing@example.com");
+        // The store is on disk and survives between runs, so the test arranges
+        // its own precondition rather than assuming a clean one. Clearing first
+        // is also the honest statement of what is being checked — creating an
+        // account that is *not* there.
+        let _ = remove(&state, "create@example.com");
+        let reply = add(&state, &add_user("Grace", "Hopper", "create@example.com"));
+        assert_eq!(reply.status, 201);
+    }
+
+    #[test]
+    fn creating_an_account_that_already_exists_is_a_400() {
+        // 400 rather than 409: the email is what is wrong with the request, and
+        // the operator fixes it by sending a different one.
+        let state = state_for("dup", "dup@example.com");
+        let reply = add(&state, &add_user("Ada", "Lovelace", "dup@example.com"));
+        assert_eq!(reply.status, 400);
+    }
+
+    // ── deleting ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn deleting_an_account_answers_with_what_was_removed() {
+        // The operator confirms it was the account they meant rather than one
+        // whose email they mistyped.
+        let state = state_for("delete", "delete@example.com");
+        let reply = remove(&state, "delete@example.com");
+        assert_eq!(reply.status, 200);
+        assert!(
+            state
+                .store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .find("delete@example.com")
+                .is_none(),
+            "and it is gone"
+        );
+    }
+
+    #[test]
+    fn deleting_an_account_that_is_not_there_is_a_404() {
+        let state = state_for("delete-missing", "delete-missing@example.com");
+        assert_eq!(remove(&state, "nobody@example.com").status, 404);
+    }
+
+    // ── the provider pin ────────────────────────────────────────────────────
+
+    #[test]
+    fn pinning_to_a_provider_that_does_not_exist_is_refused_where_it_is_set() {
+        // Validated on the way in rather than at relay time: a pin to a typo
+        // would otherwise be a 503 on every request from that account, caused by
+        // an admin action somewhere else and explainable by nobody.
+        let state = state_for("pin-unknown", "pin-unknown@example.com");
+        let reply = set_provider(
+            &state,
+            "pin-unknown@example.com",
+            &PinProvider {
+                provider: "not-a-provider".to_owned(),
+            },
+        );
+        assert_eq!(reply.status, 400);
+    }
+
+    #[test]
+    fn an_empty_pin_clears_the_override() {
+        // The escape hatch: an account that has been pinned has to be able to go
+        // back to the installation default, and an empty name is how.
+        let state = state_for("pin-clear", "pin-clear@example.com");
+        let reply = set_provider(
+            &state,
+            "pin-clear@example.com",
+            &PinProvider {
+                provider: String::new(),
+            },
+        );
+        assert_eq!(reply.status, 200);
+    }
+
+    #[test]
+    fn pinning_an_account_that_does_not_exist_is_a_404() {
+        let state = state_for("pin-missing", "pin-missing@example.com");
+        let reply = set_provider(
+            &state,
+            "nobody@example.com",
+            &PinProvider {
+                provider: String::new(),
+            },
+        );
+        assert_eq!(reply.status, 404);
+    }
+
+    // ── the model pin ───────────────────────────────────────────────────────
+
+    #[test]
+    fn pinning_to_a_model_no_provider_serves_is_refused() {
+        // Same reasoning as the provider pin, and it is checked against every
+        // provider rather than the account's own: which hop serves a model can
+        // change, and the pin is a statement about the model.
+        let state = state_for("model-unknown", "model-unknown@example.com");
+        let reply = set_model(
+            &state,
+            "model-unknown@example.com",
+            &PinModel {
+                model: "not-a-model".to_owned(),
+            },
+        );
+        assert_eq!(reply.status, 400);
+    }
+
+    #[test]
+    fn an_empty_model_pin_clears_the_override() {
+        let state = state_for("model-clear", "model-clear@example.com");
+        let reply = set_model(&state, "model-clear@example.com", &PinModel { model: String::new() });
+        assert_eq!(reply.status, 200);
+    }
+
+    // ── compaction ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn a_compaction_level_nobody_defines_is_refused() {
+        // The UI offers only the known ones, but the API is authenticated rather
+        // than private, so the server checks rather than trusting the browser.
+        let state = state_for("compact-unknown", "compact-unknown@example.com");
+        let reply = set_compact(
+            &state,
+            "compact-unknown@example.com",
+            &SetCompact {
+                compact: "maximum".to_owned(),
+            },
+        );
+        assert_eq!(reply.status, 400);
+    }
+
+    #[test]
+    fn disabling_compaction_is_always_accepted() {
+        // `none` is the escape hatch and skips the hop's objection entirely:
+        // whatever a provider refuses, turning compaction off is never the thing
+        // it is refusing.
+        let state = state_for("compact-none", "compact-none@example.com");
+        let reply = set_compact(
+            &state,
+            "compact-none@example.com",
+            &SetCompact {
+                compact: "none".to_owned(),
+            },
+        );
+        assert_eq!(reply.status, 200);
+    }
+
+    #[test]
+    fn the_hop_is_asked_whether_it_can_serve_the_level() {
+        // `compact_refusal_for` is the server-side half of the rule the UI also
+        // enforces; the two disagreeing is how an account ends up with a level
+        // its provider rejects on every request.
+        let state = state_for("compact-hop", "compact-hop@example.com");
+        let store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Whichever way the default registry answers, the function has to answer
+        // at all rather than panicking on a missing provider.
+        let _ = compact_refusal_for(&state, &store, "compact-hop@example.com");
+    }
+
+    // ── the switches ────────────────────────────────────────────────────────
+
+    #[test]
+    fn switching_an_account_off_and_back_on_works() {
+        let state = state_for("disable", "disable@example.com");
+        for disabled in [true, false] {
+            let reply = set_disabled(
+                &state,
+                "disable@example.com",
+                &SetDisabled {
+                    disabled: Some(disabled),
+                },
+            );
+            assert_eq!(reply.status, 200, "disabled={disabled}");
+        }
+    }
+
+    #[test]
+    fn every_switch_refuses_an_account_that_is_not_there() {
+        // One loop rather than four tests: the shared property is what matters,
+        // and four copies would drift the moment a fifth switch is added.
+        let state = state_for("switches", "switches@example.com");
+        let missing = "nobody@example.com";
+
+        assert_eq!(
+            set_disabled(&state, missing, &SetDisabled { disabled: Some(true) }).status,
+            404
+        );
+        assert_eq!(set_weight(&state, missing, &SetWeight { weight: Some(3) }).status, 404);
+        assert_eq!(
+            set_tools(
+                &state,
+                missing,
+                &SetTools {
+                    policy: crate::tools::Policy::default()
+                }
+            )
+            .status,
+            404
+        );
+    }
+
+    #[test]
+    fn the_weight_that_was_set_is_the_weight_reported() {
+        // The number is read by the scheduler; a response that echoed something
+        // else would make the operator doubt which one is in force.
+        let state = state_for("weight", "weight@example.com");
+        let reply = set_weight(&state, "weight@example.com", &SetWeight { weight: Some(4) });
+        assert_eq!(reply.status, 200);
+
+        let weight = state
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .find("weight@example.com")
+            .expect("the account")
+            .weight;
+        assert_eq!(weight, 4, "the number in force is the one that was set");
+    }
+}

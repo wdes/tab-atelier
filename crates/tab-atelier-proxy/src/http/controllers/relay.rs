@@ -1127,3 +1127,204 @@ pub(crate) fn upstream_body(f: &Forward, wire: provider::Wire) -> (String, Bytes
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An `OpenAI` base URL is written with the version in it, and so is the
+    /// path.
+    ///
+    /// The provider is configured as `https://api.openai.com/v1` and the relay
+    /// forwards `/v1/chat/completions` — joining them the obvious way gives
+    /// `/v1/v1/chat/completions` and a 404 from the provider that names nothing
+    /// about the proxy. `openai::chat_url` is what strips the duplicate.
+    #[test]
+    fn an_openai_base_is_not_versioned_twice() {
+        assert_eq!(
+            upstream_url(
+                "https://api.openai.com/v1",
+                provider::Wire::Openai,
+                "/v1/chat/completions"
+            ),
+            "https://api.openai.com/v1/chat/completions"
+        );
+        // Anthropic's base carries no version, so the path supplies it and
+        // there is nothing to reconcile.
+        assert_eq!(
+            upstream_url("https://api.anthropic.com", provider::Wire::Anthropic, "/v1/messages"),
+            "https://api.anthropic.com/v1/messages"
+        );
+    }
+
+    /// The shaping pass reports what it removed, and a level that is on but has
+    /// nothing to remove still reports.
+    ///
+    /// The distinction matters because "on, and elided nothing" and "off" are
+    /// different answers to the operator asking why a transcript was not
+    /// compacted — and `None` is how this signals the second.
+    #[test]
+    fn shaping_reports_what_compaction_removed() {
+        let route = routing::Route {
+            provider_id: "p".to_owned(),
+            model_id: "m".to_owned(),
+            class: provider::Class::Balanced,
+            // Work, not the classifier: the classifier is exempt from
+            // compaction by construction, so it would report nothing and this
+            // test would pass for the wrong reason.
+            kind: classifier::Kind::Work,
+            changed_from: None,
+            reason: None,
+        };
+        // Ten tool-result turns, of which the keep window leaves six.
+        let turns: Vec<String> = (0..10)
+            .map(|i| {
+                format!(
+                    r#"{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"call_{i:02}","content":"{}"}}]}}"#,
+                    "r".repeat(500)
+                )
+            })
+            .collect();
+        let body = Bytes::from(format!(r#"{{"model":"m","messages":[{}]}}"#, turns.join(",")));
+        let before = body.len();
+
+        let (after, record, _) = shape_body(
+            &body,
+            &route,
+            "m",
+            crate::compact::Compact::Tools,
+            &crate::tools::Policy::default(),
+            true,
+            crate::identity::Vendor::Anthropic,
+        );
+        let record = record.expect("a level was in force, so a record comes back");
+        assert_eq!(record.level, "tools");
+        assert_eq!(record.tool_results_elided, 4, "six of ten are inside the keep window");
+        assert_eq!(record.bytes_before, u64::try_from(before).expect("fits"));
+        assert_eq!(record.bytes_after, u64::try_from(after.len()).expect("fits"));
+        assert!(record.saved() > 0, "the body did shrink");
+        assert!(after.len() < before);
+
+        let plain = Bytes::from(r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#);
+        let (_, quiet, _) = shape_body(
+            &plain,
+            &route,
+            "m",
+            crate::compact::Compact::All,
+            &crate::tools::Policy::default(),
+            true,
+            crate::identity::Vendor::Anthropic,
+        );
+        let quiet = quiet.expect("still a record");
+        assert_eq!(quiet.tool_results_elided, 0);
+        assert_eq!(quiet.level, "all");
+    }
+
+    /// The classifier is never compacted, whatever the account's level is.
+    ///
+    /// Its transcript is the conversation under judgement, and trimming it
+    /// would mean the safety decision was made on a redacted copy — with the
+    /// redaction chosen by the pass that reads it. This is a property of what
+    /// the classifier IS, so it holds even at the most aggressive level.
+    #[test]
+    fn the_classifier_transcript_is_never_compacted() {
+        let route = routing::Route {
+            provider_id: "p".to_owned(),
+            model_id: "m".to_owned(),
+            class: provider::Class::Fast,
+            kind: classifier::Kind::Classifier,
+            changed_from: None,
+            reason: None,
+        };
+        let turns: Vec<String> = (0..10)
+            .map(|i| {
+                format!(
+                    r#"{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"call_{i:02}","content":"{}"}}]}}"#,
+                    "r".repeat(500)
+                )
+            })
+            .collect();
+        let body = Bytes::from(format!(r#"{{"model":"m","messages":[{}]}}"#, turns.join(",")));
+
+        let (after, record, _) = shape_body(
+            &body,
+            &route,
+            "m",
+            crate::compact::Compact::All,
+            &crate::tools::Policy::default(),
+            true,
+            crate::identity::Vendor::Anthropic,
+        );
+        assert!(record.is_none(), "the classifier is exempt, so nothing is reported");
+        assert_eq!(after, body, "and the body is untouched");
+    }
+
+    /// A request that named a model the router did not choose is rewritten.
+    ///
+    /// This is the fallback path: the account asked for something unavailable
+    /// and routing picked another hop, so the payload has to name what is
+    /// actually being called or the provider refuses it.
+    #[test]
+    fn a_model_the_router_overrode_is_rewritten_in_the_body() {
+        let route = routing::Route {
+            provider_id: "p".to_owned(),
+            model_id: "chosen-by-router".to_owned(),
+            class: provider::Class::Balanced,
+            kind: classifier::Kind::Work,
+            changed_from: Some("asked-for".to_owned()),
+            reason: None,
+        };
+        let body = Bytes::from(r#"{"model":"asked-for","messages":[]}"#);
+
+        let (after, _, local) = shape_body(
+            &body,
+            &route,
+            "asked-for",
+            crate::compact::Compact::None,
+            &crate::tools::Policy::default(),
+            true,
+            crate::identity::Vendor::Anthropic,
+        );
+        let text = String::from_utf8_lossy(&after);
+        assert!(text.contains("chosen-by-router"), "{text}");
+        assert!(
+            !text.contains("\"asked-for\""),
+            "the model actually being called is the one now named: {text}"
+        );
+        assert!(
+            local.is_empty(),
+            "no local tool was asked for, so none is injected: {local:?}"
+        );
+    }
+
+    /// A request that named the model the router chose is left alone.
+    ///
+    /// Re-serializing it would drop any field this proxy does not model, so the
+    /// body is passed through byte for byte when there is nothing to change.
+    #[test]
+    fn a_clean_body_is_passed_through_byte_for_byte() {
+        let route = routing::Route {
+            provider_id: "p".to_owned(),
+            model_id: "m".to_owned(),
+            class: provider::Class::Balanced,
+            kind: classifier::Kind::Work,
+            changed_from: None,
+            reason: None,
+        };
+        // A field the proxy has no type for: if the body were rebuilt from a
+        // parsed value, this would vanish.
+        let body = Bytes::from(r#"{"model":"m","messages":[],"future_field":{"x":1}}"#);
+
+        let (after, _, local) = shape_body(
+            &body,
+            &route,
+            "m",
+            crate::compact::Compact::None,
+            &crate::tools::Policy::default(),
+            true,
+            crate::identity::Vendor::Anthropic,
+        );
+        assert_eq!(after, body, "nothing to change, so nothing is rebuilt");
+        assert!(local.is_empty());
+    }
+}

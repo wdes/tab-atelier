@@ -169,3 +169,140 @@ const fn auth_name(auth: &provider::Auth) -> &'static str {
         provider::Auth::ApiKeyFile { .. } => "api_key_file",
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::provider::{Auth, Class, Registry, Wire};
+
+    fn state_with(reg: Registry) -> State {
+        let state = State::for_tests("t".to_owned());
+        *state.registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = reg;
+        state
+    }
+
+    #[test]
+    fn every_way_of_authenticating_has_a_name_the_ui_can_read() {
+        // The UI branches on these strings, so a variant falling through to a
+        // default would silently present the wrong form.
+        assert_eq!(auth_name(&Auth::ClaudeOauth), "claude_oauth");
+        assert_eq!(auth_name(&Auth::ApiKeyEnv { var: "X".to_owned() }), "api_key_env");
+        assert_eq!(auth_name(&Auth::ApiKeyFile { path: "/k".to_owned() }), "api_key_file");
+    }
+
+    #[test]
+    fn a_preset_is_marked_configured_once_it_has_been_added() {
+        // This is what turns "add" into "already here" in the panel, and it is
+        // answered by id so a preset edited after being added still counts.
+        let state = state_with(Registry::default());
+        let before = providers_json(&state);
+        let deepseek = before
+            .presets
+            .iter()
+            .find(|p| p.id == "deepseek")
+            .expect("the preset is offered");
+        assert!(!deepseek.configured, "nothing has been added yet");
+
+        {
+            let mut reg = state.registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            reg.providers
+                .push(provider::Preset::Deepseek.provider(std::path::Path::new("/")));
+        }
+        let after = providers_json(&state);
+        let deepseek = after
+            .presets
+            .iter()
+            .find(|p| p.id == "deepseek")
+            .expect("still offered");
+        assert!(deepseek.configured, "it is configured now");
+    }
+
+    #[test]
+    fn the_catalogue_carries_no_credential_only_whether_one_resolves() {
+        // The whole point of this type: an operator looking at the panel must
+        // not be able to read a key out of it, and a key that ends up here is
+        // the kind of thing that gets pasted into a bug report.
+        let mut reg = Registry::default();
+        reg.providers[0] = Provider {
+            auth: Auth::ApiKeyEnv {
+                var: "MY_SECRET_VAR".to_owned(),
+            },
+            ..reg.providers[0].clone()
+        };
+        let json = serde_json::to_string(&providers_json(&state_with(reg))).expect("serialize");
+        assert!(
+            !json.contains("MY_SECRET_VAR"),
+            "the env var name is a hint, not a secret, but it should not be needed"
+        );
+        assert!(json.contains("\"ready\""), "readiness is what is sent instead");
+        assert!(json.contains("\"auth\""), "and how it authenticates");
+    }
+
+    #[test]
+    fn every_compaction_level_is_offered_with_its_label() {
+        // The wording lives here so the enum routing reads is the one the UI
+        // renders; a missing entry is an empty dropdown.
+        let catalog = providers_json(&state_with(Registry::default()));
+        assert_eq!(catalog.compact_levels.len(), Compact::ALL.len());
+        for level in Compact::ALL {
+            assert!(
+                catalog.compact_levels.iter().any(|c| c.value == level.as_str()),
+                "{} is missing",
+                level.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn every_model_of_every_provider_is_listed() {
+        // A model dropped in translation is one the UI cannot offer and the
+        // operator cannot diagnose.
+        let mut reg = Registry::default();
+        let mut extra = reg.providers[0].clone();
+        extra.id = "second".to_owned();
+        extra.wire = Wire::Openai;
+        reg.providers.push(extra);
+
+        let catalog = providers_json(&state_with(reg));
+        assert_eq!(catalog.providers.len(), 2);
+        for p in &catalog.providers {
+            assert!(!p.models.is_empty(), "{} lists no models", p.id);
+        }
+        assert_eq!(
+            catalog.providers[1].wire,
+            Wire::Openai,
+            "which wire a hop speaks is what tells the UI how to treat its models"
+        );
+    }
+
+    #[test]
+    fn the_cost_shown_is_the_cost_at_the_moment_asked_about() {
+        // `relative_cost` alone would be wrong during a peak window, and a
+        // client recomputing it would need this same schedule arithmetic.
+        let mut reg = Registry::default();
+        reg.providers[0].peak = Some(Peak {
+            multiplier_percent: 200,
+            windows: Vec::new(),
+        });
+        let catalog = providers_json(&state_with(reg));
+        let m = catalog.providers[0]
+            .models
+            .iter()
+            .find(|m| m.relative_cost > 0)
+            .expect("a priced model");
+        // No windows means peak never applies, so the two agree — which is the
+        // half of the rule that does not depend on the clock.
+        assert_eq!(m.cost_now, m.relative_cost);
+    }
+
+    #[test]
+    fn the_class_of_a_model_survives_translation() {
+        // Routing reads the class from the persisted provider; the UI reads it
+        // from here. A mismatch would offer a heavy model for a fast job.
+        let catalog = providers_json(&state_with(Registry::default()));
+        let models = &catalog.providers[0].models;
+        assert!(models.iter().any(|m| m.class == Class::Fast));
+        assert!(models.iter().any(|m| m.class == Class::Balanced));
+        assert!(models.iter().any(|m| m.class == Class::Heavy));
+    }
+}

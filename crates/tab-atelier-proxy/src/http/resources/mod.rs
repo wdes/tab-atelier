@@ -23,7 +23,7 @@ pub(crate) use account::{
     RemovedKeyEnvelope,
 };
 pub(crate) use inspect::{InspectStateResource, InspectStatusResource};
-pub(crate) use pressure::pressure_json;
+pub(crate) use pressure::PressureResource;
 pub(crate) use provider::providers_json;
 pub(crate) use status::{CredentialsResource, OkResource};
 pub(crate) use usage::{

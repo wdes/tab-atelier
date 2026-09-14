@@ -299,7 +299,10 @@ pub(crate) fn usage_report(state: &State<Arc<AppState>>, _admin: Admin, window: 
 /// How much of the budget is left, and who is waiting on it.
 #[get("/api/pressure")]
 pub(crate) fn pressure(state: &State<Arc<AppState>>, _admin: Admin) -> Reply {
-    crate::http::resources::pressure_json(state.inner())
+    crate::transport::json_of(
+        200,
+        &crate::http::resources::PressureResource::of(state.inner(), crate::server::now_ms()),
+    )
 }
 
 // ── the operator API: capture ───────────────────────────────────────────────
