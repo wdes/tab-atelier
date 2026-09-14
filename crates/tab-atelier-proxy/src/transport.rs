@@ -107,6 +107,28 @@ pub fn json(status: u16, body: &str) -> Reply {
     reply
 }
 
+/// A JSON reply from a value rather than from text.
+///
+/// This is how a resource is returned: named structs crossing into the
+/// handler, serialized once at the edge. Callers never build a string, so a
+/// field cannot appear here and be missing from the `OpenAPI` document.
+///
+/// [`json`] stays for the handful of responses that are a literal or a
+/// forwarded upstream body, which have no Rust type to derive a schema from.
+///
+/// # Errors are the caller's
+///
+/// Serializing a struct of plain fields cannot fail, so a failure here means a
+/// custom `Serialize` did; rather than panic in a request, that yields a 500
+/// carrying the reason.
+#[must_use]
+pub fn json_of<T: serde::Serialize>(status: u16, value: &T) -> Reply {
+    match serde_json::to_string(value) {
+        Ok(body) => json(status, &body),
+        Err(e) => json(500, &format!(r#"{{"error":"could not serialize: {e}"}}"#)),
+    }
+}
+
 impl Reply {
     /// An empty reply with no content type, for a transport to fill in.
     #[must_use]
