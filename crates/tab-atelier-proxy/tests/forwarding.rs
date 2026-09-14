@@ -908,9 +908,15 @@ thread_local! {
 ///
 /// The declaration never leaves: the far end has no such `type` and refuses the
 /// whole body over it (which is how the `ou_est_charlie` incident produced a
-/// 400 on every request of a session). What the upstream sees instead is a
-/// finished call-and-result, so the model reads the data without ever being
-/// able to ask for it.
+/// 400 on every request of a session). What the upstream sees instead is the
+/// data as an aside on the caller's last turn, so the model reads the question
+/// and then the data.
+///
+/// The aside is not a fabricated call-and-result. It used to be, and that is
+/// what a later bug report was: `DeepSeek`'s Anthropic endpoint rejects a
+/// thinking-mode assistant turn that carries no `thinking` block, and an
+/// assistant turn invented here carried none — so every request with a local
+/// tool in the policy was a 400.
 #[test]
 fn a_local_tool_is_resolved_by_the_proxy_and_never_asked_upstream() {
     let _serial = EGRESS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -985,16 +991,25 @@ fn a_local_tool_is_resolved_by_the_proxy_and_never_asked_upstream() {
         "the client's own tool survives: {text:.400}"
     );
 
-    // The answer arrives as a completed exchange, appended after the caller's
-    // messages so the model reads the question, then the data.
+    // The data rides on the caller's own turn. No exchange is fabricated, and
+    // in particular no assistant turn: one invented here would have to carry a
+    // thinking block for DeepSeek's thinking mode, and there is none to carry.
     let messages = got["messages"].as_array().expect("messages");
-    let result = messages.last().expect("a last message");
-    assert_eq!(result["role"], "user");
-    assert_eq!(result["content"][0]["type"], "tool_result");
-    assert_eq!(result["content"][0]["tool_use_id"], "srvtoolu_cloudflare_ips");
-    let call = &messages[messages.len() - 2];
-    assert_eq!(call["role"], "assistant");
-    assert_eq!(call["content"][0]["name"], "cloudflare_ips");
+    assert_eq!(messages.len(), 1, "no message is invented: {text:.400}");
+    let last = messages.last().expect("the caller's turn");
+    assert_eq!(last["role"], "user");
+    let blocks = last["content"].as_array().expect("blocks");
+    assert_eq!(blocks[0]["type"], "text");
+    assert_eq!(blocks[0]["text"], "the cloudflare ranges?");
+    assert_eq!(blocks[1]["type"], "text");
+    assert!(
+        blocks[1]["text"].as_str().is_some_and(|t| t.contains("cloudflare_ips")),
+        "the data is the aside: {text:.400}"
+    );
+    assert!(
+        !text.contains("\"tool_use\""),
+        "the model is never told it acted: {text:.400}"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
