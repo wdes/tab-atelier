@@ -60,12 +60,26 @@
 //!
 //! # The nonces
 //!
-//! Minted as `HMAC(secret, issued_at)` rather than stored, so verifying one
-//! costs no lookup and cannot be forged without this process's secret. They are
-//! single-use and short-lived: a nonce that verified once goes into a table and
-//! is refused afterwards, which is what stops a captured `Authorization` header
-//! from being replayed. The table is pruned on every mint, so it is bounded by
-//! the number of logins in one window rather than by uptime.
+//! Minted as `issue_time || random || HMAC(secret, issue_time || random)`
+//! rather than stored, so verifying one costs no lookup and cannot be forged
+//! without this process's secret. Both halves of the payload are needed and
+//! neither is decoration:
+//!
+//! * the **randomness** is what makes two mints differ. Without it a nonce
+//!   would be a pure function of the clock, and two challenges issued in the
+//!   same second would hand out the *same* value — so a browser fetching a page
+//!   and its assets in parallel would redeem one and be told the other had
+//!   "already been used". That was a real bug, caught by the test below rather
+//!   than by reasoning.
+//! * the **stamp** is what bounds its life, and it is signed along with the
+//!   randomness, so neither can be rewritten to extend a nonce's usefulness.
+//!
+//! They are single-use and short-lived: a nonce that verified once goes into a
+//! table and is refused afterwards, which is what stops a captured
+//! `Authorization` header from being replayed — the whole credential travels in
+//! one header, so without that it would be usable for its entire lifetime. The
+//! table is pruned on every mint, so it is bounded by the number of logins in
+//! one window rather than by uptime.
 //!
 //! The secret is fresh per process. A restart therefore invalidates outstanding
 //! nonces and the browser prompts once more, which is the right trade: the
@@ -104,10 +118,23 @@ pub const USERNAME: &str = "admin";
 const NONCE_TTL_SECS: u64 = 300;
 
 /// The length of the hex-encoded HMAC tag on a nonce.
-const TAG_HEX: usize = 64;
+///
+/// Half of a SHA-256 tag. The rest is discarded: this is a nonce, not a
+/// signature, and 128 bits is far beyond what forging one would ever need.
+const TAG_HEX: usize = 32;
 
 /// The length of the hex-encoded issue time on a nonce.
 const STAMP_HEX: usize = 16;
+
+/// The length of the hex-encoded per-mint randomness.
+///
+/// Without this the nonce would be a pure function of the clock, and two
+/// challenges issued in the same second would hand out the SAME nonce — which,
+/// with single-use enforcement, means a browser fetching a page and its assets
+/// in parallel gets one redemption and one "that nonce has already been used".
+/// The randomness is what makes two mints differ; the stamp and the tag are
+/// what make one verifiable.
+const RAND_HEX: usize = 16;
 
 // ── what is gated ───────────────────────────────────────────────────────────
 
@@ -147,9 +174,15 @@ pub fn gated(path: &str, method: Method) -> bool {
 ///   `/me/usage` and `share_link` posts `/me/credentials`, each carrying
 ///   `x-api-key`. Both are reached from a terminal.
 ///
-/// The prefixes are written out in full rather than left as `/relay` and `/me`
-/// so that a path added beside them later is gated by default. A bare `/relay`
-/// is still exempt, because that is the mount point a client probes.
+/// The prefixes are written out in full — `/relay/anthropic/` and `/me/` — and
+/// neither bare parent is exempt. That is deliberate on both counts:
+///
+/// * a path added beside them later is gated by default, which is the whole
+///   point of listing a prefix rather than a family;
+/// * neither parent is a route, so exempting one only means an unauthenticated
+///   request for it falls through to the SPA catch-all and is handed the HTML
+///   shell. Nothing was mounting `/relay` or `/me`, and nothing should have
+///   been serving their parent to a caller who has not signed in.
 ///
 /// One thing to watch: the dashboard defines a `meUrl()` that is never called.
 /// If it is ever wired up, `/me/usage` moves behind the browser gate — which is
@@ -157,7 +190,7 @@ pub fn gated(path: &str, method: Method) -> bool {
 /// the operator is signed in to reach the page that fetches it.
 #[must_use]
 fn is_exempt(path: &str) -> bool {
-    const EXEMPT: [&str; 5] = ["/api/hello", "/robots.txt", "/favicon.ico", "/relay", "/me"];
+    const EXEMPT: [&str; 3] = ["/api/hello", "/robots.txt", "/favicon.ico"];
     /// Prefixes for the routes below a mount point.
     const EXEMPT_PREFIXES: [&str; 2] = ["/relay/anthropic/", "/me/"];
 
@@ -211,10 +244,19 @@ impl Nonces {
     }
 
     /// The tag that makes a stamp unforgeable.
-    fn tag(&self, stamp: &str) -> String {
+    fn tag(&self, payload: &str) -> String {
         let mut mac = HmacSha256::new_from_slice(&self.secret).expect("HMAC accepts a key of any length");
-        mac.update(stamp.as_bytes());
+        mac.update(payload.as_bytes());
         hex(&mac.finalize().into_bytes())
+    }
+
+    /// The first [`TAG_HEX`] characters of the tag for a payload.
+    ///
+    /// Truncated because this is a nonce, not a signature: 128 bits is already
+    /// far beyond what forging one would ever need, and a shorter nonce is
+    /// less to carry in a challenge and in every response that answers it.
+    fn short_tag(&self, payload: &str) -> String {
+        self.tag(payload)[..TAG_HEX].to_owned()
     }
 
     /// Hand out a nonce for now.
@@ -227,8 +269,13 @@ impl Nonces {
             used.retain(|_, at| now.saturating_sub(*at) <= NONCE_TTL_SECS);
         }
         let stamp = format!("{now:0STAMP_HEX$x}");
-        let tag = self.tag(&stamp);
-        format!("{stamp}{tag}")
+        // Eight bytes from a v4 UUID, which is drawn from the system's random
+        // source. Two challenges in the same second then differ.
+        let nonce = uuid::Uuid::new_v4();
+        let rand = hex(&nonce.as_bytes()[..RAND_HEX / 2]);
+        let payload = format!("{stamp}{rand}");
+        let tag = self.short_tag(&payload);
+        format!("{payload}{tag}")
     }
 
     /// Accept a nonce, once.
@@ -237,14 +284,16 @@ impl Nonces {
     /// A sentence naming which of the four ways it failed, because a client
     /// developer reading a 401 needs to tell "stale" from "forged".
     fn redeem(&self, nonce: &str, now: u64) -> Result<(), String> {
-        if nonce.len() != STAMP_HEX + TAG_HEX {
+        if nonce.len() != STAMP_HEX + RAND_HEX + TAG_HEX {
             return Err("the nonce is malformed".to_owned());
         }
-        let (stamp, tag) = nonce.split_at(STAMP_HEX);
+        let (payload, tag) = nonce.split_at(STAMP_HEX + RAND_HEX);
+        let stamp = &payload[..STAMP_HEX];
 
         // Forged before usable: an attacker should not be able to make us do
-        // the table work, and the tag check is the cheap one.
-        if !tokens_match(tag, &self.tag(stamp)) {
+        // the table work, and the tag check is the cheap one. The whole payload
+        // is signed, so the randomness cannot be swapped for a chosen value.
+        if !tokens_match(tag, &self.short_tag(payload)) {
             return Err("the nonce was not issued by this proxy".to_owned());
         }
 
@@ -623,16 +672,34 @@ mod tests {
         // Their callers are CLIs holding a key, not browsers. A challenge here
         // would break every tab, because a tab cannot answer a prompt.
         for path in [
-            "/relay",
-            "/relay/anthropic",
             "/relay/anthropic/v1/messages",
             "/relay/anthropic/api/hello",
-            "/me",
             "/me/usage",
             "/me/credentials",
         ] {
             assert!(!gated(path, Method::Post), "{path} demands a browser credential");
         }
+    }
+
+    /// The bare parent of an exempt prefix is NOT exempt.
+    ///
+    /// Neither `/relay` nor `/me` is a route, so exempting one would only mean
+    /// an unauthenticated request for it falls through to the SPA catch-all and
+    /// is handed the HTML shell — which is exactly what the gate is for.
+    #[test]
+    fn the_parent_of_an_exempt_prefix_is_still_gated() {
+        // Neither is a route: the relay lives at `/relay/anthropic/<sub..>` and
+        // the per-user paths below `/me/`. Exempting a parent that mounts
+        // nothing would only mean an unauthenticated request for it falls
+        // through to the SPA catch-all and is handed the HTML shell.
+        assert!(gated("/relay", Method::Get));
+        assert!(gated("/me", Method::Get));
+        assert!(gated("/me", Method::Post), "and not by verb either");
+        assert!(gated("/relay/anthropic", Method::Get), "the bare prefix is not a route");
+
+        // The children still are exempt, or the exemption would do nothing.
+        assert!(!gated("/relay/anthropic/v1/messages", Method::Post));
+        assert!(!gated("/me/usage", Method::Get));
     }
 
     #[test]
@@ -706,12 +773,25 @@ mod tests {
         let nonces = Nonces::new();
         let now = 1_700_000_000;
         let nonce = nonces.mint(now);
-        let (stamp, tag) = nonce.split_at(STAMP_HEX);
+        let (payload, tag) = nonce.split_at(STAMP_HEX + RAND_HEX);
 
         let mut flipped = tag.to_owned();
         let first = flipped.remove(0);
         flipped.insert(0, if first == '0' { '1' } else { '0' });
-        assert!(nonces.redeem(&format!("{stamp}{flipped}"), now).is_err());
+        assert!(nonces.redeem(&format!("{payload}{flipped}"), now).is_err());
+
+        // And every byte of the RANDOMNESS matters too. This is what the
+        // signature covering the whole payload is for: if only the stamp were
+        // signed, a client could submit a nonce body of its own choosing with a
+        // tag that checks out.
+        let mut chosen = nonce.clone();
+        let at = STAMP_HEX;
+        let digit = chosen.as_bytes()[at];
+        chosen.replace_range(at..=at, if digit == b'0' { "1" } else { "0" });
+        assert!(
+            nonces.redeem(&chosen, now).is_err(),
+            "a nonce with altered randomness must not verify"
+        );
     }
 
     #[test]
@@ -721,9 +801,8 @@ mod tests {
         let nonces = Nonces::new();
         let now = 1_700_000_000;
         let nonce = nonces.mint(now - 10_000);
-        let (stamp, tag) = nonce.split_at(STAMP_HEX);
-        let _ = stamp;
-        let rewritten = format!("{now:016x}{tag}");
+        let rest = &nonce[STAMP_HEX..];
+        let rewritten = format!("{now:0STAMP_HEX$x}{rest}");
         assert!(
             nonces.redeem(&rewritten, now).is_err(),
             "a stamp that was not signed must not verify"
@@ -746,7 +825,7 @@ mod tests {
     #[test]
     fn a_malformed_nonce_is_refused_rather_than_panicking() {
         let nonces = Nonces::new();
-        for bad in ["", "short", &"z".repeat(STAMP_HEX + TAG_HEX)] {
+        for bad in ["", "short", &"z".repeat(STAMP_HEX + RAND_HEX + TAG_HEX)] {
             assert!(nonces.redeem(bad, 1_700_000_000).is_err(), "{bad} was accepted");
         }
     }
@@ -881,21 +960,21 @@ mod tests {
         // account could rewrite every other account.
         let state = state();
         let now = 1_700_000_000;
-        let (_, secret) = state
+        // Two statements, not one chain: `Mutex` is not reentrant, so adding an
+        // account and then minting its key inside a closure over the same guard
+        // deadlocks the test binary and, with it, the whole suite.
+        let who = state
             .store
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .add("Ada", "Lovelace", "digest@example.com")
-            .map(|who| {
-                let key = state
-                    .store
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .add_key(&who.email, "laptop")
-                    .expect("mint");
-                (who, key.1)
-            })
             .expect("add");
+        let (_, secret) = state
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .add_key(&who.email, "laptop")
+            .expect("mint");
 
         let header = credential(
             &state.web_auth,
@@ -992,12 +1071,34 @@ mod tests {
         let full = good(&state, now);
 
         // Drop each field in turn; every one of them is load-bearing.
-        for field in ["username=", "realm=", "nonce=", "uri=", "response=", "nc=", "cnonce="] {
-            let without = full
+        // `starts_with`, not `contains`: `cnonce="…"` contains `nonce=`, so a
+        // substring match would drop two fields at once and the test would no
+        // longer say which one it removed.
+        for field in [
+            "username=",
+            "realm=",
+            "nonce=",
+            "uri=",
+            "response=",
+            "qop=",
+            "nc=",
+            "cnonce=",
+            "algorithm=",
+        ] {
+            // The scheme is stripped before splitting, or the first parameter
+            // arrives as `Digest username="…"` and no `starts_with` on a field
+            // name ever matches it.
+            let params = full.strip_prefix("Digest ").expect("the scheme");
+            let kept = params
                 .split(", ")
-                .filter(|part| !part.contains(field))
-                .collect::<Vec<_>>()
-                .join(", ");
+                .filter(|part| !part.starts_with(field))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                kept.len(),
+                params.split(", ").count() - 1,
+                "the fixture did not contain exactly one {field}"
+            );
+            let without = format!("Digest {}", kept.join(", "));
             assert!(
                 verify(&state, Method::Get, "/api/users", &without, now).is_err(),
                 "a credential without {field} was accepted: {without}"
@@ -1037,6 +1138,27 @@ mod tests {
         assert!(response.bytes().all(|b| b.is_ascii_hexdigit()), "{response}");
     }
 
+    /// `nc` and `cnonce` are required when `qop` is present, and refused by
+    /// absence rather than defaulted.
+    ///
+    /// A defaulted `nc` would make every credential interchangeable for as long
+    /// as its nonce lived, which is the replay window the single-use rule is
+    /// there to close.
+    #[test]
+    fn the_fields_only_the_qop_path_needs_are_still_required() {
+        let state = state();
+        let now = 1_700_000_000;
+        for part in ["nc=00000001", "cnonce=\"abc123\""] {
+            let full = good(&state, now);
+            let without = full.split(", ").filter(|p| *p != part).collect::<Vec<_>>().join(", ");
+            assert_ne!(without, full, "the fixture did not contain {part}");
+            assert!(
+                verify(&state, Method::Get, "/api/users", &without, now).is_err(),
+                "a credential without {part} was accepted: {without}"
+            );
+        }
+    }
+
     #[test]
     fn a_qop_this_proxy_cannot_compute_is_refused_by_name() {
         // `auth-int` needs the body hash, which this proxy does not compute. A
@@ -1053,11 +1175,28 @@ mod tests {
     fn a_response_that_is_not_a_digest_is_refused() {
         let state = state();
         let now = 1_700_000_000;
-        for bad in ["", "zz", "not-hex-here", &"a".repeat(63)] {
-            let header =
-                good(&state, now).replace(&format!("response=\"{}", "0".repeat(64)), &format!("response=\"{bad}"));
+        // Uppercase is included because RFC 7616 mandates lowercase hex, and a
+        // client that uppercased it must not be accepted by accident.
+        for bad in [
+            "",
+            "zz",
+            "not-hex-here",
+            &"a".repeat(63),
+            &"a".repeat(65),
+            &"A".repeat(64),
+            &"0".repeat(64),
+        ] {
+            // The real digest is read OUT of the header rather than guessed at.
+            // Substituting against an assumed value is a no-op when the
+            // assumption is wrong, and the test then re-verifies a perfectly
+            // valid credential while asserting it was refused — so it would
+            // pass only if the implementation were broken.
+            let header = good(&state, now);
+            let start = header.find("response=\"").expect("a response field") + "response=\"".len();
+            let end = start + 64;
+            let forged = format!("{}{bad}{}", &header[..start], &header[end..]);
             assert!(
-                verify(&state, Method::Get, "/api/users", &header, now).is_err(),
+                verify(&state, Method::Get, "/api/users", &forged, now).is_err(),
                 "{bad:?} was accepted"
             );
         }

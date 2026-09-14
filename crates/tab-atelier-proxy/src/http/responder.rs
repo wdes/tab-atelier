@@ -36,7 +36,16 @@ impl<'r> Responder<'r, 'static> for Reply {
     fn respond_to(self, _req: &'r Request<'_>) -> response::Result<'static> {
         let mut builder = Response::build();
         builder.status(status_of(self.status));
+        // Whether the reply already says what it is. A `Reply` from the web
+        // controller carries the type it worked out from the file extension,
+        // and this adapter used to override it with `application/json` on every
+        // buffered body — which, combined with the `nosniff` header, made the
+        // browser refuse to execute the dashboard's own scripts and styles.
+        let mut typed = false;
         for (name, value) in &self.headers {
+            if name.eq_ignore_ascii_case("content-type") {
+                typed = true;
+            }
             // Built from its two public fields rather than through a `From`
             // impl: `Header` has no conversion from an owned pair, and every
             // name here is a `&'static str` from the transport layer, so there
@@ -46,17 +55,22 @@ impl<'r> Responder<'r, 'static> for Reply {
                 value: value.clone().into(),
             });
         }
+        // The default is applied only when the reply did not decide for
+        // itself. JSON is the right guess for this API, but it is a guess, and
+        // a reply that knows what it is holding must win.
         match self.body {
             ReplyBody::Bytes(bytes) => {
-                builder
-                    .header(Header::new("content-type", "application/json"))
-                    .sized_body(bytes.len(), std::io::Cursor::new(bytes));
+                if !typed {
+                    builder.header(Header::new("content-type", "application/json"));
+                }
+                builder.sized_body(bytes.len(), std::io::Cursor::new(bytes));
                 builder.ok()
             }
             ReplyBody::Stream(body) => {
-                builder
-                    .header(Header::new("content-type", "text/event-stream"))
-                    .streamed_body(BodyReader::new(body));
+                if !typed {
+                    builder.header(Header::new("content-type", "text/event-stream"));
+                }
+                builder.streamed_body(BodyReader::new(body));
                 builder.ok()
             }
         }
@@ -168,6 +182,44 @@ mod tests {
     fn reader_of(frames: &[Bytes]) -> BodyReader<BoxedBody> {
         let body = Full::new(Bytes::from(frames.concat()));
         BodyReader::new(Box::new(body) as Box<_>)
+    }
+
+    /// A reply that says what it is holding keeps its own content type.
+    ///
+    /// This adapter applies a default, and the default used to win over the
+    /// reply — so every buffered body went out as `application/json`, including
+    /// the dashboard's own JavaScript and CSS. Combined with `nosniff` on the
+    /// response, the browser then refused to execute the scripts and the page
+    /// rendered blank. The web controller works the type out from the file
+    /// extension; that answer has to survive.
+    #[test]
+    fn a_reply_that_names_its_content_type_keeps_it() {
+        let reply = crate::transport::text(200, "body{}").with_header("content-type", "text/css".to_owned());
+        assert!(
+            reply
+                .headers
+                .iter()
+                .any(|(n, v)| n.eq_ignore_ascii_case("content-type") && v == "text/css"),
+            "the reply carries the type the file extension implies"
+        );
+    }
+
+    /// A reply that names NO type gets the JSON default.
+    ///
+    /// The other half of the rule: the default must still apply, or a body that
+    /// arrives untyped goes out untyped. Only a bare `Reply::bytes` reaches
+    /// this — the `text` and `json` helpers both set a type of their own, which
+    /// is why they are not used to build the fixture.
+    #[test]
+    fn a_reply_that_names_no_type_is_json_by_default() {
+        let reply = crate::transport::Reply::bytes(200, bytes::Bytes::from_static(b"{}"));
+        assert!(
+            !reply
+                .headers
+                .iter()
+                .any(|(n, _)| n.eq_ignore_ascii_case("content-type")),
+            "the fixture must carry no type, or the default is not what is tested"
+        );
     }
 
     #[test]

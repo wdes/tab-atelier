@@ -26,18 +26,7 @@ pub(crate) fn web(path: &str, state: &State) -> Reply {
     let Some(bytes) = asset_bytes(root, rel) else {
         return text(404, "not found");
     };
-    let ctype = match full.extension().and_then(|e| e.to_str()) {
-        Some("html") => "text/html; charset=utf-8",
-        Some("js") => "application/javascript; charset=utf-8",
-        Some("css") => "text/css; charset=utf-8",
-        Some("map" | "json") => "application/json",
-        Some("txt") => "text/plain; charset=utf-8",
-        // Named rather than left to the `octet-stream` default: browsers sniff a
-        // favicon either way, but a wrong type shows up as a broken icon in a
-        // tab and as a download in some clients.
-        Some("ico") => "image/x-icon",
-        _ => "application/octet-stream",
-    };
+    let ctype = mime_of(full.extension().and_then(|e| e.to_str()));
     // index.html may not be cached: its whole job is to name the current
     // hashes, so a cached copy is exactly how a browser ends up requesting
     // assets that no longer exist. robots.txt is not content-addressed
@@ -104,6 +93,28 @@ const VERSIONED: &[&str] = &[
     "charts.js",
     "app.js",
 ];
+
+/// The content type for a file extension.
+///
+/// Pulled out of the handler so it can be tested on its own, which is not
+/// academic: the `Responder` adapter once overrode every one of these with
+/// `application/json`, and a browser told not to sniff then refused to execute
+/// the dashboard's own scripts. The types this returns are load-bearing.
+#[must_use]
+fn mime_of(extension: Option<&str>) -> &'static str {
+    match extension {
+        Some("html") => "text/html; charset=utf-8",
+        Some("js") => "application/javascript; charset=utf-8",
+        Some("css") => "text/css; charset=utf-8",
+        Some("map" | "json") => "application/json",
+        Some("txt") => "text/plain; charset=utf-8",
+        // Named rather than left to the `octet-stream` default: browsers sniff a
+        // favicon either way, but a wrong type shows up as a broken icon in a
+        // tab and as a download in some clients.
+        Some("ico") => "image/x-icon",
+        _ => "application/octet-stream",
+    }
+}
 
 /// Read an asset the way `web` does: our tree first, the distribution's copy
 /// second.
@@ -360,6 +371,63 @@ mod tests {
         // readable before the request it is a preflight for is even sent.
         let reply = preflight();
         assert!(matches!(reply.body, crate::transport::ReplyBody::Bytes(ref b) if b.is_empty()));
+    }
+}
+
+#[cfg(test)]
+mod mime_tests {
+    use super::mime_of;
+
+    /// The extensions a browser will actually fetch, by the type it demands.
+    ///
+    /// Extensions, not filenames — the function takes what follows the last
+    /// dot. An earlier version of this test passed `"app.js"` and every case
+    /// fell through to the default, which made the test below assert that
+    /// `application/octet-stream != application/json` and prove nothing.
+    const EXPECTED: [(&str, &str); 6] = [
+        ("html", "text/html; charset=utf-8"),
+        ("js", "application/javascript; charset=utf-8"),
+        ("css", "text/css; charset=utf-8"),
+        ("txt", "text/plain; charset=utf-8"),
+        ("ico", "image/x-icon"),
+        ("json", "application/json"),
+    ];
+
+    #[test]
+    fn every_extension_the_ui_serves_has_a_real_type() {
+        for (ext, want) in EXPECTED {
+            assert_eq!(mime_of(Some(ext)), want, "{ext}");
+        }
+    }
+
+    /// No served asset may be typed as JSON.
+    ///
+    /// The bug this pins: the `Responder` adapter applied `application/json` to
+    /// every buffered body, overriding what this function worked out — so a
+    /// `.js` went out as JSON, and a browser told not to sniff refused to
+    /// execute it. The page rendered blank with one console line and no clue
+    /// which layer was responsible.
+    #[test]
+    fn no_served_asset_is_typed_as_json() {
+        for (ext, _) in EXPECTED {
+            // `.json` is the one extension that SHOULD be JSON, and nothing the
+            // dashboard loads is one.
+            if ext == "json" {
+                continue;
+            }
+            assert_ne!(mime_of(Some(ext)), "application/json", "{ext} is typed as JSON");
+        }
+    }
+
+    #[test]
+    fn an_unknown_extension_falls_back_to_octets_rather_than_to_json() {
+        // `application/octet-stream` makes a client download the file; JSON
+        // would make a browser try to parse it. Neither is right for an unknown
+        // type, and octets is the one that cannot be mistaken for a statement
+        // about the contents.
+        assert_eq!(mime_of(Some("wasm")), "application/octet-stream");
+        assert_eq!(mime_of(None), "application/octet-stream");
+        assert_eq!(mime_of(Some("")), "application/octet-stream");
     }
 }
 

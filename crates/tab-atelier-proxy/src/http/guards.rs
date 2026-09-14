@@ -210,20 +210,26 @@ impl<'r> FromRequest<'r> for Admin {
     type Error = Refusal;
 
     async fn from_request(req: &'r Request<'_>) -> Outcome<Self, Self::Error> {
-        let Outcome::Success(web) = req.guard::<WebAuth>().await else {
-            return Outcome::Error((Status::InternalServerError, Refusal::unmanaged()));
-        };
-        if web.signed_in {
-            return Outcome::Success(Self);
+        match req.guard::<WebAuth>().await {
+            Outcome::Success(web) if web.signed_in => Outcome::Success(Self),
+            // A signed-in-less success means the path was exempt from *browser*
+            // auth — reachable only if an administrative route were ever put on
+            // that list, which none is. It still needs the token, so it is
+            // refused with the reason rather than admitted.
+            Outcome::Success(_) => refuse(
+                req,
+                Status::Unauthorized,
+                "this API needs the operator token, and this path asks for no credential",
+            ),
+            // Propagated unchanged, which is the whole point of delegating: a
+            // 401 with its sentence, a 503 for an installation with no token.
+            // Turning these into a 500 — as an earlier `let-else` did — meant
+            // the API answered every bad credential with Rocket's HTML error
+            // page and, worse, carried no `WWW-Authenticate`, so a browser
+            // could never be challenged on `/api/*` at all.
+            Outcome::Error((status, refusal)) => Outcome::Error((status, refusal)),
+            Outcome::Forward(f) => Outcome::Forward(f),
         }
-        // Reachable only if an administrative route were ever put on the exempt
-        // list, which none is — so this says what happened rather than sending
-        // an empty 401.
-        refuse(
-            req,
-            Status::Unauthorized,
-            "this API needs the operator token, and this path asks for no credential",
-        )
     }
 }
 
