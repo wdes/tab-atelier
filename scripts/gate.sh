@@ -37,9 +37,12 @@ step() {
 step 'fmt' cargo fmt --all -- --check
 
 # The proxy crate is deliberately not a default member, so a plain
-# `cargo clippy` never lints it -- it needs its own invocation.
+# `cargo clippy` never lints it -- it needs its own invocation. The package name
+# lives in one variable rather than being spelled out at each step that targets
+# it, so a rename is a one-line change here instead of a hunt.
+proxy_pkg=tab-atelier-proxy
 step 'clippy (default members)' cargo clippy --workspace --all-targets -- -D warnings
-step 'clippy (proxy)' cargo clippy -p tab-atelier-proxy --all-targets -- -D warnings
+step 'clippy (proxy)' cargo clippy -p "$proxy_pkg" --all-targets -- -D warnings
 
 if [ "$fast" = 0 ]; then
   # --workspace covers every member including the non-default proxy crate.
