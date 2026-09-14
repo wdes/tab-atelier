@@ -1,0 +1,32 @@
+#!/bin/sh
+# SPDX-License-Identifier: MPL-2.0
+#
+# Every commit this repository produces carries the project's co-author
+# trailer. Enforcing it here, rather than remembering it at each commit, is the
+# point: a message written by hand, by a script, or by an agent all pass
+# through `commit-msg`, and a missing trailer is a defect the hook fixes
+# silently instead of one a reviewer has to catch.
+#
+# Idempotent, so `--amend` and repeated commits are no-ops.
+
+msg_file=$1
+[ -n "$msg_file" ] || exit 0
+[ -f "$msg_file" ] || exit 0
+
+# Already there? Match the trailer as a whole line, tolerating trailing spaces.
+if grep -qE '^Co-authored-by: DeepSeek <noreply@deepseek\.com>[[:space:]]*$' "$msg_file"; then
+	exit 0
+fi
+
+# Nothing but comment and blank lines: the commit is empty, and git will abort
+# it on its own. Appending here would only turn it into "a commit whose sole
+# content is the trailer", which is worse than the empty commit.
+if ! grep -qvE '^[[:space:]]*(#|$)' "$msg_file"; then
+	exit 0
+fi
+
+# Trailers belong in the final paragraph, blank-line separated, so append at
+# the end of the file. In `--edit` mode git strips the comment lines that may
+# follow; in `-m` mode there are none to begin with.
+printf '\nCo-authored-by: DeepSeek <noreply@deepseek.com>\n' >>"$msg_file"
+exit 0
