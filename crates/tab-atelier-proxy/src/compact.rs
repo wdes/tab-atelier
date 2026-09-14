@@ -64,11 +64,15 @@ pub enum Compact {
     /// Layer D: B, plus stub the file bodies old `Write`/`Edit` calls carry.
     ///
     /// Sits below [`Compact::All`] rather than above it because layer C is the
-    /// cheapest thing here — a stale token banner is noise, not bulk — and the
+    /// cheapest thing here — a stale system notice is noise, not bulk — and the
     /// ladder is ordered by how much a level removes. `Writes` is the bulk of
-    /// layers A–D without the banner edit; `All` is all four.
+    /// layers A–D without the notice edit; `All` is all four.
     Writes,
-    /// Layer C on top of the rest: stale `<total_tokens>` banners go too.
+    /// Layer C on top of the rest: stale injected system notices go too.
+    ///
+    /// That means both the `<total_tokens>` banners, of which only the newest
+    /// survives, and the harness's other `role: "system"` messages, which are
+    /// transient by nature and the newest [`KEEP_TURNS`] of which are kept.
     All,
 }
 
@@ -96,7 +100,7 @@ impl Compact {
             Self::Tools => "Remove old tool results",
             Self::ToolsThinking => "Remove old tool results and thinking",
             Self::Writes => "Remove old tool results, thinking and Write/Edit payloads",
-            Self::All => "Remove old tool results, thinking, Write/Edit payloads and banners",
+            Self::All => "Remove old tool results, thinking, Write/Edit payloads and system notices",
         }
     }
 
@@ -118,9 +122,9 @@ impl Compact {
         matches!(self, Self::Writes | Self::All)
     }
 
-    /// Whether this level drops stale token banners.
+    /// Whether this level drops stale injected system notices.
     #[must_use]
-    pub const fn does_banners(self) -> bool {
+    pub const fn does_notices(self) -> bool {
         matches!(self, Self::All)
     }
 
@@ -150,14 +154,14 @@ pub struct Stats {
     /// array. A count of calls would read as "one file" on a turn that dropped
     /// two.
     pub writes_elided: usize,
-    pub banners_dropped: usize,
+    pub notices_dropped: usize,
 }
 
 impl Stats {
     /// Whether the pass changed anything worth logging.
     #[must_use]
     pub const fn changed(&self) -> bool {
-        self.tool_results_elided > 0 || self.thinking_dropped > 0 || self.writes_elided > 0 || self.banners_dropped > 0
+        self.tool_results_elided > 0 || self.thinking_dropped > 0 || self.writes_elided > 0 || self.notices_dropped > 0
     }
 }
 
@@ -206,6 +210,15 @@ fn already_elided(content: &serde_json::Value) -> bool {
 /// the model still needs; a false negative costs bytes.
 const WRITE_TOOLS: [&str; 4] = ["Write", "Edit", "MultiEdit", "NotebookEdit"];
 
+/// The shell tool, whose `input.command` is the same bulk seen on the other
+/// side: a heredoc or a long pipeline is a file body wearing a command's name.
+///
+/// Kept in its own list rather than folded into [`WRITE_TOOLS`] so the stub can
+/// say "command" instead of "file content" — the byte count is the same, but
+/// the label is read by whoever is debugging a body later, and misnaming what
+/// was dropped there is its own small bug.
+const SHELL_TOOLS: [&str; 1] = ["Bash"];
+
 /// The smallest string worth replacing.
 ///
 /// Well above the length of a path, a hash or a flag, and well below a file
@@ -217,14 +230,21 @@ const MIN_WRITE_BYTES: usize = 200;
 /// pass needs one at all.
 const WRITE_ELIDED_PREFIX: &str = "[file content elided by tab-atelier-proxy: ";
 
-/// The stub that replaces a string inside a `tool_use` `input`.
+/// The marker a stub on a shell command begins with.
+const COMMAND_ELIDED_PREFIX: &str = "[command elided by tab-atelier-proxy: ";
+
+/// Every marker this pass writes, so a second pass can recognise a stub
+/// whichever family left it — see [`elide_long_strings`].
+const ELISION_PREFIXES: [&str; 2] = [WRITE_ELIDED_PREFIX, COMMAND_ELIDED_PREFIX];
+
+/// The stub that replaces a long string inside a `tool_use` `input`.
 ///
 /// It names no path: the `file_path` field beside it is untouched and already
 /// says which file, and repeating it would mean the stub disagreed with reality
 /// whenever the pass had rewritten the one and not the other. The byte count is
 /// the serialized length, the same quantity `bytes_of` reports for layer A.
-fn write_stub(byte_count: u64) -> String {
-    format!("{WRITE_ELIDED_PREFIX}{byte_count} bytes]")
+fn payload_stub(prefix: &str, byte_count: u64) -> String {
+    format!("{prefix}{byte_count} bytes]")
 }
 
 /// The oldest message index still inside the trailing window.
@@ -336,35 +356,45 @@ fn drop_thinking(messages: &mut [serde_json::Value], stats: &mut Stats) {
 /// `tool_use` block itself, its id, its name and its position all stay — which
 /// is also what keeps the id-pairing invariant of layer A intact.
 fn elide_writes(messages: &mut [serde_json::Value], stats: &mut Stats) {
-    let start = window_start(messages, KEEP_TURNS, has_write_call);
+    let start = window_start(messages, KEEP_TURNS, has_elidable_call);
     for message in &mut messages[..start] {
         let Some(list) = blocks_mut(message) else { continue };
         for block in list.iter_mut() {
-            if !is_write_call(block) {
+            let Some(prefix) = elidable_prefix(block) else {
                 continue;
-            }
+            };
             // `file_path`, `cell_id` and the rest of the small fields survive;
             // only the long strings go. There is no error case to exempt here
             // — a `tool_use` has no `is_error`, and a call that FAILED still
             // has its reason in the `tool_result`, which layer A treats.
             let Some(input) = block.get_mut("input") else { continue };
-            stats.writes_elided += elide_long_strings(input);
+            stats.writes_elided += elide_long_strings(input, prefix);
         }
     }
 }
 
-/// Whether a content block is a `tool_use` for one of the file-writing tools.
-fn is_write_call(block: &serde_json::Value) -> bool {
-    block_type(block) == Some("tool_use")
-        && block
-            .get("name")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|name| WRITE_TOOLS.contains(&name))
+/// The stub marker for a call whose payload this layer shrinks, if it does.
+///
+/// Returns the prefix rather than a bool because the two families read
+/// differently in the body — a stub saying "file content" on a shell command
+/// would misname what was dropped.
+fn elidable_prefix(block: &serde_json::Value) -> Option<&'static str> {
+    if block_type(block) != Some("tool_use") {
+        return None;
+    }
+    let name = block.get("name").and_then(serde_json::Value::as_str)?;
+    if WRITE_TOOLS.contains(&name) {
+        return Some(WRITE_ELIDED_PREFIX);
+    }
+    if SHELL_TOOLS.contains(&name) {
+        return Some(COMMAND_ELIDED_PREFIX);
+    }
+    None
 }
 
-/// Whether a message carries at least one write call.
-fn has_write_call(message: &serde_json::Value) -> bool {
-    blocks(message).is_some_and(|b| b.iter().any(is_write_call))
+/// Whether a message carries at least one call this layer shrinks.
+fn has_elidable_call(message: &serde_json::Value) -> bool {
+    blocks(message).is_some_and(|b| b.iter().any(|block| elidable_prefix(block).is_some()))
 }
 
 /// Replace every long string anywhere inside a `tool_use` `input`, returning
@@ -374,7 +404,7 @@ fn has_write_call(message: &serde_json::Value) -> bool {
 /// its edits in an array and a tool may nest its payload one level deeper than
 /// any list written here could predict. Depth is bounded by the JSON the caller
 /// already parsed, so this cannot recurse further than the body itself does.
-fn elide_long_strings(value: &mut serde_json::Value) -> usize {
+fn elide_long_strings(value: &mut serde_json::Value, prefix: &str) -> usize {
     match value {
         serde_json::Value::String(s) => {
             // Idempotence, deliberately ahead of the size gate. The stub is
@@ -382,27 +412,59 @@ fn elide_long_strings(value: &mut serde_json::Value) -> usize {
             // it — but that would make the pass idempotent by arithmetic
             // coincidence rather than by rule, and a second pass would then
             // recompute the byte count from the stub, losing the original.
-            if s.starts_with(WRITE_ELIDED_PREFIX) {
+            // Every family's marker is checked, not just this call's: a Bash
+            // block must not re-stub a body a previous Write pass left.
+            if ELISION_PREFIXES.iter().any(|p| s.starts_with(p)) {
                 return 0;
             }
             if s.len() < MIN_WRITE_BYTES {
                 return 0;
             }
             let serialized = serde_json::to_vec(&*s).map_or(0, |v| v.len());
-            *s = write_stub(u64::try_from(serialized).unwrap_or(u64::MAX));
+            *s = payload_stub(prefix, u64::try_from(serialized).unwrap_or(u64::MAX));
             1
         }
-        serde_json::Value::Array(items) => items.iter_mut().map(elide_long_strings).sum(),
-        serde_json::Value::Object(fields) => fields.values_mut().map(elide_long_strings).sum(),
+        serde_json::Value::Array(items) => items.iter_mut().map(|v| elide_long_strings(v, prefix)).sum(),
+        serde_json::Value::Object(fields) => fields.values_mut().map(|v| elide_long_strings(v, prefix)).sum(),
         _ => 0,
     }
 }
 
-/// Layer C — drop stale `<total_tokens>` banners, keeping the newest.
+/// Whether a message is one of the re-injected system notices layer D drops.
 ///
-/// Worth almost nothing in bytes — 23 messages at ~49 B is about a kilobyte.
-/// Kept because a stale token count re-read 23 times is noise rather than
-/// context, and noise is what the model has least room for.
+/// `system` is not a role the Messages API defines, so a message carrying it is
+/// by construction something the client spliced in — the harness's own prompt
+/// travels in the top-level `system` field instead. Nothing the model authored
+/// can be lost by dropping one, which is what makes this safe to do by role
+/// rather than by matching each notice's wording.
+fn is_notice(message: &serde_json::Value) -> bool {
+    message.get("role").and_then(serde_json::Value::as_str) == Some("system")
+}
+
+/// Layer C — drop stale injected system notices, keeping the newest few.
+///
+/// A wider door than [`is_banner`], which keeps exactly one: a banner is a live
+/// number the model reads to judge its own budget, so only the newest matters,
+/// while a notice is an event — a tool that errored, a note that the user
+/// replied — that stays useful for a turn or two before it is only noise. The
+/// window is what separates them; both are removed past it.
+///
+/// This is the largest class no other layer touches, because none of them look
+/// at `role` at all.
+fn drop_notices(messages: &mut Vec<serde_json::Value>, stats: &mut Stats) {
+    // `window_start` gives the OLDEST notice to keep; everything before it goes.
+    // Walked backwards so each removal leaves the indices below it untouched —
+    // a forward loop would shift the next notice down by one and skip it.
+    let mut index = window_start(messages, KEEP_TURNS, is_notice);
+    while index > 0 {
+        index -= 1;
+        if is_notice(&messages[index]) {
+            messages.remove(index);
+            stats.notices_dropped += 1;
+        }
+    }
+}
+
 fn drop_banners(messages: &mut Vec<serde_json::Value>, stats: &mut Stats) {
     // Walked from the end, so the first banner met is the newest and every
     // later removal is at a HIGHER index than any still to come — which is
@@ -416,7 +478,7 @@ fn drop_banners(messages: &mut Vec<serde_json::Value>, stats: &mut Stats) {
         }
         if kept_newest {
             messages.remove(index);
-            stats.banners_dropped += 1;
+            stats.notices_dropped += 1;
         } else {
             kept_newest = true;
         }
@@ -457,8 +519,9 @@ pub fn apply(body: &mut serde_json::Value, level: Compact) -> Stats {
     if level.does_writes() {
         elide_writes(messages, &mut stats);
     }
-    if level.does_banners() {
+    if level.does_notices() {
         drop_banners(messages, &mut stats);
+        drop_notices(messages, &mut stats);
     }
     stats
 }
@@ -695,7 +758,7 @@ mod tests {
         b["messages"] = json!(msgs);
 
         let stats = apply(&mut b, Compact::All);
-        assert_eq!(stats.banners_dropped, 2);
+        assert_eq!(stats.notices_dropped, 2);
         let banners: Vec<&str> = messages(&b)
             .iter()
             .filter(|m| m["role"] == "system")
@@ -703,14 +766,70 @@ mod tests {
             .collect();
         assert_eq!(banners, vec!["<total_tokens>2</total_tokens>"], "the newest survives");
 
-        // A `system` message that is not a banner is not a banner.
+        // A lone `system` message that is not a banner survives — it is inside
+        // the notice window, which is why. One notice, and KEEP_TURNS is six.
         let mut b = body();
         let mut msgs = messages(&b).clone();
         msgs.insert(0, json!({"role": "system", "content": "a real instruction"}));
         b["messages"] = json!(msgs);
         let stats = apply(&mut b, Compact::All);
-        assert_eq!(stats.banners_dropped, 0);
+        assert_eq!(stats.notices_dropped, 0);
         assert_eq!(messages(&b)[0]["content"], "a real instruction");
+    }
+
+    /// A stale injected notice is dropped, and only the newest `KEEP_TURNS`
+    /// are kept. The window is the whole rule for notices — there is no
+    /// marker to match, so age is the only thing that can separate one from
+    /// another, and the newest is also the least likely to be re-read.
+    #[test]
+    fn layer_c_drops_only_the_stale_system_notices() {
+        let pasted = KEEP_TURNS + 4;
+        let mut msgs = Vec::new();
+        for i in 0..pasted {
+            // Same wording, one in a `user` turn and one as a notice. Only the
+            // role decides; the text is a red herring on purpose.
+            let text = format!("[SYSTEM NOTIFICATION - NOT USER INPUT] thing {i}");
+            msgs.push(json!({"role": "user", "content": text}));
+            msgs.push(json!({"role": "system", "content": text}));
+        }
+        let mut b = json!({"model": "claude-opus-5", "max_tokens": 4096, "messages": msgs});
+
+        let stats = apply(&mut b, Compact::All);
+        assert_eq!(stats.notices_dropped, 4);
+
+        let kept: Vec<&str> = messages(&b)
+            .iter()
+            .filter(|m| m["role"] == "system")
+            .filter_map(|m| m["content"].as_str())
+            .collect();
+        assert_eq!(kept.len(), KEEP_TURNS);
+        assert!(kept.last().expect("kept").ends_with("thing 9"), "newest kept: {kept:?}");
+        assert_eq!(
+            messages(&b).iter().filter(|m| m["role"] == "user").count(),
+            pasted,
+            "a user turn that quotes a notice is still a turn"
+        );
+    }
+
+    /// Every level below `All` leaves notices exactly where they were.
+    #[test]
+    fn layer_c_is_the_only_level_that_touches_notices() {
+        for level in [Compact::None, Compact::Tools, Compact::ToolsThinking, Compact::Writes] {
+            let mut b = body();
+            let mut msgs = messages(&b).clone();
+            for i in 0..KEEP_TURNS + 3 {
+                msgs.insert(0, json!({"role": "system", "content": format!("note {i}")}));
+            }
+            b["messages"] = json!(msgs);
+
+            let stats = apply(&mut b, level);
+            assert_eq!(stats.notices_dropped, 0, "{level:?} dropped a notice");
+            assert_eq!(
+                messages(&b).iter().filter(|m| m["role"] == "system").count(),
+                KEEP_TURNS + 3,
+                "{level:?} touched a notice"
+            );
+        }
     }
 
     /// The invariant the whole feature is one mistake away from breaking: a
@@ -844,19 +963,20 @@ mod tests {
         );
         assert_eq!(
             sizes[2], sizes[3],
-            "this fixture only calls Bash, so layer D has nothing to stub: {sizes:?}"
+            "this fixture's Bash commands are one word, under the size gate, so \
+             layer D has nothing to stub: {sizes:?}"
         );
         assert_eq!(
             sizes[3], sizes[4],
-            "and it has no banners either, so all adds nothing over writes: {sizes:?}"
+            "and it has no system notices, so all adds nothing over writes: {sizes:?}"
         );
 
         // And the flags agree with the names.
-        assert!(!Compact::None.does_tools() && !Compact::None.does_thinking() && !Compact::None.does_banners());
+        assert!(!Compact::None.does_tools() && !Compact::None.does_thinking() && !Compact::None.does_notices());
         assert!(Compact::Tools.does_tools() && !Compact::Tools.does_thinking());
         assert!(Compact::ToolsThinking.does_thinking() && !Compact::ToolsThinking.does_writes());
-        assert!(Compact::Writes.does_writes() && !Compact::Writes.does_banners());
-        assert!(Compact::All.does_banners());
+        assert!(Compact::Writes.does_writes() && !Compact::Writes.does_notices());
+        assert!(Compact::All.does_notices());
     }
 
     // ---- Layer D ----------------------------------------------------------
@@ -1037,24 +1157,76 @@ mod tests {
         assert_eq!(before, after, "a small edit must not grow");
     }
 
-    /// The gate is the tool NAME, not the shape of `input`. A `Bash` call with
-    /// a long command is work the model may still need to read.
+    /// The gate is the tool NAME, not the shape of `input`. A tool outside both
+    /// families is left alone however long its strings are — `Bash` used to
+    /// stand here, and moved out when shell commands joined the stub set.
     #[test]
-    fn layer_d_does_not_touch_tools_that_are_not_file_writes() {
-        let command = "echo".to_owned() + &" a".repeat(4000);
+    fn layer_d_does_not_touch_tools_that_are_not_elidable() {
+        let pattern = "echo".to_owned() + &" a".repeat(4000);
         let mut b = turns(TURNS + 2, |_| {
             json!({
-                "type": "tool_use", "id": "call", "name": "Bash",
-                "input": {"command": command, "description": "long"},
+                "type": "tool_use", "id": "call", "name": "Grep",
+                "input": {"pattern": pattern, "path": "/tmp"},
             })
         });
         let stats = apply(&mut b, Compact::Writes);
         assert_eq!(stats.writes_elided, 0);
         assert!(
-            write_inputs(&b)[0]["command"]
+            write_inputs(&b)[0]["pattern"]
                 .as_str()
                 .expect("string")
                 .contains(" a a")
+        );
+    }
+
+    /// `Bash` is its own family, and the stub it leaves says so: a shell command
+    /// is not file content, and a body that said "file content elided" over a
+    /// command the model ran would misname what it dropped.
+    #[test]
+    fn layer_d_stubs_long_shell_commands_and_names_them() {
+        let command = "echo".to_owned() + &" a".repeat(4000);
+        let mut b = turns(TURNS + 2, |_| {
+            json!({
+                "type": "tool_use", "id": "call", "name": "Bash",
+                "input": {"command": command, "description": "long but short"},
+            })
+        });
+        let stats = apply(&mut b, Compact::Writes);
+        assert_eq!(stats.writes_elided, TURNS + 2 - KEEP_TURNS);
+
+        let input = &write_inputs(&b)[0];
+        let stub = input["command"].as_str().expect("string");
+        assert!(stub.starts_with(COMMAND_ELIDED_PREFIX), "{stub}");
+        assert!(
+            !stub.contains(WRITE_ELIDED_PREFIX),
+            "a command is not file content: {stub}"
+        );
+        // The small fields are still the model's to read.
+        assert_eq!(input["description"], "long but short");
+    }
+
+    /// A `Bash` block must not re-stub a body a `Write` pass left, and vice
+    /// versa: the families share one marker list, not one marker.
+    #[test]
+    fn layer_d_is_idempotent_across_the_two_families() {
+        let mut b = turns(TURNS + 2, |i| {
+            if i % 2 == 0 {
+                json!({"type": "tool_use", "id": "call", "name": "Bash",
+                       "input": {"command": "x".repeat(5000)}})
+            } else {
+                json!({"type": "tool_use", "id": "call", "name": "Write",
+                       "input": {"file_path": "/tmp/f.rs", "content": "y".repeat(5000)}})
+            }
+        });
+        let _ = apply(&mut b, Compact::Writes);
+        let mut twice = b.clone();
+        let stats = apply(&mut twice, Compact::Writes);
+        assert_eq!(serialized(&twice), serialized(&b), "idempotent");
+        assert_eq!(stats.writes_elided, 0, "and reports nothing to do");
+        let first = &write_inputs(&twice)[0];
+        assert!(
+            first["command"].as_str().expect("s").starts_with(COMMAND_ELIDED_PREFIX),
+            "the shell stub survived the second pass"
         );
     }
 
@@ -1118,15 +1290,15 @@ mod tests {
     /// layers A and B follow.
     #[test]
     fn layer_d_counts_its_window_over_qualifying_turns() {
-        // Ten writing turns; the newest two become `Bash`. The window keeps
+        // Ten writing turns; the newest two become `Read`. The window keeps
         // the six newest WRITES, which are now turns 2..7 — not the six newest
         // messages, which would have reached back to turn 2 as well only by
         // coincidence of the interleaving. What it must not do is keep the two
-        // Bash turns in place of two writes and stop at turn 4.
+        // Read turns in place of two writes and stop at turn 4.
         let mut b = turns(TURNS, |i| {
             if i >= TURNS - 2 {
-                return json!({"type": "tool_use", "id": format!("call_{i:02}"), "name": "Bash",
-                              "input": {"command": "ls"}});
+                return json!({"type": "tool_use", "id": format!("call_{i:02}"), "name": "Read",
+                              "input": {"file_path": "ls"}});
             }
             json!({
                 "type": "tool_use", "id": format!("call_{i:02}"), "name": "Write",
@@ -1141,7 +1313,7 @@ mod tests {
         let inputs = write_inputs(&b);
         for (i, input) in inputs.iter().enumerate() {
             // The prefix, not merely "has a content field": a kept write has
-            // one too, and a Bash input has none at all.
+            // one too, and a Read input has none at all.
             let stubbed = input["content"]
                 .as_str()
                 .is_some_and(|s| s.starts_with(WRITE_ELIDED_PREFIX));
