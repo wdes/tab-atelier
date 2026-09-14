@@ -6,7 +6,7 @@
 //! account store, which is what keeps the audit trail independent of the
 //! routing decision it records.
 
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::IpAddr;
 
 use hyper::HeaderMap;
 
@@ -18,7 +18,7 @@ use hyper::HeaderMap;
 /// because every caller's next move is to look it up in the store, and a
 /// missing key and a wrong key are the same event from here.
 #[must_use]
-pub(crate) fn presented(req: &crate::transport::InReq) -> String {
+pub fn presented(req: &crate::transport::InReq) -> String {
     let header = |name: &str| {
         req.headers
             .get(name)
@@ -40,7 +40,7 @@ pub(crate) fn presented(req: &crate::transport::InReq) -> String {
 
 /// The first value of a header, trimmed, non-empty.
 #[must_use]
-pub(crate) fn header_of(headers: &HeaderMap, name: &str) -> Option<String> {
+pub fn header_of(headers: &HeaderMap, name: &str) -> Option<String> {
     headers
         .get(name)
         .and_then(|v| v.to_str().ok())
@@ -56,7 +56,7 @@ pub(crate) fn header_of(headers: &HeaderMap, name: &str) -> Option<String> {
 /// audit trail worth reading: without it, a client could write someone else's
 /// address into their own row.
 #[must_use]
-pub(crate) fn client_ip(headers: &HeaderMap, peer: IpAddr) -> String {
+pub fn client_ip(headers: &HeaderMap, peer: IpAddr) -> String {
     if !is_trusted_hop(peer) {
         return peer.to_string();
     }
@@ -80,7 +80,7 @@ pub(crate) fn client_ip(headers: &HeaderMap, peer: IpAddr) -> String {
 /// Loopback, private and link-local all count: the proxy sits behind a TLS
 /// terminator that is one of the three.
 #[must_use]
-pub(crate) const fn is_trusted_hop(peer: IpAddr) -> bool {
+pub const fn is_trusted_hop(peer: IpAddr) -> bool {
     match peer {
         IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
         IpAddr::V6(v6) => {
@@ -95,9 +95,10 @@ pub(crate) const fn is_trusted_hop(peer: IpAddr) -> bool {
 }
 
 /// A loopback address, for when a transport cannot report a peer.
+#[cfg(test)]
 #[must_use]
-pub(crate) const fn unknown_peer() -> IpAddr {
-    IpAddr::V4(Ipv4Addr::LOCALHOST)
+pub const fn unknown_peer() -> IpAddr {
+    IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
 }
 
 #[cfg(test)]

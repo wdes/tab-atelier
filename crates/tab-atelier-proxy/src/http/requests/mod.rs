@@ -37,7 +37,7 @@ pub use user::{AddUser, PinModel, PinProvider, SetDisabled, SetWeight};
 
 use bytes::Bytes;
 
-use crate::transport::{Reply, json};
+use crate::transport::{Reply, json_of};
 
 /// A request body that refuses to become a value when it is not valid.
 ///
@@ -45,7 +45,7 @@ use crate::transport::{Reply, json};
 /// all and a body that is JSON but says something impossible are different
 /// failures, and the second should be able to say which field it is unhappy
 /// with. `serde` reports the first; `validate` reports the second.
-pub trait Validated: Sized + serde::de::DeserializeOwned {
+pub trait Validated: Sized {
     /// The rules that span more than one field.
     ///
     /// Returns the sentence to show the caller on refusal. Field-level shape —
@@ -60,15 +60,50 @@ pub trait Validated: Sized + serde::de::DeserializeOwned {
 
     /// Parse and validate in one step, as a controller would.
     ///
+    /// A request whose wire shape is not its struct shape — the tool policy,
+    /// which arrives either wrapped or bare — implements this directly instead
+    /// of bending the struct to fit whichever caller was written first. Every
+    /// other request forwards to [`parse`], which is this same default with the
+    /// `serde` bound made explicit.
+    ///
     /// # Errors
     ///
     /// [`Rejection`] with 400, either because the body is not valid JSON for
     /// this type or because [`Validated::validate`] refused it.
-    fn accept(body: &Bytes) -> Result<Self, Rejection> {
-        let parsed: Self = serde_json::from_slice(body).map_err(|e| Rejection::malformed(&e))?;
-        parsed.validate().map_err(Rejection::refused)?;
-        Ok(parsed)
+    fn accept(body: &Bytes) -> Result<Self, Rejection>;
+
+    /// The body of an inbound request, parsed and validated.
+    ///
+    /// This is what a route calls; [`Validated::accept`] is the half that knows
+    /// about JSON, so a test can drive a request from bytes without a socket.
+    ///
+    /// # Errors
+    ///
+    /// [`Rejection`], ready to become the reply.
+    fn from_request(req: &crate::transport::InReq) -> Result<Self, Rejection> {
+        Self::accept(&req.body)
     }
+}
+
+/// The `serde` half of [`Validated::accept`], for the requests whose wire shape
+/// is their struct shape.
+///
+/// It is a free function rather than a default method so that a request with a
+/// bespoke body — the tool policy, which may arrive wrapped or bare — is not
+/// forced to pretend it implements `Deserialize` just to satisfy a bound it
+/// never uses.
+///
+/// # Errors
+///
+/// [`Rejection`] with 400, naming the malformed field when `serde` can, or the
+/// rule that was broken when [`Validated::validate`] can.
+pub fn parse<T>(body: &Bytes) -> Result<T, Rejection>
+where
+    T: Validated + serde::de::DeserializeOwned,
+{
+    let parsed: T = serde_json::from_slice(body).map_err(|e| Rejection::malformed(&e))?;
+    parsed.validate().map_err(Rejection::refused)?;
+    Ok(parsed)
 }
 
 /// A refused request body, ready to become the response.
@@ -100,6 +135,19 @@ impl Rejection {
         }
     }
 
+    /// A body that broke a rule about one named field.
+    ///
+    /// The field is named in the sentence because a form with eight inputs and
+    /// a bare "invalid" is a guessing game; the caller has somewhere to put
+    /// the answer, so the answer says where.
+    #[must_use]
+    pub fn field(name: &str, why: &str) -> Self {
+        Self {
+            status: 400,
+            message: format!("{name}: {why}"),
+        }
+    }
+
     /// Whether the refusal mentions `needle` — for asserting that a message
     /// names the field it is about, not merely that it has a nonzero length.
     #[must_use]
@@ -110,7 +158,10 @@ impl Rejection {
 
 impl From<Rejection> for Reply {
     fn from(r: Rejection) -> Self {
-        json(r.status, &serde_json::json!({ "error": r.message }).to_string())
+        json_of(
+            r.status,
+            &crate::http::resources::status::ProblemResource::of(r.message),
+        )
     }
 }
 
@@ -200,6 +251,10 @@ mod tests {
             } else {
                 Ok(())
             }
+        }
+
+        fn accept(body: &Bytes) -> Result<Self, Rejection> {
+            parse(body)
         }
     }
 

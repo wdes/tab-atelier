@@ -2,7 +2,7 @@
 
 //! Arming request inspection.
 
-use super::Validated;
+use super::{Rejection, Validated};
 
 /// How long to capture requests for.
 ///
@@ -32,6 +32,10 @@ impl ArmInspect {
 impl Validated for ArmInspect {
     fn validate(&self) -> Result<(), String> {
         Ok(())
+    }
+
+    fn accept(body: &bytes::Bytes) -> Result<Self, Rejection> {
+        super::parse(body)
     }
 }
 

@@ -790,8 +790,8 @@ fn a_providers_429_does_not_pause_the_subscription() {
         sched.snapshot(tab_atelier_proxy::server::now_ms())
     };
     assert_eq!(
-        snap["backoff_for"], 0,
-        "a provider's 429 must not set the SUBSCRIPTION's backoff: {snap}"
+        snap.backoff_for, 0,
+        "a provider's 429 must not set the SUBSCRIPTION's backoff: {snap:?}"
     );
 
     let _ = std::fs::remove_dir_all(&dir);
