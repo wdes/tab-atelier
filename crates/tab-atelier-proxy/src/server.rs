@@ -50,6 +50,13 @@ pub struct State {
     pub inspect: Mutex<inspect::Store>,
     pub admin_token: String,
     pub web_root: Option<std::path::PathBuf>,
+    /// The nonces handed out with a `WWW-Authenticate` challenge, and the
+    /// secret that makes them unforgeable.
+    ///
+    /// On the state rather than in a global because the secret is per process
+    /// and a test that wants a fresh one — or two that must not accept each
+    /// other's nonces — needs it to be.
+    pub web_auth: crate::http::auth::Nonces,
 }
 
 impl State {
@@ -97,6 +104,7 @@ impl State {
             inspect: Mutex::new(inspect::Store::load(&dir)),
             admin_token,
             web_root: None,
+            web_auth: crate::http::auth::Nonces::new(),
         }
     }
 }

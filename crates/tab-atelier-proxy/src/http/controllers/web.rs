@@ -32,6 +32,10 @@ pub(crate) fn web(path: &str, state: &State) -> Reply {
         Some("css") => "text/css; charset=utf-8",
         Some("map" | "json") => "application/json",
         Some("txt") => "text/plain; charset=utf-8",
+        // Named rather than left to the `octet-stream` default: browsers sniff a
+        // favicon either way, but a wrong type shows up as a broken icon in a
+        // tab and as a download in some clients.
+        Some("ico") => "image/x-icon",
         _ => "application/octet-stream",
     };
     // index.html may not be cached: its whole job is to name the current

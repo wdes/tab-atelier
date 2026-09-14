@@ -505,6 +505,10 @@ fn serve(listen: &str) -> Result<(), String> {
         provider_backoff: Mutex::new(std::collections::BTreeMap::new()),
         admin_token: token,
         web_root: root,
+        // Fresh per process, so a restart invalidates outstanding nonces and
+        // the browser prompts once more. The alternative is a secret on disk,
+        // which is a secret to leak.
+        web_auth: tab_atelier_proxy::http::auth::Nonces::new(),
     });
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

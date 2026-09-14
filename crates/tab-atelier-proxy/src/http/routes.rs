@@ -33,11 +33,12 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use rocket::http::Status;
 use rocket::{Route, State, catch, delete, get, head, options, post, put, routes};
 
 use crate::http::body::Json;
 use crate::http::controllers::{account, hello, inspect, key, mapping, me, provider, relay, usage, web};
-use crate::http::guards::{Admin, Arrival, ClientKey};
+use crate::http::guards::{Admin, Arrival, ClientKey, WebAuth};
 use crate::http::raw::Raw;
 use crate::http::requests::compact::SetCompact;
 use crate::http::requests::inspect::ArmInspect;
@@ -333,8 +334,13 @@ pub(crate) fn disarm_inspect(state: &State<Arc<AppState>>, _admin: Admin) -> Rep
 /// the single-page app's shell — which is what makes a deep link into the UI
 /// work. The rank is what puts it last: without it this would answer
 /// `/api/users` with an HTML page and the API would look broken.
+///
+/// `_auth: WebAuth` is the whole of the gating: the page, its scripts, its
+/// styles and the vendored libraries all come through here, so requiring a
+/// credential on this route requires one for every one of them. A crawler never
+/// gets past the first request.
 #[get("/<path..>", rank = 20)]
-pub(crate) fn ui(state: &State<Arc<AppState>>, path: PathBuf) -> Reply {
+pub(crate) fn ui(state: &State<Arc<AppState>>, _auth: WebAuth, path: PathBuf) -> Reply {
     // A tail wildcard's `PathBuf` carries the segments without the leading
     // slash, and everything below compares against full paths.
     let path = format!("/{}", path.to_string_lossy());
@@ -451,10 +457,30 @@ pub(crate) fn bad_request() -> Reply {
     crate::http::problem(400, "the request could not be read")
 }
 
-/// A key that did not authenticate.
+/// Nothing signed in, or the wrong key.
+///
+/// One catcher for both because a guard picks its own status and leaves its own
+/// sentence behind; what it cannot do is add a header to the response, and a
+/// browser only prompts when it is challenged. So the challenge goes on here,
+/// and only for a gated path — a relay refusal must NOT carry it, because the
+/// client is a CLI that would try to interpret it as a browser would.
 #[catch(401)]
-pub(crate) fn unauthorized() -> Reply {
-    crate::http::problem(401, "no valid key")
+pub(crate) fn unauthorized(req: &rocket::Request<'_>) -> Reply {
+    let refusal = crate::http::refusal::recall(req, Status::Unauthorized, "no valid credential");
+    let mut reply = crate::http::problem(401, refusal.message);
+    if !crate::http::auth::gated(req.uri().path().as_str(), req.method()) {
+        return reply;
+    }
+    // A missing state means the server was built without it, which some tests
+    // do; there is then no secret to mint a nonce with, so the 401 goes out
+    // without a challenge rather than panicking.
+    if let Some(state) = req.rocket().state::<Arc<AppState>>() {
+        reply = reply.with_header(
+            "www-authenticate",
+            crate::http::auth::challenge(&state.web_auth, crate::usage::now_secs()),
+        );
+    }
+    reply
 }
 
 /// A request the account is not allowed to make.
