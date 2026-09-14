@@ -84,6 +84,30 @@ impl CredentialsResource {
 mod tests {
     use super::*;
 
+    /// The credentials response says what was installed and for whom.
+    ///
+    /// Only reachable in production after a successful repair, which needs a
+    /// real upstream — so the shape is pinned here instead.
+    #[test]
+    fn a_successful_install_names_the_account_it_was_for() {
+        let r = CredentialsResource::installed("ada@example.com");
+        assert!(r.installed);
+        assert_eq!(r.account, "ada@example.com");
+
+        let value = serde_json::to_value(&r).expect("serialize");
+        assert_eq!(value["installed"], true);
+        assert_eq!(value["account"], "ada@example.com");
+    }
+
+    /// The account is optional in practice — an upstream that does not say who
+    /// the credential belongs to still leaves a usable one installed.
+    #[test]
+    fn an_install_with_nobody_named_is_still_an_install() {
+        let r = CredentialsResource::installed(String::new());
+        assert!(r.installed, "the flag is about the credential, not the name");
+        assert!(r.account.is_empty());
+    }
+
     #[test]
     fn a_problem_names_the_error_and_nothing_else() {
         let body = serde_json::to_value(ProblemResource::of("no such user")).expect("serializes");
