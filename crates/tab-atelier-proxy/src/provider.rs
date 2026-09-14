@@ -292,6 +292,28 @@ impl Peak {
                 && hour < i8::try_from(w.end_hour).unwrap_or(0)
         })
     }
+
+    /// When the peak in force right now ends, as a Unix second.
+    ///
+    /// `None` when no window is active. Windows are hour-granular and UTC, so
+    /// the search walks the hour boundary rather than the request instant: the
+    /// answer is exact, and it crosses midnight and weekday changes without
+    /// special-casing them. A schedule that somehow never clears reports `None`
+    /// ("in force", no end) rather than inventing one.
+    #[must_use]
+    pub fn active_until(&self, unix_secs: u64) -> Option<u64> {
+        if !self.active_at(unix_secs) {
+            return None;
+        }
+        let mut at = (unix_secs / 3_600 + 1) * 3_600;
+        for _ in 0..(24 * 8) {
+            if !self.active_at(at) {
+                return Some(at);
+            }
+            at += 3_600;
+        }
+        None
+    }
 }
 
 /// Somewhere requests can go.
@@ -386,6 +408,13 @@ impl Provider {
     #[must_use]
     pub fn peak_now(&self, now: u64) -> bool {
         self.peak.as_ref().is_some_and(|p| p.active_at(now))
+    }
+
+    /// When the peak in force right now ends, so the UI can say "until HH:MM"
+    /// rather than only that peak is on.
+    #[must_use]
+    pub fn peak_until(&self, now: u64) -> Option<u64> {
+        self.peak.as_ref().and_then(|p| p.active_until(now))
     }
 
     /// Whether sending to this provider spends the shared Claude subscription.
@@ -1137,6 +1166,26 @@ mod tests {
         // the schedule at all rather than a number in a comment.
         assert_eq!(ds.cost_at(flash, 1_789_005_600), off_peak * 2);
         assert_eq!(ds.cost_at(flash, 1_789_016_400), off_peak);
+    }
+
+    /// "Peak now" without an end is a warning nobody can plan around. The end
+    /// must land on the window's boundary hour, not on the request instant
+    /// rounded forward — that would be up to 59 minutes late.
+    #[test]
+    fn an_active_window_reports_when_it_ends() {
+        let ds = Preset::Deepseek.provider(Path::new("/tmp"));
+
+        // Thursday 09:30 UTC, halfway through the 06:00–10:00 window.
+        let until = ds.peak_until(1_789_032_600).expect("an active window has an end");
+        assert_eq!(until, 1_789_034_400, "ends at 10:00 UTC, not at 09:59 or 10:30");
+        // Half-open: still in force the second before, off at the boundary.
+        assert!(ds.peak_now(until - 1));
+        assert!(!ds.peak_now(until));
+
+        // Off-peak has no end to show — the UI would otherwise print a time
+        // for a surcharge that is not being charged.
+        assert_eq!(ds.peak_until(1_789_016_400), None, "Thu 05:00 UTC is off-peak");
+        assert_eq!(ds.peak_until(1_789_178_400), None, "Saturday is off-peak too");
     }
 
     /// A withdrawn model must not be offered, however cheap it looks.

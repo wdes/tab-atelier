@@ -1896,6 +1896,7 @@ fn providers_json(state: &State) -> Response<Body> {
                     "preference": p.preference,
                     "enabled": p.enabled,
                     "peak_now": p.peak_now(now),
+                    "peak_until": p.peak_until(now),
                     "peak": p.peak,
                     // Whether the UI may offer anything but `none` for traffic
                     // through here, and why not. Level-independent: the harm
