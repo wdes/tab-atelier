@@ -34,7 +34,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use rocket::http::Status;
-use rocket::{Route, State, catch, delete, get, head, options, post, put, routes};
+use rocket::{Route, State, catch, delete, get, head, options, post, routes};
 
 use crate::http::body::Json;
 use crate::http::controllers::{account, hello, inspect, key, mapping, me, provider, relay, usage, web};
@@ -154,7 +154,7 @@ pub(crate) fn remove_user(state: &State<Arc<AppState>>, _admin: Admin, account: 
 }
 
 /// Switch an account off, or back on.
-#[put("/api/users/<account>/disabled", data = "<body>")]
+#[post("/api/users/<account>/disabled", data = "<body>")]
 pub(crate) fn set_user_disabled(
     state: &State<Arc<AppState>>,
     _admin: Admin,
@@ -165,7 +165,7 @@ pub(crate) fn set_user_disabled(
 }
 
 /// How much of the pool this account may take.
-#[put("/api/users/<account>/weight", data = "<body>")]
+#[post("/api/users/<account>/weight", data = "<body>")]
 pub(crate) fn set_user_weight(
     state: &State<Arc<AppState>>,
     _admin: Admin,
@@ -176,7 +176,7 @@ pub(crate) fn set_user_weight(
 }
 
 /// Which provider this account relays through.
-#[put("/api/users/<account>/provider", data = "<body>")]
+#[post("/api/users/<account>/provider", data = "<body>")]
 pub(crate) fn set_user_provider(
     state: &State<Arc<AppState>>,
     _admin: Admin,
@@ -187,7 +187,7 @@ pub(crate) fn set_user_provider(
 }
 
 /// Pin this account to one model on its provider.
-#[put("/api/users/<account>/model", data = "<body>")]
+#[post("/api/users/<account>/model", data = "<body>")]
 pub(crate) fn set_user_model(
     state: &State<Arc<AppState>>,
     _admin: Admin,
@@ -198,7 +198,7 @@ pub(crate) fn set_user_model(
 }
 
 /// How much history this account keeps before a conversation is compacted.
-#[put("/api/users/<account>/compact", data = "<body>")]
+#[post("/api/users/<account>/compact", data = "<body>")]
 pub(crate) fn set_user_compact(
     state: &State<Arc<AppState>>,
     _admin: Admin,
@@ -209,7 +209,7 @@ pub(crate) fn set_user_compact(
 }
 
 /// The tools this account may call.
-#[put("/api/users/<account>/tools", data = "<body>")]
+#[post("/api/users/<account>/tools", data = "<body>")]
 pub(crate) fn set_user_tools(
     state: &State<Arc<AppState>>,
     _admin: Admin,
@@ -228,7 +228,7 @@ pub(crate) fn add_key(state: &State<Arc<AppState>>, _admin: Admin, account: &str
 }
 
 /// Disable one key, or bring it back.
-#[put("/api/users/<account>/keys/<key>", data = "<body>")]
+#[post("/api/users/<account>/keys/<key>", data = "<body>")]
 pub(crate) fn set_key_disabled(
     state: &State<Arc<AppState>>,
     _admin: Admin,
@@ -260,7 +260,7 @@ pub(crate) fn save_provider(state: &State<Arc<AppState>>, _admin: Admin, body: J
 }
 
 /// Replace a provider's key without changing anything else.
-#[put("/api/providers/<id>/key", data = "<body>")]
+#[post("/api/providers/<id>/key", data = "<body>")]
 pub(crate) fn rotate_provider_key(
     state: &State<Arc<AppState>>,
     _admin: Admin,

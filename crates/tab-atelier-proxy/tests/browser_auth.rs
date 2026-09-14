@@ -86,35 +86,63 @@ fn free_port() -> u16 {
     l.local_addr().expect("addr").port()
 }
 
-/// A server on a scratch directory, with the real assets behind it.
+/// A running proxy, owning everything it needs to keep running.
 ///
-/// Returns the port and the operator token.
-fn start(name: &str) -> (Serving, u16, String) {
-    let scratch = Scratch::new(name);
-    let port = free_port();
-    let token = cli(scratch.path(), &["admin-token"]).trim().to_owned();
-    assert!(token.starts_with("tap_"), "unexpected token: {token}");
+/// One struct rather than a tuple because the scratch directory has to outlive
+/// the server: dropping it deletes the state the server is still writing to.
+/// Returning it detached from the child is how the first version of this file
+/// removed its own working directory mid-test.
+struct Proxy {
+    #[allow(dead_code, reason = "held for its Drop: it deletes the directory")]
+    scratch: Scratch,
+    #[allow(dead_code, reason = "held for its Drop: it kills the server")]
+    child: Serving,
+    port: u16,
+    token: String,
+}
 
-    let child = Command::new(BIN)
-        .args(["serve", "--listen", &format!("127.0.0.1:{port}")])
-        .env("TAB_ATELIER_PROXY_CONFIG", scratch.path().join("config"))
-        .env("TAB_ATELIER_PROXY_STATE", scratch.path().join("state"))
-        .env("HOME", scratch.path().join("home"))
-        // The repository's own assets, so `/` serves a real page rather than
-        // whatever the installed package happens to hold.
-        .env(
-            "TAB_ATELIER_PROXY_WEB",
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("assets"),
-        )
-        .env("RUST_LOG", "warn")
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn the proxy");
+impl Proxy {
+    /// Start on a fresh scratch directory, with the real assets behind it.
+    fn start(name: &str) -> Self {
+        Self::start_with(Scratch::new(name))
+    }
 
-    let mut serving = Serving(child);
-    wait_until_listening(port, &mut serving.0);
-    (serving, port, token)
+    /// Start against a directory the caller has already prepared.
+    ///
+    /// This is how a test gets an installation with accounts or keys in it
+    /// before the server comes up — the CLI writes the same files the server
+    /// reads, so arranging state means running the CLI first.
+    fn start_with(scratch: Scratch) -> Self {
+        let port = free_port();
+        let token = cli(scratch.path(), &["admin-token"]).trim().to_owned();
+        assert!(token.starts_with("tap_"), "unexpected token: {token}");
+
+        let child = Command::new(BIN)
+            .args(["serve", "--listen", &format!("127.0.0.1:{port}")])
+            .env("TAB_ATELIER_PROXY_CONFIG", scratch.path().join("config"))
+            .env("TAB_ATELIER_PROXY_STATE", scratch.path().join("state"))
+            .env("HOME", scratch.path().join("home"))
+            // The repository's own assets, so `/` serves a real page rather than
+            // whatever the installed package happens to hold.
+            .env(
+                "TAB_ATELIER_PROXY_WEB",
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("assets"),
+            )
+            .env("RUST_LOG", "warn")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn the proxy");
+
+        let mut child = Serving(child);
+        wait_until_listening(port, &mut child.0);
+        Self {
+            scratch,
+            child,
+            port,
+            token,
+        }
+    }
 }
 
 /// Block until the port answers, or the server dies trying.
@@ -243,10 +271,13 @@ fn signed_get(port: u16, path: &str, token: &str) -> String {
 ///
 /// This is the list from the request, and it is the whole feature: if any of
 /// these answers without a credential, a scraper has something to read.
-const GATED: [&str; 11] = [
+const GATED: [&str; 13] = [
     "/",
     "/index.html",
-    "/styles.css",
+    // The real asset names. There is no `/styles.css`: the only style sheet is
+    // the distribution's bootstrap, which the web controller falls back to
+    // under `/usr/share/javascript/`.
+    "/vendor/bootstrap.min.css",
     "/app.js",
     "/charts.js",
     "/vendor/vue.global.prod.js",
@@ -255,12 +286,19 @@ const GATED: [&str; 11] = [
     "/api/usage",
     "/api/inspect",
     "/api/pressure",
+    // The bare parents of the two exempt prefixes. Neither is a route, so
+    // exempting one would only mean an unauthenticated request falls through to
+    // the SPA catch-all and is handed the HTML shell — which is precisely what
+    // the gate is for.
+    "/me",
+    "/relay",
 ];
 
 /// Nothing on the gated list may be read without a credential.
 #[test]
 fn nothing_serves_a_page_or_a_script_without_signing_in() {
-    let (_serving, port, _token) = start("gated");
+    let proxy = Proxy::start("gated");
+    let port = proxy.port;
 
     for path in GATED {
         let response = get(port, path);
@@ -284,7 +322,8 @@ fn nothing_serves_a_page_or_a_script_without_signing_in() {
 /// The refusal is a challenge a browser can answer.
 #[test]
 fn the_refusal_is_a_digest_challenge_a_browser_answers() {
-    let (_serving, port, _token) = start("challenge");
+    let proxy = Proxy::start("challenge");
+    let port = proxy.port;
     let response = get(port, "/");
 
     assert_eq!(status(&response), 401);
@@ -313,16 +352,18 @@ fn the_refusal_is_a_digest_challenge_a_browser_answers() {
 /// the dashboard actually load.
 #[test]
 fn a_correct_credential_serves_the_page_and_its_assets() {
-    let (_serving, port, token) = start("signed-in");
+    let proxy = Proxy::start("signed-in");
+    let port = proxy.port;
+    let token = &proxy.token;
 
     for path in [
         "/",
         "/index.html",
-        "/styles.css",
         "/app.js",
+        "/charts.js",
         "/vendor/vue.global.prod.js",
     ] {
-        let response = signed_get(port, path, &token);
+        let response = signed_get(port, path, token);
         assert_eq!(
             status(&response),
             200,
@@ -333,15 +374,66 @@ fn a_correct_credential_serves_the_page_and_its_assets() {
     }
 
     // The page is the real one, not a placeholder.
-    let page = signed_get(port, "/", &token);
+    let page = signed_get(port, "/", token);
     assert!(body(&page).contains("<html"), "the page is not HTML");
+}
+
+/// Every asset comes back with the content type a browser will act on.
+///
+/// Asserting the bytes arrive is not enough: a reply's *type* is what decides
+/// whether the browser executes it. A `.js` served as `application/json` is
+/// refused outright when the response says not to sniff, and the dashboard
+/// renders blank with one console line and no clue which layer was at fault —
+/// which is exactly what happened when the `Responder` adapter overrode the
+/// type the web controller had worked out. This is the check that catches it,
+/// and it is a wire-level one because a unit test of the adapter did not.
+#[test]
+fn each_asset_is_served_with_the_type_a_browser_needs() {
+    let proxy = Proxy::start("content-types");
+    let port = proxy.port;
+    let token = &proxy.token;
+
+    // The gated assets: these need a credential, so they are fetched with one.
+    for (path, want) in [
+        ("/", "text/html"),
+        ("/index.html", "text/html"),
+        ("/app.js", "application/javascript"),
+        ("/charts.js", "application/javascript"),
+        ("/vendor/vue.global.prod.js", "application/javascript"),
+    ] {
+        let response = signed_get(port, path, token);
+        assert_eq!(status(&response), 200, "{path} was refused");
+        let got = header(&response, "content-type").unwrap_or_else(|| panic!("{path} answered with no content type"));
+        assert!(
+            got.starts_with(want),
+            "{path} was served as `{got}` rather than `{want}` — a browser will refuse it"
+        );
+        assert_ne!(
+            got, "application/json",
+            "{path} was served as JSON, which is the adapter overriding the handler"
+        );
+    }
+
+    // And the two exempt ones, which are fetched without a credential — so
+    // `signed_get` would fail on them before the type was ever seen.
+    for (path, want) in [("/robots.txt", "text/plain"), ("/favicon.ico", "image/x-icon")] {
+        let response = get(port, path);
+        assert_eq!(status(&response), 200, "{path}");
+        let got = header(&response, "content-type").unwrap_or_else(|| panic!("{path} answered with no content type"));
+        assert!(
+            got.starts_with(want),
+            "{path} was served as `{got}` rather than `{want}`"
+        );
+    }
 }
 
 /// The API is behind the same credential, and answers with data.
 #[test]
 fn the_api_opens_with_the_same_credential_as_the_page() {
-    let (_serving, port, token) = start("api");
-    let response = signed_get(port, "/api/users", &token);
+    let proxy = Proxy::start("api");
+    let port = proxy.port;
+    let token = &proxy.token;
+    let response = signed_get(port, "/api/users", token);
 
     assert_eq!(status(&response), 200);
     let parsed: serde_json::Value = serde_json::from_str(&body(&response)).expect("JSON");
@@ -354,12 +446,14 @@ fn the_api_opens_with_the_same_credential_as_the_page() {
 /// acceptable directly — the same secret, presented differently.
 #[test]
 fn the_operator_token_is_accepted_without_a_challenge() {
-    let (_serving, port, token) = start("token-header");
+    let proxy = Proxy::start("token-header");
+    let port = proxy.port;
+    let token = &proxy.token;
 
-    for header_line in [
-        format!("Authorization: Bearer {token}"),
-        format!("x-tab-atelier-token: {token}"),
-    ] {
+    // The two the server actually reads (`arrival::presented`). An earlier
+    // version of this test used `x-tab-atelier-token`, which nothing reads —
+    // so it was testing the test's own invention rather than the server.
+    for header_line in [format!("Authorization: Bearer {token}"), format!("x-api-key: {token}")] {
         let response = http(
             port,
             &format!("GET /api/users HTTP/1.1\r\nHost: x\r\n{header_line}\r\nConnection: close\r\n\r\n"),
@@ -375,51 +469,31 @@ fn the_operator_token_is_accepted_without_a_challenge() {
 /// rewrite every account.
 #[test]
 fn a_relay_key_does_not_open_the_operator_surface() {
+    // Arrange the account and its key with the CLI before the server starts:
+    // the CLI writes the same files the server reads.
     let scratch = Scratch::new("relay-key");
-    let port = free_port();
-    let token = cli(scratch.path(), &["admin-token"]).trim().to_owned();
-    cli(
-        scratch.path(),
-        &[
-            "add-user",
-            "--first",
-            "Ada",
-            "--last",
-            "Lovelace",
-            "--email",
-            "ada@example.com",
-        ],
-    );
-    let minted = cli(
-        scratch.path(),
-        &["add-key", "--email", "ada@example.com", "--name", "laptop"],
-    );
-    // The CLI prints the secret somewhere in its output.
-    let key = minted
-        .split_whitespace()
-        .find(|w| w.starts_with("tap_key_") || (w.starts_with("tap_") && *w != token))
-        .unwrap_or_else(|| panic!("no key in the CLI output: {minted}"))
-        .to_owned();
+    cli(scratch.path(), &["add", "Ada", "Lovelace", "ada@example.com"]);
+    // The subcommands take positional arguments. `add` deliberately prints no
+    // key — a key is named after the machine it lives on, so `add-key` is the
+    // step that mints one.
+    let minted = cli(scratch.path(), &["add-key", "ada@example.com", "laptop"]);
+    let proxy = Proxy::start_with(scratch);
+    let port = proxy.port;
 
-    let child = Command::new(BIN)
-        .args(["serve", "--listen", &format!("127.0.0.1:{port}")])
-        .env("TAB_ATELIER_PROXY_CONFIG", scratch.path().join("config"))
-        .env("TAB_ATELIER_PROXY_STATE", scratch.path().join("state"))
-        .env("HOME", scratch.path().join("home"))
-        .env(
-            "TAB_ATELIER_PROXY_WEB",
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("assets"),
-        )
-        .env("RUST_LOG", "warn")
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn");
-    let mut serving = Serving(child);
-    wait_until_listening(port, &mut serving.0);
+    // Read by its marker rather than by prefix: the operator token uses the
+    // same `tap_` prefix, so a prefix match would pick up either depending on
+    // the order they happened to appear in.
+    let key = minted
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("key: "))
+        .unwrap_or_else(|| panic!("no key in the CLI output: {minted}"))
+        .trim()
+        .to_owned();
+    assert!(key.starts_with("tap_"), "unexpected key: {key}");
+    assert_ne!(key, proxy.token, "the key must not be the operator token");
 
     // Presented as a browser credential, it must fail: the digest is computed
-    // against the operator token, so a key simply does not produce a match.
+    // against the operator token, so a user key simply does not produce a match.
     let challenge = get(port, "/api/users");
     assert_eq!(status(&challenge), 401);
     let forged = credential(&key, "GET", "/api/users", &nonce_of(&challenge));
@@ -432,15 +506,38 @@ fn a_relay_key_does_not_open_the_operator_surface() {
         401,
         "a user's relay key must not administer the proxy"
     );
+
+    // And the same key IS good for the relay, which is what it is for. Without
+    // this the test above would pass even if the key were simply invalid.
+    //
+    // The assertion is on the proxy's own wording rather than on the status:
+    // this request goes on to a provider, and a provider is entitled to answer
+    // 401 — Anthropic does, for the fake token this fixture uses — so a status
+    // check would confuse "the proxy refused the key" with "the provider
+    // refused the token". `no valid key` is a string only this proxy produces.
+    let relay = http(
+        port,
+        &format!(
+            "POST /relay/anthropic/v1/messages HTTP/1.1\r\nHost: x\r\nx-api-key: {key}\r\n\
+             Content-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+        ),
+    );
+    assert!(
+        !body(&relay).contains("no valid key"),
+        "the relay refused a valid key: {}",
+        &relay[..relay.len().min(300)]
+    );
 }
 
 /// Replaying a captured credential fails.
 #[test]
 fn a_captured_credential_cannot_be_replayed() {
-    let (_serving, port, token) = start("replay");
+    let proxy = Proxy::start("replay");
+    let port = proxy.port;
+    let token = &proxy.token;
 
     let challenge = get(port, "/api/users");
-    let credential = credential(&token, "GET", "/api/users", &nonce_of(&challenge));
+    let credential = credential(token, "GET", "/api/users", &nonce_of(&challenge));
     let request =
         format!("GET /api/users HTTP/1.1\r\nHost: x\r\nAuthorization: {credential}\r\nConnection: close\r\n\r\n");
 
@@ -455,11 +552,13 @@ fn a_captured_credential_cannot_be_replayed() {
 /// A credential is bound to the path it was made for.
 #[test]
 fn a_credential_made_for_one_path_does_not_open_another() {
-    let (_serving, port, token) = start("path-bound");
+    let proxy = Proxy::start("path-bound");
+    let port = proxy.port;
+    let token = &proxy.token;
 
     let challenge = get(port, "/api/users");
     // Computed for `/`, then sent at `/api/users`.
-    let credential = credential(&token, "GET", "/", &nonce_of(&challenge));
+    let credential = credential(token, "GET", "/", &nonce_of(&challenge));
     let response = http(
         port,
         &format!("GET /api/users HTTP/1.1\r\nHost: x\r\nAuthorization: {credential}\r\nConnection: close\r\n\r\n"),
@@ -470,10 +569,12 @@ fn a_credential_made_for_one_path_does_not_open_another() {
 /// A credential made for another verb does not open this one.
 #[test]
 fn a_credential_made_for_a_get_does_not_authorize_a_delete() {
-    let (_serving, port, token) = start("verb-bound");
+    let proxy = Proxy::start("verb-bound");
+    let port = proxy.port;
+    let token = &proxy.token;
 
     let challenge = get(port, "/api/users/nobody");
-    let credential = credential(&token, "GET", "/api/users/nobody", &nonce_of(&challenge));
+    let credential = credential(token, "GET", "/api/users/nobody", &nonce_of(&challenge));
     let response = http(
         port,
         &format!(
@@ -491,10 +592,12 @@ fn a_credential_made_for_a_get_does_not_authorize_a_delete() {
 /// query — so this pins both halves.
 #[test]
 fn the_query_string_is_part_of_the_signed_target() {
-    let (_serving, port, token) = start("query-bound");
+    let proxy = Proxy::start("query-bound");
+    let port = proxy.port;
+    let token = &proxy.token;
 
     let target = "/api/usage?window=24h";
-    let response = signed_get(port, target, &token);
+    let response = signed_get(port, target, token);
     assert_eq!(
         status(&response),
         200,
@@ -503,7 +606,7 @@ fn the_query_string_is_part_of_the_signed_target() {
 
     // And one that hashed only the path must not be.
     let challenge = get(port, target);
-    let path_only = credential(&token, "GET", "/api/usage", &nonce_of(&challenge));
+    let path_only = credential(token, "GET", "/api/usage", &nonce_of(&challenge));
     let response = http(
         port,
         &format!("GET {target} HTTP/1.1\r\nHost: x\r\nAuthorization: {path_only}\r\nConnection: close\r\n\r\n"),
@@ -518,7 +621,8 @@ fn the_query_string_is_part_of_the_signed_target() {
 /// The three paths that must stay reachable still are.
 #[test]
 fn the_crawler_files_the_probe_and_the_relay_are_not_gated() {
-    let (_serving, port, _token) = start("exempt");
+    let proxy = Proxy::start("exempt");
+    let port = proxy.port;
 
     for path in ["/robots.txt", "/favicon.ico", "/api/hello"] {
         let response = get(port, path);
@@ -563,7 +667,8 @@ fn the_crawler_files_the_probe_and_the_relay_are_not_gated() {
 /// for what is actually a missing key.
 #[test]
 fn a_relay_request_without_a_key_is_not_challenged_as_a_browser() {
-    let (_serving, port, _token) = start("relay-refusal");
+    let proxy = Proxy::start("relay-refusal");
+    let port = proxy.port;
     let response = http(
         port,
         "POST /relay/anthropic/v1/messages HTTP/1.1\r\nHost: x\r\n\
@@ -583,7 +688,8 @@ fn a_relay_request_without_a_key_is_not_challenged_as_a_browser() {
 /// that names nothing.
 #[test]
 fn a_preflight_is_answered_without_a_credential() {
-    let (_serving, port, _token) = start("preflight");
+    let proxy = Proxy::start("preflight");
+    let port = proxy.port;
     let response = http(
         port,
         "OPTIONS /api/users HTTP/1.1\r\nHost: x\r\nOrigin: http://localhost:5173\r\n\
@@ -604,7 +710,8 @@ fn a_preflight_is_answered_without_a_credential() {
 /// — it must produce a 401, not a 500 and not a dead process.
 #[test]
 fn a_malformed_authorization_header_is_refused_rather_than_fatal() {
-    let (serving, port, _token) = start("malformed");
+    let proxy = Proxy::start("malformed");
+    let port = proxy.port;
 
     for header_line in [
         "Authorization: \u{fc}\u{fc}\u{fc}\u{fc}\u{fc}\u{fc}\u{fc}\u{fc}",
@@ -631,13 +738,13 @@ fn a_malformed_authorization_header_is_refused_rather_than_fatal() {
     // And the server is still there afterwards, which a panic in a handler
     // would not necessarily leave true.
     assert_eq!(status(&get(port, "/api/hello")), 200);
-    let _ = serving;
 }
 
 /// The wrong password is refused, and said so.
 #[test]
 fn the_wrong_password_is_refused() {
-    let (_serving, port, _token) = start("wrong-password");
+    let proxy = Proxy::start("wrong-password");
+    let port = proxy.port;
 
     let challenge = get(port, "/api/users");
     let credential = credential(
@@ -668,7 +775,8 @@ fn the_wrong_password_is_refused() {
 /// most often when something is misconfigured.
 #[test]
 fn a_refusal_is_json() {
-    let (_serving, port, _token) = start("json-refusal");
+    let proxy = Proxy::start("json-refusal");
+    let port = proxy.port;
     let response = get(port, "/api/users");
     let body = body(&response);
     let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or_else(|_| panic!("not JSON: {body}"));
