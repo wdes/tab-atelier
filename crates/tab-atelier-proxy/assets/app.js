@@ -509,24 +509,22 @@ const AdminApp = Vue.defineComponent({
         // is the account's tool policy.
         modelChoices() {
             const all = this.providers ? this.providers.providers : [];
-            const wire = new Map(all.map((p) => [p.id, p.wire]));
+            const seen = new Set();
             const out = [];
             for (const p of all) {
                 if (!p.enabled)
                     continue;
                 for (const m of p.models) {
-                    if (m.deprecated)
+                    if (m.deprecated || seen.has(m.id))
                         continue;
-                    if (wire.get(p.id) === "openai") {
-                        out.push({ value: `${m.id}#tools`, label: `${m.id} — tools, no reasoning` });
-                        out.push({ value: `${m.id}#reasoning`, label: `${m.id} — reasoning, no tools` });
-                    }
-                    else {
-                        out.push({ value: m.id, label: m.id });
-                    }
+                    seen.add(m.id);
+                    out.push({ value: m.id, label: m.id });
                 }
             }
-            return out;
+            return out.sort((a, b) => a.label.localeCompare(b.label));
+        },
+        mappingModelChoices() {
+            return this.modelChoices.map((choice) => choice.value);
         },
     },
     mounted() {

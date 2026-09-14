@@ -528,14 +528,20 @@
               </table>
               <form class="row g-2 align-items-end" @submit.prevent="addMapping">
                 <div class="col-sm-4">
-                  <label class="form-label small mb-1">Asked for</label>
-                  <input v-model="newMapping.from" class="form-control form-control-sm font-monospace"
-                         placeholder="claude-opus-5" autocomplete="off" />
+                  <label class="form-label small mb-1" for="ta-mapping-from">Asked for</label>
+                  <select id="ta-mapping-from" v-model="newMapping.from" class="form-select form-select-sm font-monospace"
+                          required :disabled="!mappingModelChoices.length">
+                    <option value="" disabled>{{ mappingModelChoices.length ? 'Select a model' : 'No models available' }}</option>
+                    <option v-for="model in mappingModelChoices" :key="`from-${model}`" :value="model">{{ model }}</option>
+                  </select>
                 </div>
                 <div class="col-sm-4">
-                  <label class="form-label small mb-1">Use instead</label>
-                  <input v-model="newMapping.to" class="form-control form-control-sm font-monospace"
-                         placeholder="deepseek-flash" autocomplete="off" />
+                  <label class="form-label small mb-1" for="ta-mapping-to">Use instead</label>
+                  <select id="ta-mapping-to" v-model="newMapping.to" class="form-select form-select-sm font-monospace"
+                          required :disabled="!mappingModelChoices.length">
+                    <option value="" disabled>{{ mappingModelChoices.length ? 'Select a model' : 'No models available' }}</option>
+                    <option v-for="model in mappingModelChoices" :key="`to-${model}`" :value="model">{{ model }}</option>
+                  </select>
                 </div>
                 <div class="col-sm-2">
                   <label class="form-label small mb-1">Note</label>
