@@ -9,9 +9,9 @@ use std::convert::Infallible;
 use std::sync::Arc;
 
 use bytes::Bytes;
+use http::Method;
+use http_body::Frame;
 use http_body_util::{BodyExt, StreamBody};
-use hyper::Method;
-use hyper::body::Frame;
 
 use crate::http::guards::Arrival;
 use crate::http::middleware::arrival::{header_of, is_trusted_hop};
@@ -116,7 +116,7 @@ pub(crate) async fn anthropic(state: &Arc<State>, r: Relay<'_>) -> Reply {
         .map(str::to_owned);
     let client_headers = passthrough_headers(headers);
     let content_type = headers
-        .get(hyper::header::CONTENT_TYPE)
+        .get(http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/json")
         .to_owned();
@@ -630,7 +630,7 @@ const FORWARDED_HEADERS: &[&str] = &[
 const FORWARDED_PREFIXES: &[&str] = &["x-stainless-"];
 
 /// Collect the headers of [`FORWARDED_HEADERS`] / [`FORWARDED_PREFIXES`].
-pub(crate) fn passthrough_headers(headers: &hyper::HeaderMap) -> Vec<(String, String)> {
+pub(crate) fn passthrough_headers(headers: &http::HeaderMap) -> Vec<(String, String)> {
     headers
         .iter()
         .filter_map(|(name, value)| {

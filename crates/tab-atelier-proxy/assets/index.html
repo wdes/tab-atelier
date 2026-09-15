@@ -161,6 +161,50 @@
     <!-- Full width: the account table has seven columns and the charts read
          better wide. A 60rem cap left two thirds of a laptop screen empty. -->
     <div id="app" class="container-fluid px-4 py-4">
+      <!-- Sign in ------------------------------------------------------->
+      <div v-if="!authed" class="card shadow-sm mx-auto" style="max-width: 30rem">
+        <div class="card-body">
+          <h1 class="h5 card-title">tab-atelier-proxy</h1>
+          <p class="text-body-secondary small">
+            Paste the admin token. On the proxy host:
+            <code>tab-atelier-proxy admin-token</code>
+          </p>
+          <!-- `off`, which is the least-bad of a bad set. MDN is explicit that
+               `off` "will not prevent a password manager from asking the user
+               if they would like to save username and password information" —
+               and a `tap_` token in a synchronised vault is a relay credential
+               in a synchronised vault.
+
+               The values that look stronger are worse here. `new-password`
+               marks the field as a signup password, so Chromium offers to
+               GENERATE one — it invents a value and stores it for a field whose
+               whole purpose is to receive a token the operator already has.
+               `current-password` marks it as the site's stored login, which is
+               an outright invitation to fill and to save.
+
+               So this is best-effort, not airtight. Nothing in the attribute
+               vocabulary reliably stops a password manager; the only certain
+               way is to not use a password field at all, which would leave the
+               token unmasked in Firefox, where the CSS that replaces the
+               masking is unsupported. A token visible on screen is the lesser
+               problem, and a generated one saved to a vault is the greater. -->
+          <form autocomplete="off" @submit.prevent="signIn">
+            <input
+              v-model="token"
+              type="password"
+              class="form-control font-monospace"
+              placeholder="tap_…"
+              autocomplete="off"
+              autofocus
+            />
+            <div v-if="error" class="alert alert-danger mt-3 mb-0 py-2 small">{{ error }}</div>
+            <button class="btn btn-primary w-100 mt-3" :disabled="busy">
+              {{ busy ? 'Checking…' : 'Sign in' }}
+            </button>
+          </form>
+        </div>
+      </div>
+
       <!-- Accounts ------------------------------------------------------>
       <!-- No wrapper element, and deliberately not a bare template either.
            This markup IS the root template — `createApp(AdminApp).mount("#app")`
@@ -173,8 +217,10 @@
            The tag is not written with angle brackets anywhere in this comment
            on purpose. The structural test counts literal tags, and one inside a
            comment reads as an unclosed element. -->
+      <section v-if="authed">
         <div class="d-flex align-items-center mb-3">
           <h1 class="h4 mb-0 flex-grow-1">Accounts</h1>
+          <button class="btn btn-sm btn-outline-secondary" @click="signOut">Sign out</button>
         </div>
 
         <div v-if="error" class="alert alert-danger py-2 small">{{ error }}</div>
@@ -1088,6 +1134,7 @@
             </div>
           </div>
         </div>
+      </section>
     </div>
 
     <script src="vendor/vue.global.prod.js"></script>

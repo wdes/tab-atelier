@@ -1,24 +1,25 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! The browser gate, against the real binary over a real socket.
+//! The auth boundary, against the real binary over a real socket.
 //!
-//! Unit tests can prove the digest arithmetic; only this can prove the thing
-//! that was actually asked for — that a client which cannot answer the
-//! challenge receives **no page, no script, no style sheet and no API answer**,
-//! while the three paths that have to stay reachable still are.
+//! Unit tests can prove that a token comparison is constant-time; only this can
+//! prove the thing that matters — that an authenticated caller is served and an
+//! anonymous one is not, and that the paths which have to stay reachable still
+//! are.
 //!
 //! It runs `tab-atelier-proxy` as a process for the same reason
-//! `end_to_end.rs` does: the guards, the catchers and the route table only
-//! meet each other inside a running server, and whether the challenge reaches
-//! the wire is not visible from a library call.
+//! `end_to_end.rs` does: the guards, the catchers and the route table only meet
+//! each other inside a running server, and whether a refusal reaches the wire
+//! with the right status and the right sentence is not visible from a library
+//! call.
+//!
+//! The page and its assets are deliberately NOT behind the credential — see
+//! [`the_page_loads_without_a_credential`] for why, and for what was tried
+//! before that.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-
-use std::fmt::Write as _;
-
-use sha2::{Digest as _, Sha256};
 
 /// The binary under test, built by cargo for this integration target.
 const BIN: &str = env!("CARGO_BIN_EXE_tab-atelier-proxy");
@@ -28,7 +29,7 @@ struct Scratch(PathBuf);
 
 impl Scratch {
     fn new(name: &str) -> Self {
-        let p = std::env::temp_dir().join(format!("ta-browser-auth-{name}-{}", std::process::id()));
+        let p = std::env::temp_dir().join(format!("ta-bearer-auth-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(p.join("home/.claude")).expect("mkdir");
         // A far-future expiry so the egress never reaches the real OAuth
@@ -90,7 +91,7 @@ fn free_port() -> u16 {
 ///
 /// One struct rather than a tuple because the scratch directory has to outlive
 /// the server: dropping it deletes the state the server is still writing to.
-/// Returning it detached from the child is how the first version of this file
+/// Returning them detached from the child is how the first version of this file
 /// removed its own working directory mid-test.
 struct Proxy {
     #[allow(dead_code, reason = "held for its Drop: it deletes the directory")]
@@ -187,6 +188,17 @@ fn get(port: u16, path: &str) -> String {
     )
 }
 
+/// A GET presenting an operator token the way a client would.
+fn get_authed(port: u16, path: &str, token: &str) -> String {
+    http(
+        port,
+        &format!(
+            "GET {path} HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {token}\r\n\
+             Connection: close\r\n\r\n"
+        ),
+    )
+}
+
 /// The status code from a raw response.
 fn status(response: &str) -> u16 {
     response
@@ -213,276 +225,105 @@ fn body(response: &str) -> String {
         .unwrap_or_default()
 }
 
-/// The `nonce` from a `WWW-Authenticate: Digest` challenge.
-fn nonce_of(response: &str) -> String {
-    let challenge = header(response, "www-authenticate").expect("a challenge header");
-    challenge
-        .split("nonce=\"")
-        .nth(1)
-        .and_then(|r| r.split('"').next())
-        .unwrap_or_else(|| panic!("no nonce in {challenge}"))
-        .to_owned()
-}
+// ── the decision this file pins ──────────────────────────────────────────────
 
-/// SHA-256 as lowercase hex, which is what RFC 7616 requires.
+/// The page and its assets load for anyone; nothing in them is secret.
 ///
-/// Hand-rolled rather than pulled in: the test crate has no hex dependency and
-/// adding one to spell sixteen bytes would be the tail wagging the dog.
-fn sha256(text: &str) -> String {
-    let mut h = Sha256::new();
-    h.update(text.as_bytes());
-    h.finalize().iter().fold(String::new(), |mut acc, b| {
-        let _ = write!(acc, "{b:02x}");
-        acc
-    })
-}
-
-/// A `Digest` credential, computed the way a browser computes one.
-///
-/// `target` is the path and query exactly as the request line carries it: the
-/// digest covers the request-target, so passing anything else produces a
-/// credential the server should refuse.
-fn credential(token: &str, method: &str, target: &str, nonce: &str) -> String {
-    let nc = "00000001";
-    let cnonce = "0a4f113b";
-    let ha1 = sha256(&format!("admin:tab-atelier:{token}"));
-    let ha2 = sha256(&format!("{method}:{target}"));
-    let response = sha256(&format!("{ha1}:{nonce}:{nc}:{cnonce}:auth:{ha2}"));
-    format!(
-        "Digest username=\"admin\", realm=\"tab-atelier\", nonce=\"{nonce}\", uri=\"{target}\", \
-         algorithm=SHA-256, response=\"{response}\", qop=auth, nc={nc}, cnonce=\"{cnonce}\""
-    )
-}
-
-/// A GET carrying a freshly computed credential for `path`.
-fn signed_get(port: u16, path: &str, token: &str) -> String {
-    // First ask for a nonce. A browser does this too — the challenge is what
-    // tells it which algorithm and realm to hash against.
-    let challenge = get(port, path);
-    assert_eq!(status(&challenge), 401, "expected a challenge for {path}");
-    let credential = credential(token, "GET", path, &nonce_of(&challenge));
-    http(
-        port,
-        &format!("GET {path} HTTP/1.1\r\nHost: x\r\nAuthorization: {credential}\r\nConnection: close\r\n\r\n"),
-    )
-}
-
-/// The paths that must not be reachable without signing in.
-///
-/// This is the list from the request, and it is the whole feature: if any of
-/// these answers without a credential, a scraper has something to read.
-const GATED: [&str; 13] = [
-    "/",
-    "/index.html",
-    // The real asset names. There is no `/styles.css`: the only style sheet is
-    // the distribution's bootstrap, which the web controller falls back to
-    // under `/usr/share/javascript/`.
-    "/vendor/bootstrap.min.css",
-    "/app.js",
-    "/charts.js",
-    "/vendor/vue.global.prod.js",
-    "/api/users",
-    "/api/providers",
-    "/api/usage",
-    "/api/inspect",
-    "/api/pressure",
-    // The bare parents of the two exempt prefixes. Neither is a route, so
-    // exempting one would only mean an unauthenticated request falls through to
-    // the SPA catch-all and is handed the HTML shell — which is precisely what
-    // the gate is for.
-    "/me",
-    "/relay",
-];
-
-/// Nothing on the gated list may be read without a credential.
+/// This is a deliberate reversal. The proxy briefly served the dashboard behind
+/// an HTTP Digest challenge, which gated the HTML, the CSS and the scripts along
+/// with it. It was removed because it protected nothing: the page is a shell
+/// with no figures in it, every value on screen comes from `/api/*`, and each of
+/// those needs the operator token. What the gate did buy was a second credential
+/// — the browser held a digest while the page asked for the same token again —
+/// and a class of failure where being signed in did not mean the page was.
 #[test]
-fn nothing_serves_a_page_or_a_script_without_signing_in() {
-    let proxy = Proxy::start("gated");
+fn the_page_loads_without_a_credential() {
+    let proxy = Proxy::start("open-page");
     let port = proxy.port;
 
-    for path in GATED {
+    for path in ["/", "/index.html", "/app.js", "/api.js", "/charts.js"] {
         let response = get(port, path);
-        assert_eq!(
-            status(&response),
-            401,
-            "{path} answered without a credential:\n{}",
-            &response[..response.len().min(300)]
-        );
-        // And no content leaked in the refusal, which is what a scraper would
-        // settle for.
-        let body = body(&response);
-        assert!(
-            !body.contains("<html") && !body.contains("function") && !body.contains("/*"),
-            "{path} leaked content in its 401: {}",
-            &body[..body.len().min(200)]
-        );
+        assert_eq!(status(&response), 200, "{path} should load for anyone");
     }
+
+    // And the page really is the shell: the form is in it, and account data is
+    // not, because the data was never in the file.
+    let page = body(&get(port, "/"));
+    assert!(page.contains("Sign in"), "the form is part of the page");
+    assert!(!page.contains("ada@example.com"), "and no account data is");
 }
 
-/// The refusal is a challenge a browser can answer.
+/// And the API refuses an anonymous request, naming what is missing.
 #[test]
-fn the_refusal_is_a_digest_challenge_a_browser_answers() {
-    let proxy = Proxy::start("challenge");
+fn the_api_refuses_an_anonymous_request() {
+    let proxy = Proxy::start("anon-api");
     let port = proxy.port;
-    let response = get(port, "/");
-
-    assert_eq!(status(&response), 401);
-    let challenge = header(&response, "www-authenticate").expect("a WWW-Authenticate header");
-
-    assert!(challenge.starts_with("Digest "), "{challenge}");
-    assert!(challenge.contains("realm=\"tab-atelier\""), "{challenge}");
-    assert!(challenge.contains("qop=\"auth\""), "{challenge}");
-    assert!(
-        challenge.contains("algorithm=SHA-256"),
-        "the strong algorithm must be advertised: {challenge}"
-    );
-    assert!(
-        !challenge.contains("MD5"),
-        "MD5 must not be offered at all: {challenge}"
-    );
-    assert!(!nonce_of(&response).is_empty());
-    // And the token is not in it; the challenge is served to anyone who asks.
-    assert!(!challenge.contains("tap_"), "{challenge}");
-}
-
-/// A correct credential opens the page and everything it needs.
-///
-/// The interesting part is that the *assets* come through the same gate as the
-/// page: a credential good for one is good for the others, which is what makes
-/// the dashboard actually load.
-#[test]
-fn a_correct_credential_serves_the_page_and_its_assets() {
-    let proxy = Proxy::start("signed-in");
-    let port = proxy.port;
-    let token = &proxy.token;
 
     for path in [
-        "/",
-        "/index.html",
-        "/app.js",
-        "/charts.js",
-        "/vendor/vue.global.prod.js",
+        "/api/users",
+        "/api/providers",
+        "/api/pressure",
+        "/api/usage",
+        "/api/inspect",
     ] {
-        let response = signed_get(port, path, token);
-        assert_eq!(
-            status(&response),
-            200,
-            "{path} was refused a correctly signed request:\n{}",
-            &response[..response.len().min(300)]
-        );
-        assert!(!body(&response).is_empty(), "{path} answered 200 with no content");
-    }
-
-    // The page is the real one, not a placeholder.
-    let page = signed_get(port, "/", token);
-    assert!(body(&page).contains("<html"), "the page is not HTML");
-}
-
-/// Every asset comes back with the content type a browser will act on.
-///
-/// Asserting the bytes arrive is not enough: a reply's *type* is what decides
-/// whether the browser executes it. A `.js` served as `application/json` is
-/// refused outright when the response says not to sniff, and the dashboard
-/// renders blank with one console line and no clue which layer was at fault —
-/// which is exactly what happened when the `Responder` adapter overrode the
-/// type the web controller had worked out. This is the check that catches it,
-/// and it is a wire-level one because a unit test of the adapter did not.
-#[test]
-fn each_asset_is_served_with_the_type_a_browser_needs() {
-    let proxy = Proxy::start("content-types");
-    let port = proxy.port;
-    let token = &proxy.token;
-
-    // The gated assets: these need a credential, so they are fetched with one.
-    for (path, want) in [
-        ("/", "text/html"),
-        ("/index.html", "text/html"),
-        ("/app.js", "application/javascript"),
-        ("/charts.js", "application/javascript"),
-        ("/vendor/vue.global.prod.js", "application/javascript"),
-    ] {
-        let response = signed_get(port, path, token);
-        assert_eq!(status(&response), 200, "{path} was refused");
-        let got = header(&response, "content-type").unwrap_or_else(|| panic!("{path} answered with no content type"));
-        assert!(
-            got.starts_with(want),
-            "{path} was served as `{got}` rather than `{want}` — a browser will refuse it"
-        );
-        assert_ne!(
-            got, "application/json",
-            "{path} was served as JSON, which is the adapter overriding the handler"
-        );
-    }
-
-    // And the two exempt ones, which are fetched without a credential — so
-    // `signed_get` would fail on them before the type was ever seen.
-    for (path, want) in [("/robots.txt", "text/plain"), ("/favicon.ico", "image/x-icon")] {
         let response = get(port, path);
-        assert_eq!(status(&response), 200, "{path}");
-        let got = header(&response, "content-type").unwrap_or_else(|| panic!("{path} answered with no content type"));
+        assert_eq!(status(&response), 401, "{path} must need the token");
         assert!(
-            got.starts_with(want),
-            "{path} was served as `{got}` rather than `{want}`"
+            body(&response).contains("admin token"),
+            "the refusal should name what is missing: {}",
+            body(&response)
         );
     }
 }
 
-/// The API is behind the same credential, and answers with data.
+/// A token that is not the token is refused.
 #[test]
-fn the_api_opens_with_the_same_credential_as_the_page() {
-    let proxy = Proxy::start("api");
+fn a_wrong_token_is_refused() {
+    let proxy = Proxy::start("wrong-token");
     let port = proxy.port;
-    let token = &proxy.token;
-    let response = signed_get(port, "/api/users", token);
 
-    assert_eq!(status(&response), 200);
-    let parsed: serde_json::Value = serde_json::from_str(&body(&response)).expect("JSON");
-    assert!(parsed.get("users").is_some(), "{parsed}");
+    for wrong in ["tap_nope", "", " ", &proxy.token.to_uppercase()] {
+        let response = get_authed(port, "/api/users", wrong);
+        assert_eq!(status(&response), 401, "{wrong:?} was accepted: {}", body(&response));
+    }
+    // The real one still works, so the loop above is testing the comparison
+    // rather than a server that refuses everything.
+    assert_eq!(status(&get_authed(port, "/api/users", &proxy.token)), 200);
 }
 
-/// The operator token in a header still works, for scripts and the CLI.
-///
-/// A command-line client cannot answer a prompt, so the token has to be
-/// acceptable directly — the same secret, presented differently.
+/// The operator token opens the API, in either spelling the server reads.
 #[test]
-fn the_operator_token_is_accepted_without_a_challenge() {
-    let proxy = Proxy::start("token-header");
+fn the_operator_token_opens_the_api() {
+    let proxy = Proxy::start("bearer");
     let port = proxy.port;
-    let token = &proxy.token;
 
-    // The two the server actually reads (`arrival::presented`). An earlier
-    // version of this test used `x-tab-atelier-token`, which nothing reads —
-    // so it was testing the test's own invention rather than the server.
-    for header_line in [format!("Authorization: Bearer {token}"), format!("x-api-key: {token}")] {
+    for header in [
+        format!("Authorization: Bearer {}", proxy.token),
+        format!("x-api-key: {}", proxy.token),
+        // The scheme is case-insensitive in HTTP, and clients differ.
+        format!("Authorization: bearer {}", proxy.token),
+    ] {
         let response = http(
             port,
-            &format!("GET /api/users HTTP/1.1\r\nHost: x\r\n{header_line}\r\nConnection: close\r\n\r\n"),
+            &format!("GET /api/users HTTP/1.1\r\nHost: x\r\n{header}\r\nConnection: close\r\n\r\n"),
         );
-        assert_eq!(status(&response), 200, "{header_line} was refused");
+        assert_eq!(status(&response), 200, "{header} was refused");
+        assert!(body(&response).contains("\"users\""), "{}", body(&response));
     }
 }
 
-/// A relay key is not an operator credential.
+/// A user's relay key is not an operator credential.
 ///
-/// The security property worth proving end to end: a key a tab holds relays,
-/// and must not administer. If one satisfied this gate, every user could
-/// rewrite every account.
+/// The two are minted by different commands and are not interchangeable. If a
+/// relay key opened `/api/*`, every tab could rewrite every account.
 #[test]
 fn a_relay_key_does_not_open_the_operator_surface() {
-    // Arrange the account and its key with the CLI before the server starts:
-    // the CLI writes the same files the server reads.
     let scratch = Scratch::new("relay-key");
     cli(scratch.path(), &["add", "Ada", "Lovelace", "ada@example.com"]);
-    // The subcommands take positional arguments. `add` deliberately prints no
-    // key — a key is named after the machine it lives on, so `add-key` is the
-    // step that mints one.
     let minted = cli(scratch.path(), &["add-key", "ada@example.com", "laptop"]);
     let proxy = Proxy::start_with(scratch);
     let port = proxy.port;
 
-    // Read by its marker rather than by prefix: the operator token uses the
-    // same `tap_` prefix, so a prefix match would pick up either depending on
-    // the order they happened to appear in.
     let key = minted
         .lines()
         .find_map(|l| l.trim().strip_prefix("key: "))
@@ -490,31 +331,16 @@ fn a_relay_key_does_not_open_the_operator_surface() {
         .trim()
         .to_owned();
     assert!(key.starts_with("tap_"), "unexpected key: {key}");
-    assert_ne!(key, proxy.token, "the key must not be the operator token");
+    assert_ne!(key, proxy.token, "the fixture must use two different secrets");
 
-    // Presented as a browser credential, it must fail: the digest is computed
-    // against the operator token, so a user key simply does not produce a match.
-    let challenge = get(port, "/api/users");
-    assert_eq!(status(&challenge), 401);
-    let forged = credential(&key, "GET", "/api/users", &nonce_of(&challenge));
-    let response = http(
-        port,
-        &format!("GET /api/users HTTP/1.1\r\nHost: x\r\nAuthorization: {forged}\r\nConnection: close\r\n\r\n"),
-    );
-    assert_eq!(
-        status(&response),
-        401,
-        "a user's relay key must not administer the proxy"
-    );
+    let response = get_authed(port, "/api/users", &key);
+    assert_eq!(status(&response), 401, "a relay key must not administer the proxy");
 
-    // And the same key IS good for the relay, which is what it is for. Without
-    // this the test above would pass even if the key were simply invalid.
-    //
-    // The assertion is on the proxy's own wording rather than on the status:
-    // this request goes on to a provider, and a provider is entitled to answer
-    // 401 — Anthropic does, for the fake token this fixture uses — so a status
-    // check would confuse "the proxy refused the key" with "the provider
-    // refused the token". `no valid key` is a string only this proxy produces.
+    // And the same key DOES work at the relay, which is what it is for. Without
+    // this the assertion above would pass even if the key were simply invalid.
+    // The check is on the proxy's own wording rather than on the status: this
+    // goes on to a provider, and a provider is entitled to answer 401 —
+    // Anthropic does, for the fake token this fixture uses.
     let relay = http(
         port,
         &format!(
@@ -529,341 +355,244 @@ fn a_relay_key_does_not_open_the_operator_surface() {
     );
 }
 
-/// A credential with an explicit nonce count.
+/// The relay needs its own key even though the page does not.
 ///
-/// A browser is given ONE nonce and reuses it for every request it then makes,
-/// incrementing `nc` each time so the server can tell a repeat from a new
-/// request. Computing `nc` differently is how a test reproduces that.
-fn credential_with_nc(token: &str, method: &str, target: &str, nonce: &str, nc: &str) -> String {
-    let cnonce = "0b5f9a2c";
-    let ha1 = sha256(&format!("admin:tab-atelier:{token}"));
-    let ha2 = sha256(&format!("{method}:{target}"));
-    let response = sha256(&format!("{ha1}:{nonce}:{nc}:{cnonce}:auth:{ha2}"));
-    format!(
-        "Digest username=\"admin\", realm=\"tab-atelier\", nonce=\"{nonce}\", uri=\"{target}\", \
-         algorithm=SHA-256, response=\"{response}\", qop=auth, nc={nc}, cnonce=\"{cnonce}\""
-    )
-}
-
-/// One challenge, then every asset fetched against that same nonce.
-///
-/// This is what a browser actually does, and it is what was broken: the proxy
-/// treated a nonce as single-use, so the first asset loaded and every one after
-/// it was refused with "that nonce has already been used". The dashboard
-/// rendered as a bare page with a broken script, and the only visible clue was
-/// a set of 401s for files that had just been offered.
-///
-/// RFC 7616 is explicit that the client gets one nonce per realm and reuses it,
-/// with `nc` counting the uses — so refusing a counter it has not seen is
-/// refusing correct behaviour.
+/// The two rules are independent: the page is open and the API is not.
 #[test]
-fn one_nonce_serves_every_asset_a_page_needs() {
-    let proxy = Proxy::start("nonce-reuse");
-    let port = proxy.port;
-    let token = &proxy.token;
-
-    // The browser asks for the page, is challenged once, and keeps that nonce.
-    let challenge = get(port, "/");
-    assert_eq!(status(&challenge), 401, "the page is gated");
-    let nonce = nonce_of(&challenge);
-
-    for (i, path) in ["/", "/app.js", "/charts.js", "/index.html"].iter().enumerate() {
-        let nc = format!("{:08x}", i + 1);
-        let credential = credential_with_nc(token, "GET", path, &nonce, &nc);
-        let response = http(
-            port,
-            &format!(
-                "GET {path} HTTP/1.1\r\nHost: x\r\nAuthorization: {credential}\r\n\
-                 Connection: close\r\n\r\n"
-            ),
-        );
-        assert_eq!(
-            status(&response),
-            200,
-            "{path} at nc={nc} was refused though the nonce was issued for this page: {}",
-            &response[..response.len().min(240)]
-        );
-    }
-}
-
-/// A nonce the server never issued is refused, and the message says so.
-///
-/// The refusal has to name the nonce rather than the password: they have
-/// different causes, and a proxy that reports "wrong password" for a bad nonce
-/// sends the operator to reset a credential that was never the problem. The
-/// expiry half of this rule is a unit test (`a_nonce_is_not_eternal`), since an
-/// aged nonce cannot be minted from outside the process.
-#[test]
-fn a_nonce_this_proxy_never_issued_is_refused_by_name() {
-    let proxy = Proxy::start("nonce-forged");
-    let port = proxy.port;
-    let token = &proxy.token;
-
-    // Correctly framed at the right length, so it is refused for being
-    // unrecognised rather than for being malformed.
-    let forged = credential_with_nc(token, "GET", "/app.js", &"a".repeat(64), "00000001");
-    let response = http(
-        port,
-        &format!("GET /app.js HTTP/1.1\r\nHost: x\r\nAuthorization: {forged}\r\nConnection: close\r\n\r\n"),
-    );
-    assert_eq!(status(&response), 401);
-    let text = body(&response);
-    assert!(
-        text.contains("nonce"),
-        "the refusal should name the nonce as the problem: {text}"
-    );
-}
-
-/// Replaying a captured credential fails.
-#[test]
-fn a_captured_credential_cannot_be_replayed() {
-    let proxy = Proxy::start("replay");
-    let port = proxy.port;
-    let token = &proxy.token;
-
-    let challenge = get(port, "/api/users");
-    let credential = credential(token, "GET", "/api/users", &nonce_of(&challenge));
-    let request =
-        format!("GET /api/users HTTP/1.1\r\nHost: x\r\nAuthorization: {credential}\r\nConnection: close\r\n\r\n");
-
-    assert_eq!(status(&http(port, &request)), 200, "the first use works");
-    assert_eq!(
-        status(&http(port, &request)),
-        401,
-        "the same credential must not work twice"
-    );
-}
-
-/// A credential is bound to the path it was made for.
-#[test]
-fn a_credential_made_for_one_path_does_not_open_another() {
-    let proxy = Proxy::start("path-bound");
-    let port = proxy.port;
-    let token = &proxy.token;
-
-    let challenge = get(port, "/api/users");
-    // Computed for `/`, then sent at `/api/users`.
-    let credential = credential(token, "GET", "/", &nonce_of(&challenge));
-    let response = http(
-        port,
-        &format!("GET /api/users HTTP/1.1\r\nHost: x\r\nAuthorization: {credential}\r\nConnection: close\r\n\r\n"),
-    );
-    assert_eq!(status(&response), 401, "a credential for another path must not verify");
-}
-
-/// A credential made for another verb does not open this one.
-#[test]
-fn a_credential_made_for_a_get_does_not_authorize_a_delete() {
-    let proxy = Proxy::start("verb-bound");
-    let port = proxy.port;
-    let token = &proxy.token;
-
-    let challenge = get(port, "/api/users/nobody");
-    let credential = credential(token, "GET", "/api/users/nobody", &nonce_of(&challenge));
-    let response = http(
-        port,
-        &format!(
-            "DELETE /api/users/nobody HTTP/1.1\r\nHost: x\r\nAuthorization: {credential}\r\n\
-             Connection: close\r\n\r\n"
-        ),
-    );
-    assert_eq!(status(&response), 401, "the verb is part of the digest");
-}
-
-/// The query string is part of the signed target.
-///
-/// A client that hashed only the path would be refused, and a server that
-/// verified only the path would let a credential be reused against a different
-/// query — so this pins both halves.
-#[test]
-fn the_query_string_is_part_of_the_signed_target() {
-    let proxy = Proxy::start("query-bound");
-    let port = proxy.port;
-    let token = &proxy.token;
-
-    let target = "/api/usage?window=24h";
-    let response = signed_get(port, target, token);
-    assert_eq!(
-        status(&response),
-        200,
-        "a credential hashing the whole target must be accepted"
-    );
-
-    // And one that hashed only the path must not be.
-    let challenge = get(port, target);
-    let path_only = credential(token, "GET", "/api/usage", &nonce_of(&challenge));
-    let response = http(
-        port,
-        &format!("GET {target} HTTP/1.1\r\nHost: x\r\nAuthorization: {path_only}\r\nConnection: close\r\n\r\n"),
-    );
-    assert_eq!(
-        status(&response),
-        401,
-        "a credential that ignored the query must not verify"
-    );
-}
-
-/// The three paths that must stay reachable still are.
-#[test]
-fn the_crawler_files_the_probe_and_the_relay_are_not_gated() {
-    let proxy = Proxy::start("exempt");
+fn a_relay_request_without_a_key_is_refused() {
+    let proxy = Proxy::start("relay-anon");
     let port = proxy.port;
 
-    for path in ["/robots.txt", "/favicon.ico", "/api/hello"] {
-        let response = get(port, path);
-        assert_eq!(
-            status(&response),
-            200,
-            "{path} must be reachable without a credential:\n{}",
-            &response[..response.len().min(300)]
-        );
-        assert!(
-            header(&response, "www-authenticate").is_none(),
-            "{path} must not be challenged"
-        );
-    }
-
-    // The icon is actually an icon, not an empty 200.
-    let icon = get(port, "/favicon.ico");
-    assert!(
-        header(&icon, "content-type").is_some_and(|t| t.contains("icon") || t.contains("octet-stream")),
-        "the favicon has no usable content type"
-    );
-    assert!(!body(&icon).is_empty(), "the favicon is empty");
-
-    // The relay answers its own probe without a browser credential, which is
-    // what a tab checks before it starts.
-    let relay = get(port, "/relay/anthropic/api/hello");
-    assert_eq!(
-        status(&relay),
-        200,
-        "a tab cannot answer a prompt, so the relay must not issue one"
-    );
-    assert!(
-        header(&relay, "www-authenticate").is_none(),
-        "no browser challenge may be sent to a CLI"
-    );
-}
-
-/// A relay request with no key is refused as a key problem, not a browser one.
-///
-/// The distinction matters: a challenge here would make the client try to
-/// interpret a browser flow, and the operator would see a prompt-shaped error
-/// for what is actually a missing key.
-#[test]
-fn a_relay_request_without_a_key_is_not_challenged_as_a_browser() {
-    let proxy = Proxy::start("relay-refusal");
-    let port = proxy.port;
-    let response = http(
+    let anonymous = http(
         port,
         "POST /relay/anthropic/v1/messages HTTP/1.1\r\nHost: x\r\n\
          Content-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
     );
-    assert_eq!(status(&response), 401);
-    assert!(
-        header(&response, "www-authenticate").is_none(),
-        "a CLI must not be handed a browser challenge"
+    assert_eq!(status(&anonymous), 401);
+    assert!(body(&anonymous).contains("no valid key"), "{}", body(&anonymous));
+
+    // The operator token is not a relay key either: a different secret for a
+    // different job.
+    let as_operator = http(
+        port,
+        &format!(
+            "POST /relay/anthropic/v1/messages HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {}\r\n\
+             Content-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}",
+            proxy.token
+        ),
+    );
+    assert_eq!(
+        status(&as_operator),
+        401,
+        "the operator token must not relay: {}",
+        body(&as_operator)
     );
 }
 
-/// A CORS preflight is not challenged.
+// ── what the page needs to work at all ───────────────────────────────────────
+
+/// Every asset the browser asks for is served, including the source map.
 ///
-/// The browser is required not to send credentials on a preflight, so gating it
-/// would fail every one of them and break the development UI with a CORS error
-/// that names nothing.
+/// The map is the one that bit: Bootstrap's CSS ends in
+/// `sourceMappingURL=bootstrap.min.css.map`, so it is requested as soon as the
+/// style sheet loads, and it was the one file the resolver did not know about.
+#[test]
+fn every_asset_the_page_needs_is_served() {
+    let proxy = Proxy::start("assets");
+    let port = proxy.port;
+
+    for path in [
+        "/",
+        "/index.html",
+        "/app.js",
+        "/api.js",
+        "/charts.js",
+        "/vendor/vue.global.prod.js",
+        "/vendor/bootstrap.min.css",
+        "/vendor/bootstrap.min.css.map",
+        "/robots.txt",
+        "/favicon.ico",
+    ] {
+        let response = get(port, path);
+        assert_eq!(status(&response), 200, "{path} is missing");
+        assert!(!body(&response).is_empty(), "{path} is empty");
+    }
+}
+
+/// Each asset comes back with a type the browser will act on.
+///
+/// A script served as `application/json` is refused outright when the response
+/// says not to sniff, and the page renders blank with one console line.
+#[test]
+fn each_asset_is_served_with_the_type_a_browser_needs() {
+    let proxy = Proxy::start("content-types");
+    let port = proxy.port;
+
+    for (path, want) in [
+        ("/", "text/html"),
+        ("/app.js", "application/javascript"),
+        ("/api.js", "application/javascript"),
+        ("/charts.js", "application/javascript"),
+        ("/vendor/vue.global.prod.js", "application/javascript"),
+        ("/robots.txt", "text/plain"),
+        ("/favicon.ico", "image/x-icon"),
+    ] {
+        let response = get(port, path);
+        let got = header(&response, "content-type").unwrap_or_else(|| panic!("{path} answered with no content type"));
+        assert!(got.starts_with(want), "{path} was served as {got}");
+        assert_ne!(got, "application/json", "{path} was served as JSON");
+    }
+}
+
+/// The page's script tags are files that exist, in an order that works, and
+/// each carries a version.
+///
+/// `api.js` defines the client, `charts.js` the charts, `app.js` uses both — and
+/// these are plain scripts sharing one scope rather than modules, so the order
+/// is load-bearing. A file named in the page and absent from the package is a
+/// blank dashboard, which is exactly what shipped once.
+///
+/// The `?v=` is the cache-buster the server adds. It is checked here rather than
+/// assumed because a versioned name is the only thing that stops a browser
+/// reusing a cached client against a newer server — and for `api.js` in
+/// particular, a stale copy is a client naming routes that no longer exist.
+#[test]
+fn the_page_names_scripts_that_are_all_served_and_versioned() {
+    let proxy = Proxy::start("script-order");
+    let port = proxy.port;
+    let page = body(&get(port, "/"));
+
+    let mut seen = Vec::new();
+    for part in page.split("<script src=\"").skip(1) {
+        let src = part.split('"').next().expect("a src attribute").to_owned();
+        let (name, version) = src
+            .split_once("?v=")
+            .unwrap_or_else(|| panic!("{src} is not versioned, so a browser may serve a cached copy"));
+        assert!(!version.is_empty(), "{src} has an empty version");
+
+        assert_eq!(
+            status(&get(port, &format!("/{name}"))),
+            200,
+            "the page names {name}, which is not served"
+        );
+        seen.push(name.to_owned());
+    }
+
+    assert_eq!(
+        seen,
+        vec![
+            "vendor/vue.global.prod.js".to_owned(),
+            "api.js".to_owned(),
+            "charts.js".to_owned(),
+            "app.js".to_owned(),
+        ],
+        "Vue first, then the client, the charts, and the app that uses them"
+    );
+}
+
+// ── what stays open, and why ─────────────────────────────────────────────────
+
+/// The crawler files and the probe need no credential.
+#[test]
+fn the_crawler_files_and_the_probe_are_open() {
+    let proxy = Proxy::start("open-extras");
+    let port = proxy.port;
+
+    for path in ["/robots.txt", "/favicon.ico", "/api/hello"] {
+        assert_eq!(status(&get(port, path)), 200, "{path} should be open");
+    }
+    // The probe answers from memory, with a two-byte JSON object rather than an
+    // empty string, so a client that parses what it gets is not handed nothing
+    // and left reporting a syntax error instead of "the process is up".
+    assert_eq!(
+        body(&get(port, "/api/hello")),
+        "{}",
+        "the probe answers 200 with an empty JSON object"
+    );
+}
+
 #[test]
 fn a_preflight_is_answered_without_a_credential() {
     let proxy = Proxy::start("preflight");
     let port = proxy.port;
+
     let response = http(
         port,
-        "OPTIONS /api/users HTTP/1.1\r\nHost: x\r\nOrigin: http://localhost:5173\r\n\
-         Access-Control-Request-Method: GET\r\nConnection: close\r\n\r\n",
+        "OPTIONS /api/users HTTP/1.1\r\nHost: x\r\n\
+         Access-Control-Request-Method: POST\r\nConnection: close\r\n\r\n",
     );
-    assert_ne!(status(&response), 401, "a preflight must not be challenged");
-    assert!(
-        header(&response, "access-control-allow-origin").is_some(),
-        "and it must carry the headers the browser asked for"
-    );
+    assert_eq!(status(&response), 204);
+    let allowed = header(&response, "access-control-allow-headers").expect("the header list");
+    for needed in ["authorization", "x-api-key", "content-type"] {
+        assert!(allowed.contains(needed), "{needed} is not allowed: {allowed}");
+    }
 }
 
-/// A malformed `Authorization` header is refused, not fatal.
+// ── refusals are answerable ──────────────────────────────────────────────────
+
+/// A malformed header is refused, not fatal.
 ///
-/// This is reachable before authentication: the header comes off the wire and
-/// nothing has validated it. Slicing a `&str` at a byte index inside a
-/// multi-byte character panics, so a non-ASCII header is the case that matters
-/// — it must produce a 401, not a 500 and not a dead process.
+/// `Authorization` arrives off the wire before anything has validated it.
+/// Slicing it at a fixed byte index panics when that index lands inside a
+/// multi-byte character, which is a 500 on a path nobody has authenticated on.
+/// That was a real bug; the scheme test now uses `strip_prefix`, which returns
+/// `None` instead.
 #[test]
 fn a_malformed_authorization_header_is_refused_rather_than_fatal() {
     let proxy = Proxy::start("malformed");
     let port = proxy.port;
 
-    for header_line in [
-        "Authorization: \u{fc}\u{fc}\u{fc}\u{fc}\u{fc}\u{fc}\u{fc}\u{fc}",
-        "Authorization: Digest",
-        "Authorization: Digest ",
-        "Authorization: Digest username=\"\u{fc}\u{fc}\u{fc}\"",
-        "Authorization: Digest \u{fc}\u{fc}\u{fc}=\"x\"",
-        "Authorization: Digest username=\"admin\", realm=\"tab-atelier\", nonce=\"\"",
-        "Authorization: Basic YWRtaW46cHc=",
-        "Authorization: Digest username=\"admin\", realm=\"tab-atelier\", nonce=\"00\"",
-    ] {
+    let mut bad_headers = vec![
+        "Authorization:".to_owned(),
+        "Authorization: Bearer".to_owned(),
+        "Authorization: Bearer ".to_owned(),
+        "Authorization: Basic dXNlcjpwdw==".to_owned(),
+        "Authorization: Digest username=\"a\"".to_owned(),
+        format!("Authorization: {}", "ü".repeat(20)),
+        format!("Authorization: Bearer {}", "ü".repeat(20)),
+    ];
+    // Every prefix short enough to be sliced inside a multi-byte character, and
+    // every one of them used to be a byte index the old code could land on.
+    for n in 0..=12 {
+        bad_headers.push(format!("Authorization: Bearer {}", "ü".repeat(n)));
+        bad_headers.push(format!("Authorization: {}", "ü".repeat(n)));
+    }
+
+    for header in bad_headers {
         let response = http(
             port,
-            &format!("GET /api/users HTTP/1.1\r\nHost: x\r\n{header_line}\r\nConnection: close\r\n\r\n"),
+            &format!("GET /api/users HTTP/1.1\r\nHost: x\r\n{header}\r\nConnection: close\r\n\r\n"),
         );
-        assert_eq!(
-            status(&response),
-            401,
-            "{header_line:?} got {} rather than a refusal",
-            status(&response)
+        let code = status(&response);
+        assert!(
+            code == 401 || code == 400,
+            "{header:?} produced {code}, not a refusal: {}",
+            &response[..response.len().min(200)]
         );
     }
 
-    // And the server is still there afterwards, which a panic in a handler
-    // would not necessarily leave true.
-    assert_eq!(status(&get(port, "/api/hello")), 200);
+    // And the server is still there.
+    assert_eq!(status(&get(port, "/api/hello")), 200, "the process survived");
 }
 
-/// The wrong password is refused, and said so.
-#[test]
-fn the_wrong_password_is_refused() {
-    let proxy = Proxy::start("wrong-password");
-    let port = proxy.port;
-
-    let challenge = get(port, "/api/users");
-    let credential = credential(
-        "tap_not_the_real_token_at_all",
-        "GET",
-        "/api/users",
-        &nonce_of(&challenge),
-    );
-    let response = http(
-        port,
-        &format!("GET /api/users HTTP/1.1\r\nHost: x\r\nAuthorization: {credential}\r\nConnection: close\r\n\r\n"),
-    );
-    assert_eq!(status(&response), 401);
-
-    // The refusal must not hand back the token it expected.
-    let scratch_token = "";
-    let _ = scratch_token;
-    assert!(
-        !body(&response).contains("tap_0"),
-        "the refusal echoed a token-ish string: {}",
-        body(&response)
-    );
-}
-
-/// The response is a well-formed JSON error, not Rocket's HTML page.
+/// A refusal is JSON, with the reason in it.
 ///
-/// Every client of this proxy parses JSON, and the 401 is the one they will see
-/// most often when something is misconfigured.
+/// The reason is the point. A browser hides a response body behind its auth
+/// dialog, so a sentence that only lives in the body is a sentence nobody reads;
+/// the catcher also logs it, and this pins the body side.
 #[test]
-fn a_refusal_is_json() {
+fn a_refusal_is_json_with_a_reason() {
     let proxy = Proxy::start("json-refusal");
     let port = proxy.port;
+
     let response = get(port, "/api/users");
-    let body = body(&response);
-    let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or_else(|_| panic!("not JSON: {body}"));
-    assert!(parsed.get("error").is_some(), "{parsed}");
+    assert_eq!(status(&response), 401);
+    let text = body(&response);
+    assert!(text.starts_with('{'), "not JSON: {text}");
+
+    let value: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
+    let error = value["error"].as_str().expect("an error field");
+    assert!(!error.is_empty(), "the reason must be readable");
+    // The one thing an operator reading it needs.
+    assert!(error.contains("admin token"), "{error}");
 }

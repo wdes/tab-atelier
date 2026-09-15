@@ -26,16 +26,6 @@ pub const fn configured(state: &State) -> bool {
     !state.admin_token.is_empty()
 }
 
-/// The configured token, or `None` when the installation has none.
-///
-/// The Digest challenge needs the value itself, to hash it into the response a
-/// browser sends back. Borrowed rather than copied so it cannot be stashed
-/// somewhere less guarded by accident.
-#[must_use]
-pub fn token(state: &State) -> Option<&str> {
-    configured(state).then_some(state.admin_token.as_str())
-}
-
 /// Check a presented credential against the configured token.
 ///
 /// # Errors
@@ -72,14 +62,6 @@ pub fn guard_token(state: &State, offered: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_token_is_only_handed_out_when_there_is_one() {
-        // The Digest path hashes this value. An empty string handed back for an
-        // unconfigured installation would be a password that anybody knows.
-        assert_eq!(token(&State::for_tests(String::new())), None);
-        assert_eq!(token(&State::for_tests("s3cret".to_owned())), Some("s3cret"));
-    }
 
     #[test]
     fn an_empty_presented_credential_does_not_match_an_empty_token() {

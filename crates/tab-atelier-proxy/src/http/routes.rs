@@ -38,7 +38,7 @@ use rocket::{Route, State, catch, delete, get, head, options, post, routes};
 
 use crate::http::body::Json;
 use crate::http::controllers::{account, hello, inspect, key, mapping, me, provider, relay, usage, web};
-use crate::http::guards::{Admin, Arrival, ClientKey, WebAuth};
+use crate::http::guards::{Admin, Arrival, ClientKey};
 use crate::http::raw::Raw;
 use crate::http::requests::compact::SetCompact;
 use crate::http::requests::inspect::ArmInspect;
@@ -335,12 +335,11 @@ pub(crate) fn disarm_inspect(state: &State<Arc<AppState>>, _admin: Admin) -> Rep
 /// work. The rank is what puts it last: without it this would answer
 /// `/api/users` with an HTML page and the API would look broken.
 ///
-/// `_auth: WebAuth` is the whole of the gating: the page, its scripts, its
-/// styles and the vendored libraries all come through here, so requiring a
-/// credential on this route requires one for every one of them. A crawler never
-/// gets past the first request.
+/// The page itself needs no credential. It is a shell with no data in it — every
+/// figure on the screen comes from `/api/*`, each of which needs the operator
+/// token — and until one is entered the sign-in form is all it shows.
 #[get("/<path..>", rank = 20)]
-pub(crate) fn ui(state: &State<Arc<AppState>>, _auth: WebAuth, path: PathBuf) -> Reply {
+pub(crate) fn ui(state: &State<Arc<AppState>>, path: PathBuf) -> Reply {
     // A tail wildcard's `PathBuf` carries the segments without the leading
     // slash, and everything below compares against full paths.
     let path = format!("/{}", path.to_string_lossy());
@@ -459,45 +458,23 @@ pub(crate) fn bad_request() -> Reply {
 
 /// Nothing signed in, or the wrong key.
 ///
-/// One catcher for both because a guard picks its own status and leaves its own
-/// sentence behind; what it cannot do is add a header to the response, and a
-/// browser only prompts when it is challenged. So the challenge goes on here,
-/// and only for a gated path — a relay refusal must NOT carry it, because the
-/// client is a CLI that would try to interpret it as a browser would.
+/// Nothing presented a valid credential.
 ///
-/// The reason is logged, because this is the only place it can be seen. Rocket
-/// logs the status and not the guard's sentence, and a browser that is
-/// re-challenged shows the user a prompt rather than the body — so without this
-/// line an operator diagnosing a 401 has nothing but `Error(401 Unauthorized)`
-/// in the journal, and the sentence naming the actual problem is discarded.
+/// The guard works out which of several things went wrong and leaves its
+/// sentence in the request; this puts that sentence in the body and in the log,
+/// because the log is the only place an operator can read it — a client shows
+/// the body, but a journal entry would otherwise be `Error(401 Unauthorized)`
+/// with no indication of which reason applied.
+///
+/// No `WWW-Authenticate` is sent. This API is called by programs holding a
+/// token, not by a browser that could answer a prompt.
 #[catch(401)]
 pub(crate) fn unauthorized(req: &rocket::Request<'_>) -> Reply {
     let refusal = crate::http::refusal::recall(req, Status::Unauthorized, "no valid credential");
-    let mut reply = crate::http::problem(401, refusal.message.clone());
-    if !crate::http::auth::gated(req.uri().path().as_str(), req.method()) {
-        // A key that did not authenticate on the relay or a `/me` path: the
-        // client is a program, so it will read the body.
-        log::warn!("401 {} {} — {}", req.method(), req.uri(), refusal.message);
-        return reply;
-    }
     // The credential is never logged, only why it was refused: this line ends up
     // in a journal that operators paste into bug reports.
-    log::warn!(
-        "401 {} {} — {} (browser challenge issued)",
-        req.method(),
-        req.uri(),
-        refusal.message
-    );
-    // A missing state means the server was built without it, which some tests
-    // do; there is then no secret to mint a nonce with, so the 401 goes out
-    // without a challenge rather than panicking.
-    if let Some(state) = req.rocket().state::<Arc<AppState>>() {
-        reply = reply.with_header(
-            "www-authenticate",
-            crate::http::auth::challenge(&state.web_auth, crate::usage::now_secs()),
-        );
-    }
-    reply
+    log::warn!("401 {} {} — {}", req.method(), req.uri(), refusal.message);
+    crate::http::problem(401, refusal.message)
 }
 
 /// A request the account is not allowed to make.
