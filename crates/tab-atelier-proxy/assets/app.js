@@ -98,6 +98,9 @@ function emptyWindow() {
         calls: 0,
         errors: 0,
         tokens: { input: 0, output: 0, cache_read: 0, cache_write: 0, total: 0 },
+        // Nothing is known about this account's hop, so nothing is claimed about
+        // its price. `null` keeps the "unpriced" state distinct from a real $0.00.
+        cost: null,
     };
 }
 function emptyUsage(id) {
@@ -130,6 +133,9 @@ function emptyUsage(id) {
         // axis with the wrong dates on it. The caller that draws charts fetches
         // the real window off the response.
         window: { start: "", end: "", hours: 0 },
+        // No rate known yet, so the money unit stays unavailable rather than
+        // letting an unpriced account be plotted at zero.
+        cost_model: null,
     };
 }
 /**
@@ -349,13 +355,32 @@ const AdminApp = Vue.defineComponent({
             // The header names the chart's unit, so it must agree with the axis and
             // with the tiles below it: derive it from the same tallest bucket rather
             // than echoing the select's base label (`Wh` beside numbers in `kWh`).
-            const top = this.series.reduce((m, s) => Math.max(m, s.input, s.output), 1);
-            return window.TaCharts.unitSuffix(top, this.unit);
+            //
+            // `chartTop` converts before returning, the contract `unitSuffix` names
+            // from and `unitStep` labels ticks with. Under money that matters twice
+            // over: the drawn value is not a rescaling of a token count, so passing
+            // the raw field would name the axis from a number in a different unit
+            // entirely (an hour of `deepseek-flash` is ~150k tokens and ~$0.03).
+            return window.TaCharts.unitSuffix(window.TaCharts.chartTop(this.series, this.unit), this.unit);
         },
         unitNote() {
             if (this.unit === "tokens")
                 return "";
+            if (this.unit === "usd") {
+                // The caveat is part of the figure, not a footnote to it: without it a
+                // total that quietly omits an unpriced account reads as a total.
+                const missing = this.unpricedAccounts;
+                return missing === 0
+                    ? window.TaCharts.moneyNote()
+                    : `${window.TaCharts.moneyNote()} ${missing} account(s) in this view have no price and are not included.`;
+            }
             return window.TaCharts.energyNote();
+        },
+        /** How many accounts in the current view are unpriced, out of the ones shown. */
+        unpricedAccounts() {
+            const all = Object.values(this.usage);
+            const chosen = this.focus ? all.filter((u) => u.user.id === this.focus) : all;
+            return chosen.filter((u) => !u.cost_model).length;
         },
         // The series the charts draw: one account's, or every account's summed
         // hour by hour. Summing here rather than server-side keeps /api/usage a
@@ -369,6 +394,11 @@ const AdminApp = Vue.defineComponent({
             if (!first)
                 return [];
             const base = first.series_hourly.map((b) => ({ ...b }));
+            // Money sums only when something in the view is actually priced. Left
+            // null when nothing is, so an unpriced selection draws an empty panel
+            // rather than a confident line along zero — the same distinction the
+            // server keeps, and the one a `?? 0` here would throw away.
+            const priced = chosen.some((u) => u.cost_model);
             for (const acct of chosen.slice(1)) {
                 acct.series_hourly.forEach((b, i) => {
                     const t = base[i];
@@ -380,6 +410,10 @@ const AdminApp = Vue.defineComponent({
                     t.output += b.output;
                     t.cache_read += b.cache_read;
                     t.cache_write += b.cache_write;
+                    if (priced) {
+                        t.cost_in_micro = (t.cost_in_micro ?? 0) + (b.cost_in_micro ?? 0);
+                        t.cost_out_micro = (t.cost_out_micro ?? 0) + (b.cost_out_micro ?? 0);
+                    }
                 });
             }
             return base;
@@ -473,11 +507,20 @@ const AdminApp = Vue.defineComponent({
             const input = sum((b) => b.input);
             const output = sum((b) => b.output);
             const cache = sum((b) => b.cache_read);
+            // Any priced hour is enough to make the total meaningful; a view with
+            // none reports the dash instead of a confident `$0.00`.
+            const priced = this.series.some((b) => b.cost_in_micro != null);
+            const paid = sum((b) => (b.cost_in_micro ?? 0) + (b.cost_out_micro ?? 0));
             return [
                 { label: "API calls", value: this.fmt(calls), sub: errors ? `${errors} failed` : "none failed" },
                 { label: "Tokens", value: this.fmt(input + output + cache), sub: "input + output + cache" },
                 { label: "Input", value: this.fmt(input), sub: cache ? `${this.fmt(cache)} from cache` : "no cache hits" },
                 { label: "Output", value: this.fmt(output), sub: this.scopeLabel },
+                {
+                    label: "Cost",
+                    value: priced ? window.TaCharts.fmtMoney(paid) : "—",
+                    sub: priced ? "at list rates · see the token chart note" : "no price known for this hop",
+                },
                 {
                     label: "Energy",
                     value: window.TaCharts.withUnit(window.TaCharts.convertTokens(input + output + cache, "wh"), "wh"),
@@ -543,6 +586,24 @@ const AdminApp = Vue.defineComponent({
         },
         mappingModelChoices() {
             return this.modelChoices.map((choice) => choice.value);
+        },
+        /**
+         * A model's published rates, or nothing where none are recorded.
+         *
+         * Trims to three significant places rather than two decimals: the rates run
+         * from $0.003 to $15 per 1M, so `toFixed(2)` would render the cache-hit
+         * rate — the one figure the whole cache story turns on — as `$0.00`.
+         */
+        priceLabel(m) {
+            if (!m.price)
+                return "";
+            const rate = (micro) => {
+                const usd = micro / 1_000_000;
+                const text = usd >= 1 ? usd.toFixed(2) : usd.toFixed(4).replace(/0+$/, "").replace(/\.$/, "");
+                return `$${text}`;
+            };
+            const p = m.price;
+            return `${rate(p.cache_hit)} / ${rate(p.input)} / ${rate(p.output)} per 1M`;
         },
     },
     mounted() {

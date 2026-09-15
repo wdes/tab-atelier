@@ -486,6 +486,7 @@
                            :title="m.note || ''">
                         {{ m.id }}
                         <span class="text-body-secondary">· {{ m.class }} · {{ m.cost_now }}</span>
+                        <span class="text-body-secondary ms-1" v-if="priceLabel(m)" :title="'Cache hit, input, output — per 1M tokens, off peak. Peak hours multiply all three.'">{{ priceLabel(m) }}</span>
                       </div>
                     </td>
                     <td class="text-center small">

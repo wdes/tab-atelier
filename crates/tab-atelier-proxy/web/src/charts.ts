@@ -32,13 +32,14 @@ const H = 200;
 // conversion never touches a provider's own token numbers.
 
 /** What the token chart's y-axis and totals are expressed in. */
-const TOKEN_UNITS = ["tokens", "wh", "gco2"] as const;
+const TOKEN_UNITS = ["tokens", "wh", "gco2", "usd"] as const;
 type TokenUnit = (typeof TOKEN_UNITS)[number];
 
 const UNIT_LABEL: Record<TokenUnit, string> = {
   tokens: "tokens",
   wh: "Wh",
   gco2: "gCO₂e",
+  usd: "$",
 };
 
 /** The same labels as an ordered list, for the `<select>` in the header. */
@@ -73,11 +74,65 @@ const ENERGY_SCALE: Record<string, number> = {
   gco2: 0.03 / 0.24,
 };
 
+// Published list prices, per 1M tokens. DeepSeek's are the ones the repo
+// already records (provider.rs, beside `relative_cost`), and Flash is the model
+// every account here is served by, so they are the rates the figures are built
+// from rather than a second opinion about them.
+const SOURCE_PRICE = {
+  value: "$0.003 cached input · $0.15 uncached input · $0.60 output, per 1M tokens",
+  unit: "DeepSeek Flash list price, off-peak",
+};
+
+/** The full caveat, shown verbatim wherever a money figure appears. */
+function moneyNote(): string {
+  return (
+    `Indicative, from ${SOURCE_PRICE.unit}: ${SOURCE_PRICE.value}. Priced on the ` +
+    `server, one rate per account, with the peak window applied to the hours it ` +
+    `covers. An account served by another model is priced at the cheapest one ` +
+    `its provider still offers, so read it as a close estimate, not an invoice.`
+  );
+}
+
 /** Convert a token count into `unit`; `tokens` passes straight through. */
+/**
+ * The magnitude each panel shows for a bucket, before unit scaling.
+ *
+ * Money is not a rescaling of a token count: it prices three classes at three
+ * rates, so it arrives from the server already computed. Tokens and energy are
+ * raw counts that `convertTokens` scales afterwards. Keeping the branch here
+ * means the chart, the page header and the tiles all ask the same function
+ * which quantity they are plotting.
+ */
+function rawValues(b: UsageBucket, unit: string): [number, number] {
+  return unit === "usd" ? [b.cost_in_micro ?? 0, b.cost_out_micro ?? 0] : [b.input, b.output];
+}
+
+/**
+ * The largest value the chart will draw from these buckets, in `unit`.
+ *
+ * Converted, not raw, because the caller uses it to name the axis — and the
+ * step below it (`unitStep`) already converted, so taking the raw field here
+ * would let the two disagree.
+ */
+function chartTop(buckets: UsageBucket[], unit: string): number {
+  let top = 0;
+  for (const b of buckets) {
+    const [i, o] = rawValues(b, unit);
+    top = Math.max(top, convertTokens(i, unit), convertTokens(o, unit));
+  }
+  return top;
+}
+
 function convertTokens(tokens: number, unit: string): number {
   const scale = ENERGY_SCALE[unit];
   return scale === undefined ? tokens : tokens * WH_PER_TOKEN * scale;
 }
+// `usd` is deliberately absent from `ENERGY_SCALE`, so it falls through above
+// unchanged — and that is the point rather than an oversight. Money is priced on
+// the server and arrives already in micro-USD, because it is piecewise over
+// three token classes at three rates and no single multiplier of one token count
+// can recover it. Every other unit here *is* such a multiplier; money is the one
+// that has already been converted, so converting it again would be wrong.
 
 /** A compact count for a chart axis, where `1.2k` beats five digits. */
 function fmtCount(n: number): string {
@@ -99,11 +154,28 @@ function fmtCount(n: number): string {
 const UNIT_STEPS: Partial<Record<TokenUnit, readonly (readonly [number, string])[]>> = {
   wh: [[1e9, "GWh"], [1e6, "MWh"], [1e3, "kWh"]],
   gco2: [[1e6, "tCO₂e"], [1e3, "kgCO₂e"]],
+  // Bottoming out at 1, not 1e3, because a priced hour is routinely a fraction
+  // of a cent: without the `µ$` floor a cheap hour prints as `0.00`, which is
+  // indistinguishable from an hour nothing was spent in.
+  usd: [[1e6, "$"], [1e3, "m$"], [1, "µ$"]],
 };
+
+/** Micro-USD as currency, with the symbol leading: `$25.90`, `$0.0312`. */
+function money(micro: number): string {
+  const dollars = micro / 1e6;
+  // Decimals follow the magnitude: cents for a real sum, more only when the
+  // whole figure is smaller than one — an hourly cost of $0.004 printed as
+  // `$0.00` is indistinguishable from an hour that cost nothing.
+  const places = dollars >= 1 ? 2 : dollars >= 0.01 ? 3 : 4;
+  return `$${dollars.toFixed(places)}`;
+}
 
 /** A quantity with its unit, magnitude folded into the unit: `566.8 kWh`. */
 function withUnit(n: number, unit: string): string {
   if (unit === "tokens") return `${fmtCount(n)} tokens`;
+  // The one unit whose symbol leads rather than trails, because `25.9 $` reads
+  // as a different figure than `$25.90` — and only this one is a currency.
+  if (unit === "usd") return money(n);
   const u = unit as TokenUnit;
   const step = UNIT_STEPS[u]?.find(([m]) => Math.abs(n) >= m);
   return step === undefined
@@ -119,17 +191,18 @@ function niceNumber(v: number): number {
 }
 
 /**
- * The unit a chart prints for a series whose tallest bucket is `max` **tokens**,
- * with the magnitude folded in: `kWh`, never `k Wh`. Takes the raw token count
- * and converts here, because that is what every series holds until this function
- * names the unit; the label and the numbers it labels must be chosen from the
- * same converted maximum or the axis reads `566.8` under a `Wh` heading.
+ * The unit a chart prints for a series whose tallest bucket is `max`, in `unit`.
+ *
+ * `max` arrives already converted, matching `unitStep`, which picks the tick
+ * steps from the same converted quantity. The two must agree or the ticks read
+ * `566.8` under a `Wh` heading; converting in one and not the other is the way
+ * that happens. Callers convert, this function only names.
  */
 function unitSuffix(max: number, unit: string): string {
   const label = UNIT_LABEL[unit as TokenUnit] ?? UNIT_LABEL.tokens;
   const steps = UNIT_STEPS[unit as TokenUnit];
   if (!steps) return label;
-  const top = Math.abs(convertTokens(niceNumber(max), unit));
+  const top = Math.abs(niceNumber(max));
   return steps.find(([m]) => top >= m)?.[1] ?? label;
 }
 
@@ -398,9 +471,12 @@ const TokensChart = Vue.defineComponent({
   mixins: [hoverable, xLabels],
   props: {
     points: { type: Array as () => readonly UsageBucket[], required: true },
-    // Set by the header's toggle. The bars keep plotting raw tokens — only the
-    // numbers beside them are converted, so a switch of unit never redraws the
-    // shape of the data, just its scale labels.
+    // Set by the header's toggle. The energy units rescale the numbers without
+    // changing the bars' shape — Wh and gCO₂e are a linear factor apart from
+    // tokens, so the picture is the same one relabelled. Money is NOT that: it
+    // weights the same hour by which class the tokens were, and three classes
+    // 50x apart price to a different shape than their sum. So `usd` moves the
+    // bars too, via `valIn`/`valOut` below.
     unit: { type: String as () => TokenUnit, default: "tokens" },
   },
   computed: {
@@ -418,18 +494,18 @@ const TokensChart = Vue.defineComponent({
       return (this.plotH - this.gap) / 2;
     },
     maxIn(): number {
-      return this.niceMax(Math.max(1, ...this.pts.map((p) => p.input)));
+      return this.niceMax(Math.max(1, ...this.pts.map((p) => this.valIn(p))));
     },
     maxOut(): number {
-      return this.niceMax(Math.max(1, ...this.pts.map((p) => p.output)));
+      return this.niceMax(Math.max(1, ...this.pts.map((p) => this.valOut(p))));
     },
     // The window's totals, for the panel titles: with separate scales these
     // numbers are the only place the ratio between the two survives.
     totalIn(): number {
-      return this.pts.reduce((a, p) => a + p.input, 0);
+      return this.pts.reduce((a, p) => a + this.valIn(p), 0);
     },
     totalOut(): number {
-      return this.pts.reduce((a, p) => a + p.output, 0);
+      return this.pts.reduce((a, p) => a + this.valOut(p), 0);
     },
     barW(): number {
       // 2px of surface between neighbours, and never a sliver.
@@ -445,7 +521,17 @@ const TokensChart = Vue.defineComponent({
       );
     },
     unitName(): string {
-      return unitSuffix(Math.max(this.maxIn, this.maxOut), this.unit);
+      // From the converted magnitude, like `unitStep` above — the axis heading
+      // and the tick steps have to be chosen from the same quantity, or the
+      // ticks read `566.8` under a `Wh` heading.
+      //
+      // Money made this worth saying out loud rather than leaving implicit:
+      // `convertTokens` is the identity for `usd`, so a caller passing the raw
+      // micro-USD field and one passing a converted figure would agree today
+      // and diverge the moment the scale changed. `rawValues` and this
+      // conversion are the contract: values arrive in the unit's base unit,
+      // `convertTokens` puts them in the unit the axis prints.
+      return unitSuffix(convertTokens(Math.max(this.maxIn, this.maxOut), this.unit), this.unit);
     },
   },
   methods: {
@@ -459,10 +545,29 @@ const TokensChart = Vue.defineComponent({
       const step = this.unitStep;
       return step === undefined ? fmtCount(v) : fmtCount(v / step[0]);
     },
+    // The tooltip prints a figure, not a position on an axis, so it cannot lean
+    // on the axis name for its unit the way tick labels do — `0.03 in` is not a
+    // price. Money names itself; every other unit keeps the stepped form.
+    tip(n: number): string {
+      return this.unit === "usd" ? money(n) : this.fmt(n);
+    },
     // The panel totals label themselves rather than borrowing the axis name:
-    // a window total can sit a step above the tallest single hour.
+    // a window total can sit a step above the tallest single hour. Money writes
+    // itself as `$25.90`, where `25.90 $` would be a different layout and a
+    // different rounding.
     amt(n: number): string {
-      return withUnit(convertTokens(n, this.unit), this.unit);
+      return this.unit === "usd" ? money(n) : withUnit(convertTokens(n, this.unit), this.unit);
+    },
+    // What a bar actually plots. The switch between token counts and money has
+    // to happen HERE, at the point a value is named, because the two are not the
+    // same quantity on different scales: `input` counts tokens, while
+    // `cost_in_micro` prices three classes at three rates. Every read of a
+    // panel's magnitude goes through these two, so the choice is made once.
+    valIn(p: UsageBucket): number {
+      return rawValues(p, this.unit)[0];
+    },
+    valOut(p: UsageBucket): number {
+      return rawValues(p, this.unit)[1];
     },
     // The two scales, kept as separate functions rather than one parameterised
     // by a panel index — mixing them up would silently plot output against
@@ -501,7 +606,7 @@ const TokensChart = Vue.defineComponent({
           <tspan class="ta-key ta-bg-1"></tspan>input · {{ amt(totalIn) }}
         </text>
         <g v-for="(p, i) in pts" :key="'bi'+i">
-          <rect v-if="p.input" v-bind="barIn(i, p.input)" class="ta-bar-1" rx="4" />
+          <rect v-if="valIn(p)" v-bind="barIn(i, valIn(p))" class="ta-bar-1" rx="4" />
         </g>
 
         <!-- Output, on its own scale: the point of the split. -->
@@ -515,7 +620,7 @@ const TokensChart = Vue.defineComponent({
           <tspan class="ta-key ta-bg-2"></tspan>output · {{ amt(totalOut) }}
         </text>
         <g v-for="(p, i) in pts" :key="'bo'+i">
-          <rect v-if="p.output" v-bind="barOut(i, p.output)" class="ta-bar-2" rx="4" />
+          <rect v-if="valOut(p)" v-bind="barOut(i, valOut(p))" class="ta-bar-2" rx="4" />
         </g>
 
         <!-- One crosshair across both, because the x axis is shared. -->
@@ -528,9 +633,12 @@ const TokensChart = Vue.defineComponent({
       </svg>
       <div v-if="hovering" class="ta-tip" :style="tipStyle(hover)">
         <div class="ta-tip-h">{{ hourLabel(points[hover].hour) }}</div>
-        <div><span class="ta-key ta-bg-1"></span>{{ fmt(points[hover].input) }} in</div>
-        <div><span class="ta-key ta-bg-2"></span>{{ fmt(points[hover].output) }} out</div>
-        <div v-if="points[hover].cache_read" class="ta-tip-sub">
+        <div><span class="ta-key ta-bg-1"></span>{{ tip(valIn(points[hover])) }} in</div>
+        <div><span class="ta-key ta-bg-2"></span>{{ tip(valOut(points[hover])) }} out</div>
+        <div v-if="unit === 'usd'" class="ta-tip-sub">
+          {{ tip(valIn(points[hover]) + valOut(points[hover])) }} this hour
+        </div>
+        <div v-else-if="points[hover].cache_read" class="ta-tip-sub">
           {{ fmt(points[hover].cache_read) }} cache read
         </div>
       </div>
@@ -679,5 +787,5 @@ const PressureChart = Vue.defineComponent({
     </div>`,
 });
 
-window.TaCharts = { CallsChart, TokensChart, PressureChart, UNIT_OPTIONS, convertTokens, fmtCount, withUnit, unitSuffix, energyNote };
+window.TaCharts = { CallsChart, TokensChart, PressureChart, UNIT_OPTIONS, convertTokens, fmtCount, withUnit, unitSuffix, energyNote, moneyNote, fmtMoney: money, chartTop };
 })();

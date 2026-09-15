@@ -25,6 +25,19 @@ pub(crate) fn usage_report(state: &Arc<State>, query: &str) -> Reply {
     // Store before usage: the same order `account::remove` takes them, so a
     // report racing a deletion cannot deadlock against it.
     let store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Priced while the registry guard is held and released again, before the
+    // usage lock is taken. Taking all three at once would widen the window for
+    // a deadlock to buy nothing: a provider write goes through the store lock,
+    // which is held throughout, so no rate can move between here and the line
+    // that uses it.
+    let rates: Vec<Option<crate::provider::Rate>> = {
+        let registry = state.registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        store
+            .accounts()
+            .iter()
+            .map(|a| registry.billing_price(a.provider.as_deref(), a.model.as_deref()))
+            .collect()
+    };
     let body = {
         let u = state.usage.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         resources::UsageReportResource {
@@ -35,9 +48,10 @@ pub(crate) fn usage_report(state: &Arc<State>, query: &str) -> Reply {
             users: store
                 .accounts()
                 .iter()
-                .map(|a| resources::UserUsageResource {
+                .zip(&rates)
+                .map(|(a, rate)| resources::UserUsageResource {
                     user: resources::AccountResource::from(a),
-                    usage: resources::UsageResource::of(&u, &a.id, span, now),
+                    usage: resources::UsageResource::of(&u, &a.id, span, now, rate.as_ref()),
                 })
                 .collect(),
         }
