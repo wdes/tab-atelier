@@ -25,8 +25,8 @@
           {
             "type": "command",
             "command": "\"$CLAUDE_PROJECT_DIR\"/scripts/claude-lint-hook.sh",
-            "timeout": 600,
-            "statusMessage": "cargo fmt + clippy"
+            "timeout": 20,
+            "statusMessage": "cargo fmt"
           }
         ]
       }

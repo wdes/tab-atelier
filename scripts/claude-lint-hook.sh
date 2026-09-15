@@ -2,15 +2,22 @@
 # SPDX-License-Identifier: MPL-2.0
 #
 # Claude Code PostToolUse hook (see .claude/settings.json): after every
-# Write/Edit of a Rust file, auto-fix what clippy can fix mechanically,
-# auto-format the owning package, and run the same strict clippy CI
-# runs. Only what survives auto-fixing exits 2, which feeds the errors
-# straight back to Claude so they get fixed in the same turn instead of
-# surfacing later in CI.
+# Write/Edit of a Rust file, format it.
+#
+# It used to run `cargo clippy --fix` and then a full strict clippy pass on
+# every edit. That is two clippy invocations against this workspace's whole
+# dependency graph — minutes per file, with the timeout raised to 600s to
+# accommodate it. The feedback was useful but the cost dominated a session.
+# Clippy now runs before every commit and in CI (`--workspace --all-targets
+# -- -D warnings`), which is where it belongs.
+#
+# What remains is `rustfmt` on the edited file, which is ~30ms. It guards a
+# real failure: CI rejects formatting drift. Running the formatter directly
+# rather than through cargo skips workspace resolution, and the edition comes
+# from rustfmt.toml, so nothing has to be passed or kept in sync here.
 set -u
 
 command -v jq >/dev/null 2>&1 || exit 0
-command -v cargo >/dev/null 2>&1 || exit 0
 
 file=$(jq -r '.tool_input.file_path // .tool_response.filePath // empty')
 case "$file" in
@@ -18,38 +25,19 @@ case "$file" in
 *) exit 0 ;;
 esac
 
-cd "${CLAUDE_PROJECT_DIR:-.}" || exit 0
-
-# Map the edited file to the workspace package that owns it. The root
-# package is linted with CI's headless feature set so the hook works in
-# environments without the GUI system libraries (the GUI feature set is
-# still covered by CI).
-rel=${file#"$PWD"/}
-clippy_extra=()
-case "$rel" in
-android/*) exit 0 ;; # separate cargo project, not a workspace member
-# Any crate under crates/: its directory name is its package name. Linting the
-# crate that owns the file — not the root package — is both correct and much
-# faster. Correct because a non-default member such as tab-atelier-proxy is
-# otherwise never linted at all (plain `-p tab-atelier` does not reach it), and
-# faster because the root package drags in the whole desktop dependency graph on
-# every edit. None of these crates declare features, so clippy_extra stays empty.
-crates/*/*)
-    pkg=${rel#crates/}
-    pkg=${pkg%%/*}
-    ;;
-*) pkg=tab-atelier clippy_extra=(--no-default-features --features headless,energy) ;;
+# The desktop build under android/ is a separate cargo project with its own
+# toolchain and formatting expectations; not this hook's business.
+case "$file" in
+*/android/*) exit 0 ;;
 esac
 
-# Apply clippy's machine-applicable fixes first (--allow-dirty /
-# --allow-staged: the hook always runs on an uncommitted tree), then
-# format — which also cleans up after the fixer. Only what remains
-# unfixable is reported back.
-cargo clippy --fix --allow-dirty --allow-staged -p "$pkg" "${clippy_extra[@]}" --all-targets >/dev/null 2>&1
-cargo fmt -p "$pkg" 2>/dev/null
+# Same toolchain as CI and the other wrappers, stated once in lib/.
+# shellcheck source=scripts/lib/toolchain.sh
+. "$(dirname "$0")/lib/toolchain.sh" 2>/dev/null || export PATH="$HOME/.cargo/bin:$PATH"
 
-if ! out=$(cargo clippy -p "$pkg" "${clippy_extra[@]}" --all-targets 2>&1); then
-    printf '%s\n' "$out" | tail -n 60 >&2
-    exit 2
-fi
+# Format the file in place. The absence of `--edition` is deliberate: rustfmt
+# finds rustfmt.toml by walking up from the file, and that file is where the
+# edition is declared.
+rustfmt ${TA_TOOLCHAIN:+"+$TA_TOOLCHAIN"} "$file" >/dev/null 2>&1
+
 exit 0
