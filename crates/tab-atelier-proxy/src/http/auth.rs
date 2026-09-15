@@ -85,7 +85,7 @@
 //! nonces and the browser prompts once more, which is the right trade: the
 //! alternative is a secret on disk, which is a secret to leak.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Mutex;
 
 use hmac::{Hmac, Mac};
@@ -116,6 +116,13 @@ pub const USERNAME: &str = "admin";
 /// Long enough to type a password into a prompt that has been open a while,
 /// short enough that a captured header is not useful for long.
 const NONCE_TTL_SECS: u64 = 300;
+
+/// The most `nc` values one nonce may spend before it is reset.
+///
+/// Dashboard page loads use a few dozen. The ceiling keeps the per-nonce set
+/// bounded; reaching it answers with a fresh `stale=false` challenge, which a
+/// browser picks up without prompting.
+const MAX_NC_PER_NONCE: usize = 65_536;
 
 /// The length of the hex-encoded HMAC tag on a nonce.
 ///
@@ -199,15 +206,30 @@ fn is_exempt(path: &str) -> bool {
 
 // ── the nonces ──────────────────────────────────────────────────────────────
 
-/// Mints and redeems the nonces the challenge hands out.
+/// The nonces that have been redeemed, keyed by `(nonce, nc)`.
 ///
-/// Lives on the state because the secret is per process and the used-nonce
-/// table is per process with it.
+/// A nonce is NOT single-use, and treating it as if it were is what broke the
+/// dashboard. HTTP Digest hands the client one nonce per realm and expects it
+/// to reuse that nonce for every subsequent request, incrementing `nc`; `nc`
+/// exists precisely so the server can detect a replay without refusing reuse.
+/// Refusing the second request that reused a nonce meant the first asset loaded
+/// and every later one answered 401.
 pub struct Nonces {
     /// The HMAC key. Fresh per process; never written anywhere.
     secret: [u8; 32],
-    /// The nonces that have been redeemed, and when, so they can be pruned.
-    used: Mutex<HashMap<String, u64>>,
+    /// Per nonce, the `nc` values already spent and when the nonce was first
+    /// seen. Pruned by age, so the table is bounded by requests-per-window
+    /// rather than by uptime.
+    used: Mutex<HashMap<String, Spent>>,
+}
+
+/// The `nc` values already spent against one nonce.
+#[derive(Debug)]
+struct Spent {
+    /// When this nonce was first redeemed, for pruning.
+    first: u64,
+    /// Every `nc` seen. A repeat is the replay this guards against.
+    counts: BTreeSet<u32>,
 }
 
 impl std::fmt::Debug for Nonces {
@@ -266,7 +288,7 @@ impl Nonces {
     /// saves a timer.
     fn mint(&self, now: u64) -> String {
         if let Ok(mut used) = self.used.lock() {
-            used.retain(|_, at| now.saturating_sub(*at) <= NONCE_TTL_SECS);
+            used.retain(|_, spent| now.saturating_sub(spent.first) <= NONCE_TTL_SECS);
         }
         let stamp = format!("{now:0STAMP_HEX$x}");
         // Eight bytes from a v4 UUID, which is drawn from the system's random
@@ -282,10 +304,22 @@ impl Nonces {
     ///
     /// # Errors
     /// A sentence naming which of the four ways it failed, because a client
-    /// developer reading a 401 needs to tell "stale" from "forged".
-    fn redeem(&self, nonce: &str, now: u64) -> Result<(), String> {
+    /// Verify a nonce's signature and age, WITHOUT spending it.
+    ///
+    /// Checking and spending are separate on purpose. A credential that fails
+    /// for any other reason — a wrong password, a mismatched path — must not
+    /// consume the nonce, or one bad attempt would lock every later request out
+    /// until the browser was handed a new one. That is half of why the
+    /// dashboard answered 401 on the second asset.
+    ///
+    /// # Errors
+    /// [`NonceProblem::Forged`] for a value this proxy did not issue, and
+    /// [`NonceProblem::Stale`] for one that is simply too old — which the
+    /// catcher reports as `stale=true` so the browser retries silently instead
+    /// of prompting again.
+    fn check(&self, nonce: &str, now: u64) -> Result<(), NonceProblem> {
         if nonce.len() != STAMP_HEX + RAND_HEX + TAG_HEX {
-            return Err("the nonce is malformed".to_owned());
+            return Err(NonceProblem::Malformed);
         }
         let (payload, tag) = nonce.split_at(STAMP_HEX + RAND_HEX);
         let stamp = &payload[..STAMP_HEX];
@@ -294,24 +328,78 @@ impl Nonces {
         // the table work, and the tag check is the cheap one. The whole payload
         // is signed, so the randomness cannot be swapped for a chosen value.
         if !tokens_match(tag, &self.short_tag(payload)) {
-            return Err("the nonce was not issued by this proxy".to_owned());
+            return Err(NonceProblem::Forged);
         }
 
-        let issued = u64::from_str_radix(stamp, 16).map_err(|_| "the nonce is malformed".to_owned())?;
+        let issued = u64::from_str_radix(stamp, 16).map_err(|_| NonceProblem::Malformed)?;
         if now.saturating_sub(issued) > NONCE_TTL_SECS {
-            return Err(format!(
-                "the nonce is older than {NONCE_TTL_SECS} seconds — open the page again"
-            ));
+            return Err(NonceProblem::Stale);
         }
+        Ok(())
+    }
 
+    /// Spend one `nc` against a nonce, refusing a repeat.
+    ///
+    /// This is the replay guard, and it is keyed on `(nonce, nc)` rather than on
+    /// the nonce because that is what RFC 7616 means by `nc`: a client reuses
+    /// one nonce for every request and increments the counter, so a *repeat* of
+    /// a counter is the replay. Call it only once the response digest has been
+    /// verified, so a failed attempt cannot burn the counter.
+    ///
+    /// # Errors
+    /// A sentence naming the replay, for the log and the body.
+    fn accept(&self, nonce: &str, nc: u32, now: u64) -> Result<(), String> {
         let mut used = self.used.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if used.contains_key(nonce) {
-            return Err("that nonce has already been used".to_owned());
+        used.retain(|_, spent| now.saturating_sub(spent.first) <= NONCE_TTL_SECS);
+
+        {
+            let spent = used.entry(nonce.to_owned()).or_insert_with(|| Spent {
+                first: now,
+                counts: BTreeSet::new(),
+            });
+            if !spent.counts.insert(nc) {
+                return Err(format!(
+                    "nc={nc:08x} has already been used with this nonce — that is a replay of an \
+                     earlier request"
+                ));
+            }
+            // A ceiling on the counters one nonce may spend. A browser loading
+            // the dashboard uses a few dozen; anything approaching this is not
+            // a page load, and letting it grow would make the table unbounded.
+            if spent.counts.len() > MAX_NC_PER_NONCE {
+                spent.counts.clear();
+                spent.first = now;
+            }
         }
-        used.retain(|_, at| now.saturating_sub(*at) <= NONCE_TTL_SECS);
-        used.insert(nonce.to_owned(), now);
+        // Released before returning, so the guard's lifetime is the table work
+        // and not the caller's stack.
         drop(used);
         Ok(())
+    }
+}
+
+/// Why a nonce was not usable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NonceProblem {
+    /// Not a shape this proxy mints.
+    Malformed,
+    /// A shape it mints, but not a value it issued.
+    Forged,
+    /// Issued by this proxy, and past its window.
+    Stale,
+}
+
+impl NonceProblem {
+    /// The sentence a client sees.
+    fn message(self) -> String {
+        match self {
+            Self::Malformed => "the nonce is malformed".to_owned(),
+            Self::Forged => "the nonce was not issued by this proxy".to_owned(),
+            Self::Stale => format!(
+                "the nonce is older than {NONCE_TTL_SECS} seconds — this is normal after a page \
+                 has been open a while, and the browser retries automatically"
+            ),
+        }
     }
 }
 
@@ -374,7 +462,9 @@ pub fn verify(state: &State, method: Method, target: &str, header: &str, now: u6
     }
 
     let nonce = field("nonce").ok_or_else(|| "no nonce in the credential".to_owned())?;
-    state.web_auth.redeem(&nonce, now)?;
+    // Signature and age only. The `nc` is spent after the response digest
+    // verifies, so a wrong password cannot consume the nonce.
+    state.web_auth.check(&nonce, now).map_err(NonceProblem::message)?;
 
     // RFC 7616: a client that was challenged with `algorithm=SHA-256` echoes it
     // back. Its absence means the client hashed with RFC 2617's default, which
@@ -397,7 +487,11 @@ pub fn verify(state: &State, method: Method, target: &str, header: &str, now: u6
     // `qop=auth` is what a browser sends. A credential without it is the older
     // RFC 2069 form, which some clients still emit, and the hash differs by one
     // field — so both are computed correctly rather than one being refused.
-    let expected = if let Some(qop) = field("qop") {
+    //
+    // The counter is carried out of the branch rather than spent here: it is
+    // spent only once the digest verifies, so a wrong password cannot consume a
+    // counter the browser is about to reuse.
+    let (expected, counter) = if let Some(qop) = field("qop") {
         if qop != "auth" {
             return Err(format!("only qop=auth is supported; this credential asked for `{qop}`"));
         }
@@ -405,21 +499,30 @@ pub fn verify(state: &State, method: Method, target: &str, header: &str, now: u6
         let cnonce = field("cnonce").ok_or_else(|| "qop=auth needs a cnonce".to_owned())?;
         let ha1 = sha256_hex(&[&username, REALM, token]);
         let ha2 = sha256_hex(&[method.as_str(), &uri]);
-        sha256_hex(&[&ha1, &nonce, &nc, &cnonce, &qop, &ha2])
+        // RFC 7616 spells these as hex digits; a client that sends something
+        // else is refused by name rather than hashed to a different value.
+        let counter = u32::from_str_radix(&nc, 16).map_err(|_| format!("nc must be hexadecimal, got `{nc}`"))?;
+        (sha256_hex(&[&ha1, &nonce, &nc, &cnonce, &qop, &ha2]), Some(counter))
     } else {
         let ha1 = sha256_hex(&[&username, REALM, token]);
         let ha2 = sha256_hex(&[method.as_str(), &uri]);
-        sha256_hex(&[&ha1, &nonce, &ha2])
+        (sha256_hex(&[&ha1, &nonce, &ha2]), None)
     };
 
-    if tokens_match(&response, &expected) {
-        Ok(())
-    } else {
+    if !tokens_match(&response, &expected) {
         // Deliberately one message for a wrong password and for a malformed
         // computation: distinguishing them tells an attacker which half to
         // keep working on.
-        Err("the password is not the operator token".to_owned())
+        return Err("the password is not the operator token".to_owned());
     }
+
+    // The replay guard, keyed on the counter rather than on the nonce: reusing
+    // a nonce is what a browser is supposed to do, and repeating a counter
+    // against it is the same request sent twice.
+    if let Some(counter) = counter {
+        state.web_auth.accept(&nonce, counter, now)?;
+    }
+    Ok(())
 }
 
 /// The status a refusal from this module carries.
@@ -733,20 +836,39 @@ mod tests {
 
     // ── the nonces ──────────────────────────────────────────────────────────
 
+    /// A nonce is REUSED across requests, with the counter doing the counting.
+    ///
+    /// RFC 7616 has the client hold one nonce per realm and increment `nc` for
+    /// every request. An earlier version refused a nonce a second time, so a
+    /// page load succeeded on its first asset and 401'd every asset after it —
+    /// with no password prompt, because the browser saw a challenge whose
+    /// nonce it had already answered.
     #[test]
-    fn a_minted_nonce_redeems_once_and_then_not_again() {
-        // Replay is the attack a nonce exists to stop: the whole credential
-        // travels in one header, and anyone who copies it could otherwise use
-        // it unchanged for as long as it lives.
+    fn a_nonce_is_reused_across_requests() {
         let nonces = Nonces::new();
         let now = 1_700_000_000;
         let nonce = nonces.mint(now);
 
-        assert!(nonces.redeem(&nonce, now).is_ok(), "the first use is fine");
+        for nc in 1..20u32 {
+            assert!(nonces.check(&nonce, now).is_ok(), "the nonce stays valid");
+            assert!(nonces.accept(&nonce, nc, now).is_ok(), "nc={nc} is fresh");
+        }
+    }
+
+    #[test]
+    fn a_repeated_counter_against_one_nonce_is_refused() {
+        // Repeating a counter is the replay: the credential travels in one
+        // header, so a copy of it would otherwise work unchanged.
+        let nonces = Nonces::new();
+        let now = 1_700_000_000;
+        let nonce = nonces.mint(now);
+
+        assert!(nonces.accept(&nonce, 1, now).is_ok());
         assert!(
-            nonces.redeem(&nonce, now).is_err(),
-            "the second use of the same nonce must be refused"
+            nonces.accept(&nonce, 1, now).is_err(),
+            "the same nc twice is the same request sent twice"
         );
+        assert!(nonces.accept(&nonce, 2, now).is_ok(), "a new counter is fine");
     }
 
     #[test]
@@ -762,7 +884,7 @@ mod tests {
         let b = Nonces::new();
         let theirs = b.mint(1_700_000_000);
         assert!(
-            a.redeem(&theirs, 1_700_000_000).is_err(),
+            a.check(&theirs, 1_700_000_000).is_err(),
             "another process's nonce must not verify"
         );
     }
@@ -778,7 +900,7 @@ mod tests {
         let mut flipped = tag.to_owned();
         let first = flipped.remove(0);
         flipped.insert(0, if first == '0' { '1' } else { '0' });
-        assert!(nonces.redeem(&format!("{payload}{flipped}"), now).is_err());
+        assert!(nonces.check(&format!("{payload}{flipped}"), now).is_err());
 
         // And every byte of the RANDOMNESS matters too. This is what the
         // signature covering the whole payload is for: if only the stamp were
@@ -789,7 +911,7 @@ mod tests {
         let digit = chosen.as_bytes()[at];
         chosen.replace_range(at..=at, if digit == b'0' { "1" } else { "0" });
         assert!(
-            nonces.redeem(&chosen, now).is_err(),
+            nonces.check(&chosen, now).is_err(),
             "a nonce with altered randomness must not verify"
         );
     }
@@ -804,7 +926,7 @@ mod tests {
         let rest = &nonce[STAMP_HEX..];
         let rewritten = format!("{now:0STAMP_HEX$x}{rest}");
         assert!(
-            nonces.redeem(&rewritten, now).is_err(),
+            nonces.check(&rewritten, now).is_err(),
             "a stamp that was not signed must not verify"
         );
     }
@@ -814,37 +936,32 @@ mod tests {
         let nonces = Nonces::new();
         let issued = 1_700_000_000;
         let nonce = nonces.mint(issued);
-        assert!(nonces.redeem(&nonce, issued + NONCE_TTL_SECS).is_ok());
-        assert!(
-            nonces
-                .redeem(&nonces.mint(issued), issued + NONCE_TTL_SECS + 1)
-                .is_err()
-        );
+        assert!(nonces.check(&nonce, issued + NONCE_TTL_SECS).is_ok());
+        assert!(nonces.check(&nonces.mint(issued), issued + NONCE_TTL_SECS + 1).is_err());
     }
 
     #[test]
     fn a_malformed_nonce_is_refused_rather_than_panicking() {
         let nonces = Nonces::new();
         for bad in ["", "short", &"z".repeat(STAMP_HEX + RAND_HEX + TAG_HEX)] {
-            assert!(nonces.redeem(bad, 1_700_000_000).is_err(), "{bad} was accepted");
+            assert!(nonces.check(bad, 1_700_000_000).is_err(), "{bad} was accepted");
         }
     }
 
     #[test]
-    fn the_used_table_does_not_grow_without_bound() {
-        // It is swept on mint, which is the only thing that adds to it — so a
+    fn the_counter_table_does_not_grow_without_bound() {
+        // Swept on mint, which is the only thing that adds to it, so a
         // long-running proxy accumulates at most one window of logins.
         let nonces = Nonces::new();
         let t0 = 1_700_000_000;
-        for i in 0..50 {
+        for _ in 0..50 {
             let n = nonces.mint(t0);
-            let _ = nonces.redeem(&n, t0);
-            let _ = i;
+            assert!(nonces.accept(&n, 1, t0).is_ok());
         }
         assert_eq!(
             nonces.used.lock().expect("lock").len(),
             50,
-            "all fifty are inside one window"
+            "one entry per nonce, inside one window"
         );
 
         // A mint well past the window sweeps what is stale.
@@ -853,6 +970,28 @@ mod tests {
             nonces.used.lock().expect("lock").len() <= 1,
             "the sweep dropped the stale ones"
         );
+    }
+
+    /// One nonce may spend many counters, but not without limit.
+    ///
+    /// A browser loading the dashboard uses a few dozen; a client looping past
+    /// the ceiling is not a page load, and letting the set grow would make the
+    /// table unbounded per nonce — which is the same leak the sweep closes for
+    /// the table as a whole.
+    #[test]
+    fn one_nonce_stops_collecting_counters_at_the_ceiling() {
+        let nonces = Nonces::new();
+        let now = 1_700_000_000;
+        let nonce = nonces.mint(now);
+
+        for nc in 1..=u32::try_from(MAX_NC_PER_NONCE).expect("the ceiling fits a counter") {
+            assert!(nonces.accept(&nonce, nc, now).is_ok(), "nc={nc}");
+        }
+        let held = {
+            let used = nonces.used.lock().expect("lock");
+            used.get(&nonce).expect("the nonce is known").counts.len()
+        };
+        assert!(held <= MAX_NC_PER_NONCE + 1, "the counter set stayed bounded: {held}");
     }
 
     // ── the challenge ───────────────────────────────────────────────────────
@@ -878,7 +1017,7 @@ mod tests {
             .nth(1)
             .and_then(|r| r.split('"').next())
             .expect("a nonce");
-        assert!(nonces.redeem(nonce, 1_700_000_000).is_ok());
+        assert!(nonces.check(nonce, 1_700_000_000).is_ok());
     }
 
     #[test]
@@ -1083,7 +1222,6 @@ mod tests {
             "qop=",
             "nc=",
             "cnonce=",
-            "algorithm=",
         ] {
             // The scheme is stripped before splitting, or the first parameter
             // arrives as `Digest username="…"` and no `starts_with` on a field
@@ -1104,6 +1242,30 @@ mod tests {
                 "a credential without {field} was accepted: {without}"
             );
         }
+    }
+
+    /// An `algorithm` the client did not echo is accepted, and the response is
+    /// what decides.
+    ///
+    /// RFC 2617 clients omit it, and RFC 7616 says the absence means "the
+    /// default", which is MD5 — but a client that omitted it AND guessed MD5
+    /// produces a response that cannot match a SHA-256 computation, so the
+    /// comparison below rejects it one line later. Requiring the field would
+    /// refuse a client that omitted it and still hashed with SHA-256, which is
+    /// the one case with nothing wrong with it.
+    #[test]
+    fn a_credential_that_omits_the_algorithm_is_judged_by_its_response() {
+        let state = state();
+        let now = 1_700_000_000;
+
+        // Omitted, but the digest was computed with SHA-256 as the challenge
+        // asked: accepted.
+        let header = good(&state, now).replace(", algorithm=SHA-256", "");
+        assert!(!header.contains("algorithm"), "{header}");
+        assert!(
+            verify(&state, Method::Get, "/api/users", &header, now).is_ok(),
+            "a correct response was refused for omitting a field the challenge made optional"
+        );
     }
 
     /// A credential hashed with another algorithm is refused by name.

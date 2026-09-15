@@ -529,6 +529,91 @@ fn a_relay_key_does_not_open_the_operator_surface() {
     );
 }
 
+/// A credential with an explicit nonce count.
+///
+/// A browser is given ONE nonce and reuses it for every request it then makes,
+/// incrementing `nc` each time so the server can tell a repeat from a new
+/// request. Computing `nc` differently is how a test reproduces that.
+fn credential_with_nc(token: &str, method: &str, target: &str, nonce: &str, nc: &str) -> String {
+    let cnonce = "0b5f9a2c";
+    let ha1 = sha256(&format!("admin:tab-atelier:{token}"));
+    let ha2 = sha256(&format!("{method}:{target}"));
+    let response = sha256(&format!("{ha1}:{nonce}:{nc}:{cnonce}:auth:{ha2}"));
+    format!(
+        "Digest username=\"admin\", realm=\"tab-atelier\", nonce=\"{nonce}\", uri=\"{target}\", \
+         algorithm=SHA-256, response=\"{response}\", qop=auth, nc={nc}, cnonce=\"{cnonce}\""
+    )
+}
+
+/// One challenge, then every asset fetched against that same nonce.
+///
+/// This is what a browser actually does, and it is what was broken: the proxy
+/// treated a nonce as single-use, so the first asset loaded and every one after
+/// it was refused with "that nonce has already been used". The dashboard
+/// rendered as a bare page with a broken script, and the only visible clue was
+/// a set of 401s for files that had just been offered.
+///
+/// RFC 7616 is explicit that the client gets one nonce per realm and reuses it,
+/// with `nc` counting the uses — so refusing a counter it has not seen is
+/// refusing correct behaviour.
+#[test]
+fn one_nonce_serves_every_asset_a_page_needs() {
+    let proxy = Proxy::start("nonce-reuse");
+    let port = proxy.port;
+    let token = &proxy.token;
+
+    // The browser asks for the page, is challenged once, and keeps that nonce.
+    let challenge = get(port, "/");
+    assert_eq!(status(&challenge), 401, "the page is gated");
+    let nonce = nonce_of(&challenge);
+
+    for (i, path) in ["/", "/app.js", "/charts.js", "/index.html"].iter().enumerate() {
+        let nc = format!("{:08x}", i + 1);
+        let credential = credential_with_nc(token, "GET", path, &nonce, &nc);
+        let response = http(
+            port,
+            &format!(
+                "GET {path} HTTP/1.1\r\nHost: x\r\nAuthorization: {credential}\r\n\
+                 Connection: close\r\n\r\n"
+            ),
+        );
+        assert_eq!(
+            status(&response),
+            200,
+            "{path} at nc={nc} was refused though the nonce was issued for this page: {}",
+            &response[..response.len().min(240)]
+        );
+    }
+}
+
+/// A nonce the server never issued is refused, and the message says so.
+///
+/// The refusal has to name the nonce rather than the password: they have
+/// different causes, and a proxy that reports "wrong password" for a bad nonce
+/// sends the operator to reset a credential that was never the problem. The
+/// expiry half of this rule is a unit test (`a_nonce_is_not_eternal`), since an
+/// aged nonce cannot be minted from outside the process.
+#[test]
+fn a_nonce_this_proxy_never_issued_is_refused_by_name() {
+    let proxy = Proxy::start("nonce-forged");
+    let port = proxy.port;
+    let token = &proxy.token;
+
+    // Correctly framed at the right length, so it is refused for being
+    // unrecognised rather than for being malformed.
+    let forged = credential_with_nc(token, "GET", "/app.js", &"a".repeat(64), "00000001");
+    let response = http(
+        port,
+        &format!("GET /app.js HTTP/1.1\r\nHost: x\r\nAuthorization: {forged}\r\nConnection: close\r\n\r\n"),
+    );
+    assert_eq!(status(&response), 401);
+    let text = body(&response);
+    assert!(
+        text.contains("nonce"),
+        "the refusal should name the nonce as the problem: {text}"
+    );
+}
+
 /// Replaying a captured credential fails.
 #[test]
 fn a_captured_credential_cannot_be_replayed() {
