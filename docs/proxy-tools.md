@@ -247,6 +247,14 @@ own list in the same object. `disable` is checked after the mode, so it wins ove
 `all` — but never over the referenced-union rule below, which is what keeps a
 disabled tool that the history already calls.
 
+`allow` is an *ordering* instruction as well as a filter: under `mode: allow` the
+survivors are emitted in the list's order, and under `mode: none` they keep the
+client's. The same list under the two modes can therefore put the same tools on
+the wire in a different order, and `tools[]` leads the body, so they are not
+interchangeable when the client's order is what the cache keys on. `none` is the
+spelling to reach for when nobody is thinking about order and the list is only
+meant to bound the surface.
+
 `add` is the override: a definition injected when the client did not send one.
 Redefining a name the client *did* send is refused per request rather than
 applied, because silently replacing the definition a session is mid-way through
