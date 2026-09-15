@@ -2,8 +2,8 @@
 
 //! One request type and one reply type, for every handler.
 //!
-//! The handlers used to take `hyper::Request<Incoming>` and hand back
-//! `hyper::Response<Body>`, which welded the API to hyper: a second server
+//! The handlers used to take `http::Request<Incoming>` and hand back
+//! `http::Response<Body>`, which welded the API to hyper: a second server
 //! could only be added by rewriting every handler. This module is the seam.
 //! A handler sees an [`InReq`] — method, path, headers, and a body already read
 //! into memory — and answers with a [`Reply`]. Each transport adapts at its own
@@ -16,7 +16,7 @@
 use std::net::IpAddr;
 
 use bytes::Bytes;
-use hyper::http::HeaderMap;
+use http::HeaderMap;
 
 /// The boxed body a streamed reply carries.
 ///
@@ -31,7 +31,7 @@ pub struct InReq {
     /// Hyper's `Method`, which the handlers already compare against
     /// (`Method::GET`, `Method::POST`). Rocket's method type is a different
     /// `http` major, so its edge parses the wire spelling into this one.
-    pub method: hyper::Method,
+    pub method: http::Method,
     pub path: String,
     pub query: String,
     pub headers: HeaderMap,

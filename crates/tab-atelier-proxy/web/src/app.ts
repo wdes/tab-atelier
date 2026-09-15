@@ -188,6 +188,12 @@ const AdminApp = Vue.defineComponent({
   },
   data(): AppState {
     return {
+      // sessionStorage, not localStorage: the operator token should not outlive
+      // the tab it was typed into. And not a cookie: a cookie would be attached
+      // to every request the origin makes, including the vendored scripts, and
+      // the token has no business travelling on those.
+      token: sessionStorage.getItem("ta-proxy-admin") || "",
+      authed: false,
       users: [],
       form: { first_name: "", last_name: "", email: "" },
       freshKey: null,
@@ -532,17 +538,17 @@ const AdminApp = Vue.defineComponent({
     },
   },
   mounted() {
-    // Nothing to sign in to. Reaching this script at all means the browser
-    // answered the challenge for this origin, and it keeps attaching that
-    // credential to every request until the window closes.
-    void this.load();
+    // A token already in this session means a reload should land straight back
+    // on the list rather than asking for it again.
+    if (this.token) {
+      api.token = this.token;
+      void this.load();
+    }
   },
   methods: {
-    // Load everything the page shows.
-    //
-    // No credential is sent from here: the browser authenticated the origin
-    // before this script ran, and attaches that itself. A token typed into
-    // this page would be a second secret to hold for no gain.
+    // Load everything the page shows, and treat success as proof the token is
+    // good — there is no separate check to make, and a second round trip could
+    // only disagree with this one.
     async load() {
       this.busy = true;
       this.error = "";
@@ -555,16 +561,48 @@ const AdminApp = Vue.defineComponent({
         // empty picker and made a configured proxy look like it had no
         // providers at all.
         await this.loadProviders();
+        this.authed = true;
+        sessionStorage.setItem("ta-proxy-admin", this.token);
         // The plan moves on its own, independently of anything done here.
         this.pressureTimer ??= setInterval(() => this.loadPressure(), 30_000);
       } catch (e) {
-        // Shown in the page, which is the only place left to report it: the
-        // browser owns the credential now, so there is no token to clear and
-        // no sign-in screen to bounce back to.
         this.error = e instanceof Error ? e.message : String(e);
+        // A rejected token is cleared, so the operator is asked again rather
+        // than left tapping at a page that will keep refusing. Anything else —
+        // a network fault, a 500 — keeps it: the credential may be perfectly
+        // good and the proxy briefly unwell.
+        this.authed = false;
       } finally {
         this.busy = false;
       }
+    },
+
+    /** Sign in with the operator token, then load everything the page shows. */
+    async signIn() {
+      // Trimmed: a token pasted from a terminal usually brings a newline, and
+      // the comparison on the server is exact.
+      this.token = (this.token || "").trim();
+      api.token = this.token;
+      await this.load();
+    },
+
+    /** Forget the token, in the client and in this session. */
+    signOut() {
+      sessionStorage.removeItem("ta-proxy-admin");
+      this.token = "";
+      api.token = "";
+      this.authed = false;
+      this.users = [];
+      this.usage = {};
+      this.focus = null;
+      this.pressure = null;
+      this.inspect = null;
+      this.inspectOpen = null;
+      this.freshKey = null;
+      // Guarded: `clearInterval(null)` is legal JavaScript and a type error,
+      // and the guard costs nothing.
+      if (this.pressureTimer !== null) clearInterval(this.pressureTimer);
+      this.pressureTimer = null;
     },
     async refresh() {
       this.users = await api.users.list();

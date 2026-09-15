@@ -151,9 +151,9 @@ mod tests {
             peer: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             ip: "127.0.0.1".to_owned(),
             presented: String::new(),
-            method: hyper::Method::POST,
+            method: http::Method::POST,
             target: "/me/credentials".to_owned(),
-            headers: hyper::HeaderMap::new(),
+            headers: http::HeaderMap::new(),
         };
         let reply = tokio::runtime::Runtime::new()
             .expect("runtime")

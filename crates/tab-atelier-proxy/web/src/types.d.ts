@@ -562,6 +562,10 @@ interface Tier {
  * the file honest.
  */
 interface AppState {
+    /** The operator token, held for this tab only. */
+    token: string;
+    /** Whether a token has been accepted. */
+    authed: boolean;
     users: ApiUser[];
     form: { first_name: string; last_name: string; email: string };
     freshKey: FreshKey | null;

@@ -50,9 +50,9 @@ pub struct Arrival {
     /// The credential presented, or empty.
     pub presented: String,
     /// The headers, in the type the relay forwards with.
-    pub headers: hyper::HeaderMap,
+    pub headers: http::HeaderMap,
     /// The verb, in the type the relay forwards with.
-    pub method: hyper::Method,
+    pub method: http::Method,
     /// The path and query, exactly as they arrived.
     ///
     /// Carried rather than re-derived from Rocket's typed parameters because the
@@ -72,7 +72,7 @@ impl<'r> FromRequest<'r> for Arrival {
             peer,
             ip: arrival::client_ip(&headers, peer),
             presented: arrival::presented(&headers),
-            method: hyper::Method::from_bytes(req.method().as_str().as_bytes()).unwrap_or(hyper::Method::GET),
+            method: http::Method::from_bytes(req.method().as_str().as_bytes()).unwrap_or(http::Method::GET),
             target: req.uri().to_string(),
             headers,
         })
@@ -116,92 +116,12 @@ impl<'r> FromRequest<'r> for ClientKey {
     }
 }
 
-/// A credential that gets past the front door.
+/// The administrative credential.
 ///
-/// Two ways, and which one applies depends on who is calling:
-///
-/// * a **browser** answers the `WWW-Authenticate` challenge with a `Digest`
-///   credential. This is the operator looking at the dashboard.
-/// * a **CLI or script** presents the operator token directly — the same
-///   secret, in a header, with no challenge needed.
-///
-/// Exempt paths are let through with `signed_in: false`: the relay and the
-/// per-user paths authenticate their own callers with a key, and their clients
-/// are programs that cannot answer a prompt.
-///
-/// This is the gate on the dashboard, so it is the gate on the CSS and the
-/// JavaScript too — they are served by the same catch-all as the page. That is
-/// deliberate: a scraper that never signs in never receives a page, a bundle or
-/// a style sheet, so there is nothing to fingerprint and nothing to crawl.
-#[derive(Debug, Clone, Copy)]
-pub struct WebAuth {
-    /// Whether a credential was actually presented and accepted.
-    pub signed_in: bool,
-}
-
-#[rocket::async_trait]
-impl<'r> FromRequest<'r> for WebAuth {
-    type Error = Refusal;
-
-    async fn from_request(req: &'r Request<'_>) -> Outcome<Self, Self::Error> {
-        if !crate::http::auth::gated(req.uri().path().as_str(), req.method()) {
-            return Outcome::Success(Self { signed_in: false });
-        }
-        let Some(state) = state_of(req).await else {
-            return Outcome::Error((Status::InternalServerError, Refusal::unmanaged()));
-        };
-        // Checked BEFORE any comparison, and this order is the whole safety of
-        // the empty case: `constant_time_eq("", "")` is true, so an
-        // installation with no token would otherwise authorise everybody.
-        let Some(token) = admin_token::token(&state) else {
-            return refuse(
-                req,
-                Status::ServiceUnavailable,
-                "no operator token is configured on this proxy, so nobody can sign in — run \
-                 `tab-atelier-proxy admin-token` on the server, as the service user",
-            );
-        };
-        let _ = token;
-
-        // A browser's own answer, which carries a digest rather than a secret.
-        //
-        // The scheme is tested through `auth::is_digest` rather than by slicing
-        // the header here: this value comes off the wire before anything has
-        // validated it, and `&header[..7]` panics when byte 7 lands inside a
-        // multi-byte character.
-        if let Some(header) = req.headers().get_one("authorization")
-            && crate::http::auth::is_digest(header)
-        {
-            // The digest covers the request target, so it is passed exactly
-            // as it arrived — path and query, unnormalised.
-            let target = req.uri().to_string();
-            return match crate::http::auth::verify(&state, req.method(), &target, header, crate::usage::now_secs()) {
-                Ok(()) => Outcome::Success(Self { signed_in: true }),
-                Err(why) => refuse(req, Status::Unauthorized, &why),
-            };
-        }
-
-        // `Arrival` cannot refuse — it only reads the request — so its error
-        // type is `Infallible` and the `else` is unreachable. It is written out
-        // rather than unwrapped so that giving that guard an error later is a
-        // compile error here instead of a panic at runtime.
-        let Outcome::Success(arrival) = req.guard::<Arrival>().await else {
-            return Outcome::Error((Status::InternalServerError, Refusal::unmanaged()));
-        };
-        match admin_token::guard_token(&state, &arrival.presented) {
-            Ok(()) => Outcome::Success(Self { signed_in: true }),
-            Err(why) => refuse(req, Status::Unauthorized, &why),
-        }
-    }
-}
-
-/// The administrative credential, for the API.
-///
-/// Delegates entirely to [`WebAuth`], which already accepts either a browser's
-/// Digest credential or the token in a header. Keeping one implementation means
-/// the dashboard and the API behind it cannot disagree about who is allowed
-/// in — which is the failure that matters, because the dashboard can do
-/// everything the API can.
+/// Two ways to refuse, because they have two different fixes: 503 when the
+/// installation has no admin token at all — a deployment problem, and the
+/// message says how to fix it — and 401 when the presented one is missing or
+/// wrong.
 #[derive(Debug, Clone, Copy)]
 pub struct Admin;
 
@@ -210,25 +130,27 @@ impl<'r> FromRequest<'r> for Admin {
     type Error = Refusal;
 
     async fn from_request(req: &'r Request<'_>) -> Outcome<Self, Self::Error> {
-        match req.guard::<WebAuth>().await {
-            Outcome::Success(web) if web.signed_in => Outcome::Success(Self),
-            // A signed-in-less success means the path was exempt from *browser*
-            // auth — reachable only if an administrative route were ever put on
-            // that list, which none is. It still needs the token, so it is
-            // refused with the reason rather than admitted.
-            Outcome::Success(_) => refuse(
+        let Some(state) = state_of(req).await else {
+            return Outcome::Error((Status::InternalServerError, Refusal::unmanaged()));
+        };
+        if !admin_token::configured(&state) {
+            return refuse(
                 req,
-                Status::Unauthorized,
-                "this API needs the operator token, and this path asks for no credential",
-            ),
-            // Propagated unchanged, which is the whole point of delegating: a
-            // 401 with its sentence, a 503 for an installation with no token.
-            // Turning these into a 500 — as an earlier `let-else` did — meant
-            // the API answered every bad credential with Rocket's HTML error
-            // page and, worse, carried no `WWW-Authenticate`, so a browser
-            // could never be challenged on `/api/*` at all.
-            Outcome::Error((status, refusal)) => Outcome::Error((status, refusal)),
-            Outcome::Forward(f) => Outcome::Forward(f),
+                Status::ServiceUnavailable,
+                "no admin token configured — run `tab-atelier-proxy admin-token` on the server, \
+                 as the service user, before using this API",
+            );
+        }
+        // `Arrival` cannot refuse — it only reads the request — so its error
+        // type is `Infallible` and the `else` is unreachable. It is written out
+        // rather than unwrapped so that giving this guard an error later is a
+        // compile error here instead of a panic at runtime.
+        let Outcome::Success(arrival) = req.guard::<Arrival>().await else {
+            return Outcome::Error((Status::InternalServerError, Refusal::unmanaged()));
+        };
+        match admin_token::guard_token(&state, &arrival.presented) {
+            Ok(()) => Outcome::Success(Self),
+            Err(why) => refuse(req, Status::Unauthorized, &why),
         }
     }
 }

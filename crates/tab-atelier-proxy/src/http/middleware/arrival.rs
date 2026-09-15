@@ -12,7 +12,7 @@
 
 use std::net::IpAddr;
 
-use hyper::HeaderMap;
+use http::HeaderMap;
 
 /// The key presented by a caller, or an empty string.
 ///
@@ -25,7 +25,7 @@ use hyper::HeaderMap;
 pub fn presented(headers: &HeaderMap) -> String {
     let bearer = || {
         headers
-            .get(hyper::header::AUTHORIZATION)
+            .get(http::header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| {
                 let trimmed = v.trim();
@@ -116,10 +116,10 @@ pub const fn unknown_peer() -> IpAddr {
 pub fn from_rocket(headers: &rocket::http::HeaderMap<'_>) -> HeaderMap {
     let mut out = HeaderMap::new();
     for header in headers.iter() {
-        let Ok(name) = hyper::header::HeaderName::from_bytes(header.name.as_str().as_bytes()) else {
+        let Ok(name) = http::header::HeaderName::from_bytes(header.name.as_str().as_bytes()) else {
             continue;
         };
-        let Ok(value) = hyper::header::HeaderValue::from_str(&header.value) else {
+        let Ok(value) = http::header::HeaderValue::from_str(&header.value) else {
             continue;
         };
         out.append(name, value);

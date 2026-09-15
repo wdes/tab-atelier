@@ -339,6 +339,13 @@ mod tests {
             distro_asset("vendor/bootstrap.min.css"),
             Some("/usr/share/javascript/bootstrap5/css/bootstrap.min.css")
         );
+        // And its source map, which the style sheet asks for by name in a
+        // `sourceMappingURL` comment. Also the distribution's — see below for
+        // why it must not be ours.
+        assert_eq!(
+            distro_asset("vendor/bootstrap.min.css.map"),
+            Some("/usr/share/javascript/bootstrap5/css/bootstrap.min.css.map")
+        );
         // Only the libraries the distribution actually packages. Vue is not one
         // of them, so it stays vendored rather than 404ing at runtime.
         assert_eq!(distro_asset("vendor/vue.global.prod.js"), None);
@@ -346,10 +353,14 @@ mod tests {
         assert_eq!(distro_asset("../../../etc/passwd"), None);
 
         let root = repo_assets();
-        assert!(
-            !root.join("vendor/bootstrap.min.css").exists(),
-            "a local copy would shadow the distribution's and stop getting updates"
-        );
+        for shadowing in ["vendor/bootstrap.min.css", "vendor/bootstrap.min.css.map"] {
+            assert!(
+                !root.join(shadowing).exists(),
+                "{shadowing} in our tree would shadow the distribution's copy and stop \
+                 getting updates from it — and the .deb does not ship it, so the file would \
+                 only appear to work on a machine that happened to have one"
+            );
+        }
         assert!(
             root.join("vendor/vue.global.prod.js").is_file(),
             "Vue has no distribution package, so it has to be in the tree"

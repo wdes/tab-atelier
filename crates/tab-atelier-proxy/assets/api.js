@@ -50,6 +50,19 @@ class ApiError extends Error {
 class ApiClient {
     /** Scheme, host and port — no path, and no userinfo. */
     baseUrl;
+    /**
+     * The operator token, sent as `Authorization: Bearer`.
+     *
+     * A mutable property rather than a constructor option because signing in and
+     * out happens on the live client: the page has already fetched nothing when
+     * the operator types, and rebuilding the client to change one string would
+     * mean every namespace closure being replaced with it.
+     *
+     * Empty means "not signed in", and no header is sent at all — an
+     * `Authorization: Bearer ` with a blank value is a request the server has to
+     * decide what to do with, and there is no reason to make it.
+     */
+    token = "";
     users;
     keys;
     providers;
@@ -104,8 +117,7 @@ class ApiClient {
      * the document's, so a page opened as `http://admin:tap_…@host/` carried
      * those credentials into every request — Firefox warns about it in the
      * console, and the secret ends up in the log of anything in front of the
-     * proxy. `origin` is scheme + host + port with no userinfo, and the browser
-     * attaches the credential it holds anyway.
+     * proxy. `origin` is scheme + host + port with no userinfo.
      */
     resolveUrl(path) {
         const base = this.baseUrl.replace(/\/+$/, "");
@@ -114,10 +126,9 @@ class ApiClient {
     /**
      * One request, with the status checked and the error unwrapped.
      *
-     * A 401 is called out in words because the browser owns the credential now:
-     * the page only loaded because it was answered, so a 401 here means that
-     * answer has since expired or the token was rotated — neither of which the
-     * operator can see from a bare status.
+     * A 401 is called out in words: the operator's token was rejected, and
+     * "no valid credential" alone does not say whether it was empty, mistyped,
+     * or rotated on the server since this tab was opened.
      */
     // `object` rather than `JsonValue`: every body this API takes is a request
     // struct, and a TypeScript interface has no implicit index signature, so it
@@ -127,9 +138,18 @@ class ApiClient {
     // is here to rule out the mistakes that matter at this layer: undefined, a
     // bare string, a number.
     async request(method, path, body) {
+        const headers = {};
+        if (body !== undefined)
+            headers["Content-Type"] = "application/json";
+        // The operator token, on every call that carries one. `Bearer` and no other
+        // spelling: a second spelling is a second thing to audit and to redact, and
+        // a secret in a bespoke header is a secret that tooling does not know to
+        // strip from a log.
+        if (this.token !== "")
+            headers.Authorization = `Bearer ${this.token}`;
         const response = await fetch(this.resolveUrl(path), {
             method,
-            headers: body === undefined ? {} : { "Content-Type": "application/json" },
+            headers,
             body: body === undefined ? undefined : JSON.stringify(body),
         });
         if (!response.ok) {
