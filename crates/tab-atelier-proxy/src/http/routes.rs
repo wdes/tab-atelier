@@ -464,13 +464,30 @@ pub(crate) fn bad_request() -> Reply {
 /// browser only prompts when it is challenged. So the challenge goes on here,
 /// and only for a gated path — a relay refusal must NOT carry it, because the
 /// client is a CLI that would try to interpret it as a browser would.
+///
+/// The reason is logged, because this is the only place it can be seen. Rocket
+/// logs the status and not the guard's sentence, and a browser that is
+/// re-challenged shows the user a prompt rather than the body — so without this
+/// line an operator diagnosing a 401 has nothing but `Error(401 Unauthorized)`
+/// in the journal, and the sentence naming the actual problem is discarded.
 #[catch(401)]
 pub(crate) fn unauthorized(req: &rocket::Request<'_>) -> Reply {
     let refusal = crate::http::refusal::recall(req, Status::Unauthorized, "no valid credential");
-    let mut reply = crate::http::problem(401, refusal.message);
+    let mut reply = crate::http::problem(401, refusal.message.clone());
     if !crate::http::auth::gated(req.uri().path().as_str(), req.method()) {
+        // A key that did not authenticate on the relay or a `/me` path: the
+        // client is a program, so it will read the body.
+        log::warn!("401 {} {} — {}", req.method(), req.uri(), refusal.message);
         return reply;
     }
+    // The credential is never logged, only why it was refused: this line ends up
+    // in a journal that operators paste into bug reports.
+    log::warn!(
+        "401 {} {} — {} (browser challenge issued)",
+        req.method(),
+        req.uri(),
+        refusal.message
+    );
     // A missing state means the server was built without it, which some tests
     // do; there is then no secret to mint a nonce with, so the 401 goes out
     // without a challenge rather than panicking.
