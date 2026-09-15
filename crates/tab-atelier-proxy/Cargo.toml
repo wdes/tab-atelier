@@ -29,8 +29,7 @@ clap = { version = "4", default-features = false, features = ["derive", "std", "
 # dependency tree small. Mirrors the desktop crate's egress.
 ureq = { version = "3", features = ["json"] }
 tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "net", "sync", "time", "io-util", "macros", "signal"] }
-hyper = { version = "1", features = ["server", "http1"] }
-hyper-util = { version = "0.1", features = ["tokio"] }
+http = "1"
 # The `Body` trait and its `Frame`, for the adapter that hands a
 # relayed stream to Rocket. `http-body-util` is the toolbox; this is
 # the interface both sides agree on.
@@ -48,27 +47,10 @@ futures-util = { version = "0.3", default-features = false, features = ["std", "
 # rocket_okapi pins rocket to exactly 0.5.1, so this is a three-crate lockstep:
 # bumping one means bumping all of them together.
 rocket = { version = "0.5.1", features = ["json"] }
-# Swagger UI and RapiDoc are switched off deliberately: the spec is consumed by
-# a generator, not by a browser, and the `swagger`/`rapidoc` features vendor a
-# large JS bundle into the binary. The document is served as JSON at
-# /openapi.json, which needs no feature at all.
-rocket_okapi = { version = "0.9", default-features = false }
-rocket_ws = "0.1"
-# Adapter from tokio's mpsc receiver to the Stream the relay responder returns.
-tokio-stream = "0.1"
-# The schema derives that populate the OpenAPI document. Rocket_okapi speaks
-# schemars 0.8, and the rest of the tree (via rmcp, in the desktop crate) is on
-# 1.x — the two majors coexist, but a type deriving one cannot derive the other,
-# so the HTTP DTOs below are deliberately their own types.
-schemars = "0.8"
 sha2 = { version = "0.10", default-features = false }
 # Subresource Integrity, which mandates base64 — hex cannot stand in for it.
 # Already in this crate's graph via ureq, so declaring it costs no compile unit.
 base64 = "0.22"
-# The nonce is an HMAC over its own issue time, which is what makes it
-# stateless to verify and impossible to mint without this process's secret.
-# SHA-256 comes from `sha2`, already a dependency for the same reason.
-hmac = "0.12"
 uuid = { version = "1", features = ["v4"] }
 # Timestamp parsing for the usage log. Spelled exactly as env_logger declares
 # it, so this is the same rlib the proxy already builds via env_logger's
