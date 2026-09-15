@@ -162,12 +162,17 @@
          better wide. A 60rem cap left two thirds of a laptop screen empty. -->
     <div id="app" class="container-fluid px-4 py-4">
       <!-- Accounts ------------------------------------------------------>
-      <!-- A bare template element is a fragment: it groups the sections below
-           without adding anything to the DOM. There is no sign-in card because
-           there is nothing to sign in to — the browser answered the challenge
-           before this page was served, and holds that credential for the origin
-           until the window closes. -->
-      <template>
+      <!-- No wrapper element, and deliberately not a bare template either.
+           This markup IS the root template — `createApp(AdminApp).mount("#app")`
+           compiles whatever sits in here — and at the root a wrapper of that
+           kind renders as an EMPTY element with its children dropped: the app
+           still mounts, every fetch still succeeds, and the page is blank. The
+           sections below are the root's children directly, which Vue renders as
+           a fragment.
+
+           The tag is not written with angle brackets anywhere in this comment
+           on purpose. The structural test counts literal tags, and one inside a
+           comment reads as an unclosed element. -->
         <div class="d-flex align-items-center mb-3">
           <h1 class="h4 mb-0 flex-grow-1">Accounts</h1>
         </div>
@@ -1083,7 +1088,6 @@
             </div>
           </div>
         </div>
-      </template>
     </div>
 
     <script src="vendor/vue.global.prod.js"></script>

@@ -83,6 +83,12 @@ pub(crate) fn preflight() -> Reply {
 pub(crate) fn distro_asset(rel: &str) -> Option<&'static str> {
     match rel {
         "vendor/bootstrap.min.css" => Some("/usr/share/javascript/bootstrap5/css/bootstrap.min.css"),
+        // The style sheet ends with `sourceMappingURL=bootstrap.min.css.map`, so
+        // the browser asks for this the moment the CSS loads. The package ships
+        // it; without the entry here the request fell through to our own assets
+        // and 404'd — a console error on every page load, from a file we were
+        // deliberately not serving.
+        "vendor/bootstrap.min.css.map" => Some("/usr/share/javascript/bootstrap5/css/bootstrap.min.css.map"),
         _ => None,
     }
 }
@@ -456,6 +462,27 @@ mod ui_tests {
     fn the_ui_html_is_structurally_sound() {
         let html = include_str!("../../../assets/index.html");
 
+        // No bare `<template>` anywhere.
+        //
+        // This is the root template — `mount("#app")` compiles what is inside
+        // `#app` — and at the root a bare template renders as an EMPTY
+        // `<template>` element with its children dropped. The app mounts, every
+        // request succeeds, and the page is blank. It reached a deployed host
+        // exactly once, and the rendered DOM was
+        // `<div id="app" data-v-app=""><template></template></div>`.
+        //
+        // `<template v-if>` and `<template v-else>` are fine and are the reason
+        // this checks for the tag alone rather than the tag at all.
+        for (n, line) in html.lines().enumerate() {
+            assert!(
+                !line.trim_start().starts_with("<template>"),
+                "index.html:{}: a bare <template> at the root renders as an empty element and \
+                 drops everything inside it. Remove the wrapper — the root's children are \
+                 rendered as a fragment — or give it a directive:\n  {line}",
+                n + 1
+            );
+        }
+
         // Every comment must close. An unclosed one eats everything after it.
         let opens = html.matches("<!--").count();
         let closes = html.matches("-->").count();
@@ -716,6 +743,40 @@ mod packaging_tests {
         for path in packaged(&manifest) {
             let rel = path.strip_prefix("assets/").expect("all entries are under assets/");
             assert!(root.join(rel).exists(), "Cargo.toml ships {path}, which does not exist");
+        }
+    }
+
+    /// A style sheet we serve from the distribution brings its own source map.
+    ///
+    /// Bootstrap's CSS ends with `sourceMappingURL=bootstrap.min.css.map`, so
+    /// the browser asks for that the moment the style sheet loads. The package
+    /// ships it, but our resolver only knew about the `.css` — so every page
+    /// load produced a 404 for a file we were deliberately not serving, which
+    /// reads as a bug in this proxy and is a missing entry in one `match`.
+    ///
+    /// Skipped when the distribution's file is absent, so a machine without
+    /// `libjs-bootstrap5` — a bare CI runner — is not failing on a package it
+    /// does not have.
+    #[test]
+    fn a_distribution_style_sheet_brings_its_source_map_with_it() {
+        for css in ["vendor/bootstrap.min.css"] {
+            let Some(real) = distro_asset(css) else {
+                panic!("{css} is served from nowhere");
+            };
+            let Ok(body) = std::fs::read_to_string(real) else {
+                eprintln!("{real} is not installed here — skipping");
+                continue;
+            };
+            if !body.contains("sourceMappingURL=") {
+                continue;
+            }
+            let map = format!("{css}.map");
+            assert!(
+                distro_asset(&map).is_some(),
+                "{css} declares a source map and the browser will request {map}, which this \
+                 proxy does not resolve — it will 404 on every page load. Add it to \
+                 `distro_asset`."
+            );
         }
     }
 
