@@ -493,3 +493,95 @@ pub fn serve(listen: &str) -> Result<(), String> {
         }
     })
 }
+
+/// Create an account, and say what to do next.
+///
+/// The second line names the command that mints the first key. An account with
+/// no key authenticates nobody, so a bare "added" reads as a finished setup
+/// when it is a half-finished one.
+pub fn add_account(first: &str, last: &str, email: &str) -> Result<(), String> {
+    let mut store = store()?;
+    let account = store.add(first, last, email).map_err(|error| error.to_string())?;
+    println!("added {} <{}>", account.display_name(), account.email);
+    println!("  next: tab-atelier-proxy add-key {} <laptop|ci|...>", account.email);
+    Ok(())
+}
+
+/// Every account, one per line.
+pub fn list_accounts() -> Result<(), String> {
+    let store = store()?;
+    if store.accounts().is_empty() {
+        println!("no accounts yet — `tab-atelier-proxy add <first> <last> <email>`");
+        return Ok(());
+    }
+    for account in store.accounts() {
+        print_account(account);
+    }
+    Ok(())
+}
+
+/// Mint a key, and print the secret once.
+///
+/// The secret is not recoverable — the store keeps a hash — so a client that
+/// loses this output has to mint another. The instructions say so, because the
+/// failure otherwise appears later as an unexplained 401.
+pub fn mint_key(who: &str, name: &str) -> Result<(), String> {
+    let mut store = store()?;
+    let (key, secret) = store.add_key(who, name).map_err(|error| error.to_string())?;
+    let display = store.find(who).map_or_else(|| who.to_owned(), Account::display_name);
+    println!("{display} <{who}> — key {:?}", key.name);
+    println!("  key: {secret}");
+    println!("  This is the only time it is shown — the proxy stores a hash.");
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_poll_interval_is_the_normal_one_before_any_failure() {
+        assert_eq!(usage_poll_delay(0), USAGE_POLL);
+    }
+
+    /// The interval doubles from five minutes, and the hour cap stops it early.
+    ///
+    /// Doubling 300s four times reaches 4800s, past the 3600s ceiling, so the
+    /// ladder is 10, 20, 40 and then flat at 60 minutes rather than the eight
+    /// steps the `min(5)` alone would suggest. Asserting the cap from the fifth
+    /// step onwards is the point: a test that expected `USAGE_POLL * 32` here
+    /// would fail while the backoff was working correctly.
+    #[test]
+    fn the_poll_interval_doubles_until_the_ceiling_stops_it() {
+        assert_eq!(usage_poll_delay(1), std::time::Duration::from_mins(10));
+        assert_eq!(usage_poll_delay(2), std::time::Duration::from_mins(20));
+        assert_eq!(usage_poll_delay(3), std::time::Duration::from_mins(40));
+
+        // 300s * 2^4 = 4800s, which the cap truncates; everything after is flat.
+        for failures in [4_u32, 5, 32, 1_000, u32::MAX] {
+            assert_eq!(
+                usage_poll_delay(failures),
+                USAGE_POLL_MAX_BACKOFF,
+                "failures={failures} should sit at the ceiling"
+            );
+        }
+    }
+
+    /// A long outage saturates rather than wrapping.
+    ///
+    /// The shift is `1u32 << failures.min(5)`. Without the `min` — or with a
+    /// wider shift — a large failure count wraps, producing a delay of zero and
+    /// turning a backoff into a hot loop against an upstream that is already
+    /// failing. A zero delay would also make this loop spin the CPU.
+    #[test]
+    fn a_long_outage_saturates_the_backoff_instead_of_wrapping() {
+        for failures in [1_u32, 5, 6, 100, 1_000, u32::MAX] {
+            let delay = usage_poll_delay(failures);
+            assert!(
+                delay >= USAGE_POLL && delay <= USAGE_POLL_MAX_BACKOFF,
+                "failures={failures} produced {delay:?}, outside [1x, cap]"
+            );
+        }
+        assert_eq!(usage_poll_delay(u32::MAX), USAGE_POLL_MAX_BACKOFF);
+    }
+}

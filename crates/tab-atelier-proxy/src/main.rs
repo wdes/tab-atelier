@@ -106,38 +106,9 @@ fn run() -> Result<(), String> {
             first_name,
             last_name,
             email,
-        } => {
-            let mut store = cli::store()?;
-            let account = store
-                .add(&first_name, &last_name, &email)
-                .map_err(|error| error.to_string())?;
-            println!("added {} <{}>", account.display_name(), account.email);
-            println!("  next: tab-atelier-proxy add-key {} <laptop|ci|...>", account.email);
-            Ok(())
-        }
-        Command::List => {
-            let store = cli::store()?;
-            if store.accounts().is_empty() {
-                println!("no accounts yet — `tab-atelier-proxy add <first> <last> <email>`");
-            } else {
-                for account in store.accounts() {
-                    cli::print_account(account);
-                }
-            }
-            Ok(())
-        }
-        Command::AddKey { who, name } => {
-            let mut store = cli::store()?;
-            let (key, secret) = store.add_key(&who, &name).map_err(|error| error.to_string())?;
-            let account = store.find(&who).ok_or("account vanished")?.clone();
-            println!("{} <{}> — key {:?}", account.display_name(), account.email, key.name);
-            println!("  key: {secret}");
-            println!("  This is the only time it is shown — the proxy stores a hash.");
-            println!("  On the machine that will use it:");
-            println!("    tab-atelier remote add --label proxy --url https://<proxy-host> \\");
-            println!("        --relay-token {secret}");
-            Ok(())
-        }
+        } => cli::add_account(&first_name, &last_name, &email),
+        Command::List => cli::list_accounts(),
+        Command::AddKey { who, name } => cli::mint_key(&who, &name),
         Command::Keys { who } => cli::list_keys(&who),
         Command::RemoveKey { who, key } => cli::remove_key(&who, &key),
         Command::Disable { who } => cli::set_disabled(&who, true),
