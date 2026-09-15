@@ -14,8 +14,8 @@ policy bug makes a turn **fail**, on one provider and not the other, which is
 the worst shape a proxy defect can take.
 
 It is also the one pass that can *introduce* a `tools[]` where there was none:
-`referenced ∪ pins` on a body with no `tools` key is pins-only. So the first
-requirement below is not an optimisation.
+the referenced union on a body with no `tools` key resolves to `ALWAYS_KEPT`
+alone. So the first requirement below is not an optimisation.
 
 ## Two families of tool
 
@@ -110,30 +110,37 @@ of prose about a protocol, and a denylist forwards each one by default until
 somebody notices and adds it. An allowlist does not know about them either —
 it just fails closed instead of open.
 
-## `referenced ∪ pins`
+## The referenced union
 
-Beyond `all` / `allow` / `none`, there is a mode that needs no list to
-maintain, because the request states its own answer:
+Every mode keeps the tools whose name appears in a `tool_use` block anywhere in
+`messages[]`, in addition to whatever its own rule says. On the measured body
+that is `Bash` and `Read` — 4,361 B in, 52,544 B out.
 
-**keep the tools whose name appears in a `tool_use` block anywhere in
-`messages[]`, plus an operator's pins.**
-
-On the measured body that is `Bash` and `Read` — 4,361 B in, 52,544 B out.
-Two properties make it safe:
+This is a correctness rule first: a `tool_use` naming a tool with no definition
+is rejected by the provider, so the union is what stops a policy from failing a
+turn it was meant to shrink. Two properties make it safe as an optimisation too:
 
 - **It is monotone within a conversation.** History only grows, so a tool that
   is referenced stays referenced. The set can never oscillate and re-warm
   repeatedly, which is the failure a time- or size-based rule would have.
-- **The scan is the same walk compaction already does**, and it is
-  unambiguous — it reads names off `tool_use` blocks, not off anything the
-  operator typed.
+- **The scan covers the whole transcript, never a window.** This matters more
+  than it looks, and it was wrong for a while. `tools[]` is the first key in the
+  body, so *any* edit to it discards the prompt cache for the system prompt and
+  every message behind it — see the measured table below. A bounded window makes
+  the set **slide**: a tool used 30 messages ago leaves `tools[]`, and on the
+  turn it is referenced again the whole prefix re-bills at fifty times the hit
+  rate. The union is read off the entire transcript precisely so it can only
+  grow.
 
-**Pins are not optional.** A conversation that has not searched the web yet
-cannot start: a tool absent from `tools[]` can never be called, so it can never
-become referenced. `referenced` alone freezes the tool set at whatever turn one
-had, which is right for an established session and wrong for a fresh one. The
-pins are short — the few tools the model should be able to reach for at any
-point.
+**A policy that keeps only the union cannot bootstrap.** A tool absent from
+`tools[]` can never be called, so it can never become referenced, so a fresh
+session would send nothing. `all` is the default for that reason, and
+`ALWAYS_KEPT` is unconditional so that even the narrowest policy keeps one way
+in.
+
+`referenced` is now an alias for `all`. It was the mode that pruned to the
+union, which only made sense while the union had a window; with the scan fixed
+there is nothing left for it to remove that the union does not already keep.
 
 ## The rewrite case: WebSearch
 
@@ -195,7 +202,7 @@ Verified on the measured body, and the first of these is not a heuristic:
 - **A body with no `tools` key is not a candidate for the pass at all.** This
   is the classifier case, and it is the reason this policy is exempt from it:
   a body carrying no `tools[]` is not a request that chose its tools, and
-  `referenced ∪ pins` would *add* them. Concretely, the auto-mode permission
+  the referenced union would *add* them. Concretely, the auto-mode permission
   classifier is one such body — a judge written to emit a single parsed tag,
   which must not be handed a toolkit. See
   [`proxy-classifier.md`](proxy-classifier.md). Hard-coding the classifier
@@ -269,15 +276,15 @@ substring swap — no regex, so there is no pattern language to get wrong, and
 description.
 
 Rewrites touch the description only. A tool is never added, removed, or renamed
-by this verb, which is why it does not interact with the referenced-or-pinned
+by this verb, which is why it does not interact with the referenced-union
 safety rule at all.
 
 Two things it deliberately does not do. It does not clear the cache: a rewritten
 description still carries the client's `cache_control` marks, and that is correct,
 because the marks are still on the tools they were put on — an in-place edit moves
 no array element, so nothing has been invalidated. And it does not renumber:
-`pins` is about *array position* for prefix caching, and rewriting a string does
-not move anything.
+array *position* is what prefix caching is sensitive to, and rewriting a string
+does not move anything.
 
 An empty `find` is refused at validation, since it would match at every position.
 A rule whose `find` does not occur is not an error: the client is free to send a
@@ -315,20 +322,65 @@ execute tools, it only describes them. `add` is for restoring a tool the client
 stopped shipping, or for a tool the client's own config cannot express; it is not
 a way to give the model capabilities the harness will not perform.
 
-**`referenced` cannot bootstrap.** It is the right default for a session in
-progress and the wrong one at turn one, and there is no way to tell the two
-apart from a single body. A session that starts under `referenced` gets only
-`ToolSearch` (kept unconditionally) until the client sends real `tools[]`, which
-Claude Code does on its first turn. On a client that does not, `referenced` is
-`none` and the pins never arrive; `add` is what makes that configuration work.
+**A narrow policy cannot bootstrap.** A mode that keeps only the union is the
+right default for a session in progress and the wrong one at turn one, and there
+is no way to tell the two apart from a single body: a session that starts that
+way has referenced nothing, so it gets only `ToolSearch` (kept unconditionally)
+until the client sends real `tools[]`, which Claude Code does on its first turn.
+On a client that does not, a narrow policy has no way in and the union never
+starts; `add` is what makes that configuration work. This is why `all` is the
+default rather than the narrow mode.
 
-**The volatility argument is measured, the prefix argument is inferred.** That
-the client's own session served 77,312 of 77,507 tokens from cache on its 77th
-turn is measured, and it establishes that this endpoint caches a real Claude
-Code prefix. Whether editing `tools[]` at the front *keeps* the rest of the
-prefix or discards it has not been probed — the numbers above assume the
-pessimistic case, where it discards it. The test is cheap: send the baseline,
-then the baseline with one appended message, and read the cache split. If the
-prefix survives a tail change and not a tool change, the table stands. If it
-survives both, the break-even above is conservative and the batch trim is
-cheaper than stated.
+**The prefix argument is no longer inferred — it was measured, and it holds.**
+That this endpoint caches a real Claude Code prefix was already measured; whether
+editing `tools[]` at the front keeps the rest of the prefix or discards it was
+listed here as unprobed. It was probed against the live relay on 2026-09-15, and
+it discards it — completely. Interleaved requests in one session, with the entire
+message history byte-identical and our compaction stubs present throughout, read
+as follows:
+
+| request | `tools[]` | input | cache read |
+|---|---|---|---|
+| `13:18:10` | Bash, Edit, Write | 15,108 | **125,312** |
+| `13:18:23` | Bash, Edit | 139,970 | **2,688** |
+| `13:18:41` | Bash, Edit | 11,535 | **131,456** |
+| `13:18:49` | Bash | 140,984 | **2,432** |
+
+One definition leaving the array turns a 131k-token cache read into a 2.4k one
+and re-bills the whole prompt at the miss rate: 139,970 uncached tokens where
+15,108 were needed on that turn, and 140,984 against 11,535 on the next. The
+two definitions removed were 640 and 967 bytes — roughly 160 and 241 tokens —
+and between them they cost **254,311 tokens billed at the miss rate** in one
+conversation. The provider does cache the whole of the achievable prefix, not a
+fraction of it: measured as the longest common prefix against every earlier body
+in the session — not against the immediately preceding one — `cache_read` tracks
+that prefix at a ratio of 0.99–1.03 on the warm requests above, and 0.02 on the
+two that collapsed. (The few percent of spread is the error in estimating tokens
+from bytes, not provider behaviour.) Caching was working. What was not working
+was the *set*: it was read from a 24-message
+window, so on the turn a tool fell out of that window the request re-bought
+everything — measured across 25 requests covering 4.5 minutes of the relay's
+traffic, the two requests whose set shrank in that window account for 280,954 of
+its 731,892 uncached tokens: **38% of all uncached input, from 8% of the
+requests**, at an overall sample hit rate of 86.8%.
+
+Not every edit to the array is fatal, and it is worth being precise about which
+ones are. One record in the same sample grew its set instead of shrinking it and
+still read 117,632 tokens from cache at 86%. What decides is where the change
+lands: definitions before the edit stay cached, and everything from the edit
+onward — including the whole message history if the edit is early — is re-bought.
+The window made that edit *early*, on a set the conversation had already paid
+for.
+
+The consequence for any policy above is a budget, not a preference: editing
+`tools[]` costs the entire prefix, so a mode may only change it when it will not
+change again. Every rule that can drop a client tool is now answered from the
+whole transcript, where the answer can only grow.
+
+Worth noting that the client already expects this to be survivable: its request
+carries `anthropic-beta: mid-conversation-tool-changes-2026-07-01`, which is
+exactly the capability of changing tools partway through a conversation without
+re-buying the prefix. Whatever honours that beta — on this endpoint, as measured
+above, nothing does — a proxy deciding to edit `tools[]` is relying on a feature
+it has not confirmed is present. The measurement is the confirmation, and it
+came back negative.
