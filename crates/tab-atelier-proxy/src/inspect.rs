@@ -38,6 +38,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::users::Client;
+
 /// How many captures to keep. Small on purpose: this is for looking at the
 /// last few calls, not for building an archive. With full bodies now stored
 /// rather than clipped fragments, this is the number that bounds the file.
@@ -288,64 +290,15 @@ pub struct Outgoing<'a> {
     pub origin: Option<Origin>,
 }
 
-/// What the client says about itself, unpacked from the body's `metadata`.
-///
-/// Claude Code sends `metadata.user_id` as a STRING holding a JSON document,
-/// so reading it is a parse of a parse:
-///
-/// ```text
-/// {"metadata": {"user_id": "{\"device_id\":\"323056…\",\"account_uuid\":\"\",\"session_id\":\"a3412ddb-…\"}"}}
-/// ```
-///
-/// That shape is Anthropic's doing, not the client's: every `metadata` value
-/// has to be a string, so a structured value has nowhere to go but inside one.
-/// It is unpacked here rather than left as one opaque blob because the parts
-/// answer different questions, and a reader who has to decode base64-ish
-/// nesting by eye will not bother.
-///
-/// All three fields are optional and an empty string counts as absent: the
-/// client sends `account_uuid: ""` when nobody is logged in, and rendering
-/// that as a value would state something the wire did not.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct Client {
-    /// Stable per install. Answers "same machine, or two?".
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub device_id: Option<String>,
-    /// Per conversation, which is what makes one tab distinguishable from the
-    /// four others running beside it on the same key.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_id: Option<String>,
-    /// The account the CLIENT is logged into. Frequently empty, and unrelated
-    /// to this proxy's own accounts — it is Anthropic's, seen from the far
-    /// side, and useful mainly for spotting a session running under a login
-    /// nobody expected.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub account_uuid: Option<String>,
-}
-
 /// Unpack `metadata.user_id`, if the body has one.
 ///
-/// Returns `None` rather than an all-empty `Client` when there is nothing to
-/// report, so the field is absent from a capture instead of present and blank.
+/// The parse itself lives in [`crate::users::Client::from_body`], because a
+/// capture is no longer the only place that wants it: a key remembers the
+/// sessions it has seen, and that must happen whether or not a capture is
+/// armed. One implementation, so the two cannot disagree about an all-empty
+/// `metadata`.
 fn parse_client(body: &serde_json::Value) -> Option<Client> {
-    let inner = body.get("metadata")?.get("user_id")?.as_str()?;
-    let parsed: serde_json::Value = serde_json::from_str(inner).ok()?;
-    // Empty means absent: `account_uuid` is routinely `""` for a session that
-    // is not logged in, and treating that as a value would report a logged-out
-    // tab as belonging to an account named nothing.
-    let field = |key: &str| {
-        parsed
-            .get(key)
-            .and_then(serde_json::Value::as_str)
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned)
-    };
-    let client = Client {
-        device_id: field("device_id"),
-        session_id: field("session_id"),
-        account_uuid: field("account_uuid"),
-    };
-    (client != Client::default()).then_some(client)
+    Client::from_body(body)
 }
 
 /// The server-side tool a request asks for, if it asks for one.

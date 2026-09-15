@@ -30,6 +30,11 @@ use crate::{classifier, egress, inspect, openai, provider, qos, routing, usage};
 pub(crate) struct Relay<'a> {
     /// The account the presented key belongs to.
     pub account: &'a Account,
+    /// The id of the key that authenticated.
+    ///
+    /// Carried because the session this request came from is recorded against
+    /// the key, and the guard that knows the id runs before the body exists.
+    pub key_id: &'a str,
     /// Who called, and from where.
     pub arrival: &'a Arrival,
     /// The path below the relay's mount point, such as `/v1/messages`.
@@ -51,9 +56,16 @@ impl<'a> Relay<'a> {
     /// upstream must be what the client asked for — including a query string
     /// that nothing here parses.
     #[must_use]
-    pub fn new(account: &'a Account, arrival: &'a Arrival, sub: &std::path::Path, body: Bytes) -> Self {
+    pub fn new(
+        account: &'a Account,
+        key_id: &'a str,
+        arrival: &'a Arrival,
+        sub: &std::path::Path,
+        body: Bytes,
+    ) -> Self {
         Self {
             account,
+            key_id,
             arrival,
             sub_path: format!("/{}", sub.display()),
             query: target_query(&arrival.target),
@@ -80,12 +92,27 @@ fn target_query(target: &str) -> String {
 pub(crate) async fn anthropic(state: &Arc<State>, r: Relay<'_>) -> Reply {
     let Relay {
         account,
+        key_id,
         arrival,
         sub_path: sub,
         query,
         body,
     } = r;
     let method = arrival.method.clone();
+
+    // The session this request came from, recorded against the key before
+    // anything else can refuse it — an agent that is being turned away is
+    // exactly the one worth being able to name.
+    //
+    // This does read the body, and there is no cheap way around it: `metadata`
+    // follows `messages` on the wire, so the bounded prefix scan this first
+    // claimed cannot exist. See `users::metadata_client` for the measurement.
+    // The relay is otherwise deliberately incurious about what it forwards, so
+    // this is the one place it looks — and it looks only at the identity.
+    if let Some(client) = crate::users::metadata_client(&body) {
+        let mut store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        store.touch(key_id, None, Some(&client));
+    }
     let headers = &arrival.headers;
     let sub_pq = if query.is_empty() {
         sub.clone()

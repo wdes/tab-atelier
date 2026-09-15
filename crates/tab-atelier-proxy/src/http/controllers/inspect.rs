@@ -36,13 +36,28 @@ pub(crate) fn status(state: &Arc<State>) -> Reply {
 /// prompts it was not holding before, and the operator who armed it should be
 /// able to find out when.
 pub(crate) fn arm(req: &ArmInspect, state: &Arc<State>) -> Reply {
-    let (minutes, until) = {
+    let now = crate::usage::now_secs();
+    let (requested, until) = {
         let mut ins = state.inspect.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let minutes = req.minutes();
-        (minutes, ins.arm(crate::usage::now_secs(), minutes))
+        let requested = req.minutes();
+        (requested, ins.arm(now, requested))
+    };
+    // Report what was granted, not what was asked for. `arm` clamps to
+    // `MAX_ARM_MINUTES`, so logging the request alongside the clamped `until`
+    // produced a line that contradicted itself — "ARMED for 600 min, until
+    // <an hour from now>" — and reading that is how you conclude capture died
+    // early when it had simply been shorter than the message claimed.
+    let granted = until.saturating_sub(now) / 60;
+    let capped = if granted < requested {
+        format!(
+            " (asked for {requested}, capped at {})",
+            crate::inspect::MAX_ARM_MINUTES
+        )
+    } else {
+        String::new()
     };
     log::warn!(
-        "proxy: request inspection ARMED for {minutes} min, until {} — captures contain prompts",
+        "proxy: request inspection ARMED for {granted} min{capped}, until {} — captures contain prompts",
         crate::now_rfc3339_at(until)
     );
     json_of(200, &InspectStateResource { armed_until: until })

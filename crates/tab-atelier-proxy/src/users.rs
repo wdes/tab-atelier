@@ -30,6 +30,161 @@ use sha2::{Digest, Sha256};
 /// and greppable when it leaks.
 pub const KEY_PREFIX: &str = "tap_";
 
+/// How many sessions one key remembers.
+///
+/// Five is measured, not chosen: a single install in this fleet has held five
+/// concurrent sessions, so anything smaller would evict a tab that is still
+/// running. This bounds a burst; [`SESSION_TTL_SECS`] is what actually bounds
+/// the file.
+pub const SESSIONS_KEPT: usize = 5;
+
+/// How long a session stays worth showing.
+///
+/// A day answers "what is this key running right now" and no more. The point is
+/// to find the tab using a key, not to keep a history of every one it has ever
+/// opened — the same restraint the address beside it argues for.
+pub const SESSION_TTL_SECS: u64 = 24 * 60 * 60;
+
+/// What the client says about itself, unpacked from the body's `metadata`.
+///
+/// Claude Code sends `metadata.user_id` as a STRING holding a JSON document,
+/// so reading it is a parse of a parse:
+///
+/// ```text
+/// {"metadata": {"user_id": "{\"device_id\":\"323056…\",\"account_uuid\":\"\",\"session_id\":\"a3412ddb-…\"}"}}
+/// ```
+///
+/// That shape is Anthropic's doing, not the client's: every `metadata` value
+/// has to be a string, so a structured value has nowhere to go but inside one.
+/// It is unpacked rather than left as one opaque blob because the parts answer
+/// different questions, and a reader who has to decode base64-ish nesting by
+/// eye will not bother.
+///
+/// All three fields are optional and an empty string counts as absent: the
+/// client sends `account_uuid: ""` when nobody is logged in, and rendering that
+/// as a value would state something the wire did not.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Client {
+    /// Stable per install. Answers "same machine, or two?".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
+    /// Per conversation, which is what makes one tab distinguishable from the
+    /// four others running beside it on the same key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// The account the CLIENT is logged into. Frequently empty, and unrelated
+    /// to this proxy's own accounts — it is Anthropic's, seen from the far
+    /// side, and useful mainly for spotting a session running under a login
+    /// nobody expected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_uuid: Option<String>,
+}
+
+impl Client {
+    /// Whether this says anything at all.
+    ///
+    /// A parsed-but-blank `metadata` is not a sighting. Storing it would put an
+    /// empty row in a key's history and make "we were told nothing" read the
+    /// same as "we were told nothing was there".
+    #[must_use]
+    pub fn is_meaningful(&self) -> bool {
+        self != &Self::default()
+    }
+
+    /// Unpack the JSON string that `metadata.user_id` holds.
+    ///
+    /// Returns `None` rather than an all-empty `Client` when there is nothing
+    /// to report, so a caller can store the absence instead of a blank row.
+    #[must_use]
+    pub fn from_user_id(user_id: &str) -> Option<Self> {
+        let parsed: serde_json::Value = serde_json::from_str(user_id).ok()?;
+        // Empty means absent: `account_uuid` is routinely `""` for a session
+        // that is not logged in, and treating that as a value would report a
+        // logged-out tab as belonging to an account named nothing.
+        let field = |key: &str| {
+            parsed
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+        };
+        let client = Self {
+            device_id: field("device_id"),
+            session_id: field("session_id"),
+            account_uuid: field("account_uuid"),
+        };
+        client.is_meaningful().then_some(client)
+    }
+
+    /// The same, from an already-parsed body.
+    ///
+    /// `user_id` is itself a JSON string holding a JSON object, which is why
+    /// this is a two-step unpack and not a field read.
+    #[must_use]
+    pub fn from_body(body: &serde_json::Value) -> Option<Self> {
+        Self::from_user_id(body.get("metadata")?.get("user_id")?.as_str()?)
+    }
+}
+
+/// Just enough of a body to reach `metadata.user_id`.
+///
+/// Deserialising the whole body into a `Value` materialises every message — a
+/// megabyte of transcript on a classifier request — for one small string near
+/// the front. A shape that stops at the field we want lets serde skip the rest,
+/// which matters because this runs on every request rather than only while a
+/// capture is armed. Unknown fields are ignored, which is serde's default.
+#[derive(Deserialize)]
+struct BodyMetadata {
+    #[serde(default)]
+    metadata: Option<MetadataField>,
+}
+
+#[derive(Deserialize)]
+struct MetadataField {
+    #[serde(default)]
+    user_id: Option<String>,
+}
+
+/// Read the client identity out of a request body.
+///
+/// A shallow parse of the whole body, not the bounded prefix scan this used to
+/// claim. `metadata` sits AFTER `messages` on the wire — measured: `messages`
+/// at byte 102, `metadata` at 662,185 in a real Claude Code request — so a scan
+/// stopping at `messages` would never find it, and the feature would silently
+/// never record anything. `serde_json` skips over the conversations inside
+/// `messages` without building values for them, which is what keeps this
+/// affordable on a body that can be most of a megabyte.
+///
+/// Returns `None` for a body that is not JSON, carries no `metadata`, or names
+/// nothing — the same absence [`Client::from_user_id`] reports, so callers have
+/// one case to handle rather than three.
+#[must_use]
+pub fn metadata_client(body: &[u8]) -> Option<Client> {
+    let meta: BodyMetadata = serde_json::from_slice(body).ok()?;
+    Client::from_user_id(meta.metadata?.user_id.as_deref()?)
+}
+
+/// One Claude Code session seen using a key.
+///
+/// `device_id` and `session_id` answer different questions, and the UI shows
+/// them at the two levels they belong to: a device is a machine, a session is
+/// one tab on it. A machine running three tabs is one device with three
+/// sessions — which is the distinction "what is this person running" needs, and
+/// the one a flat list of ids loses.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Session {
+    /// The identity. Without it there is nothing to tell one tab from another,
+    /// so a sighting that names no session is not recorded.
+    pub session_id: String,
+    /// The machine, when the client named one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_uuid: Option<String>,
+    pub first_seen_at: u64,
+    pub last_seen_at: u64,
+}
+
 /// One credential belonging to an account.
 ///
 /// A person has several: a laptop, a CI runner, a fleet worker. That is not a
@@ -62,6 +217,15 @@ pub struct Key {
     /// log of the people using it.
     #[serde(default)]
     pub last_used_ip: Option<String>,
+    /// The sessions seen on this key, newest first.
+    ///
+    /// The address above says a key was used; this says by which tab, which the
+    /// address cannot answer when five of them share one key. Bounded twice
+    /// over — see [`SESSIONS_KEPT`] and [`SESSION_TTL_SECS`] — and absent from a
+    /// key whose client sends no `metadata`, so a store written before this
+    /// existed loads unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sessions: Vec<Session>,
     /// Refused without being deleted, so the name stays attached to past use.
     #[serde(default)]
     pub disabled: bool,
@@ -71,6 +235,64 @@ impl Key {
     #[must_use]
     pub const fn active(&self) -> bool {
         !self.disabled && !self.hash.is_empty()
+    }
+
+    /// Record a sighting, and report whether anything changed enough to write.
+    ///
+    /// `true` for a session never seen here, and for one whose `last_seen_at`
+    /// had gone stale, so ordinary traffic from an already-known tab writes
+    /// nothing — the same coalescing the address above gets, and for the same
+    /// reason: otherwise every proxied request rewrites the file. A known
+    /// session is still refreshed in memory; only the write is deferred.
+    fn remember_session(&mut self, client: Option<&Client>, now: u64) -> bool {
+        self.prune_sessions(now);
+        // A caller with no `metadata`, or one naming a device but no session,
+        // still gets the pruning above — a sighting is a sighting even when it
+        // carries nothing, and an expired tab should not outlive it. Neither is
+        // an event worth a write.
+        let Some(client) = client.filter(|c| c.is_meaningful()) else {
+            return false;
+        };
+        let Some(session_id) = client.session_id.as_deref() else {
+            return false;
+        };
+        if let Some(seen) = self.sessions.iter_mut().find(|s| s.session_id == session_id) {
+            let stale = now.saturating_sub(seen.last_seen_at) >= 60;
+            // `max`, not assignment: this is a record of the *latest* time we
+            // saw the tab, and the clock is not guaranteed monotonic — an NTP
+            // correction, or a sighting that arrives out of order, must not
+            // rewind it. Expiry is computed from this field, so a rewind would
+            // expire a tab early, and the sort order is this field too.
+            seen.last_seen_at = seen.last_seen_at.max(now);
+            // A device id that only arrives on later requests is still worth
+            // keeping: the client is not obliged to send it every time.
+            if seen.device_id.is_none() {
+                seen.device_id.clone_from(&client.device_id);
+            }
+            seen.account_uuid = seen.account_uuid.take().or_else(|| client.account_uuid.clone());
+            return stale;
+        }
+        self.sessions.push(Session {
+            session_id: session_id.to_owned(),
+            device_id: client.device_id.clone(),
+            account_uuid: client.account_uuid.clone(),
+            first_seen_at: now,
+            last_seen_at: now,
+        });
+        self.prune_sessions(now);
+        true
+    }
+
+    /// Drop what nobody has used for a day, then keep the newest few.
+    ///
+    /// Sorting before truncating is what makes the eviction least-recently-used
+    /// rather than "whichever was pushed first", so a tab that is still active
+    /// cannot be evicted by a burst of short-lived ones.
+    fn prune_sessions(&mut self, now: u64) {
+        self.sessions
+            .retain(|s| now.saturating_sub(s.last_seen_at) < SESSION_TTL_SECS);
+        self.sessions.sort_by_key(|s| std::cmp::Reverse(s.last_seen_at));
+        self.sessions.truncate(SESSIONS_KEPT);
     }
 }
 
@@ -218,6 +440,9 @@ impl Account {
                 last_used_at: self.legacy_last_used_at,
                 last_used_ip: self.legacy_last_used_ip.take(),
                 disabled: false,
+                // A key that predates session tracking has no sessions to carry
+                // over; it will acquire them on its next request.
+                sessions: Vec::new(),
             });
         }
         self.key_hash = String::new();
@@ -530,6 +755,7 @@ impl Store {
             last_used_at: None,
             last_used_ip: None,
             disabled: false,
+            sessions: Vec::new(),
         };
         account.keys.push(key.clone());
         self.reindex();
@@ -754,11 +980,20 @@ impl Store {
         Ok(gone)
     }
 
-    /// Stamp the KEY that was used, from `ip`.
+    /// Stamp the KEY that was used, from `ip` and the `client` it named.
     ///
     /// Best-effort: a failed write must not fail the request it is describing.
-    pub fn touch(&mut self, key_id: &str, ip: Option<&str>) {
-        let now = now_secs();
+    pub fn touch(&mut self, key_id: &str, ip: Option<&str>, client: Option<&Client>) {
+        self.touch_at(key_id, ip, client, now_secs());
+    }
+
+    /// As [`Self::touch`], at a caller-supplied instant.
+    ///
+    /// Split out so the eviction and expiry rules can be tested against a clock
+    /// the test owns: both are defined in terms of elapsed time, and a test that
+    /// can only observe "now" cannot tell a correct rule from one that ignores
+    /// the clock entirely.
+    pub fn touch_at(&mut self, key_id: &str, ip: Option<&str>, client: Option<&Client>, now: u64) {
         let persist = self
             .accounts
             .iter_mut()
@@ -767,9 +1002,10 @@ impl Store {
             .is_some_and(|k| {
                 // First use of a key, and any change of address, are worth a
                 // write immediately — they are the two things someone
-                // reviewing access actually looks for. Ordinary traffic is
-                // coalesced to one write a minute, or every proxied request
-                // would rewrite the file.
+                // reviewing access actually looks for. So is a session we have
+                // not seen here before. Ordinary traffic is coalesced to one
+                // write a minute, or every proxied request would rewrite the
+                // file.
                 let first = k.first_used_at.is_none();
                 let moved = ip.is_some() && k.last_used_ip.as_deref() != ip;
                 let stale = k.last_used_at.is_none_or(|t| now.saturating_sub(t) >= 60);
@@ -780,7 +1016,11 @@ impl Store {
                     k.last_used_ip = Some(ip.to_owned());
                 }
                 k.last_used_at = Some(now);
-                first || moved || stale
+                // Sessions are per key and the distinct-tab event is rare, so
+                // it earns a write the way an address change does: it is the
+                // answer to a question someone is actually asking.
+                let new_session = k.remember_session(client, now);
+                first || moved || stale || new_session
             });
         if persist {
             let _ = self.save();
@@ -899,7 +1139,7 @@ mod tests {
         let laptop = s.find("ada@example.org").expect("a").keys[0].clone();
         assert_eq!(laptop.first_used_at, None, "issued and never used is worth seeing");
 
-        s.touch(&laptop.id, Some("203.0.113.7"));
+        s.touch(&laptop.id, Some("203.0.113.7"), None);
         let after = s.find("ada@example.org").expect("a").clone();
         let seen = after.keys.iter().find(|k| k.id == laptop.id).expect("laptop");
         assert!(seen.first_used_at.is_some());
@@ -912,11 +1152,251 @@ mod tests {
         assert_eq!(other.last_used_ip, None);
 
         // A later call from elsewhere moves last_used_ip, never first_used.
-        s.touch(&laptop.id, Some("198.51.100.4"));
+        s.touch(&laptop.id, Some("198.51.100.4"), None);
         let moved = s.find("ada@example.org").expect("a").keys[0].clone();
         assert_eq!(moved.first_used_at, seen.first_used_at, "first use is set once");
         assert_eq!(moved.last_used_ip.as_deref(), Some("198.51.100.4"));
         assert_eq!(ada.email, "ada@example.org");
+    }
+
+    fn client(session: &str, device: &str) -> Client {
+        Client {
+            device_id: Some(device.to_owned()),
+            session_id: Some(session.to_owned()),
+            account_uuid: None,
+        }
+    }
+
+    /// The point of the whole field: two tabs on one key are told apart.
+    #[test]
+    fn a_key_records_which_tab_and_machine_used_it() {
+        let (mut s, _d) = store();
+        s.add("Ada", "Lovelace", "ada@example.org").expect("add");
+        let (laptop, _secret) = s.add_key("ada@example.org", "laptop").expect("key");
+
+        s.touch(
+            &laptop.id,
+            Some("203.0.113.7"),
+            Some(&client("5b91b78b-71ac-44f6-8ad9-e8e619baf9b5", "323056b1")),
+        );
+
+        let after = s.find("ada@example.org").expect("a");
+        let seen = after.keys.iter().find(|k| k.id == laptop.id).expect("laptop");
+        assert_eq!(seen.sessions.len(), 1);
+        assert_eq!(seen.sessions[0].session_id, "5b91b78b-71ac-44f6-8ad9-e8e619baf9b5");
+        assert_eq!(seen.sessions[0].device_id.as_deref(), Some("323056b1"));
+        assert_eq!(seen.sessions[0].first_seen_at, seen.sessions[0].last_seen_at);
+    }
+
+    /// A machine with four tabs open is one device with four sessions, which is
+    /// what makes "what is this person running" answerable at all.
+    #[test]
+    fn several_tabs_on_one_key_share_a_device_without_merging() {
+        let (mut s, _d) = store();
+        s.add("Ada", "Lovelace", "ada@example.org").expect("add");
+        let (k, _secret) = s.add_key("ada@example.org", "laptop").expect("key");
+
+        s.touch(&k.id, None, Some(&client("aaaa", "machine-1")));
+        s.touch(&k.id, None, Some(&client("bbbb", "machine-1")));
+
+        let after = s.find("ada@example.org").expect("a");
+        let seen = after.keys.iter().find(|x| x.id == k.id).expect("k");
+        assert_eq!(seen.sessions.len(), 2, "two tabs stay two rows");
+        assert_eq!(
+            seen.sessions
+                .iter()
+                .filter(|x| x.device_id.as_deref() == Some("machine-1"))
+                .count(),
+            2
+        );
+    }
+
+    /// A tab lives for days; the ring must not grow a row per request.
+    #[test]
+    fn the_same_tab_seen_again_is_one_session() {
+        let (mut s, _d) = store();
+        s.add("Ada", "Lovelace", "ada@example.org").expect("add");
+        let (k, _secret) = s.add_key("ada@example.org", "laptop").expect("key");
+
+        s.touch(&k.id, None, Some(&client("same", "m1")));
+        let first = s.find("ada@example.org").expect("a").keys[0].sessions[0].first_seen_at;
+
+        // Same session, a later request, and now the client names a device it
+        // had not before.
+        s.touch(&k.id, None, Some(&client("same", "m1")));
+
+        let seen = &s.find("ada@example.org").expect("a").keys[0].sessions;
+        assert_eq!(seen.len(), 1, "not a second row");
+        assert_eq!(seen[0].first_seen_at, first, "first sighting is set once");
+        assert!(seen[0].last_seen_at >= first, "last sighting moves");
+    }
+
+    /// The clock is not monotonic across a restart or a clock correction, and a
+    /// session that appeared to be last seen before it was first seen would
+    /// sort wrongly and read as a bug.
+    #[test]
+    fn an_out_of_order_sighting_does_not_rewind_a_session() {
+        let (mut s, _d) = store();
+        s.add("Ada", "Lovelace", "ada@example.org").expect("add");
+        let (k, _secret) = s.add_key("ada@example.org", "laptop").expect("key");
+
+        s.touch(&k.id, None, Some(&client("same", "m1")));
+        let seen_at = s.find("ada@example.org").expect("a").keys[0].sessions[0].last_seen_at;
+        // Force a second sighting at a time strictly before the first.
+        s.touch_at(&k.id, None, Some(&client("same", "m1")), seen_at.saturating_sub(600));
+
+        let row = &s.find("ada@example.org").expect("a").keys[0].sessions[0];
+        assert_eq!(row.first_seen_at, seen_at);
+        assert_eq!(row.last_seen_at, seen_at, "never moves backwards");
+    }
+
+    /// A device named later fills the blank, rather than replacing the row.
+    #[test]
+    fn a_device_named_later_fills_in_the_blank() {
+        let (mut s, _d) = store();
+        s.add("Ada", "Lovelace", "ada@example.org").expect("add");
+        let (k, _secret) = s.add_key("ada@example.org", "laptop").expect("key");
+
+        let anonymous = Client {
+            device_id: None,
+            session_id: Some("s1".to_owned()),
+            account_uuid: None,
+        };
+        s.touch(&k.id, None, Some(&anonymous));
+        assert_eq!(
+            s.find("ada@example.org").expect("a").keys[0].sessions[0].device_id,
+            None
+        );
+
+        s.touch(&k.id, None, Some(&client("s1", "m1")));
+        let seen = &s.find("ada@example.org").expect("a").keys[0].sessions;
+        assert_eq!(seen.len(), 1, "same session, not a new one");
+        assert_eq!(seen[0].device_id.as_deref(), Some("m1"));
+    }
+
+    /// Eviction is by last use, not by arrival order — a tab that goes quiet
+    /// then comes back is a tab still in use, and must not be the one dropped.
+    #[test]
+    fn the_oldest_by_last_use_is_evicted_not_the_first_seen() {
+        let (mut s, _d) = store();
+        s.add("Ada", "Lovelace", "ada@example.org").expect("add");
+        let (k, _secret) = s.add_key("ada@example.org", "laptop").expect("key");
+
+        let base = 1_700_000_000;
+        // `s0` arrives first and would be the victim under a first-seen rule.
+        for i in 0..SESSIONS_KEPT {
+            let at = base + u64::try_from(i).expect("small") * 60;
+            s.touch_at(&k.id, None, Some(&client(&format!("s{i}"), "m1")), at);
+        }
+        // Bring `s0` back, newest of all.
+        s.touch_at(&k.id, None, Some(&client("s0", "m1")), base + 10_000);
+        // …and add one more, forcing an eviction.
+        s.touch_at(&k.id, None, Some(&client("newest", "m1")), base + 20_000);
+
+        let seen = &s.find("ada@example.org").expect("a").keys[0].sessions;
+        assert_eq!(seen.len(), SESSIONS_KEPT, "capped, not grown");
+        assert!(seen.iter().any(|x| x.session_id == "s0"), "the one just used stays");
+        assert!(seen.iter().any(|x| x.session_id == "newest"));
+        assert!(!seen.iter().any(|x| x.session_id == "s1"), "the stalest goes");
+    }
+
+    #[test]
+    fn a_tab_unused_for_a_day_is_forgotten() {
+        let (mut s, _d) = store();
+        s.add("Ada", "Lovelace", "ada@example.org").expect("add");
+        let (k, _secret) = s.add_key("ada@example.org", "laptop").expect("key");
+
+        let base = 1_700_000_000;
+        s.touch_at(&k.id, None, Some(&client("stale", "m1")), base);
+        // One second past the TTL, so the stale tab's age is strictly greater
+        // than the limit and the fresh sighting lands just inside it. Sitting
+        // exactly on the boundary would assert `<` while looking like `<=`.
+        s.touch_at(&k.id, None, Some(&client("fresh", "m1")), base + SESSION_TTL_SECS + 1);
+
+        let seen = &s.find("ada@example.org").expect("a").keys[0].sessions;
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].session_id, "fresh", "the quiet tab is the one dropped");
+    }
+
+    /// `metadata` that parses but names nothing is not a sighting. "We were
+    /// told nothing" and "we were told there was nothing" must not look alike.
+    #[test]
+    fn metadata_naming_nothing_records_no_session() {
+        let (mut s, _d) = store();
+        s.add("Ada", "Lovelace", "ada@example.org").expect("add");
+        let (k, _secret) = s.add_key("ada@example.org", "laptop").expect("key");
+
+        let blanks = [
+            Client::default(),
+            Client {
+                device_id: Some("m1".to_owned()),
+                session_id: None,
+                account_uuid: None,
+            },
+        ];
+        for c in &blanks {
+            s.touch(&k.id, Some("203.0.113.7"), Some(c));
+        }
+
+        let seen = &s.find("ada@example.org").expect("a").keys[0];
+        assert!(seen.sessions.is_empty(), "no row for a nameless sighting");
+        // The address is still recorded — that part of the request was real.
+        assert_eq!(seen.last_used_ip.as_deref(), Some("203.0.113.7"));
+    }
+
+    /// `metadata.user_id` is a JSON string holding a JSON object, and the empty
+    /// string means absent. Both are easy to get wrong in opposite directions.
+    #[test]
+    fn the_client_unpacks_the_nested_user_id() {
+        let long = Client::from_user_id(
+            r#"{"device_id":"323056b1","account_uuid":"","session_id":"5b91b78b-71ac-44f6-8ad9-e8e619baf9b5"}"#,
+        )
+        .expect("parses");
+        assert_eq!(long.device_id.as_deref(), Some("323056b1"));
+        assert_eq!(long.session_id.as_deref(), Some("5b91b78b-71ac-44f6-8ad9-e8e619baf9b5"));
+        assert_eq!(long.account_uuid, None, "an empty account is no account");
+
+        // A session id alone is meaningful; everything blank is not.
+        assert!(Client::from_user_id(r#"{"session_id":"only-a-session"}"#).is_some());
+        assert!(Client::from_user_id(r#"{"device_id":"","session_id":"","account_uuid":""}"#).is_none());
+        assert!(Client::from_user_id("not json").is_none());
+        assert!(Client::from_user_id("{}").is_none());
+    }
+
+    /// The relay hands us raw bytes, and the metadata sits behind however many
+    /// other fields the client chose to send first.
+    #[test]
+    fn the_client_is_found_in_a_raw_body() {
+        let body = br#"{"model":"deepseek-flash","max_tokens":32000,"messages":[{"role":"user","content":"hi"}],
+            "metadata":{"user_id":"{\"device_id\":\"323056b1\",\"account_uuid\":\"\",\"session_id\":\"5b91b78b\"}"}}"#;
+        let found = metadata_client(body).expect("found");
+        assert_eq!(found.session_id.as_deref(), Some("5b91b78b"));
+        assert_eq!(found.device_id.as_deref(), Some("323056b1"));
+        // Empty on the wire means absent, not an account named nothing.
+        assert_eq!(found.account_uuid, None);
+
+        // Absent, malformed, and truncated bodies are all the same non-event.
+        assert!(metadata_client(br#"{"model":"x"}"#).is_none());
+        assert!(metadata_client(b"<html>").is_none());
+        assert!(metadata_client(br#"{"metadata":{"user_id":"{\"session\""#).is_none());
+        assert!(metadata_client(b"").is_none());
+    }
+
+    /// The shape-limited parse must be indifferent to what surrounds the field.
+    ///
+    /// A classifier body carries the whole conversation after `metadata`, so if
+    /// the reader ever grew to care about it, the per-request cost would jump
+    /// from a small string to a megabyte.
+    #[test]
+    fn a_large_body_does_not_change_the_answer() {
+        let filler = "x".repeat(200_000);
+        let body = format!(
+            r#"{{"messages":[{{"role":"user","content":"{filler}"}}],
+               "metadata":{{"user_id":"{{\"session_id\":\"sess-big\",\"device_id\":\"dev-big\"}}"}}}}"#
+        );
+        let found = metadata_client(body.as_bytes()).expect("found in a big body");
+        assert_eq!(found.session_id.as_deref(), Some("sess-big"));
+        assert_eq!(found.device_id.as_deref(), Some("dev-big"));
     }
 
     /// Several named keys, revoked one at a time. With a single key per
