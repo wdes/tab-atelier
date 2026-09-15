@@ -161,36 +161,15 @@
     <!-- Full width: the account table has seven columns and the charts read
          better wide. A 60rem cap left two thirds of a laptop screen empty. -->
     <div id="app" class="container-fluid px-4 py-4">
-      <!-- Sign in ------------------------------------------------------->
-      <div v-if="!authed" class="card shadow-sm mx-auto" style="max-width: 30rem">
-        <div class="card-body">
-          <h1 class="h5 card-title">tab-atelier-proxy</h1>
-          <p class="text-body-secondary small">
-            Paste the admin token. On the proxy host:
-            <code>tab-atelier-proxy admin-token</code>
-          </p>
-          <form autocomplete="off" @submit.prevent="signIn">
-            <input
-              v-model="token"
-              type="password"
-              class="form-control font-monospace"
-              placeholder="tap_…"
-              autocomplete="off"
-              autofocus
-            />
-            <div v-if="error" class="alert alert-danger mt-3 mb-0 py-2 small">{{ error }}</div>
-            <button class="btn btn-primary w-100 mt-3" :disabled="busy">
-              {{ busy ? 'Checking…' : 'Sign in' }}
-            </button>
-          </form>
-        </div>
-      </div>
-
       <!-- Accounts ------------------------------------------------------>
-      <template v-else>
+      <!-- A bare template element is a fragment: it groups the sections below
+           without adding anything to the DOM. There is no sign-in card because
+           there is nothing to sign in to — the browser answered the challenge
+           before this page was served, and holds that credential for the origin
+           until the window closes. -->
+      <template>
         <div class="d-flex align-items-center mb-3">
           <h1 class="h4 mb-0 flex-grow-1">Accounts</h1>
-          <button class="btn btn-sm btn-outline-secondary" @click="signOut">Sign out</button>
         </div>
 
         <div v-if="error" class="alert alert-danger py-2 small">{{ error }}</div>
@@ -1108,6 +1087,7 @@
     </div>
 
     <script src="vendor/vue.global.prod.js"></script>
+    <script src="api.js"></script>
     <script src="charts.js"></script>
     <script src="app.js"></script>
   </body>

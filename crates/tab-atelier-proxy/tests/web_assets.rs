@@ -44,7 +44,11 @@ fn the_committed_ui_bundle_matches_its_typescript() {
         .expect("run tsc");
     assert!(status.success(), "tsc failed — the sources do not compile");
 
-    for name in ["app.js", "charts.js"] {
+    // `api.js` is listed because it is served to the browser and must match its
+    // source like the other two. A stale copy would be a client calling routes
+    // the server no longer has — which is the failure this test exists for,
+    // and the one hardest to see, since the page would still load.
+    for name in ["api.js", "app.js", "charts.js"] {
         let fresh = std::fs::read_to_string(out.join(name)).expect("compiler output");
         let committed = std::fs::read_to_string(assets.join(name)).expect("committed asset");
         assert_eq!(
