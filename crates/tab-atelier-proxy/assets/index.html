@@ -881,25 +881,56 @@
                   <!-- One row per key. The dates and the address belong to the
                        KEY: "last used from here" says nothing when three keys
                        share an account. -->
-                  <div v-for="k in (u.keys || [])" :key="k.id" class="d-flex align-items-baseline gap-2 mb-1">
-                    <span class="font-monospace" :class="k.disabled ? 'text-decoration-line-through' : ''">
-                      {{ k.name }}
-                    </span>
-                    <span v-if="!k.first_used_at" class="fst-italic">never used</span>
-                    <span v-else>
-                      {{ ago(k.last_used_at) }}
-                      <span v-if="k.last_used_ip" class="font-monospace">· {{ k.last_used_ip }}</span>
-                    </span>
-                    <span class="ms-auto text-nowrap">
-                      <a href="#" @click.prevent="toggleKey(u, k)" class="text-decoration-none">
-                        {{ k.disabled ? 'enable' : 'disable' }}
-                      </a>
-                      <a href="#" @click.prevent="removeKey(u, k)" class="text-danger text-decoration-none ms-2">
-                        delete
-                      </a>
-                    </span>
+                  <div v-for="k in (u.keys || [])" :key="k.id" class="mb-2">
+                    <div class="d-flex align-items-baseline gap-2">
+                      <span class="font-monospace" :class="k.disabled ? 'text-decoration-line-through' : ''">
+                        {{ k.name }}
+                      </span>
+                      <span v-if="!k.first_used_at" class="fst-italic">never used</span>
+                      <span v-else>
+                        {{ ago(k.last_used_at) }}
+                        <span v-if="k.last_used_ip" class="font-monospace">· {{ k.last_used_ip }}</span>
+                      </span>
+                      <span class="ms-auto text-nowrap">
+                        <a href="#" @click.prevent="toggleKey(u, k)" class="text-decoration-none">
+                          {{ k.disabled ? 'enable' : 'disable' }}
+                        </a>
+                        <a href="#" @click.prevent="removeKey(u, k)" class="text-danger text-decoration-none ms-2">
+                          delete
+                        </a>
+                      </span>
+                    </div>
+                    <!-- The tabs this key has been used from, newest first. A
+                         session id identifies one Claude Code tab; the device id
+                         is the machine it runs on, so several sessions sharing a
+                         device is one machine with several tabs open. Opaque to
+                         us and shown truncated here — the full values are in the
+                         tooltip, because matching one against a Claude Code log
+                         or the inspect panel needs the whole thing. -->
+                    <div v-for="s in keySessions(k)"
+                      :key="s.session_id"
+                      class="ms-3 font-monospace text-body-secondary"
+                      style="font-size:.72rem"
+                      :title="sessionTitle(s)"
+                    >
+                      {{ sessionLabel(s) }}
+                    </div>
                   </div>
                   <div v-if="!(u.keys || []).length" class="fst-italic">no keys</div>
+                  <!-- Every tab this person has, across all their keys. Only
+                       shown when it adds something: with a single key it would
+                       be the list just above, repeated. -->
+                  <div v-if="(u.keys || []).length > 1" class="mt-2 pt-1 border-top">
+                    <div class="text-body-secondary" style="font-size:.7rem">all tabs</div>
+                    <div v-for="s in userSessions(u)"
+                      :key="'u' + s.session_id"
+                      class="ms-3 font-monospace text-body-secondary"
+                      style="font-size:.72rem"
+                      :title="sessionTitle(s)"
+                    >
+                      {{ sessionLabel(s) }}
+                    </div>
+                  </div>
                   <a href="#" @click.prevent="addKey(u)" class="text-decoration-none" style="font-size:.75rem">
                     + add a key
                   </a>

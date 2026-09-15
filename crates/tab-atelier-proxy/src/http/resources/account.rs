@@ -24,6 +24,23 @@ pub(crate) struct KeyResource {
     pub last_used_at: Option<u64>,
     pub last_used_ip: Option<String>,
     pub disabled: bool,
+    /// The sessions this key has been seen from, newest first.
+    pub sessions: Vec<SessionResource>,
+}
+
+/// One session seen on a key: the tab, on a machine.
+///
+/// Both ids are Claude Code's: `session_id` names the conversation, and
+/// `device_id` names the machine running the client. Full values, no
+/// shortening — a prefix is enough to tell two sessions apart in a list, but
+/// not enough to match one against the client's own logs, which is what this
+/// is for in the first place. The UI decides how much of it to draw.
+#[derive(Serialize)]
+pub(crate) struct SessionResource {
+    pub session_id: String,
+    pub device_id: Option<String>,
+    pub first_seen_at: u64,
+    pub last_seen_at: u64,
 }
 
 impl From<&users::Key> for KeyResource {
@@ -36,6 +53,18 @@ impl From<&users::Key> for KeyResource {
             last_used_at: k.last_used_at,
             last_used_ip: k.last_used_ip.clone(),
             disabled: k.disabled,
+            sessions: k.sessions.iter().map(SessionResource::from).collect(),
+        }
+    }
+}
+
+impl From<&users::Session> for SessionResource {
+    fn from(s: &users::Session) -> Self {
+        Self {
+            session_id: s.session_id.clone(),
+            device_id: s.device_id.clone(),
+            first_seen_at: s.first_seen_at,
+            last_seen_at: s.last_seen_at,
         }
     }
 }
@@ -64,6 +93,10 @@ pub(crate) struct AccountResource {
     pub tools: crate::tools::Policy,
     /// Every key, each with its own history.
     pub keys: Vec<KeyResource>,
+    /// Every session this person has run, across all their keys, newest first.
+    /// The same fact as the per-key `sessions`, rolled up so the row can answer
+    /// "what is this person running" without opening each key.
+    pub sessions: Vec<AccountSessionResource>,
     /// The account's most recent activity across all its keys, for the row
     /// summary.
     pub last_used_at: Option<u64>,
@@ -85,10 +118,67 @@ impl From<&users::Account> for AccountResource {
             compact: a.compact.as_str(),
             tools: a.tools.clone(),
             keys: a.keys.iter().map(KeyResource::from).collect(),
+            sessions: merge_sessions(&a.keys),
             last_used_at: a.keys.iter().filter_map(|k| k.last_used_at).max(),
             has_key: a.keys.iter().any(users::Key::active),
         }
     }
+}
+
+/// One session across every key of an account.
+///
+/// Same shape as [`SessionResource`] plus the credentials it arrived on, which
+/// is the only thing the merged view can say that the per-key lists cannot.
+#[derive(Serialize)]
+pub(crate) struct AccountSessionResource {
+    pub session_id: String,
+    pub device_id: Option<String>,
+    pub first_seen_at: u64,
+    pub last_seen_at: u64,
+    /// Key prefixes this session has been seen on. Usually exactly one; two
+    /// means a tab switched credentials mid-conversation, which is worth
+    /// noticing rather than hiding by printing the session twice.
+    pub keys: Vec<String>,
+}
+
+/// Flatten every key's sessions into one list, newest first.
+///
+/// Built through a `BTreeMap` keyed by session id rather than concatenating the
+/// per-key lists, so that a session seen on two keys is one entry carrying both
+/// — and so the order is decided by the sort below rather than by the order the
+/// keys happen to sit in the file.
+fn merge_sessions(keys: &[users::Key]) -> Vec<AccountSessionResource> {
+    let mut merged: std::collections::BTreeMap<&str, AccountSessionResource> = std::collections::BTreeMap::new();
+    for key in keys {
+        let prefix = key.id.chars().take(4).collect::<String>();
+        for session in &key.sessions {
+            merged
+                .entry(session.session_id.as_str())
+                .and_modify(|seen| {
+                    seen.first_seen_at = seen.first_seen_at.min(session.first_seen_at);
+                    seen.last_seen_at = seen.last_seen_at.max(session.last_seen_at);
+                    if !seen.keys.contains(&prefix) {
+                        seen.keys.push(prefix.clone());
+                    }
+                })
+                .or_insert_with(|| AccountSessionResource {
+                    session_id: session.session_id.clone(),
+                    device_id: session.device_id.clone(),
+                    first_seen_at: session.first_seen_at,
+                    last_seen_at: session.last_seen_at,
+                    keys: vec![prefix.clone()],
+                });
+        }
+    }
+    let mut out: Vec<_> = merged.into_values().collect();
+    // Newest first, and session id as the tie-break so two sessions seen in the
+    // same second do not swap places between polls.
+    out.sort_by(|a, b| {
+        b.last_seen_at
+            .cmp(&a.last_seen_at)
+            .then_with(|| a.session_id.cmp(&b.session_id))
+    });
+    out
 }
 
 /// `{"user": …}`, which is how every single-account route answers.
@@ -423,6 +513,7 @@ mod tests {
                 last_used_at: None,
                 last_used_ip: None,
                 disabled: false,
+                sessions: Vec::new(),
             }],
             key_hash: "cafebabe".to_owned(),
             legacy_first_used_at: None,

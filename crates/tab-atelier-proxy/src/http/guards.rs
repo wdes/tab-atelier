@@ -84,8 +84,17 @@ impl<'r> FromRequest<'r> for Arrival {
 /// The message differs from the operator API's so that an operator reading a
 /// log can tell the two apart, and so a confused caller is told which header
 /// this interface actually reads.
+/// The key that authenticated, and the account behind it.
+///
+/// The key id is carried, not just the account, because the sighting recorded
+/// by this guard describes the KEY — and the session a request arrived from is
+/// part of that sighting. The relay needs the id to attach a session, and the
+/// guard is the last place that knows which of an account's keys was presented.
 #[derive(Debug, Clone)]
-pub struct ClientKey(pub Account);
+pub struct ClientKey {
+    pub account: Account,
+    pub key_id: String,
+}
 
 #[rocket::async_trait]
 impl<'r> FromRequest<'r> for ClientKey {
@@ -111,7 +120,7 @@ impl<'r> FromRequest<'r> for ClientKey {
                      x-api-key header, and that the key is enabled for this account",
                 )
             },
-            |account| Outcome::Success(Self(account)),
+            |(account, key_id)| Outcome::Success(Self { account, key_id }),
         )
     }
 }

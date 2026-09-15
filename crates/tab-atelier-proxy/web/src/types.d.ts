@@ -48,6 +48,24 @@ interface ArmResponse {
 }
 
 /** A key belongs to a place, not a person — see docs/proxy.md. */
+/**
+ * One Claude Code tab, as the proxy saw it arrive.
+ *
+ * Read from the request body's `metadata.user_id`, which is a JSON string
+ * inside a JSON body and is sent by every Claude Code request including the
+ * auto-mode classifier. The values are opaque to us: `session_id` is a UUID
+ * and `device_id` a 64-hex fingerprint, and neither is validated beyond being
+ * non-empty, because a client that changes their format should not stop us
+ * recording that a tab exists.
+ */
+interface ApiSession {
+    session_id: string;
+    device_id: string | null;
+    account_uuid: string | null;
+    first_seen_at: number;
+    last_seen_at: number;
+}
+
 interface ApiKey {
     id: string;
     name: string;
@@ -56,6 +74,8 @@ interface ApiKey {
     last_used_at: number | null;
     last_used_ip: string | null;
     disabled: boolean;
+    /** Tabs seen with this key, newest first. */
+    sessions: ApiSession[];
 }
 
 interface ApiUser {

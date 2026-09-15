@@ -73,7 +73,11 @@ pub(crate) async fn relay_post(
     body: Raw,
     sub: PathBuf,
 ) -> Reply {
-    relay::anthropic(state, relay::Relay::new(&who.0, &arrival, &sub, body.bytes())).await
+    relay::anthropic(
+        state,
+        relay::Relay::new(&who.account, &who.key_id, &arrival, &sub, body.bytes()),
+    )
+    .await
 }
 
 /// A relayed read.
@@ -83,7 +87,11 @@ pub(crate) async fn relay_post(
 /// rather than from this proxy, so it is relayed like anything else.
 #[get("/relay/anthropic/<sub..>")]
 pub(crate) async fn relay_get(state: &State<Arc<AppState>>, arrival: Arrival, who: ClientKey, sub: PathBuf) -> Reply {
-    relay::anthropic(state, relay::Relay::new(&who.0, &arrival, &sub, bytes::Bytes::new())).await
+    relay::anthropic(
+        state,
+        relay::Relay::new(&who.account, &who.key_id, &arrival, &sub, bytes::Bytes::new()),
+    )
+    .await
 }
 
 /// Is the relay up?
@@ -107,13 +115,13 @@ pub(crate) fn relay_hello_head() -> Reply {
 /// What this key's account has spent.
 #[get("/me/usage?<window>")]
 pub(crate) fn me_usage(state: &State<Arc<AppState>>, who: ClientKey, window: Option<String>) -> Reply {
-    me::me_usage(state, &who.0, window.as_deref())
+    me::me_usage(state, &who.account, window.as_deref())
 }
 
 /// Repair this account's credential, in place.
 #[post("/me/credentials", data = "<body>")]
 pub(crate) async fn me_credentials(state: &State<Arc<AppState>>, arrival: Arrival, who: ClientKey, body: Raw) -> Reply {
-    me::me_credentials(state, &who.0, &arrival, body).await
+    me::me_credentials(state, &who.account, &arrival, body).await
 }
 
 // ── the probe ───────────────────────────────────────────────────────────────

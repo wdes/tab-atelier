@@ -1270,6 +1270,49 @@ const AdminApp = Vue.defineComponent({
         this.showKey({ user: u, key: data.secret, name: data.key.name });
       });
     },
+    // A key's tabs, newest first. Sorted here rather than at render so the
+    // per-key list and the merged per-person list below cannot disagree about
+    // what "most recent" means.
+    keySessions(k: ApiKey): ApiSession[] {
+      return (k.sessions ?? []).slice().sort((a, b) => b.last_seen_at - a.last_seen_at);
+    },
+    // Every tab this person has, across all their keys, deduplicated by
+    // session id.
+    //
+    // The same session id can appear under two keys — a machine re-keyed
+    // mid-session, or one credential replaced by another while a tab stayed
+    // open — and showing it twice would read as two tabs. The *newest* sighting
+    // wins, because that is the key the tab is using now; the earlier key still
+    // lists it separately, which is deliberate, since that is where the record
+    // of *that credential* belongs.
+    userSessions(u: ApiUser): ApiSession[] {
+      const bySession = new Map<string, ApiSession>();
+      for (const k of u.keys ?? []) {
+        for (const s of this.keySessions(k)) {
+          const seen = bySession.get(s.session_id);
+          if (seen === undefined || s.last_seen_at > seen.last_seen_at) bySession.set(s.session_id, s);
+        }
+      }
+      return [...bySession.values()].sort((a, b) => b.last_seen_at - a.last_seen_at);
+    },
+    // `5b91b78b · 323056b1 · 2m ago`, with the full values in the tooltip: a
+    // session uuid and a 64-hex device fingerprint are far too long for a table
+    // cell, but both are needed in full to match against a Claude Code log.
+    sessionLabel(s: ApiSession): string {
+      const parts = [this.shortHash(s.session_id), this.shortHash(s.device_id ?? undefined)];
+      return `${parts.join(" · ")} · ${this.ago(s.last_seen_at)}`;
+    },
+    sessionTitle(s: ApiSession): string {
+      return [
+        `session  ${s.session_id}`,
+        `device   ${s.device_id ?? "unknown"}`,
+        s.account_uuid ? `account  ${s.account_uuid}` : "",
+        `first seen ${new Date(s.first_seen_at * 1000).toLocaleString()}`,
+        `last seen  ${new Date(s.last_seen_at * 1000).toLocaleString()}`,
+      ]
+        .filter(Boolean)
+        .join("\n");
+    },
     removeKey(u: ApiUser, k: ApiKey) {
       if (!confirm(`Delete ${u.first_name}'s key "${k.name}"? Anything using it stops working. Their other keys are unaffected.`))
         return;

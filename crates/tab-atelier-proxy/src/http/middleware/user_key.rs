@@ -9,25 +9,32 @@
 use crate::server::State;
 use crate::users::Account;
 
-/// The account behind a key, stamped with this sighting.
+/// The account behind a key, and the id of that key, stamped with this
+/// sighting.
+///
+/// The key id is returned alongside the account because the sighting describes
+/// the KEY, and the session a request arrived from is part of it — the caller
+/// that records that session needs to know which key's history to extend.
 ///
 /// Returns `None` for an unknown, disabled or empty key — the caller decides
 /// how to say so, because the relay and the personal routes phrase a refusal
 /// differently.
 #[must_use]
-pub fn authenticate_and_stamp(state: &State, key: &str, ip: &str) -> Option<Account> {
+pub fn authenticate_and_stamp(state: &State, key: &str, ip: &str) -> Option<(Account, String)> {
     // The KEY is stamped, not the account: "last used from here" says nothing
     // when several keys share an account, which is the whole reason they are
     // named separately.
-    let found = {
-        let mut store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let found = store.authenticate_key(key).map(|(a, k)| (a.clone(), k.id.clone()));
-        if let Some((_, ref key_id)) = found {
-            store.touch(key_id, Some(ip));
-        }
-        found
-    };
-    found.map(|(a, _)| a)
+    //
+    // The session is NOT stamped here. This runs as a guard, before the body
+    // has been read, and the session lives in the body. The relay adds it once
+    // it has one, which is also why `touch` takes an `Option` client: this call
+    // and that one describe the same sighting, one field at a time.
+    let mut store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let found = store.authenticate_key(key).map(|(a, k)| (a.clone(), k.id.clone()));
+    if let Some((_, key_id)) = &found {
+        store.touch(key_id, Some(ip), None);
+    }
+    found
 }
 
 #[cfg(test)]
@@ -67,8 +74,12 @@ mod tests {
     fn a_minted_key_authenticates_to_its_account() {
         let (store, secret) = store("valid");
         let state = state_with(store);
-        let who = authenticate_and_stamp(&state, &secret, "203.0.113.7").expect("authenticates");
-        assert_eq!(who.email, "valid@example.com");
+        let (account, key_id) = authenticate_and_stamp(&state, &secret, "203.0.113.7").expect("authenticates");
+        assert_eq!(account.email, "valid@example.com");
+        // The key id has to come back with the account: the relay stamps the
+        // session that made the request onto this key, and an id lost here
+        // would attribute every tab to whichever key happened to be looked up.
+        assert!(!key_id.is_empty(), "the key id identifies which key it was");
     }
 
     #[test]
