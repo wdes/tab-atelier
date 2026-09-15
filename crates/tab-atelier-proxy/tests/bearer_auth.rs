@@ -396,26 +396,64 @@ fn a_relay_request_without_a_key_is_refused() {
 /// The map is the one that bit: Bootstrap's CSS ends in
 /// `sourceMappingURL=bootstrap.min.css.map`, so it is requested as soon as the
 /// style sheet loads, and it was the one file the resolver did not know about.
+///
+/// Split in two, and the split is the point. `OURS` must be served everywhere,
+/// because the package carries them. `THE_DISTRIBUTIONS` are resolved to
+/// `/usr/share/javascript/bootstrap5/`, which is a runtime dependency of the
+/// `.deb` and **absent from a bare CI runner** — so requiring them
+/// unconditionally asserts that whoever runs the tests happens to have the
+/// Debian package installed. That is not a property of this code, and this test
+/// failed in CI for exactly that reason before it was split.
+///
+/// Absent-because-not-installed is therefore a skip, not a failure; present is
+/// checked, so a wrong path in the resolver is still caught on any machine that
+/// has the package. The count only guards against the check going vacuous.
 #[test]
 fn every_asset_the_page_needs_is_served() {
-    let proxy = Proxy::start("assets");
-    let port = proxy.port;
-
-    for path in [
+    /// Files the package carries, so they must be served anywhere.
+    const OURS: [&str; 8] = [
         "/",
         "/index.html",
         "/app.js",
         "/api.js",
         "/charts.js",
         "/vendor/vue.global.prod.js",
-        "/vendor/bootstrap.min.css",
-        "/vendor/bootstrap.min.css.map",
         "/robots.txt",
         "/favicon.ico",
-    ] {
+    ];
+    /// Resolved to `/usr/share/javascript/bootstrap5/`, which is a runtime
+    /// dependency of the `.deb` and absent from a bare CI runner.
+    const THE_DISTRIBUTIONS: [&str; 2] = ["/vendor/bootstrap.min.css", "/vendor/bootstrap.min.css.map"];
+
+    let proxy = Proxy::start("assets");
+    let port = proxy.port;
+
+    for path in OURS {
         let response = get(port, path);
         assert_eq!(status(&response), 200, "{path} is missing");
         assert!(!body(&response).is_empty(), "{path} is empty");
+    }
+
+    let mut checked = 0;
+    for path in THE_DISTRIBUTIONS {
+        let response = get(port, path);
+        match status(&response) {
+            200 => {
+                assert!(!body(&response).is_empty(), "{path} is empty");
+                checked += 1;
+            }
+            // The distribution's package is not installed here. Nothing this
+            // crate controls can change that, and the `.deb` declares the
+            // dependency, so an installed system has it.
+            404 => {}
+            code => panic!("{path} answered {code}, which is neither served nor absent"),
+        }
+    }
+
+    // On a machine with the package — CI, once `libjs-bootstrap5` is listed,
+    // or any host running the installed `.deb` — both are verified.
+    if std::path::Path::new("/usr/share/javascript/bootstrap5").exists() {
+        assert_eq!(checked, 2, "the distribution's assets are installed but not served");
     }
 }
 

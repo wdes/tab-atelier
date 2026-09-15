@@ -39,6 +39,14 @@ jobs:
             - name: Install system dependencies
               run: |
                   sudo apt-get update
+                  # Bootstrap, for the proxy's dashboard. It is a runtime
+                  # dependency of the .deb, and the proxy resolves it from
+                  # /usr/share/javascript/bootstrap5 rather than vendoring a
+                  # copy — so without it here the resolver's paths are never
+                  # exercised in CI, and a typo in one reaches production.
+                  # That is not hypothetical: a missing source-map path did.
+                  # The tests skip these assets when absent, so a contributor
+                  # without the package is unaffected.
                   sudo apt-get install -y --no-install-recommends \
                       build-essential \
                       libvulkan-dev \
@@ -51,7 +59,8 @@ jobs:
                       libxcb-shm0-dev \
                       libxcb-xkb-dev \
                       libfontconfig-dev \
-                      libfreetype-dev
+                      libfreetype-dev \
+                      libjs-bootstrap5
             - name: Install Rust toolchain
               uses: dtolnay/rust-toolchain@stable
               with:
