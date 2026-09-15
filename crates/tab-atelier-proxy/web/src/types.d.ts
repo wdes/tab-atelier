@@ -11,6 +11,42 @@
 // <script> tags sharing one global scope. `"module": "none"` in tsconfig makes
 // an accidental `import` a compile error rather than a runtime one.
 
+/**
+ * Any JSON value.
+ *
+ * The set of values that survive `JSON.stringify` — which is exactly the set
+ * the proxy will accept and hand back. It is not `any` and not `unknown`: it
+ * names a real shape, and it is used in only the two places where this page
+ * genuinely does not know one — a tool definition the policy keeps as an
+ * opaque value, and a parsed error body from something that may not be the
+ * proxy at all. Everywhere the shape *is* known it is declared, and this name
+ * is deliberately awkward enough to make naming the real one more attractive.
+ */
+// Named object type, rather than the inline `{ [key: string]: JsonValue }` this
+// used to be. A recursive type written as an inline member of its own union
+// makes tsc instantiate the whole thing at every use site, and through Vue's
+// inferred `this` that blew up as TS2589 ("excessively deep") on an unrelated
+// line. A named interface is instantiated lazily, so it terminates.
+interface JsonObject {
+    [key: string]: JsonValue;
+}
+type JsonValue = string | number | boolean | null | JsonValue[] | JsonObject;
+
+/** The acknowledgement a mutation returns when it has nothing else to report. */
+interface OkResponse {
+    ok: boolean;
+}
+
+/** The identifier of something just created. */
+interface IdResponse {
+    id: string;
+}
+
+/** When an inspection window closes, as Unix seconds. */
+interface ArmResponse {
+    armed_until: number;
+}
+
 /** A key belongs to a place, not a person — see docs/proxy.md. */
 interface ApiKey {
     id: string;
@@ -76,7 +112,7 @@ interface ToolsPolicy {
     /** The complete set, read only by `mode: "allow"`. */
     allow: string[];
     /** Definitions injected when the client did not send them. */
-    add: unknown[];
+    add: JsonObject[];
     /** Description rewrites, keyed by tool name. Prose only — a rewrite
      *  never adds or removes a tool. */
     rewrite: Record<string, RewriteRule[]>;
@@ -376,6 +412,28 @@ interface ProviderModel {
     note?: string;
 }
 
+/**
+ * One window of a hop's peak-pricing schedule.
+ *
+ * The window is `[start_hour, end_hour)` in UTC, on the listed weekdays. The
+ * end may be lower than the start, which means it runs past midnight.
+ */
+interface PeakWindow {
+    /** ISO weekday numbers, 1 = Monday through 7 = Sunday. */
+    weekdays: number[];
+    /** The hour the window opens, UTC. */
+    start_hour: number;
+    /** The hour it closes, UTC, exclusive. */
+    end_hour: number;
+}
+
+/** A hop's peak-pricing multiplier, and when it applies. */
+interface PeakConfig {
+    /** Percent of the base price — 150 means half again as expensive. */
+    multiplier_percent: number;
+    windows: PeakWindow[];
+}
+
 interface ProviderView {
     id: string;
     base_url: string;
@@ -393,7 +451,7 @@ interface ProviderView {
     peak_now: boolean;
     /** Unix seconds when the active peak ends; null when none is in force. */
     peak_until?: number | null;
-    peak?: { multiplier_percent: number; windows: unknown[] };
+    peak?: PeakConfig;
     ready: boolean;
     auth: string;
     /**
@@ -618,6 +676,6 @@ interface Window {
         /** The class, for a test that wants its own instance and base URL. */
         ApiClient: new (options?: { baseUrl?: string }) => ApiClient;
         /** The error type, so a caller can narrow on it with `instanceof`. */
-        ApiError: new (status: number, body: unknown, message: string) => ApiError;
+        ApiError: new (status: number, body: JsonValue, message: string) => ApiError;
     };
 }

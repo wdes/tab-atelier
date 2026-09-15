@@ -116,6 +116,13 @@ assets = [
     ["assets/index.html", "/usr/share/tab-atelier-proxy/web/", "644"],
     ["assets/app.js", "/usr/share/tab-atelier-proxy/web/", "644"],
     ["assets/charts.js", "/usr/share/tab-atelier-proxy/web/", "644"],
+    # api.js must be here. It is the HTTP client every page load needs, and
+    # index.html names it in a <script src> — so a package that ships the page
+    # without this file does not lose a feature, it serves a blank dashboard
+    # and a 404 in the console. It was missing from this list once;
+    # `tests/web_assets.rs` now checks every script the page references against
+    # this array, so the next one cannot be.
+    ["assets/api.js", "/usr/share/tab-atelier-proxy/web/", "644"],
     ["assets/robots.txt", "/usr/share/tab-atelier-proxy/web/", "644"],
     # Copied from the web viewer's own icon so a tab shows the same mark
     # whichever of the two it is pointed at. Served without a credential, like

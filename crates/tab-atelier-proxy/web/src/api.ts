@@ -58,9 +58,9 @@ interface SaveProviderBody {
 class ApiError extends Error {
   readonly status: number;
   /** The parsed body, for a caller that wants more than the message. */
-  readonly body: unknown;
+  readonly body: JsonValue;
 
-  constructor(status: number, body: unknown, message: string) {
+  constructor(status: number, body: JsonValue, message: string) {
     super(message);
     this.name = "ApiError";
     this.status = status;
@@ -73,33 +73,33 @@ interface UsersApi {
   list(): Promise<ApiUser[]>;
   add(form: { first_name: string; last_name: string; email: string }): Promise<ApiUser>;
   remove(id: string): Promise<ApiUser>;
-  setDisabled(id: string, disabled: boolean): Promise<unknown>;
-  setWeight(id: string, weight: number): Promise<unknown>;
-  setProvider(id: string, provider: string): Promise<unknown>;
-  setModel(id: string, model: string): Promise<unknown>;
-  setCompact(id: string, compact: string): Promise<unknown>;
-  setTools(id: string, policy: ToolsPolicy): Promise<unknown>;
+  setDisabled(id: string, disabled: boolean): Promise<ApiUser>;
+  setWeight(id: string, weight: number): Promise<ApiUser>;
+  setProvider(id: string, provider: string): Promise<ApiUser>;
+  setModel(id: string, model: string): Promise<ApiUser>;
+  setCompact(id: string, compact: string): Promise<ApiUser>;
+  setTools(id: string, policy: ToolsPolicy): Promise<ApiUser>;
 }
 
 /** The endpoints that act on an account's keys. */
 interface KeysApi {
   add(id: string, name: string): Promise<NewKey>;
-  remove(id: string, keyId: string): Promise<unknown>;
-  setDisabled(id: string, keyId: string, disabled: boolean): Promise<unknown>;
+  remove(id: string, keyId: string): Promise<ApiKey>;
+  setDisabled(id: string, keyId: string, disabled: boolean): Promise<ApiKey>;
 }
 
 /** The endpoints that act on providers. */
 interface ProvidersApi {
   list(): Promise<ProvidersResponse>;
-  save(body: SaveProviderBody): Promise<unknown>;
-  rotateKey(id: string, key: string): Promise<unknown>;
-  remove(id: string): Promise<unknown>;
+  save(body: SaveProviderBody): Promise<IdResponse>;
+  rotateKey(id: string, key: string): Promise<IdResponse>;
+  remove(id: string): Promise<IdResponse>;
 }
 
 /** The endpoints that act on model-name mappings. */
 interface MappingsApi {
-  add(mapping: { from: string; to: string; note: string }): Promise<unknown>;
-  remove(from: string): Promise<unknown>;
+  add(mapping: { from: string; to: string; note: string }): Promise<OkResponse>;
+  remove(from: string): Promise<OkResponse>;
 }
 
 /** The read-only reports. */
@@ -114,7 +114,7 @@ interface PressureApi {
 interface InspectApi {
   get(): Promise<InspectState>;
   arm(minutes: number): Promise<InspectState>;
-  disarm(): Promise<unknown>;
+  disarm(): Promise<OkResponse>;
 }
 
 /**
@@ -211,7 +211,14 @@ class ApiClient {
    * answer has since expired or the token was rotated — neither of which the
    * operator can see from a bare status.
    */
-  async request<T = unknown>(method: string, path: string, body?: unknown): Promise<T> {
+  // `object` rather than `JsonValue`: every body this API takes is a request
+  // struct, and a TypeScript interface has no implicit index signature, so it
+  // is not assignable to `JsonValue`'s object branch. What is checked against
+  // what is the facade above — `providers.save` still demands a
+  // `SaveProviderBody`, which is where a wrong field name is caught. `object`
+  // is here to rule out the mistakes that matter at this layer: undefined, a
+  // bare string, a number.
+  async request<T>(method: string, path: string, body?: object): Promise<T> {
     const response = await fetch(this.resolveUrl(path), {
       method,
       headers: body === undefined ? {} : { "Content-Type": "application/json" },
@@ -232,10 +239,17 @@ class ApiClient {
   private async failure(response: Response): Promise<ApiError> {
     const raw = await response.text();
     let message = `${response.status} ${response.statusText}`.trim();
-    let body: unknown = raw;
+    let body: JsonValue = raw;
     try {
-      const parsed = JSON.parse(raw);
-      if (parsed && typeof parsed.error === "string") message = parsed.error;
+      const parsed: JsonValue = JSON.parse(raw);
+      if (
+        parsed !== null &&
+        typeof parsed === "object" &&
+        !Array.isArray(parsed) &&
+        typeof parsed.error === "string"
+      ) {
+        message = parsed.error;
+      }
       body = parsed;
     } catch {
       // Not JSON — an HTML error page from something in front of the proxy,
