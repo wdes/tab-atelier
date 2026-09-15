@@ -138,7 +138,6 @@ fn a_users_key_is_exchanged_for_the_proxys_claude_token() {
         provider_backoff: Mutex::new(std::collections::BTreeMap::new()),
         admin_token: "tap_admin_not_valid_here".to_owned(),
         web_root: None,
-        web_auth: tab_atelier_proxy::http::auth::Nonces::default(),
     });
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -250,7 +249,6 @@ fn a_revoked_key_stops_working_without_reaching_upstream() {
         provider_backoff: Mutex::new(std::collections::BTreeMap::new()),
         admin_token: "tap_admin".to_owned(),
         web_root: None,
-        web_auth: tab_atelier_proxy::http::auth::Nonces::default(),
     });
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -349,7 +347,6 @@ fn a_429_moves_the_next_request_to_another_provider() {
         provider_backoff: Mutex::new(std::collections::BTreeMap::new()),
         admin_token: "tap_admin".to_owned(),
         web_root: None,
-        web_auth: tab_atelier_proxy::http::auth::Nonces::default(),
     });
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -503,7 +500,6 @@ fn compaction_reaches_upstream_and_only_where_it_is_configured() {
         provider_backoff: Mutex::new(std::collections::BTreeMap::new()),
         admin_token: "tap_admin".to_owned(),
         web_root: None,
-        web_auth: tab_atelier_proxy::http::auth::Nonces::default(),
     });
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -640,7 +636,6 @@ fn the_auto_mode_classifier_is_not_retargeted_by_a_mapping() {
         provider_backoff: Mutex::new(std::collections::BTreeMap::new()),
         admin_token: "tap_admin".to_owned(),
         web_root: None,
-        web_auth: tab_atelier_proxy::http::auth::Nonces::default(),
     });
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -866,7 +861,6 @@ fn state_with(providers: Vec<Provider>, dir: &std::path::Path, sched: qos::Sched
         provider_backoff: Mutex::new(std::collections::BTreeMap::new()),
         admin_token: "tap_admin".to_owned(),
         web_root: None,
-        web_auth: tab_atelier_proxy::http::auth::Nonces::default(),
     })
 }
 
@@ -965,7 +959,6 @@ fn a_local_tool_is_resolved_by_the_proxy_and_never_asked_upstream() {
         provider_backoff: Mutex::new(std::collections::BTreeMap::new()),
         admin_token: "tap_admin".to_owned(),
         web_root: None,
-        web_auth: tab_atelier_proxy::http::auth::Nonces::default(),
     });
     let served = serve(&state);
 
@@ -1069,7 +1062,6 @@ fn an_openai_upstream_receives_a_user_agent() {
         provider_backoff: Mutex::new(std::collections::BTreeMap::new()),
         admin_token: "tap_admin".to_owned(),
         web_root: None,
-        web_auth: tab_atelier_proxy::http::auth::Nonces::default(),
     });
 
     let rt = tokio::runtime::Builder::new_multi_thread()
