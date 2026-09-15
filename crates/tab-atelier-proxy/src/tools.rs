@@ -7,13 +7,19 @@
 //! account:
 //!
 //! * **disable** — remove tools the client sent.
-//! * **whitelist** — send only these (mode `allow`).
-//! * **rewrite** — add tools the client did not send (mode `add`).
+//! * **whitelist** — send only these (mode `allow`, or `none` for the same
+//!   filter without the reorder that `allow` applies).
+//! * **rewrite** — add tools the client did not send (the `add` list, which is
+//!   a field rather than a mode).
 //!
-//! The rule that makes it safe is *referenced ∪ pins*: a tool name that
+//! The rule that makes it safe is the *referenced union*: a tool name that
 //! already appears in `messages[]` must keep its definition, whichever mode
 //! is in force. Anthropic validates that pairing, and a definition the client
 //! has already called cannot simply vanish mid-conversation.
+//!
+//! That rule is answered from the whole transcript, so its answer only ever
+//! grows. A policy is a static statement about which tools may be sent, and
+//! nothing in it depends on how far into the conversation the request is.
 //!
 //! The default — mode `all`, every list empty — is a faithful no-op. That is
 //! load-bearing, not a convenience: an unconfigured account must produce a
@@ -68,14 +74,39 @@ pub enum Mode {
     /// Kept so an account file written before the window was removed still
     /// loads. Behaves exactly as [`Mode::All`].
     Referenced,
-    /// Nothing that is not in `allow`, in `allow` order.
+    /// Nothing the client sent that is not in `allow`, reordered to match it.
+    ///
+    /// `allow` is an ordering instruction as well as a filter, so a list whose
+    /// order differs from the client's rewrites the array's positions. That is
+    /// deliberate — it lets an operator pin a stable layout — but it is also
+    /// the one way a policy can move `tools[]` without changing its
+    /// membership, and `tools[]` leads the body. [`Mode::None`] is the same
+    /// filter without the reorder, so it is the spelling to prefer when the
+    /// order is not something anyone is thinking about.
+    ///
+    /// "Nothing ... not in `allow`" is about the configuration, not about the
+    /// wire. The referenced-union rule and [`ALWAYS_KEPT`] still apply, so a
+    /// name the transcript has already used is kept even though the list does
+    /// not name it. Both pruning modes behave that way; the list bounds what
+    /// the policy proposes, and the transcript can still pull a name back in.
     Allow,
     /// Nothing that is not in `allow`.
     ///
-    /// This and [`Mode::Allow`] now resolve the same way, because `allow`
-    /// came to carry the whole decision: it is the always-keep list, the
-    /// mirror of `disable`'s always-drop, and a mode only supplies the answer
-    /// for the tools neither list names. `None` and `Allow` both answer *no*.
+    /// This and [`Mode::Allow`] agree on *membership* but not on order: both
+    /// answer *no* to anything the list does not name, and [`Mode::Allow`]
+    /// additionally sorts the survivors into the list's order. So they emit the
+    /// same set in the same order only when the list is already in the client's
+    /// order, or has a single name. With that caveat, `allow` carries the whole
+    /// decision and the mode only supplies the answer for tools it does not
+    /// name.
+    ///
+    /// `allow` is read here and by [`Mode::Allow`] — the two modes that prune
+    /// — and is deliberately dormant under [`Mode::All`] and
+    /// [`Mode::Referenced`], which keep everything whatever the list says.
+    /// It is `disable`'s mirror in shape but not in reach: `disable` is
+    /// subtracted under every mode, `allow` only where it is read. A list
+    /// under `all` is stored and means something the moment the mode changes;
+    /// it does not act before then, and [`is_noop`] is the thing that says so.
     ///
     /// The live account runs `none` with a twenty-name `allow`, so before this
     /// the twenty names were never read — see the module note above for what
@@ -1548,6 +1579,232 @@ mod tests {
         assert_eq!(names(&full), names(&referenced));
         assert_eq!(names(&referenced), ["Read", "Bash", "Edit"]);
         assert!(!Mode::Referenced.prunes());
+    }
+
+    // --- The prompt a tail window re-bought -------------------------------
+    //
+    // Production ran `{"mode":"none","allow":[…20 tools]}`. `none` ignored
+    // `allow` and pruned from the tail of the conversation, so a tool called
+    // early and never again fell out of `tools[]`. Because `tools[]` is the
+    // first element of an Anthropic body, that invalidated every cache
+    // breakpoint behind it: measured on the live relay, one definition leaving
+    // the array turned a 131k-token cache read into a 2.4k one and billed the
+    // whole prompt at the miss rate — 15,108 input tokens became 139,970.
+    //
+    // Nothing rejected the request, nothing logged a fault, and each body on
+    // its own was valid and smaller. So these pin the invariant rather than
+    // the symptom: the set must not depend on *when* a tool was last used.
+
+    /// The live account's policy in shape: a list the operator wrote down.
+    fn production_policy() -> Policy {
+        Policy {
+            mode: Mode::None,
+            allow: ["Read", "Bash", "Edit", "Write"].map(String::from).to_vec(),
+            ..Policy::default()
+        }
+    }
+
+    /// A conversation that calls `name` once and then does other things for
+    /// `quiet` turns — the shape that aged a tool out of the window.
+    fn conversation_calling_once(name: &str, quiet: usize) -> Value {
+        let mut messages = vec![
+            json!({"role": "user", "content": "start"}),
+            json!({"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t0", "name": name, "input": {}}
+            ]}),
+            json!({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t0", "content": "ok"}
+            ]}),
+        ];
+        for i in 0..quiet {
+            messages.push(json!({"role": "assistant", "content": [
+                {"type": "tool_use", "id": format!("f{i}"), "name": "Read", "input": {}}
+            ]}));
+            messages.push(json!({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": format!("f{i}"), "content": "ok"}
+            ]}));
+        }
+        Value::Array(messages)
+    }
+
+    /// Apply `policy` to a conversation that called `name` `quiet` turns ago.
+    fn body_calling_once(name: &str, quiet: usize, policy: &Policy) -> Value {
+        let mut body = request(&["Read", "Bash", "Edit", "Write"]);
+        body["messages"] = conversation_calling_once(name, quiet);
+        apply(&mut body, policy, true);
+        body
+    }
+
+    #[test]
+    fn a_tool_called_once_is_still_sent_after_long_silence() {
+        let body = body_calling_once("Write", 400, &production_policy());
+        assert_eq!(
+            names(&body),
+            ["Read", "Bash", "Edit", "Write"],
+            "a tool the conversation called must not age out of the array"
+        );
+    }
+
+    #[test]
+    fn one_turn_and_five_hundred_turns_ago_emit_the_same_array() {
+        // The window's defining property was that its answer depended on age.
+        // Pin that nothing does: the same reference, 1 turn old or 500, has to
+        // produce a byte-identical array, or the provider re-buys a prefix it
+        // had no reason to think had changed.
+        let policy = production_policy();
+        let fresh = body_calling_once("Write", 0, &policy);
+        let stale = body_calling_once("Write", 500, &policy);
+        assert_eq!(
+            fresh["tools"], stale["tools"],
+            "tools[] must be byte-identical however old the reference is"
+        );
+    }
+
+    #[test]
+    fn a_tool_the_conversation_used_survives_even_an_empty_allow_list() {
+        // The referenced-union rule is the safety net under every mode: a
+        // `tool_use` in `messages[]` naming a tool that is no longer defined
+        // is rejected outright upstream, so the definition has to stay even
+        // when the policy says otherwise.
+        let policy = Policy {
+            mode: Mode::None,
+            allow: Vec::new(),
+            ..Policy::default()
+        };
+        let body = body_calling_once("Write", 400, &policy);
+        assert_eq!(
+            names(&body),
+            ["Read", "Write"],
+            "Read is in the recent tail, Write is not; both are referenced"
+        );
+    }
+
+    #[test]
+    fn the_production_policy_sends_exactly_its_allow_list() {
+        // The live account's shape, and the request that was silently
+        // discarding it: `none` with a list the operator wrote down. The list
+        // is the whole decision under a pruning mode, and it has to be visible
+        // to `is_noop` as well — `apply` returns early there, so a filter that
+        // does not register never runs. Those are the two ways the same list
+        // can be inert, and one incident is enough for both to matter.
+        let policy = production_policy();
+        assert!(!is_noop(&policy), "a list under `none` is a policy that runs");
+        let mut body = request(&["Read", "Bash", "Edit", "Write", "WebFetch", "Task"]);
+        let report = apply(&mut body, &policy, true);
+        assert_eq!(names(&body), ["Read", "Bash", "Edit", "Write"]);
+        assert_eq!(report.removed, ["WebFetch", "Task"]);
+    }
+
+    #[test]
+    fn a_list_under_a_keeping_mode_is_stored_and_dormant() {
+        // Not a bug, and the counterpart to the test above. `all` and
+        // `referenced` keep everything whatever the list says, so the list is
+        // inert *and* the body must come back untouched — `apply` must not
+        // re-encode a body it is not going to change, because re-encoding goes
+        // through `serde_json` and reorders every key. The tempting "fix" is
+        // to make the populated list act; that would re-encode for nothing and
+        // break the byte-identical prefix the cache runs on. See
+        // `an_allow_list_under_the_mode_that_ignores_it_is_still_a_noop`,
+        // which pins `all` specifically.
+        for mode in [Mode::All, Mode::Referenced] {
+            let policy = Policy {
+                mode,
+                allow: vec!["Read".into()],
+                ..Policy::default()
+            };
+            assert!(is_noop(&policy), "{mode:?} reads no list");
+            let mut body = request(&["Read", "Bash", "Edit"]);
+            let before = body.clone();
+            apply(&mut body, &policy, true);
+            assert_eq!(body, before, "{mode:?} must not touch the body");
+        }
+    }
+
+    #[test]
+    fn the_pruning_modes_agree_on_membership_but_not_on_order() {
+        // `allow` and `none` are the two modes that read the list, and they
+        // agree on *which* tools survive — which is why the production
+        // policy's `none` was reachable at all, and why moving it to `allow`
+        // changed nothing until ordering was considered. They do not agree on
+        // the order: `allow` sorts into the list, `none` keeps the client's.
+        // The list is the reverse of the client's order so the two must differ.
+        let allow = |mode| Policy {
+            mode,
+            allow: vec!["Edit".into(), "Read".into()],
+            ..Policy::default()
+        };
+        let mut a = request(&["Read", "Bash", "Edit"]);
+        let mut b = request(&["Read", "Bash", "Edit"]);
+        apply(&mut a, &allow(Mode::Allow), true);
+        apply(&mut b, &allow(Mode::None), true);
+
+        let set = |body: &Value| {
+            let mut sorted = names(body);
+            sorted.sort();
+            sorted
+        };
+        assert_eq!(set(&a), set(&b), "the same tools survive both modes");
+        assert_eq!(set(&a), ["Edit", "Read"]);
+
+        assert_eq!(names(&a), ["Edit", "Read"], "`allow` follows the list");
+        assert_eq!(names(&b), ["Read", "Edit"], "`none` follows the client");
+    }
+
+    #[test]
+    fn allow_mode_sorts_the_array_into_the_lists_order() {
+        // `allow` is an ordering instruction as well as a filter, so the list
+        // decides positions too. Deliberate, but it is the one way a policy
+        // moves `tools[]` without changing its membership.
+        let policy = Policy {
+            mode: Mode::Allow,
+            // Deliberately the reverse of the body's order.
+            allow: ["Write", "Edit", "Bash", "Read"].map(String::from).to_vec(),
+            ..Policy::default()
+        };
+        let mut filtered = request(&["Read", "Bash", "Edit", "Write"]);
+        apply(&mut filtered, &policy, true);
+        assert_eq!(names(&filtered), ["Write", "Edit", "Bash", "Read"]);
+    }
+
+    #[test]
+    fn none_mode_filters_without_touching_the_clients_order() {
+        // Same membership as `allow`, no reorder. The two modes are not
+        // interchangeable: identical lists put identical tools on the wire in a
+        // different order, and this is the difference.
+        let policy = Policy {
+            mode: Mode::None,
+            allow: ["Write", "Edit", "Bash", "Read"].map(String::from).to_vec(),
+            ..Policy::default()
+        };
+        let mut filtered = request(&["Read", "Bash", "Edit", "Write"]);
+        apply(&mut filtered, &policy, true);
+        assert_eq!(
+            names(&filtered),
+            ["Read", "Bash", "Edit", "Write"],
+            "`none` keeps the client's order, so it is the cache-neutral spelling"
+        );
+    }
+
+    #[test]
+    fn no_mode_emits_a_set_that_shrinks_as_the_conversation_grows() {
+        // The cache property, swept over every mode: growing a conversation
+        // without introducing a new tool must not change `tools[]`. Age is the
+        // one input the provider cannot see, so it must not be an input here.
+        for mode in [Mode::All, Mode::Referenced, Mode::Allow, Mode::None] {
+            let policy = Policy {
+                mode,
+                allow: ["Read", "Bash", "Edit", "Write"].map(String::from).to_vec(),
+                ..Policy::default()
+            };
+            for name in ["Read", "Bash", "Edit", "Write"] {
+                let short = body_calling_once(name, 1, &policy);
+                let long = body_calling_once(name, 300, &policy);
+                assert_eq!(
+                    short["tools"], long["tools"],
+                    "{mode:?} emitted a different array once {name} was old"
+                );
+            }
+        }
     }
 
     #[test]
