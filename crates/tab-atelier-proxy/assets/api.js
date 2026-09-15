@@ -119,6 +119,13 @@ class ApiClient {
      * answer has since expired or the token was rotated — neither of which the
      * operator can see from a bare status.
      */
+    // `object` rather than `JsonValue`: every body this API takes is a request
+    // struct, and a TypeScript interface has no implicit index signature, so it
+    // is not assignable to `JsonValue`'s object branch. What is checked against
+    // what is the facade above — `providers.save` still demands a
+    // `SaveProviderBody`, which is where a wrong field name is caught. `object`
+    // is here to rule out the mistakes that matter at this layer: undefined, a
+    // bare string, a number.
     async request(method, path, body) {
         const response = await fetch(this.resolveUrl(path), {
             method,
@@ -140,8 +147,12 @@ class ApiClient {
         let body = raw;
         try {
             const parsed = JSON.parse(raw);
-            if (parsed && typeof parsed.error === "string")
+            if (parsed !== null &&
+                typeof parsed === "object" &&
+                !Array.isArray(parsed) &&
+                typeof parsed.error === "string") {
                 message = parsed.error;
+            }
             body = parsed;
         }
         catch {

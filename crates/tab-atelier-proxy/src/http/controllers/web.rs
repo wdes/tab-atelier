@@ -579,3 +579,163 @@ mod ui_tests {
         found
     }
 }
+
+#[cfg(test)]
+mod packaging_tests {
+    use std::path::{Path, PathBuf};
+
+    use super::distro_asset;
+
+    /// The repository's own `assets/`, which is what the package installs.
+    fn repo_assets() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("assets")
+    }
+
+    /// The crate manifest, which is where the `.deb` asset list lives.
+    fn manifest() -> String {
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml")).expect("the manifest")
+    }
+
+    /// Every path `index.html` pulls in from this origin.
+    ///
+    /// `<script src=…>` and `<link … href=…>` are the two ways this page reaches
+    /// for another file. Anything with a scheme, or a bare `#`, is skipped: a
+    /// URL to somewhere else is not ours to ship, and an anchor is not a file.
+    fn referenced(html: &str) -> Vec<String> {
+        let mut found = Vec::new();
+        for key in ["src=\"", "href=\""] {
+            for (at, _) in html.match_indices(key) {
+                let rest = &html[at + key.len()..];
+                let Some((path, _)) = rest.split_once('"') else {
+                    continue;
+                };
+                if !path.starts_with('#') && !path.contains("://") {
+                    found.push(path.to_owned());
+                }
+            }
+        }
+        found.sort();
+        found.dedup();
+        found
+    }
+
+    /// The `assets/…` paths the `.deb` is told to install.
+    ///
+    /// Read line by line to the closing bracket, rather than by taking
+    /// everything after `assets = [` up to the next `]`: each entry is itself a
+    /// bracketed array, so the first `]` belongs to the first entry. Splitting
+    /// there sees one asset and silently ignores the rest, which is a check that
+    /// passes while testing almost nothing.
+    fn packaged(manifest: &str) -> Vec<String> {
+        let mut found = Vec::new();
+        let mut inside = false;
+        for line in manifest.lines() {
+            let trimmed = line.trim();
+            if !inside {
+                inside = trimmed.starts_with("assets = [");
+                continue;
+            }
+            if trimmed == "]" {
+                break;
+            }
+            if let Some(at) = trimmed.find("\"assets/") {
+                let rest = &trimmed[at + 1..];
+                if let Some((path, _)) = rest.split_once('"') {
+                    found.push(path.to_owned());
+                }
+            }
+        }
+        assert!(
+            inside,
+            "no `assets = [` in Cargo.toml — has the packaging layout changed?"
+        );
+        found
+    }
+
+    /// Everything the page references is a file the package will actually have.
+    ///
+    /// The failure this pins, which reached a deployed host: `index.html` gained
+    /// `<script src="api.js">` and the `.deb` asset list did not, so the package
+    /// installed a page whose HTTP client was absent. Every page load 404'd on
+    /// it and the dashboard was blank — a total failure of the only UI there is,
+    /// from a one-line omission that nothing checked.
+    ///
+    /// A reference is satisfied either by our own tree, in which case the
+    /// package must list it, or by `distro_asset`, which resolves to the
+    /// distribution's copy. Asking that function rather than repeating its table
+    /// is deliberate: a mapping added there is covered here with nobody having
+    /// to remember this test exists.
+    #[test]
+    fn every_asset_the_page_references_is_one_the_package_ships() {
+        let root = repo_assets();
+        let html = std::fs::read_to_string(root.join("index.html")).expect("the committed UI");
+        let manifest = manifest();
+        let packaged = packaged(&manifest);
+        let refs = referenced(&html);
+        assert!(
+            refs.len() >= 4,
+            "only {} references found in index.html — the scan has stopped working, so this \
+             test would pass for the wrong reason: {refs:?}",
+            refs.len()
+        );
+
+        for rel in refs {
+            if let Some(from_distro) = distro_asset(&rel) {
+                assert!(
+                    from_distro.starts_with('/'),
+                    "{rel} resolves to {from_distro:?}, which is not an absolute path"
+                );
+                continue;
+            }
+            assert!(
+                root.join(&rel).exists(),
+                "index.html references {rel}, which is not in assets/ and not served by the \
+                 distribution — the page will 404 on it"
+            );
+            assert!(
+                packaged.iter().any(|p| p == &format!("assets/{rel}")),
+                "index.html references {rel} and assets/{rel} exists, but the .deb asset list \
+                 in Cargo.toml does not include it — the package would install a page whose \
+                 {rel} is missing. Add:\n    \
+                 [\"assets/{rel}\", \"/usr/share/tab-atelier-proxy/web/\", \"644\"],"
+            );
+        }
+    }
+
+    /// And the other direction: nothing shipped is left unreferenced by accident.
+    ///
+    /// Weaker than the check above and kept deliberately narrow — it only asks
+    /// that every path the package installs is a file that exists, so a rename
+    /// in one place cannot leave a `.deb` build failing at package time with a
+    /// message about a missing source file.
+    #[test]
+    fn nothing_the_package_installs_is_missing_from_the_tree() {
+        let root = repo_assets();
+        let manifest = manifest();
+
+        for path in packaged(&manifest) {
+            let rel = path.strip_prefix("assets/").expect("all entries are under assets/");
+            assert!(root.join(rel).exists(), "Cargo.toml ships {path}, which does not exist");
+        }
+    }
+
+    #[test]
+    fn the_asset_scans_are_not_vacuous() {
+        // Both parsers are textual, so a change to the markup or the manifest
+        // would silently make them find nothing — and a check over an empty list
+        // passes. This pins that they still see what is there.
+        assert_eq!(
+            packaged(
+                "assets = [\n    [\"assets/a\", \"/y\", \"644\"],\n    \
+                 [\"assets/b\", \"/y\", \"644\"],\n]"
+            ),
+            vec!["assets/a".to_owned(), "assets/b".to_owned()],
+            "both entries, not just the first"
+        );
+        assert_eq!(
+            referenced("<script src=\"a.js\"></script><a href=\"#\">x</a><a href=\"https://e/x\">y</a>"),
+            vec!["a.js".to_owned()],
+            "scheme URLs and anchors are not files to ship"
+        );
+    }
+}

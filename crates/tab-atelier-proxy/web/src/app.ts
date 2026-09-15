@@ -748,18 +748,26 @@ const AdminApp = Vue.defineComponent({
       // Parsed here rather than sent as a string for the server to parse:
       // a syntax error in a text box is the typist's, and `JSON.parse` can say
       // where it is. What the server gets is the stored shape.
-      let added: unknown[] = [];
+      // `JsonObject[]`, not `unknown[]`: a tool definition is a JSON object —
+      // name, description, input schema — so the object form is both the
+      // accurate type and the one that keeps `JsonValue`'s recursion out of
+      // Vue's inferred `this`, which is where it blew up as TS2589. The one
+      // `any` involved is `JSON.parse`'s return type, and it is contained to
+      // the assignment below: from there the value is narrowed before use.
+      let added: JsonObject[] = [];
       if (t.add.trim()) {
+        let parsed: JsonObject[];
         try {
-          added = JSON.parse(t.add) as unknown[];
+          parsed = JSON.parse(t.add);
         } catch (e) {
           this.error = `that is not valid JSON: ${e instanceof Error ? e.message : e}`;
           return Promise.resolve();
         }
-        if (!Array.isArray(added)) {
+        if (!Array.isArray(parsed)) {
           this.error = "the added tools must be a JSON array of definitions";
           return Promise.resolve();
         }
+        added = parsed;
       }
       let rewrite: Record<string, RewriteRule[]>;
       try {
@@ -1061,7 +1069,10 @@ const AdminApp = Vue.defineComponent({
       if (!total || active.length < 2) return "all of it when alone";
       return `≈${Math.round(((u.weight || 1) / total) * 100)}% when all busy`;
     },
-    setWeight(u: ApiUser, value: unknown) {
+    // The value arrives from a `<select>`'s `$event.target.value`, which is a
+    // string whatever the option's `:value` was bound to — so `string` is what
+    // this actually receives, and the coercion below is not redundant.
+    setWeight(u: ApiUser, value: string) {
       const weight = Math.max(1, Math.min(100, Number(value) || 1));
       return this.act(() => api.users.setWeight(u.id, weight));
     },
@@ -1119,7 +1130,11 @@ const AdminApp = Vue.defineComponent({
     // Every mutation funnels through here so a failure always lands in the
     // banner instead of the console, and the list can never drift from the
     // server's state after a partial success.
-    async act(fn: () => Promise<unknown>) {
+    // Generic, so the caller's own return type is what is checked: the result
+    // is discarded here, but naming it `unknown` would have meant every call
+    // site converting its real type to `unknown` first, which is where the
+    // `any` creeps back in.
+    async act<T>(fn: () => Promise<T>) {
       this.busy = true;
       this.error = "";
       try {

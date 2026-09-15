@@ -110,13 +110,21 @@ mod tests {
 
     #[test]
     fn a_problem_names_the_error_and_nothing_else() {
-        let body = serde_json::to_value(ProblemResource::of("no such user")).expect("serializes");
-        assert_eq!(body, serde_json::json!({ "error": "no such user" }));
+        // Compared as the exact bytes that go on the wire, not as a parsed
+        // value: a `serde_json::Value` comparison ignores key order and would
+        // pass for a body with the fields in a different order than the one
+        // every client is written against.
+        assert_eq!(
+            serde_json::to_string(&ProblemResource::of("no such user")).expect("serializes"),
+            r#"{"error":"no such user"}"#
+        );
     }
 
     #[test]
     fn an_acknowledgement_says_ok() {
-        let body = serde_json::to_value(OkResource::yes()).expect("serializes");
-        assert_eq!(body, serde_json::json!({ "ok": true }));
+        assert_eq!(
+            serde_json::to_string(&OkResource::yes()).expect("serializes"),
+            r#"{"ok":true}"#
+        );
     }
 }
