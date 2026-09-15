@@ -40,9 +40,15 @@ pub(crate) fn me_usage(state: &Arc<State>, who: &Account, window: Option<&str>) 
         .and_then(|w| resources::path_window(&format!("window={w}")))
         .unwrap_or(usage::Window::Hours(24 * 7))
         .span(now);
+    // Resolved and released before the usage lock is taken: `who` is a borrow
+    // from the guard, so this cannot race a settings write for this account.
+    let rate = {
+        let registry = state.registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        registry.billing_price(who.provider.as_deref(), who.model.as_deref())
+    };
     let usage = {
         let u = state.usage.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        resources::UsageResource::of(&u, &who.id, span, now)
+        resources::UsageResource::of(&u, &who.id, span, now, rate.as_ref())
     };
     json_of(
         200,

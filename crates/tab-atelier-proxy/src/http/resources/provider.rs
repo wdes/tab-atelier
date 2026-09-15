@@ -26,6 +26,13 @@ pub(crate) struct ModelResource {
     pub class: provider::Class,
     pub relative_cost: u32,
     pub cost_now: u32,
+    /// What it costs, per 1M tokens, off peak.
+    ///
+    /// Sent beside `relative_cost` because the two answer different questions:
+    /// `relative_cost` orders the hops for routing, this says what the bill
+    /// will say. `None` where no figure is published — most hops — which the
+    /// panel shows as unknown rather than as free.
+    pub price: Option<provider::Price>,
     pub deprecated: bool,
     pub note: Option<String>,
 }
@@ -86,6 +93,7 @@ fn model_resource(p: &Provider, m: &provider::Model, now: u64) -> ModelResource 
         class: m.class,
         relative_cost: m.relative_cost,
         cost_now: p.cost_at(m, now),
+        price: m.price,
         deprecated: m.deprecated,
         note: m.note.clone(),
     }

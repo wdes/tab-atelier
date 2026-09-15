@@ -138,6 +138,14 @@ interface UsageWindow {
     calls: number;
     errors: number;
     tokens: TokenTotals;
+    /**
+     * What `tokens` cost, or `null` when the hop is unpriced.
+     *
+     * Priced at base rates, never at a peak, so the same window reads the same
+     * figure whenever it is fetched. The chart is where peak is charged, because
+     * the chart is the only surface that knows which hour a token was spent in.
+     */
+    cost: UsageCost | null;
 }
 
 /** One hour of one account's usage. */
@@ -149,6 +157,31 @@ interface UsageBucket {
     output: number;
     cache_read: number;
     cache_write: number;
+    /**
+     * The same hour in micro-USD, split the way it is billed.
+     *
+     * Present only when the server could price the account. Absent is NOT zero:
+     * it means no rate was known, and the money unit says so rather than
+     * plotting a confident $0.00. `null`, not a missing key, so that a caller
+     * has to handle the unpriced case instead of defaulting past it.
+     *
+     * In and out are split because they are priced differently, and the split
+     * is what makes the two panels of the token chart independent — a single
+     * total would force the input panel to know about output tokens, and the
+     * input panel is the one that has to fold `cache_read` in at its own rate.
+     *
+     * Optional because this shape is also the calls chart's, and a calls line
+     * has no cost to carry. The tokens chart is the only reader, and it is only
+     * ever in `usd` mode for an account the server reported a rate for.
+     */
+    cost_in_micro?: number | null;
+    cost_out_micro?: number | null;
+}
+
+/** What one span's tokens cost, in micro-USD. See `UsageBucket`'s split. */
+interface UsageCost {
+    in_micro: number;
+    out_micro: number;
 }
 
 /**
@@ -173,6 +206,15 @@ interface AccountUsage {
     last_7d: UsageWindow;
     all_time: UsageWindow;
     series_hourly: UsageBucket[];
+    /**
+     * The model these figures were priced at, or `null` when nothing could be.
+     *
+     * `null` rather than a default rate because the two mean opposite things: an
+     * unpriced account contributes *nothing* to a money total, and drawing that
+     * as `$0` would understate the bill invisibly. The UI counts these and says
+     * so beside the figure.
+     */
+    cost_model: string | null;
     /**
      * The requested window, as the server resolved it.
      *
@@ -408,8 +450,18 @@ interface ProviderModel {
     class: string;
     relative_cost: number;
     cost_now: number;
+    /** Published rates, micro-USD per 1M tokens, off peak. Absent where none
+     * are published, which the panel shows as unknown rather than free. */
+    price?: ModelPrice | null;
     deprecated: boolean;
     note?: string;
+}
+
+/** A model's three rates, in micro-USD per 1M tokens. */
+interface ModelPrice {
+    cache_hit: number;
+    input: number;
+    output: number;
 }
 
 /**
@@ -665,6 +717,12 @@ interface Window {
         unitSuffix: (max: number, unit: string) => string;
         /** The estimate's citation and caveat, shown beside converted figures. */
         energyNote: () => string;
+        /** The price model's caveat, shown beside money figures. */
+        moneyNote: () => string;
+        /** Micro-USD as dollars: `25900000` renders as `$25.90`. */
+        fmtMoney: (micro: number) => string;
+        /** The largest drawn value across these buckets, in `unit`. */
+        chartTop: (buckets: UsageBucket[], unit: string) => number;
     };
     /**
      * The HTTP client, from api.ts.

@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 
 use serde::Serialize;
 
+use crate::provider;
 use crate::usage;
 
 /// A window's tokens, flattened beside its call counts.
@@ -47,6 +48,44 @@ impl From<&usage::Tokens> for TokenResource {
     }
 }
 
+/// What a batch of tokens cost, in micro-USD.
+///
+/// Split the way the chart is drawn. The two panels are priced at different
+/// rates — 50:1 between a cache read and a miss on Flash — so one combined
+/// total could not be put back onto them, and a figure that cannot be drawn
+/// where it belongs is a figure nobody can check.
+///
+/// Micro-USD rather than a float: this is a sum of many small per-request
+/// costs, and binary floating point accumulates the error in the direction
+/// nobody looks. Shown as dollars only at the last moment, by the UI.
+#[derive(Serialize)]
+pub(crate) struct CostResource {
+    /// Cache reads and misses, each at its own published rate, plus cache
+    /// writes at the miss rate — a write is a first read that pays full price.
+    pub in_micro: i128,
+    /// Everything the model generated.
+    pub out_micro: i128,
+}
+
+impl CostResource {
+    /// Price one batch of tokens, or `None` when the hop publishes no rates.
+    ///
+    /// `None` rather than zeroes: a flat-rate subscription costs real money
+    /// that these token counts do not measure, and rendering that as `$0.00`
+    /// would be a different claim from "unpriced".
+    ///
+    /// Takes an already-resolved `price` rather than a rate and an instant, so
+    /// that the peak question is answered at the call site where it can be
+    /// explained. The two callers answer it differently, and deliberately — see
+    /// `WindowResource::of` and `BucketResource::of`.
+    fn of(t: &usage::Tokens, price: Option<provider::Price>) -> Option<Self> {
+        let price = price?;
+        let cache_read = t.cache_read.saturating_add(t.cache_write);
+        let (in_micro, out_micro) = price.split_micro(cache_read, t.input, t.output);
+        Some(Self { in_micro, out_micro })
+    }
+}
+
 /// Calls and tokens over one span.
 #[derive(Serialize)]
 pub(crate) struct WindowResource {
@@ -57,15 +96,25 @@ pub(crate) struct WindowResource {
     /// read as a spike of usage.
     pub errors: u64,
     pub tokens: TokenResource,
+    /// What `tokens` cost, or `None` when the hop is unpriced.
+    pub cost: Option<CostResource>,
 }
 
 impl WindowResource {
-    fn of(u: &usage::Store, id: &str, window: usage::Window, now: u64) -> Self {
-        let (calls, errors, tokens) = u.totals(id, window.span(now));
+    fn of(u: &usage::Store, id: &str, window: usage::Window, now: u64, rate: Option<&provider::Rate>) -> Self {
+        let span = window.span(now);
+        let (calls, errors, tokens) = u.totals(id, span);
         Self {
             calls,
             errors,
             tokens: TokenResource::from(&tokens),
+            // Base rates, *not* `rate.at(span.last)`. A window total priced at
+            // its final instant would make the same seven days of history read
+            // double or half depending on what time of day you happened to
+            // refresh — a money figure that moves while the data does not is
+            // worse than one that is uniformly off-peak. The chart, which knows
+            // each hour, is the surface that charges peak exactly.
+            cost: CostResource::of(&tokens, rate.map(|r| r.price)),
         }
     }
 }
@@ -84,10 +133,23 @@ pub(crate) struct BucketResource {
     pub output: u64,
     pub cache_read: u64,
     pub cache_write: u64,
+    /// This hour's cost, split as the chart draws it.
+    ///
+    /// `None` on an unpriced hop, never `0`: the money unit hides itself rather
+    /// than plotting an hour that looks free. `Option` rather than a flag plus
+    /// zeroes, so a caller cannot read the number without having handled the
+    /// absent case.
+    pub cost_in_micro: Option<i128>,
+    pub cost_out_micro: Option<i128>,
 }
 
-impl From<&usage::Bucket> for BucketResource {
-    fn from(b: &usage::Bucket) -> Self {
+impl BucketResource {
+    /// `hour` doubles as the pricing instant, so a peak hour is charged at peak
+    /// without the chart having to know the schedule.
+    fn of(b: &usage::Bucket, rate: Option<&provider::Rate>) -> Self {
+        // `b.hour` is the pricing instant, so an hour billed at peak is priced
+        // at peak and the hours either side of a boundary are not.
+        let cost = CostResource::of(&b.tokens, rate.map(|r| r.at(b.hour)));
         Self {
             hour: b.hour,
             calls: b.calls,
@@ -96,6 +158,8 @@ impl From<&usage::Bucket> for BucketResource {
             output: b.tokens.output,
             cache_read: b.tokens.cache_read,
             cache_write: b.tokens.cache_write,
+            cost_in_micro: cost.as_ref().map(|c| c.in_micro),
+            cost_out_micro: cost.as_ref().map(|c| c.out_micro),
         }
     }
 }
@@ -126,24 +190,36 @@ pub(crate) struct UsageResource {
     /// Dense hourly buckets, oldest first, ending at the current hour.
     pub series_hourly: Vec<BucketResource>,
     pub retained_hours: u64,
+    /// The model whose published rates the money figures used, or `None` when
+    /// this account's hop has no published rate at all.
+    ///
+    /// The client decides whether to offer the money unit off this field, and
+    /// shows the name beside the figure. It is a model rather than a provider
+    /// because the rates are per model, and it names one model for the whole
+    /// account because a usage bucket records tokens, not which model among
+    /// several earned them. Exact for the traffic here — each account reaches
+    /// one model — and an approximation worth stating if that stops holding.
+    pub cost_model: Option<String>,
 }
 
 /// Render one account's usage.
 ///
 /// `now` is passed rather than read here, so the requested window and the two
-/// fixed ones are resolved from one reading of the clock.
+/// fixed ones are resolved from one reading of the clock. `rate` is explicit
+/// for the same reason: the caller holds the registry lock, and resolving it
+/// here would mean taking one.
 impl UsageResource {
     #[must_use]
-    pub(crate) fn of(u: &usage::Store, id: &str, span: usage::Span, now: u64) -> Self {
+    pub(crate) fn of(u: &usage::Store, id: &str, span: usage::Span, now: u64, rate: Option<&provider::Rate>) -> Self {
         Self {
             window: SpanResource {
                 start: crate::now_rfc3339_at(span.first),
                 end: crate::now_rfc3339_at(span.last),
                 hours: span.hours(),
             },
-            all_time: WindowResource::of(u, id, usage::Window::All, now),
-            last_24h: WindowResource::of(u, id, usage::Window::Hours(24), now),
-            last_7d: WindowResource::of(u, id, usage::Window::Hours(24 * 7), now),
+            all_time: WindowResource::of(u, id, usage::Window::All, now, rate),
+            last_24h: WindowResource::of(u, id, usage::Window::Hours(24), now, rate),
+            last_7d: WindowResource::of(u, id, usage::Window::Hours(24 * 7), now, rate),
             by_model: u
                 .for_account(id)
                 .map(|a| {
@@ -153,8 +229,9 @@ impl UsageResource {
                         .collect()
                 })
                 .unwrap_or_default(),
-            series_hourly: u.series(id, span).iter().map(BucketResource::from).collect(),
+            series_hourly: u.series(id, span).iter().map(|b| BucketResource::of(b, rate)).collect(),
             retained_hours: usage::RETAIN_HOURS,
+            cost_model: rate.map(|r| r.model.clone()),
         }
     }
 }
@@ -327,7 +404,7 @@ mod tests {
         // where a zero is the truth.
         let u = store("empty");
         let (span, now) = day();
-        let r = UsageResource::of(&u, "nobody", span, now);
+        let r = UsageResource::of(&u, "nobody", span, now, None);
 
         assert_eq!(r.last_24h.calls, 0);
         assert_eq!(r.last_24h.tokens.total, 0);
@@ -342,7 +419,7 @@ mod tests {
         u.record("acct", Some("claude-sonnet-4"), tokens(10, 20), true);
 
         let (span, now) = day();
-        let r = UsageResource::of(&u, "acct", span, now);
+        let r = UsageResource::of(&u, "acct", span, now, None);
 
         assert_eq!(r.last_24h.calls, 1);
         assert_eq!(r.last_24h.tokens.input, 10);
@@ -359,7 +436,7 @@ mod tests {
         u.record("acct", Some("m"), tokens(0, 0), false);
 
         let (span, now) = day();
-        let r = UsageResource::of(&u, "acct", span, now);
+        let r = UsageResource::of(&u, "acct", span, now, None);
 
         assert_eq!(r.last_24h.calls, 1);
         assert_eq!(r.last_24h.errors, 1);
@@ -376,7 +453,7 @@ mod tests {
         u.record("acct", Some("claude-haiku-4"), tokens(3, 4), true);
 
         let (span, now) = day();
-        let r = UsageResource::of(&u, "acct", span, now);
+        let r = UsageResource::of(&u, "acct", span, now, None);
 
         assert!(r.by_model.contains_key("claude-opus-4"), "{:?}", r.by_model.keys());
         assert!(r.by_model.contains_key("claude-haiku-4"));
@@ -392,7 +469,7 @@ mod tests {
         u.record("acct", None, tokens(5, 5), true);
 
         let (span, now) = day();
-        let r = UsageResource::of(&u, "acct", span, now);
+        let r = UsageResource::of(&u, "acct", span, now, None);
         assert_eq!(r.last_24h.tokens.total, 10);
     }
 
@@ -405,7 +482,7 @@ mod tests {
         u.record("theirs", Some("m"), tokens(99, 0), true);
 
         let (span, now) = day();
-        let r = UsageResource::of(&u, "mine", span, now);
+        let r = UsageResource::of(&u, "mine", span, now, None);
         assert_eq!(r.last_24h.tokens.total, 10);
     }
 
@@ -417,7 +494,7 @@ mod tests {
         u.record("acct", Some("m"), tokens(9, 1), true);
 
         let (span, now) = day();
-        let r = UsageResource::of(&u, "acct", span, now);
+        let r = UsageResource::of(&u, "acct", span, now, None);
 
         assert_eq!(r.last_24h.calls, 1);
         assert_eq!(r.last_7d.calls, 1, "a day is inside a week");
@@ -437,7 +514,7 @@ mod tests {
             first: now - 3600,
             last: now,
         };
-        let r = UsageResource::of(&u, "acct", span, now);
+        let r = UsageResource::of(&u, "acct", span, now, None);
 
         assert_eq!(r.window.start, crate::now_rfc3339_at(span.first));
         assert_eq!(r.window.end, crate::now_rfc3339_at(span.last));
@@ -454,7 +531,7 @@ mod tests {
             first: now - 6 * 3600,
             last: now,
         };
-        let r = UsageResource::of(&u, "acct", span, now);
+        let r = UsageResource::of(&u, "acct", span, now, None);
         assert_eq!(
             r.series_hourly.len(),
             7,
@@ -468,7 +545,7 @@ mod tests {
         // compute that without both numbers.
         let u = store("retention");
         let (span, now) = day();
-        let r = UsageResource::of(&u, "acct", span, now);
+        let r = UsageResource::of(&u, "acct", span, now, None);
         assert_eq!(r.retained_hours, usage::RETAIN_HOURS);
     }
 
@@ -484,12 +561,153 @@ mod tests {
             tokens: tokens(6, 9),
             by_model: std::collections::BTreeMap::new(),
         };
-        let r = BucketResource::from(&bucket);
+        let r = BucketResource::of(&bucket, None);
         assert_eq!(r.hour, 1_700_000_000);
         assert_eq!(r.calls, 3);
         assert_eq!(r.errors, 1);
         assert_eq!(r.input, 6);
         assert_eq!(r.output, 9);
+        // No rate was supplied, so the hour is unpriced rather than free. The
+        // absence is the signal — `0` would be a different claim, and one the
+        // money unit would happily plot.
+        assert!(r.cost_in_micro.is_none());
+        assert!(r.cost_out_micro.is_none());
+    }
+
+    #[test]
+    fn a_priced_bucket_splits_by_what_each_class_costs() {
+        // The two halves must not come out equal for a batch that is not equal:
+        // an implementation that priced everything at one rate would pass a
+        // test written with symmetric tokens and fail this one.
+        let bucket = usage::Bucket {
+            hour: 1_700_000_000,
+            calls: 1,
+            errors: 0,
+            tokens: usage::Tokens {
+                input: 1_000_000,
+                output: 1_000_000,
+                ..tokens(0, 0)
+            },
+            by_model: std::collections::BTreeMap::new(),
+        };
+        let rate = flat_rate(3_000, 150_000, 600_000);
+        let r = BucketResource::of(&bucket, Some(&rate));
+        // Off-peak: 1M misses at $0.15 and 1M out at $0.60, in micro-USD.
+        assert_eq!(r.cost_in_micro, Some(150_000));
+        assert_eq!(r.cost_out_micro, Some(600_000));
+    }
+
+    #[test]
+    fn a_peak_hour_is_priced_at_peak() {
+        // The provider's real schedule, so the test moves if the schedule does:
+        // 200% Mon-Fri, 01:00-04:00 and 06:00-10:00 UTC. All of these are
+        // Monday 2026-09-14, so the weekday arm is exercised rather than
+        // assumed — and 10:00 pins the half-open boundary, which is the
+        // off-by-one an implementation is most likely to ship.
+        let rate = rate_with_peak();
+        assert_eq!(
+            cost_at_utc(&rate, 2026, 9, 14, 5, 0),
+            Some(150_000),
+            "Mon 05:00Z is off-peak"
+        );
+        assert_eq!(
+            cost_at_utc(&rate, 2026, 9, 14, 6, 0),
+            Some(300_000),
+            "Mon 06:00Z opens the peak"
+        );
+        assert_eq!(
+            cost_at_utc(&rate, 2026, 9, 14, 7, 0),
+            Some(300_000),
+            "Mon 07:00Z is doubled"
+        );
+        assert_eq!(
+            cost_at_utc(&rate, 2026, 9, 14, 9, 59),
+            Some(300_000),
+            "Mon 09:59Z is the last doubled minute"
+        );
+        assert_eq!(
+            cost_at_utc(&rate, 2026, 9, 14, 10, 0),
+            Some(150_000),
+            "Mon 10:00Z is off-peak again"
+        );
+    }
+
+    #[test]
+    fn a_weekend_hour_is_never_peak() {
+        // The same clock hour, a day earlier. If the weekday arm were dropped
+        // from the window these two would match, so this is what says the
+        // window is "weekday" and not merely "these hours".
+        let rate = rate_with_peak();
+        assert_eq!(
+            cost_at_utc(&rate, 2026, 9, 14, 7, 0),
+            Some(300_000),
+            "Mon 2026-09-14 07:00Z"
+        );
+        assert_eq!(
+            cost_at_utc(&rate, 2026, 9, 13, 7, 0),
+            Some(150_000),
+            "Sun 2026-09-13 07:00Z, same clock hour"
+        );
+    }
+
+    /// What 1M miss-priced tokens at the given UTC instant cost, in micro-USD.
+    ///
+    /// Addressed by calendar date rather than by epoch second on purpose: a
+    /// hand-computed epoch is unreviewable, and one that is silently a day out
+    /// still passes unless the reader re-derives it.
+    fn cost_at_utc(rate: &provider::Rate, y: i16, m: i8, d: i8, h: i8, min: i8) -> Option<i128> {
+        let hour = jiff::civil::date(y, m, d)
+            .at(h, min, 0, 0)
+            .to_zoned(jiff::tz::TimeZone::UTC)
+            .expect("UTC resolves every civil time")
+            .timestamp()
+            .as_second();
+        let bucket = usage::Bucket {
+            hour: u64::try_from(hour).expect("after the epoch"),
+            calls: 1,
+            errors: 0,
+            tokens: usage::Tokens {
+                input: 1_000_000,
+                ..tokens(0, 0)
+            },
+            by_model: std::collections::BTreeMap::new(),
+        };
+        BucketResource::of(&bucket, Some(rate)).cost_in_micro
+    }
+
+    /// A rate with the given published prices and no peak schedule.
+    fn flat_rate(cache_hit: u32, input: u32, output: u32) -> provider::Rate {
+        provider::Rate {
+            price: provider::Price {
+                cache_hit,
+                input,
+                output,
+            },
+            peak: None,
+            model: "test-model".to_owned(),
+        }
+    }
+
+    /// `DeepSeek` Flash's off-peak rates with its real peak windows.
+    fn rate_with_peak() -> provider::Rate {
+        provider::Rate {
+            peak: Some(provider::Peak {
+                multiplier_percent: 200,
+                windows: vec![
+                    provider::PeakWindow {
+                        weekdays: vec![1, 2, 3, 4, 5],
+                        start_hour: 1,
+                        end_hour: 4,
+                    },
+                    provider::PeakWindow {
+                        weekdays: vec![1, 2, 3, 4, 5],
+                        start_hour: 6,
+                        end_hour: 10,
+                    },
+                ],
+            }),
+            ..flat_rate(3_000, 150_000, 600_000)
+        }
     }
 
     #[test]
@@ -498,6 +716,7 @@ mod tests {
             calls: 2,
             errors: 0,
             tokens: TokenResource::from(&tokens(1, 2)),
+            cost: None,
         };
         assert_eq!(w.calls, 2);
         assert_eq!(w.tokens.total, 3);
@@ -517,7 +736,7 @@ mod tests {
 
         let u = store("row");
         let (span, now) = day();
-        let usage = UsageResource::of(&u, "acct", span, now);
+        let usage = UsageResource::of(&u, "acct", span, now, None);
         let row = UserUsageResource {
             user: crate::http::resources::account::AccountResource::from(&account),
             usage,
@@ -541,7 +760,7 @@ mod tests {
                 name: "Ada".to_owned(),
                 email: "ada@example.com".to_owned(),
             },
-            usage: UsageResource::of(&u, "acct", span, now),
+            usage: UsageResource::of(&u, "acct", span, now, None),
         };
         let value: serde_json::Value = serde_json::to_value(&me).expect("serialize");
 
@@ -568,6 +787,6 @@ mod tests {
         assert_eq!(report.window, "7d");
         assert_eq!(report.hours, 24 * 7);
         assert_eq!(report.users.len(), 0, "an installation with no accounts says so");
-        let _ = UsageResource::of(&u, "acct", span, now);
+        let _ = UsageResource::of(&u, "acct", span, now, None);
     }
 }

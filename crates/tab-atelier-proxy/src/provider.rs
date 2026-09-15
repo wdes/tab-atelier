@@ -192,6 +192,122 @@ impl Auth {
     }
 }
 
+/// What a model costs, in micro-USD per 1M tokens.
+///
+/// Micro-USD because the figures are small enough that whole dollars lose
+/// them: `deepseek-flash` caches at $0.003/1M, so a busy hour is a fraction of
+/// a cent and an integer of dollars would round a day's spend to zero.
+///
+/// **Indicative, and deliberately separate from [`Model::relative_cost`].**
+/// Routing needs an ordering, which stays true for years; a bill needs an
+/// absolute figure, which provably does not — that is why `relative_cost`
+/// refuses to carry one and keeps its published rates in the comment on the
+/// [`Preset::Deepseek`] arm below. This is the other half of that split: it
+/// exists so an operator can see roughly what a conversation cost, and no
+/// routing decision ever reads it.
+///
+/// **A missing price is not a zero price.** Only models whose rates are
+/// actually recorded get one; see [`Registry::billing_price`] on what that
+/// means for the ones that do not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Price {
+    /// Cached input, per 1M tokens.
+    pub cache_hit: u32,
+    /// Uncached input, per 1M tokens.
+    ///
+    /// On this scale it usually equals `relative_cost * 10_000`, because that
+    /// is cents-per-million against micro-USD-per-million. The two are not
+    /// tied together in code — a rate that moves must be edited in both places,
+    /// and the cross-check test says so — but they have the same source.
+    pub input: u32,
+    /// Generated tokens, per 1M.
+    pub output: u32,
+}
+
+impl Price {
+    /// The same rates at a peak multiplier, rounded down.
+    ///
+    /// Mirrors [`Provider::cost_at`], which scales `relative_cost` identically.
+    /// Rounding down rather than to-nearest so a doubled rate cannot land a
+    /// micro-USD above the figure the provider publishes.
+    #[must_use]
+    const fn scaled(self, percent: u32) -> Self {
+        Self {
+            cache_hit: self.cache_hit.saturating_mul(percent) / 100,
+            input: self.input.saturating_mul(percent) / 100,
+            output: self.output.saturating_mul(percent) / 100,
+        }
+    }
+
+    /// What a mixed batch of tokens costs, in micro-USD.
+    ///
+    /// The three classes are arguments rather than one total on purpose: they
+    /// are priced differently — 50x apart on Flash — so a caller that summed
+    /// them first would already have lost the answer. `i128` accumulator, like
+    /// the rest of the money arithmetic here, because a busy window times a
+    /// doubled peak rate overflows `i64` well before it stops being plausible.
+    #[must_use]
+    pub fn cost_micro(&self, cache_read: u64, input: u64, output: u64) -> i128 {
+        let (input_side, output_side) = self.split_micro(cache_read, input, output);
+        input_side + output_side
+    }
+
+    /// The same cost, kept in the two halves the charts draw.
+    ///
+    /// Defined once and summed by [`Self::cost_micro`] rather than written
+    /// twice: the chart's two panels and the totals tile must agree, and the
+    /// way to guarantee that is for the total to be the sum of the parts
+    /// rather than a second calculation that is expected to match.
+    #[must_use]
+    pub fn split_micro(&self, cache_read: u64, input: u64, output: u64) -> (i128, i128) {
+        let hit = i128::from(self.cache_hit) * i128::from(cache_read);
+        let miss = i128::from(self.input) * i128::from(input);
+        let out = i128::from(self.output) * i128::from(output);
+        ((hit + miss) / 1_000_000, out / 1_000_000)
+    }
+}
+
+/// A rate with a provider's peak multiplier applied when it is in force.
+///
+/// One implementation, used by both the routing-facing [`Provider::cost_at`]
+/// and the billing-facing [`Rate::at`], so a change to how peak is decided
+/// cannot land in one and miss the other.
+fn price_with_peak(price: Price, peak: Option<&Peak>, unix_secs: u64) -> Price {
+    match peak {
+        Some(p) if p.active_at(unix_secs) => price.scaled(p.multiplier_percent),
+        _ => price,
+    }
+}
+
+/// What an account's tokens cost, and the rate that answer came from.
+///
+/// Owned rather than borrowed because the registry is behind a lock: a borrow
+/// cannot outlive the guard, and the aggregation spending this runs long after
+/// it is released.
+///
+/// [`Self::price`] is deliberately the **off-peak** rate. Peak is applied per
+/// hour by [`Self::at`], never here, so that an hour billed at double is priced
+/// at double and the hours around it are not — pricing a whole window from one
+/// reading of the clock would get both halves wrong on either side of a
+/// boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rate {
+    /// Published rates per 1M tokens, in micro-USD, off-peak.
+    pub price: Price,
+    /// The provider's peak schedule, if it has one.
+    pub peak: Option<Peak>,
+    /// The model these rates belong to, for the UI's provenance note.
+    pub model: String,
+}
+
+impl Rate {
+    /// This rate at an instant, peak included.
+    #[must_use]
+    pub fn at(&self, unix_secs: u64) -> Price {
+        price_with_peak(self.price, self.peak.as_ref(), unix_secs)
+    }
+}
+
 /// One model a provider serves.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Model {
@@ -204,6 +320,15 @@ pub struct Model {
     /// and that is stable.
     #[serde(default = "one")]
     pub relative_cost: u32,
+    /// What this costs, when the rates are known. See [`Price`].
+    ///
+    /// Absent for most models, and deliberately so. The subscription hop has no
+    /// per-token price to state — it is a flat plan, and a metered figure for
+    /// it would invent a marginal cost that does not exist — and no other hop's
+    /// published rates are recorded in this repository yet. `None` means "show
+    /// no figure", never "costs nothing".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price: Option<Price>,
     /// Withdrawn or about to be. Routing skips it; the UI shows why.
     ///
     /// A deprecated model is worse than a missing one, because it still
@@ -230,8 +355,26 @@ impl Model {
             id: id.to_owned(),
             class,
             relative_cost,
+            price: None,
             deprecated: false,
             note: None,
+        }
+    }
+
+    /// The same model, with what it costs where those rates are known.
+    ///
+    /// Chained onto [`Self::new`] rather than added as arguments, so that the
+    /// many models with no recorded rates keep the short constructor and
+    /// nothing has to pass a placeholder to say "unknown".
+    #[must_use]
+    pub fn priced(self, cache_hit: u32, input: u32, output: u32) -> Self {
+        Self {
+            price: Some(Price {
+                cache_hit,
+                input,
+                output,
+            }),
+            ..self
         }
     }
 
@@ -355,6 +498,18 @@ impl Provider {
     #[must_use]
     pub fn serves(&self, model_id: &str) -> Option<&Model> {
         self.models.iter().find(|m| m.id == model_id && !m.deprecated)
+    }
+
+    /// What this model's tokens cost right now, in micro-USD per 1M.
+    ///
+    /// The same peak test [`Self::cost_at`] applies to `relative_cost`, applied
+    /// to the published rates. Two functions rather than one because they
+    /// answer to different masters: `cost_at` orders candidates for routing and
+    /// must never move, while this one is a bill and moves whenever a provider
+    /// republishes. `None` when the rates are not recorded — see [`Price`].
+    #[must_use]
+    pub fn price_at(&self, model: &Model, unix_secs: u64) -> Option<Price> {
+        Some(price_with_peak(model.price?, self.peak.as_ref(), unix_secs))
     }
 }
 
@@ -622,12 +777,21 @@ impl Preset {
                 models: vec![
                     // 1M context, thinking and non-thinking, tool calls,
                     // vision. The only model here that is not being withdrawn.
-                    Model::new("deepseek-flash", Class::Balanced, 15),
+                    //
+                    // The one model in this file with a recorded rate triple,
+                    // so the one the money unit can price. Published per 1M,
+                    // as the comment above gives them: $0.003 cached input,
+                    // $0.15 uncached, $0.60 output. Peak doubles all three.
+                    Model::new("deepseek-flash", Class::Balanced, 15).priced(3_000, 150_000, 600_000),
                     // Withdrawn 2026-09-14, after which requests to it are
                     // served by Flash at Flash's price. Listed so an operator
                     // can see it existed and why it is not offered — not
                     // routed to, because it would report a cost and a
                     // capability that are both about to stop being true.
+                    //
+                    // Left unpriced despite those requests billing at Flash's
+                    // rates: `is_usable` is false, so nothing routes here and
+                    // `billing_price` never reaches it.
                     Model::retiring(
                         "deepseek-v4-pro",
                         Class::Heavy,
@@ -653,6 +817,14 @@ impl Preset {
             // `prompt_tokens_details.cached_tokens` is surfaced to the client
             // in `cache_read_input_tokens`, but `relative_cost` models only
             // input and output, exactly as it does for every other provider.
+            //
+            // No `Price` on these three, though their input and output rates
+            // are right here: OpenAI's cached-input rate is not recorded in
+            // this repository, and billing cached tokens at the miss rate
+            // would overstate the bill precisely on the traffic that is most
+            // cached — the classifier reads at 99.8%. A wrong number is worse
+            // than no number, so these show an unknown cost until that rate is
+            // recorded alongside the other two.
             Self::Openai => Provider {
                 id: id.to_owned(),
                 wire: Wire::Openai,
@@ -960,6 +1132,55 @@ impl Registry {
         out
     }
 
+    /// What one 1M tokens costs the account holding these pins, in micro-USD.
+    ///
+    /// The chain mirrors routing rather than inventing a rule: a model pin
+    /// outranks a provider pin, and a provider pin is enforced rather than
+    /// merely preferred, so an id that names nothing live yields `None` instead
+    /// of quietly billing at some other hop's rates.
+    ///
+    /// **An approximation, and it says so.** A usage bucket records tokens, not
+    /// which model produced them, so one rate has to stand for a whole account's
+    /// hour. That is exact when an account's traffic lands on one model — which
+    /// is what pinned providers and pinned models are for, and what this
+    /// deployment does — and wrong for an account left mixing models. The
+    /// alternative, costing each bucket from the server's own per-model tallies,
+    /// is not available: those are per window, not per hour, so the chart and
+    /// the summary tile would disagree.
+    ///
+    /// Without a provider pin this falls back to the hop routing reaches for
+    /// first that can be priced at all. Preference alone decides that, because
+    /// routing breaks the tie on the cost of a model the caller has not named
+    /// yet — so this is the one place the chain is directionally right rather
+    /// than exact.
+    ///
+    /// The returned rate is off-peak; callers cost an hour through
+    /// [`Rate::at`] so peak hours are priced as peak.
+    #[must_use]
+    pub fn billing_price(&self, provider_pin: Option<&str>, model_pin: Option<&str>) -> Option<Rate> {
+        let provider = match provider_pin {
+            Some(id) => self.providers.iter().find(|p| p.id == id && p.enabled)?,
+            None => self
+                .providers
+                .iter()
+                .filter(|p| p.enabled && p.models.iter().any(|m| !m.deprecated && m.price.is_some()))
+                .min_by_key(|p| p.preference)?,
+        };
+        let model = match model_pin {
+            Some(id) => provider.models.iter().find(|m| m.id == id && !m.deprecated)?,
+            None => provider
+                .models
+                .iter()
+                .filter(|m| !m.deprecated && m.price.is_some())
+                .min_by_key(|m| m.relative_cost)?,
+        };
+        Some(Rate {
+            price: model.price?,
+            peak: provider.peak.clone(),
+            model: model.id.clone(),
+        })
+    }
+
     /// Rewrite a requested model name through the mapping table.
     ///
     /// Follows chains, so `a → b → c` resolves to `c`, and stops on a cycle
@@ -1068,6 +1289,7 @@ mod tests {
                     id: "anthropic.claude-opus-5-v1:0".to_owned(),
                     class: Class::Heavy,
                     relative_cost: 30,
+                    price: None,
                     deprecated: false,
                     note: None,
                 },
@@ -1075,6 +1297,7 @@ mod tests {
                     id: "anthropic.claude-haiku-4-5-v1:0".to_owned(),
                     class: Class::Fast,
                     relative_cost: 2,
+                    price: None,
                     deprecated: false,
                     note: None,
                 },
@@ -1317,6 +1540,125 @@ mod tests {
         }
         // After the subscription, which is already paid for.
         assert!(ds.preference > Registry::default().providers[0].preference);
+    }
+
+    #[test]
+    fn the_published_prices_agree_with_the_routing_primitive() {
+        // `relative_cost` is the miss-input rate in *cents* per 1M and `Price`
+        // holds *micro*-USD per 1M, so the two are the same number four decimal
+        // places apart. Pinning that here is what makes a slip in either unit
+        // fail loudly instead of quietly costing 1000x too little: the display
+        // and the router would otherwise drift with nothing to compare them.
+        let ds = Preset::Deepseek.provider(Path::new("/var/lib/tab-atelier-proxy"));
+        let mut priced = 0;
+        for model in &ds.models {
+            let Some(price) = model.price else {
+                continue;
+            };
+            assert_eq!(
+                price.input / 10_000,
+                model.relative_cost,
+                "{}: ${}/1M miss-input is {} cents, not {}",
+                model.id,
+                f64::from(price.input) / 1_000_000.0,
+                price.input / 10_000,
+                model.relative_cost,
+            );
+            // And the classes must stay ordered the way the provider prices
+            // them, or a cheap-looking total is hiding an inverted lookup.
+            assert!(
+                price.cache_hit < price.input && price.input < price.output,
+                "{}: hit {} < miss {} < out {} is the shape of every published table",
+                model.id,
+                price.cache_hit,
+                price.input,
+                price.output,
+            );
+            priced += 1;
+        }
+        assert!(priced > 0, "the preset ships at least one priced model");
+
+        // The one model deliberately left unpriced, because it is withdrawn and
+        // its traffic is served by Flash at Flash prices.
+        let pro = ds.models.iter().find(|m| m.id.contains("v4-pro"));
+        assert!(
+            pro.is_some_and(|m| m.price.is_none()),
+            "a withdrawn model must stay unpriced, not be costed at its own rates"
+        );
+    }
+
+    /// The one test with an outside source of truth: a bill this proxy produced.
+    ///
+    /// The first real period reported 176M uncached tokens, 2.94B cached, and a
+    /// cache-miss line of $29.20 that was 63% of the total. Feeding those counts
+    /// through the table has to land on the same shape, or the table is not the
+    /// one the vendor charged by. It is also what fixes the rates' *units*:
+    /// `micro` per 1M is only right because this arithmetic comes out in
+    /// dollars.
+    #[test]
+    fn the_rates_reproduce_the_reported_bill() {
+        let ds = Preset::Deepseek.provider(Path::new("/var/lib/tab-atelier-proxy"));
+        let price = ds.models[0].price.expect("flash is priced");
+
+        let miss = price.cost_micro(0, 176_000_000, 0);
+        let hit = price.cost_micro(2_940_000_000, 0, 0);
+        assert_eq!(miss, 26_400_000, "176M uncached at $0.15/1M is $26.40");
+        assert_eq!(hit, 8_820_000, "2.94B cached at $0.003/1M is $8.82");
+
+        // The reported miss line was $29.20, not $26.40, and the gap is the
+        // reason the peak multiplier is part of the model rather than a note:
+        // $29.20/176M is $0.166/1M, which no flat rate in the table produces,
+        // but which 10.6% of the volume at double does. Pricing this at
+        // off-peak rates alone would under-report it by 10%.
+        let peak_share = 0.106;
+        let with_peak = miss + (miss * 106 / 1000);
+        assert_eq!(with_peak, 29_198_400);
+        assert!(
+            (with_peak - 29_200_000).abs() < 100_000,
+            "peak-inclusive miss should land on the reported $29.20"
+        );
+        assert!((0.0..0.25).contains(&peak_share), "and on a plausible peak share");
+
+        // 63% of the bill, with output at $0.60/1M as the remainder.
+        let out = price.cost_micro(0, 0, 12_400_000);
+        let total = miss + hit + out;
+        let share = miss * 100 / total;
+        assert!(
+            (60..=66).contains(&share),
+            "the miss line was 63% of the total, this table gives {share}%"
+        );
+    }
+
+    #[test]
+    fn a_hit_costs_far_less_than_a_miss_which_is_why_the_split_exists() {
+        // The measured gap is 50x on Flash. If a change ever made the two equal,
+        // the input panel's money figure would stop being dominated by misses
+        // and the whole reason for splitting `cost_in` from `cost_out` would be
+        // gone — so the assumption is asserted rather than described.
+        let ds = Preset::Deepseek.provider(Path::new("/var/lib/tab-atelier-proxy"));
+        let flash = ds.models.iter().find(|m| m.id == "deepseek-flash").expect("flash");
+        let price = flash.price.expect("priced");
+        assert_eq!(price.cache_hit * 50, price.input);
+    }
+
+    #[test]
+    fn the_deepseek_preset_records_published_off_peak_rates() {
+        // Off-peak, from the published table quoted at the top of the preset:
+        // $0.003 hit / $0.15 miss / $0.60 out per 1M. Stored in micro-USD, so
+        // the same figures a factor of a million larger.
+        let ds = Preset::Deepseek.provider(Path::new("/var/lib/tab-atelier-proxy"));
+        let flash = ds.models.iter().find(|m| m.id == "deepseek-flash").expect("flash");
+        let price = flash.price.expect("flash is priced");
+        assert_eq!(price.cache_hit, 3_000, "$0.003/1M");
+        assert_eq!(price.input, 150_000, "$0.15/1M");
+        assert_eq!(price.output, 600_000, "$0.60/1M");
+
+        // And the peak schedule that doubles them, which the cost of an hour
+        // depends on as much as the rates do.
+        let peak = ds.peak.as_ref().expect("deepseek has a peak schedule");
+        assert_eq!(peak.multiplier_percent, 200);
+        assert_eq!(peak.windows.len(), 2, "01:00-04:00 and 06:00-10:00");
+        assert!(peak.windows.iter().all(|w| w.weekdays == vec![1, 2, 3, 4, 5]));
     }
 
     #[test]
