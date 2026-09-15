@@ -191,10 +191,11 @@ pub fn gated(path: &str, method: Method) -> bool {
 ///   shell. Nothing was mounting `/relay` or `/me`, and nothing should have
 ///   been serving their parent to a caller who has not signed in.
 ///
-/// One thing to watch: the dashboard defines a `meUrl()` that is never called.
-/// If it is ever wired up, `/me/usage` moves behind the browser gate — which is
-/// a one-line change here, and the digest would already be satisfied because
-/// the operator is signed in to reach the page that fetches it.
+/// One thing to watch: the dashboard has a "my usage" link (`meUrl()`) that
+/// points at `/me/usage` with an `x-api-key` the operator pastes in. That path
+/// is exempt here, so the link works — but it needs a relay key, not the
+/// operator token. If `/me/usage` is ever moved behind this gate, the link has
+/// to move with it.
 #[must_use]
 fn is_exempt(path: &str) -> bool {
     const EXEMPT: [&str; 3] = ["/api/hello", "/robots.txt", "/favicon.ico"];

@@ -504,8 +504,6 @@ interface Tier {
  * the file honest.
  */
 interface AppState {
-    token: string;
-    authed: boolean;
     users: ApiUser[];
     form: { first_name: string; last_name: string; email: string };
     freshKey: FreshKey | null;
@@ -605,5 +603,21 @@ interface Window {
         unitSuffix: (max: number, unit: string) => string;
         /** The estimate's citation and caveat, shown beside converted figures. */
         energyNote: () => string;
+    };
+    /**
+     * The HTTP client, from api.ts.
+     *
+     * Namespaced on `window` because these files are plain scripts sharing one
+     * scope rather than modules: a top-level `api` in api.ts would be visible
+     * here by luck and collide by accident. `TaCharts` above is the same
+     * arrangement.
+     */
+    TaApi: {
+        /** The one client the page uses. */
+        api: ApiClient;
+        /** The class, for a test that wants its own instance and base URL. */
+        ApiClient: new (options?: { baseUrl?: string }) => ApiClient;
+        /** The error type, so a caller can narrow on it with `instanceof`. */
+        ApiError: new (status: number, body: unknown, message: string) => ApiError;
     };
 }

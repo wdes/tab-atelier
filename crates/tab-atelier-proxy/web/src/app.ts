@@ -9,6 +9,11 @@
 
 const { createApp } = Vue;
 
+// The HTTP client, from api.ts. Read off the namespace rather than left as a
+// top-level `api` const over there: both files are scripts sharing one scope,
+// so a name declared in one is visible — and can collide — in the other.
+const { api } = window.TaApi;
+
 /** The tool policy every request already gets, and the one an account that
  *  predates the field is carrying. `all` sends the client's toolkit through
  *  untouched — the only default that cannot silently break a session. */
@@ -76,6 +81,19 @@ function formatRules(rules: Record<string, RewriteRule[]>): string {
     }
   }
   return lines.join("\n");
+}
+
+/** A provider's current models, in the `id:class:cost` form the server parses.
+ *
+ * Sent on every save because the form edits one field at a time and the server
+ * replaces what it is given: a save that omitted the models would wipe them.
+ * Deprecated ones are dropped — they are listed for reference and must not be
+ * re-sent as current. */
+function providerModels(p: ProviderView): string {
+  return p.models
+    .filter((m) => !m.deprecated)
+    .map((m) => `${m.id}:${m.class}:${m.relative_cost}`)
+    .join(",");
 }
 
 /** A zeroed usage record, for an account that has not called anything yet. */
@@ -170,10 +188,6 @@ const AdminApp = Vue.defineComponent({
   },
   data(): AppState {
     return {
-      // sessionStorage, not localStorage: the admin token should not outlive
-      // the tab it was typed into.
-      token: sessionStorage.getItem("ta-proxy-admin") || "",
-      authed: false,
       users: [],
       form: { first_name: "", last_name: "", email: "" },
       freshKey: null,
@@ -518,50 +532,22 @@ const AdminApp = Vue.defineComponent({
     },
   },
   mounted() {
-    // A token already in this session means a reload should land straight back
-    // on the list rather than asking again.
-    if (this.token) this.signIn();
+    // Nothing to sign in to. Reaching this script at all means the browser
+    // answered the challenge for this origin, and it keeps attaching that
+    // credential to every request until the window closes.
+    void this.load();
   },
   methods: {
-    // Generic so each call site says what it expects back. The alternative is
-    // an `any` that quietly spreads through every caller — which is what this
-    // migration exists to stop.
-    async api<T = unknown>(method: string, path: string, body?: unknown): Promise<T> {
-      const resp = await fetch(path, {
-        method,
-        // The one place a credential is attached, for every call in this app.
-        // Bearer only: a second spelling is a second thing to audit and to
-        // redact, and a secret in a header no tooling knows about.
-        headers: {
-          Authorization: "Bearer " + this.token,
-          ...(body ? { "Content-Type": "application/json" } : {}),
-        },
-        body: body ? JSON.stringify(body) : undefined,
-      });
-      const text = await resp.text();
-      let data = {};
-      try {
-        data = text ? JSON.parse(text) : {};
-      } catch {
-        // A non-JSON body here means something in front of the proxy answered
-        // (a gateway, a captive portal). Say that rather than "unexpected
-        // token < in JSON", which sends people looking in the wrong place.
-        throw new Error(`${resp.status}: ${text.slice(0, 120) || "empty response"}`);
-      }
-      if (!resp.ok) throw new Error((data as { error?: string }).error || `${resp.status}`);
-      return data as T;
-    },
-    async signIn() {
+    // Load everything the page shows.
+    //
+    // No credential is sent from here: the browser authenticated the origin
+    // before this script ran, and attaches that itself. A token typed into
+    // this page would be a second secret to hold for no gain.
+    async load() {
       this.busy = true;
       this.error = "";
       try {
-        // Trim: a token pasted from a terminal usually brings a newline, and
-        // the comparison is exact.
-        this.token = (this.token || "").trim();
-        const data = await this.api<{ users: ApiUser[] }>("GET", "/api/users");
-        this.users = data.users;
-        this.authed = true;
-        sessionStorage.setItem("ta-proxy-admin", this.token);
+        this.users = await api.users.list();
         await this.loadUsage();
         await this.loadPressure();
         // With the rest, not behind a button: the account table's "routed to"
@@ -572,29 +558,16 @@ const AdminApp = Vue.defineComponent({
         // The plan moves on its own, independently of anything done here.
         this.pressureTimer ??= setInterval(() => this.loadPressure(), 30_000);
       } catch (e) {
+        // Shown in the page, which is the only place left to report it: the
+        // browser owns the credential now, so there is no token to clear and
+        // no sign-in screen to bounce back to.
         this.error = e instanceof Error ? e.message : String(e);
-        this.authed = false;
-        sessionStorage.removeItem("ta-proxy-admin");
       } finally {
         this.busy = false;
       }
     },
-    signOut() {
-      sessionStorage.removeItem("ta-proxy-admin");
-      this.token = "";
-      this.authed = false;
-      this.users = [];
-      this.usage = {};
-      this.focus = null;
-      this.pressure = null;
-      // Guarded: `clearInterval(null)` is legal JavaScript and a type error,
-      // and the guard is free.
-      if (this.pressureTimer !== null) clearInterval(this.pressureTimer);
-      this.pressureTimer = null;
-      this.freshKey = null;
-    },
     async refresh() {
-      this.users = (await this.api<{ users: ApiUser[] }>("GET", "/api/users")).users;
+      this.users = await api.users.list();
       await this.loadUsage();
       // Kept in step with the account list: a provider added or removed in
       // another tab would otherwise leave every row's picker showing stale
@@ -615,7 +588,7 @@ const AdminApp = Vue.defineComponent({
     async loadProviders() {
       this.providersBusy = true;
       try {
-        this.providers = await this.api<ProvidersResponse>("GET", "/api/providers");
+        this.providers = await api.providers.list();
       } finally {
         this.providersBusy = false;
       }
@@ -624,17 +597,17 @@ const AdminApp = Vue.defineComponent({
       // `dup` makes this an ADDED entry, not an edit of one already there:
       // clicking DeepSeek twice has to leave two rows with two key files, not
       // one row holding whichever key was pasted last.
-      await this.api("POST", "/api/providers", { preset: p.id, dup: true });
+      await api.providers.save({ preset: p.id, dup: true });
       await this.loadProviders();
     },
     async setKey(p: ProviderView) {
       const key = prompt(`API key for ${p.id}:`, "");
       if (!key) return;
-      await this.api("POST", `/api/providers/${p.id}/key`, { key });
+      await api.providers.rotateKey(p.id, key);
       await this.loadProviders();
     },
     async toggleProvider(p: ProviderView) {
-      await this.api("POST", "/api/providers", {
+      await api.providers.save({
         id: p.id,
         base_url: p.base_url,
         models: p.models.filter((m) => !m.deprecated).map((m) => `${m.id}:${m.class}:${m.relative_cost}`).join(","),
@@ -660,7 +633,7 @@ const AdminApp = Vue.defineComponent({
       }
       this.busy = true;
       try {
-        await this.api("POST", "/api/providers", {
+        await api.providers.save({
           id: p.id,
           base_url: p.base_url,
           models: p.models.filter((m) => !m.deprecated).map((m) => `${m.id}:${m.class}:${m.relative_cost}`).join(","),
@@ -681,7 +654,7 @@ const AdminApp = Vue.defineComponent({
     async setUserCompact(u: ApiUser, value: string) {
       this.busy = true;
       try {
-        await this.api("POST", `/api/users/${u.id}/compact`, { compact: value });
+        await api.users.setCompact(u.id, value);
         this.error = "";
         await this.refresh();
       } catch (e) {
@@ -722,7 +695,7 @@ const AdminApp = Vue.defineComponent({
           : flav === "tools" && u.tools.mode === "none" ? "all"
           : null;
         if (mode) {
-          await this.api("POST", `/api/users/${u.id}/tools`, {
+          await api.users.setTools(u.id, {
             mode,
             disable: u.tools.disable,
             allow: u.tools.allow,
@@ -730,7 +703,7 @@ const AdminApp = Vue.defineComponent({
             rewrite: u.tools.rewrite,
           });
         }
-        await this.api("POST", `/api/users/${u.id}/model`, { model });
+        await api.users.setModel(u.id, model);
         this.error = "";
         await this.refresh();
       } catch (e) {
@@ -796,7 +769,7 @@ const AdminApp = Vue.defineComponent({
         return Promise.resolve();
       }
       return this.act(async () => {
-        await this.api("POST", `/api/users/${t.id}/tools`, {
+        await api.users.setTools(t.id, {
           mode: t.mode,
           disable: splitNames(t.disable),
           allow: splitNames(t.allow),
@@ -808,7 +781,7 @@ const AdminApp = Vue.defineComponent({
     },
     async removeProvider(p: ProviderView) {
       if (!confirm(`Remove provider ${p.id}? Accounts pinned to it are unpinned.`)) return;
-      await this.api("DELETE", `/api/providers/${p.id}`);
+      await api.providers.remove(p.id);
       await this.loadProviders();
       await this.refresh();
     },
@@ -826,7 +799,7 @@ const AdminApp = Vue.defineComponent({
     async setProviderEnabled(p: ProviderView, enabled: boolean) {
       this.busy = true;
       try {
-        await this.api("POST", "/api/providers", {
+        await api.providers.save({
           id: p.id,
           base_url: p.base_url,
           models: p.models.filter((m) => !m.deprecated).map((m) => `${m.id}:${m.class}:${m.relative_cost}`).join(","),
@@ -845,16 +818,16 @@ const AdminApp = Vue.defineComponent({
     async addMapping() {
       const m = this.newMapping;
       if (!m.from || !m.to) return;
-      await this.api("POST", "/api/mappings", m);
+      await api.mappings.add(m);
       this.newMapping = { from: "", to: "", note: "" };
       await this.loadProviders();
     },
     async removeMapping(m: MappingView) {
-      await this.api("DELETE", `/api/mappings/${encodeURIComponent(m.from)}`);
+      await api.mappings.remove(m.from);
       await this.loadProviders();
     },
     async setUserProvider(u: ApiUser, provider: string) {
-      await this.api("POST", `/api/users/${u.id}/provider`, { provider });
+      await api.users.setProvider(u.id, provider);
       await this.refresh();
     },
     /** What the row's badge says: enough to tell "governed" from "default"
@@ -956,7 +929,7 @@ const AdminApp = Vue.defineComponent({
     async loadInspect() {
       this.inspectBusy = true;
       try {
-        this.inspect = await this.api<InspectState>("GET", "/api/inspect");
+        this.inspect = await api.inspect.get();
       } finally {
         this.inspectBusy = false;
       }
@@ -971,14 +944,14 @@ const AdminApp = Vue.defineComponent({
       if (!raw) return;
       const minutes = Number(raw);
       if (!Number.isFinite(minutes) || minutes < 1) return;
-      await this.api("POST", "/api/inspect", { minutes });
+      await api.inspect.arm(minutes);
       await this.loadInspect();
     },
     // One action, because "stop recording" and "delete what you recorded" are
     // the same intention in practice.
     async stopInspect() {
       if (!confirm("Stop capturing and delete every capture taken so far?")) return;
-      await this.api("DELETE", "/api/inspect");
+      await api.inspect.disarm();
       this.inspectOpen = null;
       await this.loadInspect();
     },
@@ -1052,7 +1025,7 @@ const AdminApp = Vue.defineComponent({
     // indistinguishable from a button that does nothing.
     async loadPressure(quiet = true) {
       try {
-        this.pressure = await this.api<Pressure>("GET", "/api/pressure");
+        this.pressure = await api.pressure.get();
       } catch (e) {
         if (!quiet) this.error = e instanceof Error ? e.message : String(e);
       }
@@ -1090,10 +1063,10 @@ const AdminApp = Vue.defineComponent({
     },
     setWeight(u: ApiUser, value: unknown) {
       const weight = Math.max(1, Math.min(100, Number(value) || 1));
-      return this.act(() => this.api("POST", `/api/users/${u.id}/weight`, { weight }));
+      return this.act(() => api.users.setWeight(u.id, weight));
     },
     async loadUsage() {
-      const data = await this.api<UsageResponse>("GET", `/api/usage?window=${this.usageWindow}`);
+      const data = await api.usage.report(this.usageWindow);
       // The server owns the window vocabulary and echoes the canonical token
       // back — `48h` settles to `2d`, and a window it did not recognise falls
       // back to its default. Taking that value rather than keeping the one we
@@ -1165,12 +1138,11 @@ const AdminApp = Vue.defineComponent({
     // first one goes, in the same breath.
     add() {
       return this.act(async () => {
-        const data = await this.api<{ user: ApiUser }>("POST", "/api/users", this.form);
-        const who = data.user;
+        const who = await api.users.add(this.form);
         this.form = { first_name: "", last_name: "", email: "" };
         const name = prompt(`Account created. Where will ${who.first_name}'s first key be used? (laptop, ci, fleet…)`, "laptop");
         if (!name) return;
-        const k = await this.api<NewKey>("POST", `/api/users/${who.id}/keys`, { name });
+        const k = await api.keys.add(who.id, name);
         this.showKey({ user: who, key: k.secret, name: k.key.name });
       });
     },
@@ -1180,24 +1152,24 @@ const AdminApp = Vue.defineComponent({
       const name = prompt(`Name for ${u.first_name}'s new key (laptop, ci, fleet…)`, "");
       if (!name) return;
       return this.act(async () => {
-        const data = await this.api<NewKey>("POST", `/api/users/${u.id}/keys`, { name });
+        const data = await api.keys.add(u.id, name);
         this.showKey({ user: u, key: data.secret, name: data.key.name });
       });
     },
     removeKey(u: ApiUser, k: ApiKey) {
       if (!confirm(`Delete ${u.first_name}'s key "${k.name}"? Anything using it stops working. Their other keys are unaffected.`))
         return;
-      return this.act(() => this.api("DELETE", `/api/users/${u.id}/keys/${k.id}`));
+      return this.act(() => api.keys.remove(u.id, k.id));
     },
     toggleKey(u: ApiUser, k: ApiKey) {
-      return this.act(() => this.api("POST", `/api/users/${u.id}/keys/${k.id}/disabled`, { disabled: !k.disabled }));
+      return this.act(() => api.keys.setDisabled(u.id, k.id, !k.disabled));
     },
     setDisabled(u: ApiUser, disabled: boolean) {
-      return this.act(() => this.api("POST", `/api/users/${u.id}/disabled`, { disabled }));
+      return this.act(() => api.users.setDisabled(u.id, disabled));
     },
     remove(u: ApiUser) {
       if (!confirm(`Delete ${u.first_name} ${u.last_name} <${u.email}>? Their key stops working.`)) return;
-      return this.act(() => this.api("DELETE", `/api/users/${u.id}`));
+      return this.act(() => api.users.remove(u.id));
     },
     showKey(data: { user: ApiUser; key: string; name?: string }) {
       this.copied = false;

@@ -90,6 +90,12 @@ pub(crate) fn distro_asset(rel: &str) -> Option<&'static str> {
 const VERSIONED: &[&str] = &[
     "vendor/bootstrap.min.css",
     "vendor/vue.global.prod.js",
+    // `api.js` most of all: it names every route the page calls, so a cached
+    // copy after an upgrade is a client asking for endpoints that may not
+    // exist. `app.js` is committed alongside it and changes at least as often,
+    // but a stale one of those fails visibly — a stale `api.js` fails as a
+    // request to the wrong path.
+    "api.js",
     "charts.js",
     "app.js",
 ];
