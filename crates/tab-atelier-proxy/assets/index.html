@@ -1068,25 +1068,27 @@
               <label class="form-label small fw-semibold" for="ta-tools-mode">Mode</label>
               <select id="ta-tools-mode" class="form-select form-select-sm mb-1" v-model="tools.mode">
                 <option value="all">Every tool — send the client's array as it stands</option>
-                <option value="referenced">Only what a conversation is already using</option>
+                <option value="referenced">Every tool — legacy alias of the above</option>
                 <option value="allow">Only the names listed below</option>
-                <option value="none">None — drop the client's tools entirely</option>
+                <option value="none">Only the names listed below — legacy alias of the above</option>
               </select>
               <p class="small text-body-secondary mb-3">
-                <strong>Referenced</strong> is the safe way to save context: a tool the
-                conversation has already called, or that is still in the recent history, is
-                kept whether or not it is listed here. That is not a preference — a
-                <code>tool_use</code> naming a tool that is no longer defined is rejected
-                outright, which would fail the turn rather than shrink it.
+                <strong>Only the names listed below</strong> keeps exactly those, plus every
+                tool the conversation already references. The second half is not a preference:
+                a <code>tool_use</code> naming a tool with no definition is rejected outright,
+                which would fail the turn rather than shrink it. Both are answered from the
+                whole transcript, never from a window — a tool that comes and goes as history
+                slides re-bills the entire prompt cache on the turn it returns.
               </p>
 
               <label class="form-label small fw-semibold" for="ta-tools-allow">Allowed names</label>
               <textarea id="ta-tools-allow" rows="2" class="form-control form-control-sm font-monospace mb-1"
                         v-model="tools.allow"
-                        :disabled="tools.mode !== 'allow'"
+                        :disabled="tools.mode !== 'allow' && tools.mode !== 'none'"
                         placeholder="Read, Glob, Grep"></textarea>
               <p class="small text-body-secondary mb-3">
-                Used only by the <strong>allow</strong> mode above.
+                Used by the <strong>allow</strong> and <strong>none</strong> modes above.
+                Ignored by the two that send everything.
               </p>
 
               <label class="form-label small fw-semibold" for="ta-tools-disable">Never send</label>

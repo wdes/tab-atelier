@@ -24,33 +24,67 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// How far back to look for referenced names.
-///
-/// Matches compaction's window rather than being its own number, because the
-/// two answer the same question — which of these are still live — and
-/// disagreeing windows would mean a tool kept for one reason and dropped for
-/// another in the same pass.
-pub const PINS_WINDOW: usize = 24;
-
 /// Always kept, in every mode, whatever it is referenced by.
 ///
 /// Not a policy choice: tool search is how the client reaches every other
 /// tool, so removing it does not hide one tool, it hides the mechanism.
 pub const ALWAYS_KEPT: [&str; 1] = ["ToolSearch"];
 
-/// How many tools the client is offered.
+/// Which tool definitions go out, and how a policy decides.
+///
+/// # Every mode is a function of the policy, never of the transcript
+///
+/// This used to be false. `referenced` and `none` both resolved to *names the
+/// conversation has called*, over a 24-message tail window, so `tools[]` moved
+/// from turn to turn. It is the first element of the body — ahead of `system`
+/// and every `messages` block — so dropping one definition invalidates the
+/// whole cached prefix and the next request re-buys the entire conversation at
+/// miss price.
+///
+/// That is not a close call, and this proxy's own traffic measures it. On
+/// `deepseek-flash` a cache read is $0.003/1M against $0.15/1M for a miss, so a
+/// 241-token definition is traded for a 139,970-token re-warm: about 28,000x in
+/// the wrong direction. Removing a definition only pays if it is larger than
+/// forty-nine times the prefix it invalidates, and `tools[]` sits ahead of
+/// everything, so that never happens.
+/// It shows up in `inspect.jsonl` as a hit rate falling to 1% on exactly the
+/// turns a tool ages out of the window (3 tools → 2 → 1 as `Write` and then
+/// `Edit` left the window, `cache_read` 125312 → 2688 → 2432).
+///
+/// The same removal can leave a model reaching for a tool it can no longer call
+/// — plausibly emitting it as text, which a client renders as prose rather than
+/// running. That is a hypothesis this proxy's records have not caught, so it is
+/// not the reason for the change; the invalidation above is, and it is enough
+/// on its own.
+///
+/// So the modes below are static on purpose. A policy that wants fewer tools
+/// says so once, in `allow`/`disable`, and gets the same array every turn.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Mode {
     /// Everything the client sent, minus `disable`. The default.
     #[default]
     All,
-    /// Everything on the first request, then only names the conversation
-    /// has actually called.
+    /// Kept so an account file written before the window was removed still
+    /// loads. Behaves exactly as [`Mode::All`].
     Referenced,
-    /// Only `allow`, in `allow` order.
+    /// Nothing that is not in `allow`, in `allow` order.
     Allow,
-    /// Nothing, except names the conversation has called.
+    /// Nothing that is not in `allow`.
+    ///
+    /// This and [`Mode::Allow`] now resolve the same way, because `allow`
+    /// came to carry the whole decision: it is the always-keep list, the
+    /// mirror of `disable`'s always-drop, and a mode only supplies the answer
+    /// for the tools neither list names. `None` and `Allow` both answer *no*.
+    ///
+    /// The live account runs `none` with a twenty-name `allow`, so before this
+    /// the twenty names were never read — see the module note above for what
+    /// it cost instead. With `allow` empty this is the narrowest policy there
+    /// is, but not literally nothing: the referenced-union rule still keeps
+    /// every definition the transcript has ever named, and [`ALWAYS_KEPT`] is
+    /// unconditional. Neither is negotiable, because dropping either leaves a
+    /// `tool_use` in `messages[]` that names a tool the provider cannot
+    /// resolve.
     None,
 }
 
@@ -67,9 +101,13 @@ impl Mode {
 
     /// Whether this mode can remove anything at all. Used to skip the whole
     /// pass — and the re-encode it would force — for the default case.
+    ///
+    /// `Referenced` is in here because it no longer prunes on its own: with no
+    /// `disable` and no `allow` it has nothing to remove, so rebuilding the
+    /// array would be a re-encode that only risks moving the client's marks.
     #[must_use]
     const fn prunes(self) -> bool {
-        !matches!(self, Self::All)
+        !matches!(self, Self::All | Self::Referenced)
     }
 }
 
@@ -403,13 +441,13 @@ impl Report {
 /// Whether this policy could change any request. The default cannot, and
 /// `shape_body` uses that to stay out of the way entirely.
 ///
-/// No `allow` term, deliberately. `allow` is read only in [`Mode::Allow`],
-/// which already prunes — so `!prunes()` has answered "no" before the list
-/// could be consulted, and the term would be dead code that reads as if it
-/// were doing work. The tempting misreading it would invite is the opposite of
-/// the truth: a populated `allow` under [`Mode::All`] is still a no-op, because
-/// `All` ignores the list. Such a policy is stored and means something the
-/// moment the mode changes; it just does not act now.
+/// No `allow` term, deliberately. `allow` is read only in [`Mode::Allow`] and
+/// [`Mode::None`] — both of which prune, so `!prunes()` has already answered
+/// "no" before either could consult the list, and the term would be dead code
+/// that reads as if it were doing work. The tempting misreading it would invite
+/// is the opposite of the truth: a populated `allow` under [`Mode::All`] is
+/// still a no-op, because `All` ignores the list. Such a policy is stored and
+/// means something the moment the mode changes; it just does not act now.
 #[must_use]
 pub fn is_noop(policy: &Policy) -> bool {
     !policy.mode.prunes() && policy.disable.is_empty() && policy.add.is_empty() && policy.rewrite.is_empty()
@@ -494,7 +532,6 @@ pub fn apply(body: &mut Value, policy: &Policy, takes_cache: bool) -> Report {
     };
 
     report.offered = tools.len();
-    let first_turn = is_first_turn(body);
     let mut keep = referenced_names(body);
     // A forced tool is a pin the body states outright. Folded in here rather
     // than given an arm of its own so it inherits the same protection — and so
@@ -513,7 +550,7 @@ pub fn apply(body: &mut Value, policy: &Policy, takes_cache: bool) -> Report {
             continue;
         };
         let protected = ALWAYS_KEPT.contains(&name) || keep.contains(name);
-        let wanted = keep_by_mode(policy, name, first_turn) && !disabled.contains(name);
+        let wanted = keep_by_mode(policy, name) && !disabled.contains(name);
         if wanted || protected {
             if !wanted {
                 // Kept against the mode, or against `disable`. This is the
@@ -714,20 +751,20 @@ fn strip_one(tool: &mut Value) -> bool {
 ///
 /// A separate function because the pin rule is not a mode: it is a floor
 /// beneath every mode, so the modes must be answerable on their own terms.
-fn keep_by_mode(policy: &Policy, name: &str, first_turn: bool) -> bool {
+fn keep_by_mode(policy: &Policy, name: &str) -> bool {
     match policy.mode {
-        // Everything, always — not "everything to begin with". `all` and
-        // `referenced` are easy to conflate here and the two arms look
-        // mergeable; they are not, and doing so silently turns `all` into
-        // `referenced` from the second turn onward.
-        Mode::All => true,
-        // Everything on the opening request, then only what has been
-        // called. The first turn is the whole point: nothing has been
-        // called yet, so pruning there would leave the model with no
-        // tools at all.
-        Mode::Referenced => first_turn,
-        Mode::Allow => policy.allow.iter().any(|a| a == name),
-        Mode::None => false,
+        // `referenced` is the pre-removal spelling of `all` — see `Mode`.
+        Mode::All | Mode::Referenced => true,
+        // `allow` is the whole policy in these two; they differ only in
+        // whether the array is reordered into `allow` order below.
+        //
+        // `none` honouring `allow` is the fix for the live case `Mode`
+        // documents: the account was on `none` with a 20-name `allow` list,
+        // and `none` ignored that list entirely, so an allowlist the operator
+        // had written down was silently replaced by whatever the tail window
+        // happened to have seen. An explicit list is a static statement, and
+        // it is taken as one.
+        Mode::Allow | Mode::None => policy.allow.iter().any(|a| a == name),
     }
 }
 
@@ -736,31 +773,25 @@ pub fn tool_name(tool: &Value) -> Option<&str> {
     tool.get("name").and_then(Value::as_str)
 }
 
-/// Whether this is the client's opening request.
-///
-/// The proxy cannot see "the first request of a session" directly, but it
-/// does not need to: a conversation that has not answered anything yet has
-/// no `assistant` message. Every later request in the same conversation
-/// carries the transcript, so the first `assistant` turn is the moment the
-/// window starts applying.
-fn is_first_turn(body: &Value) -> bool {
-    !messages(body).any(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
-}
-
-/// Tool names the conversation has already called, over the tail window.
+/// Tool names the conversation has already called, over its whole history.
 ///
 /// These are the definitions that must survive whatever the mode says: a
 /// `tool_use` block naming a tool that is not in `tools[]` is rejected
 /// upstream, so removing one would break the request rather than the tool.
+///
+/// The whole history, not a tail window. An elided `tool_result` stub still
+/// carries its `tool_use_id`, and the `tool_use` it pairs with can be
+/// arbitrarily far back, so a window only proves a name is too recent to have
+/// fallen out yet — never that nothing older needs it. The bound is invisible
+/// until a conversation is long enough to reach it, which is exactly when
+/// breaking it costs the most.
 ///
 /// The [`ALWAYS_KEPT`] exemptions are deliberately *not* folded in here.
 /// They are a different reason to keep a tool, and merging them would make
 /// `Report::pinned` unable to say which one applied.
 fn referenced_names(body: &Value) -> std::collections::HashSet<String> {
     let mut names = std::collections::HashSet::new();
-    let all: Vec<&Value> = messages(body).collect();
-    let start = all.len().saturating_sub(PINS_WINDOW);
-    for message in &all[start..] {
+    for message in messages(body) {
         let Some(content) = message.get("content").and_then(Value::as_array) else {
             continue;
         };
@@ -1024,24 +1055,31 @@ mod tests {
         }
     }
 
-    /// First request in a conversation: nothing has been called yet, so
-    /// pruning would leave the model with nothing to work with.
+    /// `Referenced` on its own asks for nothing, so the pass is skipped
+    /// outright rather than rebuilt in place. Rebuilding would re-encode an
+    /// identical array, which only risks moving the client's `cache_control`
+    /// marks — and the marks are what make the prefix cheap to read.
     #[test]
-    fn mode_referenced_sends_everything_on_the_first_turn() {
+    fn mode_referenced_alone_is_a_noop() {
         let policy = Policy {
             mode: Mode::Referenced,
             ..Policy::default()
         };
         let mut body = request(&["Read", "Bash", "Edit"]);
+        let before = body.clone();
         let report = apply(&mut body, &policy, true);
         assert_eq!(names(&body), ["Read", "Bash", "Edit"]);
-        assert!(report.removed.is_empty());
-        assert_eq!(report.offered, 3);
-        assert_eq!(report.sent, 3, "the report must not read as pruned");
+        assert_eq!(body, before, "the body must come through untouched");
+        assert!(!report.changed());
+        assert_eq!(report.offered, 0, "a skipped pass reports nothing offered");
     }
 
+    /// It kept pruning after the first turn, and that was the whole cost of
+    /// the mode: `tools[]` leads the body, so a set that shrinks as tools go
+    /// quiet invalidates the system prompt and every message behind it. The
+    /// saving is the weight of one definition; the loss is the prefix.
     #[test]
-    fn mode_referenced_prunes_once_the_conversation_has_answered() {
+    fn mode_referenced_does_not_prune_once_the_conversation_has_answered() {
         let policy = Policy {
             mode: Mode::Referenced,
             ..Policy::default()
@@ -1053,8 +1091,9 @@ mod tests {
                 {"type": "tool_use", "id": "t1", "name": "Read", "input": {}}
             ]},
         ]);
-        apply(&mut body, &policy, true);
-        assert_eq!(names(&body), ["Read"]);
+        let report = apply(&mut body, &policy, true);
+        assert_eq!(names(&body), ["Read", "Bash", "Edit"]);
+        assert!(report.removed.is_empty());
     }
 
     #[test]
@@ -1385,8 +1424,14 @@ mod tests {
         assert!(body["messages"][0].get("cache_control").is_some());
     }
 
+    /// The correctness floor has no window. A `tool_use` far enough back that
+    /// a tail scan would miss it is still a `tool_use` the model sent, and
+    /// dropping its definition makes the request itself invalid.
+    ///
+    /// This is the inverse of what the window used to do, so the test is the
+    /// old one turned around: the same shaped body, the opposite assertion.
     #[test]
-    fn references_outside_the_window_are_not_pinned() {
+    fn references_outside_any_window_are_still_pinned() {
         let policy = Policy {
             mode: Mode::None,
             ..Policy::default()
@@ -1395,12 +1440,114 @@ mod tests {
         let mut messages = vec![json!({"role": "assistant", "content": [
             {"type": "tool_use", "id": "old", "name": "Bash", "input": {}}
         ]})];
-        for i in 0..PINS_WINDOW {
+        // Far enough back that no plausible tail window reaches it.
+        for i in 0..500 {
             messages.push(json!({"role": "user", "content": format!("filler {i}")}));
         }
         body["messages"] = Value::Array(messages);
         apply(&mut body, &policy, true);
-        assert!(!names(&body).contains(&"Bash".to_owned()), "fell out of the window");
+        assert!(
+            names(&body).contains(&"Bash".to_owned()),
+            "a referenced tool must survive however old the reference"
+        );
+    }
+
+    /// [`Mode::None`] means "only what the conversation has called", and an
+    /// `allow` list is how an operator writes that set down explicitly. It
+    /// used to be ignored outside [`Mode::Allow`], so a policy carrying one
+    /// read as an allowlist and behaved as a sliding window.
+    #[test]
+    fn mode_none_honours_an_allow_list() {
+        let policy = Policy {
+            mode: Mode::None,
+            allow: vec!["Read".into()],
+            ..Policy::default()
+        };
+        let mut body = request(&["Read", "Bash", "Edit"]);
+        body["messages"] = json!([{"role": "user", "content": "hi"}]);
+        let report = apply(&mut body, &policy, true);
+        assert_eq!(names(&body), ["Read"], "the allow list is the whole answer");
+        assert_eq!(report.sent, 1);
+    }
+
+    /// Every pruning mode keeps one tool name after another after the same
+    /// conversation state, because `tools[]` is the first key of the body:
+    /// a set that shrinks as tools fall out of use invalidates the system
+    /// prompt and the entire history behind it, every time it shrinks.
+    #[test]
+    fn a_pruning_mode_sends_a_stable_set_across_turns() {
+        let policies = [
+            Policy {
+                mode: Mode::Referenced,
+                ..Policy::default()
+            },
+            Policy {
+                mode: Mode::Allow,
+                allow: vec!["Read".into(), "Bash".into()],
+                ..Policy::default()
+            },
+            // The live account: `none` with a written-down allow list, which
+            // is the combination that produced the 1% turns.
+            Policy {
+                mode: Mode::None,
+                allow: vec!["Read".into(), "Bash".into(), "Edit".into()],
+                ..Policy::default()
+            },
+        ];
+        for policy in policies {
+            let mut first = request(&["Read", "Bash", "Edit"]);
+            first["messages"] = json!([{"role": "user", "content": "hi"}]);
+            apply(&mut first, &policy, true);
+            let after_first = names(&first);
+
+            // One tool called; the others go quiet for a long stretch.
+            let mut body = request(&["Read", "Bash", "Edit"]);
+            let mut messages = vec![json!({"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": "Bash", "input": {}}
+            ]})];
+            for i in 0..500 {
+                messages.push(json!({"role": "user", "content": format!("filler {i}")}));
+            }
+            body["messages"] = Value::Array(messages);
+            apply(&mut body, &policy, true);
+
+            assert_eq!(
+                names(&body),
+                after_first,
+                "{:?} sent a different set after 500 quiet turns",
+                policy.mode
+            );
+        }
+    }
+
+    /// [`Mode::All`] and [`Mode::Referenced`] are the same request. They were
+    /// two behaviours; the pruning one bought a smaller body at the price of
+    /// re-buying the whole prefix, which costs far more than the tools weigh.
+    #[test]
+    fn referenced_is_an_alias_for_all() {
+        let mut full = request(&["Read", "Bash", "Edit"]);
+        let mut referenced = full.clone();
+        full["messages"] = json!([{"role": "user", "content": "hi"}]);
+        referenced["messages"] = json!([{"role": "user", "content": "hi"}]);
+        apply(
+            &mut full,
+            &Policy {
+                mode: Mode::All,
+                ..Policy::default()
+            },
+            true,
+        );
+        apply(
+            &mut referenced,
+            &Policy {
+                mode: Mode::Referenced,
+                ..Policy::default()
+            },
+            true,
+        );
+        assert_eq!(names(&full), names(&referenced));
+        assert_eq!(names(&referenced), ["Read", "Bash", "Edit"]);
+        assert!(!Mode::Referenced.prunes());
     }
 
     #[test]
