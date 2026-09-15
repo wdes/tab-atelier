@@ -580,8 +580,25 @@ const AdminApp = Vue.defineComponent({
     mappingModelChoices(): string[] {
       return this.modelChoices.map((choice) => choice.value);
     },
+  },
+  mounted() {
+    // A token already in this session means a reload should land straight back
+    // on the list rather than asking for it again.
+    if (this.token) {
+      api.token = this.token;
+      void this.load();
+    }
+  },
+  methods: {
     /**
      * A model's published rates, or nothing where none are recorded.
+     *
+     * A method rather than a computed, because it takes the thing it labels.
+     * `computed` entries are getters that Vue evaluates with no arguments, so
+     * the template's `priceLabel(m)` would call the getter's *result* — which
+     * threw `priceLabel is not a function` and left the whole page blank,
+     * because Vue aborts the render on the first such error. Helpers that take
+     * an argument belong here.
      *
      * Trims to three significant places rather than two decimals: the rates run
      * from $0.003 to $15 per 1M, so `toFixed(2)` would render the cache-hit
@@ -597,16 +614,6 @@ const AdminApp = Vue.defineComponent({
       const p = m.price;
       return `${rate(p.cache_hit)} / ${rate(p.input)} / ${rate(p.output)} per 1M`;
     },
-  },
-  mounted() {
-    // A token already in this session means a reload should land straight back
-    // on the list rather than asking for it again.
-    if (this.token) {
-      api.token = this.token;
-      void this.load();
-    }
-  },
-  methods: {
     // Load everything the page shows, and treat success as proof the token is
     // good — there is no separate check to make, and a second round trip could
     // only disagree with this one.
@@ -1382,4 +1389,43 @@ const AdminApp = Vue.defineComponent({
   },
 });
 
-createApp(AdminApp).mount("#app");
+const app = createApp(AdminApp);
+
+// A render error is not fatal, but Vue treats it as one: it aborts the render,
+// leaving `#app` as whatever the template had produced so far — nothing, for a
+// first paint. So a mistake anywhere in the template shows as a blank white
+// page with the cause only in a console nobody has open, which is how
+// `priceLabel is not a function` reached production.
+//
+// Two things happen instead. The error is reported to the console with the
+// component that raised it, so it is diagnosable from a screenshot of the
+// console rather than a live debugger. And the page is replaced with something
+// that says so, because a visible failure is strictly better than a blank one:
+// a blank page is indistinguishable from "the proxy is down", "the network is
+// broken" and "you typed the wrong port", and it invites reloading rather than
+// reporting.
+//
+// Deliberately not a retry or a recovery: whatever was rendered is gone, and
+// guessing at a partial re-render would hide the bug rather than surface it.
+app.config.errorHandler = (err, _instance, info) => {
+  console.error(`dashboard render failed (${info})`, err);
+  const message = err instanceof Error ? err.message : String(err);
+  // Deferred, and that is the whole trick: Vue patches the failed render's
+  // placeholder into `#app` *after* this handler returns — a lone comment
+  // node, `<!---->` — so anything written here is overwritten a moment later
+  // and the page stays blank. Waiting one turn lets that patch land first.
+  setTimeout(() => {
+    const root = document.querySelector("#app");
+    // Text, not `childElementCount`: the placeholder is a comment, and a
+    // comment is not an element, so an element count reads zero on a page
+    // that has both failed and been re-rendered.
+    if (!root || (root.textContent ?? "").trim() !== "") return;
+    root.innerHTML =
+      `<div class="p-4"><div class="alert alert-danger mb-0">` +
+      `<strong>The dashboard failed to render.</strong> ` +
+      `<pre class="mt-2 mb-0 small">${message.replace(/[<&]/g, (c) => (c === "<" ? "&lt;" : "&amp;"))}</pre>` +
+      `</div></div>`;
+  }, 0);
+};
+
+app.mount("#app");
