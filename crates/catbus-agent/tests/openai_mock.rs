@@ -255,15 +255,33 @@ fn openai_backend_runs_a_tool_round_trip() {
 
     // Round 2 must feed the tool output back as a `tool` message tied
     // to the call id, preceded by the assistant tool-call turn.
+    //
+    // The state turn is appended after all of it, so the last message is the
+    // env block rather than the tool result. That ordering is deliberate and
+    // also what this wire requires: OpenAI is strict that a `tool` message
+    // directly follows the assistant turn carrying its `tool_calls`, so the
+    // state turn must not land between them.
     let second = rx.recv_timeout(Duration::from_secs(5)).unwrap();
     let req = body_of(&second);
     let messages = req["messages"].as_array().unwrap();
-    let assistant = &messages[messages.len() - 2];
+    let last = messages.len() - 1;
+
+    let assistant = &messages[last - 2];
     assert_eq!(assistant["role"], "assistant");
     assert_eq!(assistant["tool_calls"][0]["id"], "call_1");
-    let tool_msg = &messages[messages.len() - 1];
-    assert_eq!(tool_msg["role"], "tool");
+    let tool_msg = &messages[last - 1];
+    assert_eq!(
+        tool_msg["role"], "tool",
+        "a tool result must immediately follow its call"
+    );
     assert_eq!(tool_msg["tool_call_id"], "call_1");
+    let state = &messages[last];
+    assert_eq!(state["role"], "user");
+    assert!(
+        state["content"].as_str().unwrap_or_default().starts_with("<env "),
+        "the state turn goes last, got: {}",
+        state["content"]
+    );
     assert!(
         tool_msg["content"].as_str().unwrap().contains("mock says hi"),
         "tool result should carry the file contents: {tool_msg}"
@@ -273,28 +291,40 @@ fn openai_backend_runs_a_tool_round_trip() {
 #[test]
 fn api_error_is_reported_over_the_socket() {
     let dir = tempfile::tempdir().unwrap();
-    let (port, _rx) = spawn_mock_server(vec![(
-        "HTTP/1.1 500 Internal Server Error",
-        r#"{"error":"mock exploded"}"#,
-    )]);
+    // Four responses, because a 500 is retryable and the agent now sends up to
+    // four attempts before giving up. One response would leave the second
+    // connection refused — a transport error rather than the status the test is
+    // about — so the mock has to answer every attempt for the assertion below
+    // to be testing error reporting rather than connection handling.
+    let (port, _rx) = spawn_mock_server(vec![
+        ("HTTP/1.1 500 Internal Server Error", r#"{"error":"mock exploded"}"#),
+        ("HTTP/1.1 500 Internal Server Error", r#"{"error":"mock exploded"}"#),
+        ("HTTP/1.1 500 Internal Server Error", r#"{"error":"mock exploded"}"#),
+        ("HTTP/1.1 500 Internal Server Error", r#"{"error":"mock exploded"}"#),
+    ]);
     let socket = dir.path().join("agent.sock");
     let _agent = spawn_agent(dir.path(), &socket, port);
 
     let (mut reader, mut stream) = connect_socket(&socket);
 
-    // Flip plan-mode over the socket first, so the failing request is
-    // also built with the plan-mode system prompt branch.
+    // Flip to plan mode over the socket first, so the failing request is
+    // also built with the plan gate in its environment turn. The reply text
+    // changed from `plan-mode = true` when the two-state boolean became a
+    // three-state gate; the message is presentation, and nothing parses it.
     stream.write_all(b"{\"kind\":\"set_plan_mode\",\"on\":true}\n").unwrap();
     let mut line = String::new();
     reader.read_line(&mut line).unwrap();
-    assert!(line.contains("plan-mode = true"), "unexpected reply: {line}");
+    assert!(line.contains("gate = plan"), "unexpected reply: {line}");
 
+    // Retries make this take a few seconds: the backoff is 1s, 2s and 4s
+    // between four attempts. The socket read timeout is 30s, so it fits, but
+    // the wait is real and this test is the slowest here because of it.
     let reply = send_prompt(&mut stream, &mut reader, "hello?");
     assert_eq!(reply["kind"], "error", "unexpected reply: {reply}");
     let message = reply["message"].as_str().unwrap();
     assert!(
         message.contains("500") && message.contains("mock exploded"),
-        "error should surface status and body: {message}"
+        "error should surface status and body after the retries are exhausted: {message}"
     );
 }
 

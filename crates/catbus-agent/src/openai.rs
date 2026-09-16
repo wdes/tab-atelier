@@ -55,14 +55,23 @@ pub fn infomaniak_chat_url(product_id: &str) -> String {
 /// Build the chat-completions request body from the agent's
 /// Anthropic-shaped state. `system` becomes the leading `system`
 /// message; `tool_specs` are the Anthropic-format specs from
-/// `tools::tool_specs()`.
+/// [`crate::tools::ToolSet::specs`].
+///
+/// `state` is the env turn — the working directory and permission mode, as
+/// rendered by [`crate::cache::env_text`]. It goes on the **end**, after the
+/// history, for the same reason it does on the relay wire: a turn at the end
+/// extends the prefix, where the same bytes at the front would invalidate
+/// everything behind them. This wire has no `cache_control`, but the ordering
+/// costs nothing and keeps the two backends consistent, so a reader does not
+/// have to remember which one is which.
 #[must_use]
-pub fn build_request(model: &str, system: &str, tool_specs: &[Value], history: &[ApiMessage]) -> Value {
-    let mut messages = Vec::with_capacity(history.len() + 1);
+pub fn build_request(model: &str, system: &str, state: &str, tool_specs: &[Value], history: &[ApiMessage]) -> Value {
+    let mut messages = Vec::with_capacity(history.len() + 2);
     messages.push(json!({ "role": "system", "content": system }));
     for msg in history {
         convert_message(msg, &mut messages);
     }
+    messages.push(json!({ "role": "user", "content": state }));
     let tools: Vec<Value> = tool_specs.iter().map(tool_to_openai).collect();
     json!({
         "model": model,
@@ -317,8 +326,8 @@ mod tests {
                 }],
             ),
         ];
-        let specs = crate::tools::tool_specs();
-        let req = build_request("test-model", "be helpful", &specs, &history);
+        let specs = crate::tools::ToolSet::builtin().specs().to_vec();
+        let req = build_request("test-model", "be helpful", "state", &specs, &history);
 
         assert_eq!(req["model"], "test-model");
         assert_eq!(req["max_tokens"], 8192);
@@ -374,12 +383,16 @@ mod tests {
                 },
             ],
         )];
-        let req = build_request("m", "s", &[], &history);
+        let req = build_request("m", "s", "state", &[], &history);
         let messages = req["messages"].as_array().unwrap();
-        assert_eq!(messages.len(), 3);
+        // system, the tool result, the trailing text, and the state turn.
+        assert_eq!(messages.len(), 4);
         assert_eq!(messages[1]["role"], "tool");
         assert_eq!(messages[2]["role"], "user");
         assert_eq!(messages[2]["content"], "carry on");
+        // The state turn is last, after the history — the ordering that keeps
+        // it from invalidating anything behind it.
+        assert_eq!(messages[3]["content"], "state");
     }
 
     #[test]
@@ -394,17 +407,20 @@ mod tests {
                 content: ApiContent::Plain("not a turn".into()),
             },
         ];
-        let req = build_request("m", "s", &[], &history);
+        let req = build_request("m", "s", "state", &[], &history);
         let messages = req["messages"].as_array().unwrap();
-        assert_eq!(messages.len(), 2);
+        // The system role in the history is not a turn and is dropped, so this
+        // is system, the assistant's answer, and the state turn.
+        assert_eq!(messages.len(), 3);
         assert_eq!(messages[1]["role"], "assistant");
         assert_eq!(messages[1]["content"], "prior answer");
+        assert_eq!(messages[2]["content"], "state");
     }
 
     #[test]
     fn tool_spec_without_schema_gets_empty_parameters() {
         let specs = [json!({ "name": "Bare" })];
-        let req = build_request("m", "s", &specs, &[]);
+        let req = build_request("m", "s", "state", &specs, &[]);
         let tool = &req["tools"][0]["function"];
         assert_eq!(tool["name"], "Bare");
         assert_eq!(tool["parameters"], json!({ "type": "object", "properties": {} }));
@@ -413,9 +429,12 @@ mod tests {
     #[test]
     fn build_request_drops_empty_assistant_turns() {
         let history = vec![blocks("assistant", vec![])];
-        let req = build_request("m", "s", &[], &history);
-        // Only the system message survives.
-        assert_eq!(req["messages"].as_array().unwrap().len(), 1);
+        let req = build_request("m", "s", "state", &[], &history);
+        let messages = req["messages"].as_array().unwrap();
+        // The empty assistant turn contributes nothing, so only the system
+        // message and the state turn remain.
+        assert_eq!(messages.len(), 2, "got {messages:?}");
+        assert_eq!(messages[1]["content"], "state");
     }
 
     /// Mock of a plain text answer, `x.ai` / `OpenAI` shape.

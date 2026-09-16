@@ -23,6 +23,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
 use crate::agent::Agent;
+use crate::tools;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SocketError {
@@ -109,11 +110,32 @@ async fn handle(stream: UnixStream, agent: Arc<Agent>) -> Result<(), SocketError
                 }
             },
             Request::SetPlanMode { on } => {
-                agent.set_plan_mode(on);
+                let gate = if on { tools::Gate::Plan } else { tools::Gate::Open };
+                agent.set_gate(gate);
                 write_line(
                     &mut write_half,
                     &Response::Done {
-                        text: format!("plan-mode = {on}"),
+                        text: format!("gate = {}", gate.as_str()),
+                    },
+                )
+                .await?;
+            }
+            Request::SetGate { gate } => {
+                let Some(parsed) = tools::parse_gate(&gate) else {
+                    write_line(
+                        &mut write_half,
+                        &Response::Error {
+                            message: format!("unknown gate {gate:?}; expected open, plan or auto"),
+                        },
+                    )
+                    .await?;
+                    continue;
+                };
+                agent.set_gate(parsed);
+                write_line(
+                    &mut write_half,
+                    &Response::Done {
+                        text: format!("gate = {}", parsed.as_str()),
                     },
                 )
                 .await?;
@@ -145,8 +167,22 @@ async fn shutdown_signal() {
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum Request {
-    Prompt { text: String },
-    SetPlanMode { on: bool },
+    Prompt {
+        text: String,
+    },
+    /// The original two-state form, kept working.
+    ///
+    /// A client that only knows about plan-mode still decides
+    /// `Plan` vs `Open` and cannot express auto — which is the correct
+    /// degradation: it never asked for the third state, so it must not get it.
+    SetPlanMode {
+        on: bool,
+    },
+    /// The three-state form. `"open"`, `"plan"` or `"auto"`; anything else is
+    /// refused rather than defaulted, so a typo cannot silently mean "open".
+    SetGate {
+        gate: String,
+    },
 }
 
 #[derive(Serialize)]
