@@ -9,10 +9,23 @@
 //! `messages` there turns every turn into a full-price cache miss. Shorter
 //! body, bigger bill.
 //!
-//! A prompt cache does not follow a request to a provider that is not
-//! Anthropic, though. The moment routing sends a call elsewhere the cache is
-//! gone anyway, and *that* is the hop where shortening the history costs
-//! nothing. Hence a per-provider setting rather than a global one.
+//! A provider that is not Anthropic was assumed to have no prompt cache at
+//! all, which was the original justification for compacting here: if the cache
+//! is gone the moment routing sends a call elsewhere, shortening the history
+//! costs nothing. **That assumption is wrong.** Measured on the live `DeepSeek`
+//! hop, the auto-mode classifier — a request this pass deliberately never
+//! touches — reads back 99.8% of its prompt from cache, and conversations sit
+//! at 85–98%. So a non-Anthropic hop does cache, and rewriting the middle of
+//! `messages` there invalidates the prefix exactly as it would on Anthropic.
+//!
+//! What follows from that, and what is deliberately not yet acted on: this
+//! pass cannot see which `cache_control` breakpoints a body carries, so it
+//! cannot tell a cold conversation from a warm one. It compacts both. The
+//! saving is real (the bytes are old turns, priced at cache-hit rates), but it
+//! is smaller than it looks and it is paid for in invalidated prefixes. Making
+//! the pass idle-gated — compact only when the conversation is cold enough
+//! that no warm prefix exists to break — is the fix, and it needs a per-
+//! conversation signal this process does not currently keep.
 //!
 //! # Deterministic, and why that matters
 //!
@@ -28,6 +41,32 @@
 //! desync the `tool_use` arguments the model already emitted. `system[]` is
 //! the other half of that prefix. Neither is in the blast radius here, nor is
 //! `metadata`, `context_management`, `thinking` or `output_config`.
+//!
+//! # Why write payloads are no longer elided
+//!
+//! Layer D used to replace the long string arguments of old `Write` and `Edit`
+//! calls — the model's own authored text — with a stub. It is gone, and the
+//! reason is not that it saved too little.
+//!
+//! A stub standing where file content was is text the model can copy. On
+//! 2026-09-16 an agent did exactly that: it read a stubbed `Write` in its own
+//! history, took the stub for the file, and wrote the marker into
+//! `046-boot-text.sh`, destroying `policies.json` and four memory files. The
+//! same mechanism put markers into pull-request bodies. Nothing on the response
+//! path can catch it after the fact — the relay streams the answer back
+//! untouched and never sees the arguments the model emits.
+//!
+//! Eliding a `tool_result` is a different thing. Those carry command output,
+//! which nothing renders back as a file body, and the model is told the content
+//! is gone. Layer D replaced text the model had *authored*, so a stub there read
+//! as something it had authored too.
+//!
+//! What it cost: measured over 150 live requests it was 11% of everything
+//! compaction removed (range 7–17%), worth roughly $59/month — the bytes are
+//! old turns, so they are priced at cache-hit rates rather than the miss rate
+//! that dominates the bill. There was no safe subset to keep either: 93% of
+//! those bytes sat in payloads under 10 KB, so the saving was in volume rather
+//! than in a few outliers that could have been exempted.
 //!
 //! # Relationship to `src/transcript_compact.rs`
 //!
@@ -61,13 +100,6 @@ pub enum Compact {
     Tools,
     /// Layer B: A, plus drop `thinking` from old assistant turns.
     ToolsThinking,
-    /// Layer D: B, plus stub the file bodies old `Write`/`Edit` calls carry.
-    ///
-    /// Sits below [`Compact::All`] rather than above it because layer C is the
-    /// cheapest thing here — a stale system notice is noise, not bulk — and the
-    /// ladder is ordered by how much a level removes. `Writes` is the bulk of
-    /// layers A–D without the notice edit; `All` is all four.
-    Writes,
     /// Layer C on top of the rest: stale injected system notices go too.
     ///
     /// That means both the `<total_tokens>` banners, of which only the newest
@@ -78,7 +110,7 @@ pub enum Compact {
 
 impl Compact {
     /// Every level, in order of how much they remove.
-    pub const ALL: [Self; 5] = [Self::None, Self::Tools, Self::ToolsThinking, Self::Writes, Self::All];
+    pub const ALL: [Self; 4] = [Self::None, Self::Tools, Self::ToolsThinking, Self::All];
 
     /// The name as it appears in `providers.json`.
     #[must_use]
@@ -87,7 +119,6 @@ impl Compact {
             Self::None => "none",
             Self::Tools => "tools",
             Self::ToolsThinking => "tools_thinking",
-            Self::Writes => "writes",
             Self::All => "all",
         }
     }
@@ -99,8 +130,7 @@ impl Compact {
             Self::None => "None",
             Self::Tools => "Remove old tool results",
             Self::ToolsThinking => "Remove old tool results and thinking",
-            Self::Writes => "Remove old tool results, thinking and Write/Edit payloads",
-            Self::All => "Remove old tool results, thinking, Write/Edit payloads and system notices",
+            Self::All => "Remove old tool results, thinking and system notices",
         }
     }
 
@@ -113,13 +143,7 @@ impl Compact {
     /// Whether this level drops old thinking blocks.
     #[must_use]
     pub const fn does_thinking(self) -> bool {
-        matches!(self, Self::ToolsThinking | Self::Writes | Self::All)
-    }
-
-    /// Whether this level stubs out the file bodies old write calls carry.
-    #[must_use]
-    pub const fn does_writes(self) -> bool {
-        matches!(self, Self::Writes | Self::All)
+        matches!(self, Self::ToolsThinking | Self::All)
     }
 
     /// Whether this level drops stale injected system notices.
@@ -150,16 +174,6 @@ pub struct Stats {
     /// result it replaced — see [`MIN_TOOL_RESULT_BYTES`].
     pub tool_results_kept_small: usize,
     pub thinking_dropped: usize,
-    /// Layer D: file bodies replaced inside old `tool_use` inputs.
-    ///
-    /// Counted per STRING, not per call, because one call can carry several —
-    /// an `Edit` has `old_string` and `new_string`, a `MultiEdit` has a whole
-    /// array. A count of calls would read as "one file" on a turn that dropped
-    /// two.
-    pub writes_elided: usize,
-    /// Write calls left intact because their paired `tool_result` is an error —
-    /// see [`errored_call_ids`].
-    pub writes_kept_for_error: usize,
     pub notices_dropped: usize,
 }
 
@@ -167,7 +181,7 @@ impl Stats {
     /// Whether the pass changed anything worth logging.
     #[must_use]
     pub const fn changed(&self) -> bool {
-        self.tool_results_elided > 0 || self.thinking_dropped > 0 || self.writes_elided > 0 || self.notices_dropped > 0
+        self.tool_results_elided > 0 || self.thinking_dropped > 0 || self.notices_dropped > 0
     }
 }
 
@@ -203,67 +217,6 @@ fn stub(byte_count: u64, tool_use_id: &str) -> String {
 /// Whether this content is already a stub from an earlier pass.
 fn already_elided(content: &serde_json::Value) -> bool {
     content.as_str().is_some_and(|s| s.starts_with(ELIDED_PREFIX))
-}
-
-/// The tools whose `input` carries file content rather than a command.
-///
-/// Matched by NAME, which is a coupling the other layers do not have: A and B
-/// read the block `type`, which the API defines, while these strings are Claude
-/// Code's choice and could be renamed. The failure is bounded and safe — a
-/// renamed tool simply stops being compacted, exactly as it is today — and the
-/// alternative, matching on the SHAPE of `input`, would rewrite whichever tool
-/// happened to have a long field in it. A false positive there corrupts a call
-/// the model still needs; a false negative costs bytes.
-const WRITE_TOOLS: [&str; 4] = ["Write", "Edit", "MultiEdit", "NotebookEdit"];
-
-/// The smallest string worth replacing.
-///
-/// Well above the length of a path, a hash or a flag, and well below a file
-/// body. Charging a stub for a 30-byte `old_string` would make the body BIGGER
-/// on a turn that edits four small things.
-const MIN_WRITE_BYTES: usize = 200;
-
-/// The marker every write stub begins with — see [`ELIDED_PREFIX`] for why the
-/// pass needs one at all.
-const WRITE_ELIDED_PREFIX: &str = "[file content elided by tab-atelier-proxy: ";
-
-/// The stub that replaces a long string inside a `tool_use` `input`.
-///
-/// It names no path: the `file_path` field beside it is untouched and already
-/// says which file, and repeating it would mean the stub disagreed with reality
-/// whenever the pass had rewritten the one and not the other. The byte count is
-/// the serialized length, the same quantity `bytes_of` reports for layer A.
-fn payload_stub(prefix: &str, byte_count: u64) -> String {
-    format!("{prefix}{byte_count} bytes]")
-}
-
-/// A path at or beyond this length is logged when a write call carries one.
-///
-/// Paths are never elided — see [`is_content_key`] — but they are still
-/// strings, and the first version of this pass stubbed them like content. That
-/// cost the model the filename it needed and was silent about it, so the guard
-/// is worth a log line: an operator seeing a long path named does not mean the
-/// pass is broken, but *not* seeing one named while a filename vanishes is the
-/// signal that the guard has stopped holding.
-///
-/// `NAME_MAX` is 255 bytes on Linux, so this sits below the legal maximum
-/// rather than at it: the interesting case is a path approaching the limit,
-/// not one that has reached it.
-const PATH_LOG_BYTES: usize = 120;
-
-/// Report any path-like field on a write or shell call that is long enough to
-/// matter. Observability only — it changes nothing about the body.
-fn log_long_paths(input: &serde_json::Value) {
-    let Some(fields) = input.as_object() else { return };
-    for (key, value) in fields {
-        if !key.ends_with("path") {
-            continue;
-        }
-        let Some(path) = value.as_str() else { continue };
-        if path.len() >= PATH_LOG_BYTES {
-            eprintln!("tab-atelier-proxy: long {key} ({} bytes): {path}", path.len());
-        }
-    }
 }
 
 /// The oldest message index still inside the trailing window.
@@ -342,8 +295,7 @@ fn elide_tool_results(messages: &mut [serde_json::Value], stats: &mut Stats) {
             // been updated." — often shorter than the stub itself, which then
             // both grows the body and deletes the only record that the call
             // succeeded. Comparing against the real stub keeps that rule exact
-            // without a magic number. Layer D holds the same floor for a short
-            // `old_string` (`MIN_WRITE_BYTES`).
+            // without a magic number.
             let replacement = stub(bytes_of(content), id);
             if replacement.len() as u64 >= bytes_of(content) {
                 stats.tool_results_kept_small += 1;
@@ -371,155 +323,7 @@ fn drop_thinking(messages: &mut [serde_json::Value], stats: &mut Stats) {
     }
 }
 
-/// Layer D — stub the file bodies old write calls carry in their `input`.
-///
-/// The mirror of layer A, and the same bulk seen from the other side. A `Write`
-/// block holds the whole file in its `input.content`, while its matching
-/// `tool_result` is the four words "File created successfully" — so layer A
-/// finds nothing there while the payload sits in the pair's other half. On an
-/// editing session that is the largest untouched class in the body.
-///
-/// Only the VALUE changes, never the key. Upstream validates a re-sent
-/// `tool_use` block's `input` against the tool's schema on every turn, so the
-/// field has to stay present and stay a string: shrinking a string cannot fail
-/// a `type: string` check, while removing the key fails `required`. The
-/// `tool_use` block itself, its id, its name and its position all stay — which
-/// is also what keeps the id-pairing invariant of layer A intact.
-fn elide_writes(messages: &mut [serde_json::Value], stats: &mut Stats) {
-    // Read the pairing before mutating these messages: layer A rewrites them
-    // too, and this pass should not depend on what it chose to leave behind.
-    let errored = errored_call_ids(messages);
-    let start = window_start(messages, KEEP_TURNS, has_elidable_call);
-    for message in &mut messages[..start] {
-        let Some(list) = blocks_mut(message) else { continue };
-        for block in list.iter_mut() {
-            let Some(prefix) = elidable_prefix(block) else {
-                continue;
-            };
-            // A failed call's payload is the only record of what the model
-            // tried to do: the paired result says why it did not land, but not
-            // what "it" was. Stubbing both halves leaves an agent unable to
-            // tell a write that failed from one that was merely compressed,
-            // which is precisely how one concludes it already wrote the file.
-            if let Some(id) = block.get("id").and_then(serde_json::Value::as_str)
-                && errored.iter().any(|e| e == id)
-            {
-                stats.writes_kept_for_error += 1;
-                continue;
-            }
-            let Some(input) = block.get_mut("input") else { continue };
-            log_long_paths(input);
-            stats.writes_elided += elide_long_strings(input, prefix);
-        }
-    }
-}
-
-/// Ids of calls whose `tool_result` came back marked `is_error`.
-///
-/// `is_error` lives on the paired result, not on the `tool_use` — so a caller
-/// that only looks at the call cannot see it. Reading the pairing up front is
-/// what lets [`elide_writes`] spare a failed call's payload.
-fn errored_call_ids(messages: &[serde_json::Value]) -> Vec<String> {
-    let mut ids = Vec::new();
-    for message in messages {
-        let Some(list) = blocks(message) else { continue };
-        for block in list {
-            if block_type(block) != Some("tool_result") {
-                continue;
-            }
-            let failed = block
-                .get("is_error")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false);
-            if !failed {
-                continue;
-            }
-            if let Some(id) = block.get("tool_use_id").and_then(serde_json::Value::as_str) {
-                ids.push(id.to_owned());
-            }
-        }
-    }
-    ids
-}
-
-/// The stub marker for a call whose payload this layer shrinks, if it does.
-///
-/// Only file-writing tools are shrunk. A `Bash` command is the model's own
-/// intent rather than a payload — stubbing it left agents unable to see what
-/// they had run and reasoning about commands they could not read — so shell
-/// calls are never elided, however long they are. The bulk of a shell call is
-/// its output, which layer A already bounds.
-fn elidable_prefix(block: &serde_json::Value) -> Option<&'static str> {
-    if block_type(block) != Some("tool_use") {
-        return None;
-    }
-    let name = block.get("name").and_then(serde_json::Value::as_str)?;
-    if WRITE_TOOLS.contains(&name) {
-        return Some(WRITE_ELIDED_PREFIX);
-    }
-    None
-}
-
-/// Whether a message carries at least one call this layer shrinks.
-fn has_elidable_call(message: &serde_json::Value) -> bool {
-    blocks(message).is_some_and(|b| b.iter().any(|block| elidable_prefix(block).is_some()))
-}
-
-/// Replace every long string anywhere inside a `tool_use` `input`, returning
-/// how many were replaced.
-///
-/// Recursive rather than a fixed list of field names, because `MultiEdit` nests
-/// its edits in an array and a tool may nest its payload one level deeper than
-/// any list written here could predict. Depth is bounded by the JSON the caller
-/// already parsed, so this cannot recurse further than the body itself does.
-fn elide_long_strings(value: &mut serde_json::Value, prefix: &str) -> usize {
-    elide_strings_under(value, prefix, None)
-}
-
-/// A field holding a *path*, not a payload. Paths are identifiers the model
-/// needs to name what it is acting on; a `file_path` is legally up to
-/// `NAME_MAX` (255) bytes per component, so it would clear `MIN_WRITE_BYTES`
-/// and be replaced by a stub the model cannot use. Payload fields — `content`,
-/// `old_string`, `command`, and whatever a future tool nests — are still
-/// stubbed wherever they appear.
-fn is_path_key(key: &str) -> bool {
-    matches!(key, "file_path" | "notebook_path" | "path")
-}
-
-/// [`elide_long_strings`], carrying the field name each value sits under so a
-/// path field can be exempted. An array element has no key of its own; the
-/// objects inside it name their own fields when we descend into them.
-fn elide_strings_under(value: &mut serde_json::Value, prefix: &str, key: Option<&str>) -> usize {
-    if key.is_some_and(is_path_key) {
-        return 0;
-    }
-    match value {
-        serde_json::Value::String(s) => {
-            // Idempotence, deliberately ahead of the size gate. The stub is
-            // well under `MIN_WRITE_BYTES` today, so the gate would also stop
-            // it — but that would make the pass idempotent by arithmetic
-            // coincidence rather than by rule, and a second pass would then
-            // recompute the byte count from the stub, losing the original.
-            if s.starts_with(WRITE_ELIDED_PREFIX) {
-                return 0;
-            }
-            if s.len() < MIN_WRITE_BYTES {
-                return 0;
-            }
-            let serialized = serde_json::to_vec(&*s).map_or(0, |v| v.len());
-            *s = payload_stub(prefix, u64::try_from(serialized).unwrap_or(u64::MAX));
-            1
-        }
-        serde_json::Value::Array(items) => items.iter_mut().map(|v| elide_strings_under(v, prefix, None)).sum(),
-        serde_json::Value::Object(fields) => fields
-            .iter_mut()
-            .map(|(k, v)| elide_strings_under(v, prefix, Some(k)))
-            .sum(),
-        _ => 0,
-    }
-}
-
-/// Whether a message is one of the re-injected system notices layer D drops.
+/// Whether a message is one of the re-injected system notices this pass drops.
 ///
 /// `system` is not a role the Messages API defines, so a message carrying it is
 /// by construction something the client spliced in — the harness's own prompt
@@ -604,9 +408,6 @@ pub fn apply(body: &mut serde_json::Value, level: Compact) -> Stats {
     }
     if level.does_thinking() {
         drop_thinking(messages, &mut stats);
-    }
-    if level.does_writes() {
-        elide_writes(messages, &mut stats);
     }
     if level.does_notices() {
         drop_banners(messages, &mut stats);
@@ -797,9 +598,8 @@ mod tests {
     /// has been updated." — under 100 bytes. Stubbing that spends MORE bytes
     /// than it saves, and deletes the only record that the call succeeded: a
     /// model re-reading its own history finds an opaque stub where "it worked"
-    /// used to be, and cannot tell whether the edit landed. Layer D already
-    /// refuses to charge a stub for a short `old_string` (`MIN_WRITE_BYTES`);
-    /// this is the same floor for layer A.
+    /// used to be, and cannot tell whether the edit landed. This is the floor
+    /// that keeps that from happening.
     #[test]
     fn layer_a_leaves_a_result_shorter_than_its_own_stub() {
         let ack = "The file /src/lib.rs has been updated.";
@@ -815,32 +615,6 @@ mod tests {
             ack,
             "a 34-byte acknowledgement must survive a ~90-byte stub"
         );
-    }
-
-    /// Linux allows a 255-byte path component (`NAME_MAX`). A stub stands in
-    /// for a body without naming the file, so the `file_path` beside it must
-    /// come through byte-identical. Multi-byte characters on purpose: a slice
-    /// taken at a byte offset would panic or split a character, where a plain
-    /// ASCII name could truncate without complaint.
-    #[test]
-    fn a_max_length_filename_survives_the_write_stub() {
-        let name = "é".repeat(127);
-        assert_eq!(name.len(), 254, "127 x 'é' fills a 255-byte component");
-        let path = format!("/tmp/{name}");
-
-        let mut b = write_body();
-        // Message 1 is the oldest assistant turn: the first the layer reaches.
-        b["messages"][1]["content"][1]["input"]["file_path"] = json!(path);
-
-        let stats = apply(&mut b, Compact::Writes);
-
-        assert_eq!(stats.writes_elided, TURNS - KEEP_TURNS);
-        let first = write_inputs(&b)[0];
-        assert_eq!(first["file_path"], json!(path), "the path is not sliced");
-        assert_eq!(first["file_path"].as_str().expect("a path").len(), 259);
-        let stub = first["content"].as_str().expect("a stub");
-        assert!(stub.starts_with(WRITE_ELIDED_PREFIX), "{stub}");
-        assert!(stub.contains("5002 bytes"), "{stub}");
     }
 
     /// Layer B, and its window: counted over turns that HAVE thinking, so
@@ -955,7 +729,7 @@ mod tests {
     /// Every level below `All` leaves notices exactly where they were.
     #[test]
     fn layer_c_is_the_only_level_that_touches_notices() {
-        for level in [Compact::None, Compact::Tools, Compact::ToolsThinking, Compact::Writes] {
+        for level in [Compact::None, Compact::Tools, Compact::ToolsThinking] {
             let mut b = body();
             let mut msgs = messages(&b).clone();
             for i in 0..KEEP_TURNS + 3 {
@@ -1099,486 +873,18 @@ mod tests {
             assert!(pair[1] <= pair[0], "each level must not grow the body: {sizes:?}");
         }
         assert!(
-            sizes[0] > sizes[4],
+            sizes[0] > sizes[3],
             "`all` must actually be smaller than none: {sizes:?}"
         );
         assert_eq!(
             sizes[2], sizes[3],
-            "this fixture's Bash commands are one word, under the size gate, so \
-             layer D has nothing to stub: {sizes:?}"
-        );
-        assert_eq!(
-            sizes[3], sizes[4],
-            "and it has no system notices, so all adds nothing over writes: {sizes:?}"
+            "and it has no system notices, so all adds nothing over tools_thinking: {sizes:?}"
         );
 
         // And the flags agree with the names.
         assert!(!Compact::None.does_tools() && !Compact::None.does_thinking() && !Compact::None.does_notices());
         assert!(Compact::Tools.does_tools() && !Compact::Tools.does_thinking());
-        assert!(Compact::ToolsThinking.does_thinking() && !Compact::ToolsThinking.does_writes());
-        assert!(Compact::Writes.does_writes() && !Compact::Writes.does_notices());
-        assert!(Compact::All.does_notices());
-    }
-
-    // ---- Layer D ----------------------------------------------------------
-
-    /// The real-world shape layer D exists for: a `Write` whose `tool_result`
-    /// is a four-word confirmation while the file body sits in the call's own
-    /// `input`. Layer A now keeps such a short result rather than pay for a
-    /// stub longer than it was, so the 5 KB payload is reachable only here.
-    /// That asymmetry is why this layer is not redundant with it.
-    fn write_body() -> serde_json::Value {
-        let mut messages = Vec::new();
-        for i in 0..TURNS {
-            messages.push(json!({
-                "role": "user",
-                "content": [{
-                    "type": "tool_result",
-                    "tool_use_id": format!("call_{i:02}"),
-                    "content": "File created successfully",
-                }],
-            }));
-            messages.push(json!({
-                "role": "assistant",
-                "content": [
-                    {"type": "thinking", "thinking": "t".repeat(200 + i), "signature": format!("sig{i:02}")},
-                    {
-                        "type": "tool_use",
-                        "id": format!("call_{i:02}"),
-                        "name": "Write",
-                        // Sizes differ per turn, so the stub's byte count is
-                        // checkable against a specific index.
-                        "input": {"file_path": format!("/tmp/f{i:02}.rs"), "content": "x".repeat(5000 + i)},
-                    },
-                ],
-            }));
-        }
-        json!({"model": "claude-opus-5", "max_tokens": 4096, "messages": messages})
-    }
-
-    /// A body of `n` tool turns, each assistant turn built by `assistant(i)`.
-    ///
-    /// For the fixtures that are about one layer's window rather than its
-    /// effect: `KEEP_TURNS` turns is the threshold, so a test that wants
-    /// anything elided at all needs more than that.
-    fn turns(n: usize, assistant: impl Fn(usize) -> serde_json::Value) -> serde_json::Value {
-        let mut messages = Vec::new();
-        for i in 0..n {
-            messages.push(json!({
-                "role": "user",
-                "content": [{"type": "tool_result", "tool_use_id": format!("call_{i:02}"), "content": "ok"}],
-            }));
-            messages.push(json!({"role": "assistant", "content": [assistant(i)]}));
-        }
-        json!({"model": "claude-opus-5", "max_tokens": 4096, "messages": messages})
-    }
-
-    /// Every `tool_use` `input`, in order.
-    fn write_inputs(body: &serde_json::Value) -> Vec<&serde_json::Value> {
-        messages(body)
-            .iter()
-            .filter_map(blocks)
-            .flatten()
-            .filter(|b| block_type(b) == Some("tool_use"))
-            .filter_map(|b| b.get("input"))
-            .collect()
-    }
-
-    #[test]
-    fn layer_d_stubs_the_file_bodies_of_old_write_calls() {
-        let mut b = write_body();
-        let stats = apply(&mut b, Compact::Writes);
-
-        assert_eq!(stats.writes_elided, TURNS - KEEP_TURNS);
-        assert_eq!(
-            stats.tool_results_elided, 0,
-            "a 26-byte confirmation is shorter than the stub that would replace \
-             it, so layer A keeps it — the gate that stops a stub enlarging the body"
-        );
-
-        // …but what A finds there is nothing, which is the point. Measured
-        // rather than asserted in prose: A alone leaves the bodies behind.
-        let mut with_a_only = write_body();
-        let _ = apply(&mut with_a_only, Compact::Tools);
-        let saved = serialized(&with_a_only).len() - serialized(&b).len();
-        assert!(
-            saved > 19_000,
-            "the file bodies are the bulk and only D removes them; D saved {saved} bytes"
-        );
-
-        let inputs = write_inputs(&b);
-        assert_eq!(inputs.len(), TURNS, "no call may be removed");
-
-        // The stubbed ones keep everything but the body, including the path
-        // that makes the stub worth reading.
-        let first = inputs[0];
-        assert_eq!(first["file_path"], "/tmp/f00.rs");
-        let content = first["content"].as_str().expect("content must stay a string");
-        assert!(content.starts_with(WRITE_ELIDED_PREFIX), "{content}");
-        assert!(
-            content.contains("5002 bytes"),
-            "the count is of the serialized string it replaced: {content}"
-        );
-        assert!(
-            !content.contains("5000 bytes"),
-            "the count must include the JSON quotes, not the raw length: {content}"
-        );
-
-        // …and the kept ones are byte-identical.
-        let before = write_body();
-        let originals = write_inputs(&before);
-        for (i, kept) in inputs.iter().enumerate().skip(TURNS - KEEP_TURNS) {
-            assert_eq!(
-                serialized(kept),
-                serialized(originals[i]),
-                "the kept writes must be byte-identical: {i}"
-            );
-        }
-    }
-
-    /// A failed write is the one case the model must be able to audit: the
-    /// error names the reason, and the payload names what "it" was. Stubbing
-    /// the payload leaves `Error: …` attached to a byte count — an error with
-    /// no subject, and a gap the model can fill with "I already wrote it".
-    #[test]
-    fn layer_d_spares_a_write_whose_result_errored() {
-        let mut messages = Vec::new();
-        for i in 0..TURNS {
-            // One old call failed; every other call in the window succeeded.
-            let failed = i == 1;
-            messages.push(json!({
-                "role": "user",
-                "content": [{
-                    "type": "tool_result",
-                    "tool_use_id": format!("call_{i:02}"),
-                    "content": if failed { "Error: file is read-only" } else { "ok" },
-                    "is_error": failed,
-                }],
-            }));
-            messages.push(json!({
-                "role": "assistant",
-                "content": [{
-                    "type": "tool_use",
-                    "id": format!("call_{i:02}"),
-                    "name": "Write",
-                    "input": {
-                        "file_path": format!("/tmp/f{i:02}.rs"),
-                        "content": "x".repeat(5000 + i),
-                    },
-                }],
-            }));
-        }
-        let mut body = json!({
-            "model": "claude-opus-5",
-            "max_tokens": 4096,
-            "messages": messages,
-        });
-
-        let stats = apply(&mut body, Compact::Writes);
-
-        let inputs = write_inputs(&body);
-        assert_eq!(inputs.len(), TURNS, "no call may be removed");
-        let failed = inputs[1]["content"].as_str().expect("content must stay a string");
-        assert!(
-            !failed.starts_with(WRITE_ELIDED_PREFIX),
-            "the failed write keeps its payload: {failed}"
-        );
-        assert!(
-            failed.len() > 4000,
-            "and keeps it whole rather than truncated: {} bytes",
-            failed.len()
-        );
-        assert_eq!(stats.writes_kept_for_error, 1);
-
-        // The successful call in the same window is still stubbed: the
-        // exemption follows the outcome, not the tool.
-        assert!(
-            inputs[0]["content"]
-                .as_str()
-                .expect("content must stay a string")
-                .starts_with(WRITE_ELIDED_PREFIX)
-        );
-    }
-
-    /// Layer D is the mirror of A and must not run before its level: an
-    /// operator who chose `tools_thinking` did not ask for write bodies to go.
-    #[test]
-    fn layer_d_only_runs_at_its_own_level() {
-        for level in [Compact::None, Compact::Tools, Compact::ToolsThinking] {
-            let mut b = write_body();
-            let stats = apply(&mut b, level);
-            assert_eq!(stats.writes_elided, 0, "{level:?} stubbed a write");
-            let first = write_inputs(&b)[0];
-            assert_eq!(
-                first["content"].as_str().expect("string").len(),
-                5000,
-                "{level:?} touched a file body"
-            );
-        }
-    }
-
-    /// Upstream validates a re-sent `tool_use.input` against the tool's schema
-    /// on every turn. Stubbing a VALUE cannot fail a `type: string`; removing
-    /// a KEY fails `required`. This is the invariant that keeps the layer legal.
-    #[test]
-    fn layer_d_leaves_every_input_key_in_place() {
-        let before = write_body();
-        let mut after = before.clone();
-        let _ = apply(&mut after, Compact::Writes);
-        for (b, a) in write_inputs(&before).iter().zip(write_inputs(&after)) {
-            let b = b.as_object().expect("object");
-            let a = a.as_object().expect("object");
-            let keys: Vec<&String> = b.keys().collect();
-            assert_eq!(keys, a.keys().collect::<Vec<_>>(), "a key was removed or added");
-            for (name, value) in a {
-                assert_eq!(
-                    b[name].is_string(),
-                    value.is_string(),
-                    "{name} changed type — a schema check would fail"
-                );
-            }
-        }
-    }
-
-    /// A stub costs bytes. Below the threshold, replacing would make the body
-    /// BIGGER — a small `Edit` is two short strings and a path.
-    ///
-    /// Sized past `KEEP_TURNS` so the short strings are genuinely inside the
-    /// window: a fixture smaller than the window would pass this vacuously.
-    #[test]
-    fn layer_d_leaves_short_strings_alone() {
-        let mut b = turns(TURNS + 2, |_| {
-            json!({
-                "type": "tool_use", "id": "call", "name": "Edit",
-                "input": {"file_path": "/tmp/a.rs", "old_string": "let x = 1;", "new_string": "let x = 2;"},
-            })
-        });
-        let before = write_inputs(&b).into_iter().map(serialized).collect::<Vec<_>>();
-        let stats = apply(&mut b, Compact::Writes);
-        assert_eq!(stats.writes_elided, 0);
-        // The inputs specifically, not the whole body: layer A runs at this
-        // level too and elides the `ok` results, which would mask a write stub.
-        let after = write_inputs(&b).into_iter().map(serialized).collect::<Vec<_>>();
-        assert_eq!(before, after, "a small edit must not grow");
-    }
-
-    /// The gate is the tool NAME, not the shape of `input`. A tool outside the
-    /// write family is left alone however long its strings are — reading tools
-    /// like `Grep` and shell calls both pass through untouched.
-    #[test]
-    fn layer_d_does_not_touch_tools_that_are_not_elidable() {
-        let pattern = "echo".to_owned() + &" a".repeat(4000);
-        let mut b = turns(TURNS + 2, |_| {
-            json!({
-                "type": "tool_use", "id": "call", "name": "Grep",
-                "input": {"pattern": pattern, "path": "/tmp"},
-            })
-        });
-        let stats = apply(&mut b, Compact::Writes);
-        assert_eq!(stats.writes_elided, 0);
-        assert!(
-            write_inputs(&b)[0]["pattern"]
-                .as_str()
-                .expect("string")
-                .contains(" a a")
-        );
-    }
-
-    /// A shell command is the model's own intent, not a payload. Stubbing it
-    /// left agents unable to read what they had run and quoting values out of
-    /// commands they could not see, so `Bash` is never elided however long the
-    /// command is. The bulk of a shell call is its output, which layer A
-    /// bounds on the other side of the exchange.
-    #[test]
-    fn layer_d_never_stubs_shell_commands() {
-        let command = "echo".to_owned() + &" a".repeat(4000);
-        let mut b = turns(TURNS + 2, |_| {
-            json!({
-                "type": "tool_use", "id": "call", "name": "Bash",
-                "input": {"command": command, "description": "long but short"},
-            })
-        });
-        let stats = apply(&mut b, Compact::Writes);
-        assert_eq!(stats.writes_elided, 0);
-
-        let input = &write_inputs(&b)[0];
-        assert_eq!(input["command"], command, "the model keeps its own command");
-    }
-
-    /// A shell call and a write call can share one turn. Every write older than
-    /// the window is stubbed and the shell call beside it is not, and a second
-    /// pass changes none of it.
-    #[test]
-    fn layer_d_elides_writes_beside_shell_calls_and_stays_idempotent() {
-        let command = "x".repeat(5000);
-        let content = "y".repeat(5000);
-        let mut b = turns(TURNS + 2, |_| json!(null));
-
-        // `turns` wraps a single block per assistant message, so the two calls a
-        // turn needs are spliced in afterwards.
-        let mut msgs = messages(&b).clone();
-        for i in 0..TURNS + 2 {
-            msgs[2 * i + 1]["content"] = json!([
-                {"type": "tool_use", "id": "shell", "name": "Bash",
-                 "input": {"command": command}},
-                {"type": "tool_use", "id": "write", "name": "Write",
-                 "input": {"file_path": "/tmp/f.rs", "content": content}},
-            ]);
-        }
-        b["messages"] = json!(msgs);
-
-        // Every turn carries a write, so the last `KEEP_TURNS` turns are exactly
-        // the writes that stay whole.
-        let first = apply(&mut b, Compact::Writes);
-        assert_eq!(
-            first.writes_elided,
-            TURNS + 2 - KEEP_TURNS,
-            "the writes older than the window, and only those"
-        );
-
-        let mut twice = b.clone();
-        let stats = apply(&mut twice, Compact::Writes);
-        assert_eq!(serialized(&twice), serialized(&b), "idempotent");
-        assert_eq!(stats.writes_elided, 0, "and reports nothing to do");
-
-        // Two calls per turn, shell first: turn `t` is `inputs[2t]` (Bash) and
-        // `inputs[2t + 1]` (Write).
-        let inputs = write_inputs(&twice);
-        assert_eq!(inputs.len(), 2 * (TURNS + 2), "no call may be removed");
-        for turn in 0..TURNS + 2 {
-            assert_eq!(
-                inputs[2 * turn]["command"],
-                command,
-                "turn {turn}: a shell command is never stubbed"
-            );
-            if turn < TURNS + 2 - KEEP_TURNS {
-                assert!(
-                    inputs[2 * turn + 1]["content"]
-                        .as_str()
-                        .expect("content must stay a string")
-                        .starts_with(WRITE_ELIDED_PREFIX),
-                    "turn {turn} is older than the window, so its payload is elided"
-                );
-            } else {
-                assert_eq!(
-                    inputs[2 * turn + 1]["content"],
-                    content,
-                    "turn {turn} is inside the window"
-                );
-            }
-        }
-    }
-
-    /// The same rule as every other layer: a retry, or a second route change
-    /// on one request, re-runs the pass over its own output. Without the
-    /// marker the stub would be re-stubbed and the count would become the
-    /// stub's own length on every pass.
-    #[test]
-    fn layer_d_is_idempotent_and_reports_the_original_size() {
-        let mut once = write_body();
-        let _ = apply(&mut once, Compact::Writes);
-        let mut twice = once.clone();
-        let stats = apply(&mut twice, Compact::Writes);
-        assert_eq!(serialized(&twice), serialized(&once), "idempotent");
-        assert_eq!(stats.writes_elided, 0, "and reports nothing to do");
-
-        // The count is of what it replaced, not of the stub.
-        let stub = write_inputs(&twice)[0]["content"].as_str().expect("string");
-        assert!(stub.contains("5002 bytes"), "{stub}");
-        assert!(!stub.contains("bytes] bytes"), "the stub consumed itself: {stub}");
-    }
-
-    /// Nesting: `MultiEdit` keeps its edits in an array, and a stub has to be
-    /// found there too or the layer silently skips a whole tool.
-    #[test]
-    fn layer_d_reaches_strings_nested_in_arrays() {
-        let mut b = turns(TURNS + 2, |_| {
-            json!({
-                "type": "tool_use", "id": "call", "name": "MultiEdit",
-                "input": {"file_path": "/tmp/a.rs", "edits": [
-                    {"old_string": "a".repeat(300), "new_string": "b".repeat(300)},
-                    {"old_string": "c".repeat(10), "new_string": "d".repeat(10)},
-                ]},
-            })
-        });
-        let stats = apply(&mut b, Compact::Writes);
-        assert_eq!(
-            stats.writes_elided,
-            2 * (TURNS + 2 - KEEP_TURNS),
-            "two long strings in each turn outside the window, and no others"
-        );
-        let edits = write_inputs(&b)[0]["edits"].as_array().expect("array");
-        assert!(
-            edits[0]["old_string"]
-                .as_str()
-                .expect("s")
-                .starts_with(WRITE_ELIDED_PREFIX)
-        );
-        assert!(
-            edits[0]["new_string"]
-                .as_str()
-                .expect("s")
-                .starts_with(WRITE_ELIDED_PREFIX)
-        );
-        assert_eq!(edits[1]["old_string"], "c".repeat(10), "a short one is left alone");
-        assert_eq!(edits[1]["new_string"], "d".repeat(10), "a short one is left alone");
-    }
-
-    /// The window is counted over turns that HAVE a write call, so "keep 6"
-    /// keeps six writes rather than six assistant messages — the same rule
-    /// layers A and B follow.
-    #[test]
-    fn layer_d_counts_its_window_over_qualifying_turns() {
-        // Ten writing turns; the newest two become `Read`. The window keeps
-        // the six newest WRITES, which are now turns 2..7 — not the six newest
-        // messages, which would have reached back to turn 2 as well only by
-        // coincidence of the interleaving. What it must not do is keep the two
-        // Read turns in place of two writes and stop at turn 4.
-        let mut b = turns(TURNS, |i| {
-            if i >= TURNS - 2 {
-                return json!({"type": "tool_use", "id": format!("call_{i:02}"), "name": "Read",
-                              "input": {"file_path": "ls"}});
-            }
-            json!({
-                "type": "tool_use", "id": format!("call_{i:02}"), "name": "Write",
-                "input": {"file_path": format!("/tmp/f{i:02}.rs"), "content": "x".repeat(5000)},
-            })
-        });
-        let stats = apply(&mut b, Compact::Writes);
-        assert_eq!(
-            stats.writes_elided, 2,
-            "eight writes remain and six are kept, so exactly two are stubbed"
-        );
-        let inputs = write_inputs(&b);
-        for (i, input) in inputs.iter().enumerate() {
-            // The prefix, not merely "has a content field": a kept write has
-            // one too, and a Read input has none at all.
-            let stubbed = input["content"]
-                .as_str()
-                .is_some_and(|s| s.starts_with(WRITE_ELIDED_PREFIX));
-            assert_eq!(
-                stubbed,
-                i < 2,
-                "turn {i} stub state — the two non-writing turns must not shorten the window"
-            );
-        }
-    }
-
-    /// The pairing invariant, re-checked with layer D in play — a `tool_use`
-    /// and its `tool_result` are a pair, and this layer edits the OTHER half
-    /// of the pair from layer A.
-    #[test]
-    fn layer_d_leaves_the_pairing_alone() {
-        let (before_uses, before_results) = pair_ids(&write_body());
-        assert_eq!(before_uses, before_results, "the fixture is balanced to begin with");
-
-        for level in Compact::ALL {
-            let mut b = write_body();
-            let _ = apply(&mut b, level);
-            let (uses, results) = pair_ids(&b);
-            assert_eq!(uses, before_uses, "{level:?} changed the tool_use ids");
-            assert_eq!(results, before_results, "{level:?} changed the tool_result ids");
-            assert_eq!(uses, results, "{level:?} unbalanced the pairing");
-        }
+        assert!(Compact::ToolsThinking.does_thinking() && !Compact::ToolsThinking.does_notices());
+        assert!(Compact::All.does_thinking() && Compact::All.does_notices());
     }
 }

@@ -453,14 +453,6 @@ interface CaptureCompaction {
     tool_results_kept_for_error: number;
     tool_results_kept_small: number;
     thinking_dropped: number;
-    /**
-     * Layer D: file bodies stubbed inside old `Write`/`Edit` inputs.
-     *
-     * Optional because `inspect.jsonl` holds captures written before the
-     * field existed, and a file that fails to parse costs the whole history.
-     */
-    writes_elided?: number;
-    writes_kept_for_error?: number;
     notices_dropped: number;
 }
 

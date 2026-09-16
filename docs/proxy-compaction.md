@@ -86,13 +86,26 @@ missing forever. That rules out anything time-based or random.
 | A | `tools` | replaces old `tool_result` **content** with a stub naming the byte count and `tool_use_id` | last **6** tool-result turns |
 | B | `+thinking` | drops `thinking` blocks on older assistant turns | last **6** assistant turns |
 | C | `+notices` | drops stale injected system notices — the `<total_tokens>` banner, `[SYSTEM NOTIFICATION …]`, PostToolUse notes, "user sent a new message" | the newest banner, plus the last **6** notices |
-| D | `+writes` | replaces the long string arguments (`content`, `new_string`, `old_string`, …) of old write-tool calls (`Write`, `Edit`, `MultiEdit`, `NotebookEdit`) with a stub, keeping the key and the call's shape | write calls in the last **6** assistant turns |
 
-Layer D deliberately does **not** touch `Bash`. A shell command is the agent's
-stated intent, not a payload: `Bash` was once treated as a write tool and its
-`command` argument stubbed, which hid an agent's own shell history from it. The
-bulk of a `Bash` call is its output, and layer A already bounds that, so nothing
-is stubbed here and the command text is always preserved verbatim.
+There used to be a fourth layer, `+writes`, and it was **removed**. It stubbed
+the long string arguments (`content`, `new_string`, `old_string`, …) of old
+write-tool calls, and in doing so it let a stub be written into a file: a marker
+left in the history was reproduced by the model as the argument of a later
+write. That destroyed a boot script, a `policies.json` and four memory files,
+and reached pull requests. The mechanism is worth stating plainly — the marker
+was not "executed" by anything. It was text in the conversation, and the model,
+asked to author a file, copied text it could see.
+
+`Bash` had been exempted for exactly this reason: a shell command is the agent's
+stated intent, not a payload, so its `command` text was never stubbed. Applying
+that rule consistently means a file body the model authored is never replaced by
+a marker either, so the layer is gone rather than narrowed — there was no safe
+subset, because its bytes sit in volume (11,026 payloads averaging 1.2 KB) and
+not in outliers that could be singled out.
+
+The saving was real but small: over the captures sampled it removed **12.9 MB
+against layer A's 107 MB** — 11% of everything this pass removes — and bodies
+came out about 5% smaller because of it.
 
 The stubs are the point of layer A: `"[tool result elided by tab-atelier-proxy:
 9073 bytes; tool_use_id=call_00_Xv1cviAjZqN6HSYLdu3g4425]"` keeps the block, its
@@ -138,7 +151,7 @@ in `users.json`:
   <option value="none">None</option>
   <option value="tools">Remove old tool results</option>
   <option value="tools_thinking">Remove old tool results and thinking</option>
-  <option value="all">Remove old tool results, thinking, write payloads and notices</option>
+  <option value="all">Remove old tool results, thinking and notices</option>
 </select>
 ```
 

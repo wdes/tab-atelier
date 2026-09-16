@@ -192,15 +192,6 @@ pub struct Compaction {
     /// Tool results a stub would have lengthened — kept verbatim.
     pub tool_results_kept_small: usize,
     pub thinking_dropped: usize,
-    /// Layer D: file bodies stubbed inside old `Write`/`Edit` inputs.
-    ///
-    /// Counted per STRING, so one editing turn can report two. Read together
-    /// with the byte counts, not on its own: a pass that stubs four small
-    /// strings has done far less than one naming a single tool result.
-    #[serde(default)]
-    pub writes_elided: usize,
-    /// Write calls kept whole because their result was an error.
-    pub writes_kept_for_error: usize,
     pub notices_dropped: usize,
 }
 
