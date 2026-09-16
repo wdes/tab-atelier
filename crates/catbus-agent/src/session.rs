@@ -514,6 +514,21 @@ pub enum Block {
         #[serde(skip_serializing_if = "std::ops::Not::not")]
         is_error: bool,
     },
+    /// A reasoning block from a thinking model.
+    ///
+    /// The relay may route a session to a model that emits these, and the
+    /// transcript we send back has to be the one we received — so the parts
+    /// are kept verbatim and never interpreted. Only surface the *visible*
+    /// text to the user; `thinking` is display-only for the operator and
+    /// nothing downstream should treat it as an answer.
+    #[serde(rename = "thinking")]
+    Thinking {
+        thinking: String,
+        /// Opaque marker binding this block to the response it came from.
+        /// Round-tripped unchanged; never inspected.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
+    },
 }
 
 impl Entry {

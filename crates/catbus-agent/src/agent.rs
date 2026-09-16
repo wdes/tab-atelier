@@ -3,35 +3,37 @@
 //! The agent loop: send user message → call Messages API → execute
 //! tool calls → loop until the model stops asking for tools.
 //!
-//! Three OAuth-specific quirks live here:
+//! Messages calls go to the **relay**, not to Anthropic: `call_relay()`
+//! posts to `<relay>/relay/anthropic/v1/messages` with this machine's
+//! relay token. The proxy behind that URL holds the subscription login
+//! and injects the identity headers the upstream expects, so this crate
+//! carries no OAuth credential, no refresh cycle, and no account.
 //!
-//! * `Authorization: Bearer …` from `auth::access_token()`.
-//! * `anthropic-beta: oauth-2025-04-20,claude-code-20250219` — the
-//!   server rejects OAuth Messages requests without these flags.
+//! Two things still live here because they describe *us* rather than the
+//! login:
+//!
 //! * The first system block **must** start with the literal Claude
-//!   Code identifier; without it the OAuth path returns a 4xx. Our
-//!   own instructions go in a second system block.
+//!   Code identifier; the upstream rejects the request otherwise, and
+//!   the proxy forwards system blocks untouched.
+//! * Our own instructions go in the second and third system blocks.
 
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
-use crate::auth::Auth;
+use crate::relay::Relay;
 use crate::session::{self, Block, Session};
 use crate::tools;
 
 /// Identifier the server requires at the start of the first system
-/// block on every OAuth-authenticated Messages call.
+/// block on every Messages call. The proxy forwards system blocks
+/// through untouched, so the client is still the one that has to send it.
 const CLAUDE_CODE_PREFIX: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
 
 /// Sticking to a non-thinking, non-1M-context model keeps the bring-up
 /// surface small. Both can be swapped via `/model` later.
 const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
-/// Beta flags, API version and the Messages endpoint all come from
-/// `claude_api` — the proxy and the desktop relay send the same ones, and
-/// three copies of this list had already drifted once.
-use claude_api::ANTHROPIC_BETA;
 
 /// Static portion of our second system block. The dynamic prefix (cwd,
 /// plan-mode flag) is `format!()`'d once per call; this 1.5 KB tail is
@@ -47,8 +49,9 @@ const SYSTEM_STATIC_INSTRUCTIONS: &str = "Your text replies are rendered directl
 /// Which API backend answers this session's prompts. Chosen once at
 /// startup from the CLI; the tool loop is backend-agnostic.
 pub enum Provider {
-    /// Anthropic Messages API via Claude Code's OAuth credentials.
-    Anthropic(Auth),
+    /// Anthropic Messages API through a tab-atelier relay, which holds
+    /// the subscription login.
+    Relay(Relay),
     /// Any `OpenAI`-compatible chat-completions endpoint (`x.ai`/Grok,
     /// Infomaniak AI Tools, `OpenAI`, a local server, ...).
     OpenAiCompat(crate::openai::Config),
@@ -238,7 +241,10 @@ impl Agent {
                     Block::ToolUse { id, name, input } => {
                         tool_uses.push((id.as_str(), name.as_str(), input));
                     }
-                    Block::ToolResult { .. } => {}
+                    // A tool result is ours, not the model's; and reasoning
+                    // stays in the transcript we echo back but is not part of
+                    // the answer the user asked for.
+                    Block::ToolResult { .. } | Block::Thinking { .. } => {}
                 }
             }
 
@@ -316,7 +322,7 @@ impl Agent {
 
     async fn call_messages(&self) -> Result<MessagesResp, AgentError> {
         match &self.provider {
-            Provider::Anthropic(auth) => self.call_anthropic(auth).await,
+            Provider::Relay(relay) => self.call_relay(relay).await,
             Provider::OpenAiCompat(cfg) => self.call_openai_compat(cfg).await,
         }
     }
@@ -336,8 +342,14 @@ impl Agent {
         )
     }
 
-    async fn call_anthropic(&self, auth: &Auth) -> Result<MessagesResp, AgentError> {
-        let token = auth.access_token().await.map_err(AgentError::Auth)?;
+    /// One Messages call, routed through the relay.
+    ///
+    /// We send the relay token as `x-api-key` — the header the proxy's
+    /// client guard reads first — and deliberately send no `Authorization`,
+    /// no `anthropic-beta` and no `x-app`: the relay owns those, resolving
+    /// the credential and the beta flags for the upstream it picks. Sending
+    /// ours as well would either be dropped or fight the relay's choice.
+    async fn call_relay(&self, relay: &Relay) -> Result<MessagesResp, AgentError> {
         let active = self.active.read().await;
         let cwd = active.session.cwd.display().to_string();
         let tool_specs = tools::tool_specs();
@@ -365,27 +377,30 @@ impl Agent {
             tools: &tool_specs,
             messages: &active.history,
         };
-        let request = self
+        let mut request = self
             .http
-            .post(format!("{}{}", claude_api::BASE_API_URL, claude_api::MESSAGES_PATH))
-            .bearer_auth(token)
-            .header("anthropic-version", claude_api::ANTHROPIC_VERSION)
-            .header("anthropic-beta", ANTHROPIC_BETA)
-            // The identity headers Claude Code's API client sends. Without
-            // them an OAuth token is talking to an endpoint that expects
-            // Claude Code and seeing a client it does not recognise.
-            .header("x-app", "cli")
-            .json(&body);
+            .post(relay.messages_url())
+            .header("x-api-key", relay.token())
+            .header("anthropic-version", claude_api::ANTHROPIC_VERSION);
+        if let Some((client_id, client_secret)) = relay.cloudflare_access() {
+            request = request
+                .header("CF-Access-Client-Id", client_id)
+                .header("CF-Access-Client-Secret", client_secret);
+        }
+        let request = request.json(&body);
         drop(active);
         let resp = request.send().await.map_err(|e| AgentError::Http(e.to_string()))?;
         let status = resp.status();
+        // Read the body as text before parsing so a shape mismatch reports
+        // what actually arrived. A bare "error decoding response body" from
+        // the relay's own compactor, an SSE frame set, or a refusal page all
+        // look identical otherwise, and all three have different fixes.
+        let text = resp.text().await.map_err(|e| AgentError::Http(e.to_string()))?;
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(AgentError::Api(format!("{status}: {body}")));
+            return Err(AgentError::Api(format!("{status}: {}", truncate(&text, 2000))));
         }
-        resp.json::<MessagesResp>()
-            .await
-            .map_err(|e| AgentError::Http(format!("decode: {e}")))
+        serde_json::from_str::<MessagesResp>(&text)
+            .map_err(|e| AgentError::Api(format!("decode: {e}; body was: {}", truncate(&text, 2000))))
     }
 
     /// Same turn, different wire: translate our Anthropic-shaped
@@ -492,6 +507,20 @@ fn rebuild_history(project_dir: &std::path::Path, id: &str) -> Vec<ApiMessage> {
     }
     truncate_at_orphan_tool_use(&mut out);
     out
+}
+
+/// Clip a response body to at most `max` bytes for an error message, so a
+/// multi-megabyte body can't bury the daemon's own log. Backs off to a
+/// `char` boundary so a multi-byte character at the cut is never split.
+fn truncate(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 /// Anthropic's API requires every `tool_use` in an assistant turn to
@@ -641,8 +670,8 @@ pub enum ApiContent {
 
 #[derive(Debug, thiserror::Error)]
 pub enum AgentError {
-    #[error("auth: {0}")]
-    Auth(crate::auth::AuthError),
+    #[error("relay: {0}")]
+    Relay(#[from] crate::relay::RelayError),
     #[error("api: {0}")]
     Api(String),
     #[error("http: {0}")]

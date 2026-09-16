@@ -86,7 +86,7 @@ check_licence() {
             # `.githooks/pre-commit` and friends get checked rather than
             # skipped, which is what bit the version of this that used the
             # whole path.
-            head -n 1 -- "$f" | grep -q '^#!' || continue
+            head -n 1 -- "$f" | grep -q '^#!/' || continue
             ext="sh"
         fi
 
@@ -114,9 +114,14 @@ check_licence() {
 
         # A separate failure, and a much worse one: a licence line above
         # `#!/usr/bin/env bash` stops the script being executable at all.
-        if head -n 5 -- "$f" | grep -q '^#!'; then
+        #
+        # `#!/` and not `#!`: Rust's inner attributes (`#![allow(…)]`) open
+        # with the same two characters, so matching `#!` reports every file
+        # that has one as a broken shebang. `tests/licence_headers.rs` hit
+        # this exact bug and fixed it there; this is the same fix.
+        if head -n 5 -- "$f" | grep -q '^#!/'; then
             case "$(head -n 1 -- "$f")" in
-                '#!'*) ;;
+                '#!/'*) ;;
                 *)
                     note "$f: has a shebang that is not on line 1 — the kernel ignores it."
                     bad=1

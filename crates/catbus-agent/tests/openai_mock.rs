@@ -149,6 +149,10 @@ fn agent_command(dir: &Path) -> Command {
         .env_remove("CATBUS_OPENAI_MODEL")
         .env_remove("INFOMANIAK_PRODUCT_ID")
         .env_remove("INFOMANIAK_API_TOKEN")
+        .env_remove("CATBUS_RELAY_URL")
+        .env_remove("CATBUS_RELAY_TOKEN")
+        .env_remove("CATBUS_PREFERENCES")
+        .env_remove("XDG_CONFIG_HOME")
         .env(
             "LLVM_PROFILE_FILE",
             format!("{}/catbus-e2e-%p.profraw", env!("CARGO_TARGET_TMPDIR")),
@@ -320,19 +324,25 @@ fn print_socket_works_with_the_infomaniak_shortcut() {
 }
 
 #[test]
-fn anthropic_is_the_default_backend_when_credentials_exist() {
+fn the_relay_is_resolved_from_preferences_when_no_flags_are_given() {
     let dir = tempfile::tempdir().unwrap();
-    let claude_dir = dir.path().join(".claude");
-    std::fs::create_dir_all(&claude_dir).unwrap();
-    // Far-future expiry so load() succeeds without hitting the
-    // refresh endpoint; --print-socket exits before any API call.
+    let prefs = dir.path().join("preferences.json");
     std::fs::write(
-        claude_dir.join(".credentials.json"),
-        r#"{"claudeAiOauth":{"accessToken":"sk-test","refreshToken":"sk-r","expiresAt":9999999999999,"scopes":["user:inference"]}}"#,
+        &prefs,
+        r#"{
+            "relay_endpoint_id": "relay-id",
+            "remote_endpoints": [
+                { "id": "other", "url": "https://ignored.example", "relay_token": "tap_ignored" },
+                { "id": "relay-id", "url": "https://relay.example", "relay_token": "tap_chosen" }
+            ]
+        }"#,
     )
     .unwrap();
     let socket = dir.path().join("agent.sock");
+    // --print-socket exits before any HTTP, so the relay is resolved but
+    // never contacted.
     let out = agent_command(dir.path())
+        .env("CATBUS_PREFERENCES", &prefs)
         .args([
             "--new-session",
             "--cwd",
@@ -345,4 +355,35 @@ fn anthropic_is_the_default_backend_when_credentials_exist() {
         .unwrap();
     assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), socket.to_str().unwrap());
+}
+
+#[test]
+fn a_local_claude_login_alone_is_not_enough() {
+    // The regression this guards: catbus used to read the operator's own
+    // ~/.claude OAuth credential and call Anthropic directly. The login
+    // lives on the proxy now, so a machine with those credentials but no
+    // relay configured must fail with the relay's own advice rather than
+    // quietly going direct.
+    let dir = tempfile::tempdir().unwrap();
+    let claude_dir = dir.path().join(".claude");
+    std::fs::create_dir_all(&claude_dir).unwrap();
+    std::fs::write(
+        claude_dir.join(".credentials.json"),
+        r#"{"claudeAiOauth":{"accessToken":"sk-test","refreshToken":"sk-r","expiresAt":9999999999999,"scopes":["user:inference"]}}"#,
+    )
+    .unwrap();
+    let out = agent_command(dir.path())
+        .args([
+            "--new-session",
+            "--cwd",
+            dir.path().to_str().unwrap(),
+            "--socket",
+            dir.path().join("agent.sock").to_str().unwrap(),
+            "--print-socket",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "credentials alone must not be enough");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("no relay configured"), "stderr: {stderr}");
 }
