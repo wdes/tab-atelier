@@ -29,8 +29,11 @@ use reedline::{
 use tokio::io::AsyncWriteExt;
 
 mod agent;
+mod cache;
+mod guard;
 mod openai;
 mod relay;
+mod retry;
 mod session;
 mod socket;
 mod tools;
@@ -91,6 +94,28 @@ struct Args {
     /// out of `ps` output and shell history.
     #[arg(long, env = "CATBUS_RELAY_TOKEN", hide_env_values = true)]
     relay_token: Option<String>,
+
+    /// Model auto mode grades actions with. Defaults to a cheap
+    /// Flash-class model rather than this session's own model: judging a
+    /// proposed command is classification, not reasoning, and grading every
+    /// write with a heavy model costs an order of magnitude more than the
+    /// judgement is worth. The judge's prompt is fixed, so it caches after the
+    /// first call either way.
+    #[arg(long, env = "CATBUS_JUDGE_MODEL")]
+    judge_model: Option<String>,
+
+    /// File holding the monitor prompt for auto mode, in place of the
+    /// built-in one. This exists so an operator can install the exact prompt
+    /// their provider uses without this repository carrying it.
+    #[arg(long, env = "CATBUS_MONITOR_PROMPT")]
+    monitor_prompt: Option<PathBuf>,
+
+    /// JSON file configuring the tool set: `{"disable": [...], "allow": [...],
+    /// "add": [...]}`. Resolved once at startup, so changing it takes a
+    /// restart — a tool array that moved mid-session would invalidate the
+    /// prompt cache on every turn.
+    #[arg(long, env = "CATBUS_TOOLS_CONFIG")]
+    tools_config: Option<PathBuf>,
 
     /// Base URL of any OpenAI-compatible service, e.g.
     /// `https://api.x.ai/v1` (Grok) or `http://localhost:11434/v1`
@@ -214,7 +239,26 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     log::info!("session {} ready at {}", session.id, socket_path.display());
-    let agent = Arc::new(agent::Agent::new(provider, session));
+
+    // Read the monitor prompt before building the agent, so a bad path is a
+    // startup failure rather than a surprise the first time auto mode blocks
+    // something. The prompt is only used in auto mode, but a setting that is
+    // wrong should say so immediately.
+    let monitor_prompt = guard::Judge::prompt_from_path(args.monitor_prompt.as_deref())?;
+    let judge_model = args
+        .judge_model
+        .clone()
+        .unwrap_or_else(|| guard::DEFAULT_JUDGE_MODEL.to_owned());
+    // Resolved here, once, before the agent exists. A bad config is a startup
+    // failure: a tool set that silently differs from what the operator wrote
+    // would tell the model it has a tool that behaves otherwise.
+    let tool_set = tools::ToolSet::load(args.tools_config.as_deref())?;
+    log::info!("offering {} tools", tool_set.specs().len());
+    let agent = Arc::new(
+        agent::Agent::new(provider, session)
+            .with_judge(judge_model, monitor_prompt)
+            .with_tools(tool_set),
+    );
 
     let socket_task = tokio::spawn({
         let agent = Arc::clone(&agent);
@@ -355,8 +399,9 @@ async fn run_repl(agent: Arc<agent::Agent>, cwd: &std::path::Path) -> std::io::R
                 .write_all(
                     b"slash commands:\n  \
                       /help              show this list\n  \
-                      /plan              enable plan-mode (write/edit/bash refuse)\n  \
-                      /noplan            disable plan-mode\n  \
+                      /plan              plan only - write/edit/bash propose instead of acting\n  \
+                      /auto              ask a judge before each write/edit/bash\n  \
+                      /noplan            allow everything (same as /noauto)\n  \
                       /rename <name>     rename the current session\n  \
                       /resume            list previous sessions in this cwd\n  \
                       /resume <id>       switch to a previous session in-place\n  \
@@ -369,14 +414,22 @@ async fn run_repl(agent: Arc<agent::Agent>, cwd: &std::path::Path) -> std::io::R
         if prompt == "/exit" || prompt == "/quit" {
             break;
         }
+        // The three modes are exclusive, so `/noplan` is also `/noauto` —
+        // there is no fourth state to return to, and two names for "allow
+        // everything" would suggest otherwise.
         if prompt == "/plan" {
-            agent.set_plan_mode(true);
-            stdout.write_all(b"plan-mode = true\n").await?;
+            agent.set_gate(tools::Gate::Plan);
+            stdout.write_all(b"gate = plan\n").await?;
             continue;
         }
-        if prompt == "/noplan" {
-            agent.set_plan_mode(false);
-            stdout.write_all(b"plan-mode = false\n").await?;
+        if prompt == "/auto" {
+            agent.set_gate(tools::Gate::Auto);
+            stdout.write_all(b"gate = auto\n").await?;
+            continue;
+        }
+        if prompt == "/noplan" || prompt == "/noauto" {
+            agent.set_gate(tools::Gate::Open);
+            stdout.write_all(b"gate = open\n").await?;
             continue;
         }
         if prompt == "/deb" {
