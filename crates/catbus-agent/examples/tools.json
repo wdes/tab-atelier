@@ -1,0 +1,67 @@
+{
+  "disable": ["Bash"],
+
+  "add": [
+    {
+      "name": "GitStatus",
+      "description": "Show the working tree status: staged, unstaged and untracked changes, as `git status --short` prints them.",
+      "schema": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "argv": ["git", "status", "--short"],
+      "timeout_secs": 15,
+      "judged": false
+    },
+
+    {
+      "name": "GitLog",
+      "description": "Show recent commits, newest first. Optionally limit how many.",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "max": {
+            "type": "integer",
+            "description": "How many commits to show. Defaults to 10."
+          }
+        },
+        "required": []
+      },
+      "argv": ["git", "log", "--oneline", "--max-count={max?}"],
+      "timeout_secs": 15,
+      "judged": false
+    },
+
+    {
+      "name": "CargoTest",
+      "description": "Run the test suite for the current crate. Optionally filter by a substring of the test name.",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "filter": {
+            "type": "string",
+            "description": "Only run tests whose name contains this substring."
+          }
+        },
+        "required": []
+      },
+      "argv": ["cargo", "test", "{filter?}"],
+      "timeout_secs": 300,
+      "judged": true
+    },
+
+    {
+      "name": "CargoCheck",
+      "description": "Type-check the current crate without producing a binary. Faster than a full build.",
+      "schema": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "argv": ["cargo", "check"],
+      "timeout_secs": 300,
+      "judged": true
+    }
+  ]
+}
