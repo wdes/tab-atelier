@@ -789,9 +789,28 @@ impl Preset {
                     // routed to, because it would report a cost and a
                     // capability that are both about to stop being true.
                     //
-                    // Left unpriced despite those requests billing at Flash's
-                    // rates: `is_usable` is false, so nothing routes here and
-                    // `billing_price` never reaches it.
+                    // This is the published table's second column: $0.022 hit
+                    // / $0.66 miss / $1.98 out per 1M, doubling at peak to
+                    // $0.044 / $1.32 / $3.96. That it is this model is not a
+                    // guess — the miss rate is 4.40x Flash's, which is exactly
+                    // what `relative_cost: 66` against Flash's 15 already
+                    // encoded, arrived at independently.
+                    //
+                    // Worth knowing it is NOT a flat multiple of Flash: the
+                    // hit rate is 7.33x and the output 3.30x, so the two
+                    // models have different shapes — Flash 1:50:200 across
+                    // hit:miss:out, this one 1:30:90. That is the whole reason
+                    // `relative_cost` cannot price anything and a real triple
+                    // is needed per model: one scalar describes one class, and
+                    // scaling Flash's triple by this model's miss ratio would
+                    // be wrong on two of the three.
+                    //
+                    // Still not wired into `price`, and now for a checkable
+                    // reason rather than a guess: `billing_price` filters
+                    // `!m.deprecated` on both its paths, so a price here could
+                    // never be selected for billing. It would surface only in
+                    // the providers panel, reading "$0.66/1M" for requests
+                    // that actually bill at Flash's $0.15.
                     Model::retiring(
                         "deepseek-v4-pro",
                         Class::Heavy,
@@ -1659,6 +1678,16 @@ mod tests {
         assert_eq!(peak.multiplier_percent, 200);
         assert_eq!(peak.windows.len(), 2, "01:00-04:00 and 06:00-10:00");
         assert!(peak.windows.iter().all(|w| w.weekdays == vec![1, 2, 3, 4, 5]));
+
+        // Peak doubles all three classes, the cached one included: the
+        // published table gives $0.006 / $0.30 / $1.20 against $0.003 /
+        // $0.15 / $0.60. Exempting cache hits is the natural guess — a
+        // discount you would expect to survive peak — and it is wrong, which
+        // is why `scaled` multiplies `cache_hit` rather than leaving it.
+        let at_peak = price.scaled(peak.multiplier_percent);
+        assert_eq!(at_peak.cache_hit, 6_000, "$0.006/1M at peak");
+        assert_eq!(at_peak.input, 300_000, "$0.30/1M at peak");
+        assert_eq!(at_peak.output, 1_200_000, "$1.20/1M at peak");
     }
 
     #[test]
