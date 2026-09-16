@@ -107,7 +107,10 @@ fn convert_message(msg: &ApiMessage, out: &mut Vec<Value>) {
                         "content": content,
                     })),
                     Block::Text { text: t } => append_line(&mut text, t),
-                    Block::ToolUse { .. } => {}
+                    // Tool-use on a *user* turn does not occur, and reasoning
+                    // has no place in the OpenAI wire format — dropping both is
+                    // the only faithful translation.
+                    Block::ToolUse { .. } | Block::Thinking { .. } => {}
                 }
             }
             if !text.is_empty() {
@@ -128,7 +131,7 @@ fn convert_message(msg: &ApiMessage, out: &mut Vec<Value>) {
                         // JSON *string*, not an object.
                         "function": { "name": name, "arguments": input.to_string() },
                     })),
-                    Block::ToolResult { .. } => {}
+                    Block::ToolResult { .. } | Block::Thinking { .. } => {}
                 }
             }
             if text.is_empty() && tool_calls.is_empty() {

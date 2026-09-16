@@ -389,6 +389,18 @@ curl -N -H "x-api-key: $(tab-atelier relay token)" -H 'content-type: application
 
 `-N` disables curl buffering so you see the SSE `data:` frames stream in. Errors map to a stage: `401 relay: unauthorized` (wrong `x-api-key`), `502 relay not configured` (no `relay via`), `502 egress oauth: …` (remote can't read/refresh its Claude creds — re-`/login` there).
 
+### `catbus-agent` relays too
+
+`catbus-agent` is a relay client like any other, not a second implementation of the login:
+
+```sh
+catbus-agent --relay-url https://proxy.example.org --relay-token tap_…
+```
+
+With no flags it reads the relay endpoint from the same `preferences.json`, so on a machine that already runs tab-atelier a plain `catbus-agent` works. `CATBUS_RELAY_URL`, `CATBUS_RELAY_TOKEN` and `CATBUS_PREFERENCES` are the env equivalents.
+
+The Claude login lives **only** on the relay. `catbus-agent` no longer reads `~/.claude/.credentials.json`, no longer refreshes an OAuth token, and cannot be pointed at `api.anthropic.com` — with no relay configured it refuses to start rather than silently going direct. So an agent tab works on a box with no `claude` login at all (a CI runner, a container): it needs only a relay token, and there is no subscription credential in its environment or its crash reports. Reasoning blocks from a model the relay routes to are kept verbatim in the transcript the upstream requires back, but are never shown as the answer.
+
 ## Environment variables
 
 Inject env vars into tabs' PTYs from the CLI — globally (all tabs) or per-tab:

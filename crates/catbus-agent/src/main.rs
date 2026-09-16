@@ -5,11 +5,13 @@
 //! Named after the many-windowed feline conveyance from *My Neighbor
 //! Totoro*. Each `tab-atelier` tab can run one catbus instance, and
 //! you talk to it through a per-session UNIX socket. Internally it
-//! authenticates via Claude Code's OAuth credentials (so a Max
-//! subscription works without an API key) — or talks to any
-//! OpenAI-compatible service instead (`--openai-url`, `--openai-token`
-//! and `--openai-model` for `x.ai`/Grok, `OpenAI`, a local server,
-//! etc., or the `--infomaniak-*` shortcut for Infomaniak AI Tools).
+//! talks to a tab-atelier relay, which holds the Claude subscription
+//! login and forwards to Anthropic — so a Max subscription works
+//! without an API key, and without the login ever reaching this
+//! process. It can also talk to any OpenAI-compatible service instead
+//! (`--openai-url`, `--openai-token` and `--openai-model` for
+//! `x.ai`/Grok, `OpenAI`, a local server, etc., or the
+//! `--infomaniak-*` shortcut for Infomaniak AI Tools).
 //! It persists the conversation in the same JSONL shape Claude Code
 //! uses (so the existing `/tabs/N/catbus/messages` endpoint Just
 //! Works), and runs a small Read / Write / Edit / Bash tool loop.
@@ -27,8 +29,8 @@ use reedline::{
 use tokio::io::AsyncWriteExt;
 
 mod agent;
-mod auth;
 mod openai;
+mod relay;
 mod session;
 mod socket;
 mod tools;
@@ -77,10 +79,29 @@ struct Args {
     #[arg(long)]
     no_tui: bool,
 
+    /// Relay to talk to, e.g. `https://proxy.example` or the full
+    /// `https://proxy.example/relay/anthropic`. Defaults to the relay
+    /// endpoint in tab-atelier's preferences.json, so a machine that
+    /// already runs tab-atelier needs no flag.
+    #[arg(long, env = "CATBUS_RELAY_URL")]
+    relay_url: Option<String>,
+
+    /// This machine's relay token, minted on the proxy. Sent as
+    /// `x-api-key`. Prefer the env var over the flag so the secret stays
+    /// out of `ps` output and shell history.
+    #[arg(long, env = "CATBUS_RELAY_TOKEN", hide_env_values = true)]
+    relay_token: Option<String>,
+
     /// Base URL of any OpenAI-compatible service, e.g.
     /// `https://api.x.ai/v1` (Grok) or `http://localhost:11434/v1`
     /// (Ollama). `/chat/completions` is appended when missing. Routes
-    /// the session through that service instead of Anthropic OAuth.
+    /// the session through that service instead of the relay.
+    ///
+    /// Deliberately *not* `conflicts_with` the relay flags: a machine
+    /// that relays by default exports `CATBUS_RELAY_URL`, and that must
+    /// not stop someone reaching for a different backend. An
+    /// OpenAI-compatible backend simply takes precedence when both are
+    /// configured.
     #[arg(
         long,
         env = "CATBUS_OPENAI_URL",
@@ -105,7 +126,7 @@ struct Args {
     /// Infomaniak AI Tools product id — a shortcut for --openai-url
     /// that builds the product-scoped Infomaniak endpoint. Together
     /// with --infomaniak-token this routes the session through
-    /// Infomaniak's OpenAI-compatible API instead of Anthropic OAuth.
+    /// Infomaniak's OpenAI-compatible API instead of the relay.
     #[arg(long, env = "INFOMANIAK_PRODUCT_ID", requires = "infomaniak_token")]
     infomaniak_product_id: Option<String>,
 
@@ -128,7 +149,18 @@ struct Args {
 }
 
 #[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() {
+    // Print the error's Display form. Returning a Result from `main`
+    // would print the Debug form instead, which for the relay errors
+    // buries the one sentence telling the operator what to configure
+    // inside an enum dump.
+    if let Err(e) = run().await {
+        eprintln!("catbus-agent: {e}");
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     // REPL mode shares the tab with stdout, so even "to stderr" logs
     // print in the same window. Quiet the floor to `warn` unless the
@@ -144,10 +176,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => std::env::current_dir()?,
     };
 
-    // Auth must succeed *before* we open the socket — no point
-    // accepting prompts we can't service. With an OpenAI-compatible
-    // backend configured the Claude OAuth credentials are never
-    // touched, so catbus runs on machines without a Claude Code login.
+    // The relay must resolve *before* we open the socket — no point
+    // accepting prompts we can't service. Relay resolution only reads
+    // this machine's own preferences and token; the subscription login
+    // stays on the proxy, so catbus works on a box with no Claude Code
+    // credentials at all.
     let provider =
         if let (Some(url), Some(token), Some(model)) = (args.openai_url, args.openai_token, args.openai_model) {
             agent::Provider::OpenAiCompat(openai::Config {
@@ -162,7 +195,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 model: args.infomaniak_model,
             })
         } else {
-            agent::Provider::Anthropic(auth::load()?)
+            let relay = relay::Relay::resolve(args.relay_url.as_deref(), args.relay_token.as_deref())?;
+            log::info!("relaying to {}", relay.base_url());
+            agent::Provider::Relay(relay)
         };
     let session = session::open(&cwd, args.resume.as_deref(), args.new_session)?;
 

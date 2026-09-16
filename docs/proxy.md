@@ -416,6 +416,36 @@ tab-atelier relay on
 
 Claude tabs opened after that route through the proxy.
 
+## `catbus-agent` is a client too
+
+`catbus-agent` talks to the proxy the same way a claude tab does — it is a
+relay client, not a second implementation of the login.
+
+```sh
+catbus-agent --relay-url https://proxy.example.org --relay-token tap_…
+```
+
+with no flags it reads the relay endpoint out of the same
+`~/.config/tab-atelier/preferences.json` the app uses, so on a machine that
+already runs tab-atelier a plain `catbus-agent` is enough. `CATBUS_RELAY_URL`,
+`CATBUS_RELAY_TOKEN` and `CATBUS_PREFERENCES` are the environment equivalents.
+
+The login lives **only** here. `catbus-agent` no longer reads
+`~/.claude/.credentials.json`, no longer refreshes an OAuth token, and cannot
+be pointed straight at `api.anthropic.com`: with no relay configured it refuses
+to start rather than quietly going direct. Three consequences worth knowing:
+
+- **It works on a box with no `claude` login at all.** A CI runner or a
+  container only needs the relay token. There is nothing to refresh and no
+  account to leak, because the client holds no subscription credential.
+- **Compaction is the proxy's.** Reasoning models routed through the relay can
+  emit `thinking` blocks; they are kept verbatim in the transcript and echoed
+  back unchanged (the upstream requires its own reasoning blocks back), but
+  they are never shown as the answer.
+- **The Claude Code identifier in `system[0]` is still sent by the client**,
+  because the relay forwards system blocks untouched and the upstream rejects a
+  request without it. That string is not a credential — it is a request shape.
+
 ## Migrating from `relay egress`
 
 The old role is refused now, with a message pointing here — deliberately, since
