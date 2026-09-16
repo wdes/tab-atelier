@@ -107,10 +107,31 @@ The saving was real but small: over the captures sampled it removed **12.9 MB
 against layer A's 107 MB** — 11% of everything this pass removes — and bodies
 came out about 5% smaller because of it.
 
-The stubs are the point of layer A: `"[tool result elided by tab-atelier-proxy:
-9073 bytes; tool_use_id=call_00_Xv1cviAjZqN6HSYLdu3g4425]"` keeps the block, its
-id and its position, and tells the model *that something was there* rather than
-pretending it was always empty.
+The stubs are the point of layer A: `"[elided: 9073B]"` keeps the block and its
+position, and tells the model *that something was there* rather than pretending
+it was always empty. It deliberately does not repeat the `tool_use_id`, which is
+already a sibling field on the same block — 803 of 804 stubs were duplicating it
+at 44 bytes each. The byte count stays: it is what tells the model whether
+re-reading is worth the round trip.
+
+The marker is matched in both forms. Conversations already in flight when it
+shrank still carry the long one, and recognising only the short form would make
+the pass re-stub them — nesting a stub inside a stub and recomputing the byte
+count from the stub rather than from the result it replaced, so the original
+size would be lost and the number would shrink on every pass.
+
+**Nothing shorter than 200 bytes is stubbed at all.** A tool result is evidence,
+and the short ones are the evidence that matters most: "The file /src/lib.rs has
+been updated." is the only record in the conversation that a call succeeded.
+Stub that and the model cannot tell "it worked" from "that call never happened",
+so it repeats work it has already done.
+
+That floor used to be implicit, and the accident is worth recording. The rule was
+"stub only when the stub is strictly shorter than the result", which with a
+102-byte stub meant "over 102 bytes" without anyone deciding it. Shrinking the
+stub to 14 would have quietly moved the floor to 14 and started eating
+acknowledgements; `a_short_acknowledgement_is_never_elided` failed the moment the
+marker changed, which is how it was caught.
 
 Layer C is the biggest of the last two wins on a measured body: 51.7 KB of a
 353 KB request was injected system notices — harness notifications, PostToolUse

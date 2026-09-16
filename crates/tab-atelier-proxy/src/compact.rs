@@ -195,28 +195,65 @@ fn bytes_of(value: &serde_json::Value) -> u64 {
     u64::try_from(serde_json::to_vec(value).map_or(0, |v| v.len())).unwrap_or(u64::MAX)
 }
 
-/// The marker every stub begins with.
+/// The marker every stub begins with, and the floor below which nothing is
+/// stubbed at all.
 ///
-/// Load-bearing, not cosmetic: it is what makes the pass **idempotent**. A
-/// second pass over an already-compacted body would otherwise elide the stubs
-/// again and recompute their byte count from the stub instead of from the
-/// result it replaced — so the number in the message would shrink on every
-/// pass and the original size would be gone. A retry, or a second route change
-/// on the same request, is enough to do it.
-const ELIDED_PREFIX: &str = "[tool result elided by tab-atelier-proxy: ";
+/// Kept to the shortest form that still tells the model two things: something
+/// was here, and how much of it. The byte count is not decoration — it is what
+/// the model judges "is re-reading this worth a turn" on, and dropping it would
+/// invite exactly the re-reads this pass exists to avoid.
+///
+/// The previous text was
+/// `[tool result elided by tab-atelier-proxy: N bytes; tool_use_id=…]` — 102
+/// bytes where this is 14, and the id was 49 of them. It was also pure
+/// duplication: in one captured body 803 of 804 stubs repeated a value already
+/// sitting in the `tool_use_id` field of the very block they annotated. The
+/// prose went for the same reason — nothing reads it but the model, and the
+/// model needs the number, not the sentence.
+const ELIDED_PREFIX: &str = "[elided:";
+
+/// The marker this replaced.
+///
+/// Still recognised, so that a conversation already in flight when the format
+/// changed is not elided a second time: a stub inside a stub tells the model
+/// less than the original stub did, and the byte count would then shrink on
+/// every pass instead of staying the size of the result it replaced.
+///
+/// It can be deleted once no live conversation predates the change — stubs only
+/// exist inside bodies, so they age out with the conversations holding them.
+const ELIDED_PREFIX_LEGACY: &str = "[tool result elided by tab-atelier-proxy: ";
+
+/// The shortest `tool_result` worth replacing with a stub.
+///
+/// A tool result is evidence, and the short ones are the evidence that matters
+/// most: "The file /src/lib.rs has been updated." is the only record in the
+/// conversation that the call succeeded. Replacing it saves a handful of bytes
+/// and leaves the model unable to tell "it worked" from "that call never
+/// happened" — and an agent that cannot tell those apart retries work it has
+/// already done.
+///
+/// It was previously implicit. The rule was "only when the stub is strictly
+/// shorter than the result", which with a 102-byte stub meant "over 102 bytes"
+/// by accident. Stating it matters because the marker is now 14 bytes: without
+/// this floor the same rule would have started eliding acknowledgements, and
+/// nothing in the design would have said that was wrong.
+const MIN_TOOL_RESULT_BYTES: u64 = 200;
 
 /// The stub that replaces an elided `tool_result`'s content.
 ///
-/// The block, its id and its position all stay. That is the point: the model
-/// is told *something was there* and which call it answered, rather than being
-/// shown an empty result and concluding the tool returned nothing.
-fn stub(byte_count: u64, tool_use_id: &str) -> String {
-    format!("{ELIDED_PREFIX}{byte_count} bytes; tool_use_id={tool_use_id}]")
+/// The block, its id and its position all stay. That is the point: the model is
+/// told *something was there*, rather than being shown an empty result and
+/// concluding the tool returned nothing. The id is not repeated in the text
+/// because it is already the sibling field of the block this replaces.
+fn stub(byte_count: u64) -> String {
+    format!("{ELIDED_PREFIX}{byte_count}B]")
 }
 
 /// Whether this content is already a stub from an earlier pass.
 fn already_elided(content: &serde_json::Value) -> bool {
-    content.as_str().is_some_and(|s| s.starts_with(ELIDED_PREFIX))
+    content
+        .as_str()
+        .is_some_and(|s| s.starts_with(ELIDED_PREFIX) || s.starts_with(ELIDED_PREFIX_LEGACY))
 }
 
 /// The oldest message index still inside the trailing window.
@@ -281,26 +318,37 @@ fn elide_tool_results(messages: &mut [serde_json::Value], stats: &mut Stats) {
                 stats.tool_results_kept_for_error += 1;
                 continue;
             }
-            let Some(id) = block.get("tool_use_id").and_then(serde_json::Value::as_str) else {
+            // A result with no id is not bound to a call, so a stub would leave
+            // content pointing at nothing. Not the shape Claude Code sends, and
+            // cheap to refuse.
+            if block.get("tool_use_id").and_then(serde_json::Value::as_str).is_none() {
                 continue;
-            };
+            }
             let Some(content) = block.get("content") else { continue };
             // Already a stub from a previous pass: leaving it alone keeps the
             // original byte count in the message and makes the pass idempotent.
             if already_elided(content) {
                 continue;
             }
-            // Only replace a result when the stub is STRICTLY shorter. A `Write`
-            // or `Edit` acknowledges in a line like "The file /src/lib.rs has
-            // been updated." — often shorter than the stub itself, which then
-            // both grows the body and deletes the only record that the call
-            // succeeded. Comparing against the real stub keeps that rule exact
-            // without a magic number.
-            let replacement = stub(bytes_of(content), id);
-            if replacement.len() as u64 >= bytes_of(content) {
+            // The floor decides, not the stub length. A tool result is evidence:
+            // "The file /src/lib.rs has been updated." is the only record in the
+            // conversation that the call succeeded, and it is short. Replacing it
+            // saves a handful of bytes and costs the model the ability to tell
+            // "it worked" from "that call never happened".
+            //
+            // This floor used to be implicit, and the accident is worth naming.
+            // The rule was "only when the stub is strictly shorter than the
+            // result", which with a 102-byte stub happened to mean "over 102
+            // bytes". Shrinking the stub to 14 would have quietly moved that
+            // floor to 14 and started eating acknowledgements — caught by
+            // `a_short_acknowledgement_is_never_elided`, which failed the moment
+            // the marker changed.
+            let content_len = bytes_of(content);
+            if content_len < MIN_TOOL_RESULT_BYTES {
                 stats.tool_results_kept_small += 1;
                 continue;
             }
+            let replacement = stub(content_len);
             block["content"] = serde_json::Value::String(replacement);
             stats.tool_results_elided += 1;
         }
@@ -541,15 +589,17 @@ mod tests {
         assert_eq!(stats.tool_results_elided, TURNS - KEEP_TURNS);
         assert_eq!(stats.thinking_dropped, 0, "layer A does not touch thinking");
 
-        // The elided ones carry the stub, with the byte count of what they
-        // replaced and the id they answer.
+        // The elided ones carry the stub: the byte count of what they replaced,
+        // and nothing else. The id is asserted separately, as the sibling field
+        // it already is — repeating it in the text cost 49 bytes a stub and told
+        // the model nothing it could not read one field over.
         let first = results[0];
         assert_eq!(first["tool_use_id"], "call_00");
         let text = first["content"].as_str().expect("content became a string");
         assert_eq!(
             text,
             format!(
-                "[tool result elided by tab-atelier-proxy: {} bytes; tool_use_id=call_00]",
+                "[elided:{}B]",
                 // The serialized length of the 1000-byte payload plus quotes.
                 1002
             )
@@ -592,16 +642,20 @@ mod tests {
         );
     }
 
-    /// A result smaller than the stub that would replace it must be left alone.
+    /// A short acknowledgement is evidence, and is never elided.
     ///
     /// A `Write` or `Edit` acknowledges with a line like "The file /src/lib.rs
-    /// has been updated." — under 100 bytes. Stubbing that spends MORE bytes
-    /// than it saves, and deletes the only record that the call succeeded: a
-    /// model re-reading its own history finds an opaque stub where "it worked"
-    /// used to be, and cannot tell whether the edit landed. This is the floor
-    /// that keeps that from happening.
+    /// has been updated." — 34 bytes. It is the only record in the conversation
+    /// that the call succeeded: a model re-reading its own history would find an
+    /// opaque stub where "it worked" used to be, and could not tell whether the
+    /// edit landed, so it would do the work again.
+    ///
+    /// This test is why the floor is now a named constant rather than an
+    /// accident of the stub's length. It passed for years because the stub was
+    /// 102 bytes and the rule was "stub only if strictly shorter"; shrinking the
+    /// stub to 14 moved the implicit floor to 14 and this failed immediately.
     #[test]
-    fn layer_a_leaves_a_result_shorter_than_its_own_stub() {
+    fn a_short_acknowledgement_is_never_elided() {
         let ack = "The file /src/lib.rs has been updated.";
         let mut b = body();
         // The oldest result is the one layer A reaches for first.
@@ -613,7 +667,7 @@ mod tests {
         assert_eq!(
             tool_results(&b)[0]["content"],
             ack,
-            "a 34-byte acknowledgement must survive a ~90-byte stub"
+            "a 34-byte acknowledgement must survive a 14-byte stub"
         );
     }
 
@@ -820,9 +874,9 @@ mod tests {
             .filter(|c| c.starts_with(ELIDED_PREFIX))
             .collect();
         assert_eq!(stubs.len(), TURNS - KEEP_TURNS);
-        assert!(stubs[0].contains("1002 bytes"), "{}", stubs[0]);
+        assert!(stubs[0].contains("1002B"), "{}", stubs[0]);
         assert!(
-            !stubs[0].contains("76 bytes"),
+            !stubs[0].contains("14B"),
             "the stub's own length leaked in: {}",
             stubs[0]
         );
