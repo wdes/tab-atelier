@@ -985,10 +985,6 @@ const AdminApp = Vue.defineComponent({
       if (k.tool_results_kept_for_error) parts.push(`${k.tool_results_kept_for_error} errors kept`);
       if (k.tool_results_kept_small) parts.push(`${k.tool_results_kept_small} too small to save`);
       if (k.thinking_dropped) parts.push(`${k.thinking_dropped} thinking`);
-      // Singular/plural matters here more than elsewhere: "1 write payloads"
-      // reads as a bug in the counter rather than a count of one.
-      if (k.writes_elided) parts.push(`${k.writes_elided} write ${k.writes_elided === 1 ? "payload" : "payloads"}`);
-      if (k.writes_kept_for_error) parts.push(`${k.writes_kept_for_error} failed kept`);
       if (k.notices_dropped) parts.push(`${k.notices_dropped} notices`);
       return parts.length ? `${k.level}: ${parts.join(", ")}` : `${k.level}: nothing to remove`;
     },

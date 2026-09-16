@@ -520,14 +520,13 @@ pub(crate) fn shape_body(
     if elided.changed() {
         log::info!(
             "proxy: compacted {}/{} {before} → {} bytes: {} tool results elided ({} errors kept), \
-             {} thinking dropped, {} write payloads stubbed, {} notices dropped",
+             {} thinking dropped, {} notices dropped",
             route.provider_id,
             route.model_id,
             encoded.len(),
             elided.tool_results_elided,
             elided.tool_results_kept_for_error,
             elided.thinking_dropped,
-            elided.writes_elided,
             elided.notices_dropped
         );
     }
@@ -551,8 +550,6 @@ pub(crate) fn shape_body(
             tool_results_kept_for_error: elided.tool_results_kept_for_error,
             tool_results_kept_small: elided.tool_results_kept_small,
             thinking_dropped: elided.thinking_dropped,
-            writes_elided: elided.writes_elided,
-            writes_kept_for_error: elided.writes_kept_for_error,
             notices_dropped: elided.notices_dropped,
         })
     };
