@@ -20,7 +20,7 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::net::UnixStream;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -569,5 +569,219 @@ fn toggling_the_gate_does_not_move_the_cached_prefix() {
         text_of(last).contains("gate=\"plan\""),
         "the second request's state turn should carry the new mode:\n{}",
         last["content"]
+    );
+}
+
+/// A reply that asks for one tool call.
+///
+/// The call id is a parameter, and it matters: the transcript accumulates, so
+/// by the third request the history holds every earlier `tool_result`. Sharing
+/// one id across rounds makes a lookup by id ambiguous — it finds the oldest —
+/// and the test then reads a stale result while believing it read the new one.
+/// Distinct ids also mean the pairing this asserts is the real one.
+fn tool_round(call_id: &str, name: &str, input: &str) -> String {
+    format!(
+        r#"{{
+    "id": "msg_tool",
+    "type": "message",
+    "role": "assistant",
+    "model": "claude-sonnet-4-6",
+    "content": [{{ "type": "tool_use", "id": "{call_id}", "name": "{name}", "input": {input} }}],
+    "stop_reason": "tool_use",
+    "usage": {{ "input_tokens": 5, "output_tokens": 4 }}
+}}"#
+    )
+}
+
+/// The `tool_result` text a request carried back, by call id.
+fn tool_result_of(body: &serde_json::Value, id: &str) -> String {
+    body["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .flat_map(|m| m["content"].as_array().cloned().unwrap_or_default())
+        .find(|b| b["type"] == "tool_result" && b["tool_use_id"] == id)
+        .and_then(|b| b["content"].as_str().map(str::to_owned))
+        .unwrap_or_else(|| panic!("no tool_result for {id} in:\n{body}"))
+}
+
+/// A throwaway git repository with one commit and one untracked file.
+fn git_repo(dir: &Path) -> PathBuf {
+    let repo = dir.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    for args in [
+        vec!["init", "-q"],
+        vec!["config", "user.email", "t@example.com"],
+        vec!["config", "user.name", "T"],
+        vec!["commit", "-q", "--allow-empty", "-m", "first commit"],
+    ] {
+        let out = Command::new("git").args(&args).current_dir(&repo).output().unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    std::fs::write(repo.join("untracked.txt"), "hello").unwrap();
+    repo
+}
+
+/// A config with a git tool, a cargo tool and one taking an argument.
+///
+/// Written to a temp file rather than used from `examples/tools.json` so the
+/// cargo entry can be `--version`: this test runs *inside* `cargo test`, which
+/// holds the target-directory lock, so a nested `cargo test` or `cargo check`
+/// would block until the outer run finished and the test would hang rather than
+/// fail. A version query exercises the same exec path with no lock, and the
+/// shipped example keeps the `cargo test` an operator actually wants.
+fn tools_config(dir: &Path) -> PathBuf {
+    let path = dir.join("tools.json");
+    let config = serde_json::json!({
+        "disable": ["Bash"],
+        "add": [
+            {
+                "name": "GitStatus",
+                "description": "Show the working tree status.",
+                "schema": { "type": "object", "properties": {}, "required": [] },
+                "argv": ["git", "status", "--short"],
+                "timeout_secs": 15,
+                "judged": false
+            },
+            {
+                "name": "CargoVersion",
+                "description": "Show the cargo version.",
+                "schema": { "type": "object", "properties": {}, "required": [] },
+                "argv": ["cargo", "--version"],
+                "timeout_secs": 30,
+                "judged": false
+            },
+            {
+                "name": "GitLogLimit",
+                "description": "Show the last N commits.",
+                "schema": {
+                    "type": "object",
+                    "properties": { "max": { "type": "integer" } },
+                    "required": ["max"]
+                },
+                "argv": ["git", "log", "--oneline", "--max-count={max}"],
+                "timeout_secs": 15,
+                "judged": false
+            }
+        ]
+    });
+    std::fs::write(&path, config.to_string()).unwrap();
+    path
+}
+
+/// Configured tools really run, on the real binary, with real subprocesses.
+///
+/// The other tests here check what the agent *sends*. This one checks what it
+/// *does*: only the model is mocked, while `dispatch`, `expand`,
+/// `tokio::process::Command` and the socket loop are the shipping code. It also
+/// asserts the configured tool array — `Bash` gone, three tools added — reached
+/// the wire, and that the requests carry cache breakpoints.
+#[test]
+fn configured_tools_execute_for_real() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = git_repo(dir.path());
+    let config = tools_config(dir.path());
+    let socket = dir.path().join("agent.sock");
+
+    // The model calls each tool in turn, then stops. Each result comes back in
+    // the *next* request, which is what the mock captures.
+    let (port, rx) = spawn_mock_relay(vec![
+        (
+            "HTTP/1.1 200 OK",
+            Box::leak(tool_round("call_git", "GitStatus", "{}").into_boxed_str()),
+        ),
+        (
+            "HTTP/1.1 200 OK",
+            Box::leak(tool_round("call_cargo", "CargoVersion", "{}").into_boxed_str()),
+        ),
+        (
+            "HTTP/1.1 200 OK",
+            Box::leak(tool_round("call_log", "GitLogLimit", r#"{"max": 1}"#).into_boxed_str()),
+        ),
+        ("HTTP/1.1 200 OK", FINAL_ROUND),
+    ]);
+    let (_agent, mut reader, mut stream) = spawn_agent(&repo, &socket, |cmd| {
+        cmd.args([
+            "--relay-url",
+            &format!("http://127.0.0.1:{port}"),
+            "--relay-token",
+            "tap_test_token",
+            "--tools-config",
+            config.to_str().unwrap(),
+        ]);
+    });
+
+    let reply = send_prompt(&mut stream, &mut reader, "check the repo");
+    assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+
+    // Every request goes through the channel, including the first — which is
+    // where the tool array belongs, before any tool has run.
+    let first = body_of(&rx.recv_timeout(Duration::from_secs(30)).unwrap());
+
+    // The git tool printed the real `git status --short` output.
+    let second = body_of(&rx.recv_timeout(Duration::from_secs(30)).unwrap());
+    let status = tool_result_of(&second, "call_git");
+    assert!(
+        status.contains("untracked.txt"),
+        "GitStatus should have printed real git output, got: {status}"
+    );
+
+    // The cargo tool ran a real cargo.
+    let third = body_of(&rx.recv_timeout(Duration::from_secs(30)).unwrap());
+    let cargo = tool_result_of(&third, "call_cargo");
+    assert!(
+        cargo.trim().starts_with("cargo "),
+        "CargoVersion should have printed real `cargo --version` output, got: {cargo}"
+    );
+
+    // The argument was substituted as a whole argv element.
+    let fourth = body_of(&rx.recv_timeout(Duration::from_secs(30)).unwrap());
+    let log = tool_result_of(&fourth, "call_log");
+    assert!(
+        log.contains("first commit"),
+        "GitLogLimit should have run `git log --oneline --max-count=1`, got: {log}"
+    );
+
+    // The configured array reached the wire: Bash removed, three tools added.
+    let names: Vec<&str> = first["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .filter_map(|t| t["name"].as_str())
+        .collect();
+    assert!(
+        !names.contains(&"Bash"),
+        "Bash was disabled but is still offered: {names:?}"
+    );
+    assert!(
+        names.contains(&"Read"),
+        "disabling Bash must not take the built-ins nobody asked to remove: {names:?}"
+    );
+    for wanted in ["GitStatus", "CargoVersion", "GitLogLimit"] {
+        assert!(names.contains(&wanted), "{wanted} missing from {names:?}");
+    }
+
+    // Every system block carries a breakpoint, which is the half of the cache
+    // fix that stops a mode toggle from invalidating the whole prompt.
+    assert!(
+        first["system"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|b| b.get("cache_control").is_some()),
+        "every system block should carry a breakpoint:\n{first}"
+    );
+
+    // And the growing transcript carries cache breakpoints, so it is being
+    // cached rather than re-bought every turn.
+    assert!(
+        first["messages"].as_array().unwrap().iter().any(|m| m["content"]
+            .as_array()
+            .is_some_and(|c| c.iter().any(|b| b.get("cache_control").is_some()))),
+        "no cache breakpoints on a real request:\n{first}"
     );
 }

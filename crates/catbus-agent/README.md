@@ -90,6 +90,18 @@ be removed and added to without a rebuild:
       "argv": ["git", "status", "--short"],
       "timeout_secs": 10,
       "judged": false
+    },
+    {
+      "name": "CargoTest",
+      "description": "Run the test suite, optionally filtered by name.",
+      "schema": {
+        "type": "object",
+        "properties": { "filter": { "type": "string" } },
+        "required": []
+      },
+      "argv": ["cargo", "test", "{filter?}"],
+      "timeout_secs": 300,
+      "judged": true
     }
   ]
 }
@@ -98,6 +110,14 @@ be removed and added to without a rebuild:
 ```sh
 catbus-agent --tools-config ./tools.json
 ```
+
+A working set is committed at `examples/tools.json` — `git status`, `git log`,
+`cargo test` and `cargo check`, with `Bash` removed.
+
+`tests/relay.rs::configured_tools_execute_for_real` runs this for real: it starts
+the actual binary with a config file, has the (mocked) model call the tools, and
+asserts the results are the real output of real `git` and `cargo` subprocesses.
+Only the model is simulated.
 
 - **`disable`** / **`allow`** filter the built-in set. `"disable": ["Bash"]`
   removes shell access entirely; `allow` keeps only what it lists.
@@ -113,6 +133,12 @@ catbus-agent --tools-config ./tools.json
 substituted as whole arguments. `["git", "log", "-n", "{count}"]` with
 `count = "5; rm -rf /"` runs `git log -n '5; rm -rf /'` — one argument, no
 expansion, nothing to escape. Nothing is ever handed to `sh -c`.
+
+A placeholder written `{param?}` is **optional**: when the argument is absent the
+whole argv entry is dropped, so `["cargo", "test", "{filter?}"]` runs plain
+`cargo test` when no filter was given. An optional placeholder must be a whole
+argument — `-n{count?}` is refused at startup, because dropping it would lose the
+flag and keeping it would pass a bare `-n`.
 
 The set is resolved **once, at startup**. Changing the file needs a restart, and
 that is a cache decision as much as a design one: the tool array is the first

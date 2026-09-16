@@ -145,6 +145,20 @@ impl ToolSet {
             if tool.argv.is_empty() {
                 return Err(format!("custom tool {:?} has an empty argv", tool.name));
             }
+            // An `{name?}` is only understood when it is the entire element,
+            // because that is the only shape where "drop it" is unambiguous.
+            // Embedded in a longer element — `-n{count?}` — dropping would lose
+            // the flag too and keeping would pass a bare `-n`, so it is refused
+            // where an operator will see it rather than misread at runtime.
+            for element in &tool.argv {
+                if element.contains("?}") && Self::optional_name(element).is_none() {
+                    return Err(format!(
+                        "custom tool {:?} has {element:?}, but an optional placeholder must be the \
+                         whole argument — write \"{{name?}}\" as its own argv entry",
+                        tool.name
+                    ));
+                }
+            }
             if custom.contains_key(&tool.name) {
                 return Err(format!("custom tool {:?} is defined twice", tool.name));
             }
@@ -248,34 +262,32 @@ impl ToolSet {
     /// A placeholder with no matching argument is an error rather than an empty
     /// string: silently passing `""` where a path was expected produces a
     /// command that runs against the wrong thing.
+    ///
+    /// A placeholder written `{name?}` is **optional**: when the argument is
+    /// absent the whole argv element is dropped. That is what makes
+    /// `["cargo", "test", "{filter?}"]` run plain `cargo test` when no filter
+    /// was given, which is the common case — without it the model would have to
+    /// supply a filter it does not have, or the element would expand to the
+    /// empty string and cargo would receive a blank argument.
+    ///
+    /// The element must be *exactly* the optional placeholder. `-n{count?}`
+    /// is refused at config load, because dropping that element would lose the
+    /// flag while keeping nothing, and keeping it would pass a bare `-n`.
     fn expand(tool: &CustomTool, input: &Value) -> Result<Vec<String>, String> {
-        let argument = |name: &str| -> Result<String, String> {
-            let value = input
-                .get(name)
-                .ok_or_else(|| format!("tool {:?} needs an argument {name:?} that was not supplied", tool.name))?;
-            // Strings pass through unchanged. Numbers and booleans are
-            // stringified because a schema may reasonably declare `"count":
-            // {"type": "integer"}` and the model will send `5`, not `"5"`.
-            // Anything else — an object or array — is refused rather than
-            // rendered, since there is no single argument it could mean.
-            match value {
-                Value::String(s) => Ok(s.clone()),
-                Value::Number(n) => Ok(n.to_string()),
-                Value::Bool(b) => Ok(b.to_string()),
-                other => Err(format!(
-                    "tool {:?} argument {name:?} must be a string, number or boolean, not {}",
-                    tool.name,
-                    match other {
-                        Value::Null => "null",
-                        Value::Array(_) => "an array",
-                        _ => "an object",
-                    }
-                )),
-            }
-        };
-
         let mut argv = Vec::with_capacity(tool.argv.len());
         for element in &tool.argv {
+            // The optional form first, because it is the whole element or
+            // nothing at all: `{name?}` becomes exactly the value, or the
+            // element is dropped.
+            if let Some(name) = Self::optional_name(element) {
+                if let Some(value) = input.get(name).filter(|v| !v.is_null()) {
+                    argv.push(Self::value_to_argument(&tool.name, name, value)?);
+                }
+                continue;
+            }
+            // Otherwise every placeholder is required. Substitution is textual
+            // within the element, so `--max-count={count}` becomes
+            // `--max-count=5` as one argument.
             let mut out = String::new();
             let mut rest = element.as_str();
             while let Some(open) = rest.find('{') {
@@ -285,13 +297,54 @@ impl ToolSet {
                 };
                 out.push_str(&rest[..open]);
                 let name = &rest[open + 1..open + close];
-                out.push_str(&argument(name)?);
+                let value = input
+                    .get(name)
+                    .ok_or_else(|| format!("tool {:?} needs an argument {name:?} that was not supplied", tool.name))?;
+                out.push_str(&Self::value_to_argument(&tool.name, name, value)?);
                 rest = &rest[open + close + 1..];
             }
             out.push_str(rest);
             argv.push(out);
         }
         Ok(argv)
+    }
+
+    /// The name inside an optional placeholder, when the whole element is one.
+    ///
+    /// `"{filter?}"` → `Some("filter")`. Anything else — `"-n{count?}"`, a
+    /// placeholder embedded in text — is `None`, and validation refuses it at
+    /// startup rather than dropping the flag while keeping nothing.
+    fn optional_name(element: &str) -> Option<&str> {
+        element
+            .strip_prefix('{')?
+            .strip_suffix("?}")?
+            .split('}')
+            .next()
+            .filter(|name| !name.is_empty())
+    }
+
+    /// One JSON value as a single argv string.
+    ///
+    /// Strings pass through unchanged. Numbers and booleans are stringified,
+    /// because a schema may reasonably declare `"count": {"type": "integer"}` and
+    /// the model will send `5`, not `"5"`. Anything else is refused rather than
+    /// rendered: there is no single argument an object or an array could mean, and
+    /// inventing one — `[object Object]`, a comma-joined list — would be a quiet
+    /// way to run a command against the wrong thing.
+    fn value_to_argument(tool: &str, name: &str, value: &Value) -> Result<String, String> {
+        match value {
+            Value::String(s) => Ok(s.clone()),
+            Value::Number(n) => Ok(n.to_string()),
+            Value::Bool(b) => Ok(b.to_string()),
+            other => Err(format!(
+                "tool {tool:?} argument {name:?} must be a string, number or boolean, not {}",
+                match other {
+                    Value::Null => "null",
+                    Value::Array(_) => "an array",
+                    _ => "an object",
+                }
+            )),
+        }
     }
 
     /// The custom tool by that name, if this set has one.
@@ -567,6 +620,71 @@ mod tests {
         assert!(
             ToolSet::expand(&t, &json!({ "b": true })).is_err(),
             "a missing argument is an error"
+        );
+    }
+
+    /// `{name?}` is the whole element or nothing, which is what lets
+    /// `["cargo", "test", "{filter?}"]` run plain `cargo test` when no filter
+    /// was given. Without it the model would have to invent a filter, or the
+    /// element would expand to `""` and cargo would receive a blank argument.
+    #[test]
+    fn an_optional_placeholder_is_dropped_when_absent() {
+        let t = tool(&["cargo", "test", "{filter?}"]);
+
+        // Absent, null: dropped, and the command is still well-formed.
+        assert_eq!(ToolSet::expand(&t, &json!({})).expect("expands"), vec!["cargo", "test"]);
+        assert_eq!(
+            ToolSet::expand(&t, &json!({ "filter": null })).expect("expands"),
+            vec!["cargo", "test"]
+        );
+
+        // Present: substituted as its own argument.
+        assert_eq!(
+            ToolSet::expand(&t, &json!({ "filter": "caching" })).expect("expands"),
+            vec!["cargo", "test", "caching"]
+        );
+
+        // And still one argument, however hostile the value.
+        assert_eq!(
+            ToolSet::expand(&t, &json!({ "filter": "a; rm -rf /" })).expect("expands"),
+            vec!["cargo", "test", "a; rm -rf /"]
+        );
+    }
+
+    /// An optional placeholder must be an entire element. `-n{max?}` is refused
+    /// at startup because neither reading is right: dropping it loses the flag,
+    /// keeping it passes a bare `-n`.
+    #[test]
+    fn an_optional_placeholder_must_be_a_whole_argument() {
+        let bad = ToolConfig {
+            add: vec![CustomTool {
+                name: "Bad".into(),
+                ..tool(&["git", "log", "-n{max?}"])
+            }],
+            ..ToolConfig::default()
+        };
+        let err = ToolSet::from_config(bad).expect_err("should refuse");
+        assert!(err.contains("whole argument"), "{err}");
+
+        let fine = ToolConfig {
+            add: vec![CustomTool {
+                name: "Fine".into(),
+                ..tool(&["git", "log", "-n", "{max?}"])
+            }],
+            ..ToolConfig::default()
+        };
+        assert!(ToolSet::from_config(fine).is_ok());
+    }
+
+    /// A required placeholder is still required — the optional form must not
+    /// have relaxed anything.
+    #[test]
+    fn a_required_placeholder_is_still_required() {
+        let t = tool(&["git", "log", "--max-count={max}"]);
+        assert!(ToolSet::expand(&t, &json!({})).is_err());
+        assert_eq!(
+            ToolSet::expand(&t, &json!({ "max": 3 })).expect("expands"),
+            vec!["git", "log", "--max-count=3"]
         );
     }
 
