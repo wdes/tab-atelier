@@ -20,7 +20,9 @@ use serde_json::{Value, json};
 use tab_atelier_proxy::compact::{Compact, KEEP_TURNS, apply};
 
 /// The marker production puts in place of a stubbed tool result.
-const TOOL_STUB: &str = "[tool result elided by tab-atelier-proxy: ";
+/// The stub layer A writes, and the legacy one it must still recognise.
+const TOOL_STUB: &str = "[elided:";
+const TOOL_STUB_LEGACY: &str = "[tool result elided by tab-atelier-proxy: ";
 /// The marker it puts in place of an old write payload.
 const WRITE_STUB: &str = "[file content elided by tab-atelier-proxy: ";
 
@@ -136,6 +138,42 @@ fn old_tool_results_are_replaced_by_a_stub() {
     assert!(stats.tool_results_elided > 0, "nothing was elided");
     let text = body.to_string();
     assert!(text.contains(TOOL_STUB), "no tool stub was written");
+}
+
+#[test]
+fn a_legacy_stub_survives_the_pass_unchanged() {
+    // Bodies already in flight when the marker shrank still carry the old text.
+    // Re-stubbing one would nest a stub inside a stub and recompute the byte
+    // count from the stub rather than from the result it replaced — so the
+    // number would shrink on every pass and the original size would be gone.
+    //
+    // Two things protect that, and this test pins the second. The size floor
+    // keeps a realistic legacy stub (~76 bytes) untouched no matter what;
+    // the prefix check is what covers a stub above the floor, which is why the
+    // one planted here is padded past 200 bytes. Without the padding this test
+    // passed even with the legacy prefix removed, because the floor had already
+    // kept the stub — it asserted nothing.
+    let mut body = long_session(4, 1_600);
+    let legacy = format!("{TOOL_STUB_LEGACY}1002 bytes; tool_use_id=call_00{}]", "x".repeat(200));
+
+    let mut planted = false;
+    for message in body["messages"].as_array_mut().into_iter().flatten() {
+        for block in message["content"].as_array_mut().into_iter().flatten() {
+            if block["type"] == "tool_result" && !planted {
+                block["content"] = json!(legacy);
+                planted = true;
+            }
+        }
+    }
+    assert!(planted, "the fixture has no tool_result to plant a legacy stub in");
+
+    let _ = apply(&mut body, Compact::Tools);
+
+    assert_eq!(
+        body.to_string().matches(&legacy).count(),
+        1,
+        "the legacy stub was rewritten or nested inside a new one"
+    );
 }
 
 #[test]

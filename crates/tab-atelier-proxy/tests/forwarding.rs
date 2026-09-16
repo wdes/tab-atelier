@@ -547,11 +547,8 @@ fn compaction_reaches_upstream_and_only_where_it_is_configured() {
         "the body should have shrunk upstream: {sent} → {}",
         body.len()
     );
-    assert!(
-        body.contains("tool result elided by tab-atelier-proxy"),
-        "no stub upstream"
-    );
-    let elided = body.matches("tool result elided by tab-atelier-proxy").count();
+    assert!(body.contains("[elided:"), "no stub upstream");
+    let elided = body.matches("[elided:").count();
     assert_eq!(elided, 4, "tool results elided (want 4): {elided}");
     let kept_thinking = body.matches(r#""type":"thinking""#).count();
     assert_eq!(kept_thinking, 6, "thinking blocks kept (want 6): {kept_thinking}");
