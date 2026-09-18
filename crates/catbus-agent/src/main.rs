@@ -497,7 +497,6 @@ async fn run_repl(agent: Arc<agent::Agent>, cwd: &std::path::Path) -> std::io::R
                       /rename <name>     rename the current session\n  \
                       /resume            list previous sessions in this cwd\n  \
                       /resume <id>       switch to a previous session in-place\n  \
-                      /deb               build the .deb and print its path\n  \
                       /exit              quit (same as Ctrl-D)\n\n",
                 )
                 .await?;
@@ -514,37 +513,6 @@ async fn run_repl(agent: Arc<agent::Agent>, cwd: &std::path::Path) -> std::io::R
             stdout
                 .write_all(format!("gate = {}\n", gate.as_str()).as_bytes())
                 .await?;
-            continue;
-        }
-        if prompt == "/deb" {
-            stdout.write_all(b"\x1b[36mbuilding .deb...\x1b[0m\n").await?;
-            stdout.flush().await?;
-            let out = tokio::process::Command::new("cargo")
-                .args(["deb", "--no-build"])
-                .current_dir(cwd)
-                .output()
-                .await;
-            match out {
-                Ok(o) if o.status.success() => {
-                    // cargo-deb prints the .deb path as the last non-empty
-                    // line of stdout.
-                    let text = String::from_utf8_lossy(&o.stdout);
-                    let path = text.lines().rfind(|l| !l.trim().is_empty()).unwrap_or("(no output)");
-                    let path = path.trim().trim_matches('`');
-                    stdout.write_all(format!("\x1b[1m{path}\x1b[0m\n").as_bytes()).await?;
-                }
-                Ok(o) => {
-                    let stderr = String::from_utf8_lossy(&o.stderr);
-                    stdout
-                        .write_all(format!("\x1b[31merror:\x1b[0m cargo-deb failed\n{stderr}").as_bytes())
-                        .await?;
-                }
-                Err(e) => {
-                    stdout
-                        .write_all(format!("\x1b[31merror:\x1b[0m could not run cargo-deb: {e}\n").as_bytes())
-                        .await?;
-                }
-            }
             continue;
         }
         if prompt == "/clear" {
