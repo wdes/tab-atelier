@@ -153,6 +153,11 @@ fn agent_command(dir: &Path) -> Command {
         .env_remove("CATBUS_RELAY_TOKEN")
         .env_remove("CATBUS_PREFERENCES")
         .env_remove("XDG_CONFIG_HOME")
+        // Reply formatting is steered by these; cleared so the suite does not
+        // depend on the shell that launched it.
+        .env_remove("CATBUS_ANSI")
+        .env_remove("NO_COLOR")
+        .env_remove("CLICOLOR")
         .env(
             "LLVM_PROFILE_FILE",
             format!("{}/catbus-e2e-%p.profraw", env!("CARGO_TARGET_TMPDIR")),

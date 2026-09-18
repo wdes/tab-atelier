@@ -29,7 +29,7 @@ use std::fmt::Write as _;
 use crate::relay::Relay;
 use crate::session::{self, Block, Session};
 use crate::tools;
-use crate::{cache, guard, retry};
+use crate::{ansi, cache, guard, retry};
 
 /// Identifier the server requires at the start of the first system
 /// block on every Messages call. The proxy forwards system blocks
@@ -40,7 +40,7 @@ const CLAUDE_CODE_PREFIX: &str = "You are Claude Code, Anthropic's official CLI 
 /// surface small. Both can be swapped via `/model` later.
 const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
 
-/// Static portion of the second system block.
+/// Static portion of the second system block, when a terminal will render it.
 ///
 /// Both system blocks are now `&'static str`: the working directory and the
 /// permission mode used to be formatted into a block here, which put mutable
@@ -49,13 +49,30 @@ const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
 ///
 /// Nothing session-specific may be added to this text. If it can change while
 /// the agent runs, it belongs in the env turn.
-const SYSTEM_STATIC_INSTRUCTIONS: &str = "Your text replies are rendered directly in a terminal emulator \
+const INSTRUCTIONS_TERMINAL: &str = "Your text replies are rendered directly in a terminal emulator \
     that supports ANSI colour and formatting — use ANSI SGR escapes \
     (bold, colours, etc.) to make output readable. Do NOT use \
     markdown — no asterisks, no backtick fences, no hashes. \
     Use ANSI instead: \x1b[1m for bold, \x1b[32m for green, \
     \x1b[33m for yellow, \x1b[31m for red, \x1b[36m for cyan, \
     \x1b[0m to reset.";
+
+/// The same slot when *no* terminal will render the answer.
+///
+/// One session is read by several clients and only some have a terminal: the
+/// REPL prints to one, but the socket, the transcript an API client mirrors,
+/// and a phone showing the same conversation do not. Asking for SGR there is
+/// asking for literal `[1m` in the text — the emphasis arrives as noise. So the
+/// request has to match the sink, and this is the variant for the sinks that
+/// interpret nothing.
+///
+/// Markdown stays out for the same reason it is out of the terminal text:
+/// plain prose is what reads correctly with nothing in between.
+const INSTRUCTIONS_PLAIN: &str = "Your text replies are shown as plain text. Do NOT use markdown or \
+    ANSI escape sequences — no asterisks, no backtick fences, no hashes, \
+    no colour codes: they are displayed literally and make the answer \
+    harder to read. Write plain prose in short sentences. For lists, use a \
+    hyphen or a number at the start of each line with no other decoration.";
 
 /// Which API backend answers this session's prompts. Chosen once at
 /// startup from the CLI; the tool loop is backend-agnostic.
@@ -97,6 +114,11 @@ pub struct Agent {
     /// array leads the body, so a set that varied between requests would
     /// invalidate every breakpoint behind it. See [`crate::tools::ToolSet`].
     tools: tools::ToolSet,
+    /// Whether the answer is written to a terminal that renders escape
+    /// sequences. Chooses between [`INSTRUCTIONS_TERMINAL`] and
+    /// [`INSTRUCTIONS_PLAIN`] — see [`Self::with_ansi`] for why the default is
+    /// the conservative one.
+    ansi: bool,
     /// Current activity description shown in the REPL spinner.
     /// `None` = idle, `Some(s)` = description of what's happening.
     pub status: std::sync::Mutex<Option<String>>,
@@ -127,6 +149,12 @@ impl Agent {
             judge_model: crate::guard::DEFAULT_JUDGE_MODEL.to_owned(),
             monitor_prompt: crate::guard::MONITOR_PROMPT.to_owned(),
             tools: tools::ToolSet::builtin(),
+            // Off unless the caller asks. A session is usually mirrored by
+            // something with no terminal — the phone, an API client, the
+            // transcript — and escape sequences are worse than useless there.
+            // Opting in is a one-line change for the launcher, which is the
+            // only party that knows what stdout actually is.
+            ansi: false,
             status: std::sync::Mutex::new(None),
             tokens_in: std::sync::atomic::AtomicU64::new(0),
             tokens_out: std::sync::atomic::AtomicU64::new(0),
@@ -178,6 +206,45 @@ impl Agent {
     pub fn with_tools(mut self, tools: tools::ToolSet) -> Self {
         self.tools = tools;
         self
+    }
+
+    /// Tell the agent whether its answers are read in a terminal.
+    ///
+    /// A builder rather than a `new` parameter because it describes the sink,
+    /// not the agent, and most callers do not have a terminal to describe. The
+    /// default is `false`: a session that is *mirrored* — read over the socket,
+    /// stored in the transcript, shown on a phone — is the common case, and
+    /// escape sequences there arrive as literal `[1m`. Only a caller that will
+    /// actually render stdout (the REPL, when stdout is a tty) should opt in.
+    #[must_use]
+    pub const fn with_ansi(mut self, ansi: bool) -> Self {
+        self.ansi = ansi;
+        self
+    }
+
+    /// The instruction text matching this agent's sink.
+    ///
+    /// Both variants are `&'static str`, so this stays a borrow and the prompt
+    /// prefix remains cacheable — a value built here would put a fresh
+    /// allocation in the middle of the cached region on every turn.
+    const fn instructions(&self) -> &'static str {
+        if self.ansi {
+            INSTRUCTIONS_TERMINAL
+        } else {
+            INSTRUCTIONS_PLAIN
+        }
+    }
+
+    /// The reply as this agent's sink should receive it.
+    ///
+    /// The instruction text is a request, not a guarantee. A model can ignore
+    /// it, half-apply it, or have emitted escapes before the sink changed — a
+    /// session resumed by a later process writing somewhere else. Filtering on
+    /// the way out means a reader with no terminal never sees `[1m`, whatever
+    /// the model chose to send. When `ansi` is set the text is passed through
+    /// untouched, because there the terminal *is* interpreting it.
+    fn for_sink(&self, text: String) -> String {
+        if self.ansi { text } else { ansi::strip_owned(text) }
     }
 
     /// Grade one proposed action, in auto mode.
@@ -320,10 +387,23 @@ impl Agent {
                 .fetch_add(resp.usage.input_tokens, std::sync::atomic::Ordering::Relaxed);
             self.tokens_out
                 .fetch_add(resp.usage.output_tokens, std::sync::atomic::Ordering::Relaxed);
-            // Persist what the model produced first (clones the blocks
-            // into the transcript entry — one clone), then iterate by
-            // borrow, then move into in-memory history (no second clone).
-            let entry = session::assistant_blocks(&session, resp.model.clone(), resp.content.clone());
+            // Persist a plain copy, not `resp.content` itself. The transcript is
+            // a *shared* artifact read by clients with no terminal —
+            // tab-atelier renders chat bubbles straight from it — so it stays
+            // plain even for a session whose REPL is painting a terminal. That
+            // is the reported bug: the reply reached the transcript exactly as
+            // the model sent it, bypassing every socket-side filter.
+            //
+            // The visible answer is filtered separately, by `for_sink`, because
+            // a terminal *should* keep its colour. So the two can legitimately
+            // differ, and the in-memory history keeps the model's own bytes:
+            // echoing them back verbatim is one less thing to get wrong, and
+            // that is the copy the upstream sees.
+            //
+            // Still one clone: persist first, then iterate the blocks by
+            // borrow, then move them into in-memory history without a second
+            // copy.
+            let entry = session::assistant_blocks(&session, resp.model.clone(), plain_content(&resp.content));
             session.append(&entry)?;
 
             // Collect tool_use blocks by reference; pull any text into
@@ -363,7 +443,7 @@ impl Agent {
                         content: ApiContent::Blocks(resp.content),
                     });
                 }
-                return Ok(final_text);
+                return Ok(self.for_sink(final_text));
             }
 
             // Run tools, build a single user-message of tool_result
@@ -446,7 +526,7 @@ impl Agent {
             Err(AgentError::TooManyRounds)
         } else {
             final_text.push_str("\n\n\x1b[33m[tool loop hit the 32-round cap — response may be incomplete]\x1b[0m");
-            Ok(final_text)
+            Ok(self.for_sink(final_text))
         }
     }
 
@@ -482,7 +562,7 @@ impl Agent {
                 },
                 SystemBlock {
                     kind: "text",
-                    text: std::borrow::Cow::Borrowed(SYSTEM_STATIC_INSTRUCTIONS),
+                    text: std::borrow::Cow::Borrowed(self.instructions()),
                 },
             ],
             tools: &tool_specs,
@@ -555,7 +635,7 @@ impl Agent {
         // put mutable bytes at the very front — the defect this change exists
         // to remove. `build_request` appends it after the history instead, for
         // the same reason it goes last on the relay wire.
-        let system = SYSTEM_STATIC_INSTRUCTIONS.to_owned();
+        let system = self.instructions().to_owned();
         let tool_specs = self.tools.specs().to_vec();
         let state = cache::env_text(&active.session.cwd.display().to_string(), self.gate().as_str());
         let body = crate::openai::build_request(&cfg.model, &system, &state, &tool_specs, &active.history);
@@ -714,6 +794,27 @@ fn truncate(s: &str, max: usize) -> &str {
         end -= 1;
     }
     &s[..end]
+}
+
+/// A copy of `content` with escapes removed from its text blocks only.
+///
+/// For the transcript, which is shared and therefore read by clients that
+/// interpret nothing — tab-atelier renders chat bubbles from it. Only `text` is
+/// rewritten: tool-use ids are what the upstream matches results against, and a
+/// thinking block's signature is checked against the reasoning it signs, so
+/// either one edited here would turn a display fix into a rejected request.
+fn plain_content(content: &[Block]) -> Vec<Block> {
+    content
+        .iter()
+        .map(|block| match block {
+            Block::Text { text } => Block::Text {
+                text: ansi::strip_owned(text.clone()),
+            },
+            // Clone as-is: tool_use, tool_result and thinking all carry
+            // load-bearing bytes that must survive verbatim.
+            other => other.clone(),
+        })
+        .collect()
 }
 
 /// Anthropic's API requires every `tool_use` in an assistant turn to
