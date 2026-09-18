@@ -505,6 +505,19 @@ pub fn pty_env(colors_enabled: bool) -> std::collections::HashMap<String, String
         env.insert("COLORTERM".into(), "truecolor".into());
     } else {
         env.insert("TERM".into(), "dumb".into());
+        // The standard signal alongside the legacy one. `TERM=dumb` is a claim
+        // about what the terminal *can* do, and using it to mean "policy says no
+        // colour" is a lie that degrades every TUI in the tab — as the note on
+        // [`new_tab_env`] above already observes. `NO_COLOR`/`CLICOLOR` say the
+        // same thing without that cost, and they are what `new_tab_env` sends for
+        // API-created tabs, so all three paths now spell "no colour" the same way.
+        //
+        // `TERM=dumb` is kept rather than replaced, because tools that read
+        // nothing else still depend on it. Moving it to `xterm-256color` would
+        // change what every program in a colours-off tab sees — a separate
+        // decision, with its own trade-off, not taken here.
+        env.insert("NO_COLOR".into(), "1".into());
+        env.insert("CLICOLOR".into(), "0".into());
     }
     // Force the telemetry / feedback-survey opt-out onto every tab.
     apply_telemetry_disable_env(&mut env);
@@ -563,12 +576,16 @@ pub fn minimal_pty_env<S: std::hash::BuildHasher>(
     }
     env.entry("PATH".to_string())
         .or_insert_with(|| CLEAR_ENV_DEFAULT_PATH.to_string());
-    // 2. Colours: identical policy to the inheriting `pty_env` path.
+    // 2. Colours: identical policy to the inheriting `pty_env` path, standard
+    // signal included — see the note there for why `NO_COLOR`/`CLICOLOR` travel
+    // alongside `TERM=dumb`.
     if colors_enabled {
         env.insert("TERM".to_string(), "xterm-256color".to_string());
         env.insert("COLORTERM".to_string(), "truecolor".to_string());
     } else {
         env.insert("TERM".to_string(), "dumb".to_string());
+        env.insert("NO_COLOR".to_string(), "1".to_string());
+        env.insert("CLICOLOR".to_string(), "0".to_string());
     }
     // 3. Telemetry opt-out (tab-atelier privacy default).
     apply_telemetry_disable_env(&mut env);
@@ -4953,6 +4970,37 @@ mod tests {
             !env.contains_key("COLORTERM"),
             "no truecolor advertised when colours are off"
         );
+        // The standard signal, and the one a client is expected to read. Without
+        // it a colours-off tab only said `TERM=dumb`, which is a claim about
+        // capability rather than policy — so a program that honours `NO_COLOR`
+        // (and not `TERM`) kept emitting escapes. That was the reported bug: a
+        // catbus tab with colours switched off still showing ANSI.
+        assert_eq!(
+            env.get("NO_COLOR").map(String::as_str),
+            Some("1"),
+            "colours off must set NO_COLOR, not only TERM"
+        );
+        assert_eq!(env.get("CLICOLOR").map(String::as_str), Some("0"));
+    }
+
+    #[test]
+    fn minimal_pty_env_advertises_no_colour_opt_out_when_colours_are_on() {
+        // The other direction, so the assertions above cannot be satisfied by
+        // setting the opt-out unconditionally — which would strip colour from
+        // every tab including the ones the user left coloured.
+        let env = minimal_pty_env(
+            true,
+            &std::collections::BTreeMap::new(),
+            &std::collections::HashMap::new(),
+        );
+        assert!(
+            !env.contains_key("NO_COLOR"),
+            "a coloured tab must not opt out: {env:?}"
+        );
+        assert!(
+            !env.contains_key("CLICOLOR"),
+            "a coloured tab must not opt out: {env:?}"
+        );
     }
 
     #[test]
@@ -6170,6 +6218,9 @@ mod state_writer_tests {
         // every agent's output unreadable, so this is worth pinning.
         assert_eq!(on.get("TERM").map(String::as_str), Some("xterm-256color"));
         assert_eq!(on.get("COLORTERM").map(String::as_str), Some("truecolor"));
+        assert!(!on.contains_key("NO_COLOR"), "a coloured tab must not opt out: {on:?}");
+        assert!(!on.contains_key("CLICOLOR"), "a coloured tab must not opt out: {on:?}");
+
         let off = crate::pty_env(false);
         assert!(
             !off.contains_key("COLORTERM"),
@@ -6177,6 +6228,15 @@ mod state_writer_tests {
         );
         // TERM is always set: an empty TERM breaks ncurses programs outright.
         assert!(off.contains_key("TERM"), "TERM must always be set");
+        // And the standard opt-out travels with it. `TERM=dumb` alone is a
+        // capability claim, so a client reading only `NO_COLOR` saw nothing and
+        // kept emitting escapes — the reported bug. Both spawn paths must agree.
+        assert_eq!(
+            off.get("NO_COLOR").map(String::as_str),
+            Some("1"),
+            "colours off must set NO_COLOR, not only TERM"
+        );
+        assert_eq!(off.get("CLICOLOR").map(String::as_str), Some("0"));
     }
 
     #[test]

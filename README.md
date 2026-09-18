@@ -411,11 +411,14 @@ A `catbus-agent` session has several readers and only some have a terminal. The 
 | `--no-tui`, or piped | plain prose, no markdown, no escapes | stripped |
 | the transcript on disk | — | always plain |
 
-`--ansi` (or `CATBUS_ANSI=true`) forces escapes on for a pipe known to render them — a `script` capture, an xterm-backed panel. `NO_COLOR` (any non-empty value) and `CLICOLOR=0` force them off, and an explicit `--ansi` wins over both. The transcript is plain regardless, because tab-atelier renders chat bubbles straight from it and has no terminal to interpret anything.
+`--ansi` (or `CATBUS_ANSI=true`) forces escapes on for a pipe known to render them — a `script` capture, an xterm-backed panel. `NO_COLOR` (any non-empty value), `CLICOLOR=0` and `TERM=dumb` force them off, and an explicit `--ansi` wins over all three. The transcript is plain regardless, because tab-atelier renders chat bubbles straight from it and has no terminal to interpret anything.
 
-Precedence, most explicit first: `--ansi`/`--ansi=false` → `NO_COLOR` / `CLICOLOR=0` → whether stdout is really a terminal.
+Precedence, most explicit first: `--ansi`/`--ansi=false` → `NO_COLOR` / `CLICOLOR=0` / `TERM=dumb` → whether stdout is really a terminal.
 
-`NO_COLOR` matters more than it looks: `new_tab_env` already sets it for the tabs an *agent* asked for, because those tabs' output is read by another program (`peek`, `output`, a `--wait` poll). A `catbus-agent` running in one of those tabs now honours the same signal, so it comes out plain with the launcher needing to say nothing — while a catbus tab opened from the GUI, with a real terminal, keeps its colour.
+All three opt-out signals are honoured because the app uses two mechanisms and a client does not get to choose which one it is handed:
+
+- `NO_COLOR`/`CLICOLOR` — what `new_tab_env` sets for the tabs an *agent* asked for, since those tabs' output is read by another program (`peek`, `output`, a `--wait` poll).
+- `TERM=dumb` — what the per-tab **colors** toggle sets (`pty_env`). It is a blunt instrument, and the app's own note says so: `TERM=dumb` claims the terminal *cannot* render colour, which degrades every TUI in the tab rather than just asking for no colour. The tab's colours-off environment now also sets `NO_COLOR=1` and `CLICOLOR=0`, so the standard signal travels with the legacy one and both spawn paths (`pty_env`, `minimal_pty_env`) agree. `TERM` is still set to `dumb` as before, because tools that read nothing else still rely on it — changing what every program in the tab sees is a separate decision.
 
 This is belt-and-braces on purpose: the instruction is a request the model may ignore, and the transcript is written from the reply as the model sent it, so escape sequences are also filtered out on the way to any reader that will not interpret them. That filter lives in `crates/catbus-agent/src/ansi.rs`, on `vte`'s parser via `strip-ansi-escapes` (already in the binary as a `reedline` dependency). `tab-atelier peek` applies the same rule for the same reason.
 

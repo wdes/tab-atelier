@@ -152,14 +152,25 @@ impl Drop for KillOnDrop {
 /// reading before the next line arrives. Sending them immediately also works —
 /// the pty buffers — but would make a timing failure much harder to read.
 fn type_and_expect(line: &str, expect: &str) -> (bool, String) {
+    type_and_expect_env(&[], line, expect)
+}
+
+/// As [`type_and_expect`], with extra environment variables set on the child.
+///
+/// The env is the input to the colour decision, so testing that decision means
+/// controlling it explicitly — and `RUST_LOG` is needed because the verdict is
+/// logged at `info`, which REPL mode suppresses unless it is asked for.
+fn type_and_expect_env(env: &[(&str, &str)], line: &str, expect: &str) -> (bool, String) {
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path();
     let mut pty = Pty::open();
 
-    let child = Command::new(env!("CARGO_BIN_EXE_catbus-agent"))
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_catbus-agent"));
+    cmd
         // Hermetic, for the same reasons as the socket tests: no operator config,
         // no inherited colour settings.
         .env("HOME", home)
+        .env("RUST_LOG", "info")
         .env_remove("NO_COLOR")
         .env_remove("CLICOLOR")
         .env_remove("CATBUS_ANSI")
@@ -183,7 +194,11 @@ fn type_and_expect(line: &str, expect: &str) -> (bool, String) {
             "http://127.0.0.1:9",
             "--relay-token",
             "tap_pty_test",
-        ])
+        ]);
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+    let child = cmd
         // All three streams on the pty: reedline writes the prompt to stdout and
         // reads keys from the controlling terminal, so anything left as a pipe
         // would either hide the output or fail the open.
@@ -203,6 +218,41 @@ fn type_and_expect(line: &str, expect: &str) -> (bool, String) {
     pty.send(&format!("{line}\n"));
     let matched = pty.drain_until(&mut seen, expect, Duration::from_secs(20));
     (matched, seen)
+}
+
+/// The colour verdict the binary reaches from its environment.
+///
+/// Stands in for the tab case that was broken: a real terminal (`stdout_renders`
+/// true, since this is a pty) whose environment says no colour. Reading `TERM`
+/// only would decide `true` and emit escapes into a tab the user had explicitly
+/// switched to monochrome, so both signals are checked here.
+#[test]
+fn a_colours_off_tab_gets_a_plain_agent() {
+    // `TERM=dumb` is what the app's per-tab toggle set; `NO_COLOR` is the
+    // standard signal it now sets alongside. Either must be enough on its own,
+    // so both are exercised — a fix that only read one would still be broken for
+    // whichever path sends the other.
+    for env in [
+        &[("TERM", "dumb")][..],
+        &[("TERM", "dumb"), ("NO_COLOR", "1")][..],
+        &[("NO_COLOR", "1")][..],
+    ] {
+        let (_, seen) = type_and_expect_env(env, "/noplan", "gate = open");
+        assert!(
+            seen.contains("ansi escapes in replies: false"),
+            "env {env:?} should disable escapes; output was:\n{seen}"
+        );
+    }
+}
+
+/// And a colour-capable terminal keeps them, so the fix is not a blanket off.
+#[test]
+fn a_colour_capable_tab_keeps_escapes() {
+    let (_, seen) = type_and_expect_env(&[("TERM", "xterm-256color")], "/noplan", "gate = open");
+    assert!(
+        seen.contains("ansi escapes in replies: true"),
+        "an ordinary terminal should keep escapes; output was:\n{seen}"
+    );
 }
 
 #[test]

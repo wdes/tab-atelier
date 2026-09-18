@@ -286,17 +286,24 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // come out plain without the launcher saying anything — tab-atelier's
     // `new_tab_env` sets `NO_COLOR=1` for the tabs an *agent* asked for, since
     // those tabs' output is read by another program (`peek`, `output`, a
-    // `--wait` poll) and escapes there are bytes nothing renders. See
-    // `ansi::allow_escapes` for the full reasoning.
+    // `--wait` poll) and escapes there are bytes nothing renders — and what
+    // makes a tab with its right-click colours switched off come out plain too,
+    // since that toggle is expressed as `TERM=dumb`. See `ansi::allow_escapes`
+    // for the full reasoning.
     let stdout_renders = !args.no_tui && std::io::stdout().is_terminal();
     let env_disables_colour = ansi::colour_disabled_in_env();
     let ansi = ansi::allow_escapes(args.ansi, stdout_renders, env_disables_colour);
     // Log every input, not just the verdict: when the answer looks wrong, the
-    // useful question is *which* source decided it.
+    // useful question is *which* source decided it. TERM is included because it
+    // is the signal the app's per-tab colours toggle uses, and a `TERM=dumb` tab
+    // is otherwise indistinguishable from a misconfiguration.
     log::info!(
         "ansi escapes in replies: {ansi} \
-         (flag={:?}, stdout_renders={stdout_renders}, no_color={env_disables_colour})",
-        args.ansi
+         (flag={:?}, stdout_renders={stdout_renders}, colour_disabled={env_disables_colour}, \
+         TERM={:?}, NO_COLOR={:?})",
+        args.ansi,
+        std::env::var("TERM").ok(),
+        std::env::var("NO_COLOR").ok()
     );
     let agent = Arc::new(
         agent::Agent::new(provider, session)
