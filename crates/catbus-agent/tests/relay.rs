@@ -1771,3 +1771,88 @@ fn a_tool_only_loop_that_hits_the_cap_reports_an_error() {
         "the error should name the knob to turn:\n{message}"
     );
 }
+
+/// A reply that is nothing but an empty `thinking` block must not poison the
+/// next request.
+///
+/// This is the live failure, reproduced. The model streamed a `thinking` block
+/// whose text was empty while its signature survived; the turn was pushed into
+/// history as-is, because the loop moves `resp.content` wholesale, and the next
+/// request carried an assistant message with no content in it. Anthropic
+/// answers that with `messages.N: all messages must have non-empty content` —
+/// a 400 that ends the turn and, for an operator, looks like the session
+/// dying for no reason.
+///
+/// The first reply here is that poisoned turn verbatim: the only block in the
+/// message is a `thinking` block with `"thinking": ""`. The assertion is on the
+/// *second* request, so it fails if the block is ever put back on the wire.
+#[test]
+fn a_turn_of_nothing_but_an_empty_thinking_block_is_pruned_from_the_next_request() {
+    const EMPTY_THINKING: &str = r#"{
+        "id": "msg_empty",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-sonnet-4-6",
+        "content": [{ "type": "thinking", "thinking": "", "signature": "sig" }],
+        "stop_reason": "end_turn",
+        "usage": { "input_tokens": 5, "output_tokens": 4 }
+    }"#;
+
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("agent.sock");
+    let (port, rx) = spawn_mock_relay(vec![
+        ("HTTP/1.1 200 OK", EMPTY_THINKING),
+        ("HTTP/1.1 200 OK", FINAL_ROUND),
+        ("HTTP/1.1 200 OK", FINAL_ROUND),
+    ]);
+    let (_agent, mut reader, mut stream) = spawn_agent(dir.path(), &socket, |cmd| {
+        cmd.args([
+            "--relay-url",
+            &format!("http://127.0.0.1:{port}"),
+            "--relay-token",
+            RELAY_TOKEN,
+        ]);
+    });
+
+    let reply = send_prompt(&mut stream, &mut reader, "one");
+    assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+
+    let reply = send_prompt(&mut stream, &mut reader, "two");
+    assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+
+    // The first request is the prompt on its own; the second is the one that
+    // would have carried the poisoned turn.
+    let _first = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let raw = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let messages = body_of(&raw)["messages"].as_array().expect("messages array").clone();
+
+    assert!(
+        messages.len() >= 2,
+        "the second request should carry the two prompts:\n{raw}"
+    );
+    assert!(
+        messages.iter().all(|m| m["role"] != "assistant"),
+        "the empty assistant turn should not have been sent at all:\n{raw}"
+    );
+    for (i, message) in messages.iter().enumerate() {
+        // The env turn the harness appends is still a plain string; history is
+        // in blocks. Both must be non-empty, which is the property that matters.
+        if let Some(text) = message["content"].as_str() {
+            assert!(!text.trim().is_empty(), "message {i} has no content:\n{raw}");
+            continue;
+        }
+        let blocks = message["content"].as_array().expect("content is a string or blocks");
+        assert!(
+            !blocks.is_empty(),
+            "message {i} has no content, which is the 400 this guards:\n{raw}"
+        );
+        for block in blocks {
+            if block["type"] == "thinking" {
+                assert!(
+                    !block["thinking"].as_str().unwrap_or_default().trim().is_empty(),
+                    "an empty thinking block reached the relay in message {i}:\n{raw}"
+                );
+            }
+        }
+    }
+}

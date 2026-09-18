@@ -107,6 +107,80 @@ pub fn stabilise_shapes(body: &mut Value) -> usize {
     changed
 }
 
+/// What a tool that said nothing leaves behind.
+const NO_OUTPUT: &str = "(no output)";
+
+/// Drop the content that is not content, and any turn left holding none.
+///
+/// Anthropic answers a message with nothing in it with `messages.N: all
+/// messages must have non-empty content`, and an empty block counts as nothing
+/// — so "the content array is non-empty" is not the property that matters. The
+/// case that found this was a `thinking` block whose `thinking` was empty: a
+/// session resumed from a transcript can carry one, because the transcript kept
+/// the block's signature and not its text.
+///
+/// An empty `tool_result` is filled in rather than dropped, since dropping it
+/// would leave the `tool_use` above it unanswered, which the API rejects in
+/// turn. Nothing else can be removed without losing something the model asked
+/// for, so nothing else is.
+///
+/// Returns how many blocks and turns were removed or replaced.
+pub fn prune_empty_content(body: &mut Value) -> usize {
+    let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
+        return 0;
+    };
+    let mut changed = 0;
+    let mut kept = Vec::with_capacity(messages.len());
+    for mut message in messages.drain(..) {
+        if let Some(Value::Array(blocks)) = message.get_mut("content") {
+            for block in blocks.iter_mut() {
+                if block["type"] == "tool_result" && empty_block(block) {
+                    block["content"] = Value::String(NO_OUTPUT.to_owned());
+                    changed += 1;
+                }
+            }
+            let before = blocks.len();
+            blocks.retain(|block| !empty_block(block));
+            changed += before - blocks.len();
+        }
+        if message.get("content").is_none_or(empty_content) {
+            changed += 1;
+            continue;
+        }
+        kept.push(message);
+    }
+    *messages = kept;
+    changed
+}
+
+/// Whether `block` is a content block with no content in it.
+fn empty_block(block: &Value) -> bool {
+    match block["type"].as_str() {
+        Some("text") => empty_text(block, "text"),
+        Some("thinking") => empty_text(block, "thinking"),
+        Some("tool_result") => block.get("content").is_none_or(empty_content),
+        // Anything unmodelled (a future block type, `redacted_thinking`) is
+        // treated as content: its bytes are what the model or the provider
+        // asked to see, and this pass only knows about the three shapes it
+        // can be sure are empty.
+        _ => false,
+    }
+}
+
+/// Whether a block's string field is missing, empty, or only whitespace.
+fn empty_text(block: &Value, field: &str) -> bool {
+    block[field].as_str().is_none_or(|text| text.trim().is_empty())
+}
+
+/// Whether a message's `content` or a `tool_result`'s `content` holds nothing.
+fn empty_content(content: &Value) -> bool {
+    match content {
+        Value::String(text) => text.trim().is_empty(),
+        Value::Array(blocks) => blocks.iter().all(empty_block),
+        _ => true,
+    }
+}
+
 /// The last content block of message `index`.
 ///
 /// Content may be a plain string or an array of blocks; a string is promoted
@@ -452,5 +526,93 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The failure this exists for: a resumed session sent a turn whose only
+    /// content was a `thinking` block with no text, and the API answered
+    /// `messages.6: all messages must have non-empty content`.
+    #[test]
+    fn it_drops_a_turn_whose_only_block_is_an_empty_thinking_block() {
+        let mut b = body(&json!([
+            { "role": "user", "content": [{ "type": "text", "text": "go" }] },
+            { "role": "assistant", "content": [
+                { "type": "thinking", "thinking": "", "signature": "sig" }
+            ]},
+            { "role": "user", "content": [{ "type": "text", "text": "on" }] },
+        ]));
+
+        assert_eq!(
+            prune_empty_content(&mut b),
+            2,
+            "the empty block and the turn it emptied"
+        );
+        let messages = b["messages"].as_array().expect("messages");
+        assert_eq!(messages.len(), 2, "the turn that said nothing is gone");
+        assert_eq!(messages[1]["content"][0]["text"], "on", "and the rest survives");
+    }
+
+    /// An empty block condemns only itself, not the turn it sits in: a turn
+    /// that also called a tool is a turn worth keeping.
+    #[test]
+    fn it_drops_the_empty_block_and_keeps_the_turn() {
+        let mut b = body(&json!([
+            { "role": "assistant", "content": [
+                { "type": "text", "text": "   " },
+                { "type": "tool_use", "id": "t1", "name": "Bash", "input": {} },
+            ]},
+        ]));
+
+        assert_eq!(prune_empty_content(&mut b), 1);
+        let blocks = b["messages"][0]["content"].as_array().expect("blocks");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["type"], "tool_use");
+    }
+
+    /// Removing an empty `tool_result` would orphan its `tool_use`, which the
+    /// API rejects in turn — so it is answered instead. This is the same trade
+    /// `truncate_at_orphan_tool_use` makes from the other side.
+    #[test]
+    fn an_empty_tool_result_is_answered_rather_than_orphaned() {
+        let mut b = body(&json!([
+            { "role": "assistant", "content": [
+                { "type": "tool_use", "id": "t1", "name": "Bash", "input": {} }
+            ]},
+            { "role": "user", "content": [
+                { "type": "tool_result", "tool_use_id": "t1", "content": "" }
+            ]},
+        ]));
+
+        assert_eq!(prune_empty_content(&mut b), 1);
+        let messages = b["messages"].as_array().expect("messages");
+        assert_eq!(messages.len(), 2, "both turns survive");
+        assert_eq!(messages[1]["content"][0]["content"], NO_OUTPUT);
+    }
+
+    /// A body with nothing empty in it must come back byte-identical —
+    /// including block types this pass does not model but must not touch.
+    #[test]
+    fn a_healthy_history_is_left_alone() {
+        let mut b = body(&json!([
+            { "role": "user", "content": [{ "type": "text", "text": "hi" }] },
+            { "role": "assistant", "content": [
+                { "type": "thinking", "thinking": "hmm", "signature": "sig" },
+                { "type": "text", "text": "hello" },
+                { "type": "redacted_thinking", "data": "opaque" },
+            ]},
+            { "role": "user", "content": [
+                { "type": "tool_result", "tool_use_id": "t1", "content": "fine" }
+            ]},
+        ]));
+        let before = b.clone();
+
+        assert_eq!(prune_empty_content(&mut b), 0);
+        assert_eq!(b, before);
+    }
+
+    /// A classifier-shaped body carries no `messages` at all.
+    #[test]
+    fn a_body_without_messages_is_untouched() {
+        let mut b = json!({ "system": [{ "type": "text", "text": "s" }] });
+        assert_eq!(prune_empty_content(&mut b), 0);
     }
 }

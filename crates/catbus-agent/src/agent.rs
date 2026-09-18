@@ -674,7 +674,7 @@ impl Agent {
         let cwd = active.session.cwd.display().to_string();
         drop(active);
         // Uniform content shapes on the history first, then the state turn,
-        // then the marks. The order is load-bearing twice over.
+        // then the marks. The order is load-bearing three times over.
         //
         // Shapes before the state turn, because `is_env_turn` recognises that
         // turn by its bare-string content — stabilising afterwards would turn
@@ -686,10 +686,21 @@ impl Agent {
         // to a block array to attach one, and it only marks the last real turn
         // — so without this the same message would change shape once it stopped
         // being last. See `cache::stabilise_shapes`.
+        //
+        // Emptiness before the marks too, and for the same reason: a turn this
+        // removes must not be the turn a breakpoint was just attached to. It is
+        // the last step before the wire that can drop a message, so it catches
+        // history from every source — resumed from disk, rebuilt from a
+        // transcript, or built live — and the API's answer to an empty message
+        // is a 400 that ends the turn. See `cache::prune_empty_content`.
         let reshaped = cache::stabilise_shapes(&mut encoded);
+        let pruned = cache::prune_empty_content(&mut encoded);
         cache::append_env_turn(&mut encoded, &cwd, self.gate().as_str());
         let breakpoints = cache::mark_breakpoints(&mut encoded);
-        log::debug!("relay request: {reshaped} messages reshaped, {breakpoints} cache breakpoints");
+        log::debug!(
+            "relay request: {reshaped} messages reshaped, {pruned} empty blocks or turns pruned, \
+             {breakpoints} cache breakpoints"
+        );
         // Sent through the retry helper rather than straight: a 429 here used
         // to end the turn, and a rate limit is a statement about timing, not
         // about the request. The closure rebuilds the request per attempt
@@ -1070,4 +1081,88 @@ pub enum AgentError {
     TooManyRounds { max_rounds: u32 },
     #[error("cancelled by user")]
     Cancelled,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Write a transcript in the shape the agent writes, under a temp project
+    /// dir, and hand back (dir, id).
+    fn transcript(lines: &str) -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let id = "00000000-0000-0000-0000-0000000000ff".to_owned();
+        std::fs::write(dir.path().join(format!("{id}.jsonl")), lines).expect("write transcript");
+        (dir, id)
+    }
+
+    /// The resume path against the failure that produced
+    /// `messages.6: all messages must have non-empty content`.
+    ///
+    /// A transcript entry whose content is a single `thinking` block with no
+    /// thinking in it parses fine — `Block` has a field for the text, and an
+    /// empty string is a valid one — so the reader keeps the turn, because it
+    /// describes what the transcript says. It is the request pipeline that has
+    /// to drop it, because only there is it known to be something the API
+    /// refuses. This asserts both halves are still wired together: the reader
+    /// keeping the turn is what makes the pipeline's job load-bearing.
+    #[test]
+    fn a_resumed_turn_of_an_empty_thinking_block_is_pruned_from_the_request() {
+        let (dir, id) = transcript(concat!(
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"and now?"}]}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"","signature":"sig"}]}}"#,
+            "\n",
+        ));
+
+        let history = rebuild_history(dir.path(), &id);
+        assert_eq!(history.len(), 2, "the reader keeps what the transcript says");
+
+        // Exactly the pipeline's order up to the prune.
+        let mut body = serde_json::json!({ "messages": history });
+        crate::cache::stabilise_shapes(&mut body);
+        assert_eq!(crate::cache::prune_empty_content(&mut body), 2);
+
+        let messages = body["messages"].as_array().expect("messages");
+        assert_eq!(messages.len(), 1, "the turn that said nothing is gone");
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"][0]["text"], "and now?");
+    }
+
+    /// The shape the live loop hands over when a model replies with a thinking
+    /// block and a tool call: the turn is real, only the thinking is empty, and
+    /// the `tool_use` must survive — the `tool_result` answering it is in the
+    /// very next turn, and an unmatched pair is its own 400.
+    ///
+    /// The transcript is the live one, in order. A lone `tool_use` turn would
+    /// be dropped by `truncate_at_orphan_tool_use` before this pass ever ran,
+    /// so the answer to the call has to be here or the test proves nothing.
+    #[test]
+    fn an_empty_thinking_block_does_not_take_a_tool_call_with_it() {
+        let (dir, id) = transcript(concat!(
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"go"}]}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"role":"assistant","content":["#,
+            r#"{"type":"thinking","thinking":"  ","signature":"sig"},"#,
+            r#"{"type":"tool_use","id":"t1","name":"Read","input":{"path":"x"}}]}}"#,
+            "\n",
+            r#"{"type":"user","message":{"role":"user","content":["#,
+            r#"{"type":"tool_result","tool_use_id":"t1","content":"the file"}]}}"#,
+            "\n",
+        ));
+
+        let mut body = serde_json::json!({ "messages": rebuild_history(dir.path(), &id) });
+        assert_eq!(crate::cache::prune_empty_content(&mut body), 1);
+
+        let messages = body["messages"].as_array().expect("messages");
+        assert_eq!(messages.len(), 3, "only the block goes, not a turn");
+        let blocks = messages[1]["content"].as_array().expect("blocks");
+        assert_eq!(blocks.len(), 1, "the empty thinking block is gone");
+        assert_eq!(blocks[0]["type"], "tool_use");
+        assert_eq!(blocks[0]["id"], "t1");
+        assert_eq!(
+            messages[2]["content"][0]["tool_use_id"], "t1",
+            "and the call is still answered"
+        );
+    }
 }
