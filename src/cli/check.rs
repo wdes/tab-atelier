@@ -52,13 +52,16 @@ pub fn report() -> i32 {
         ok = false;
     }
 
+    // The app's own directories, not the XDG bases they sit in: "which
+    // directory is this actually using" is the question this answers, and
+    // `~/.config` on its own does not answer it.
     println!(
         "  state dir ................... {}",
-        crate::platform::state_base_dir().display()
+        crate::state_dir(&crate::platform::state_base_dir()).display()
     );
     println!(
         "  config dir .................. {}",
-        crate::platform::config_dir().display()
+        crate::config_dir(&crate::platform::config_base_dir()).display()
     );
 
     if ok {
