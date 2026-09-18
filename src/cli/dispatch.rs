@@ -53,6 +53,13 @@ pub struct Cli {
     #[arg(long, global = true, hide = true)]
     pub check_crypto: bool,
 
+    /// Preflight what this build needs at run time — the GUI's libraries, the
+    /// pty, the state and config dirs — name the package that supplies anything
+    /// missing, and exit. Run this first when a build that compiled cleanly
+    /// will not start.
+    #[arg(long, global = true)]
+    pub check: bool,
+
     /// Start in forced Claude-only mode: every new tab launches `claude` in
     /// `auto` mode instead of a shell (the right-click "New bash tab" item
     /// cancels it). GUI only.
@@ -780,6 +787,13 @@ pub enum Commands {
 /// inside the dispatched subcommand for code-path consistency.
 #[must_use]
 pub fn dispatch(cli: Cli) -> bool {
+    // A global flag rather than a verb, because it has to answer on both
+    // editions and before any daemon work — it reports on process start-up, not
+    // on a running instance. Checked before the verb so `--check` alone, with
+    // no subcommand, still runs.
+    if cli.check {
+        std::process::exit(crate::cli::check::report());
+    }
     let Some(code) = command_exit_code(cli) else {
         return false;
     };

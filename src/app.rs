@@ -6835,56 +6835,6 @@ fn mru_tab_order<T: Ord>(active: usize, last_focused: &[Option<T>]) -> Vec<usize
     order
 }
 
-fn run_check() {
-    println!("tab-atelier v{} --check", env!("CARGO_PKG_VERSION"));
-
-    let libs: &[(&str, &str)] = &[
-        ("libfreetype.so.6", "libfreetype6"),
-        ("libxkbcommon.so.0", "libxkbcommon0"),
-        ("libxkbcommon-x11.so.0", "libxkbcommon-x11-0"),
-        ("libxcb.so.1", "libxcb1"),
-        ("libxcb-xkb.so.1", "libxcb-xkb1"),
-    ];
-    let mut ok = true;
-    let mut missing = Vec::new();
-    for (lib, pkg) in libs {
-        print!("  {lib:<30}");
-        let found = std::path::Path::new("/usr/lib/x86_64-linux-gnu").join(lib).exists()
-            || std::path::Path::new("/usr/lib64").join(lib).exists()
-            || std::path::Path::new("/usr/lib").join(lib).exists();
-        if found {
-            println!("ok");
-        } else {
-            println!("MISSING  (apt install {pkg})");
-            missing.push(*pkg);
-            ok = false;
-        }
-    }
-
-    print!("  /dev/ptmx (pty support) ..... ");
-    if std::path::Path::new("/dev/ptmx").exists() {
-        println!("ok");
-    } else {
-        println!("MISSING");
-        ok = false;
-    }
-
-    let state_dir = platform::state_base_dir();
-    print!("  state dir ................... ");
-    println!("{}", state_dir.display());
-
-    let config_dir = platform::config_dir();
-    print!("  config dir .................. ");
-    println!("{}", config_dir.display());
-
-    if ok {
-        println!("all checks passed");
-    } else {
-        println!("\nTo fix, run:\n  sudo apt install {}", missing.join(" "));
-        std::process::exit(1);
-    }
-}
-
 /// Launch the gpui application. Blocks until the window closes.
 ///
 /// # Panics
@@ -6898,16 +6848,10 @@ pub fn run() {
     // file logger is installed.
     crate::init_gui_file_logging();
 
-    let args: Vec<String> = std::env::args().collect();
-    if args.iter().any(|a| a == "--check") {
-        run_check();
-        return;
-    }
-    if args.iter().any(|a| a == "-V" || a == "--version") {
-        println!("tab-atelier v{}", env!("CARGO_PKG_VERSION"));
-        return;
-    }
-
+    // `--check` and `--version` are handled by the clap front end in
+    // `cli::dispatch`, which both editions run before this. Scanning
+    // `env::args` for them here — as this used to — was a second parser that
+    // clap could not see, and it silently disagreed with clap's help.
     info!("starting Tab Atelier v{}", env!("CARGO_PKG_VERSION"));
 
     // Reap agent processes leaked by a prior (unclean) run before we
