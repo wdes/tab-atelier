@@ -401,6 +401,24 @@ With no flags it reads the relay endpoint from the same `preferences.json`, so o
 
 The Claude login lives **only** on the relay. `catbus-agent` no longer reads `~/.claude/.credentials.json`, no longer refreshes an OAuth token, and cannot be pointed at `api.anthropic.com` — with no relay configured it refuses to start rather than silently going direct. So an agent tab works on a box with no `claude` login at all (a CI runner, a container): it needs only a relay token, and there is no subscription credential in its environment or its crash reports. Reasoning blocks from a model the relay routes to are kept verbatim in the transcript the upstream requires back, but are never shown as the answer.
 
+#### Reply formatting
+
+A `catbus-agent` session has several readers and only some have a terminal. The REPL paints to one; the transcript, the socket, and the tab-atelier chat view do not. So the agent is told to format for the sink that will actually render it:
+
+| Session | Instruction | Reply |
+| --- | --- | --- |
+| REPL, stdout a tty | ANSI SGR colour | keeps its colour |
+| `--no-tui`, or piped | plain prose, no markdown, no escapes | stripped |
+| the transcript on disk | — | always plain |
+
+`--ansi` (or `CATBUS_ANSI=true`) forces escapes on for a pipe known to render them — a `script` capture, an xterm-backed panel. `NO_COLOR` (any non-empty value) and `CLICOLOR=0` force them off, and an explicit `--ansi` wins over both. The transcript is plain regardless, because tab-atelier renders chat bubbles straight from it and has no terminal to interpret anything.
+
+Precedence, most explicit first: `--ansi`/`--ansi=false` → `NO_COLOR` / `CLICOLOR=0` → whether stdout is really a terminal.
+
+`NO_COLOR` matters more than it looks: `new_tab_env` already sets it for the tabs an *agent* asked for, because those tabs' output is read by another program (`peek`, `output`, a `--wait` poll). A `catbus-agent` running in one of those tabs now honours the same signal, so it comes out plain with the launcher needing to say nothing — while a catbus tab opened from the GUI, with a real terminal, keeps its colour.
+
+This is belt-and-braces on purpose: the instruction is a request the model may ignore, and the transcript is written from the reply as the model sent it, so escape sequences are also filtered out on the way to any reader that will not interpret them. That filter lives in `crates/catbus-agent/src/ansi.rs`, on `vte`'s parser via `strip-ansi-escapes` (already in the binary as a `reedline` dependency). `tab-atelier peek` applies the same rule for the same reason.
+
 ## Environment variables
 
 Inject env vars into tabs' PTYs from the CLI — globally (all tabs) or per-tab:

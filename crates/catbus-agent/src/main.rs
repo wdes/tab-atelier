@@ -19,6 +19,7 @@
 #![allow(clippy::module_name_repetitions)]
 
 use std::borrow::Cow;
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -29,6 +30,7 @@ use reedline::{
 use tokio::io::AsyncWriteExt;
 
 mod agent;
+mod ansi;
 mod cache;
 mod guard;
 mod openai;
@@ -81,6 +83,25 @@ struct Args {
     /// rather than from a tab the user is staring at.
     #[arg(long)]
     no_tui: bool,
+
+    /// Allow ANSI escapes in text replies.
+    ///
+    /// With no flag, escapes are allowed only when stdout is a terminal *and*
+    /// the environment has not asked for no colour — a session read over the
+    /// socket, shown on a phone, or marked `NO_COLOR` by tab-atelier gets
+    /// plain prose instead, because `[1m` is what a reader with no terminal
+    /// sees otherwise. Setting this forces escapes on, and `--ansi=false`
+    /// forces them off.
+    ///
+    /// Escape sequences are filtered out of anything a non-terminal reader
+    /// would see regardless, so a model that ignores the instruction cannot
+    /// leak them into the transcript.
+    ///
+    /// `num_args = 0..=1` is what lets it be written bare (`--ansi`) while
+    /// still accepting an explicit `--ansi=false`. A plain `Option<bool>`
+    /// would require a value, and the bare form is the one people type.
+    #[arg(long, env = "CATBUS_ANSI", num_args = 0..=1, default_missing_value = "true")]
+    ansi: Option<bool>,
 
     /// Relay to talk to, e.g. `https://proxy.example` or the full
     /// `https://proxy.example/relay/anthropic`. Defaults to the relay
@@ -254,10 +275,29 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // would tell the model it has a tool that behaves otherwise.
     let tool_set = tools::ToolSet::load(args.tools_config.as_deref())?;
     log::info!("offering {} tools", tool_set.specs().len());
+    // Whether the answer may carry escape sequences. Most explicit source
+    // wins: an explicit `--ansi`, then the colour convention, then whether
+    // stdout is really a terminal. The middle step is what makes an agent tab
+    // come out plain without the launcher saying anything — tab-atelier's
+    // `new_tab_env` sets `NO_COLOR=1` for the tabs an *agent* asked for, since
+    // those tabs' output is read by another program (`peek`, `output`, a
+    // `--wait` poll) and escapes there are bytes nothing renders. See
+    // `ansi::allow_escapes` for the full reasoning.
+    let stdout_renders = !args.no_tui && std::io::stdout().is_terminal();
+    let env_disables_colour = ansi::colour_disabled_in_env();
+    let ansi = ansi::allow_escapes(args.ansi, stdout_renders, env_disables_colour);
+    // Log every input, not just the verdict: when the answer looks wrong, the
+    // useful question is *which* source decided it.
+    log::info!(
+        "ansi escapes in replies: {ansi} \
+         (flag={:?}, stdout_renders={stdout_renders}, no_color={env_disables_colour})",
+        args.ansi
+    );
     let agent = Arc::new(
         agent::Agent::new(provider, session)
             .with_judge(judge_model, monitor_prompt)
-            .with_tools(tool_set),
+            .with_tools(tool_set)
+            .with_ansi(ansi),
     );
 
     let socket_task = tokio::spawn({

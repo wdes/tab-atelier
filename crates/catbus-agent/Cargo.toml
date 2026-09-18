@@ -50,6 +50,10 @@ reedline = "0.42"
 # CancellationToken — propagates Ctrl+C from the REPL into the agent's
 # HTTP / tool loop so an in-flight request can be aborted cleanly.
 tokio-util = { version = "0.7", default-features = false }
+# ANSI escape removal for readers with no terminal (the transcript, the
+# socket, a phone). Already in the tree as a `reedline` dependency, so this
+# declares a direct use rather than adding weight — see `src/ansi.rs`.
+strip-ansi-escapes = "0.2"
 
 [dev-dependencies]
 # Isolated $HOME + cwd for the end-to-end mock-API tests.
