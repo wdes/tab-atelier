@@ -511,7 +511,7 @@ pub enum Block {
     ToolResult {
         tool_use_id: String,
         content: String,
-        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         is_error: bool,
     },
     /// A reasoning block from a thinking model.
@@ -582,5 +582,47 @@ pub fn assistant_blocks(session: &Session, model: String, content: Vec<Block>) -
             model,
             content,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A transcript the agent wrote must be one it can read back.
+    ///
+    /// `is_error` is skipped when false, so the common `tool_result` on disk has
+    /// no such key — and without `serde(default)` the reader rejected every one
+    /// of them. The damage was not limited to the missing result: the `tool_use`
+    /// above it was then an orphan, so `truncate_at_orphan_tool_use` dropped
+    /// that turn too, and resuming a session silently lost its tool history.
+    #[test]
+    fn a_tool_result_written_without_is_error_reads_back() {
+        let written = serde_json::json!({
+            "type": "tool_result",
+            "tool_use_id": "t1",
+            "content": "the file",
+        });
+        let block: Block = serde_json::from_value(written.clone()).expect("reads back");
+
+        assert_eq!(
+            serde_json::to_value(&block).expect("writes"),
+            written,
+            "and it is still written the same terse way it was read"
+        );
+    }
+
+    /// An error result round-trips too, with the flag intact.
+    #[test]
+    fn an_error_tool_result_keeps_is_error() {
+        let block = Block::ToolResult {
+            tool_use_id: "t1".into(),
+            content: "boom".into(),
+            is_error: true,
+        };
+        let json = serde_json::to_value(&block).expect("writes");
+        assert_eq!(json["is_error"], true);
+        let read_back: Block = serde_json::from_value(json).expect("reads");
+        assert!(matches!(read_back, Block::ToolResult { is_error: true, .. }));
     }
 }
