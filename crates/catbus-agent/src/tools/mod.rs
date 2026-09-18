@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! The four primitives the agent loop exposes to the model:
-//! `Read`, `Write`, `Edit`, `Bash`. Plan-mode gates the three that
-//! have side effects. Each module returns a single string back to
-//! the model — error vs. success is signalled by the bool the
-//! dispatcher pairs with it.
+//! The primitives the agent loop exposes to the model: `Read`, `Write`, `Edit`,
+//! `Bash`, `FileTree`, and the inter-agent `ListAgents` / `Delegate`. Plan-mode
+//! gates the ones that have side effects. Each module returns a single string
+//! back to the model — error vs. success is signalled by the bool the dispatcher
+//! pairs with it.
 
 use std::path::Path;
 
@@ -12,6 +12,7 @@ mod bash;
 mod config;
 mod delegate;
 mod edit;
+mod filetree;
 mod list_agents;
 mod read;
 mod write;
@@ -21,6 +22,29 @@ mod write;
 // module needs to name them — exporting them invited callers to build a set by
 // hand and skip the validation in `from_config`.
 pub use config::ToolSet;
+
+/// The smallest tool set that can still finish a task with files, with no shell:
+/// `Read`, `Write`, `FileTree`.
+///
+/// `Write` is not optional — without a shell it is the only way to save work.
+/// `FileTree` is what makes `Write` usable, since an agent holding only `Read`
+/// cannot discover a path the prompt never named, and would have to guess where
+/// to put a new file. `Edit` is left out as a refinement of `Write`, and
+/// `Bash`, `Delegate` and `ListAgents` as capabilities a plain-file task does
+/// not need — which is the point: what is absent cannot be reached by a
+/// confused model, and nothing here can touch a file outside the session's own
+/// working directory.
+///
+/// `allow` this list in a tools config to run such an agent:
+///
+/// ```json
+/// { "allow": ["Read", "Write", "FileTree"] }
+/// ```
+///
+/// Kept as a `const` rather than left to each config so that this list, the
+/// tool specs, and the integration test that drives the trio all name the same
+/// three tools.
+pub const MINIMAL_TOOLS: &[&str] = &["Read", "Write", "FileTree"];
 
 /// What the agent is currently allowed to do.
 ///
@@ -147,6 +171,12 @@ pub fn changes_the_world(name: &str) -> bool {
 ///
 /// Read remains unrestricted in every mode — pure observation is always safe.
 ///
+/// A name this set does not offer is refused *before* the gate is consulted.
+/// The spec list is what withholds a capability (a minimal set simply never
+/// lists `Bash`), and a model does hallucinate familiar tool names — so without
+/// this check the withholding would be advice rather than a limit, and an agent
+/// configured with three tools could still run a shell by asking for one.
+///
 /// A method on [`ToolSet`] rather than a free function because a custom tool
 /// needs the set's own definitions to run: its `argv`, its timeout, and whether
 /// it is judged. A free function would have to be handed the set anyway, and
@@ -160,6 +190,11 @@ impl ToolSet {
         cwd: &Path,
         gate: Gate,
     ) -> Result<String, String> {
+        // Membership first: an unoffered name is refused here, so the `match`
+        // below can never be reached by a tool the operator withheld.
+        if !self.offers(name) {
+            return Err(format!("unknown tool: {name}"));
+        }
         // Custom tools first, so a name this set defines cannot fall through to
         // a built-in. `from_config` already refuses a shadowed name at startup,
         // so this ordering is belt-and-braces on a case that cannot reach here.
@@ -168,6 +203,10 @@ impl ToolSet {
         }
         match name {
             "Read" => read::run(input, cwd).await,
+            // Observation, so it is never gated: refusing an agent the right to
+            // see what is on disk would leave `Write` unusable and make
+            // plan-mode a dead end rather than a pause.
+            "FileTree" => filetree::run(input, cwd).await,
             "Write" => {
                 if let Some(why) = gate.refusal("Write") {
                     return Err(why.to_string());
@@ -221,6 +260,11 @@ pub fn builtin_specs() -> Vec<serde_json::Value> {
                 "required": ["path"]
             }
         }),
+        // `FileTree` sits beside `Read` because the two are the observation
+        // pair: this one finds what exists, that one shows what is inside.
+        // Defined in its own module so its schema and the limits it enforces
+        // cannot drift apart.
+        filetree::spec(),
         serde_json::json!({
             "name": "Write",
             "description": "Write a file from scratch. Overwrites existing content. Refused in plan-mode.",
@@ -285,4 +329,149 @@ pub fn builtin_specs() -> Vec<serde_json::Value> {
 pub fn resolve(cwd: &Path, path: &str) -> std::path::PathBuf {
     let p = Path::new(path);
     if p.is_absolute() { p.to_path_buf() } else { cwd.join(p) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The config an operator writes to get [`MINIMAL_TOOLS`] and nothing else.
+    fn minimal_config() -> config::ToolConfig {
+        serde_json::from_value(serde_json::json!({ "allow": MINIMAL_TOOLS })).unwrap()
+    }
+
+    #[test]
+    fn every_minimal_tool_exists_and_is_dispatchable() {
+        // `MINIMAL_TOOLS` is a list of strings, so a typo would produce a config
+        // that silently runs a *smaller* set than intended — and an agent with
+        // neither Read nor Write looks like a model failure, not a config one.
+        let builtin = ToolSet::builtin();
+        for name in MINIMAL_TOOLS {
+            assert!(
+                builtin.offers(name),
+                "MINIMAL_TOOLS names {name:?}, which is not a built-in tool"
+            );
+        }
+    }
+
+    #[test]
+    fn each_minimal_tool_has_a_spec_and_the_names_agree() {
+        // The spec's `name` is what the model actually sends back, so a spec
+        // whose name differs from the config entry is a tool the model cannot
+        // call.
+        let specs = builtin_specs();
+        for name in MINIMAL_TOOLS {
+            let spec = specs
+                .iter()
+                .find(|s| s["name"] == *name)
+                .unwrap_or_else(|| panic!("no spec for {name:?}"));
+            assert_eq!(spec["name"].as_str().unwrap(), *name);
+        }
+    }
+
+    #[test]
+    fn the_minimal_set_is_exactly_read_write_and_filetree() {
+        // Guards the definition of "minimal" itself. Widening it silently would
+        // hand every restricted agent a capability nobody asked it to have.
+        assert_eq!(MINIMAL_TOOLS, ["Read", "Write", "FileTree"]);
+    }
+
+    #[test]
+    fn allowing_the_minimal_set_withholds_every_dangerous_tool() {
+        let set = ToolSet::from_config(minimal_config()).unwrap();
+        for name in MINIMAL_TOOLS {
+            assert!(set.offers(name), "{name} should be offered");
+        }
+        // Bash is the one the operator explicitly asked to withhold; the rest
+        // are capabilities a plain-file task has no use for, and each one is a
+        // way for a confused model to reach outside the working directory.
+        for name in ["Bash", "Edit", "Delegate", "ListAgents"] {
+            assert!(!set.offers(name), "{name} must not be offered");
+        }
+        assert_eq!(set.specs().len(), MINIMAL_TOOLS.len());
+    }
+
+    #[test]
+    fn a_filetree_spec_is_offered_in_the_builtin_set() {
+        // Catches the case where the module is written but never registered.
+        let set = ToolSet::builtin();
+        assert!(set.offers("FileTree"));
+        assert!(set.specs().iter().any(|s| s["name"] == "FileTree"));
+    }
+
+    #[test]
+    fn the_minimal_keyword_matches_the_allow_list_an_operator_would_write() {
+        // Two spellings of the same request must produce the same agent:
+        // `--tools-config minimal` and the JSON in the docs. If they diverge,
+        // one of them is a lie, and the docs are what people read.
+        let via_keyword = ToolSet::load(Some(std::path::Path::new(config::MINIMAL_KEYWORD))).unwrap();
+        let via_allow = ToolSet::from_config(minimal_config()).unwrap();
+        assert_eq!(names_of(&via_keyword), names_of(&via_allow));
+        assert_eq!(names_of(&via_keyword).len(), MINIMAL_TOOLS.len());
+    }
+
+    #[test]
+    fn the_minimal_keyword_is_not_confused_with_a_path() {
+        // `minimal` is a keyword, not a filename, so it must resolve without
+        // the file existing — and an unrelated path must still be read.
+        let keyword = ToolSet::load(Some(std::path::Path::new("minimal"))).unwrap();
+        assert!(keyword.offers("FileTree"));
+        assert!(!keyword.offers("Edit"));
+
+        let missing = ToolSet::load(Some(std::path::Path::new("/nonexistent-tools-xyz.json")));
+        assert!(missing.is_err(), "a path that does not exist should still fail");
+    }
+
+    /// Sorted tool names, for comparing two sets regardless of order.
+    fn names_of(set: &ToolSet) -> Vec<String> {
+        let mut names: Vec<String> = set
+            .specs()
+            .iter()
+            .filter_map(|s| s["name"].as_str().map(str::to_owned))
+            .collect();
+        names.sort_unstable();
+        names
+    }
+
+    #[test]
+    fn dispatch_refuses_a_tool_the_set_does_not_offer() {
+        // The guard that makes withholding real. `specs()` is what *tells* the
+        // model which tools exist, but a model can emit a `tool_use` for any
+        // name it likes — including one it was never offered — so the
+        // dispatcher has to check membership itself. Without this, a
+        // three-tool agent could still run a shell by asking for `Bash`.
+        //
+        // Tested here rather than only through the binary because this is the
+        // boundary itself, and a unit test states the rule without a mock relay
+        // in the way.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let set = ToolSet::from_config(minimal_config()).unwrap();
+        let gate = Gate::Open;
+        let cwd = std::path::Path::new("/tmp");
+
+        for withheld in ["Bash", "Edit", "Delegate", "ListAgents", "ReadFile"] {
+            let err = runtime
+                .block_on(set.dispatch(withheld, &serde_json::json!({}), cwd, gate))
+                .expect_err("a tool outside the set must not dispatch");
+            assert_eq!(err, format!("unknown tool: {withheld}"), "wrong refusal for {withheld}");
+        }
+        // And a tool that *is* offered passes the guard, so the check is not
+        // simply refusing everything. `FileTree` on a missing path fails later
+        // in its own code, which is a different error than the guard's.
+        let err = runtime
+            .block_on(set.dispatch(
+                "FileTree",
+                &serde_json::json!({"path": "/nonexistent-xyz", "depth": 1}),
+                cwd,
+                gate,
+            ))
+            .expect_err("a missing path should still error");
+        assert!(
+            !err.starts_with("unknown tool"),
+            "the guard rejected an offered tool: {err}"
+        );
+    }
 }

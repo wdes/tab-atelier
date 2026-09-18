@@ -419,6 +419,60 @@ Precedence, most explicit first: `--ansi`/`--ansi=false` → `NO_COLOR` / `CLICO
 
 This is belt-and-braces on purpose: the instruction is a request the model may ignore, and the transcript is written from the reply as the model sent it, so escape sequences are also filtered out on the way to any reader that will not interpret them. That filter lives in `crates/catbus-agent/src/ansi.rs`, on `vte`'s parser via `strip-ansi-escapes` (already in the binary as a `reedline` dependency). `tab-atelier peek` applies the same rule for the same reason.
 
+#### Tools, and the no-shell agent
+
+`FileTree` lists a directory to a depth you choose: `{"path": ".", "depth": 2}`. Output is one **relative path per line**, sorted, directories suffixed `/`, symlinks shown as `name -> target`, then a `---` line and totals:
+
+```
+/home/you/project
+src/
+src/deep/deeper/leaf.txt
+src/lib.rs
+src/main.rs
+README.md
+srclink -> src
+---
+2 directories, 4 files, 1 symlink
+```
+
+Relative, flat paths on purpose: every line can be passed straight back as the `path` of a `Read` or `Write` with no joining, and it is the shape `sort` and `rg --files` print. A path the model has to *derive* from indentation is a path it can get wrong, and a wrong path costs a whole failed round trip — more than the bytes an ancestor prefix repeats. `depth` is required and capped at 6 — a deeper request is refused rather than clamped, because silently showing less than asked for is how a model concludes a directory is empty when it is not. `max_entries` bounds the output and any truncation is reported.
+
+**What is skipped, and why it changed.** Two things only, both reported:
+
+1. **Version-control directories** (`.git`, `.hg`, `.svn`, `.bzr`). `.git` is the one directory guaranteed to dwarf the project it sits in.
+2. **Whatever the project's own ignore rules exclude**, via ripgrep's `ignore` crate — `.gitignore` at any level, `.git/info/exclude`, and the operator's **global** ignore file. So a file `rg` hides is a file this hides.
+
+An earlier version carried a hard-coded noise list (`node_modules`, `target`, `__pycache__`, …). That was the wrong instrument: those directories are already gitignored in nearly every project, so the list was redundant where it was right and *wrong* where the project disagreed — a vendored `target/` that is committed, or a tree with no `node_modules` at all. The project's own rules are correct by construction: they are its statement about what is not source. Dotfiles are **not** skipped (`.github/`, `.env.example`, `.eslintrc` are exactly what an agent gets asked about); VCS directories are the only name-based exception, and they are enumerated rather than pattern-matched.
+
+Two flags widen the listing, both defaulting to false:
+
+- `show_ignored: true` — include ignored paths *and descend into ignored directories*, so `node_modules/` shows its contents. Also the way to tell "missing" from "ignored".
+- `show_vcs: true` — include version-control directories.
+
+Both are gated on the walker rather than filtering entries afterwards, because an ignored *directory* has to be traversed to list what is inside it. Non-boolean values fall back to the quiet default: these flags widen output on purpose, and `"false"` read as truthy is the classic way `show_vcs` would dump a whole `.git` into the context window. When `show_ignored` is set the note says so, since an unqualified "ignore rules applied" would mislead.
+
+**The global ignore file is honoured, which is a real asymmetry.** Unlike the project's rules, `~/.config/git/ignore` (or `core.excludesFile`) is per-machine, so a pattern in *your* global ignore hides a file for your agent and not for a colleague's — the same asymmetry `rg` already has. Each call names the sources it consulted, so a file you expected but cannot see is explicable rather than mysterious. On a default XDG setup the file is read from `$XDG_CONFIG_HOME/git/ignore`.
+
+#### The no-shell agent
+
+`FileTree` exists so that `Read` and `Write` can be a whole tool set. `Read` shows a file but not what sits beside it, so without a listing tool an agent cannot discover a path the prompt never named — it guesses filenames with `Read` until something hits. Hence three tools and not two:
+
+```sh
+catbus-agent --tools-config minimal          # == {"allow": ["Read","Write","FileTree"]}
+```
+
+With no shell the agent cannot run the tests it writes, and `Write` is the only way it can save anything. What is absent cannot be reached even by a confused model: `dispatch` refuses any name the set does not offer, so emitting a `tool_use` for `Bash` on an agent that was never given one returns `unknown tool: Bash` instead of running.
+
+#### A relay must allow `FileTree` in its tool policy
+
+A proxy-side tool policy whitelist **fails closed for names it does not know**, so a newer client tool is stripped before the model ever sees it. The symptom is quiet: nothing errors, the client puts three tools on the wire, the model is told it has two, and it reports the tool as unavailable — while the agent guesses filenames with `Read` and never says why. Add `FileTree` to the account's policy alongside `Read`/`Write` (see `docs/proxy-tools.md`) before expecting the minimal set to work through a relay. If an agent claims a tool is missing, check the policy before the client.
+
+#### `/clear`
+
+#### `/clear`
+
+`/clear` in the REPL starts a fresh session in the same working directory. Nothing is deleted: the old transcript stays on disk and the reply names its id, so `/resume <id>` goes back. Forgetting the conversation rather than emptying the history keeps the old tokens/turns sidecars meaningful and leaves the operator an undo, which is what makes it safe to offer. The same thing is available over the socket as `{"kind":"clear"}`, so the GUI and a phone can offer it too.
+
 ## Environment variables
 
 Inject env vars into tabs' PTYs from the CLI — globally (all tabs) or per-tab:

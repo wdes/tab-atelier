@@ -110,6 +110,19 @@ of prose about a protocol, and a denylist forwards each one by default until
 somebody notices and adds it. An allowlist does not know about them either —
 it just fails closed instead of open.
 
+**The consequence for a client's own tools.** Fail-closed applies to anything
+not in the list, including tools a *first-party* client sends. `catbus-agent`
+gained `FileTree`, and a whitelist that predates it strips it before the model
+sees it: the client puts three tools on the wire, the model is told it has two,
+and it reports the missing one as unavailable rather than erroring — so the
+symptom is an agent that guesses filenames with `Read` and never says why. When
+a client adds a tool, add it here too. `FileTree` belongs beside `Read` and
+`Write` for the no-shell agent (`--tools-config minimal`).
+
+That failure mode is worth naming precisely because it is *quiet*: nothing 4xxs,
+both providers agree, and the only evidence is the agent's behaviour. If an
+agent claims a tool is missing, check this list before the client.
+
 ## The referenced union
 
 Every mode keeps the tools whose name appears in a `tool_use` block anywhere in

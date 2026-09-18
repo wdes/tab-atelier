@@ -54,7 +54,19 @@ tokio-util = { version = "0.7", default-features = false }
 # socket, a phone). Already in the tree as a `reedline` dependency, so this
 # declares a direct use rather than adding weight — see `src/ansi.rs`.
 strip-ansi-escapes = "0.2"
+# Directory walking with the project's own ignore rules, so `FileTree` skips
+# what the project says is not source instead of a hard-coded noise list.
+# This is ripgrep's walker: the same rules `rg` applies, global ignore file
+# included.
+ignore = "0.4"
 
 [dev-dependencies]
 # Isolated $HOME + cwd for the end-to-end mock-API tests.
 tempfile = "3"
+# A real pty, for the one thing no other test can reach: the REPL. reedline
+# opens /dev/tty itself, so a piped stdin fails with ENXIO — which means the
+# slash-command path, including `/auto`, is otherwise untestable. `term` is the
+# feature gating `pty::openpty`, a *safe* wrapper; the project denies
+# `unsafe_code`, so calling libc's openpty directly is not an option. A
+# dev-dependency so it never reaches a release build.
+nix = { version = "0.31", features = ["term"] }

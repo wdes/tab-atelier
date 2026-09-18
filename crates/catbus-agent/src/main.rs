@@ -135,6 +135,11 @@ struct Args {
     /// "add": [...]}`. Resolved once at startup, so changing it takes a
     /// restart — a tool array that moved mid-session would invalidate the
     /// prompt cache on every turn.
+    ///
+    /// The literal word `minimal` is accepted instead of a path, as a
+    /// shorthand for `{"allow": ["Read", "Write", "FileTree"]}` — a file-editing
+    /// agent with no shell. A name that is neither a path nor `minimal` is an
+    /// error rather than a silent fallback to the full set.
     #[arg(long, env = "CATBUS_TOOLS_CONFIG")]
     tools_config: Option<PathBuf>,
 
@@ -388,10 +393,49 @@ fn make_editor() -> Reedline {
 /// In-tab REPL: print a prompt, read a line, hand it to the agent,
 /// print the answer, repeat.
 ///
+/// The gate a bare mode command selects, or `None` if `input` is not one.
+///
+/// Extracted from the REPL loop because that loop needs a terminal to run at
+/// all — reedline puts the tty in raw mode — so a test cannot reach the mapping
+/// from the typed word to the mode. That mapping is exactly what can silently
+/// break: a command that prints `gate = auto` while setting something else looks
+/// identical to a working one.
+///
+/// Delegates to [`tools::parse_gate`] after stripping the slash rather than
+/// keeping its own table. The socket's `set_gate` request parses the same words
+/// through the same function, and a second hand-written mapping here is how
+/// `/auto` and `{"kind":"set_gate","gate":"auto"}` would come to mean different
+/// things — a difference nothing would catch, since both would report
+/// `gate = auto`. Delegating makes the two the same code path, and it is why
+/// `/auto` can be checked through the socket, where a tty is not required.
+///
+/// Matched on the whole word, never a prefix: `/autorun` must not enable auto
+/// mode, and `/plan the refactor` must stay a prompt.
+fn gate_command(input: &str) -> Option<tools::Gate> {
+    let word = input.trim().strip_prefix('/')?;
+    match word {
+        // The two aliases are REPL conveniences with no wire spelling: "no
+        // plan" and "no auto" both mean "no gate", and either is what an
+        // operator reaches for. Everything else is the shared vocabulary.
+        "noplan" | "noauto" => Some(tools::Gate::Open),
+        other => tools::parse_gate(other),
+    }
+}
+
 /// Line editing comes from `reedline` (history, cursor movement,
 /// Ctrl-R search). Ctrl-C while typing clears the buffer and re-prompts;
 /// Ctrl-C while the agent is working cancels the in-flight request via
 /// `agent.cancel_current()`. Ctrl-D exits.
+///
+/// The `allow` is load-bearing and belongs to *this* function: at ~290 lines it
+/// is well past the 100-line pedantic threshold, and the length is structural —
+/// it is one flat `if let` chain over the slash commands, where each arm prints
+/// and `continue`s. Splitting it would mean threading the stdout handle and the
+/// command string through helpers that exist only to shorten it. Note that
+/// inserting a function immediately above this one silently moves the `allow`
+/// onto that new function instead, which is a live hazard: it happened once
+/// while adding `gate_command`, and the only symptom was clippy turning red on a
+/// function nobody had touched.
 #[allow(clippy::too_many_lines)]
 async fn run_repl(agent: Arc<agent::Agent>, cwd: &std::path::Path) -> std::io::Result<()> {
     let mut stdout = tokio::io::stdout();
@@ -439,6 +483,7 @@ async fn run_repl(agent: Arc<agent::Agent>, cwd: &std::path::Path) -> std::io::R
                 .write_all(
                     b"slash commands:\n  \
                       /help              show this list\n  \
+                      /clear             forget the conversation, start a fresh session here\n  \
                       /plan              plan only - write/edit/bash propose instead of acting\n  \
                       /auto              ask a judge before each write/edit/bash\n  \
                       /noplan            allow everything (same as /noauto)\n  \
@@ -457,19 +502,11 @@ async fn run_repl(agent: Arc<agent::Agent>, cwd: &std::path::Path) -> std::io::R
         // The three modes are exclusive, so `/noplan` is also `/noauto` —
         // there is no fourth state to return to, and two names for "allow
         // everything" would suggest otherwise.
-        if prompt == "/plan" {
-            agent.set_gate(tools::Gate::Plan);
-            stdout.write_all(b"gate = plan\n").await?;
-            continue;
-        }
-        if prompt == "/auto" {
-            agent.set_gate(tools::Gate::Auto);
-            stdout.write_all(b"gate = auto\n").await?;
-            continue;
-        }
-        if prompt == "/noplan" || prompt == "/noauto" {
-            agent.set_gate(tools::Gate::Open);
-            stdout.write_all(b"gate = open\n").await?;
+        if let Some(gate) = gate_command(prompt) {
+            agent.set_gate(gate);
+            stdout
+                .write_all(format!("gate = {}\n", gate.as_str()).as_bytes())
+                .await?;
             continue;
         }
         if prompt == "/deb" {
@@ -498,6 +535,32 @@ async fn run_repl(agent: Arc<agent::Agent>, cwd: &std::path::Path) -> std::io::R
                 Err(e) => {
                     stdout
                         .write_all(format!("\x1b[31merror:\x1b[0m could not run cargo-deb: {e}\n").as_bytes())
+                        .await?;
+                }
+            }
+            continue;
+        }
+        if prompt == "/clear" {
+            // Nothing is deleted: the old transcript stays on disk, so the
+            // operator is told its id and how to get the conversation back.
+            // Printing it is the whole safety story for this command.
+            match agent.clear().await {
+                Ok(previous) => {
+                    let id_short = previous.id.get(..8).unwrap_or(&previous.id).to_owned();
+                    stdout
+                        .write_all(
+                            format!(
+                                "started a fresh session; the previous one ({}, {id_short}) is \
+                                 still on disk — /resume {} to return to it\n",
+                                previous.name, previous.id
+                            )
+                            .as_bytes(),
+                        )
+                        .await?;
+                }
+                Err(e) => {
+                    stdout
+                        .write_all(format!("\x1b[31merror:\x1b[0m could not clear: {e}\n").as_bytes())
                         .await?;
                 }
             }
@@ -786,5 +849,104 @@ fn humanise_age(secs: u64) -> String {
         format!("{}h ago", secs / 3600)
     } else {
         format!("{}d ago", secs / 86_400)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn each_mode_command_selects_its_own_gate() {
+        // The mapping the REPL acts on. `/auto` in particular is the only way to
+        // reach the judge, so a silent mismatch here would leave auto mode
+        // unreachable while the REPL happily printed "gate = auto".
+        assert_eq!(gate_command("/plan"), Some(tools::Gate::Plan));
+        assert_eq!(gate_command("/auto"), Some(tools::Gate::Auto));
+        assert_eq!(gate_command("/noplan"), Some(tools::Gate::Open));
+        assert_eq!(gate_command("/noauto"), Some(tools::Gate::Open));
+    }
+
+    #[test]
+    fn the_three_modes_are_distinct_and_named_as_the_model_sees_them() {
+        // Three words, three states. Two commands mapping to one gate would
+        // leave a mode unreachable, and the name the REPL prints has to be the
+        // name the agent puts in the environment turn — otherwise the operator
+        // reads one thing and the model is told another.
+        let gates = [
+            gate_command("/plan").unwrap(),
+            gate_command("/auto").unwrap(),
+            gate_command("/noplan").unwrap(),
+        ];
+        assert_ne!(gates[0], gates[1]);
+        assert_ne!(gates[1], gates[2]);
+        assert_ne!(gates[0], gates[2]);
+        assert_eq!(tools::Gate::Plan.as_str(), "plan");
+        assert_eq!(tools::Gate::Auto.as_str(), "auto");
+        assert_eq!(tools::Gate::Open.as_str(), "open");
+    }
+
+    #[test]
+    fn the_repl_and_the_socket_agree_about_what_each_mode_is_called() {
+        // The guarantee that makes `/auto` trustworthy: it resolves through the
+        // same function the socket's `set_gate` uses, so the two cannot drift
+        // into meaning different things. Without this, the REPL could print
+        // `gate = auto` while the socket's spelling of "auto" did something
+        // else — and nothing would notice, because both would look right from
+        // their own side.
+        for gate in [tools::Gate::Open, tools::Gate::Plan, tools::Gate::Auto] {
+            let socket_parsed = tools::parse_gate(gate.as_str());
+            assert_eq!(
+                socket_parsed,
+                Some(gate),
+                "the wire name {} does not round-trip",
+                gate.as_str()
+            );
+            let repl_parsed = gate_command(&format!("/{}", gate.as_str()));
+            assert_eq!(
+                repl_parsed,
+                socket_parsed,
+                "/{} and set_gate({:?}) disagree",
+                gate.as_str(),
+                gate.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn auto_mode_is_reachable_from_the_repl_word_that_promises_it() {
+        // The specific claim behind the command: `/auto` selects the judged
+        // mode, not merely a mode that prints "auto".
+        assert_eq!(gate_command("/auto"), Some(tools::Gate::Auto));
+        assert_eq!(gate_command("/auto").map(tools::Gate::as_str), Some("auto"));
+    }
+
+    #[test]
+    fn a_command_is_matched_exactly_never_by_prefix() {
+        // A prompt is not a command unless it is the whole word. `/autorun` must
+        // reach the model as a prompt rather than quietly enabling the judge,
+        // and `/plan the refactor` must stay a prompt.
+        for not_a_command in [
+            "/autorun",
+            "/automatic",
+            "/plan the refactor",
+            "/planning",
+            "/noplan/x",
+            "plain text",
+            "/pla",
+            "",
+            "  ",
+        ] {
+            assert_eq!(gate_command(not_a_command), None, "{not_a_command:?} is not a command");
+        }
+    }
+
+    #[test]
+    fn surrounding_whitespace_does_not_hide_a_command() {
+        // Reedline hands over the line as typed, and a pasted command can carry
+        // a trailing space.
+        assert_eq!(gate_command("/auto "), Some(tools::Gate::Auto));
+        assert_eq!(gate_command("  /plan"), Some(tools::Gate::Plan));
+        assert_eq!(gate_command("/clear "), None, "clear is handled separately");
     }
 }
