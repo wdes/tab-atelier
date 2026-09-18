@@ -157,6 +157,16 @@ pub struct Cleared {
 impl Agent {
     #[must_use]
     pub fn new(provider: Provider, session: Session) -> Self {
+        // A session that is opened rather than created already has a transcript:
+        // `--resume <id>` names one, and the default "resume the newest session
+        // in this cwd" path picks one. The history is rebuilt from it here, the
+        // same way `swap_session` does for the in-REPL `/resume <id>`, so that
+        // reopening a session continues the conversation the transcript
+        // describes. Without this the agent appended to a transcript it had
+        // never read: the model answered with no context, and every turn it
+        // wrote was a non-sequitur on disk. A fresh session has an empty
+        // transcript, so this costs it nothing.
+        let history = rebuild_history(&session.project_dir, &session.id);
         Self {
             provider,
             http: reqwest::Client::builder()
@@ -165,7 +175,7 @@ impl Agent {
                 .expect("http client init"),
             active: tokio::sync::RwLock::new(ActiveSession {
                 session: Arc::new(session),
-                history: Vec::new(),
+                history,
             }),
             gate: std::sync::atomic::AtomicU8::new(tools::Gate::Open.to_bits()),
             judge_model: crate::guard::DEFAULT_JUDGE_MODEL.to_owned(),

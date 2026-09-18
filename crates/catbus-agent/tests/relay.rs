@@ -1856,3 +1856,66 @@ fn a_turn_of_nothing_but_an_empty_thinking_block_is_pruned_from_the_next_request
         }
     }
 }
+
+/// Opening a session that already has a transcript continues the conversation.
+///
+/// `session::open` defaults to the newest transcript in the cwd — the "I closed
+/// the tab, I reopened it, pick up where I left off" path — and `--resume <id>`
+/// names one outright. Both land in `Agent::new`, which built an empty history,
+/// so the agent appended to a transcript whose contents it had never read: the
+/// model got no context, and every turn it wrote was a non-sequitur on disk.
+///
+/// The in-REPL `/resume <id>` path rebuilt it all along; this asserts the same
+/// thing is true of the entry points that start a process.
+#[test]
+fn resuming_a_session_gives_the_model_the_history_it_never_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("agent.sock");
+
+    // One exchange, so there is a transcript with something in it.
+    let (port, _rx) = spawn_mock_relay(vec![("HTTP/1.1 200 OK", FINAL_ROUND)]);
+    {
+        let (_agent, mut reader, mut stream) = spawn_agent_at(dir.path(), &socket, port);
+        let reply = send_prompt(&mut stream, &mut reader, "first");
+        assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+    }
+
+    let mut files = Vec::new();
+    jsonl_files(&dir.path().join(".claude").join("projects"), &mut files);
+    assert_eq!(files.len(), 1, "expected one transcript: {files:?}");
+    let id = files[0].file_stem().unwrap().to_str().unwrap().to_owned();
+
+    // Resume that exact session and look at what the first request carries.
+    // `spawn_agent` also passes `--new-session`; `--resume` takes precedence in
+    // `session::open`, so the session opened is the one named here.
+    let (port, rx) = spawn_mock_relay(vec![("HTTP/1.1 200 OK", FINAL_ROUND)]);
+    let (_agent, mut reader, mut stream) = spawn_agent(dir.path(), &socket, |cmd| {
+        cmd.args([
+            "--resume",
+            &id,
+            "--relay-url",
+            &format!("http://127.0.0.1:{port}"),
+            "--relay-token",
+            RELAY_TOKEN,
+        ]);
+    });
+    let reply = send_prompt(&mut stream, &mut reader, "second");
+    assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+
+    let body = body_of(&rx.recv_timeout(Duration::from_secs(10)).unwrap());
+    let messages = body["messages"].as_array().expect("messages");
+    let text = messages.iter().map(text_of).collect::<Vec<_>>().join("\n");
+
+    assert!(
+        text.contains("first"),
+        "the resumed history's prompt is missing:\n{text}"
+    );
+    assert!(
+        text.contains("hi from the relay"),
+        "the resumed reply is missing:\n{text}"
+    );
+    assert!(
+        messages.len() >= 3,
+        "the resumed turns should sit between the two prompts:\n{text}"
+    );
+}
