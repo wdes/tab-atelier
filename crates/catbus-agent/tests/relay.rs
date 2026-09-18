@@ -1919,3 +1919,57 @@ fn resuming_a_session_gives_the_model_the_history_it_never_read() {
         "the resumed turns should sit between the two prompts:\n{text}"
     );
 }
+
+/// A reply that asks for a tool must be answered, whatever its stop reason says.
+///
+/// `end_turn` together with a `tool_use` is contradictory, but providers do
+/// emit it, and the loop trusted the stop reason over the content: it returned
+/// the assistant's text and moved the turn into history with the call
+/// unanswered. Every request after that carried a `tool_use` with no
+/// `tool_result`, which the API rejects outright — so the session answered once
+/// and then failed on every prompt until it was thrown away. The tools never
+/// ran, so nothing in the reply explained why.
+///
+/// Whether the call ran is only observable as a second request carrying its
+/// result, which is what this asserts.
+#[test]
+fn an_end_turn_that_asks_for_a_tool_still_runs_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::write(work.join("note.txt"), "the catbus is late").unwrap();
+
+    let contradictory = serde_json::json!({
+        "id": "msg_contradiction",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-sonnet-4-6",
+        "content": [
+            { "type": "text", "text": "let me look" },
+            { "type": "tool_use", "id": "c1", "name": "Read", "input": { "path": "note.txt" } }
+        ],
+        "stop_reason": "end_turn",
+        "usage": { "input_tokens": 5, "output_tokens": 4 }
+    })
+    .to_string();
+
+    let (port, rx) = spawn_mock_relay_owned(vec![
+        ("HTTP/1.1 200 OK", contradictory),
+        ("HTTP/1.1 200 OK", FINAL_ROUND.to_owned()),
+    ]);
+    let socket = dir.path().join("agent.sock");
+    let (_agent, mut reader, mut stream) = spawn_minimal_agent(dir.path(), &work, &socket, port);
+
+    let reply = send_prompt(&mut stream, &mut reader, "read the note");
+    assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+
+    let _first = rx.recv_timeout(Duration::from_secs(30)).unwrap();
+    let second = rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the call was never run, so its result was never sent");
+    let result = tool_result_of(&body_of(&second), "c1");
+    assert!(
+        result.contains("the catbus is late"),
+        "the tool should have run and its output sent back: {result}"
+    );
+}
