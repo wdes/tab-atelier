@@ -21,6 +21,7 @@
 
 use std::fs::File;
 use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::os::fd::OwnedFd;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
@@ -161,6 +162,16 @@ fn type_and_expect(line: &str, expect: &str) -> (bool, String) {
 /// controlling it explicitly — and `RUST_LOG` is needed because the verdict is
 /// logged at `info`, which REPL mode suppresses unless it is asked for.
 fn type_and_expect_env(env: &[(&str, &str)], line: &str, expect: &str) -> (bool, String) {
+    // Port 9 (discard) is deliberately dead: these tests never send a prompt, so
+    // the relay is never contacted and the URL only has to be well-formed.
+    type_and_expect_at(9, env, line, expect)
+}
+
+/// As [`type_and_expect_env`], pointed at a live relay on `port`.
+///
+/// Split out so a test that *does* send a prompt can aim at a mock relay. The
+/// dead-port default above is what keeps the other tests from needing one.
+fn type_and_expect_at(port: u16, env: &[(&str, &str)], line: &str, expect: &str) -> (bool, String) {
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path();
     let mut pty = Pty::open();
@@ -187,11 +198,8 @@ fn type_and_expect_env(env: &[(&str, &str)], line: &str, expect: &str) -> (bool,
             // the operator's own repository while the test runs.
             "--tools-config",
             "minimal",
-            // A refused-connection port. The relay is only contacted when a
-            // prompt is sent, and this test never sends one, so the URL only has
-            // to be well-formed.
             "--relay-url",
-            "http://127.0.0.1:9",
+            &format!("http://127.0.0.1:{port}"),
             "--relay-token",
             "tap_pty_test",
         ]);
@@ -293,5 +301,167 @@ fn a_typo_is_treated_as_a_prompt_not_a_command() {
     assert!(
         !seen.contains("gate = "),
         "a typo changed the gate; output was:\n{seen}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The status line: the spinner during a download, and the totals line after.
+//
+// These need a *reply*, so unlike the tests above they point the agent at a mock
+// relay rather than a dead port. The formatting is unit-tested in
+// `statusline.rs` without a terminal; what can only be checked here is that the
+// REPL feeds it the right values and actually paints them — a totals line wired
+// to the wrong field would pass every unit test in that module.
+// ---------------------------------------------------------------------------
+
+/// A reply with non-trivial `usage`, so the totals line has real numbers to
+/// show and the expected string is known exactly.
+const REPLY_WITH_USAGE: &str = r#"{
+    "id": "msg_pty",
+    "type": "message",
+    "role": "assistant",
+    "model": "claude-sonnet-4-6",
+    "content": [{ "type": "text", "text": "Hello there." }],
+    "stop_reason": "end_turn",
+    "usage": { "input_tokens": 12345, "output_tokens": 6789 }
+}"#;
+
+/// Read one HTTP/1.1 request (headers plus a `Content-Length` body).
+///
+/// The body has to be drained, not just the headers: the request carries the
+/// whole conversation and tool specs, and answering before it is fully read can
+/// reset the connection instead of replying.
+fn read_request(stream: &mut TcpStream) {
+    let mut buf = Vec::new();
+    let mut chunk = [0_u8; 8192];
+    let header_end = loop {
+        let Ok(n) = stream.read(&mut chunk) else { return };
+        if n == 0 {
+            return;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break pos + 4;
+        }
+    };
+    let length: usize = String::from_utf8_lossy(&buf[..header_end])
+        .lines()
+        .find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            if key.eq_ignore_ascii_case("content-length") {
+                value.trim().parse().ok()
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0);
+    while buf.len() < header_end + length {
+        let Ok(n) = stream.read(&mut chunk) else { return };
+        if n == 0 {
+            return;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+}
+
+/// Serve one reply, after `delay`, and return the port.
+///
+/// The delay is the point: it is what gives the spinner time to paint frames, so
+/// a test can observe the in-flight line rather than only the final totals.
+fn spawn_delayed_relay(body: &'static str, delay: Duration) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        // One request is enough: a successful reply ends the turn, so the client
+        // makes exactly one.
+        if let Ok((mut stream, _)) = listener.accept() {
+            read_request(&mut stream);
+            std::thread::sleep(delay);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+    port
+}
+
+/// The transcript as the test sees it, with colour escapes removed.
+///
+/// Needed because the spinner and the totals line both carry SGR, and a literal
+/// search for `12,345 in` would otherwise have to interleave escape codes that
+/// the test does not care about.
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '\u{1b}' {
+            out.push(ch);
+            continue;
+        }
+        // `ESC [` then parameters and a final letter: the only kind emitted here.
+        if chars.peek() == Some(&'[') {
+            chars.next();
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn a_turn_paints_the_spinner_and_then_the_totals_line() {
+    // A colour-capable tab, because the spinner line carries SGR and the
+    // `\r\x1b[K` repaint is only meaningful on a terminal that interprets it.
+    let port = spawn_delayed_relay(REPLY_WITH_USAGE, Duration::from_secs(3));
+    let (matched, seen) = type_and_expect_at(port, &[("TERM", "xterm-256color")], "hello", "12,345 in");
+
+    assert!(
+        matched,
+        "the totals line never appeared; output was:\n{}",
+        strip_ansi(&seen)
+    );
+    let flat = strip_ansi(&seen);
+
+    // The totals line, with the server's own numbers and the mode alongside.
+    assert!(flat.contains("12,345 in - 6,789 out"), "totals line malformed:\n{flat}");
+    assert!(flat.contains("manual"), "the mode field is missing:\n{flat}");
+    // Its whole purpose is to sit under the reply, so the reply must precede it.
+    let reply_at = flat.find("Hello there.").expect("the reply should be shown");
+    let totals_at = flat.find("12,345 in - 6,789 out").unwrap();
+    assert!(reply_at < totals_at, "the totals line should follow the reply:\n{flat}");
+
+    // The in-flight spinner painted at least one frame, with a token count.
+    assert!(
+        flat.contains("tokens in"),
+        "no spinner frame carried a token count:\n{flat}"
+    );
+    assert!(
+        flat.contains("Thinking"),
+        "the spinner never showed the activity label:\n{flat}"
+    );
+    // And the count is marked as the local estimate, not the server's figure —
+    // the distinction the `~` exists to make.
+    assert!(
+        flat.contains('~'),
+        "the in-flight count must be marked as an estimate:\n{flat}"
+    );
+}
+
+#[test]
+fn the_spinner_repaints_rather_than_appending() {
+    // The erase sequence is what keeps a long activity label from bleeding into
+    // the next frame. Asserted against the raw bytes, since stripping ANSI would
+    // remove the very thing under test.
+    let port = spawn_delayed_relay(REPLY_WITH_USAGE, Duration::from_secs(2));
+    let (_, seen) = type_and_expect_at(port, &[], "hello", "tokens in");
+    assert!(
+        seen.contains("\r\u{1b}[K"),
+        "the spinner must erase the previous frame before drawing: {seen:?}"
     );
 }
