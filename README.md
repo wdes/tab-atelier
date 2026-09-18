@@ -142,6 +142,16 @@ A normal launch acquires a single-instance lock on `~/.local/state/tab-atelier/t
 
 `--read-only` skips the lock so any number of read-only instances can run alongside the primary one. In that mode tab-atelier never writes anything: no `tabs.json` rewrites, no per-tab output / uptime / energy files, no preference saves, no rename-time file moves. The preferences "Save" button is visually disabled. Useful for snapshotting the running workspace from a script or for poking around without disturbing live state.
 
+### Preflight before launching
+
+```sh
+tab-atelier --check
+```
+
+The GUI resolves its libraries at run time, so a build can compile cleanly and still fail to start with nothing but a loader message about a missing `.so`. `--check` looks for each one, prints the `apt install` line for any that are absent, and reports the state and config dirs it will use. Run it first when a launch fails and nothing was written to the log.
+
+It is a global flag, so `tab-atelier --check` works on the headless binary too — there it reports the dirs and the pty and leaves the GUI libraries alone, since that build never loads them.
+
 ### Headless variant
 
 For servers (no display, no gpui), install `tab-atelier-headless.deb` instead. Same HTTP API, same persistence files, same `set-status` / `tabs` / `remote` CLI subcommands — just no window. Ships with a systemd user unit:

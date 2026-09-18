@@ -801,11 +801,10 @@ pub fn run() -> std::io::Result<()> {
     let level = logger.filter();
     crate::log_ring::install(logger, level);
 
-    if std::env::args().any(|a| a == "-V" || a == "--version") {
-        println!("{}", crate::version_line("tab-atelier-headless"));
-        return Ok(());
-    }
-
+    // `-V` / `--version` are answered by clap in `cli::dispatch`, which runs
+    // before this function does — the sniff that used to be here was dead code,
+    // and printed a second version format that disagreed with clap's. See
+    // `cli::help_tests::nothing_outside_clap_parses_the_command_line`.
     info!("starting {}", crate::version_line("tab-atelier-headless"));
 
     let mut prefs = load_preferences(&platform::config_dir());

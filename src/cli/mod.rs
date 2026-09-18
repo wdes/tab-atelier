@@ -17,6 +17,8 @@ pub mod bench_lag;
 pub mod brain;
 /// `tab-atelier brief` — what a Claude session starting here would be told.
 pub mod brief;
+/// `tab-atelier --check` — preflight the GUI's runtime libraries.
+pub mod check;
 pub mod claude_hook;
 /// The single shared client-subcommand router used by both the GUI
 /// (`src/main.rs`) and the headless daemon ([`dispatch`]).
@@ -180,6 +182,70 @@ mod help_tests {
             }
         }
         assert!(missing.is_empty(), "{}", missing.join("\n  "));
+    }
+
+    /// Nothing outside clap reads the command line.
+    ///
+    /// The check above only sees a hand-rolled parser that leaves its
+    /// `unknown argument` marker behind, and it only looks under `src/cli`.
+    /// That is exactly the hole `run_check` sat in: a `src/app.rs` scan of
+    /// `std::env::args` that clap could not see, so `--check` was answered when
+    /// the process reached `app::run` and rejected by clap before it ever got
+    /// there — and the same scan matched `--version`, which clap already owned.
+    ///
+    /// `env::args` is the escape hatch, so this watches it directly and over
+    /// the whole crate. Comments are stripped, because several of them name the
+    /// thing this forbids.
+    #[test]
+    fn nothing_outside_clap_parses_the_command_line() {
+        /// Files allowed to read `env::args`, with the reason. Empty, and meant
+        /// to stay that way: a process has one command line, so it gets one
+        /// parser.
+        const ALLOWED: &[(&str, &str)] = &[];
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut stack = vec![root];
+        let mut found = Vec::new();
+
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|e| e != "rs") {
+                    continue;
+                }
+                let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+                if ALLOWED.iter().any(|(file, _)| *file == name) {
+                    continue;
+                }
+                // This file names the very thing it forbids, so it would match
+                // itself. It is the guard, and it is the only exemption.
+                if path.file_name() == std::path::Path::new(file!()).file_name() {
+                    continue;
+                }
+                let Ok(src) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                let code = src
+                    .lines()
+                    .filter(|line| !line.trim_start().starts_with("//"))
+                    .any(|line| line.contains(concat!("env::", "args")));
+                if code {
+                    found.push(path.display().to_string());
+                }
+            }
+        }
+
+        assert!(
+            found.is_empty(),
+            "these read the command line without clap's knowledge — declare the flag in \
+             `cli::dispatch::Cli` instead, or add the file to ALLOWED with a reason:\n  {}",
+            found.join("\n  ")
+        );
     }
 }
 
