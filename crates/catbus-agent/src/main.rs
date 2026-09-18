@@ -38,6 +38,7 @@ mod relay;
 mod retry;
 mod session;
 mod socket;
+mod statusline;
 mod tools;
 
 #[derive(Parser, Debug)]
@@ -330,9 +331,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     Ok(())
 }
-
-/// Spinner frames — simple ASCII so any font renders them.
-const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /// reedline `Prompt` impl that renders the session-name prefix in cyan.
 /// The name is snapshotted once per `read_line()` call so reedline can
@@ -695,13 +693,19 @@ async fn run_repl(agent: Arc<agent::Agent>, cwd: &std::path::Path) -> std::io::R
                 stdout.flush().await?;
                 break;
             };
-            let spinner_char = SPINNER[frame % SPINNER.len()];
-            // `\r` parks the cursor; `\x1b[K` erases from the cursor
-            // to end-of-line so a shorter label never leaves the tail
-            // of a previous longer one behind (e.g. "thinking" written
-            // over "Bash: grep -ri ..." used to show "thinking ri ...").
+            // The line is built by `statusline` so its layout — spinner, label,
+            // running token count — is testable without a terminal. The count is
+            // read live on every frame, so it climbs while the model streams
+            // rather than appearing only at the end.
             stdout
-                .write_all(format!("\r\x1b[K\x1b[36m{spinner_char}\x1b[0m {label}").as_bytes())
+                .write_all(
+                    statusline::spinner_line(
+                        frame,
+                        &statusline::activity_label(&label),
+                        spinner_agent.inflight_input_estimate(),
+                    )
+                    .as_bytes(),
+                )
                 .await?;
             stdout.flush().await?;
             frame += 1;
@@ -720,12 +724,26 @@ async fn run_repl(agent: Arc<agent::Agent>, cwd: &std::path::Path) -> std::io::R
             Ok(Ok(Ok(reply))) => {
                 // Persist token usage sidecar so tab-atelier can pick it up.
                 let session = agent.active_session().await;
-                let _ = session.save_tokens(
-                    agent.tokens_in.load(std::sync::atomic::Ordering::Relaxed),
-                    agent.tokens_out.load(std::sync::atomic::Ordering::Relaxed),
-                );
+                let _ = session.save_tokens(agent.total_tokens_in(), agent.total_tokens_out());
                 stdout.write_all(b"\n").await?;
                 stdout.write_all(reply.as_bytes()).await?;
+                stdout.write_all(b"\n\n").await?;
+                // The totals line, directly below the reply and above the next
+                // prompt: cumulative tokens on the left, the mode on the right,
+                // flush with the terminal edge. Written once rather than
+                // repainted, so it stays correct in a log or a `script` capture
+                // — which is why it pads instead of moving the cursor.
+                stdout
+                    .write_all(
+                        statusline::totals_line(
+                            agent.total_tokens_in(),
+                            agent.total_tokens_out(),
+                            agent.gate(),
+                            statusline::terminal_width(),
+                        )
+                        .as_bytes(),
+                    )
+                    .await?;
                 stdout.write_all(b"\n\n").await?;
                 set_tab_status("waiting", Some(&session_id_after));
             }

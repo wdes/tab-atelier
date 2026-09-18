@@ -432,6 +432,28 @@ All three opt-out signals are honoured because the app uses two mechanisms and a
 
 This is belt-and-braces on purpose: the instruction is a request the model may ignore, and the transcript is written from the reply as the model sent it, so escape sequences are also filtered out on the way to any reader that will not interpret them. That filter lives in `crates/catbus-agent/src/ansi.rs`, on `vte`'s parser via `strip-ansi-escapes` (already in the binary as a `reedline` dependency). `tab-atelier peek` applies the same rule for the same reason.
 
+#### The status line
+
+While a reply is downloading, the REPL repaints one line in place:
+
+```
+⠹ Thinking - ~1,339 tokens in
+```
+
+The spinner animates, the label is the agent's current activity (`Thinking` while waiting on the model, or the tool description it sets otherwise), and the count is an **estimate** — marked `~` because the Messages API reports `usage` only in its *final* response, so until then the only figure available is local arithmetic on the payload size (`statusline::estimate_input_tokens`, 4 bytes/token, deliberately crude). Before this, that field read `0 tokens in` for the entire download, which is worse than no number at all: it looks like the request is stuck. When no request is in flight the count is omitted rather than shown as `~0`, since `~0` claims a measurement of zero.
+
+When the reply lands, a totals line is printed below it:
+
+```
+12,345 in - 6,789 out                                                                         manual
+```
+
+Cumulative tokens on the left, the mode on the right, flush with the terminal edge — and right-aligned by *padding*, not a cursor escape, so the line stays correct in a log or a `script` capture. On a terminal narrower than the text it degrades to a single space and wraps, rather than truncating: a wrapped line is legible, a cut one misreports the numbers.
+
+The right-hand field is `auto` when the judge is in the loop and `manual` otherwise — a two-state answer to "will something be consulted before a change?", which is the distinction worth showing at a glance. `plan` and `open` both read `manual`; the finer distinction is already visible in `/help` and the environment turn.
+
+Both lines are built by `crates/catbus-agent/src/statusline.rs` as pure functions of numbers, so the layout edge cases are unit-tested without a terminal — which matters, because the REPL is only reachable through one.
+
 #### Tools, and the no-shell agent
 
 `FileTree` lists a directory to a depth you choose: `{"path": ".", "depth": 2}`. Output is one **relative path per line**, sorted, directories suffixed `/`, symlinks shown as `name -> target`, then a `---` line and totals:
@@ -479,8 +501,6 @@ With no shell the agent cannot run the tests it writes, and `Write` is the only 
 #### A relay must allow `FileTree` in its tool policy
 
 A proxy-side tool policy whitelist **fails closed for names it does not know**, so a newer client tool is stripped before the model ever sees it. The symptom is quiet: nothing errors, the client puts three tools on the wire, the model is told it has two, and it reports the tool as unavailable — while the agent guesses filenames with `Read` and never says why. Add `FileTree` to the account's policy alongside `Read`/`Write` (see `docs/proxy-tools.md`) before expecting the minimal set to work through a relay. If an agent claims a tool is missing, check the policy before the client.
-
-#### `/clear`
 
 #### `/clear`
 

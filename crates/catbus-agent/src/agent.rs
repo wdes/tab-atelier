@@ -135,6 +135,11 @@ pub struct Agent {
     /// Both counters accumulate monotonically and are never reset.
     pub tokens_in: std::sync::atomic::AtomicU64,
     pub tokens_out: std::sync::atomic::AtomicU64,
+    /// Serialised size of the request currently in flight, in bytes, or 0 when
+    /// none is. Held as a byte count rather than a token estimate so the
+    /// conversion lives in one place (`statusline::estimate_input_tokens`) and
+    /// can change without touching this field.
+    pub inflight_input_bytes: std::sync::atomic::AtomicU64,
     /// Cancellation flag for the currently-running turn. Re-built at
     /// the start of every `run_user_prompt` so Ctrl+C only kills the
     /// in-flight request, not future ones.
@@ -190,6 +195,7 @@ impl Agent {
             status: std::sync::Mutex::new(None),
             tokens_in: std::sync::atomic::AtomicU64::new(0),
             tokens_out: std::sync::atomic::AtomicU64::new(0),
+            inflight_input_bytes: std::sync::atomic::AtomicU64::new(0),
             cancel: std::sync::Mutex::new(CancellationToken::new()),
         }
     }
@@ -219,6 +225,41 @@ impl Agent {
     #[must_use]
     pub fn gate(&self) -> tools::Gate {
         tools::Gate::from_bits(self.gate.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Input tokens billed this process, cumulative across every prompt.
+    ///
+    /// Accessors rather than reading the public atomics directly, so a caller
+    /// does not have to name an `Ordering` to display a number — `Relaxed` is
+    /// correct here (the value is only ever shown, never used to order other
+    /// accesses), and it is the kind of detail a call site should not repeat.
+    #[must_use]
+    pub fn total_tokens_in(&self) -> u64 {
+        self.tokens_in.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Output tokens billed this process, cumulative across every prompt.
+    #[must_use]
+    pub fn total_tokens_out(&self) -> u64 {
+        self.tokens_out.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Estimated input tokens for the request currently in flight, or `None`
+    /// when nothing is in flight.
+    ///
+    /// The estimate exists only because the server withholds `usage` until its
+    /// final response, so during a download there is nothing else to show. It is
+    /// set from the serialised payload's length just before sending and cleared
+    /// as soon as the response arrives, so it never lingers as a stale figure
+    /// once the authoritative total is available.
+    #[must_use]
+    pub fn inflight_input_estimate(&self) -> Option<u64> {
+        match self.inflight_input_bytes.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => None,
+            bytes => Some(crate::statusline::estimate_input_tokens(
+                usize::try_from(bytes).unwrap_or(usize::MAX),
+            )),
+        }
     }
 
     /// Configure the judge that auto mode consults.
@@ -719,6 +760,20 @@ impl Agent {
             "relay request: {reshaped} messages reshaped, {pruned} empty blocks or turns pruned, \
              {breakpoints} cache breakpoints"
         );
+        // Serialised once and reused as the request body. Two reasons it is not
+        // handed to `.json()`: the cache breakpoints have to be written into the
+        // value first, and the byte length is needed for the spinner's estimate —
+        // measuring with a separate `to_vec` would serialise the whole payload
+        // twice, which for a long session is the largest object the process
+        // handles.
+        let payload = serde_json::to_vec(&encoded).map_err(|e| AgentError::Api(format!("encode: {e}")))?;
+        let payload_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
+        // Published after every mutation of `encoded` (state turn and breakpoints
+        // both add bytes), or the figure would be short. Cleared by the guard on
+        // every exit path, so a stale estimate cannot outlive its request.
+        self.inflight_input_bytes
+            .store(payload_bytes, std::sync::atomic::Ordering::Relaxed);
+        let _clear = InflightGuard(&self.inflight_input_bytes);
         // Sent through the retry helper rather than straight: a 429 here used
         // to end the turn, and a rate limit is a statement about timing, not
         // about the request. The closure rebuilds the request per attempt
@@ -729,13 +784,19 @@ impl Agent {
                 .http
                 .post(relay.messages_url())
                 .header("x-api-key", relay.token())
+                // `.body()` rather than `.json()` because the bytes are already
+                // serialised; the header matches what `.json()` would set, and is
+                // what the proxy forwards upstream.
+                .header("content-type", "application/json")
                 .header("anthropic-version", claude_api::ANTHROPIC_VERSION);
             if let Some((client_id, client_secret)) = relay.cloudflare_access() {
                 attempt = attempt
                     .header("CF-Access-Client-Id", client_id)
                     .header("CF-Access-Client-Secret", client_secret);
             }
-            attempt.json(&encoded)
+            // A `Vec` clone is a memcpy, and only happens on a retry — cheaper
+            // than re-serialising, and reqwest needs owned bytes per attempt.
+            attempt.body(payload.clone())
         })
         .await?;
         if !status.is_success() {
@@ -900,6 +961,22 @@ where
         );
         tokio::time::sleep(wait).await;
         attempt += 1;
+    }
+}
+
+/// Zeroes an in-flight byte counter when dropped.
+///
+/// A guard rather than a clear at the end of the function because the request
+/// can end four ways — success, a decode failure, a retry giving up, or a
+/// cancellation — and the counter must be zero in all of them. Clearing
+/// explicitly would mean four call sites, each of which could be forgotten, and
+/// a stale non-zero value would show a token count for a request that is no
+/// longer running.
+struct InflightGuard<'a>(&'a std::sync::atomic::AtomicU64);
+
+impl Drop for InflightGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 }
 

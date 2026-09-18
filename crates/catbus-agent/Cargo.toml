@@ -59,6 +59,11 @@ strip-ansi-escapes = "0.2"
 # This is ripgrep's walker: the same rules `rg` applies, global ignore file
 # included.
 ignore = "0.4"
+# Terminal width, for right-aligning the mode on the status line. Tiny and
+# purpose-built — it reads TIOCGWINSZ and nothing else, and its only dependency
+# (rustix, for termios) is already in the tree, so this adds one crate and no
+# transitive weight.
+terminal_size = "0.4"
 
 [dev-dependencies]
 # Isolated $HOME + cwd for the end-to-end mock-API tests.
