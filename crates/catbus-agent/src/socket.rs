@@ -140,6 +140,27 @@ async fn handle(stream: UnixStream, agent: Arc<Agent>) -> Result<(), SocketError
                 )
                 .await?;
             }
+            Request::Clear => match agent.clear().await {
+                // The previous id is in the reply so the client can offer a way
+                // back — over a socket the user cannot see the agent's stderr,
+                // so a bare "ok" would strand them.
+                Ok(previous) => {
+                    write_line(
+                        &mut write_half,
+                        &Response::Done {
+                            text: format!(
+                                "cleared; previous session ({}, {}) is still on disk",
+                                previous.name,
+                                previous.id.get(..8).unwrap_or(&previous.id)
+                            ),
+                        },
+                    )
+                    .await?;
+                }
+                Err(e) => {
+                    write_line(&mut write_half, &Response::Error { message: e.to_string() }).await?;
+                }
+            },
         }
     }
     Ok(())
@@ -183,6 +204,14 @@ enum Request {
     SetGate {
         gate: String,
     },
+    /// Start a fresh session, leaving the current transcript on disk.
+    ///
+    /// The counterpart of the REPL's `/clear`, so a client that cannot type a
+    /// slash command — the tab-atelier GUI, a phone — can offer the same thing.
+    /// Nothing is deleted, which is what makes it safe to expose over a socket:
+    /// the reply names the transcript that was left behind so the client can
+    /// show the user how to get it back.
+    Clear,
 }
 
 #[derive(Serialize)]

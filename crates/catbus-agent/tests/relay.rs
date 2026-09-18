@@ -162,11 +162,28 @@ fn spawn_agent(
     socket: &Path,
     configure: impl FnOnce(&mut Command),
 ) -> (KillOnDrop, BufReader<UnixStream>, UnixStream) {
+    spawn_agent_in(home, home, socket, configure)
+}
+
+/// As [`spawn_agent`], but with the agent's working directory separate from its
+/// HOME.
+///
+/// Two paths rather than one because `--cwd` cannot simply be passed twice: clap
+/// rejects a repeated argument, so a test wanting a fixture tree distinct from
+/// the tempdir holding `.claude` has to say so here. Kept as a delegating
+/// variant rather than a parameter on [`spawn_agent`] so the common case — cwd
+/// is where HOME is — stays a three-argument call.
+fn spawn_agent_in(
+    home: &Path,
+    cwd: &Path,
+    socket: &Path,
+    configure: impl FnOnce(&mut Command),
+) -> (KillOnDrop, BufReader<UnixStream>, UnixStream) {
     let mut cmd = agent_command(home);
     cmd.args([
         "--new-session",
         "--cwd",
-        home.to_str().unwrap(),
+        cwd.to_str().unwrap(),
         "--socket",
         socket.to_str().unwrap(),
         "--no-tui",
@@ -174,14 +191,22 @@ fn spawn_agent(
     .stdout(Stdio::null())
     .stderr(Stdio::piped());
     configure(&mut cmd);
-    let child = KillOnDrop(cmd.spawn().unwrap());
+    let mut child = KillOnDrop(cmd.spawn().unwrap());
 
     let deadline = Instant::now() + Duration::from_secs(10);
     let stream = loop {
         if let Ok(s) = UnixStream::connect(socket) {
             break s;
         }
-        assert!(Instant::now() < deadline, "agent socket never appeared");
+        // A start failure is almost always a bad flag or an unreadable config
+        // file, and the agent explains it on stderr — which the harness would
+        // otherwise discard, leaving "socket never appeared" as the only clue
+        // and forcing a manual repro of whatever the test was doing.
+        assert!(
+            Instant::now() < deadline,
+            "agent socket never appeared; it exited with:\n{}",
+            stop_and_read_stderr(&mut child)
+        );
         std::thread::sleep(Duration::from_millis(50));
     };
     stream.set_read_timeout(Some(Duration::from_mins(1))).unwrap();
@@ -191,6 +216,24 @@ fn spawn_agent(
     let started: serde_json::Value = serde_json::from_str(&line).unwrap();
     assert_eq!(started["kind"], "started");
     (child, reader, stream)
+}
+
+/// Everything the child wrote to stderr, after stopping it.
+///
+/// Killed first so the read reaches EOF instead of blocking on a process that
+/// never got far enough to close its own stderr.
+fn stop_and_read_stderr(child: &mut KillOnDrop) -> String {
+    let _ = child.0.kill();
+    let _ = child.0.wait();
+    let mut text = String::new();
+    if let Some(mut err) = child.0.stderr.take() {
+        let _ = err.read_to_string(&mut text);
+    }
+    if text.trim().is_empty() {
+        "<no output>".to_owned()
+    } else {
+        text.trim().to_owned()
+    }
 }
 
 /// The common case: relay address and token given as flags.
@@ -626,6 +669,29 @@ fn tool_result_of(body: &serde_json::Value, id: &str) -> String {
         .unwrap_or_else(|| panic!("no tool_result for {id} in:\n{body}"))
 }
 
+/// A tool round that also says something, unlike [`tool_round`].
+///
+/// The distinction is not cosmetic: the loop's round cap behaves differently
+/// depending on whether any prose was produced. With text it appends a warning
+/// to what it has; with nothing but tool calls there is no answer to annotate,
+/// so it returns an error instead. Testing the cap therefore needs a round that
+/// talks *and* asks for a tool.
+fn talking_tool_round(call_id: &str, name: &str, input: &str, text: &str) -> String {
+    serde_json::json!({
+        "id": "msg_tool",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-sonnet-4-6",
+        "content": [
+            { "type": "text", "text": text },
+            { "type": "tool_use", "id": call_id, "name": name, "input": serde_json::from_str::<serde_json::Value>(input).unwrap() }
+        ],
+        "stop_reason": "tool_use",
+        "usage": { "input_tokens": 5, "output_tokens": 4 }
+    })
+    .to_string()
+}
+
 /// A throwaway git repository with one commit and one untracked file.
 fn git_repo(dir: &Path) -> PathBuf {
     let repo = dir.join("repo");
@@ -838,6 +904,25 @@ fn configured_tools_execute_for_real() {
 /// to mangle while editing, so the test failed as a *decode* error instead of
 /// failing on the colour bug it was written for.
 ///
+/// The judge's answer: a severity on its own, with no closing tag.
+///
+/// The judge is asked with `</severity>` as a stop sequence, so generation stops
+/// *before* the closer is emitted and the real reply is a bare `<severity>N`.
+/// Mimicking that matters: a mock that returned the tidy closed form would test
+/// a shape the server never actually produces.
+fn judge_verdict(severity: u8) -> String {
+    serde_json::json!({
+        "id": "msg_judge",
+        "type": "message",
+        "role": "assistant",
+        "model": "deepseek-flash",
+        "content": [{ "type": "text", "text": format!("<severity>{severity}") }],
+        "stop_reason": "stop_sequence",
+        "usage": { "input_tokens": 5, "output_tokens": 4 }
+    })
+    .to_string()
+}
+
 /// The literal `[0m` in the middle is deliberate: that is *text*, not an
 /// escape, and must survive. A filter matching the visible shape would delete a
 /// sentence like this one.
@@ -1084,5 +1169,605 @@ fn an_agent_tab_marked_no_color_gets_the_plain_instruction() {
     assert!(
         instructions.contains("Do NOT use markdown or ANSI escape sequences"),
         "NO_COLOR must select the plain instruction:\n{instructions}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The minimal tool set: Read + Write + FileTree, no shell.
+//
+// These drive the real binary against a mock relay, so they exercise the whole
+// path a task takes: the specs that reach the wire, the dispatch of each call,
+// and the result the model sees back. A unit test on `filetree::run` would miss
+// whether the tool is registered at all, or whether a `Write` that a FileTree
+// found a path for actually lands on disk.
+// ---------------------------------------------------------------------------
+
+/// `{"allow": ["Read", "Write", "FileTree"]}` — the config that produces
+/// [`catbus_agent::tools::MINIMAL_TOOLS`].
+///
+/// Written as a literal rather than read from `MINIMAL_TOOLS` on purpose: this
+/// is the file an operator would hand-write, and the point of the test is that
+/// *that* JSON yields a working agent. Importing the constant would test the
+/// constant against itself.
+fn minimal_tools_config(dir: &Path) -> PathBuf {
+    let path = dir.join("minimal-tools.json");
+    std::fs::write(
+        &path,
+        serde_json::json!({ "allow": ["Read", "Write", "FileTree"] }).to_string(),
+    )
+    .unwrap();
+    path
+}
+
+/// Spawn an agent with `--tools-config minimal_tools_config`, pointed at a mock
+/// relay, rooted at `root`.
+fn spawn_minimal_agent(
+    home: &Path,
+    root: &Path,
+    socket: &Path,
+    port: u16,
+) -> (KillOnDrop, BufReader<UnixStream>, UnixStream) {
+    let config = minimal_tools_config(home);
+    spawn_agent_in(home, root, socket, |cmd| {
+        cmd.args([
+            "--relay-url",
+            &format!("http://127.0.0.1:{port}"),
+            "--relay-token",
+            RELAY_TOKEN,
+            "--tools-config",
+            config.to_str().unwrap(),
+        ]);
+    })
+}
+
+fn tool_names(body: &serde_json::Value) -> Vec<String> {
+    body["tools"]
+        .as_array()
+        .expect("tools array")
+        .iter()
+        .filter_map(|t| t["name"].as_str().map(str::to_owned))
+        .collect()
+}
+
+/// The tool set actually offered on the wire is exactly the three, so a model
+/// cannot call a capability the operator withheld.
+#[test]
+fn a_minimal_agent_offers_only_read_write_and_filetree() {
+    let dir = tempfile::tempdir().unwrap();
+    let (port, rx) = spawn_mock_relay(vec![("HTTP/1.1 200 OK", FINAL_ROUND)]);
+    let socket = dir.path().join("agent.sock");
+    let (_agent, mut reader, mut stream) = spawn_minimal_agent(dir.path(), dir.path(), &socket, port);
+
+    let reply = send_prompt(&mut stream, &mut reader, "hi");
+    assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+
+    let body = body_of(&rx.recv_timeout(Duration::from_secs(10)).unwrap());
+    let mut names = tool_names(&body);
+    names.sort();
+    assert_eq!(
+        names,
+        vec!["FileTree", "Read", "Write"],
+        "the offered set must be exactly the minimal trio"
+    );
+}
+
+/// The task the user asked for, end to end: the agent looks around with
+/// `FileTree`, reads a file with `Read`, and writes a new one with `Write` —
+/// with no shell anywhere in the loop.
+///
+/// This is the test that would catch a `FileTree` that is registered but whose
+/// output is unusable, or a `Write` that cannot be reached because nothing told
+/// the model which directory it is in.
+#[test]
+fn a_minimal_agent_completes_a_file_task_without_a_shell() {
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(work.join("docs")).unwrap();
+    std::fs::write(work.join("docs/notes.txt"), "the catbus is late").unwrap();
+
+    // The model's plan: see what is here, read the note, write a summary.
+    //
+    // Four responses for four round trips, in order — each request carries the
+    // previous round's tool result, so request N+1 is where result N is found.
+    // The mock blocks on accept, so a fifth would hang the test rather than
+    // fail it.
+    let (port, rx) = spawn_mock_relay_owned(vec![
+        (
+            "HTTP/1.1 200 OK",
+            tool_round("c1", "FileTree", r#"{"path": ".", "depth": 2}"#),
+        ),
+        (
+            "HTTP/1.1 200 OK",
+            tool_round("c2", "Read", r#"{"path": "docs/notes.txt"}"#),
+        ),
+        (
+            "HTTP/1.1 200 OK",
+            tool_round(
+                "c3",
+                "Write",
+                r#"{"path": "SUMMARY.md", "content": "The catbus is late."}"#,
+            ),
+        ),
+        ("HTTP/1.1 200 OK", FINAL_ROUND.to_owned()),
+    ]);
+    let socket = dir.path().join("agent.sock");
+    let (_agent, mut reader, mut stream) = spawn_minimal_agent(dir.path(), &work, &socket, port);
+
+    let reply = send_prompt(&mut stream, &mut reader, "summarise the notes in docs/");
+    assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+
+    let first = body_of(&rx.recv_timeout(Duration::from_secs(30)).unwrap());
+    let second = body_of(&rx.recv_timeout(Duration::from_secs(30)).unwrap());
+    let third = body_of(&rx.recv_timeout(Duration::from_secs(30)).unwrap());
+    let fourth = body_of(&rx.recv_timeout(Duration::from_secs(30)).unwrap());
+
+    // No shell was ever on offer — absent from the first request's specs — and
+    // the task completes anyway, which is the whole claim.
+    let offered = tool_names(&first);
+    assert!(
+        !offered.contains(&"Bash".to_string()),
+        "a shell must not be reachable: {offered:?}"
+    );
+
+    // FileTree showed the real tree, so the agent could find the file.
+    let tree = tool_result_of(&second, "c1");
+    assert!(tree.contains("docs/"), "FileTree found no directory:\n{tree}");
+    assert!(tree.contains("notes.txt"), "FileTree found no file:\n{tree}");
+
+    // Read returned the contents, proving the path FileTree printed is the path
+    // Read accepts. If the two disagreed the pair would be useless together,
+    // which is why this is checked rather than assumed.
+    let read = tool_result_of(&third, "c2");
+    assert!(read.contains("the catbus is late"), "Read got:\n{read}");
+
+    // Write reported success, naming the path it used, and the bytes really
+    // landed there. The byte count is not asserted: its exact value depends on
+    // the fixture string, and hard-coding it tests my arithmetic rather than
+    // the tool — the file's contents check below is the real one.
+    let write = tool_result_of(&fourth, "c3");
+    assert!(
+        write.starts_with("Wrote "),
+        "Write should report what it wrote:\n{write}"
+    );
+    assert!(
+        write.contains("SUMMARY.md"),
+        "Write should name the file it wrote:\n{write}"
+    );
+    // Proves the path was resolved against the session's cwd and not the
+    // process's: `work` is not the process cwd, and only the session's is.
+    assert!(
+        write.contains(work.to_str().unwrap()),
+        "Write resolved against the wrong directory:\n{write}"
+    );
+    let written = std::fs::read_to_string(work.join("SUMMARY.md")).expect("SUMMARY.md should exist");
+    assert_eq!(written, "The catbus is late.");
+}
+
+/// A withheld tool is refused with an error the model can act on, rather than
+/// being dispatched anyway.
+///
+/// Worth pinning because the withholding is done by filtering `specs()`, so the
+/// dispatcher has to agree with the spec list — if it did not, an agent could
+/// reach Bash simply by emitting a `tool_use` for a tool it was never offered,
+/// and a model that hallucinates a familiar tool name does exactly that.
+#[test]
+fn a_withheld_tool_cannot_be_reached_by_naming_it() {
+    let dir = tempfile::tempdir().unwrap();
+    // The model asks for Bash even though it was never offered it — which is
+    // what a hallucinated familiar tool name looks like on the wire.
+    let (port, rx) = spawn_mock_relay_owned(vec![
+        (
+            "HTTP/1.1 200 OK",
+            tool_round("c1", "Bash", r#"{"command": "echo pwned"}"#),
+        ),
+        ("HTTP/1.1 200 OK", FINAL_ROUND.to_owned()),
+    ]);
+    let socket = dir.path().join("agent.sock");
+    let (_agent, mut reader, mut stream) = spawn_minimal_agent(dir.path(), dir.path(), &socket, port);
+
+    let reply = send_prompt(&mut stream, &mut reader, "run echo pwned");
+    assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+
+    let _first = body_of(&rx.recv_timeout(Duration::from_secs(30)).unwrap());
+    let second = body_of(&rx.recv_timeout(Duration::from_secs(30)).unwrap());
+    let result = tool_result_of(&second, "c1");
+
+    // Exact match, not a substring hunt: the loop wraps a dispatch error as
+    // `Error: {e}`, so this pins both the refusal and the fact that nothing
+    // else ran. `pwned` appears nowhere, because the command never executed.
+    assert_eq!(
+        result, "Error: unknown tool: Bash",
+        "Bash must be refused by name, got:\n{result}"
+    );
+    assert!(!result.contains("pwned"), "the shell command ran:\n{result}");
+}
+
+/// The `/clear` socket request starts a fresh session and leaves the old
+/// transcript in place.
+///
+/// The socket form rather than the REPL one, because this is the shape a GUI or
+/// a phone uses — and "nothing is deleted" is the safety property that makes it
+/// reasonable to expose at all.
+#[test]
+fn clearing_starts_a_fresh_session_and_keeps_the_old_transcript() {
+    let dir = tempfile::tempdir().unwrap();
+    let (port, _rx) = spawn_mock_relay(vec![("HTTP/1.1 200 OK", FINAL_ROUND)]);
+    let socket = dir.path().join("agent.sock");
+    let (_agent, mut reader, mut stream) = spawn_agent_at(dir.path(), &socket, port);
+
+    // Have a conversation, so there is a transcript worth preserving.
+    let reply = send_prompt(&mut stream, &mut reader, "hi");
+    assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+
+    let before = transcript_text(dir.path());
+    assert!(before.contains("hi"), "the first turn should be on disk:\n{before}");
+
+    // Clear it.
+    stream.write_all(b"{\"kind\":\"clear\"}\n").unwrap();
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    let cleared: serde_json::Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(cleared["kind"], "done", "clear failed: {cleared}");
+    let text = cleared["text"].as_str().unwrap();
+    assert!(
+        text.contains("still on disk"),
+        "the reply must say the old transcript survives: {text}"
+    );
+
+    // Both transcripts now exist: the cleared one, untouched, and a new one.
+    let mut files = Vec::new();
+    jsonl_files(&dir.path().join(".claude").join("projects"), &mut files);
+    assert_eq!(files.len(), 2, "expected the old transcript and a new one: {files:?}");
+    let preserved = files
+        .iter()
+        .any(|f| std::fs::read_to_string(f).unwrap_or_default().contains("hi"));
+    assert!(preserved, "the old transcript was destroyed by clear");
+}
+
+/// `--tools-config` with `allow` is the only way in: an agent given no config
+/// keeps the full built-in set, so nothing about this change restricts a
+/// normal session.
+#[test]
+fn a_session_without_a_tools_config_still_gets_every_tool() {
+    let dir = tempfile::tempdir().unwrap();
+    let (port, rx) = spawn_mock_relay(vec![("HTTP/1.1 200 OK", FINAL_ROUND)]);
+    let socket = dir.path().join("agent.sock");
+    let (_agent, mut reader, mut stream) = spawn_agent_at(dir.path(), &socket, port);
+
+    send_prompt(&mut stream, &mut reader, "hi");
+    let body = body_of(&rx.recv_timeout(Duration::from_secs(10)).unwrap());
+    let names = tool_names(&body);
+    for expected in ["Read", "Write", "Edit", "Bash", "FileTree"] {
+        assert!(names.contains(&expected.to_string()), "missing {expected} in {names:?}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Auto mode.
+//
+// Three tests cover the chain, because no single one can: the REPL needs a tty
+// to run at all, so the typed command cannot be driven from a subprocess test,
+// and the judge needs a relay the REPL tests cannot provide. Together they pin
+// that `/auto` reaches the judged mode and that the judged mode actually stops a
+// write.
+//
+//   1. `auto_mode_consults_the_judge_and_honours_a_block` (here) — the socket's
+//      `set_gate auto` makes the judge run and its verdict stop a Write.
+//   2. `ansi_and_the_typed_gate_commands_reach_the_repl` (a pty test) — typing
+//      `/auto` at a real prompt makes the REPL report `gate = auto`.
+//   3. `the_repl_and_the_socket_agree_about_what_each_mode_is_called` (unit) —
+//      `/auto` resolves through the very function the socket uses.
+// ---------------------------------------------------------------------------
+
+/// Auto mode consults the judge before a world-changing tool, and a blocking
+/// verdict stops the write from happening.
+///
+/// The write is the point. A test that only checked for a judge *request* would
+/// pass on an agent that asks the judge and then ignores the answer, which is
+/// the failure mode that matters: the gate would look enabled while enforcing
+/// nothing.
+#[test]
+fn auto_mode_consults_the_judge_and_honours_a_block() {
+    let dir = tempfile::tempdir().unwrap();
+    // Four responses, in order: the model asks to Write, the judge blocks it,
+    // the model gives its final answer — and the mock's last entry is consumed
+    // by the third request.
+    let (port, rx) = spawn_mock_relay_owned(vec![
+        (
+            "HTTP/1.1 200 OK",
+            tool_round("c1", "Write", r#"{"path": "evil.txt", "content": "x"}"#),
+        ),
+        // 90 is above the block threshold, so the write must not run.
+        ("HTTP/1.1 200 OK", judge_verdict(90)),
+        ("HTTP/1.1 200 OK", FINAL_ROUND.to_owned()),
+    ]);
+    let socket = dir.path().join("agent.sock");
+    let (_agent, mut reader, mut stream) = spawn_minimal_agent(dir.path(), dir.path(), &socket, port);
+
+    // Enable the gate over the socket. This is the same code path the REPL's
+    // `/auto` uses — both go through `parse_gate` — so what it proves about
+    // `Gate::Auto` holds for the typed command too.
+    stream
+        .write_all(b"{\"kind\":\"set_gate\",\"gate\":\"auto\"}\n")
+        .unwrap();
+    let mut ack = String::new();
+    reader.read_line(&mut ack).unwrap();
+    let ack: serde_json::Value = serde_json::from_str(&ack).unwrap();
+    assert_eq!(ack["kind"], "done", "set_gate failed: {ack}");
+    assert_eq!(ack["text"], "gate = auto", "unexpected ack: {ack}");
+
+    let reply = send_prompt(&mut stream, &mut reader, "write the file");
+    assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+
+    let first = body_of(&rx.recv_timeout(Duration::from_secs(30)).unwrap());
+    let judge = body_of(&rx.recv_timeout(Duration::from_secs(30)).unwrap());
+    let third = body_of(&rx.recv_timeout(Duration::from_secs(30)).unwrap());
+
+    // The judge really ran, and ran as the judge: nothing else in the loop asks
+    // for `deepseek-flash`, and the judge is the only caller that passes a stop
+    // sequence.
+    assert_eq!(
+        judge["model"], "deepseek-flash",
+        "the second request should be the judge's:\n{judge}"
+    );
+    assert!(
+        judge["stop_sequences"].is_array(),
+        "the judge request should carry stop sequences:\n{judge}"
+    );
+    // It was asked about *our* write, not something generic: the tool and the
+    // path it would touch are in the prompt.
+    let judge_text = judge.to_string();
+    assert!(
+        judge_text.contains("evil.txt"),
+        "the judge was not told what to judge:\n{judge}"
+    );
+
+    // And the block was honoured: no file, and a tool result saying so.
+    assert!(
+        !dir.path().join("evil.txt").exists(),
+        "the write ran despite a blocking verdict"
+    );
+    let result = tool_result_of(&third, "c1");
+    assert!(
+        result.contains("blocked") || result.contains("refused"),
+        "the tool result should report the refusal, got:\n{result}"
+    );
+    // The main loop's own request never carried the judge's model, so the two
+    // kinds of call are not being conflated.
+    assert_ne!(first["model"], "deepseek-flash");
+}
+
+/// A reply the server cut off at the output limit is reported as incomplete.
+///
+/// `stop_reason: "max_tokens"` with no tool calls lands in the same branch as a
+/// clean `end_turn` — the model simply stopped, so there is no error to raise
+/// and nothing to continue with. Reporting `done` over half a sentence is the
+/// failure this guards; an operator reading a fragment as a whole answer is
+/// worse than an error, because nothing looks wrong.
+#[test]
+fn a_reply_cut_off_at_the_output_limit_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let truncated = serde_json::json!({
+        "id": "msg_cut",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-sonnet-4-6",
+        "content": [{ "type": "text", "text": "Here is the analysis you asked for. The first thing to" }],
+        "stop_reason": "max_tokens",
+        "usage": { "input_tokens": 5, "output_tokens": 8192 }
+    })
+    .to_string();
+    let (port, _rx) = spawn_mock_relay_owned(vec![("HTTP/1.1 200 OK", truncated)]);
+    let socket = dir.path().join("agent.sock");
+    let (_agent, mut reader, mut stream) = spawn_agent_at(dir.path(), &socket, port);
+
+    let reply = send_prompt(&mut stream, &mut reader, "explain");
+    assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+    let text = reply["text"].as_str().unwrap();
+
+    // The fragment is still shown — it is not withheld — but flagged.
+    assert!(
+        text.contains("Here is the analysis"),
+        "the text should survive:\n{text}"
+    );
+    assert!(text.contains("cut off"), "a truncated reply must be flagged:\n{text}");
+    // And the flag names the limit that was hit, so the fix is discoverable.
+    assert!(text.contains("8192"), "the limit should be named:\n{text}");
+}
+
+/// A clean `end_turn` carries no such warning, so the flag means something.
+///
+/// Without this, the test above would pass on a parser that appended the warning
+/// to every reply.
+#[test]
+fn a_complete_reply_is_not_flagged_as_truncated() {
+    let dir = tempfile::tempdir().unwrap();
+    let (port, _rx) = spawn_mock_relay(vec![("HTTP/1.1 200 OK", FINAL_ROUND)]);
+    let socket = dir.path().join("agent.sock");
+    let (_agent, mut reader, mut stream) = spawn_agent_at(dir.path(), &socket, port);
+
+    let reply = send_prompt(&mut stream, &mut reader, "hi");
+    assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+    let text = reply["text"].as_str().unwrap();
+    assert_eq!(
+        text, "hi from the relay",
+        "an end_turn reply should be verbatim:\n{text}"
+    );
+}
+
+/// The round-cap warning states the limit that is actually in force.
+///
+/// It previously hard-coded "32-round cap" while the default was 200, so an
+/// operator who took it at face value would raise `CATBUS_MAX_ROUNDS` to
+/// something *below* the default and observe no change at all. Set to a small
+/// value here so the cap is reached in a few round trips rather than 200.
+#[test]
+fn the_round_cap_warning_names_the_real_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    // Each response says a little and asks to Read again, so the loop keeps
+    // going until the cap and still has prose to append the warning to. Prose
+    // matters here: a loop of pure tool calls has no partial answer to annotate
+    // and returns the error variant instead, which is asserted separately.
+    let responses: Vec<(&'static str, String)> = (0..8)
+        .map(|i| {
+            (
+                "HTTP/1.1 200 OK",
+                talking_tool_round(
+                    &format!("c{i}"),
+                    "Read",
+                    r#"{"path": "notes.txt"}"#,
+                    &format!("reading pass {i}"),
+                ),
+            )
+        })
+        .collect();
+    let (port, _rx) = spawn_mock_relay_owned(responses);
+    let socket = dir.path().join("agent.sock");
+    std::fs::write(dir.path().join("notes.txt"), "some notes").unwrap();
+
+    let (_agent, mut reader, mut stream) = spawn_agent(dir.path(), &socket, |cmd| {
+        cmd.env("CATBUS_MAX_ROUNDS", "3").args([
+            "--relay-url",
+            &format!("http://127.0.0.1:{port}"),
+            "--relay-token",
+            RELAY_TOKEN,
+        ]);
+    });
+
+    let reply = send_prompt(&mut stream, &mut reader, "keep reading");
+    assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+    let text = reply["text"].as_str().unwrap();
+    assert!(
+        text.contains("hit the 3-round cap"),
+        "the real limit must be quoted:\n{text}"
+    );
+    assert!(
+        !text.contains("32-round"),
+        "the stale hard-coded limit is back:\n{text}"
+    );
+    assert!(
+        text.contains("CATBUS_MAX_ROUNDS"),
+        "the warning should name the knob to turn:\n{text}"
+    );
+}
+
+///
+/// Without this, the test above would pass on an implementation that blocked
+/// every write in auto mode — which would be a different feature entirely.
+#[test]
+fn auto_mode_allows_a_write_the_judge_does_not_object_to() {
+    let dir = tempfile::tempdir().unwrap();
+    let (port, rx) = spawn_mock_relay_owned(vec![
+        (
+            "HTTP/1.1 200 OK",
+            tool_round("c1", "Write", r#"{"path": "fine.txt", "content": "ok"}"#),
+        ),
+        ("HTTP/1.1 200 OK", judge_verdict(5)),
+        ("HTTP/1.1 200 OK", FINAL_ROUND.to_owned()),
+    ]);
+    let socket = dir.path().join("agent.sock");
+    let (_agent, mut reader, mut stream) = spawn_minimal_agent(dir.path(), dir.path(), &socket, port);
+
+    stream
+        .write_all(b"{\"kind\":\"set_gate\",\"gate\":\"auto\"}\n")
+        .unwrap();
+    let mut ack = String::new();
+    reader.read_line(&mut ack).unwrap();
+
+    let reply = send_prompt(&mut stream, &mut reader, "write the file");
+    assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+
+    let _first = body_of(&rx.recv_timeout(Duration::from_secs(30)).unwrap());
+    let _judge = body_of(&rx.recv_timeout(Duration::from_secs(30)).unwrap());
+    let third = body_of(&rx.recv_timeout(Duration::from_secs(30)).unwrap());
+
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("fine.txt")).expect("the write should have run"),
+        "ok"
+    );
+    let result = tool_result_of(&third, "c1");
+    assert!(
+        !result.contains("blocked"),
+        "a low severity should not block:\n{result}"
+    );
+}
+
+/// With the gate open, no judge call is made at all.
+///
+/// Pins that auto mode is opt-in: if the judge ran unconditionally, every turn
+/// would cost a second round trip and the `gate = open` output would be a lie.
+#[test]
+fn open_mode_does_not_call_the_judge() {
+    let dir = tempfile::tempdir().unwrap();
+    // Only two responses: a Write and then the final answer. If the judge were
+    // consulted the mock would block on a third accept and the test would hang
+    // rather than fail, so this also asserts the *absence* of an extra request.
+    let (port, rx) = spawn_mock_relay_owned(vec![
+        (
+            "HTTP/1.1 200 OK",
+            tool_round("c1", "Write", r#"{"path": "plain.txt", "content": "ok"}"#),
+        ),
+        ("HTTP/1.1 200 OK", FINAL_ROUND.to_owned()),
+    ]);
+    let socket = dir.path().join("agent.sock");
+    let (_agent, mut reader, mut stream) = spawn_minimal_agent(dir.path(), dir.path(), &socket, port);
+
+    let reply = send_prompt(&mut stream, &mut reader, "write the file");
+    assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+
+    let first = body_of(&rx.recv_timeout(Duration::from_secs(30)).unwrap());
+    let second = body_of(&rx.recv_timeout(Duration::from_secs(30)).unwrap());
+    assert_ne!(
+        second["model"], "deepseek-flash",
+        "the judge ran in open mode:\n{second}"
+    );
+    assert_ne!(first["model"], "deepseek-flash");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("plain.txt")).expect("the write should have run"),
+        "ok"
+    );
+}
+
+/// A tool-only loop that hits the cap reports an error rather than a warning.
+///
+/// The other half of the same behaviour: with no prose collected there is no
+/// partial answer to annotate, so the loop must not claim to have produced one.
+/// Both messages have to name the knob — an operator whose agent stops has only
+/// these two strings to work from.
+#[test]
+fn a_tool_only_loop_that_hits_the_cap_reports_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let responses: Vec<(&'static str, String)> = (0..6)
+        .map(|i| {
+            (
+                "HTTP/1.1 200 OK",
+                tool_round(&format!("c{i}"), "Read", r#"{"path": "notes.txt"}"#),
+            )
+        })
+        .collect();
+    let (port, _rx) = spawn_mock_relay_owned(responses);
+    let socket = dir.path().join("agent.sock");
+    std::fs::write(dir.path().join("notes.txt"), "some notes").unwrap();
+
+    let (_agent, mut reader, mut stream) = spawn_agent(dir.path(), &socket, |cmd| {
+        cmd.env("CATBUS_MAX_ROUNDS", "3").args([
+            "--relay-url",
+            &format!("http://127.0.0.1:{port}"),
+            "--relay-token",
+            RELAY_TOKEN,
+        ]);
+    });
+
+    let reply = send_prompt(&mut stream, &mut reader, "keep reading");
+    assert_eq!(reply["kind"], "error", "unexpected reply: {reply}");
+    let message = reply["message"].as_str().unwrap();
+    assert!(message.contains("round cap"), "the cap should be named:\n{message}");
+    assert!(
+        message.contains("3-round"),
+        "the error should quote the real limit, as the warning does:\n{message}"
+    );
+    assert!(
+        message.contains("CATBUS_MAX_ROUNDS"),
+        "the error should name the knob to turn:\n{message}"
     );
 }

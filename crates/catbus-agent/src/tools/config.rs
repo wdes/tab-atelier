@@ -86,6 +86,29 @@ const fn yes() -> bool {
     true
 }
 
+/// Accepted by `--tools-config` in place of a JSON path.
+///
+/// The minimal set is three short names, and an operator who wants "no shell"
+/// on one run should not have to create a file to say so — so
+/// `--tools-config minimal` is the shorthand for
+/// `{"allow": ["Read", "Write", "FileTree"]}`. The set itself lives in
+/// [`super::MINIMAL_TOOLS`], so the keyword and the documented list cannot
+/// drift.
+pub const MINIMAL_KEYWORD: &str = "minimal";
+
+/// The config `--tools-config minimal` stands for.
+///
+/// Exposed rather than inlined into [`load`] so a caller building a set in
+/// code asks for the same thing the keyword does, instead of re-listing the
+/// three names and inventing a fourth definition of "minimal".
+#[must_use]
+pub fn minimal_config() -> ToolConfig {
+    ToolConfig {
+        allow: Some(super::MINIMAL_TOOLS.iter().map(|name| (*name).to_owned()).collect()),
+        ..ToolConfig::default()
+    }
+}
+
 /// The tools this agent will offer, and how to run them.
 ///
 /// Built once. Holding the resolved specs alongside the custom definitions
@@ -119,6 +142,13 @@ impl ToolSet {
         let Some(path) = path else {
             return Ok(Self::builtin());
         };
+        // The shorthand, checked before touching the filesystem: an operator
+        // asking for `minimal` means the keyword whether or not a file of that
+        // name happens to exist, and silently reading `./minimal` instead would
+        // be a surprise in exactly the case where being explicit matters.
+        if path.as_os_str() == MINIMAL_KEYWORD {
+            return Self::from_config(minimal_config());
+        }
         let raw = std::fs::read_to_string(path)
             .map_err(|e| format!("tools config {} could not be read: {e}", path.display()))?;
         let config: ToolConfig = serde_json::from_str(&raw)
@@ -461,8 +491,15 @@ mod tests {
     #[test]
     fn the_default_set_is_every_builtin() {
         let set = ToolSet::builtin();
-        assert_eq!(names(&set).len(), 6);
-        assert!(set.offers("Bash"));
+        // Exact set, not a count: a count tells you *that* it changed, this
+        // tells you *what* changed, and adding a built-in should be a decision
+        // someone makes here rather than a side effect of registering a spec.
+        // FileTree is the most recent addition.
+        let mut expected = vec!["Bash", "Delegate", "Edit", "FileTree", "ListAgents", "Read", "Write"];
+        expected.sort_unstable();
+        let mut actual = names(&set);
+        actual.sort_unstable();
+        assert_eq!(actual, expected);
     }
 
     #[test]

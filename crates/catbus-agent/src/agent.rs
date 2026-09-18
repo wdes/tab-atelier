@@ -40,6 +40,15 @@ const CLAUDE_CODE_PREFIX: &str = "You are Claude Code, Anthropic's official CLI 
 /// surface small. Both can be swapped via `/model` later.
 const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
 
+/// Output-token ceiling for a Messages call.
+///
+/// A named constant rather than a literal at the request site, because the
+/// truncation warning below quotes it: writing the number in two places is how
+/// a message comes to promise a limit the request does not use, which is exactly
+/// what happened to the round-cap warning that claimed "32" while the default
+/// was 200.
+const MAX_OUTPUT_TOKENS: u32 = 8192;
+
 /// Static portion of the second system block, when a terminal will render it.
 ///
 /// Both system blocks are now `&'static str`: the working directory and the
@@ -130,6 +139,19 @@ pub struct Agent {
     /// the start of every `run_user_prompt` so Ctrl+C only kills the
     /// in-flight request, not future ones.
     cancel: std::sync::Mutex<CancellationToken>,
+}
+
+/// What [`Agent::clear`] replaced, so the REPL can offer a way back.
+///
+/// A struct rather than a tuple so the two strings cannot be swapped by
+/// accident at a call site: both are identifiers that look alike, and printing
+/// the name where the id belongs would tell the operator to run
+/// `/resume <name>`, which does not work.
+pub struct Cleared {
+    /// Pass to `/resume` to return to the replaced session.
+    pub id: String,
+    /// Human-readable label, for saying *which* conversation was left behind.
+    pub name: String,
 }
 
 impl Agent {
@@ -329,6 +351,50 @@ impl Agent {
         Ok(())
     }
 
+    /// Forget the conversation and start a fresh session in the same working
+    /// directory, replacing the active one.
+    ///
+    /// A *new* session, not an emptied history. That choice is deliberate:
+    ///
+    /// * the old transcript stays on disk untouched, so `/clear` cannot destroy
+    ///   work — it is recoverable with `/resume` or by reading the file, which
+    ///   is what makes it safe to offer at all;
+    /// * the model gets exactly the context a brand-new session gets, with no
+    ///   residue of a summary or a truncated tail;
+    /// * the token sidecar under the old session id keeps describing a
+    ///   conversation that still exists on disk.
+    ///
+    /// The name is not carried over — a name labels the transcript it belongs
+    /// to, and this is a different transcript. The caller can `/rename` it.
+    ///
+    /// Deliberately does **not** reset `tokens_in`/`tokens_out`. Those are
+    /// documented as process-cumulative and the REPL prints them as the cost of
+    /// this run, so zeroing them here would under-report spend. `/clear` resets
+    /// the conversation, not the meter.
+    ///
+    /// Returns the id and name of the session it replaced, so the caller can
+    /// tell the operator which transcript to `/resume` if the clear was a
+    /// mistake. Only these two are handed back: `Session` owns a `Mutex` and so
+    /// is not `Clone`, and the caller needs nothing else.
+    pub async fn clear(&self) -> Result<Cleared, AgentError> {
+        let cwd = self.active.read().await.session.cwd.clone();
+        let new_session = crate::session::open(&cwd, None, true)?;
+        let history = rebuild_history(&new_session.project_dir, &new_session.id);
+        let previous = {
+            let mut active = self.active.write().await;
+            let previous = Arc::clone(&active.session);
+            *active = ActiveSession {
+                session: Arc::new(new_session),
+                history,
+            };
+            previous
+        };
+        Ok(Cleared {
+            id: previous.id.clone(),
+            name: previous.session_name(),
+        })
+    }
+
     /// One full turn: append the user's text to the transcript, then
     /// drive the tool loop until the assistant stops asking for
     /// tools. Returns the model's final assistant text concatenated.
@@ -443,6 +509,24 @@ impl Agent {
                         content: ApiContent::Blocks(resp.content),
                     });
                 }
+                // A reply cut off by the output limit is not a finished answer,
+                // yet the branch above treats it as one: the model stopped
+                // mid-sentence, so there is no tool to continue with and no
+                // error to raise. Saying so is the difference between a client
+                // that knows it has a fragment and one that reports `done` over
+                // half a sentence — which is what happened before this check
+                // existed.
+                if stop_reason.as_deref() == Some("max_tokens") {
+                    // `write!` rather than `push_str(&format!(..))`: the same
+                    // output, without building and dropping a throwaway `String`.
+                    // `write!` to a `String` is infallible, so the result is
+                    // discarded rather than unwrapped.
+                    let _ = write!(
+                        final_text,
+                        "\n\n\x1b[33m[reply cut off at the {MAX_OUTPUT_TOKENS}-token output limit — \
+                         it may end mid-sentence; ask for the rest to continue]\x1b[0m"
+                    );
+                }
                 return Ok(self.for_sink(final_text));
             }
 
@@ -519,13 +603,21 @@ impl Agent {
                 });
             }
         }
-        // 32 rounds exhausted. Return whatever text was collected so far
-        // so the REPL shows it, and append a warning so the user knows
-        // the loop was cut short rather than silently losing output.
+        // Rounds exhausted. Return whatever text was collected so far so the
+        // REPL shows it, and append a warning so the reader knows the loop was
+        // cut short rather than silently losing output. The limit is
+        // interpolated rather than written out: this message said "32-round cap"
+        // while the default was 200, so an operator who believed it would raise
+        // `CATBUS_MAX_ROUNDS` to a value *below* the real default and see no
+        // change.
         if final_text.is_empty() {
-            Err(AgentError::TooManyRounds)
+            Err(AgentError::TooManyRounds { max_rounds })
         } else {
-            final_text.push_str("\n\n\x1b[33m[tool loop hit the 32-round cap — response may be incomplete]\x1b[0m");
+            let _ = write!(
+                final_text,
+                "\n\n\x1b[33m[tool loop hit the {max_rounds}-round cap — response may be incomplete; \
+                 raise CATBUS_MAX_ROUNDS to allow more]\x1b[0m"
+            );
             Ok(self.for_sink(final_text))
         }
     }
@@ -554,7 +646,7 @@ impl Agent {
         // after it. See `crate::cache`.
         let body = MessagesReq {
             model: DEFAULT_MODEL,
-            max_tokens: 8192,
+            max_tokens: MAX_OUTPUT_TOKENS,
             system: vec![
                 SystemBlock {
                     kind: "text",
@@ -972,8 +1064,10 @@ pub enum AgentError {
     Http(String),
     #[error("transcript: {0}")]
     Transcript(#[from] crate::session::SessionError),
-    #[error("tool loop exceeded the round cap (set CATBUS_MAX_ROUNDS to raise it)")]
-    TooManyRounds,
+    /// Carries the limit for the same reason the warning does: a message that
+    /// names a round count the operator cannot act on is worse than naming none.
+    #[error("tool loop hit the {max_rounds}-round cap with no text to return (set CATBUS_MAX_ROUNDS to raise it)")]
+    TooManyRounds { max_rounds: u32 },
     #[error("cancelled by user")]
     Cancelled,
 }
