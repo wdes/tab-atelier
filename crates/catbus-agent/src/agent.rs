@@ -507,7 +507,15 @@ impl Agent {
             }
 
             let stop_reason = resp.stop_reason.clone();
-            if matches!(stop_reason.as_deref(), Some("end_turn" | "stop_sequence")) || tool_uses.is_empty() {
+            // The test is whether there is tool work, not what `stop_reason`
+            // says. A reply that carries `tool_use` blocks has to be answered
+            // whatever the stop reason claims, because the API rejects a history
+            // in which a `tool_use` has no matching `tool_result` — so an
+            // `end_turn` that came with tool calls would end the turn here, push
+            // the unanswered calls into history, and 400 every request after it
+            // until the session was thrown away. The stop reason is still read
+            // below for the `max_tokens` fragment warning.
+            if tool_uses.is_empty() {
                 // No tool work to do — end the borrow into resp.content and
                 // move it straight into history. Inner scope keeps the
                 // write-lock guard tight (clippy::significant_drop_tightening).
