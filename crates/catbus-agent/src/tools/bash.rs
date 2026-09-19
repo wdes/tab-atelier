@@ -26,13 +26,19 @@ pub async fn run(input: &serde_json::Value, cwd: &Path) -> Result<String, String
 
     // `bash -lc` so we inherit the user's PATH / aliases. Stderr is
     // merged with stdout to give the model one chunk of context.
+    //
+    // `kill_on_drop` matters on the timeout arm below: the future returned by
+    // `wait_with_output` is dropped there, and `Child` does not kill on drop, so
+    // without this a command that outlives its timeout keeps running — together
+    // with anything it started — with nothing left to reap it or report on it.
     let mut cmd = Command::new("bash");
     cmd.arg("-lc")
         .arg(command)
         .current_dir(cwd)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
 
     let child = cmd.spawn().map_err(|e| format!("spawn bash: {e}"))?;
     let out = match tokio::time::timeout(timeout, child.wait_with_output()).await {
