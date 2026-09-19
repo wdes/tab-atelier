@@ -2432,3 +2432,72 @@ fn allowed_tools_cannot_grant_a_tool_the_launcher_withheld() {
         "and what the set does offer, so the fix is obvious: {said}"
     );
 }
+/// A session continues with the model it was using, without being told again.
+///
+/// The model is a property of the session, not of one run of the process — Claude
+/// Code records it and carries on, and this is the same idea. It matters here
+/// because Tab Atelier restarts the agent whenever a tab is reopened, so a choice
+/// held only in memory is lost exactly when the operator comes back, and `--resume`
+/// used to start over at the default.
+///
+/// The sidecar is written directly rather than through `/model`, because the
+/// sidecar is the contract between the two: `/model` writes it, and startup reads
+/// it. Its round trip is covered in `session`'s own tests, and `/model`'s wiring to
+/// it in `agent`'s.
+///
+/// Asserted on what the *request* carries, which is the thing that was wrong. The
+/// transcript is the wrong place to look: it records the model the relay served,
+/// not the one the client asked for.
+#[test]
+fn a_resumed_session_keeps_its_model() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let socket = home.join("agent.sock");
+
+    // One exchange, so there is a real session to resume.
+    let (port, _rx) = spawn_mock_relay(vec![("HTTP/1.1 200 OK", FINAL_ROUND)]);
+    let (transcript, session_id) = {
+        let (_agent, mut reader, mut stream) = spawn_agent_in(home, home, &socket, |cmd| {
+            cmd.args([
+                "--relay-url",
+                &format!("http://127.0.0.1:{port}"),
+                "--relay-token",
+                RELAY_TOKEN,
+            ]);
+        });
+        let reply = send_prompt(&mut stream, &mut reader, "first");
+        assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+        let mut files = Vec::new();
+        jsonl_files(home, &mut files);
+        assert_eq!(files.len(), 1, "one transcript: {files:?}");
+        let path = files.pop().unwrap();
+        let id = path.file_stem().unwrap().to_str().unwrap().to_owned();
+        (path, id)
+    };
+
+    // What `/model` leaves behind: a sidecar beside the transcript. Taken from the
+    // transcript's own directory rather than re-deriving the cwd escaping, so this
+    // test cannot drift from `session::open`'s rule.
+    std::fs::write(transcript.with_extension("model"), "claude-opus-4").unwrap();
+
+    // Resume it: the request must ask for the saved model, not the default.
+    let (port, rx) = spawn_mock_relay(vec![("HTTP/1.1 200 OK", FINAL_ROUND)]);
+    let (_agent, mut reader, mut stream) = spawn_agent_in(home, home, &socket, |cmd| {
+        cmd.args([
+            "--resume",
+            &session_id,
+            "--relay-url",
+            &format!("http://127.0.0.1:{port}"),
+            "--relay-token",
+            RELAY_TOKEN,
+        ]);
+    });
+    let reply = send_prompt(&mut stream, &mut reader, "second");
+    assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+
+    let body = body_of(&rx.recv_timeout(Duration::from_secs(30)).unwrap());
+    assert_eq!(
+        body["model"], "claude-opus-4",
+        "a resumed session must ask for the model it was switched to:\n{body:#?}"
+    );
+}

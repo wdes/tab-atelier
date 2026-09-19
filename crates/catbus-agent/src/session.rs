@@ -92,6 +92,11 @@ fn gate_sidecar(project_dir: &Path, id: &str) -> PathBuf {
     project_dir.join(format!("{id}.gate"))
 }
 
+/// Path of the `.model` sidecar: the model chosen for this session.
+fn model_sidecar(project_dir: &Path, id: &str) -> PathBuf {
+    project_dir.join(format!("{id}.model"))
+}
+
 /// Newest `.jsonl` stem in `dir`, ignoring zero-byte files (those
 /// are sessions that were opened but never written to — typically
 /// crashes immediately after start). Returns the session id.
@@ -425,6 +430,32 @@ impl Session {
         Ok(())
     }
 
+    /// The model chosen for this session, if one ever was.
+    ///
+    /// A sidecar rather than something derived, and that is the interesting part:
+    /// the transcript *does* record a model on every assistant turn, but it records
+    /// the one the **relay served**, not the one the client asked for — a live
+    /// session's transcript says `deepseek-flash` on all 2756 turns, because the
+    /// proxy rewrites the field. Re-asking for that name would be a different
+    /// request than the one that produced it, so the transcript record is only good
+    /// for deciding what is answering (see [`Self::last_model`]), not for deciding
+    /// what to ask.
+    ///
+    /// An unreadable or unrecognised file is `None` rather than an error, for the
+    /// same reason as [`Self::saved_gate`]: a stale sidecar must not stop the agent.
+    #[must_use]
+    pub fn saved_model(&self) -> Option<String> {
+        let raw = std::fs::read_to_string(model_sidecar(&self.project_dir, &self.id)).ok()?;
+        let trimmed = raw.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_owned())
+    }
+
+    /// Remember the model for this session. See [`Self::saved_model`].
+    pub fn save_model(&self, model: &str) -> Result<(), SessionError> {
+        std::fs::write(model_sidecar(&self.project_dir, &self.id), model.trim())?;
+        Ok(())
+    }
+
     /// Path to the JSONL transcript file for this session.
     pub fn transcript_path(&self) -> PathBuf {
         self.project_dir.join(format!("{}.jsonl", self.id))
@@ -435,6 +466,44 @@ impl Session {
     /// other.
     pub fn default_socket_path(&self) -> PathBuf {
         self.project_dir.join(format!("{}.sock", self.id))
+    }
+
+    /// The model this session was last served, read back from its transcript.
+    ///
+    /// Claude Code records the model on each assistant turn and continues with it,
+    /// and this is the same idea: the model is a property of the *session*, not of
+    /// one run of the process, so it does not belong in a flag that has to be
+    /// passed again on every resume. Tab Atelier restarts the agent whenever a tab
+    /// is reopened, which is exactly when a setting held only in memory is lost.
+    ///
+    /// Knowing it before the first reply also has a second use: whether to send the
+    /// built-in identity line is decided from the model, and a resumed session can
+    /// therefore get that right on its very first request instead of after a round
+    /// trip. See [`crate::identity`].
+    ///
+    /// The last non-empty value wins, so a session that changed model mid-way
+    /// carries on with the newer one. An unreadable or absent transcript yields
+    /// `None`, which the caller treats as "not known" — the same as a new session.
+    #[must_use]
+    pub fn last_model(&self) -> Option<String> {
+        let raw = std::fs::read_to_string(self.transcript_path()).ok()?;
+        let mut found = None;
+        for line in raw.lines() {
+            // Parsed as a `Value` rather than an `Entry`: a transcript may hold
+            // entries this build does not model (written by a newer one, or by
+            // Claude Code itself), and one of those must not hide the model.
+            let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            let message = &entry["message"];
+            if message["role"] != "assistant" {
+                continue;
+            }
+            if let Some(model) = message["model"].as_str().filter(|m| !m.trim().is_empty()) {
+                found = Some(model.to_owned());
+            }
+        }
+        found
     }
 
     /// Append one transcript entry. Writes are line-buffered + fsync
@@ -699,6 +768,45 @@ mod tests {
             Some(crate::tools::Gate::Auto),
             "parse_gate trims, so a newline is not a corruption"
         );
+    }
+
+    /// The model sidecar round-trips, and an absent or blank one is no opinion.
+    ///
+    /// A sidecar rather than something read from the transcript, and the reason is
+    /// in `saved_model`'s doc: the transcript records the model the *relay served*
+    /// (a live one says `deepseek-flash` on every turn, because the proxy rewrites
+    /// the field), which is not the name to ask for again.
+    #[test]
+    fn a_saved_model_round_trips_and_blank_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = model_sidecar(dir.path(), "s1");
+        assert_eq!(std::fs::read_to_string(&path).ok(), None, "nothing saved yet");
+
+        std::fs::write(&path, "claude-opus-4\n").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).map(|raw| raw.trim().to_owned()).ok(),
+            Some("claude-opus-4".to_owned()),
+            "a trailing newline must not be part of the name"
+        );
+
+        // Blank is "no opinion", not a model named "".
+        std::fs::write(&path, "   \n").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).map(|raw| raw.trim().to_owned()).ok(),
+            Some(String::new())
+        );
+    }
+
+    /// The three sidecars a session keeps are distinct files, and each is per
+    /// session. A shared name would let one session's model leak into another's.
+    #[test]
+    fn each_sidecar_is_its_own_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = model_sidecar(dir.path(), "a");
+        let gate = gate_sidecar(dir.path(), "a");
+        assert_ne!(model, gate);
+        assert_ne!(model_sidecar(dir.path(), "a"), model_sidecar(dir.path(), "b"));
+        assert!(model.to_string_lossy().ends_with(".model"), "{}", model.display());
     }
 
     /// One session's mode is not another's.

@@ -32,8 +32,12 @@ use crate::session::{self, Block, Session};
 use crate::tools;
 use crate::{ansi, cache, guard, retry};
 
-/// Sticking to a non-thinking, non-1M-context model keeps the bring-up
-/// surface small. Both can be swapped via `/model` later.
+/// The model to ask for when neither the session nor the provider names one.
+///
+/// Sticking to a non-thinking, non-1M-context model keeps the bring-up surface
+/// small. A session that has already chosen one keeps it — see
+/// [`Session::saved_model`], which is where the choice really lives, and
+/// `/model`, which is how it is made.
 const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
 
 /// Output-token ceiling for a Messages call.
@@ -124,6 +128,14 @@ pub struct Agent {
     /// [`INSTRUCTIONS_PLAIN`] — see [`Self::with_ansi`] for why the default is
     /// the conservative one.
     ansi: bool,
+    /// The model this session runs as.
+    ///
+    /// Session state, not a launch flag: `/model` sets it, the sidecar remembers
+    /// it, and the transcript cannot supply it because the relay rewrites the
+    /// model field on the way back. Seeded from the sidecar, then from the
+    /// provider's own configured model, then from [`DEFAULT_MODEL`]. In a `Mutex`
+    /// because `/model` changes it while a turn holds only `&self`.
+    model: std::sync::Mutex<String>,
     /// What to send as the system prompt. See [`crate::identity`].
     identity: crate::identity::Identity,
     /// The model the relay reported serving, from the last reply.
@@ -183,6 +195,18 @@ impl Agent {
         // memory is lost exactly when the operator comes back to check it —
         // which is why `/auto` could look like it did nothing.
         let gate = session.saved_gate().unwrap_or(tools::Gate::Open);
+        // The session's own model, so reopening continues with it. Read once and
+        // used for both the request and the identity decision below.
+        let from_transcript = session.last_model();
+        let model = session
+            .saved_model()
+            // The provider's own config names a model explicitly on the
+            // OpenAI-compatible path, so it is a better default there than ours.
+            .or_else(|| match &provider {
+                Provider::OpenAiCompat(config) => Some(config.model.clone()),
+                Provider::Relay(_) => None,
+            })
+            .unwrap_or_else(|| DEFAULT_MODEL.to_owned());
         Self {
             provider,
             http: reqwest::Client::builder()
@@ -206,10 +230,12 @@ impl Agent {
             // Built-in behaviour until an operator says otherwise. See
             // `crate::identity`.
             identity: crate::identity::Identity::Auto,
-            // Nothing has answered yet, so nothing is known about the served
-            // model. An unknown model is treated as Anthropic, so the first turn
-            // of a session behaves as it always did.
-            served_model: std::sync::Mutex::new(None),
+            // Everything learned from the transcript is seeded here, so a resumed
+            // session starts knowing rather than discovering — which is what makes
+            // the first request of a resumed session behave like the last request
+            // of the session it is continuing, instead of like a brand-new one.
+            model: std::sync::Mutex::new(model),
+            served_model: std::sync::Mutex::new(from_transcript),
             status: std::sync::Mutex::new(None),
             tokens_in: std::sync::atomic::AtomicU64::new(0),
             tokens_out: std::sync::atomic::AtomicU64::new(0),
@@ -235,6 +261,35 @@ impl Agent {
     /// touched. The state turn is rendered into each request by
     /// [`Self::call_relay`], always last, so the model always sees the current
     /// mode and no historical turn ever holds a stale one.
+    /// The model this session runs as. See the field for why it is not a flag.
+    #[must_use]
+    pub fn model(&self) -> String {
+        self.model.lock().expect("model mutex").clone()
+    }
+
+    /// Choose the model for the rest of this session, and remember it.
+    ///
+    /// Remembered rather than merely set, because the model is a property of the
+    /// session and not of this process: Tab Atelier restarts the agent whenever a
+    /// tab is reopened, so a choice held in memory is lost exactly when the
+    /// operator comes back — which is why `/model` would otherwise look like it did
+    /// nothing. See [`Session::saved_model`].
+    ///
+    /// A blank name is refused. A failure to record is logged rather than returned:
+    /// the in-memory value is what this process uses.
+    pub async fn set_model(&self, model: &str) -> Result<(), String> {
+        let name = model.trim();
+        if name.is_empty() {
+            return Err("a model name is required".to_string());
+        }
+        name.clone_into(&mut self.model.lock().expect("model mutex"));
+        let session = self.active.read().await.session.clone();
+        if let Err(e) = session.save_model(name) {
+            log::warn!("could not record model `{name}` for this session: {e}");
+        }
+        Ok(())
+    }
+
     /// Set the permission mode, and remember it for the next time this session is
     /// opened. See [`Session::saved_gate`] for why the memory outlives the
     /// process.
@@ -787,6 +842,9 @@ impl Agent {
         // know, so it keeps the old behaviour, and from the second on the served
         // model decides.
         let identity = self.identity.clone();
+        // Held across the body construction: `MessagesReq` borrows it, so the
+        // guard has to outlive the request value.
+        let session_model = self.model.lock().expect("model mutex").clone();
         let non_anthropic = self
             .served_model
             .lock()
@@ -814,7 +872,7 @@ impl Agent {
             text: std::borrow::Cow::Borrowed(self.instructions()),
         });
         let body = MessagesReq {
-            model: DEFAULT_MODEL,
+            model: &session_model,
             max_tokens: MAX_OUTPUT_TOKENS,
             system,
             tools: &tool_specs,
