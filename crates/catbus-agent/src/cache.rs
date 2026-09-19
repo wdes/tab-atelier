@@ -113,11 +113,16 @@ const NO_OUTPUT: &str = "(no output)";
 /// Drop the content that is not content, and any turn left holding none.
 ///
 /// Anthropic answers a message with nothing in it with `messages.N: all
-/// messages must have non-empty content`, and an empty block counts as nothing
-/// — so "the content array is non-empty" is not the property that matters. The
-/// case that found this was a `thinking` block whose `thinking` was empty: a
-/// session resumed from a transcript can carry one, because the transcript kept
-/// the block's signature and not its text.
+/// messages must have non-empty content`, so "the content array is non-empty" is
+/// not the property that matters. Two shapes were found producing almost that
+/// error, from real transcripts rather than from reasoning about the spec:
+///
+/// * a `thinking` block whose `thinking` was empty — a transcript keeps the
+///   block's signature and not always its text;
+/// * a turn whose only block was a *full* `thinking` block. Emptiness was the
+///   wrong thing to look for: the block is full, it just is not content, and an
+///   endpoint that does not implement thinking drops it in transit, so the turn
+///   arrives empty. See [`only_deliberation`].
 ///
 /// An empty `tool_result` is filled in rather than dropped, since dropping it
 /// would leave the `tool_use` above it unanswered, which the API rejects in
@@ -142,6 +147,13 @@ pub fn prune_empty_content(body: &mut Value) -> usize {
             let before = blocks.len();
             blocks.retain(|block| !empty_block(block));
             changed += before - blocks.len();
+            // Deliberation on its own is not a turn. Cleared rather than removed
+            // here so the check below drops the message in one place, counting it
+            // the same way an emptied turn is counted.
+            if only_deliberation(blocks) {
+                blocks.clear();
+                changed += 1;
+            }
         }
         if message.get("content").is_none_or(empty_content) {
             changed += 1;
@@ -151,6 +163,23 @@ pub fn prune_empty_content(body: &mut Value) -> usize {
     }
     *messages = kept;
     changed
+}
+
+/// Whether a message holds nothing but the model's own deliberation.
+///
+/// A `thinking` block is not content any later turn reads — it is the model's
+/// working, kept so a provider that implements thinking can verify it. It also
+/// does not survive an endpoint that does not implement it, and every model this
+/// relay serves is not Anthropic's, so the block is dropped in transit and the
+/// turn arrives with no content at all.
+///
+/// Found in a real transcript rather than reasoned about: six assistant turns
+/// whose only block was thinking, and the API refused exactly those indices
+/// (`messages.3`, then `messages.6`) with "all messages must have non-empty
+/// content". Emptiness was the wrong thing to look for — the block is full, it
+/// just is not content.
+fn only_deliberation(blocks: &[Value]) -> bool {
+    !blocks.is_empty() && blocks.iter().all(|block| block["type"] == "thinking")
 }
 
 /// Whether `block` is a content block with no content in it.
@@ -607,6 +636,58 @@ mod tests {
 
         assert_eq!(prune_empty_content(&mut b), 0);
         assert_eq!(b, before);
+    }
+
+    /// A turn holding nothing but thinking is not a turn.
+    ///
+    /// This is the shape behind the second 400 — `messages.3`, and `messages.6`
+    /// before it — from a resumed Claude Code transcript, where thinking is
+    /// written as its own entry. The block is not empty: it is full of the
+    /// model's working, so an emptiness check keeps it. The relayed model does
+    /// not implement thinking, so the block is dropped in transit and the turn
+    /// arrives with no content at all, which is what the API refuses.
+    ///
+    /// Checked against the transcript that produced it: six such turns, at the
+    /// indices the API named, and none left after this.
+    #[test]
+    fn a_turn_of_nothing_but_thinking_is_dropped() {
+        let mut b = body(&json!([
+            { "role": "user", "content": [{ "type": "text", "text": "go" }] },
+            { "role": "assistant", "content": [
+                { "type": "thinking", "thinking": "let me weigh the options", "signature": "sig" }
+            ]},
+            { "role": "assistant", "content": [{ "type": "text", "text": "here it is" }] },
+        ]));
+
+        assert_eq!(prune_empty_content(&mut b), 2, "the content and the turn it emptied");
+        let messages = b["messages"].as_array().expect("messages");
+        assert_eq!(messages.len(), 2, "only deliberation went, and the turn with it");
+        assert_eq!(messages[1]["content"][0]["text"], "here it is");
+        assert!(
+            !serde_json::to_string(messages).unwrap().contains("weigh the options"),
+            "the deliberation itself must be gone, not merely emptied"
+        );
+    }
+
+    /// A turn whose thinking sits beside real content keeps both: only a turn that
+    /// is *nothing but* deliberation arrives empty, so only that one is dropped.
+    /// (That thinking beside content survives untouched is also pinned by
+    /// `a_healthy_history_is_left_alone`; this states the reason.)
+    #[test]
+    fn thinking_beside_real_content_is_kept() {
+        let mut b = body(&json!([
+            { "role": "assistant", "content": [
+                { "type": "thinking", "thinking": "weighing", "signature": "sig" },
+                { "type": "tool_use", "id": "t1", "name": "Read", "input": {} },
+            ]},
+            { "role": "user", "content": [
+                { "type": "tool_result", "tool_use_id": "t1", "content": "fine" }
+            ]},
+        ]));
+
+        assert_eq!(prune_empty_content(&mut b), 0);
+        assert_eq!(b["messages"][0]["content"][0]["type"], "thinking");
+        assert_eq!(b["messages"].as_array().unwrap().len(), 2);
     }
 
     /// A classifier-shaped body carries no `messages` at all.
