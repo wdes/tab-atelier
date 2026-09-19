@@ -426,11 +426,20 @@ pub fn tab_env_extras(
     // reports, shared transcripts — and the master token administers every tab
     // in the instance. The relay token only authenticates to the relay route.
     if relay_mode() {
-        m.insert(
-            "ANTHROPIC_BASE_URL".into(),
-            format!("{}/relay/anthropic", api_url.trim_end_matches('/')),
-        );
+        let relay_base = format!("{}/relay/anthropic", api_url.trim_end_matches('/'));
+        m.insert("ANTHROPIC_BASE_URL".into(), relay_base.clone());
         m.insert("ANTHROPIC_API_KEY".into(), relay_token());
+        // The same endpoint for catbus-agent, which reads its own variables
+        // rather than Anthropic's. It resolves `CATBUS_RELAY_URL`/`_TOKEN` first
+        // and, given both, never consults `preferences.json` — which is what
+        // matters here: a tab with its internet disabled has only loopback (the
+        // per-tab ruleset allows `oifname "lo"` for the local API), so the remote
+        // relay a user normally keeps in `preferences.json` is unreachable, and
+        // the agent would fail with a connect error that says nothing about the
+        // cause. Pointing it at the local relay is what lets a catbus agent work
+        // in a tab that cannot reach the internet.
+        m.insert("CATBUS_RELAY_URL".into(), relay_base);
+        m.insert("CATBUS_RELAY_TOKEN".into(), relay_token());
     }
     m
 }
@@ -4385,6 +4394,39 @@ mod tests {
         assert_eq!(relay_token(), relay_token());
         assert!(!relay_token().is_empty());
         assert_ne!(relay_token(), "MASTER-TOKEN");
+    }
+
+    #[test]
+    fn relay_mode_points_catbus_at_the_local_relay() {
+        // A tab with its internet disabled reaches loopback and nothing else, so
+        // the remote relay a user keeps in `preferences.json` is unreachable from
+        // inside it. catbus resolves `CATBUS_RELAY_URL`/`_TOKEN` ahead of
+        // preferences, so these two are what let an agent run in such a tab.
+        let was = relay_mode();
+        set_relay_mode(true);
+        let extra = std::collections::BTreeMap::new();
+        let env = tab_env_extras("tab-1", "http://127.0.0.1:7890", "MASTER-TOKEN", &extra);
+
+        // The trailing path is deliberately part of the value: catbus accepts a
+        // bare origin too, but matching what ANTHROPIC_BASE_URL gets means the two
+        // agents in a tab are pointed at the same route by the same string.
+        assert_eq!(
+            env.get("CATBUS_RELAY_URL").map(String::as_str),
+            Some("http://127.0.0.1:7890/relay/anthropic"),
+            "the agent must be pointed at the local relay, not the public one"
+        );
+        assert_eq!(
+            env.get("CATBUS_RELAY_TOKEN").map(String::as_str),
+            Some(relay_token().as_str()),
+            "and it authenticates with the relay token, never the master one"
+        );
+        assert_ne!(
+            env.get("CATBUS_RELAY_TOKEN").map(String::as_str),
+            Some("MASTER-TOKEN"),
+            "the master token administers every tab and must not be handed to an agent"
+        );
+
+        set_relay_mode(was);
     }
 
     #[test]
