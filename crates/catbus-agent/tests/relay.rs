@@ -140,6 +140,10 @@ fn agent_command(home: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_catbus-agent"));
     cmd.env("HOME", home)
         .env_remove("XDG_CONFIG_HOME")
+        // The state dir too: `Tasks` resolves its list through
+        // `$XDG_STATE_HOME` before `$HOME`, so without this a test run from a
+        // shell that sets it would write into the operator's real task lists.
+        .env_remove("XDG_STATE_HOME")
         .env_remove("CATBUS_RELAY_URL")
         .env_remove("CATBUS_RELAY_TOKEN")
         .env_remove("CATBUS_PREFERENCES")
@@ -2118,4 +2122,91 @@ fn a_spawned_sub_agent_answers_and_is_reaped() {
         );
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// The `Tasks` tool works through the dispatcher, not just in its own unit tests.
+///
+/// The unit tests call `apply` directly, so they would all pass with the tool
+/// unregistered — never offered to the model, or offered and then rejected by the
+/// dispatcher's `match`. This asserts what an agent actually experiences: the
+/// schema is on the wire, `add` writes, `list` reads back what `add` wrote, and
+/// the file lands under the pinned state directory.
+///
+/// The state directory is pinned through the environment because that is how the
+/// tool resolves it, and the minimal preset deliberately does not offer `Tasks` —
+/// so this builds its own tool config.
+#[test]
+fn the_tasks_tool_acts_through_the_dispatcher() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let work = home.join("work");
+    let state = home.join("state");
+    std::fs::create_dir_all(&work).unwrap();
+
+    let config = home.join("tools.json");
+    std::fs::write(&config, serde_json::json!({ "allow": ["Read", "Tasks"] }).to_string()).unwrap();
+
+    let rounds = vec![
+        (
+            "HTTP/1.1 200 OK",
+            tool_round(
+                "t1",
+                "Tasks",
+                &serde_json::json!({"action":"add","title":"first"}).to_string(),
+            ),
+        ),
+        (
+            "HTTP/1.1 200 OK",
+            tool_round("t2", "Tasks", &serde_json::json!({"action":"list"}).to_string()),
+        ),
+        ("HTTP/1.1 200 OK", FINAL_ROUND.to_owned()),
+    ];
+    let (port, rx) = spawn_mock_relay_owned(rounds);
+    let socket = home.join("agent.sock");
+    let (_agent, mut reader, mut stream) = spawn_agent_in(home, &work, &socket, |cmd| {
+        cmd.args([
+            "--relay-url",
+            &format!("http://127.0.0.1:{port}"),
+            "--relay-token",
+            RELAY_TOKEN,
+            "--tools-config",
+            config.to_str().unwrap(),
+        ]);
+        // Pinned so a stray run cannot write into the operator's real list.
+        cmd.env("XDG_STATE_HOME", &state);
+    });
+
+    let reply = send_prompt(&mut stream, &mut reader, "add a task");
+    assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+
+    // The first request must carry the schema; otherwise nothing else matters.
+    let first = body_of(&rx.recv_timeout(Duration::from_secs(30)).unwrap());
+    let offered = first["tools"]
+        .as_array()
+        .expect("tools array")
+        .iter()
+        .any(|t| t["name"] == "Tasks");
+    assert!(offered, "Tasks must be offered to the model:\n{first:#?}");
+
+    let second = rx.recv_timeout(Duration::from_secs(30)).unwrap();
+    let added = tool_result_of(&body_of(&second), "t1");
+    assert!(added.contains("#1"), "`add` should have created task 1: {added}");
+    assert!(added.contains("first"), "and echoed the title: {added}");
+
+    let third = rx.recv_timeout(Duration::from_secs(30)).unwrap();
+    let listed = tool_result_of(&body_of(&third), "t2");
+    assert!(
+        listed.contains("first"),
+        "`list` must read back what `add` wrote: {listed}"
+    );
+    assert!(listed.contains("#1"), "{listed}");
+
+    // One list, for one working directory, really on disk.
+    let lists: Vec<PathBuf> = std::fs::read_dir(state.join("tab-atelier").join("agent-tasks"))
+        .expect("the list directory should exist")
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(lists.len(), 1, "one list for one cwd: {lists:?}");
+    let raw = std::fs::read_to_string(&lists[0]).unwrap();
+    assert!(raw.contains("first"), "{raw}");
 }

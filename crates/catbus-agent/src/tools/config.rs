@@ -503,6 +503,7 @@ mod tests {
             "ListAgents",
             "Read",
             "Spawn",
+            "Tasks",
             "Write",
         ];
         expected.sort_unstable();

@@ -16,6 +16,7 @@ mod filetree;
 mod list_agents;
 mod read;
 mod spawn;
+mod tasks;
 mod write;
 
 // Only the resolved set is re-exported. `CustomTool` and `ToolConfig` describe
@@ -250,6 +251,12 @@ impl ToolSet {
                 }
                 spawn::run(input, cwd).await
             }
+            // Deliberately unguarded. It writes to the agent's own state
+            // directory, not the operator's tree, so it is not in
+            // `changes_the_world` and auto mode should not spend a judge call on
+            // it — and plan-mode should allow it, since writing down a plan is
+            // what plan-mode is for. See `tasks`'s module doc.
+            "Tasks" => tasks::run(input, cwd),
             other => Err(format!("unknown tool: {other}")),
         }
     }
@@ -331,6 +338,8 @@ pub fn builtin_specs() -> Vec<serde_json::Value> {
         // Defined in its own module, so the defaults the tool actually uses and
         // the defaults it advertises cannot drift apart.
         spawn::spec(),
+        // Likewise, and built from the same `ACTIONS` array the dispatch uses.
+        tasks::spec(),
         serde_json::json!({
             "name": "Bash",
             "description": "Run a shell command in the agent's working directory. Default 10-minute timeout; pass timeout_secs (up to 3600) for long builds. Refused in plan-mode.",
