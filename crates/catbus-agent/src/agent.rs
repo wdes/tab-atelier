@@ -617,10 +617,19 @@ impl Agent {
                 // the turn: the model needs to see the refusal and propose
                 // something else, which is exactly the behaviour plan-mode
                 // produces and the reason it is useful.
-                if gate.judges() && self.tools.changes_the_world(name) {
+                // Every verdict is recorded, allowed or refused. A judge that
+                // allows and says nothing is indistinguishable from one that
+                // never ran, so a working gate can be reported as doing nothing —
+                // and there is no way to tell a permissive judge from an absent
+                // one. The record goes to the log and, when allowed, into the
+                // tool result, which is where the operator or a later session
+                // will actually look.
+                let vetted: Option<String> = if gate.judges() && self.tools.changes_the_world(name) {
                     *self.status.lock().expect("status mutex") = Some(format!("checking {name}"));
                     let history = { self.active.read().await.history.clone() };
                     let verdict = self.judge_action(name, input, &history).await;
+                    let record = format!("auto checked {name}: {}", verdict.summary());
+                    log::info!("gate: {record}");
                     if verdict.blocks() {
                         results.push(Block::ToolResult {
                             tool_use_id: (*id).to_string(),
@@ -629,14 +638,20 @@ impl Agent {
                         });
                         continue;
                     }
-                }
+                    Some(record)
+                } else {
+                    None
+                };
 
-                let (content, is_error) = tokio::select! {
+                let (mut content, is_error) = tokio::select! {
                     out = self.tools.dispatch(name, input, &session.cwd, gate) => {
                         out.map_or_else(|e| (format!("Error: {e}"), true), |out| (out, false))
                     }
                     () = cancel.cancelled() => return Err(AgentError::Cancelled),
                 };
+                if let Some(record) = vetted {
+                    content = format!("{content}\n\n[{record}]");
+                }
                 results.push(Block::ToolResult {
                     tool_use_id: (*id).to_string(),
                     content,

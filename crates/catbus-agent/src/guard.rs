@@ -197,6 +197,25 @@ impl Verdict {
             },
         )
     }
+
+    /// A one-line record of the verdict, for the transcript and the log.
+    ///
+    /// [`Self::describe`] is written for a refusal, where the model needs to
+    /// understand what to do differently. This is for the record of a check that
+    /// **allowed**, which otherwise leaves no trace anywhere — and a gate that
+    /// leaves no trace when it works is indistinguishable from one that never
+    /// ran, which is how "auto mode does nothing" gets reported about a gate that
+    /// is doing its job.
+    #[must_use]
+    pub fn summary(&self) -> String {
+        self.severity().map_or_else(
+            || "unusable, so refused".to_owned(),
+            |severity| {
+                let outcome = if self.blocks() { "refused" } else { "allowed" };
+                format!("severity {severity}, {outcome}")
+            },
+        )
+    }
 }
 
 #[derive(Deserialize)]
@@ -549,5 +568,39 @@ mod tests {
             MONITOR_PROMPT.len() < 8_000,
             "the built-in prompt is meant to be concise"
         );
+    }
+}
+
+#[cfg(test)]
+mod record_tests {
+    use super::*;
+
+    /// The record distinguishes the three outcomes, because "allowed" and
+    /// "refused" are the whole reason it exists — a record that read the same
+    /// either way would be no better than none.
+    #[test]
+    fn a_verdict_summarises_with_its_severity_and_outcome() {
+        assert_eq!(Verdict::Scored(5).summary(), "severity 5, allowed");
+        assert_eq!(Verdict::Scored(90).summary(), "severity 90, refused");
+        // Unusable can only refuse, and says so rather than naming a severity it
+        // does not have.
+        let unusable = Verdict::Unusable("no verdict in the reply".into());
+        assert_eq!(unusable.summary(), "unusable, so refused");
+        assert!(unusable.blocks());
+    }
+
+    /// The boundary is worth pinning in the record's words as well as in
+    /// `blocks`: an off-by-one here would print "allowed" for a refusal.
+    #[test]
+    fn the_record_agrees_with_the_block_decision_at_the_boundary() {
+        for severity in [0, BLOCK_ABOVE, BLOCK_ABOVE + 1, 100] {
+            let verdict = Verdict::Scored(severity);
+            let said_allowed = verdict.summary().contains("allowed");
+            assert_eq!(
+                said_allowed,
+                !verdict.blocks(),
+                "severity {severity}: the summary and the decision must agree"
+            );
+        }
     }
 }

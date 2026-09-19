@@ -1694,6 +1694,19 @@ fn auto_mode_allows_a_write_the_judge_does_not_object_to() {
         !result.contains("blocked"),
         "a low severity should not block:\n{result}"
     );
+    // The record of a check that *allowed* is the whole point: without it, a gate
+    // that works leaves no trace, and "auto mode does nothing" is a report that can
+    // be made about a gate doing its job. Severity 5 is the judge's answer and must
+    // appear in what the operator and the next session can read.
+    assert!(
+        result.contains("auto checked Write"),
+        "an allowed action must leave a record of the check:\n{result}"
+    );
+    assert!(
+        result.contains("severity 5"),
+        "the record should carry the judge's own number:\n{result}"
+    );
+    assert!(result.contains("allowed"), "and say which way it went:\n{result}");
 }
 
 /// With the gate open, no judge call is made at all.
