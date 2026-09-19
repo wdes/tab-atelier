@@ -15,6 +15,7 @@ mod edit;
 mod filetree;
 mod list_agents;
 mod read;
+mod spawn;
 mod write;
 
 // Only the resolved set is re-exported. `CustomTool` and `ToolConfig` describe
@@ -95,6 +96,13 @@ impl Gate {
             Self::Plan => Some(match what {
                 "Write" => "Plan-mode is on. Describe the file you want to create instead of writing it.",
                 "Edit" => "Plan-mode is on. Describe the edit instead of applying it.",
+                // Refused here rather than judged, and named separately: a child
+                // starts with the gate open, so starting one would leave
+                // plan-mode without changing anything in this session.
+                "Spawn" => {
+                    "Plan-mode is on. Describe what you want done instead of starting a sub-agent — \
+                     a sub-agent begins with the gate open, so this would plan nothing."
+                }
                 _ => "Plan-mode is on. Describe the command instead of running it.",
             }),
             Self::Open | Self::Auto => None,
@@ -230,6 +238,18 @@ impl ToolSet {
             // *target* agent against its own state, not by this one.
             "ListAgents" => list_agents::run(input, cwd).await,
             "Delegate" => delegate::run(input, cwd).await,
+            // Not in `changes_the_world`: the child inherits this gate and judges
+            // its own actions, which is the reasoning in that function's comment.
+            // What *is* enforced here is that a child cannot be started from
+            // plan-mode at all, because plan-mode's promise is that nothing on
+            // disk changes — and a child starts `Open`, so spawning one would
+            // leave the mode by the side door rather than the front.
+            "Spawn" => {
+                if let Some(why) = gate.refusal("Spawn") {
+                    return Err(why.to_string());
+                }
+                spawn::run(input, cwd).await
+            }
             other => Err(format!("unknown tool: {other}")),
         }
     }
@@ -308,6 +328,9 @@ pub fn builtin_specs() -> Vec<serde_json::Value> {
                 "required": ["target", "prompt"]
             }
         }),
+        // Defined in its own module, so the defaults the tool actually uses and
+        // the defaults it advertises cannot drift apart.
+        spawn::spec(),
         serde_json::json!({
             "name": "Bash",
             "description": "Run a shell command in the agent's working directory. Default 10-minute timeout; pass timeout_secs (up to 3600) for long builds. Refused in plan-mode.",
