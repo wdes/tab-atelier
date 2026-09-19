@@ -2223,3 +2223,111 @@ fn the_tasks_tool_acts_through_the_dispatcher() {
     let raw = std::fs::read_to_string(&lists[0]).unwrap();
     assert!(raw.contains("first"), "{raw}");
 }
+
+/// An operator prompt file replaces the whole system prompt.
+///
+/// The point of the file is that the operator owns what the model is told about
+/// itself, so the built-in Claude line must be gone — not merely followed by the
+/// operator's text, which would leave the assertion it replaces standing. The
+/// rendering block still follows, because it describes the terminal rather than
+/// the model: dropping it would let a model emit markdown into a terminal that
+/// cannot render it, which is a property of this TUI and not of anybody's
+/// identity.
+#[test]
+fn an_identity_file_replaces_the_system_prompt() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let identity = home.join("identity.md");
+    std::fs::write(&identity, "---\nAllowedTools: Read\n---\nYou are a parrot.").unwrap();
+
+    let (port, rx) = spawn_mock_relay(vec![("HTTP/1.1 200 OK", FINAL_ROUND)]);
+    let socket = home.join("agent.sock");
+    let (_agent, mut reader, mut stream) = spawn_agent_in(home, home, &socket, |cmd| {
+        cmd.args([
+            "--relay-url",
+            &format!("http://127.0.0.1:{port}"),
+            "--relay-token",
+            RELAY_TOKEN,
+            "--identity-file",
+            identity.to_str().unwrap(),
+        ]);
+    });
+
+    let reply = send_prompt(&mut stream, &mut reader, "hi");
+    assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+
+    let body = body_of(&rx.recv_timeout(Duration::from_secs(30)).unwrap());
+    let system = body["system"].as_array().expect("system array");
+    let all = serde_json::to_string(system).unwrap();
+
+    assert_eq!(
+        system[0]["text"], "You are a parrot.",
+        "the operator's text comes first"
+    );
+    assert_eq!(system.len(), 2, "the identity and the rendering rules: {system:#?}");
+    assert!(
+        !all.contains("You are Claude Code"),
+        "the built-in identity must be replaced, not merely followed:\n{all}"
+    );
+    assert!(
+        !system[1]["text"].as_str().unwrap_or_default().is_empty(),
+        "the rendering block must survive an operator identity:\n{system:#?}"
+    );
+}
+
+/// A relay that says it is serving a non-Anthropic model stops the Claude
+/// identity line going out.
+///
+/// Only a reply can say what is serving, so the first turn of a session keeps the
+/// built-in identity — it cannot know, and behaving as before is the safe default.
+/// From the second turn on, the answer is known, and claiming to be Claude Code
+/// on a model that is not is the thing this exists to stop.
+#[test]
+fn a_non_anthropic_model_drops_the_claude_identity_line() {
+    const DEEPSEEK: &str = r#"{
+        "id": "m1", "type": "message", "role": "assistant", "model": "deepseek-flash",
+        "content": [{ "type": "text", "text": "hello" }],
+        "stop_reason": "end_turn", "usage": { "input_tokens": 5, "output_tokens": 4 }
+    }"#;
+
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let (port, rx) = spawn_mock_relay(vec![("HTTP/1.1 200 OK", DEEPSEEK), ("HTTP/1.1 200 OK", FINAL_ROUND)]);
+    let socket = home.join("agent.sock");
+    let (_agent, mut reader, mut stream) = spawn_agent_in(home, home, &socket, |cmd| {
+        cmd.args([
+            "--relay-url",
+            &format!("http://127.0.0.1:{port}"),
+            "--relay-token",
+            RELAY_TOKEN,
+        ]);
+    });
+
+    let reply = send_prompt(&mut stream, &mut reader, "one");
+    assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+    let first = body_of(&rx.recv_timeout(Duration::from_secs(30)).unwrap());
+    assert!(
+        serde_json::to_string(&first["system"])
+            .unwrap()
+            .contains("You are Claude Code"),
+        "the first turn cannot know the model, so it keeps the built-in identity:\n{first:#?}"
+    );
+
+    let reply = send_prompt(&mut stream, &mut reader, "two");
+    assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+    let second = body_of(&rx.recv_timeout(Duration::from_secs(30)).unwrap());
+    let system = second["system"].as_array().expect("system array");
+    let all = serde_json::to_string(system).unwrap();
+
+    assert!(
+        !all.contains("You are Claude Code"),
+        "a non-Anthropic model must not be told it is Claude Code:\n{all}"
+    );
+    assert!(!system.is_empty(), "the rendering rules must still be sent:\n{all}");
+    assert!(
+        system
+            .iter()
+            .all(|b| !b["text"].as_str().unwrap_or_default().is_empty()),
+        "and no block may be left empty:\n{all}"
+    );
+}

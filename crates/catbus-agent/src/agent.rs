@@ -12,12 +12,13 @@
 //! Two things still live here because they describe *us* rather than the
 //! login:
 //!
-//! * The first system block **must** start with the literal Claude
-//!   Code identifier; the upstream rejects the request otherwise, and
-//!   the proxy forwards system blocks untouched.
-//! * Our own instructions go in the second system block, and both blocks are
-//!   static — the working directory and permission mode are a trailing turn,
-//!   so that changing either does not invalidate the cached prefix.
+//! * The first system block is the identity, and it is chosen rather than
+//!   fixed: an operator file replaces it, and the built-in Claude Code line is
+//!   only sent when the served model is Anthropic. See [`crate::identity`] for
+//!   why it is conditional — this crate talks to relays that are not Anthropic.
+//! * Our rendering instructions go in the last system block, and every block is
+//!   static — the working directory and permission mode are a trailing turn, so
+//!   that changing either does not invalidate the cached prefix.
 
 use std::sync::Arc;
 
@@ -30,11 +31,6 @@ use crate::relay::Relay;
 use crate::session::{self, Block, Session};
 use crate::tools;
 use crate::{ansi, cache, guard, retry};
-
-/// Identifier the server requires at the start of the first system
-/// block on every Messages call. The proxy forwards system blocks
-/// through untouched, so the client is still the one that has to send it.
-const CLAUDE_CODE_PREFIX: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
 
 /// Sticking to a non-thinking, non-1M-context model keeps the bring-up
 /// surface small. Both can be swapped via `/model` later.
@@ -128,6 +124,16 @@ pub struct Agent {
     /// [`INSTRUCTIONS_PLAIN`] — see [`Self::with_ansi`] for why the default is
     /// the conservative one.
     ansi: bool,
+    /// What to send as the system prompt. See [`crate::identity`].
+    identity: crate::identity::Identity,
+    /// The model the relay reported serving, from the last reply.
+    ///
+    /// Only knowable from a reply, so the first turn of a session has none — see
+    /// the identity block in [`Self::call_relay`]. In a `Mutex` because the turn
+    /// that learns it holds only `&self`: the agent is shared, and a reply can
+    /// arrive on any of its tasks. Kept as the raw name rather than a flag so the
+    /// log can say which model caused a change.
+    served_model: std::sync::Mutex<Option<String>>,
     /// Current activity description shown in the REPL spinner.
     /// `None` = idle, `Some(s)` = description of what's happening.
     pub status: std::sync::Mutex<Option<String>>,
@@ -197,6 +203,13 @@ impl Agent {
             // Opting in is a one-line change for the launcher, which is the
             // only party that knows what stdout actually is.
             ansi: false,
+            // Built-in behaviour until an operator says otherwise. See
+            // `crate::identity`.
+            identity: crate::identity::Identity::Auto,
+            // Nothing has answered yet, so nothing is known about the served
+            // model. An unknown model is treated as Anthropic, so the first turn
+            // of a session behaves as it always did.
+            served_model: std::sync::Mutex::new(None),
             status: std::sync::Mutex::new(None),
             tokens_in: std::sync::atomic::AtomicU64::new(0),
             tokens_out: std::sync::atomic::AtomicU64::new(0),
@@ -309,6 +322,13 @@ impl Agent {
     #[must_use]
     pub const fn with_ansi(mut self, ansi: bool) -> Self {
         self.ansi = ansi;
+        self
+    }
+
+    /// Use an operator-supplied system prompt. See [`crate::identity`].
+    #[must_use]
+    pub fn with_identity(mut self, identity: crate::identity::Identity) -> Self {
+        self.identity = identity;
         self
     }
 
@@ -540,6 +560,30 @@ impl Agent {
             let entry = session::assistant_blocks(&session, resp.model.clone(), plain_content(&resp.content));
             session.append(&entry)?;
 
+            // Remember what actually answered, and say so the first time it
+            // changes shape. This is the only source for it: no reply yet means no
+            // name, which is why the first turn of a session keeps the built-in
+            // identity — see the system block in `call_relay`.
+            {
+                let mut served = self.served_model.lock().expect("served model mutex");
+                let was_anthropic = served.as_deref().is_none_or(crate::identity::is_anthropic);
+                if served.as_deref() != Some(resp.model.as_str()) {
+                    let now_anthropic = crate::identity::is_anthropic(&resp.model);
+                    if now_anthropic != was_anthropic {
+                        // Once per change, not once per request: a model that is
+                        // not Anthropic is the case an operator wants to know
+                        // about, since it is the one where the Claude identity
+                        // line stops going out.
+                        log::info!(
+                            "the relay is serving `{}`, so the Claude identity line will {} be sent",
+                            resp.model,
+                            if now_anthropic { "" } else { "no longer" }
+                        );
+                    }
+                    *served = Some(resp.model.clone());
+                }
+            }
+
             // Collect tool_use blocks by reference; pull any text into
             // the visible answer so the caller has *something* even
             // mid-tool-use. The borrows into `resp.content` survive the
@@ -735,19 +779,44 @@ impl Agent {
         // *middle* block — before the static instructions — which meant a cwd
         // or gate change invalidated the block behind it and every message
         // after it. See `crate::cache`.
+        // Which identity block to send. The operator's file, when there is one,
+        // replaces the whole system prompt rather than being added to it —
+        // whoever writes it owns what the model is told about itself. Failing
+        // that, the Claude line goes out only when the model is Anthropic, or
+        // when no reply has named a model yet: the first turn of a session cannot
+        // know, so it keeps the old behaviour, and from the second on the served
+        // model decides.
+        let identity = self.identity.clone();
+        let non_anthropic = self
+            .served_model
+            .lock()
+            .expect("served model mutex")
+            .as_deref()
+            .is_some_and(|model| !crate::identity::is_anthropic(model));
+        let mut system = match identity {
+            crate::identity::Identity::Text { text, .. } => vec![SystemBlock {
+                kind: "text",
+                text: std::borrow::Cow::Owned(text),
+            }],
+            crate::identity::Identity::Omitted => Vec::new(),
+            crate::identity::Identity::Auto if non_anthropic => Vec::new(),
+            crate::identity::Identity::Auto => vec![SystemBlock {
+                kind: "text",
+                text: std::borrow::Cow::Borrowed(crate::identity::CLAUDE_CODE_PREFIX),
+            }],
+        };
+        // The rendering instructions always go last, and survive an operator
+        // identity: they describe the terminal, not the model, so they are true
+        // whatever the operator wrote. Dropping them with the identity text would
+        // let a model emit markdown into a terminal that cannot render it.
+        system.push(SystemBlock {
+            kind: "text",
+            text: std::borrow::Cow::Borrowed(self.instructions()),
+        });
         let body = MessagesReq {
             model: DEFAULT_MODEL,
             max_tokens: MAX_OUTPUT_TOKENS,
-            system: vec![
-                SystemBlock {
-                    kind: "text",
-                    text: std::borrow::Cow::Borrowed(CLAUDE_CODE_PREFIX),
-                },
-                SystemBlock {
-                    kind: "text",
-                    text: std::borrow::Cow::Borrowed(self.instructions()),
-                },
-            ],
+            system,
             tools: &tool_specs,
             messages: &active.history,
         };

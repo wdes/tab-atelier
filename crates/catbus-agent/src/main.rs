@@ -34,6 +34,7 @@ mod agent;
 mod ansi;
 mod cache;
 mod guard;
+mod identity;
 mod openai;
 mod relay;
 mod retry;
@@ -113,6 +114,26 @@ struct Args {
     /// the agent being restarted, which is what a tab reopen does.
     #[arg(long, value_name = "MODE")]
     gate: Option<String>,
+
+    /// Use this text as the whole system prompt, instead of the built-in one.
+    ///
+    /// The built-in prompt tells the model it is Claude Code, which is untrue on
+    /// any endpoint that is not Anthropic's, and the terminal-rendering rules are
+    /// still appended after this. Takes precedence over `--identity-file`.
+    #[arg(long, value_name = "TEXT", env = "CATBUS_IDENTITY")]
+    identity: Option<String>,
+
+    /// Read the system prompt from this file — markdown, optionally with
+    /// `---`-delimited front matter that may set `AllowedTools`.
+    ///
+    /// The text replaces the whole system prompt. A blank file means "send no
+    /// identity at all". Naming a file that cannot be read, or that holds no
+    /// prompt, is an error: it was asked for by name, so a typo should be loud.
+    /// Without this flag (and without `CATBUS_IDENTITY_FILE`) the built-in
+    /// location is used when it happens to exist, where absence means the
+    /// built-in prompt rather than an error.
+    #[arg(long, value_name = "PATH", env = "CATBUS_IDENTITY_FILE")]
+    identity_file: Option<PathBuf>,
 
     /// Allow ANSI escapes in text replies.
     ///
@@ -369,7 +390,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         agent::Agent::new(provider, session)
             .with_judge(judge_model, monitor_prompt)
             .with_tools(tool_set)
-            .with_ansi(ansi),
+            .with_ansi(ansi)
+            // Resolved here, where a bad file is a start-up error the operator can
+            // see, rather than inside the request path where it would surface as a
+            // failed turn.
+            .with_identity(identity::load(args.identity.as_deref(), args.identity_file.as_deref())?),
     );
 
     // An explicit mode wins over the one the session was last left in. Applied
