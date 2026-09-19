@@ -8,11 +8,11 @@ lands. Nothing is pushed: pushes need the Nitrokey.
 |---|------|-------|
 | T1 | `Tasks` tool for catbus-agent — a task list with actions on the items | **done** |
 | T2 | `/auto` does not work | **done** |
-| T3 | Right-click "Catbus" should not be offered when the tab already has an agent | next |
-| T4 | Thinking traces are not surfaced | todo |
+| T3 | Right-click "Catbus" should not be offered when the tab already has an agent | **done** |
+| T4 | Thinking traces are not surfaced | **needs a decision** |
 | T5 | Approval logging — nothing records what the gate allowed | **done** |
-| T6 | Model on launch — pick a model per tab | todo |
-| T7 | Identity file (`---` front matter, `AllowedTools:`) — approved earlier | todo |
+| T6 | Model on launch — pick a model per tab | **needs a decision** |
+| T7 | Identity file (`---` front matter, `AllowedTools:`) — approved earlier | **done** |
 
 Notes, so the next session does not re-derive them:
 
@@ -24,12 +24,26 @@ Notes, so the next session does not re-derive them:
 - **T5** is the observable T2 needed. `Verdict::summary` now goes to the log and
   into the tool result on the allowed path, so a working gate is distinguishable
   from an absent one.
+- **T4** — nothing renders or persists a thinking block. The question to settle
+  first is where they should appear: the REPL, the transcript, the socket, or all
+  three. They are already parsed (the empty-block fix depends on that) and already
+  dropped before the transcript, so "surface them" is a real feature rather than a
+  repair.
 - **T6** is three flags, not one: `--model`/`--api-url` (Anthropic-compatible),
   `--openai-url`+`--openai-model`, `--infomaniak-*`. On the relay path the proxy
-  picks the model, so it is neither of those — decide which is meant before
-  building.
-- **T7** spec is preserved at `/tmp/identity-spec.txt`. `Spawn` (its prerequisite)
-  is done.
+  picks the model, so it is none of those — decide which is meant before building.
+- **T7**'s `AllowedTools` is parsed and carried but **not enforced**: narrowing the
+  tool set from a prompt file has to reconcile with `--tools-config` rather than
+  silently override it.
+- **ANSI is already conditional**, contrary to the note that prompted a look:
+  `ansi::allow_escapes(sink_renders, TERM=dumb)` picks between `INSTRUCTIONS_TERMINAL`
+  (invites SGR) and `INSTRUCTIONS_PLAIN` (forbids markdown *and* escapes, asks for
+  plain prose), and `ansi::strip` scrubs escapes on the way out for sinks that
+  render nothing — which is the `[36mRead[0m[0m` case its test documents. The
+  residual weakness is scope: the *instruction* is per process while one session is
+  read by several sinks (REPL, socket, phone), so a non-terminal sink gets stripped
+  terminal-prose rather than plain prose. Worth fixing only if a phone actually
+  reads it.
 
 Already landed this session, for reference: the empty-content 400, the resume
 history bug, `is_error` round-trip, `end_turn` + `tool_use`, the `Spawn` tool,
