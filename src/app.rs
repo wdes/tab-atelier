@@ -3957,26 +3957,57 @@ impl AppState {
             // half-typed input, then `catbus-agent\n` runs it. No exec —
             // the shell stays alive underneath, so exiting catbus returns
             // the user to their session.
-            container = container.child(
-                div()
-                    .id("menu-catbus")
-                    .px(px(12.0))
-                    .py(px(4.0))
-                    .cursor_pointer()
-                    .hover(|s| s.bg(menu_hover))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
-                            this.tabs[idx]
-                                .view
-                                .read(cx)
-                                .send_input_bytes(b"\x15catbus-agent\n".to_vec());
-                            this.context_menu = None;
-                            cx.notify();
-                        }),
-                    )
-                    .child("\u{1f408}\u{fe0f}\u{1f68c}\u{fe0f} Catbus"),
-            );
+            //
+            // Not offered while an agent is already serving this tab. Clicking it
+            // would type the command regardless, and the new agent would either be
+            // refused by its own start-up guard or — worse, before that guard
+            // existed — bind over the running agent's socket and leave two agents
+            // appending to one transcript. The liveness is the same `agent_pid`
+            // the status dot uses, so the menu and the dot cannot disagree.
+            //
+            // With the `catbus` feature off the sweep never runs, so `agent_pid`
+            // is always None and nothing is known; the item stays offered, which
+            // is what it did before. Same caveat the dot takes.
+            #[cfg(feature = "catbus")]
+            let agent_serving_this_tab =
+                self.tabs[idx].agent_kind.is_some() && self.tabs[idx].agent_pid.get().is_some();
+            #[cfg(not(feature = "catbus"))]
+            let agent_serving_this_tab = false;
+
+            container = if agent_serving_this_tab {
+                // Dimmed rather than hidden: an item that disappears reads as a
+                // bug, and the operator's actual question is "why can't I start
+                // one here", which the label answers.
+                container.child(
+                    div()
+                        .id("menu-catbus-busy")
+                        .px(px(12.0))
+                        .py(px(4.0))
+                        .text_color(th.fg_muted_hsla())
+                        .child("\u{1f408}\u{fe0f}\u{1f68c}\u{fe0f} Catbus — an agent already runs here"),
+                )
+            } else {
+                container.child(
+                    div()
+                        .id("menu-catbus")
+                        .px(px(12.0))
+                        .py(px(4.0))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(menu_hover))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
+                                this.tabs[idx]
+                                    .view
+                                    .read(cx)
+                                    .send_input_bytes(b"\x15catbus-agent\n".to_vec());
+                                this.context_menu = None;
+                                cx.notify();
+                            }),
+                        )
+                        .child("\u{1f408}\u{fe0f}\u{1f68c}\u{fe0f} Catbus"),
+                )
+            };
 
             // ⛑ Brain — same pattern as Catbus: Ctrl-U + the command +
             // newline, takes over the current tab. Inside the brain
