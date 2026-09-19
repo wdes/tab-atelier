@@ -694,10 +694,120 @@ pub fn no_internet_command(prog: &str, args: &[String]) -> (String, Vec<String>)
     (BWRAP_BIN.to_string(), out)
 }
 
+/// What a jailed command may see, and where it may write.
+///
+/// Built to express, for one command, what the headless unit expresses for the
+/// whole daemon: an emptied root, the system paths read-only, and a chosen set of
+/// writable trees. See [`jailed_command`] for why that shape and not another.
+#[derive(Debug, Default, Clone)]
+pub struct Jail {
+    /// The only tree the command may modify. Bound read-write.
+    pub worktree: String,
+    /// Paths that must also stay writable, because the command cannot work without
+    /// them: a transcript directory, a state directory, the socket's directory.
+    pub writable: Vec<String>,
+    /// Extra read-only grants, for a tree the command should read and not change.
+    pub readable: Vec<String>,
+}
+
+/// Wrap a command so that only the jailed paths are visible, and only the chosen
+/// ones are writable.
+///
+/// This is the per-command form of the sandbox `tab-atelier-headless.service`
+/// builds for its whole daemon. The unit does it with systemd — `TemporaryFileSystem=/`
+/// to empty the root, `BindReadOnlyPaths=` for the system trees, `BindPaths=` for the
+/// writable ones — because it has to: the service runs with `RestrictNamespaces=true`
+/// and `SystemCallFilter=~@mount`, so **bubblewrap cannot run inside it at all**. Its
+/// `/run` is emptied too and `/run/dbus` is not bound back, so it cannot ask systemd
+/// to make a namespace on its behalf either. The jail has to be made from outside, at
+/// unit level, and it therefore covers the daemon rather than a worktree.
+///
+/// Outside a unit — a desktop user's tab — bubblewrap does work, which is what makes
+/// a *per-worktree* jail possible there. That is what this builds.
+///
+/// The order of the arguments matters and is the whole trick, the same way it is in
+/// the unit: the root is emptied first, then paths are bound back into it. So:
+///
+/// 1. `--tmpfs /` — an empty root. Nothing of the host is visible by default.
+/// 2. `--ro-bind` the system trees a process needs to start: binaries, libraries,
+///    `/etc` for the passwd db, `resolv.conf` and the SSL trust store.
+/// 3. Its own `/tmp`, `/proc` and `/dev`.
+/// 4. **Last**, the worktree and anything else the caller named — so that a
+///    writable grant is never hidden by a mount made after it. This is not
+///    hypothetical: a worktree under `/tmp` (which is where the test suites and the
+///    scenario harness put theirs) was un-writable because `--tmpfs /tmp` ran after
+///    the bind, and a `--tmpfs` on a parent hides everything under it. Found by
+///    running the thing rather than by reading it.
+///
+/// Networking is deliberately **not** part of this. The headless service has no
+/// `--unshare-net`; its per-tab network policy is nftables keyed on the tab's cgroup,
+/// and the same separation is right here — `no_internet_command` composes with this
+/// for the case where a caller wants both. Loopback survives either way, so a tab
+/// with no internet can still reach the app's own relay.
+///
+/// The property that matters most is what is *absent*: no host `$HOME`, no `/srv`, no
+/// `/var`. A file the command was never granted is not restricted — it is not in the
+/// namespace at all, which is a stronger statement than a permission bit, and it is
+/// why confinement composes better than relocating a secret.
+#[must_use]
+pub fn jailed_command(jail: &Jail, prog: &str, args: &[String]) -> (String, Vec<String>) {
+    /// System trees a process needs in order to start at all. `-try` on the ones
+    /// that are absent on some systems (a merged-`/usr` host has no `/lib64`),
+    /// because a missing optional path must not make the jail unusable.
+    const SYSTEM_RO: &[&str] = &["/usr", "/lib", "/lib64", "/bin", "/sbin", "/etc", "/opt"];
+
+    let mut out: Vec<String> = vec!["--tmpfs".to_string(), "/".to_string()];
+    for path in SYSTEM_RO {
+        // The `-try` variant takes the same SRC DEST pair and only differs in
+        // tolerating a missing source.
+        out.push("--ro-bind-try".to_string());
+        out.push((*path).to_string());
+        out.push((*path).to_string());
+    }
+    // The private mounts come before the caller's grants, because a tmpfs on a
+    // parent hides every bind made under it earlier.
+    out.extend(
+        ["--tmpfs", "/tmp", "--proc", "/proc", "--dev", "/dev"]
+            .iter()
+            .map(|s| (*s).to_string()),
+    );
+    if !jail.worktree.is_empty() {
+        out.push("--bind".to_string());
+        out.push(jail.worktree.clone());
+        out.push(jail.worktree.clone());
+    }
+    // Everything the caller named is bound read-only first, then the writable ones
+    // are bound again over the top. bwrap applies binds in order, so the later one
+    // wins — which is what lets a worktree live inside a tree that is otherwise
+    // read-only, and what makes `writable` authoritative if a path is in both.
+    for path in jail.readable.iter().chain(jail.writable.iter()) {
+        out.push("--ro-bind-try".to_string());
+        out.push(path.clone());
+        out.push(path.clone());
+    }
+    for path in &jail.writable {
+        out.push("--bind".to_string());
+        out.push(path.clone());
+        out.push(path.clone());
+    }
+    out.extend(
+        [
+            // The sandbox must not outlive the app that made it, and it must not be
+            // the thing that outlives its own parent.
+            "--die-with-parent",
+            "--",
+            prog,
+        ]
+        .iter()
+        .map(|s| (*s).to_string()),
+    );
+    out.extend(args.iter().cloned());
+    (BWRAP_BIN.to_string(), out)
+}
+
 /// `setpriv` (util-linux) executable name — used to strip Linux
 /// capabilities from a tab's shell subtree.
 const SETPRIV_BIN: &str = "setpriv";
-
 /// True when `setpriv` is on `PATH` (util-linux; essentially always on
 /// Debian). Probed without executing.
 #[must_use]
@@ -4780,6 +4890,160 @@ mod tests {
             &args[sep + 1..],
             &["/bin/bash".to_string(), "-l".to_string()],
             "real cmd after --"
+        );
+    }
+
+    #[test]
+    fn jailed_command_empties_the_root_before_binding_anything() {
+        // Order is the mechanism, not a detail: binds land on whatever is there
+        // when they run, so the empty root has to come first or the host stays
+        // visible underneath.
+        let jail = Jail {
+            worktree: "/srv/work".into(),
+            ..Jail::default()
+        };
+        let (prog, args) = jailed_command(&jail, "/bin/bash", &[]);
+        assert_eq!(prog, "bwrap");
+        assert_eq!(args[0], "--tmpfs", "the first argument must empty the root");
+        assert_eq!(args[1], "/");
+        let first_bind = args
+            .iter()
+            .position(|a| a.starts_with("--bind") || a.starts_with("--ro-bind"))
+            .expect("some bind");
+        assert!(first_bind > 1, "the root must be emptied before any bind");
+    }
+
+    #[test]
+    fn jailed_command_makes_only_the_named_trees_writable() {
+        let jail = Jail {
+            worktree: "/srv/work".into(),
+            writable: vec!["/home/u/.claude/projects/-srv-work".into()],
+            readable: vec!["/srv/read-only".into()],
+        };
+        let (_, args) = jailed_command(&jail, "catbus-agent", &["--cwd".into(), "/srv/work".into()]);
+
+        // Read-write binds: the worktree and the named writable, and nothing else.
+        let rw: Vec<&String> = args
+            .iter()
+            .enumerate()
+            .filter(|(i, a)| *a == "--bind" && args.get(i + 1).is_some())
+            .map(|(i, _)| &args[i + 1])
+            .collect();
+        assert_eq!(
+            rw,
+            vec![
+                &"/srv/work".to_string(),
+                &"/home/u/.claude/projects/-srv-work".to_string()
+            ],
+            "only the worktree and the explicitly writable paths may be modified"
+        );
+
+        // A named read-only grant is bound, and read-only.
+        let ro_pairs: Vec<(&String, &String)> = args
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| *a == "--ro-bind-try")
+            .filter_map(|(i, _)| Some((args.get(i + 1)?, args.get(i + 2)?)))
+            .collect();
+        assert!(
+            ro_pairs.iter().any(|(src, _)| *src == "/srv/read-only"),
+            "a readable grant should be bound read-only: {ro_pairs:?}"
+        );
+        assert!(
+            ro_pairs.iter().any(|(src, _)| *src == "/usr"),
+            "the system trees must stay readable or nothing starts: {ro_pairs:?}"
+        );
+    }
+
+    /// The property the jail exists for: a host path that was never granted is not
+    /// *restricted*, it is **absent**. A permission bit can be argued with; a file
+    /// that is not in the namespace cannot be read at all.
+    #[test]
+    fn jailed_command_does_not_grant_the_host_home_or_var() {
+        let jail = Jail {
+            worktree: "/srv/work".into(),
+            ..Jail::default()
+        };
+        let (_, args) = jailed_command(&jail, "/bin/bash", &[]);
+        let joined = args.join(" ");
+        for forbidden in ["/home", "/root", "/var", "/mnt", "/media", "/run/user"] {
+            assert!(
+                !joined.contains(forbidden),
+                "{forbidden} must not be bound into the jail: {joined}"
+            );
+        }
+        // A `~/.config` credential is out of reach by construction — which is why
+        // confinement is the answer here rather than moving the file.
+        assert!(!joined.contains(".config"), "{joined}");
+    }
+
+    /// Networking stays separate, so this composes with `no_internet_command`
+    /// rather than duplicating it. The headless service makes the same split: its
+    /// jail is filesystem-only and its network policy is nftables.
+    #[test]
+    fn jailed_command_leaves_the_network_alone() {
+        let jail = Jail {
+            worktree: "/srv/work".into(),
+            ..Jail::default()
+        };
+        let (_, args) = jailed_command(&jail, "/bin/bash", &[]);
+        assert!(
+            !args.iter().any(|a| a == "--unshare-net"),
+            "the filesystem jail must not decide about the network: {args:?}"
+        );
+    }
+
+    /// A writable grant must not be hidden by a mount made after it.
+    ///
+    /// This is a bug that was found by running the thing: with `--tmpfs /tmp` after
+    /// the worktree bind, a worktree under `/tmp` — which is where the test suites
+    /// and the scenario harness put theirs — came out un-writable, because a
+    /// `--tmpfs` on a parent hides every bind beneath it. The symptom was
+    /// `bash: /tmp/.../from-inside.txt: No such file or directory` from inside a
+    /// jail that looked correctly built.
+    #[test]
+    fn jailed_command_binds_the_worktree_after_the_private_mounts() {
+        let jail = Jail {
+            worktree: "/tmp/a-worktree".into(),
+            writable: vec!["/tmp/a-worktree/state".into()],
+            ..Jail::default()
+        };
+        let (_, args) = jailed_command(&jail, "/bin/bash", &[]);
+
+        let tmpfs_tmp = args
+            .windows(2)
+            .position(|w| w[0] == "--tmpfs" && w[1] == "/tmp")
+            .expect("the jail has its own /tmp");
+        let worktree = args
+            .windows(3)
+            .position(|w| w[0] == "--bind" && w[1] == "/tmp/a-worktree")
+            .expect("the worktree is bound");
+        assert!(
+            worktree > tmpfs_tmp,
+            "the worktree bind must come after `--tmpfs /tmp`, or it is hidden"
+        );
+
+        // And the last bind of all is the worktree's, so nothing re-hides it.
+        let last_bind = args.iter().rposition(|a| a == "--bind").expect("some bind");
+        assert_eq!(
+            args[last_bind + 1],
+            "/tmp/a-worktree/state",
+            "the final writable grant must be the last binding action"
+        );
+    }
+
+    #[test]
+    fn jailed_command_keeps_the_real_command_after_the_separator() {
+        let jail = Jail {
+            worktree: "/srv/work".into(),
+            ..Jail::default()
+        };
+        let (_, args) = jailed_command(&jail, "catbus-agent", &["--once".into()]);
+        let sep = args.iter().position(|a| a == "--").expect("has -- separator");
+        assert_eq!(
+            &args[sep + 1..],
+            &["catbus-agent".to_string(), "--once".to_string()],
+            "the wrapped command keeps its own arguments"
         );
     }
 
