@@ -262,6 +262,35 @@ async fn main() {
     }
 }
 
+/// Resolve the operator's prompt file and the tool set they end up with.
+///
+/// Both are resolved together, and before the agent exists, because the prompt
+/// file is one of the two sources the tool set comes from. A bad file or a bad
+/// tool name is a startup failure rather than something that surfaces as a failed
+/// turn later.
+///
+/// `AllowedTools` in the front matter **narrows** the set the launcher configured
+/// and never widens it: `narrowed_to` refuses a name the launcher's `--tools-config`
+/// withheld, so a prompt file cannot grant itself a tool. That is the whole point
+/// of the ceiling — the wrapper answer is the same tool list the operator already
+/// chose, minus what the prompt file removes.
+fn resolve_tools(args: &Args) -> Result<(tools::ToolSet, identity::Identity), Box<dyn std::error::Error>> {
+    let tool_set = tools::ToolSet::load(args.tools_config.as_deref())?;
+    let identity = identity::load(args.identity.as_deref(), args.identity_file.as_deref())?;
+    let Some(allowed) = identity.allowed_tools() else {
+        log::info!("offering {} tools", tool_set.specs().len());
+        return Ok((tool_set, identity));
+    };
+
+    let narrowed = tool_set.narrowed_to(allowed)?;
+    log::info!(
+        "the identity file limits the tool set to {} (from {})",
+        narrowed.names().join(", "),
+        tool_set.names().join(", ")
+    );
+    Ok((narrowed, identity))
+}
+
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     // REPL mode shares the tab with stdout, so even "to stderr" logs
@@ -272,6 +301,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default_level))
         .target(env_logger::Target::Stderr)
         .init();
+
+    // Resolved early, because the code below moves fields out of `args` — the cwd
+    // and the provider's own config — and these two need to read it. The logger is
+    // initialised first so that anything they report is actually seen.
+    let (tool_set, identity) = resolve_tools(&args)?;
 
     let cwd = match args.cwd {
         Some(p) => p,
@@ -359,8 +393,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Resolved here, once, before the agent exists. A bad config is a startup
     // failure: a tool set that silently differs from what the operator wrote
     // would tell the model it has a tool that behaves otherwise.
-    let tool_set = tools::ToolSet::load(args.tools_config.as_deref())?;
-    log::info!("offering {} tools", tool_set.specs().len());
     // Whether the answer may carry escape sequences. Most explicit source
     // wins: an explicit `--ansi`, then the colour convention, then whether
     // stdout is really a terminal. The middle step is what makes an agent tab
@@ -391,10 +423,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .with_judge(judge_model, monitor_prompt)
             .with_tools(tool_set)
             .with_ansi(ansi)
-            // Resolved here, where a bad file is a start-up error the operator can
-            // see, rather than inside the request path where it would surface as a
-            // failed turn.
-            .with_identity(identity::load(args.identity.as_deref(), args.identity_file.as_deref())?),
+            .with_identity(identity),
     );
 
     // An explicit mode wins over the one the session was last left in. Applied

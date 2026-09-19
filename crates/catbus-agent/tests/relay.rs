@@ -2331,3 +2331,104 @@ fn a_non_anthropic_model_drops_the_claude_identity_line() {
         "and no block may be left empty:\n{all}"
     );
 }
+
+/// `AllowedTools` in the prompt file narrows what the model is offered.
+///
+/// Asserted on the wire rather than on the set, because the tool array is what the
+/// model actually sees: a narrowed set that still sent every spec would be the
+/// same bug wearing a different name.
+#[test]
+fn allowed_tools_in_the_identity_file_narrow_the_offered_tools() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let identity = home.join("identity.md");
+    std::fs::write(&identity, "---\nAllowedTools: Read\n---\nYou are a parrot.").unwrap();
+
+    let (port, rx) = spawn_mock_relay(vec![("HTTP/1.1 200 OK", FINAL_ROUND)]);
+    let socket = home.join("agent.sock");
+    let (_agent, mut reader, mut stream) = spawn_agent_in(home, home, &socket, |cmd| {
+        cmd.args([
+            "--relay-url",
+            &format!("http://127.0.0.1:{port}"),
+            "--relay-token",
+            RELAY_TOKEN,
+            "--identity-file",
+            identity.to_str().unwrap(),
+        ]);
+    });
+
+    let reply = send_prompt(&mut stream, &mut reader, "hi");
+    assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+
+    let body = body_of(&rx.recv_timeout(Duration::from_secs(30)).unwrap());
+    let offered: Vec<&str> = body["tools"]
+        .as_array()
+        .expect("tools array")
+        .iter()
+        .filter_map(|t| t["name"].as_str())
+        .collect();
+    assert_eq!(
+        offered,
+        vec!["Read"],
+        "only the named tool may be offered, got {offered:?}"
+    );
+    // The prompt is still the operator's: narrowing must not disturb the identity.
+    assert_eq!(body["system"][0]["text"], "You are a parrot.");
+}
+
+/// A prompt file cannot grant a tool the launcher withheld.
+///
+/// This is the property that makes `AllowedTools` a ceiling: it narrows the set
+/// `--tools-config` chose and never widens it. `minimal` has no `Bash`, so naming
+/// `Bash` must fail loudly at start-up rather than quietly re-adding the shell the
+/// operator deliberately kept out.
+#[test]
+fn allowed_tools_cannot_grant_a_tool_the_launcher_withheld() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let identity = home.join("identity.md");
+    std::fs::write(&identity, "---\nAllowedTools: Read, Bash\n---\nhi").unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_catbus-agent"))
+        .args([
+            "--no-tui",
+            "--new-session",
+            // `--print-socket` makes the process exit as soon as it has resolved
+            // its tools, which is the step under test. Without it, a run that
+            // *should* have failed but did not would sit in its REPL forever and
+            // this test would hang instead of failing — which is what happened
+            // the first time it was falsified, and a hang is a much worse signal
+            // than a failure.
+            "--print-socket",
+            "--cwd",
+            home.to_str().unwrap(),
+            "--socket",
+            home.join("never.sock").to_str().unwrap(),
+            "--tools-config",
+            "minimal",
+            "--identity-file",
+            identity.to_str().unwrap(),
+        ])
+        .env("HOME", home)
+        .env_remove("XDG_STATE_HOME")
+        .output()
+        .expect("run the binary");
+
+    assert!(
+        !output.status.success(),
+        "a prompt file naming a withheld tool must not start"
+    );
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        said.contains("Bash"),
+        "the failure must name the tool it refused: {said}"
+    );
+    assert!(
+        said.contains("Read"),
+        "and what the set does offer, so the fix is obvious: {said}"
+    );
+}

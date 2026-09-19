@@ -261,6 +261,77 @@ impl ToolSet {
                 .any(|s| s.get("name").and_then(Value::as_str) == Some(name))
     }
 
+    /// Every name this set offers, sorted.
+    #[must_use]
+    pub fn names(&self) -> Vec<&str> {
+        self.specs
+            .iter()
+            .filter_map(|s| s.get("name").and_then(Value::as_str))
+            .collect()
+    }
+
+    /// Keep only the named tools, or fail saying what is available.
+    ///
+    /// Narrow-only by construction: a name this set does not already offer is an
+    /// error rather than something to add. That direction matters because the
+    /// caller is a *prompt file*, and a prompt file must not be able to grant a
+    /// tool the launcher's `--tools-config` withheld — `AllowedTools` is a ceiling,
+    /// not a request.
+    ///
+    /// An unknown name is an error rather than a silent drop, for the same reason
+    /// a misspelled `--identity-file` is: a permission list with a typo in it
+    /// would otherwise narrow to something the operator did not write, and say
+    /// nothing about it.
+    pub fn narrowed_to(&self, allowed: &[String]) -> Result<Self, String> {
+        let available = self.names();
+        let mut unknown: Vec<&str> = allowed
+            .iter()
+            .map(String::as_str)
+            .filter(|name| !self.offers(name))
+            .collect();
+        if !unknown.is_empty() {
+            unknown.sort_unstable();
+            unknown.dedup();
+            return Err(format!(
+                "unknown tool(s) in AllowedTools: {} — this set offers {}",
+                unknown.join(", "),
+                available.join(", ")
+            ));
+        }
+
+        let keep: std::collections::BTreeSet<&str> = allowed.iter().map(String::as_str).collect();
+        let specs: Vec<Value> = self
+            .specs
+            .iter()
+            .filter(|spec| {
+                spec.get("name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| keep.contains(name))
+            })
+            .cloned()
+            .collect();
+
+        if specs.is_empty() {
+            // Reachable only by intersecting two sources that share no tool. An
+            // agent with no tools can do nothing at all, so it is a configuration
+            // conflict to report rather than a state to run in.
+            return Err(format!(
+                "AllowedTools leaves no tools at all — it names {} but this set offers {}",
+                allowed.join(", "),
+                available.join(", ")
+            ));
+        }
+
+        let custom = self
+            .custom
+            .iter()
+            .filter(|(name, _)| keep.contains(name.as_str()))
+            .map(|(name, tool)| (name.clone(), tool.clone()))
+            .collect();
+
+        Ok(Self { specs, custom })
+    }
+
     /// Whether auto mode should grade this tool before running it.
     ///
     /// Built-in write tools always. A custom tool when it says so, which
@@ -536,6 +607,58 @@ mod tests {
         .expect("valid");
         // Sorted, because a stable order is a cache property.
         assert_eq!(names(&set), vec!["Edit", "Read"]);
+    }
+
+    /// `AllowedTools` narrows the launch's tool set and can only narrow it.
+    ///
+    /// This is the property that makes the prompt file a ceiling rather than a
+    /// request: a name the launcher's `--tools-config` withheld must be refused,
+    /// not granted, or a prompt file could hand itself a tool the operator
+    /// deliberately left out.
+    #[test]
+    fn narrowing_keeps_only_the_named_tools() {
+        let set = ToolSet::from_config(ToolConfig {
+            allow: Some(vec!["Read".into(), "Edit".into(), "Bash".into()]),
+            ..ToolConfig::default()
+        })
+        .expect("valid");
+
+        let narrowed = set.narrowed_to(&["Read".to_owned()]).expect("Read is offered");
+        assert_eq!(names(&narrowed), vec!["Read"]);
+        // The original is untouched — the caller may still want the wider set for
+        // the log line that explains what was removed.
+        assert_eq!(names(&set), vec!["Bash", "Edit", "Read"]);
+    }
+
+    /// A name the set does not offer is an error, not a silent drop: a typo in a
+    /// permission list would otherwise narrow to something nobody wrote, and say
+    /// nothing about it.
+    #[test]
+    fn narrowing_refuses_a_tool_the_set_does_not_offer() {
+        let set = ToolSet::from_config(ToolConfig {
+            allow: Some(vec!["Read".into()]),
+            ..ToolConfig::default()
+        })
+        .expect("valid");
+
+        let err = set.narrowed_to(&["Read".to_owned(), "Bash".to_owned()]).unwrap_err();
+        assert!(err.contains("Bash"), "the error must name the offender: {err}");
+        assert!(err.contains("offers Read"), "and what was available: {err}");
+    }
+
+    /// Narrowing to nothing is a configuration conflict, not a runnable state: an
+    /// agent with no tools can do nothing, so it is better to refuse at start-up.
+    #[test]
+    fn narrowing_to_nothing_is_refused() {
+        let set = ToolSet::from_config(ToolConfig {
+            allow: Some(vec!["Read".into()]),
+            ..ToolConfig::default()
+        })
+        .expect("valid");
+        // `allow` was already narrowed, so naming a tool that is not in it is the
+        // unknown-name path; an empty list is the empty path.
+        let err = set.narrowed_to(&[]).unwrap_err();
+        assert!(err.contains("no tools at all"), "{err}");
     }
 
     /// The order of the specs is content: the tool array leads the body, so a

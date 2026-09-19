@@ -798,7 +798,7 @@ impl Agent {
                 kind: "text",
                 text: std::borrow::Cow::Owned(text),
             }],
-            crate::identity::Identity::Omitted => Vec::new(),
+            crate::identity::Identity::Omitted { .. } => Vec::new(),
             crate::identity::Identity::Auto if non_anthropic => Vec::new(),
             crate::identity::Identity::Auto => vec![SystemBlock {
                 kind: "text",

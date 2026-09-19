@@ -41,7 +41,26 @@ pub enum Identity {
         allowed_tools: Option<Vec<String>>,
     },
     /// Send no identity block at all.
-    Omitted,
+    ///
+    /// Carries tool limits all the same: a file whose body is blank but whose
+    /// front matter names `AllowedTools` is still a statement about tools, and
+    /// dropping it here would ignore a limit the operator wrote.
+    Omitted { allowed_tools: Option<Vec<String>> },
+}
+
+impl Identity {
+    /// The tool names the operator's file limits this agent to, if it said.
+    ///
+    /// `None` means no opinion — every tool the launch's tool set offers. An empty
+    /// slice would mean "nothing named", which the enforcement layer refuses; see
+    /// [`crate::tools::ToolSet::narrowed_to`].
+    #[must_use]
+    pub fn allowed_tools(&self) -> Option<&[String]> {
+        match self {
+            Self::Auto => None,
+            Self::Text { allowed_tools, .. } | Self::Omitted { allowed_tools } => allowed_tools.as_deref(),
+        }
+    }
 }
 
 /// Path of the built-in prompt file.
@@ -130,8 +149,9 @@ fn load_at(inline: Option<&str>, file: Option<&Path>, default: &Path) -> Result<
     };
     let (text, allowed_tools) = parse_prompt(&raw).map_err(|e| format!("identity file {}: {e}", default.display()))?;
     if text.trim().is_empty() {
-        // A blank file is how the operator says "send nothing".
-        return Ok(Identity::Omitted);
+        // A blank body is how the operator says "send no identity" — but the front
+        // matter was still written, so its tool list travels with it.
+        return Ok(Identity::Omitted { allowed_tools });
     }
     Ok(Identity::Text { text, allowed_tools })
 }
@@ -377,11 +397,21 @@ mod tests {
 
         // Blank: send nothing.
         std::fs::write(&target, "   \n").unwrap();
-        assert_eq!(load_at(None, None, &target).unwrap(), Identity::Omitted);
+        assert_eq!(
+            load_at(None, None, &target).unwrap(),
+            Identity::Omitted { allowed_tools: None }
+        );
 
-        // Front matter with no body is blank too, so it also means "nothing".
+        // Front matter with no body is blank too, so it means "no identity" —
+        // but the tool list it names travels with it, because that was also
+        // written deliberately.
         std::fs::write(&target, "---\nAllowedTools: Read\n---\n").unwrap();
-        assert_eq!(load_at(None, None, &target).unwrap(), Identity::Omitted);
+        assert_eq!(
+            load_at(None, None, &target).unwrap(),
+            Identity::Omitted {
+                allowed_tools: Some(vec!["Read".into()])
+            }
+        );
 
         // A prompt: use it.
         std::fs::write(&target, "You are a parrot.").unwrap();
