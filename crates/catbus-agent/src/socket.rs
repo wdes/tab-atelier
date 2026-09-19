@@ -15,7 +15,7 @@
 //! returns the whole concatenated text), so `chunk` is reserved for
 //! later. Clients should already handle it.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -238,4 +238,55 @@ enum Response {
     Started,
     Done { text: String },
     Error { message: String },
+}
+
+/// Whether something is already listening on `path`.
+///
+/// Connecting is the only honest test. A socket *file* survives a crash, so its
+/// presence says nothing about whether an agent is behind it, and treating a
+/// leftover file as "an agent is running" would refuse to start an agent at all
+/// after any unclean exit. A connect to a file with no listener fails with
+/// `ECONNREFUSED`; a connect to a live one succeeds.
+///
+/// Used at start-up to keep two agents off one session — see the guard in `main`.
+/// The connection is closed immediately and nothing is sent, so a peer sees a
+/// client that connected and went away. That is harmless for a normal agent (it
+/// logs a warning), but a peer run with `--once` treats that connection as its
+/// one and exits, so this is only safe to call against a socket this process is
+/// deciding whether to take over — never as a general liveness poll.
+#[must_use]
+pub fn is_live(path: &Path) -> bool {
+    std::os::unix::net::UnixStream::connect(path).is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_socket_file_with_no_listener_is_not_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.sock");
+
+        // Absent: nothing there at all.
+        assert!(!is_live(&path));
+
+        // A leftover file with no listener — what an agent killed uncleanly
+        // leaves behind. This is the case the start-up guard depends on getting
+        // right: reading it as live would refuse to start an agent after every
+        // crash, which is worse than the collision it guards against.
+        drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
+        assert!(path.exists(), "the socket file outlives its listener");
+        assert!(!is_live(&path), "a stale socket file must not read as live");
+    }
+
+    #[test]
+    fn a_socket_with_a_listener_is_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        assert!(is_live(&path));
+        drop(listener);
+        assert!(!is_live(&path), "and stops reading as live when the listener goes");
+    }
 }
