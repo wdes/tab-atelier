@@ -1973,3 +1973,149 @@ fn an_end_turn_that_asks_for_a_tool_still_runs_it() {
         "the tool should have run and its output sent back: {result}"
     );
 }
+
+/// Every live process whose command line mentions `needle`.
+///
+/// Used to prove a sub-agent is *gone* rather than merely quiet: the socket file
+/// is removed either way, so the file proves nothing, and a leaked child is
+/// invisible in the reply.
+fn processes_with(needle: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return found;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name.to_str().filter(|n| n.chars().all(|c| c.is_ascii_digit())) else {
+            continue;
+        };
+        let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+            continue;
+        };
+        let cmdline = String::from_utf8_lossy(&raw).replace('\0', " ");
+        if cmdline.contains(needle) {
+            found.push(format!("{pid}: {}", cmdline.trim()));
+        }
+    }
+    found
+}
+
+/// The socket path prefix a sub-agent is started with.
+///
+/// Assembled at runtime from two pieces rather than written as one literal, and
+/// derived from the same `temp_dir` the tool uses. A single literal would appear
+/// in the command line of whatever shell launched this test — a heredoc, a
+/// `cargo test` wrapper — and the `/proc` scan below would then find *that* and
+/// report a phantom leak. Same trick as the `env::args` guard in `cli`.
+fn sub_agent_socket_prefix() -> String {
+    std::env::temp_dir()
+        .join(concat!("catbus-", "sub-"))
+        .display()
+        .to_string()
+}
+
+/// A sub-agent is really started, really answers, and is really reaped.
+///
+/// The three claims need three assertions, because each has a way of passing on
+/// its own: the reply proves the child ran, the child's *own* relay receiving a
+/// request proves `Spawn` started an agent rather than inventing a reply, and the
+/// `/proc` scan proves it was cleaned up. A spawn path whose cleanup is untested
+/// is the ordinary way orphaned agents accumulate.
+///
+/// The child's relay is a second mock server, reached through the environment
+/// rather than a flag: a sub-agent is started with no relay flags of its own, so
+/// this is also the check that a child inherits its endpoint instead of silently
+/// falling back to whatever `preferences.json` holds.
+#[test]
+fn a_spawned_sub_agent_answers_and_is_reaped() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let work = home.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let marker = sub_agent_socket_prefix();
+
+    // Before: nothing of ours is running.
+    assert!(
+        processes_with(&marker).is_empty(),
+        "a previous run left a sub-agent behind"
+    );
+
+    // The child's relay. One canned reply, and it is what the tool result must
+    // carry — a reply the parent could only have obtained by asking.
+    let (child_port, child_rx) = spawn_mock_relay(vec![("HTTP/1.1 200 OK", FINAL_ROUND)]);
+
+    // The parent's relay: a canned Spawn call, then the final answer.
+    let call = tool_round(
+        "s1",
+        "Spawn",
+        &serde_json::json!({ "task": "say hi", "cwd": work.to_str().unwrap() }).to_string(),
+    );
+    let (port, rx) = spawn_mock_relay_owned(vec![
+        ("HTTP/1.1 200 OK", call),
+        ("HTTP/1.1 200 OK", FINAL_ROUND.to_owned()),
+    ]);
+
+    let socket = home.join("agent.sock");
+    let (_agent, mut reader, mut stream) = spawn_agent_in(home, home, &socket, |cmd| {
+        // The parent's own endpoint, given as a flag.
+        cmd.args([
+            "--relay-url",
+            &format!("http://127.0.0.1:{port}"),
+            "--relay-token",
+            RELAY_TOKEN,
+        ]);
+        // What a child of this agent will inherit, since a child is started with
+        // no flags of its own.
+        cmd.env("CATBUS_RELAY_URL", format!("http://127.0.0.1:{child_port}"));
+        cmd.env("CATBUS_RELAY_TOKEN", RELAY_TOKEN);
+    });
+
+    let reply = send_prompt(&mut stream, &mut reader, "start a helper");
+    assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+
+    // Request 1 asks for the tool; request 2 carries its result.
+    let _first = rx.recv_timeout(Duration::from_secs(30)).unwrap();
+    let second = rx
+        .recv_timeout(Duration::from_secs(90))
+        .expect("the parent never sent a second request, so Spawn never returned");
+    let result = tool_result_of(&body_of(&second), "s1");
+
+    assert!(
+        result.contains("hi from the relay"),
+        "the sub-agent's reply must reach the tool result: {result}"
+    );
+    // With `--once` the child exits by itself after answering, so the ordinary
+    // footer is empty and the *only* footer that matters is the warning. Asserting
+    // absence of that warning is what makes this a check on the cleanup rather
+    // than on the wording; the `/proc` scan below is the real proof.
+    assert!(
+        !result.contains("DID NOT STOP"),
+        "the sub-agent would not stop: {result}"
+    );
+    assert!(
+        result.contains("finished in"),
+        "the reply should say what the sub-agent cost in time: {result}"
+    );
+
+    // The child reached its own relay, so a real agent ran.
+    child_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the sub-agent never contacted the relay it was told about");
+
+    // And nothing is left. Retried because the kill is asynchronous: the child
+    // is signalled, then reaped, and a `ps` racing that window would see a
+    // dying process.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let left = processes_with(&marker);
+        if left.is_empty() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "sub-agent(s) outlived the call that started them:\n  {}",
+            left.join("\n  ")
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}

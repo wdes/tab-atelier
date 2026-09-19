@@ -21,6 +21,36 @@ tab-atelier dispatch --new --name build "<prompt>"   # spin up a fresh agent tab
 been unchanged for `--quiet` seconds (default 8) — the agent went idle — then
 prints it. See `cli::delegate` for `--timeout`.
 
+## An agent starting another agent — `Spawn`
+
+`dispatch` is how a *tab* hands work to another tab. A catbus agent has the same
+gap one level down: it can find peers and prompt them, but until `Spawn` it could
+not start one, so any "spawn a worker" workflow had to be driven from outside the
+agent, by a script the agent could not see.
+
+| tool | what it does |
+| --- | --- |
+| `ListAgents` | finds catbus agents already running, by their sockets |
+| `Delegate` | prompts one of those agents and waits for its reply |
+| `Spawn` | **starts a new agent** for one task, takes its reply, and stops it |
+
+`Spawn` runs the same binary as the agent that called it, in a directory the
+caller chooses, with a tool set the caller chooses (default `minimal` — `Read`,
+`Write`, `FileTree`, and deliberately no shell). It is ephemeral: the child runs
+with `--once`, so it answers one prompt and exits on its own rather than waiting
+to be reaped. That is what makes the cleanup structural — an agent killed
+mid-call runs no cleanup at all, so a child that waited to be killed would stay
+alive forever.
+
+Three things bound the cost, since every child is a full agent session: two
+generations (`CATBUS_SPAWN_DEPTH`, inherited so the ceiling holds across
+processes), three children at once, and `Delegate`'s timeout. `Spawn` is refused
+outright in plan-mode — a child begins with its gate open, so spawning one would
+leave plan-mode by the side door.
+
+`Spawn` is what `docs/fleet-playbook.md` means by "spawn workers"; the playbook's
+other half, the board and `dispatch`, is above.
+
 ## See who's around — `peers`
 
 ```

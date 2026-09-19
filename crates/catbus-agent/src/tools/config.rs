@@ -494,8 +494,17 @@ mod tests {
         // Exact set, not a count: a count tells you *that* it changed, this
         // tells you *what* changed, and adding a built-in should be a decision
         // someone makes here rather than a side effect of registering a spec.
-        // FileTree is the most recent addition.
-        let mut expected = vec!["Bash", "Delegate", "Edit", "FileTree", "ListAgents", "Read", "Write"];
+        // Spawn is the most recent addition (FileTree before it).
+        let mut expected = vec![
+            "Bash",
+            "Delegate",
+            "Edit",
+            "FileTree",
+            "ListAgents",
+            "Read",
+            "Spawn",
+            "Write",
+        ];
         expected.sort_unstable();
         let mut actual = names(&set);
         actual.sort_unstable();

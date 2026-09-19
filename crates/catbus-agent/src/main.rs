@@ -41,6 +41,12 @@ mod socket;
 mod statusline;
 mod tools;
 
+// A clap `Args` struct is a bag of independent flags: each one is genuinely
+// boolean and unrelated to the others, which is the shape this lint exists to
+// discourage in a *domain* type. Modelling them as one enum would fuse flags
+// that can be combined (`--print-socket --once`), so the allow is scoped to this
+// struct rather than the crate. The root crate makes the same call for `AppState`.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Parser, Debug)]
 #[command(
     version,
@@ -84,6 +90,16 @@ struct Args {
     /// rather than from a tab the user is staring at.
     #[arg(long)]
     no_tui: bool,
+
+    /// Answer one socket prompt, then exit.
+    ///
+    /// This is how a sub-agent started by the `Spawn` tool is run. It is not a
+    /// convenience: a child that stays up until its parent reaps it cannot
+    /// survive a parent that dies first, and a parent that is killed mid-call
+    /// runs no cleanup at all. A process that leaves on its own cannot be
+    /// orphaned.
+    #[arg(long)]
+    once: bool,
 
     /// Allow ANSI escapes in text replies.
     ///
@@ -316,11 +332,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let socket_task = tokio::spawn({
         let agent = Arc::clone(&agent);
         let path = socket_path.clone();
-        async move { socket::serve(agent, path).await }
+        let once = args.once;
+        async move { socket::serve(agent, path, once).await }
     });
 
     if args.no_tui {
-        // Headless: just block on the socket task.
+        // Headless: just block on the socket task. With `--once` this returns as
+        // soon as the one prompt has been answered, and the process exits.
         socket_task.await??;
     } else {
         run_repl(Arc::clone(&agent), &cwd).await?;

@@ -31,7 +31,13 @@ pub enum SocketError {
     Io(#[from] std::io::Error),
 }
 
-pub async fn serve(agent: Arc<Agent>, path: PathBuf) -> Result<(), SocketError> {
+/// Serve socket clients until shut down.
+///
+/// `once` makes the first connection the last one: the prompt is answered, the
+/// socket file is removed, and the process returns so it can exit. That is how
+/// the `Spawn` tool runs a sub-agent — see `--once` in `main`, which explains
+/// why a self-terminating child is the only kind that cannot be orphaned.
+pub async fn serve(agent: Arc<Agent>, path: PathBuf, once: bool) -> Result<(), SocketError> {
     // Stale socket from a crashed previous run blocks bind otherwise.
     let _ = std::fs::remove_file(&path);
     if let Some(parent) = path.parent() {
@@ -55,6 +61,18 @@ pub async fn serve(agent: Arc<Agent>, path: PathBuf) -> Result<(), SocketError> 
                 match res {
                     Ok((stream, _)) => {
                         let agent = Arc::clone(&agent);
+                        // With `--once` the connection is the whole purpose of
+                        // the process, so it is awaited here rather than
+                        // spawned: the loop then ends, the socket file is
+                        // removed, and this agent exits on its own. A spawned
+                        // child that instead waited to be reaped is what leaves a
+                        // running agent behind when its parent dies mid-call.
+                        if once {
+                            if let Err(e) = handle(stream, agent).await {
+                                log::warn!("connection error: {e}");
+                            }
+                            break;
+                        }
                         tokio::spawn(async move {
                             if let Err(e) = handle(stream, agent).await {
                                 log::warn!("connection error: {e}");
