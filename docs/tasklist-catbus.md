@@ -11,7 +11,7 @@ lands. Nothing is pushed: pushes need the Nitrokey.
 | T3 | Right-click "Catbus" should not be offered when the tab already has an agent | **done** |
 | T4 | Thinking traces are not surfaced | **needs a decision** |
 | T5 | Approval logging — nothing records what the gate allowed | **done** |
-| T6 | Model on launch — pick a model per tab | **needs a decision** |
+| T6 | Model on launch — pick a model per tab | **done** (`/model`, session state) |
 | T7 | Identity file (`---` front matter, `AllowedTools:`) — approved earlier | **done** |
 
 Notes, so the next session does not re-derive them:
@@ -29,9 +29,18 @@ Notes, so the next session does not re-derive them:
   three. They are already parsed (the empty-block fix depends on that) and already
   dropped before the transcript, so "surface them" is a real feature rather than a
   repair.
-- **T6** is three flags, not one: `--model`/`--api-url` (Anthropic-compatible),
-  `--openai-url`+`--openai-model`, `--infomaniak-*`. On the relay path the proxy
-  picks the model, so it is none of those — decide which is meant before building.
+- **T6** is done as session state rather than a flag: the model lives in a
+  `.model` sidecar, `/model <name>` sets it, and startup reads it — so a resumed
+  session continues with its model and nothing has to be passed again. It is *not*
+  read from the transcript, which records what the relay **served**
+  (`deepseek-flash` on every turn) rather than what the client asked for; that
+  value is used only to decide whether to send the Claude identity line.
+- **A third 400 shape, fixed separately:** a turn whose only block is a *full*
+  thinking block. Emptiness was the wrong thing to look for the first time — the
+  block is full, it just is not content, and an endpoint without thinking drops it
+  in transit. Found by running the pipeline over the transcript that produced it:
+  thinking-only turns at indices 3, 6, 9, 12, 15, 23, and the API named
+  `messages.3` and `messages.6`.
 - **T7** is complete, `AllowedTools` included: it narrows the launcher's tool set
   and can only narrow it, so a prompt file cannot re-add a tool `--tools-config`
   withheld.
