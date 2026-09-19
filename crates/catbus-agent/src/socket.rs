@@ -129,7 +129,7 @@ async fn handle(stream: UnixStream, agent: Arc<Agent>) -> Result<(), SocketError
             },
             Request::SetPlanMode { on } => {
                 let gate = if on { tools::Gate::Plan } else { tools::Gate::Open };
-                agent.set_gate(gate);
+                agent.set_gate(gate).await;
                 write_line(
                     &mut write_half,
                     &Response::Done {
@@ -149,7 +149,7 @@ async fn handle(stream: UnixStream, agent: Arc<Agent>) -> Result<(), SocketError
                     .await?;
                     continue;
                 };
-                agent.set_gate(parsed);
+                agent.set_gate(parsed).await;
                 write_line(
                     &mut write_half,
                     &Response::Done {

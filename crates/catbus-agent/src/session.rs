@@ -87,6 +87,11 @@ fn load_session_name(project_dir: &Path, id: &str) -> String {
         .unwrap_or_default()
 }
 
+/// Path of the `.gate` sidecar: the permission mode as it was last set.
+fn gate_sidecar(project_dir: &Path, id: &str) -> PathBuf {
+    project_dir.join(format!("{id}.gate"))
+}
+
 /// Newest `.jsonl` stem in `dir`, ignoring zero-byte files (those
 /// are sessions that were opened but never written to — typically
 /// crashes immediately after start). Returns the session id.
@@ -399,6 +404,27 @@ impl Session {
         self.name.lock().expect("name mutex").clone()
     }
 
+    /// The permission mode this session was last left in, if it was ever set.
+    ///
+    /// Recorded beside the transcript the way the name is, because the mode is a
+    /// decision about *this* session and has to outlive the process. Tab Atelier
+    /// restarts the agent on a tab reopen, so a mode held only in memory is lost
+    /// exactly when the operator comes back to check it worked — which reads as
+    /// the mode never having been set. An unrecognised or unreadable file is
+    /// `None` rather than an error: a stale sidecar must not stop the agent from
+    /// starting, and the fallback is the same as having no file at all.
+    #[must_use]
+    pub fn saved_gate(&self) -> Option<crate::tools::Gate> {
+        let raw = std::fs::read_to_string(gate_sidecar(&self.project_dir, &self.id)).ok()?;
+        crate::tools::parse_gate(&raw)
+    }
+
+    /// Remember the permission mode for this session. See [`Self::saved_gate`].
+    pub fn save_gate(&self, gate: crate::tools::Gate) -> Result<(), SessionError> {
+        std::fs::write(gate_sidecar(&self.project_dir, &self.id), gate.as_str())?;
+        Ok(())
+    }
+
     /// Path to the JSONL transcript file for this session.
     pub fn transcript_path(&self) -> PathBuf {
         self.project_dir.join(format!("{}.jsonl", self.id))
@@ -624,5 +650,61 @@ mod tests {
         assert_eq!(json["is_error"], true);
         let read_back: Block = serde_json::from_value(json).expect("reads");
         assert!(matches!(read_back, Block::ToolResult { is_error: true, .. }));
+    }
+
+    /// The mode is remembered beside the transcript, and a session that was never
+    /// set has none.
+    ///
+    /// This is what makes `/auto` survive a tab reopen: Tab Atelier restarts the
+    /// agent, so a mode held only in memory is gone exactly when the operator
+    /// comes back to check it — which reads as the mode never having been set at
+    /// all.
+    #[test]
+    fn a_saved_gate_is_read_back_and_absent_before_it_is_set() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Nothing written yet: no opinion, so the caller's default stands.
+        assert_eq!(
+            std::fs::read_to_string(gate_sidecar(dir.path(), "s1")).ok(),
+            None,
+            "no sidecar should exist before anything is saved"
+        );
+
+        for gate in [
+            crate::tools::Gate::Auto,
+            crate::tools::Gate::Plan,
+            crate::tools::Gate::Open,
+        ] {
+            std::fs::write(gate_sidecar(dir.path(), "s1"), gate.as_str()).unwrap();
+            assert_eq!(
+                crate::tools::parse_gate(&std::fs::read_to_string(gate_sidecar(dir.path(), "s1")).unwrap()),
+                Some(gate),
+                "{} must round-trip through its own spelling",
+                gate.as_str()
+            );
+        }
+    }
+
+    /// A damaged or unknown sidecar must not stop the agent from starting: the
+    /// caller falls back to its default, which is the same as having no file.
+    #[test]
+    fn an_unreadable_gate_sidecar_is_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(gate_sidecar(dir.path(), "s2"), "banana").unwrap();
+        assert_eq!(crate::tools::parse_gate("banana"), None);
+        // Trailing whitespace, as a hand-edited file would have.
+        std::fs::write(gate_sidecar(dir.path(), "s3"), "auto\n").unwrap();
+        assert_eq!(
+            crate::tools::parse_gate(&std::fs::read_to_string(gate_sidecar(dir.path(), "s3")).unwrap()),
+            Some(crate::tools::Gate::Auto),
+            "parse_gate trims, so a newline is not a corruption"
+        );
+    }
+
+    /// One session's mode is not another's.
+    #[test]
+    fn the_gate_sidecar_is_per_session() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_ne!(gate_sidecar(dir.path(), "a"), gate_sidecar(dir.path(), "b"));
     }
 }

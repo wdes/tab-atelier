@@ -172,6 +172,11 @@ impl Agent {
         // wrote was a non-sequitur on disk. A fresh session has an empty
         // transcript, so this costs it nothing.
         let history = rebuild_history(&session.project_dir, &session.id);
+        // The mode this session was last left in, so it survives a restart. Tab
+        // Atelier restarts the agent on a tab reopen, and a mode held only in
+        // memory is lost exactly when the operator comes back to check it —
+        // which is why `/auto` could look like it did nothing.
+        let gate = session.saved_gate().unwrap_or(tools::Gate::Open);
         Self {
             provider,
             http: reqwest::Client::builder()
@@ -182,7 +187,7 @@ impl Agent {
                 session: Arc::new(session),
                 history,
             }),
-            gate: std::sync::atomic::AtomicU8::new(tools::Gate::Open.to_bits()),
+            gate: std::sync::atomic::AtomicU8::new(gate.to_bits()),
             judge_model: crate::guard::DEFAULT_JUDGE_MODEL.to_owned(),
             monitor_prompt: crate::guard::MONITOR_PROMPT.to_owned(),
             tools: tools::ToolSet::builtin(),
@@ -217,8 +222,20 @@ impl Agent {
     /// touched. The state turn is rendered into each request by
     /// [`Self::call_relay`], always last, so the model always sees the current
     /// mode and no historical turn ever holds a stale one.
-    pub fn set_gate(&self, gate: tools::Gate) {
+    /// Set the permission mode, and remember it for the next time this session is
+    /// opened. See [`Session::saved_gate`] for why the memory outlives the
+    /// process.
+    pub async fn set_gate(&self, gate: tools::Gate) {
         self.gate.store(gate.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        // A failure here must not lose the mode the operator just chose: the
+        // in-memory value is what this process uses, and the sidecar only decides
+        // what a *later* process starts with. So it is logged rather than
+        // returned — the alternative is a mode that silently does not stick,
+        // which is the bug this is fixing.
+        let session = self.active.read().await.session.clone();
+        if let Err(e) = session.save_gate(gate) {
+            log::warn!("could not record gate `{}` for this session: {e}", gate.as_str());
+        }
     }
 
     /// The current permission mode.

@@ -103,6 +103,17 @@ struct Args {
     #[arg(long)]
     once: bool,
 
+    /// Start in this permission mode: `open` (everything allowed, the default),
+    /// `auto` (a judge checks each write/edit/bash first), or `plan` (write,
+    /// edit, bash and spawn propose instead of acting).
+    ///
+    /// Overrides the mode the session was last left in, so a launcher can pin it
+    /// for a tab. Without this there was no way to start in a mode: the gate was
+    /// reachable only through a slash command or the socket, and neither survives
+    /// the agent being restarted, which is what a tab reopen does.
+    #[arg(long, value_name = "MODE")]
+    gate: Option<String>,
+
     /// Allow ANSI escapes in text replies.
     ///
     /// With no flag, escapes are allowed only when stdout is a terminal *and*
@@ -361,6 +372,24 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .with_ansi(ansi),
     );
 
+    // An explicit mode wins over the one the session was last left in. Applied
+    // here rather than in `Agent::new`, because the flag belongs to this launch
+    // while the saved mode belongs to the session — and it is written back, so
+    // pinning a tab once is enough. An unknown word is a hard error: it was typed
+    // by a launcher, so it is a mistake to fix, not something to default away.
+    if let Some(word) = args.gate.as_deref() {
+        let gate =
+            tools::parse_gate(word).ok_or_else(|| format!("unknown --gate `{word}` — one of: open, auto, plan"))?;
+        agent.set_gate(gate).await;
+    }
+
+    // Stated at start-up, because "which mode am I in" is the first thing an
+    // operator needs when a write went through that they expected to be checked,
+    // or was refused when they expected it to go. The mode now comes from three
+    // places — this flag, the session's saved value, or the default — and this
+    // line is the only thing that says which one won.
+    log::info!("permission mode: {}", agent.gate().as_str());
+
     let socket_task = tokio::spawn({
         let agent = Arc::clone(&agent);
         let path = socket_path.clone();
@@ -547,7 +576,7 @@ async fn run_repl(agent: Arc<agent::Agent>, cwd: &std::path::Path) -> std::io::R
                 // there is no fourth state to return to.
                 Action::Gate => {
                     if let Some(gate) = gate_command(command.name) {
-                        agent.set_gate(gate);
+                        agent.set_gate(gate).await;
                         stdout
                             .write_all(format!("gate = {}\n", gate.as_str()).as_bytes())
                             .await?;
@@ -839,6 +868,23 @@ async fn print_banner(stdout: &mut tokio::io::Stdout, agent: &agent::Agent) -> s
             .await?;
     }
     let path = agent.transcript_path().await;
+    // The mode, in the banner as well as the log. An operator who sees a write go
+    // through that they expected to be checked needs to know where the mode came
+    // from — this flag, the session's saved value, or the default — and the REPL
+    // floor is `warn`, so the log line below never reaches a tab.
+    let mode = agent.gate().as_str();
+    if agent.gate() == tools::Gate::Open {
+        // Open is the default, so saying nothing about it would be the least
+        // noise; saying it is worth one dim line because it is also what a cleared
+        // plan-mode and a `--gate open` look like, and those are choices.
+        stdout
+            .write_all(format!("\x1b[2mmode {mode} — nothing is checked\x1b[0m\n").as_bytes())
+            .await?;
+    } else {
+        stdout
+            .write_all(format!("\x1b[1mmode {mode}\x1b[0m\n").as_bytes())
+            .await?;
+    }
     print_exchanges(stdout, &path).await?;
     stdout.write_all(b"\n").await?;
     stdout.flush().await
