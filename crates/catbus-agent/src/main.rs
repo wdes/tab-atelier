@@ -281,6 +281,36 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    // Refuse to start a second agent on a session that already has one.
+    //
+    // Two agents on one session is not a supported shape, and it fails in a way
+    // that names nothing useful. The default socket is derived from the session
+    // id, so the second agent binds the first one's socket: tab-atelier then
+    // talks to whichever agent won, while the other keeps its own unrelated
+    // history. Both append to the same transcript, so the file alternates
+    // between two conversations — and since each holds an in-memory history that
+    // its sibling keeps invalidating, the transcript can end up with turns no
+    // single agent's history matches. The symptom is a 400 about a message
+    // number that does not correspond to anything the operator typed.
+    //
+    // `--socket` means an operator (or the `Spawn` tool) has picked the endpoint
+    // deliberately and may be starting a second agent for the same directory on
+    // purpose, so the guard is for the derived path: "do not take over a session
+    // that is already being served".
+    if args.socket.is_none() && socket::is_live(&socket_path) {
+        let id = &session.id;
+        let short = id.get(..8).unwrap_or(id);
+        return Err(format!(
+            "a catbus-agent is already serving session {short} at {}.\n  \
+             Another agent here would share this session's transcript with it, and neither \
+             would have a consistent history.\n  \
+             Use that agent — or, to start a second one, pass --socket <path> so the two \
+             do not collide.",
+            socket_path.display()
+        )
+        .into());
+    }
+
     log::info!("session {} ready at {}", session.id, socket_path.display());
 
     // Read the monitor prompt before building the agent, so a bad path is a
