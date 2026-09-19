@@ -32,9 +32,9 @@ Notes, so the next session does not re-derive them:
 - **T6** is three flags, not one: `--model`/`--api-url` (Anthropic-compatible),
   `--openai-url`+`--openai-model`, `--infomaniak-*`. On the relay path the proxy
   picks the model, so it is none of those — decide which is meant before building.
-- **T7**'s `AllowedTools` is parsed and carried but **not enforced**: narrowing the
-  tool set from a prompt file has to reconcile with `--tools-config` rather than
-  silently override it.
+- **T7** is complete, `AllowedTools` included: it narrows the launcher's tool set
+  and can only narrow it, so a prompt file cannot re-add a tool `--tools-config`
+  withheld.
 - **ANSI is already conditional**, contrary to the note that prompted a look:
   `ansi::allow_escapes(sink_renders, TERM=dumb)` picks between `INSTRUCTIONS_TERMINAL`
   (invites SGR) and `INSTRUCTIONS_PLAIN` (forbids markdown *and* escapes, asks for
