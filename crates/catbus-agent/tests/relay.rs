@@ -2501,3 +2501,84 @@ fn a_resumed_session_keeps_its_model() {
         "a resumed session must ask for the model it was switched to:\n{body:#?}"
     );
 }
+
+/// Reasoning reaches the caller beside the answer, never inside it.
+///
+/// The whole reason `Turn` has two fields: a harness reading `done.text` — the
+/// tab-atelier API, the phone, the peer verbs — must see exactly the reply it saw
+/// before this existed, so the model's deliberation is a sibling field rather than
+/// a preamble. A model that does not think sends nothing at all, since the field is
+/// skipped when empty.
+#[test]
+fn a_reply_carries_its_reasoning_beside_the_answer() {
+    const WITH_THINKING: &str = r#"{
+        "id": "m1", "type": "message", "role": "assistant", "model": "deepseek-flash",
+        "content": [
+            { "type": "thinking", "thinking": "the operator wants a file", "signature": "sig" },
+            { "type": "text", "text": "Here is the file." }
+        ],
+        "stop_reason": "end_turn", "usage": { "input_tokens": 5, "output_tokens": 4 }
+    }"#;
+
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let (port, _rx) = spawn_mock_relay(vec![("HTTP/1.1 200 OK", WITH_THINKING)]);
+    let socket = home.join("agent.sock");
+    let (_agent, mut reader, mut stream) = spawn_agent_in(home, home, &socket, |cmd| {
+        cmd.args([
+            "--relay-url",
+            &format!("http://127.0.0.1:{port}"),
+            "--relay-token",
+            RELAY_TOKEN,
+        ]);
+    });
+
+    let reply = send_prompt(&mut stream, &mut reader, "make a file");
+    assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+
+    assert_eq!(
+        reply["text"], "Here is the file.",
+        "the answer must be the answer alone:\n{reply:#?}"
+    );
+    assert_eq!(
+        reply["reasoning"], "the operator wants a file",
+        "the deliberation travels in its own field:\n{reply:#?}"
+    );
+
+    // And the transcript keeps both, in the shape Claude Code writes, so a reader
+    // on disk sees the same conversation.
+    let mut files = Vec::new();
+    jsonl_files(home, &mut files);
+    let raw = std::fs::read_to_string(&files[0]).unwrap();
+    assert!(
+        raw.contains("the operator wants a file"),
+        "the transcript should hold the reasoning too:\n{raw}"
+    );
+}
+
+/// A reply with no thinking carries no `reasoning` field at all.
+///
+/// The field is skipped when empty, so a client that predates it sees a byte-identical
+/// message — which is what makes this change safe for the existing consumers.
+#[test]
+fn a_reply_without_thinking_omits_the_reasoning_field() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let (port, _rx) = spawn_mock_relay(vec![("HTTP/1.1 200 OK", FINAL_ROUND)]);
+    let socket = home.join("agent.sock");
+    let (_agent, mut reader, mut stream) = spawn_agent_in(home, home, &socket, |cmd| {
+        cmd.args([
+            "--relay-url",
+            &format!("http://127.0.0.1:{port}"),
+            "--relay-token",
+            RELAY_TOKEN,
+        ]);
+    });
+
+    let reply = send_prompt(&mut stream, &mut reader, "hi");
+    assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+    assert!(
+        reply.get("reasoning").is_none(),
+        "an empty reasoning must not appear on the wire:\n{reply:#?}"
+    );
+}

@@ -94,6 +94,22 @@ pub enum Provider {
     OpenAiCompat(crate::openai::Config),
 }
 
+/// What one turn produced.
+///
+/// `answer` and `reasoning` are separate channels rather than one string, because
+/// they are shown differently and consumed by different clients: a harness reading
+/// `done.text` wants the answer, and folding the model's deliberation into it would
+/// change what every existing consumer displays. The transcript keeps both, in the
+/// shape Claude Code writes (see `plain_content`), so a reader on disk sees the
+/// same conversation either way.
+pub struct Turn {
+    /// What the operator asked for.
+    pub answer: String,
+    /// The model's own deliberation, when it produced any. Empty for a model that
+    /// does not think.
+    pub reasoning: String,
+}
+
 /// Session + history bundled together so swapping sessions mid-REPL
 /// is atomic — we hold one write-lock and replace both at once.
 struct ActiveSession {
@@ -261,6 +277,16 @@ impl Agent {
     /// touched. The state turn is rendered into each request by
     /// [`Self::call_relay`], always last, so the model always sees the current
     /// mode and no historical turn ever holds a stale one.
+    /// Whether this session's answers may carry ANSI escapes.
+    ///
+    /// Exposed so a caller that renders a reply asks the same value the system
+    /// prompt was built from — the two deciding separately is how a model gets
+    /// told to use escapes and then has them printed literally.
+    #[must_use]
+    pub const fn renders_escapes(&self) -> bool {
+        self.ansi
+    }
+
     /// The model this session runs as. See the field for why it is not a flag.
     #[must_use]
     pub fn model(&self) -> String {
@@ -541,7 +567,7 @@ impl Agent {
     /// One full turn: append the user's text to the transcript, then
     /// drive the tool loop until the assistant stops asking for
     /// tools. Returns the model's final assistant text concatenated.
-    pub async fn run_user_prompt(&self, text: String) -> Result<String, AgentError> {
+    pub async fn run_user_prompt(&self, text: String) -> Result<Turn, AgentError> {
         // Fresh token per turn so a stale cancel doesn't kill the next
         // request before it even starts. Hold the lock only long enough
         // to swap; the inner future borrows the new clone.
@@ -557,7 +583,7 @@ impl Agent {
     }
 
     #[allow(clippy::too_many_lines)]
-    async fn run_user_prompt_inner(&self, text: String, cancel: &CancellationToken) -> Result<String, AgentError> {
+    async fn run_user_prompt_inner(&self, text: String, cancel: &CancellationToken) -> Result<Turn, AgentError> {
         // Snapshot session Arc so we're not holding the RwLock across
         // await points in the tool loop.
         let session = Arc::clone(&self.active.read().await.session);
@@ -574,6 +600,9 @@ impl Agent {
         }
 
         let mut final_text = String::new();
+        // Separate from `final_text` so the answer keeps exactly the shape it had
+        // before reasoning was carried: see `Turn`.
+        let mut reasoning = String::new();
         // Cap on tool rounds. 200 is intentionally high — the model
         // self-terminates via end_turn long before this in normal use.
         // The env-var escape hatch exists for unusually long tasks.
@@ -656,10 +685,17 @@ impl Agent {
                     Block::ToolUse { id, name, input } => {
                         tool_uses.push((id.as_str(), name.as_str(), input));
                     }
-                    // A tool result is ours, not the model's; and reasoning
-                    // stays in the transcript we echo back but is not part of
-                    // the answer the user asked for.
-                    Block::ToolResult { .. } | Block::Thinking { .. } => {}
+                    // A tool result is ours, not the model's. Reasoning is the
+                    // model's own, and is carried beside the answer rather than
+                    // inside it — a caller that only wants what it asked for reads
+                    // `Turn::answer`, which is unchanged.
+                    Block::Thinking { thinking, .. } => {
+                        if !reasoning.is_empty() {
+                            reasoning.push('\n');
+                        }
+                        reasoning.push_str(thinking);
+                    }
+                    Block::ToolResult { .. } => {}
                 }
             }
 
@@ -702,7 +738,10 @@ impl Agent {
                          it may end mid-sentence; ask for the rest to continue]\x1b[0m"
                     );
                 }
-                return Ok(self.for_sink(final_text));
+                return Ok(Turn {
+                    answer: self.for_sink(final_text),
+                    reasoning: self.for_sink(reasoning),
+                });
             }
 
             // Run tools, build a single user-message of tool_result
@@ -808,7 +847,10 @@ impl Agent {
                 "\n\n\x1b[33m[tool loop hit the {max_rounds}-round cap — response may be incomplete; \
                  raise CATBUS_MAX_ROUNDS to allow more]\x1b[0m"
             );
-            Ok(self.for_sink(final_text))
+            Ok(Turn {
+                answer: self.for_sink(final_text),
+                reasoning: self.for_sink(reasoning),
+            })
         }
     }
 
@@ -1340,6 +1382,57 @@ pub enum AgentError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A thinking block survives `plain_content` byte for byte, signature
+    /// included.
+    ///
+    /// Verified against three real transcripts first — 44,000-odd entries, 0 that
+    /// failed to parse, 0 signatures lost and 0 text mismatches — and pinned here
+    /// with the shape those files use, since a test cannot read the operator's
+    /// home. The signature is the part that matters: a provider that implements
+    /// thinking verifies it, so a block that arrives with its text and without its
+    /// signature is worse than one that never arrived.
+    #[test]
+    fn thinking_survives_the_block_conversion_intact() {
+        let raw: Vec<crate::session::Block> = serde_json::from_value(serde_json::json!([
+            { "type": "thinking", "thinking": "  weigh the options\n  then commit  ", "signature": "sig-abc" },
+            { "type": "text", "text": "Here is the schema." },
+        ]))
+        .expect("parses");
+
+        let kept = plain_content(&raw);
+        assert_eq!(kept.len(), 2, "both blocks kept: {kept:#?}");
+        // Whitespace is the model's, not ours: only the empty case is trimmed.
+        assert_eq!(
+            serde_json::to_value(&kept[0]).expect("serialises"),
+            serde_json::json!({
+                "type": "thinking",
+                "thinking": "  weigh the options\n  then commit  ",
+                "signature": "sig-abc",
+            }),
+            "the thinking and its signature must round-trip unchanged"
+        );
+    }
+
+    /// A thinking block whose text is empty still round-trips, signature and all.
+    ///
+    /// This is the shape 41,000 times over in the local transcripts: a session
+    /// where the provider kept the signature and dropped the text. Keeping the
+    /// block here is deliberate — dropping a block that names a signature would
+    /// change the turn — and it is `cache::prune_empty_content` that removes it
+    /// before it can reach the API.
+    #[test]
+    fn an_empty_thinking_block_keeps_its_signature_for_the_prune_to_see() {
+        let raw: Vec<crate::session::Block> = serde_json::from_value(serde_json::json!([
+            { "type": "thinking", "thinking": "", "signature": "sig-abc" },
+        ]))
+        .expect("parses");
+        let kept = plain_content(&raw);
+        assert_eq!(
+            serde_json::to_value(&kept[0]).expect("serialises"),
+            serde_json::json!({ "type": "thinking", "thinking": "", "signature": "sig-abc" })
+        );
+    }
 
     /// Write a transcript in the shape the agent writes, under a temp project
     /// dir, and hand back (dir, id).

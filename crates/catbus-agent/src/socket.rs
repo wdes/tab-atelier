@@ -121,7 +121,18 @@ async fn handle(stream: UnixStream, agent: Arc<Agent>) -> Result<(), SocketError
         match req {
             Request::Prompt { text } => match agent.run_user_prompt(text).await {
                 Ok(reply) => {
-                    write_line(&mut write_half, &Response::Done { text: reply }).await?;
+                    let turn = reply;
+                    write_line(
+                        &mut write_half,
+                        &Response::Done {
+                            text: turn.answer,
+                            // Carried beside the answer, never inside it: a client
+                            // that does not know this field sees exactly the reply
+                            // it saw before.
+                            reasoning: turn.reasoning,
+                        },
+                    )
+                    .await?;
                 }
                 Err(e) => {
                     write_line(&mut write_half, &Response::Error { message: e.to_string() }).await?;
@@ -130,13 +141,7 @@ async fn handle(stream: UnixStream, agent: Arc<Agent>) -> Result<(), SocketError
             Request::SetPlanMode { on } => {
                 let gate = if on { tools::Gate::Plan } else { tools::Gate::Open };
                 agent.set_gate(gate).await;
-                write_line(
-                    &mut write_half,
-                    &Response::Done {
-                        text: format!("gate = {}", gate.as_str()),
-                    },
-                )
-                .await?;
+                write_line(&mut write_half, &Response::done(format!("gate = {}", gate.as_str()))).await?;
             }
             Request::SetGate { gate } => {
                 let Some(parsed) = tools::parse_gate(&gate) else {
@@ -150,13 +155,7 @@ async fn handle(stream: UnixStream, agent: Arc<Agent>) -> Result<(), SocketError
                     continue;
                 };
                 agent.set_gate(parsed).await;
-                write_line(
-                    &mut write_half,
-                    &Response::Done {
-                        text: format!("gate = {}", parsed.as_str()),
-                    },
-                )
-                .await?;
+                write_line(&mut write_half, &Response::done(format!("gate = {}", parsed.as_str()))).await?;
             }
             Request::Clear => match agent.clear().await {
                 // The previous id is in the reply so the client can offer a way
@@ -165,13 +164,11 @@ async fn handle(stream: UnixStream, agent: Arc<Agent>) -> Result<(), SocketError
                 Ok(previous) => {
                     write_line(
                         &mut write_half,
-                        &Response::Done {
-                            text: format!(
-                                "cleared; previous session ({}, {}) is still on disk",
-                                previous.name,
-                                previous.id.get(..8).unwrap_or(&previous.id)
-                            ),
-                        },
+                        &Response::done(format!(
+                            "cleared; previous session ({}, {}) is still on disk",
+                            previous.name,
+                            previous.id.get(..8).unwrap_or(&previous.id)
+                        )),
                     )
                     .await?;
                 }
@@ -236,8 +233,32 @@ enum Request {
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum Response {
     Started,
-    Done { text: String },
-    Error { message: String },
+    Done {
+        text: String,
+        /// The model's own deliberation, when it produced any.
+        ///
+        /// A sibling field rather than part of `text`, so a client that predates
+        /// it — the tab-atelier API, the phone — reads exactly the reply it read
+        /// before. Empty for every reply that is not a turn's answer, and skipped
+        /// on the wire when empty, so nothing changes for a model that does not
+        /// think. See `agent::Turn`.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        reasoning: String,
+    },
+    Error {
+        message: String,
+    },
+}
+
+impl Response {
+    /// A reply with no reasoning attached — every response that is not a turn's
+    /// answer: a gate change, a clear, a handshake.
+    fn done(text: impl Into<String>) -> Self {
+        Self::Done {
+            text: text.into(),
+            reasoning: String::new(),
+        }
+    }
 }
 
 /// Whether something is already listening on `path`.

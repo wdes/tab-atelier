@@ -624,6 +624,32 @@ async fn run_repl(agent: Arc<agent::Agent>, cwd: &std::path::Path) -> std::io::R
                     stdout.write_all(slash::help_text().as_bytes()).await?;
                 }
                 Action::Exit => break,
+                Action::Model => {
+                    // `/model <name>` switches; bare `/model` says which one is in
+                    // use. Reported from the agent rather than from a local copy, so
+                    // what is printed is what the next request will carry.
+                    if argument.is_empty() {
+                        stdout
+                            .write_all(format!("model = {}\n", agent.model()).as_bytes())
+                            .await?;
+                    } else {
+                        match agent.set_model(argument).await {
+                            Ok(()) => {
+                                stdout
+                                    .write_all(
+                                        format!("model = {}\n(in use from the next request)\n", argument.trim())
+                                            .as_bytes(),
+                                    )
+                                    .await?;
+                            }
+                            Err(e) => {
+                                stdout
+                                    .write_all(format!("\x1b[31merror:\x1b[0m {e}\n").as_bytes())
+                                    .await?;
+                            }
+                        }
+                    }
+                }
                 // `gate_command` is the parser the socket's `set_gate` uses, so
                 // the mode printed here is the mode the socket would read. The
                 // gate words, `/noplan`'s aliases among them, are exclusive:
@@ -846,7 +872,22 @@ async fn run_repl(agent: Arc<agent::Agent>, cwd: &std::path::Path) -> std::io::R
                 let session = agent.active_session().await;
                 let _ = session.save_tokens(agent.total_tokens_in(), agent.total_tokens_out());
                 stdout.write_all(b"\n").await?;
-                stdout.write_all(reply.as_bytes()).await?;
+                // Reasoning first, dimmed: it is the model's own working rather
+                // than the answer, so it reads as context and not as a result.
+                // Printed only when the sink renders escapes — a sink that does
+                // not would show the dim escapes literally, which is the fault
+                // `ansi::strip` exists to prevent.
+                if !reply.reasoning.is_empty() {
+                    if agent.renders_escapes() {
+                        stdout
+                            .write_all(format!("\x1b[2m{}\x1b[0m\n", reply.reasoning).as_bytes())
+                            .await?;
+                    } else {
+                        stdout.write_all(reply.reasoning.as_bytes()).await?;
+                        stdout.write_all(b"\n").await?;
+                    }
+                }
+                stdout.write_all(reply.answer.as_bytes()).await?;
                 stdout.write_all(b"\n\n").await?;
                 // The totals line, directly below the reply and above the next
                 // prompt: cumulative tokens on the left, the mode on the right,
