@@ -27,6 +27,7 @@ use clap::Parser;
 use reedline::{
     FileBackedHistory, Prompt, PromptEditMode, PromptHistorySearch, PromptHistorySearchStatus, Reedline, Signal,
 };
+use slash::Action;
 use tokio::io::AsyncWriteExt;
 
 mod agent;
@@ -37,6 +38,7 @@ mod openai;
 mod relay;
 mod retry;
 mod session;
+mod slash;
 mod socket;
 mod statusline;
 mod tools;
@@ -482,13 +484,13 @@ fn gate_command(input: &str) -> Option<tools::Gate> {
 ///
 /// The `allow` is load-bearing and belongs to *this* function: at ~290 lines it
 /// is well past the 100-line pedantic threshold, and the length is structural —
-/// it is one flat `if let` chain over the slash commands, where each arm prints
-/// and `continue`s. Splitting it would mean threading the stdout handle and the
-/// command string through helpers that exist only to shorten it. Note that
-/// inserting a function immediately above this one silently moves the `allow`
-/// onto that new function instead, which is a live hazard: it happened once
-/// while adding `gate_command`, and the only symptom was clippy turning red on a
-/// function nobody had touched.
+/// it is one `match` over the commands' actions, where each arm prints and falls
+/// through to the same `continue`. Splitting it would mean threading the stdout
+/// handle and the command string through helpers that exist only to shorten it.
+/// Note that inserting a function immediately above this one silently moves the
+/// `allow` onto that new function instead, which is a live hazard: it happened
+/// once while adding `gate_command`, and the only symptom was clippy turning red
+/// on a function nobody had touched.
 #[allow(clippy::too_many_lines)]
 async fn run_repl(agent: Arc<agent::Agent>, cwd: &std::path::Path) -> std::io::Result<()> {
     let mut stdout = tokio::io::stdout();
@@ -529,173 +531,160 @@ async fn run_repl(agent: Arc<agent::Agent>, cwd: &std::path::Path) -> std::io::R
             continue;
         }
 
-        // Slash commands are interpreted locally; everything else
-        // becomes a user turn for the model.
-        if prompt == "/help" {
-            stdout
-                .write_all(
-                    b"slash commands:\n  \
-                      /help              show this list\n  \
-                      /clear             forget the conversation, start a fresh session here\n  \
-                      /plan              plan only - write/edit/bash propose instead of acting\n  \
-                      /auto              ask a judge before each write/edit/bash\n  \
-                      /noplan            allow everything (same as /noauto)\n  \
-                      /rename <name>     rename the current session\n  \
-                      /resume            list previous sessions in this cwd\n  \
-                      /resume <id>       switch to a previous session in-place\n  \
-                      /exit              quit (same as Ctrl-D)\n\n",
-                )
-                .await?;
-            continue;
-        }
-        if prompt == "/exit" || prompt == "/quit" {
-            break;
-        }
-        // The three modes are exclusive, so `/noplan` is also `/noauto` —
-        // there is no fourth state to return to, and two names for "allow
-        // everything" would suggest otherwise.
-        if let Some(gate) = gate_command(prompt) {
-            agent.set_gate(gate);
-            stdout
-                .write_all(format!("gate = {}\n", gate.as_str()).as_bytes())
-                .await?;
-            continue;
-        }
-        if prompt == "/clear" {
-            // Nothing is deleted: the old transcript stays on disk, so the
-            // operator is told its id and how to get the conversation back.
-            // Printing it is the whole safety story for this command.
-            match agent.clear().await {
-                Ok(previous) => {
-                    let id_short = previous.id.get(..8).unwrap_or(&previous.id).to_owned();
-                    stdout
-                        .write_all(
-                            format!(
-                                "started a fresh session; the previous one ({}, {id_short}) is \
-                                 still on disk — /resume {} to return to it\n",
-                                previous.name, previous.id
-                            )
-                            .as_bytes(),
-                        )
-                        .await?;
+        // Slash commands are interpreted locally; everything else becomes a
+        // user turn for the model. Which word is which command lives in
+        // `slash`, so a command cannot exist without a help entry, and no help
+        // entry can describe something its command does not do.
+        if let Some((command, argument)) = slash::lookup(prompt) {
+            match command.action {
+                Action::Help => {
+                    stdout.write_all(slash::help_text().as_bytes()).await?;
                 }
-                Err(e) => {
-                    stdout
-                        .write_all(format!("\x1b[31merror:\x1b[0m could not clear: {e}\n").as_bytes())
-                        .await?;
+                Action::Exit => break,
+                // `gate_command` is the parser the socket's `set_gate` uses, so
+                // the mode printed here is the mode the socket would read. The
+                // gate words, `/noplan`'s aliases among them, are exclusive:
+                // there is no fourth state to return to.
+                Action::Gate => {
+                    if let Some(gate) = gate_command(command.name) {
+                        agent.set_gate(gate);
+                        stdout
+                            .write_all(format!("gate = {}\n", gate.as_str()).as_bytes())
+                            .await?;
+                    }
                 }
-            }
-            continue;
-        }
-        if let Some(new_name) = prompt.strip_prefix("/rename ") {
-            let new_name = new_name.trim();
-            if new_name.is_empty() {
-                stdout.write_all(b"usage: /rename <name>\n").await?;
-                continue;
-            }
-            match agent.rename_session(new_name).await {
-                Ok(()) => {
-                    stdout
-                        .write_all(format!("session renamed to \x1b[1m{new_name}\x1b[0m\n").as_bytes())
-                        .await?;
-                }
-                Err(e) => {
-                    stdout
-                        .write_all(format!("\x1b[31merror:\x1b[0m {e}\n").as_bytes())
-                        .await?;
-                }
-            }
-            continue;
-        }
-        if prompt == "/rename" {
-            stdout.write_all(b"usage: /rename <name>\n").await?;
-            continue;
-        }
-        if let Some(target_id) = prompt.strip_prefix("/resume ") {
-            let target_id = target_id.trim();
-            if target_id.is_empty() {
-                stdout.write_all(b"usage: /resume <session-id>\n").await?;
-                continue;
-            }
-            match session::open(cwd, Some(target_id), false) {
-                Ok(new_session) => {
-                    let new_id = new_session.id.clone();
-                    let new_name = new_session.session_name();
-                    match agent.swap_session(new_session).await {
-                        Ok(()) => {
-                            let label = if new_name.is_empty() {
-                                format!("\x1b[2m{new_id}\x1b[0m")
-                            } else {
-                                format!("\x1b[1m{new_name}\x1b[0m  \x1b[2m{new_id}\x1b[0m")
-                            };
+                Action::Clear => {
+                    // Nothing is deleted: the old transcript stays on disk, so the
+                    // operator is told its id and how to get the conversation back.
+                    // Printing it is the whole safety story for this command.
+                    match agent.clear().await {
+                        Ok(previous) => {
+                            let id_short = previous.id.get(..8).unwrap_or(&previous.id).to_owned();
                             stdout
-                                .write_all(format!("switched to session {label}\n").as_bytes())
+                                .write_all(
+                                    format!(
+                                        "started a fresh session; the previous one ({}, {id_short}) is \
+                                         still on disk — /resume {} to return to it\n",
+                                        previous.name, previous.id
+                                    )
+                                    .as_bytes(),
+                                )
                                 .await?;
-                            let path = agent.transcript_path().await;
-                            print_exchanges(&mut stdout, &path).await?;
-                            stdout.write_all(b"\n").await?;
                         }
                         Err(e) => {
                             stdout
-                                .write_all(format!("\x1b[31merror:\x1b[0m swap failed: {e}\n").as_bytes())
+                                .write_all(format!("\x1b[31merror:\x1b[0m could not clear: {e}\n").as_bytes())
                                 .await?;
                         }
                     }
                 }
-                Err(e) => {
+                Action::Rename => {
+                    // `/rename` with no name, or with nothing but spaces, has
+                    // nothing to name: the table records that this command takes
+                    // an argument, not that one was typed.
+                    if argument.is_empty() {
+                        stdout.write_all(b"usage: /rename <name>\n").await?;
+                    } else {
+                        match agent.rename_session(argument).await {
+                            Ok(()) => {
+                                stdout
+                                    .write_all(format!("session renamed to \x1b[1m{argument}\x1b[0m\n").as_bytes())
+                                    .await?;
+                            }
+                            Err(e) => {
+                                stdout
+                                    .write_all(format!("\x1b[31merror:\x1b[0m {e}\n").as_bytes())
+                                    .await?;
+                            }
+                        }
+                    }
+                }
+                Action::Resume => {
+                    // `/resume <id>` switches to that session in place; on its
+                    // own, `/resume` lists the ones this cwd has.
+                    if !argument.is_empty() {
+                        match session::open(cwd, Some(argument), false) {
+                            Ok(new_session) => {
+                                let new_id = new_session.id.clone();
+                                let new_name = new_session.session_name();
+                                match agent.swap_session(new_session).await {
+                                    Ok(()) => {
+                                        let label = if new_name.is_empty() {
+                                            format!("\x1b[2m{new_id}\x1b[0m")
+                                        } else {
+                                            format!("\x1b[1m{new_name}\x1b[0m  \x1b[2m{new_id}\x1b[0m")
+                                        };
+                                        stdout
+                                            .write_all(format!("switched to session {label}\n").as_bytes())
+                                            .await?;
+                                        let path = agent.transcript_path().await;
+                                        print_exchanges(&mut stdout, &path).await?;
+                                        stdout.write_all(b"\n").await?;
+                                    }
+                                    Err(e) => {
+                                        stdout
+                                            .write_all(format!("\x1b[31merror:\x1b[0m swap failed: {e}\n").as_bytes())
+                                            .await?;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                stdout
+                                    .write_all(
+                                        format!("\x1b[31merror:\x1b[0m could not open session: {e}\n").as_bytes(),
+                                    )
+                                    .await?;
+                            }
+                        }
+                        continue;
+                    }
+                    let sessions = session::list_sessions(cwd);
+                    if sessions.is_empty() {
+                        stdout.write_all(b"no previous sessions in this cwd.\n\n").await?;
+                        continue;
+                    }
+                    let current_id = agent.session_id().await;
                     stdout
-                        .write_all(format!("\x1b[31merror:\x1b[0m could not open session: {e}\n").as_bytes())
+                        .write_all(format!("{} session(s) for {}:\n", sessions.len(), cwd.display()).as_bytes())
+                        .await?;
+                    let now = std::time::SystemTime::now();
+                    let project_dir = session::project_dir_for(cwd);
+                    for (id, name, ts) in &sessions {
+                        let age = now
+                            .duration_since(*ts)
+                            .map_or_else(|_| "in the future".to_string(), |d| humanise_age(d.as_secs()));
+                        let marker = if id == &current_id {
+                            " \x1b[32m(current)\x1b[0m"
+                        } else {
+                            ""
+                        };
+                        // Use the /rename'd name when set; otherwise fall back
+                        // to the session's first user prompt (truncated) so
+                        // every row carries something recognisable, not just a
+                        // UUID. The id is always shown after the label.
+                        let derived_label = if name.is_empty() {
+                            project_dir
+                                .as_ref()
+                                .and_then(|d| session::first_prompt(&d.join(format!("{id}.jsonl")), 60))
+                        } else {
+                            None
+                        };
+                        let label = match (name.is_empty(), derived_label) {
+                            (false, _) => format!("\x1b[1m{name}\x1b[0m  \x1b[2m{id}\x1b[0m"),
+                            (true, Some(prompt_label)) => {
+                                format!("\x1b[1m{prompt_label}\x1b[0m  \x1b[2m{id}\x1b[0m")
+                            }
+                            (true, None) => format!("\x1b[2m{id}\x1b[0m"),
+                        };
+                        stdout
+                            .write_all(format!("  {label}  {age}{marker}\n").as_bytes())
+                            .await?;
+                    }
+                    stdout
+                        .write_all(b"\nto switch in-place: /resume <session-id>\n\n")
                         .await?;
                 }
             }
-            continue;
-        }
-        if prompt == "/resume" {
-            let sessions = session::list_sessions(cwd);
-            if sessions.is_empty() {
-                stdout.write_all(b"no previous sessions in this cwd.\n\n").await?;
-                continue;
-            }
-            let current_id = agent.session_id().await;
-            stdout
-                .write_all(format!("{} session(s) for {}:\n", sessions.len(), cwd.display()).as_bytes())
-                .await?;
-            let now = std::time::SystemTime::now();
-            let project_dir = session::project_dir_for(cwd);
-            for (id, name, ts) in &sessions {
-                let age = now
-                    .duration_since(*ts)
-                    .map_or_else(|_| "in the future".to_string(), |d| humanise_age(d.as_secs()));
-                let marker = if id == &current_id {
-                    " \x1b[32m(current)\x1b[0m"
-                } else {
-                    ""
-                };
-                // Use the /rename'd name when set; otherwise fall back
-                // to the session's first user prompt (truncated) so
-                // every row carries something recognisable, not just a
-                // UUID. The id is always shown after the label.
-                let derived_label = if name.is_empty() {
-                    project_dir
-                        .as_ref()
-                        .and_then(|d| session::first_prompt(&d.join(format!("{id}.jsonl")), 60))
-                } else {
-                    None
-                };
-                let label = match (name.is_empty(), derived_label) {
-                    (false, _) => format!("\x1b[1m{name}\x1b[0m  \x1b[2m{id}\x1b[0m"),
-                    (true, Some(prompt_label)) => {
-                        format!("\x1b[1m{prompt_label}\x1b[0m  \x1b[2m{id}\x1b[0m")
-                    }
-                    (true, None) => format!("\x1b[2m{id}\x1b[0m"),
-                };
-                stdout
-                    .write_all(format!("  {label}  {age}{marker}\n").as_bytes())
-                    .await?;
-            }
-            stdout
-                .write_all(b"\nto switch in-place: /resume <session-id>\n\n")
-                .await?;
             continue;
         }
 
@@ -988,6 +977,15 @@ mod tests {
         // a trailing space.
         assert_eq!(gate_command("/auto "), Some(tools::Gate::Auto));
         assert_eq!(gate_command("  /plan"), Some(tools::Gate::Plan));
-        assert_eq!(gate_command("/clear "), None, "clear is handled separately");
+        // `/clear` is a command, but not a mode: it resolves in `slash`'s table
+        // and this parser — which the dispatch reaches only for a `Gate` action —
+        // must not claim it. The REPL asks the table first and never gets here
+        // for a non-gate, so a match here would be a mode nobody can select.
+        assert_eq!(gate_command("/clear "), None, "clear is not a mode");
+        assert_eq!(
+            slash::lookup("/clear ").map(|(command, _)| command.action),
+            Some(slash::Action::Clear),
+            "and the table is where it is owned"
+        );
     }
 }
