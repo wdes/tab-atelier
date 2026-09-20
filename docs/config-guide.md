@@ -158,8 +158,8 @@ a lower risk rather than the code assuming one.
 **A custom tool may not take a built-in's name.** The agent refuses to start if one shadows
 the other, on the grounds that a familiar name with different behaviour is worse than a
 refusal. The built-ins are `Read`, `Write`, `Edit`, `FileTree`, `Bash`, `ListAgents`,
-`Delegate`, `Spawn`, `Tasks`, `AskUserQuestion`, `PHPUnit`, `Composer`, `Bun`, `GitStatus`
-and `GitCommit` — hence the name above, which cannot be `GitStatus`.
+`Delegate`, `Spawn`, `Tasks`, `AskUserQuestion`, `PHPUnit`, `Composer`, `Bun`, `SSH`
+and `Git` — hence the name above, which cannot be `Git`.
 
 A working example is in the package at `/usr/share/doc/tab-atelier/tools.json`.
 

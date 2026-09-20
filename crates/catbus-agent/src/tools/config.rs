@@ -384,7 +384,31 @@ impl ToolSet {
         if let Some(tool) = self.custom.get(name) {
             return tool.judged;
         }
+        // `Git` cannot be answered by its name: three of its eight actions read and five write, so the
+        // action is what decides. Answered as writing here — the safe direction, since judging a read
+        // costs one judge call where failing to judge a push means it happens unexamined.
+        if name == "Git" {
+            return true;
+        }
         crate::tools::changes_the_world(name)
+    }
+
+    /// Whether **this call** changes the world, which for `Git` depends on the action.
+    ///
+    /// The judge site needs this rather than [`Self::changes_the_world`]: judging the tool name alone
+    /// would spend a judge call on `git show` and — worse — judge a push as though it were a read if the
+    /// answer went the other way. One `Git` tool with eight actions means the question can only be
+    /// answered from the input.
+    #[must_use]
+    pub fn call_changes_the_world(&self, name: &str, input: &serde_json::Value) -> bool {
+        if name != "Git" {
+            return self.changes_the_world(name);
+        }
+        if !self.offers(name) {
+            return false;
+        }
+        let action = input.get("action").and_then(|v| v.as_str()).unwrap_or("");
+        crate::tools::git::action_writes(action)
     }
 
     /// Substitute `{param}` placeholders into `argv`.
@@ -609,8 +633,7 @@ mod tests {
             "Delegate",
             "Edit",
             "FileTree",
-            "GitCommit",
-            "GitStatus",
+            "Git",
             "ListAgents",
             "PHPUnit",
             "Read",

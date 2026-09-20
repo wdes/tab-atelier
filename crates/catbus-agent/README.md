@@ -84,10 +84,14 @@ be removed and added to without a rebuild:
   "disable": ["Bash"],
   "add": [
     {
-      "name": "GitStatus",
-      "description": "Show the working tree status.",
-      "schema": { "type": "object", "properties": {}, "required": [] },
-      "argv": ["git", "status", "--short"],
+      "name": "GitBlameLine",
+      "description": "Who last touched a line.",
+      "schema": {
+        "type": "object",
+        "properties": { "path": { "type": "string" }, "line": { "type": "integer" } },
+        "required": ["path", "line"]
+      },
+      "argv": ["git", "blame", "-L", "{line},{line}", "--", "{path}"],
       "timeout_secs": 10,
       "judged": false
     },
@@ -127,8 +131,8 @@ Only the model is simulated.
   shadows the other, on the grounds that a familiar name with different behaviour
   is worse than a refusal. The built-in names are `Read`, `Write`, `Edit`,
   `FileTree`, `Bash`, `ListAgents`, `Delegate`, `Spawn`, `Tasks`, `PHPUnit`,
-  `Composer`, `Bun`, `GitStatus` and `GitCommit` — so the example's git tool is
-  `GitBisect`, and a config `add`ing a `GitStatus` of its own will not start.
+  `Composer`, `Bun`, `SSH` and `Git` — so the samples here are `GitBlameLine` and
+  `GitBisect`, and a config `add`ing a `Git` of its own will not start.
   Rename it, or add the built-in to `disable`.
 - **`judged`** defaults to `true`. Auto mode grades anything that executes
   unless the tool says otherwise, so the safe default is the default and a

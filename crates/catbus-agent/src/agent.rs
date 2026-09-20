@@ -1004,7 +1004,7 @@ impl Agent {
                 // one. The record goes to the log and, when allowed, into the
                 // tool result, which is where the operator or a later session
                 // will actually look.
-                let vetted: Option<String> = if gate.judges() && self.tools.changes_the_world(name) {
+                let vetted: Option<String> = if gate.judges() && self.tools.call_changes_the_world(name, input) {
                     *self.status.lock().expect("status mutex") = Some(format!("checking {name}"));
                     let history = { self.active.read().await.history.clone() };
                     let verdict = self.judge_action(name, input, &history).await;

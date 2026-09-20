@@ -78,8 +78,7 @@ pins it for a launch.
 | `PHPUnit` | Run this project's PHPUnit and get structured results: counts, and one entry per failure with its test, `file:line`, message and diff already separated. |
 | `Composer` | `install`, `update`, or `run` a script from composer.json. `scripts` lists what the project defines, with the author's descriptions where there are any. Always non-interactive. |
 | `Bun` | `run` a script from package.json, `install`, or `scripts` to list them. |
-| `GitStatus` | What is uncommitted: branch, ahead/behind, and the staged, unstaged, untracked and conflicted paths. Read-only. |
-| `GitCommit` | Commit a named set of files. It stages nothing you did not name; commits by path, so anything else already staged stays staged. |
+| `Git` | One tool, eight actions — `show`, `commit`, `tag`, `history`, three `worktree` verbs and `push`. See below. |
 | `ListAgents` | Other agents running on this machine. |
 | `Delegate` | Ask one of them something, and wait. |
 | `Spawn` | Start a new agent for one task, take its reply, and stop it. |
@@ -119,12 +118,14 @@ points at `keyscan`, so running a command never trusts a host as a side effect.
 `forward_agent` forwards your SSH agent for that connection, which means a command on the host can
 use your keys. Off unless asked; that is the whole point of the flag and the whole risk of it.
 
-`PHPUnit`, `Composer`, `Bun`, `GitCommit`, `SSH` and `Spawn` all run project code, so `auto` judges
-them and `plan` refuses them. `Read`, `FileTree`, `GitStatus` and `ListAgents` change
-nothing and are never judged. `Tasks` writes only to the agent's own state directory, so it
+`PHPUnit`, `Composer`, `Bun`, the writing `Git` actions, `SSH` and `Spawn` all run project code or
+change things, so `auto` judges them and `plan` refuses them. `Read`, `FileTree`, `ListAgents` and the
+reading `Git` actions — `show`, `history`, `worktree-list` — change nothing and are never judged. `Tasks` writes only to the agent's own state directory, so it
 is allowed even in plan mode — a plan is what plan mode is for.
 
-**There is no push.** Committing is the agent's; publishing is yours.
+**`push` names its destination.** A remote and a branch are both required, so a publish is never
+implicit — and in a session under `plan` or `auto` it is refused or judged like anything else that
+changes the world.
 
 ## Being asked a question
 

@@ -110,7 +110,13 @@ impl Gate {
                      a sub-agent begins with the gate open, so this would plan nothing."
                 }
                 "PHPUnit" => "Plan-mode is on. Describe what the tests should check instead of running them.",
-                "GitCommit" => "Plan-mode is on. Say what you would commit instead of committing it.",
+                // The git writing actions, each named, since the tool covers eight verbs.
+                "commit" => "Plan-mode is on. Say what you would commit instead of committing it.",
+                "amend" => "Plan-mode is on. Say what you would amend instead of rewriting the commit.",
+                "tag" => "Plan-mode is on. Say which commit you would tag instead of tagging it.",
+                "worktree-add" => "Plan-mode is on. Describe the worktree you would create instead of creating it.",
+                "worktree-remove" => "Plan-mode is on. Say which worktree you would remove instead of removing it.",
+                "push" => "Plan-mode is on. Say what you would push, and where, instead of pushing it.",
                 "Composer" | "Bun" => "Plan-mode is on. Describe the commands you would run instead of running them.",
                 "SSH" => "Plan-mode is on. Describe what you would run on the host instead of running it.",
                 _ => "Plan-mode is on. Describe the command instead of running it.",
@@ -187,7 +193,9 @@ pub fn parse_gate(name: &str) -> Option<Gate> {
 pub fn changes_the_world(name: &str) -> bool {
     matches!(
         name,
-        "Write" | "Edit" | "Bash" | "PHPUnit" | "GitCommit" | "Composer" | "Bun" | "SSH"
+        // `Git` is deliberately absent: its eight actions differ — three read, five write — so a bare
+        // tool name cannot answer the question, and the dispatcher asks `git::action_writes` instead.
+        "Write" | "Edit" | "Bash" | "PHPUnit" | "Composer" | "Bun" | "SSH"
     )
 }
 
@@ -305,14 +313,18 @@ impl ToolSet {
                 }
                 ssh::run_allowed(input, cwd, self.ssh_policy()).await
             }
-            // Read-only, so never judged and never refused.
-            "GitStatus" => git::status(input, cwd).await,
-            // Refused in plan-mode and judged in auto mode: it writes to the repository.
-            "GitCommit" => {
-                if let Some(why) = gate.refusal("GitCommit") {
+            // One tool with actions, so **the gate is asked about the action rather than the tool**:
+            // `show` and `history` only read, and judging those would spend a judge call on `git status`
+            // and refuse them in plan-mode for merely looking. The writing actions are judged and
+            // refused here, by name, so a refusal says which of them was wanted.
+            "Git" => {
+                let action = input.get("action").and_then(|v| v.as_str()).unwrap_or("");
+                if git::action_writes(action)
+                    && let Some(why) = gate.refusal(action)
+                {
                     return Err(why.to_string());
                 }
-                git::commit(input, cwd).await
+                git::run(input, cwd).await
             }
             // Runs project code, so it is judged like the shell is — see
             // `changes_the_world` — and refused in plan-mode.
@@ -406,8 +418,7 @@ pub fn builtin_specs() -> Vec<serde_json::Value> {
         // Likewise, and built from the same `ACTIONS` array the dispatch uses.
         tasks::spec(),
         phpunit::spec(),
-        git::status_spec(),
-        git::commit_spec(),
+        git::spec(),
         ssh::spec(),
         packages::composer_spec(),
         ask::spec(),
