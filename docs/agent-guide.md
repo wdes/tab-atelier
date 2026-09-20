@@ -98,9 +98,14 @@ the package manager, whose error would say only what it could not find.
     SSH { action: command, host: dc1.servers.example.org, command: "uptime" }
     SSH { action: keyscan, host: dc1.servers.example.org }
 
-Only `host` — a name, an address, or either with a port — and `forward_agent` may be set. There is no
-user, no extra ssh option, no key selection, no jump host and no tunnel, so none of those is
-reachable through it. The login is whatever your own ssh config says.
+Only `host` — a name, an address, or either with a port — plus `jump` and `forward_agent` may be set.
+There is no user, no extra ssh option, no key selection and no tunnel, so none of those is reachable
+through it. The login is whatever your own ssh config says.
+
+`jump` routes the connection through another host (`ssh -J`), for a machine only reachable from a
+bastion. It needs **its own grant**: the session's `AllowedJumpHosts` must list it, and that list is
+opt-in — `AllowedHosts` permits destinations, not routes to them. The refusal when it is missing names
+the line to add.
 
 `command` runs one non-interactive command and returns its output. It cannot prompt: ssh runs with
 no terminal and in batch mode, so a command that needs a password or an answer fails instead of

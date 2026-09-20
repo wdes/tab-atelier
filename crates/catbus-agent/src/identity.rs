@@ -41,6 +41,8 @@ pub enum Identity {
         allowed_tools: Option<Vec<String>>,
         /// Hosts the `SSH` tool may reach, if it said.
         allowed_hosts: Option<Vec<String>>,
+        /// Hosts the `SSH` tool may route through, if it said.
+        allowed_jump_hosts: Option<Vec<String>>,
     },
     /// Send no identity block at all.
     ///
@@ -50,6 +52,7 @@ pub enum Identity {
     Omitted {
         allowed_tools: Option<Vec<String>>,
         allowed_hosts: Option<Vec<String>>,
+        allowed_jump_hosts: Option<Vec<String>>,
     },
 }
 
@@ -64,6 +67,20 @@ impl Identity {
         match self {
             Self::Auto => None,
             Self::Text { allowed_tools, .. } | Self::Omitted { allowed_tools, .. } => allowed_tools.as_deref(),
+        }
+    }
+
+    /// The hosts the operator's file lets SSH route through, if it said.
+    ///
+    /// Its own key rather than folded into [`Self::allowed_hosts`], because permitting a destination
+    /// and permitting a route to it are different decisions — see `tools::ssh`.
+    #[must_use]
+    pub fn allowed_jump_hosts(&self) -> Option<&[String]> {
+        match self {
+            Self::Auto => None,
+            Self::Text { allowed_jump_hosts, .. } | Self::Omitted { allowed_jump_hosts, .. } => {
+                allowed_jump_hosts.as_deref()
+            }
         }
     }
 
@@ -141,6 +158,7 @@ fn load_at(inline: Option<&str>, file: Option<&Path>, default: &Path) -> Result<
             text: text.to_owned(),
             allowed_tools: None,
             allowed_hosts: None,
+            allowed_jump_hosts: None,
         });
     }
 
@@ -159,6 +177,7 @@ fn load_at(inline: Option<&str>, file: Option<&Path>, default: &Path) -> Result<
             text: parsed.body,
             allowed_tools: parsed.allowed_tools,
             allowed_hosts: parsed.allowed_hosts,
+            allowed_jump_hosts: parsed.allowed_jump_hosts,
         });
     }
 
@@ -180,12 +199,14 @@ fn load_at(inline: Option<&str>, file: Option<&Path>, default: &Path) -> Result<
         return Ok(Identity::Omitted {
             allowed_tools: parsed.allowed_tools,
             allowed_hosts: parsed.allowed_hosts,
+            allowed_jump_hosts: parsed.allowed_jump_hosts,
         });
     }
     Ok(Identity::Text {
         text: parsed.body,
         allowed_tools: parsed.allowed_tools,
         allowed_hosts: parsed.allowed_hosts,
+        allowed_jump_hosts: parsed.allowed_jump_hosts,
     })
 }
 
@@ -200,6 +221,8 @@ pub struct Parsed {
     pub allowed_tools: Option<Vec<String>>,
     /// `AllowedHosts`: which hosts the `SSH` tool may connect to.
     pub allowed_hosts: Option<Vec<String>>,
+    /// `AllowedJumpHosts`: which hosts the `SSH` tool may route through.
+    pub allowed_jump_hosts: Option<Vec<String>>,
 }
 
 /// A comma-separated list from a header, trimmed and without empties.
@@ -228,6 +251,7 @@ pub fn parse_prompt(raw: &str) -> Result<Parsed, String> {
             body: raw.trim_start_matches('\n').to_owned(),
             allowed_tools: None,
             allowed_hosts: None,
+            allowed_jump_hosts: None,
         });
     }
 
@@ -236,6 +260,10 @@ pub fn parse_prompt(raw: &str) -> Result<Parsed, String> {
     // and the more useful of the two for the tool that runs commands on other machines: a tool list
     // says ssh may be used, this says where.
     let mut allowed_hosts: Option<Vec<String>> = None;
+    // The hosts `SSH` may route *through*. A separate key from `AllowedHosts` because the two answers
+    // are separate questions: a hop is a machine the connection passes through, not another place to
+    // connect, so permitting destinations does not permit a route. See `tools::ssh`.
+    let mut allowed_jump_hosts: Option<Vec<String>> = None;
     let mut closed = false;
     let mut body_start = 0;
     for (index, line) in lines.by_ref().enumerate() {
@@ -258,6 +286,9 @@ pub fn parse_prompt(raw: &str) -> Result<Parsed, String> {
         if key.trim().eq_ignore_ascii_case("AllowedHosts") {
             allowed_hosts = Some(split_list(value));
         }
+        if key.trim().eq_ignore_ascii_case("AllowedJumpHosts") {
+            allowed_jump_hosts = Some(split_list(value));
+        }
     }
     if !closed {
         return Err("front matter opened with --- but never closed with ---".to_string());
@@ -276,6 +307,7 @@ pub fn parse_prompt(raw: &str) -> Result<Parsed, String> {
         body,
         allowed_tools,
         allowed_hosts,
+        allowed_jump_hosts,
     })
 }
 
@@ -429,6 +461,7 @@ mod tests {
                 text: "from the flag".into(),
                 allowed_tools: None,
                 allowed_hosts: None,
+                allowed_jump_hosts: None,
             }
         );
     }
@@ -466,6 +499,7 @@ mod tests {
                 text: "You are a parrot.".into(),
                 allowed_tools: Some(vec!["Write".into(), "Read".into()]),
                 allowed_hosts: None,
+                allowed_jump_hosts: None,
             }
         );
     }
@@ -491,6 +525,7 @@ mod tests {
             Identity::Omitted {
                 allowed_tools: None,
                 allowed_hosts: None,
+                allowed_jump_hosts: None,
             }
         );
 
@@ -503,6 +538,7 @@ mod tests {
             Identity::Omitted {
                 allowed_tools: Some(vec!["Read".into()]),
                 allowed_hosts: None,
+                allowed_jump_hosts: None,
             }
         );
 
@@ -514,6 +550,7 @@ mod tests {
                 text: "You are a parrot.".into(),
                 allowed_tools: None,
                 allowed_hosts: None,
+                allowed_jump_hosts: None,
             }
         );
 

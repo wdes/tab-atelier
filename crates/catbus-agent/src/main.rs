@@ -439,7 +439,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .with_judge(judge_model, monitor_prompt)
             // The identity file's `AllowedHosts`, enforced by the SSH tool itself: the tool needs it
             // mid-call, and the dispatcher is where a tool is reached.
-            .with_tools(tool_set.with_allowed_hosts(identity.allowed_hosts()))
+            // The identity file's limits on SSH: which destinations, and which jump hosts. Both
+            // travel together, so one cannot be applied while the other is forgotten.
+            .with_tools(tool_set.with_ssh_policy(tools::ssh::Policy {
+                allowed_hosts: identity.allowed_hosts().map(<[String]>::to_vec),
+                allowed_jump_hosts: identity.allowed_jump_hosts().map(<[String]>::to_vec),
+            }))
             .with_ansi(ansi)
             .with_identity(identity),
     );

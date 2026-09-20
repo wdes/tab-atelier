@@ -117,12 +117,12 @@ pub fn minimal_config() -> ToolConfig {
 pub struct ToolSet {
     specs: Vec<Value>,
     custom: BTreeMap<String, CustomTool>,
-    /// Hosts the `SSH` tool may connect to, from the identity file's `AllowedHosts`.
+    /// The operator's limits on where `SSH` may connect, from the identity file's front matter.
     ///
     /// On the tool set rather than checked in `main`, because the dispatcher is a method here and this
-    /// is the only piece of policy a tool itself has to consult mid-call. `None` means the file said
-    /// nothing, which is not the same as an empty list: no opinion versus nobody allowed.
-    allowed_hosts: Option<Vec<String>>,
+    /// is the only piece of policy a tool itself has to consult mid-call. See `ssh::Policy` for why
+    /// the two lists' absences mean different things.
+    policy: crate::tools::ssh::Policy,
 }
 
 impl ToolSet {
@@ -132,7 +132,7 @@ impl ToolSet {
         Self {
             specs: crate::tools::builtin_specs(),
             custom: BTreeMap::new(),
-            allowed_hosts: None,
+            policy: crate::tools::ssh::Policy::default(),
         }
     }
 
@@ -254,24 +254,24 @@ impl ToolSet {
             custom,
             // A set built from a config file has no host policy of its own: the identity
             // file supplies one, through `with_allowed_hosts`.
-            allowed_hosts: None,
+            policy: crate::tools::ssh::Policy::default(),
         })
     }
 
-    /// Restrict the `SSH` tool to these hosts.
+    /// Apply the operator's SSH limits.
     ///
-    /// Called with the identity file's `AllowedHosts`. Passing `None` leaves the tool unrestricted,
-    /// which is what a file that says nothing about hosts means.
+    /// Called once, with the identity file's parsed front matter. Taking the whole policy rather than
+    /// two arguments means a caller cannot apply one list and forget the other.
     #[must_use]
-    pub fn with_allowed_hosts(mut self, hosts: Option<&[String]>) -> Self {
-        self.allowed_hosts = hosts.map(<[String]>::to_vec);
+    pub fn with_ssh_policy(mut self, policy: crate::tools::ssh::Policy) -> Self {
+        self.policy = policy;
         self
     }
 
-    /// The hosts this set allows, if it restricts them at all. See the field.
+    /// The SSH limits in force. See the field.
     #[must_use]
-    pub fn allowed_hosts(&self) -> Option<&[String]> {
-        self.allowed_hosts.as_deref()
+    pub const fn ssh_policy(&self) -> &crate::tools::ssh::Policy {
+        &self.policy
     }
 
     /// The specs to send, in a stable order.
@@ -363,7 +363,7 @@ impl ToolSet {
             custom,
             // Carried through narrowing, so restricting the tools cannot silently drop the host
             // limit — the two are set independently and neither implies the other.
-            allowed_hosts: self.allowed_hosts.clone(),
+            policy: self.policy.clone(),
         })
     }
 

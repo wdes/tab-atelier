@@ -67,7 +67,8 @@ be used:
 
 An entry is either an exact host or a leading `*.` for a domain and its subdomains. `*.example.com`
 matches `api.example.com` and not `example.com` itself, deliberately: a wildcard that also covered
-the bare domain would be wider than it reads.
+the bare domain would be wider than it reads. There is no CIDR syntax — `10.0.0.0/8` is not a
+hostname and is refused — so a range has to be written as the names or domains in it.
 
 Leaving `AllowedHosts` out means no opinion — every host the session can reach is reachable.
 Writing it with no names at all (`AllowedHosts:`) means the opposite: no host is allowed.
@@ -78,6 +79,25 @@ list, so an agent reports it rather than trying to work around it.
 
 A port is not part of the policy. `AllowedHosts` is about where, so `dc1.servers.example.org` also
 permits `dc1.servers.example.org:2222`.
+
+### Routing through a jump host
+
+A second key grants hopping through another machine:
+
+    AllowedJumpHosts: bastion.example.org, *.bastions.example.org
+
+**The two keys disagree about being absent, deliberately.** No `AllowedHosts` means no destination
+was restricted; no `AllowedJumpHosts` means **no jump host is permitted at all**, and the refusal
+names the line to add. Destinations are a range, so silence has to mean unrestricted — a tool whose
+job is connecting somewhere cannot read silence as "nowhere". A jump host is a capability: a machine
+the connection passes *through* rather than another place to connect, so allowing destinations does
+not imply allowing a route to them. Capabilities are granted; ranges are limited.
+
+That is the safe direction. The permissive mistake would let an agent route a connection through a
+machine the destination list never mentioned.
+
+A jump host is checked against `AllowedJumpHosts` alone, not against `AllowedHosts` — it is a route,
+not a destination. `keyscan` cannot use one (it connects directly), and says so when asked.
 
 The rendering instructions are appended after your text and are not yours to replace: they
 describe the terminal, not the model, and a model told to write markdown into a terminal

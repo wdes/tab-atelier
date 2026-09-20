@@ -2,27 +2,55 @@
 
 //! Two things an agent may do over SSH, and nothing else.
 //!
-//! `command` runs one non-interactive command on a host. `keyscan` reports a host's public keys,
-//! and can be asked to trust them.
+//! `command` runs one non-interactive command on a host, optionally through a jump host. `keyscan`
+//! reports a host's public keys, and can be asked to trust them.
 //!
-//! **What can be set is deliberately tiny: a host, and whether the agent is forwarded.** No user,
-//! no `-o`, no `-i`, no `-J`, no `-L`/`-R`/`-D`. That is not a limitation to work around, it is the
-//! safety property. Each of those omissions closes something specific:
+//! **What can be set is deliberately tiny: a destination, a jump host, and whether the agent is
+//! forwarded.** No user, no `-o`, no `-i`, no tunnels. Each omission closes something specific:
 //!
-//! * **No `-o`** — an operator's own config can set `ProxyCommand`, which runs a *local* command to
-//!   reach the host. Without `-o` in reach, a proposed "host" cannot become a local execution.
-//! * **No `-J` and no tunnels** — a jump host reaches a machine nobody named, and a tunnel opens a
-//!   path into a network rather than running a command.
+//! * **No `-o`** — the model cannot hand ssh an option, so it cannot reach `ProxyCommand` or
+//!   `LocalCommand` through the argument vector itself.
+//! * **No tunnels** — no `-L`, `-R` or `-D`. A tunnel opens a path into a network rather than running
+//!   a command, and a refusal cannot describe a path.
 //! * **No `-i`** — which key is used stays the operator's business, decided by their own config and
 //!   agent. A tool that could name a key could use one the operator did not mean to offer.
 //! * **No user field** — the login is whatever the operator's config says, so this cannot be used to
 //!   try accounts.
 //!
-//! The host is the one remaining input, and it is where the argument injection would live: a string
-//! beginning `-` is read by ssh as an *option*. So a target is parsed into a host and an optional
-//! port, validated against what a hostname may contain, and a leading dash is refused outright
-//! rather than escaped — see [`Target::parse`]. Nothing is passed through a shell, and ssh never
-//! sees an argument this file did not construct.
+//! ## What "no `-o`" does *not* mean
+//!
+//! It does not mean a local command cannot run. **Your own ssh config still applies**, and a `Host`
+//! stanza with a `ProxyCommand` runs when that host is connected to — for the destination and for the
+//! jump host alike. An earlier version of this comment claimed otherwise, which was simply wrong:
+//! `ssh somehost` runs `somehost`'s `ProxyCommand` whether or not this tool passes any `-o`.
+//!
+//! That is your configuration doing what you wrote, and it is deliberately left alone. Passing
+//! `-oProxyCommand=none` would close it and would also break a bastion reachable only that way —
+//! a real setup, and one this repository is already thinking about in `docs/ssh-agent-proxy.md`. The
+//! guarantees this file actually offers are narrower, and worth stating exactly: **the model cannot
+//! add an option, and it cannot name a host your lists do not permit.** What your config does for a
+//! host you allowed is a decision you already made.
+//!
+//! ## The two lists, and why one is opt-out and the other opt-in
+//!
+//! A host is the only input that becomes an argument, so it is where the argument injection would
+//! live: a string beginning `-` is read by ssh as an *option*, which is why a leading dash is refused
+//! outright rather than escaped — no legitimate address starts with one. Beyond that, where a
+//! connection may go is the operator's to decide, and there are two separate questions:
+//!
+//! * **`AllowedHosts`** limits *destinations*. Absent means no destination was restricted, which is
+//!   what "the operator said nothing" has to mean for a tool whose basic job is connecting somewhere.
+//!   It is a range, so it is opt-out.
+//! * **`AllowedJumpHosts`** grants *jumping*. Absent means no jump host is permitted, and the refusal
+//!   names the key to add. It is opt-in because a jump host is an extra way to connect rather than
+//!   another destination: a machine the connection passes *through*, so allowing destinations does
+//!   not imply allowing a route to them. Capabilities are granted; ranges are limited. The safe
+//!   direction, since the permissive mistake would let an agent connect to a machine the destination
+//!   list never mentioned.
+//!
+//! Both lists take an exact host or a leading `*.` for a domain and its subdomains, and neither
+//! wildcard matches the bare domain. A jump host is checked against `AllowedJumpHosts` and not against
+//! `AllowedHosts`: it is a route, not a destination.
 //!
 //! Non-interactive means non-interactive: `-T` so no pseudo-terminal is requested and
 //! `BatchMode=yes` so ssh fails instead of prompting. An agent cannot answer a password prompt, and
@@ -32,7 +60,8 @@
 //! `StrictHostKeyChecking=yes` is passed explicitly, overriding a config that might say
 //! `accept-new`. The effect is that an unknown host fails, with an error pointing at `keyscan`;
 //! trusting a host is therefore always a deliberate act rather than a side effect of running a
-//! command.
+//! command. That holds for the jump host too: an unknown bastion fails before the destination is
+//! reached, which is the right order — the hop that cannot be verified is the one to stop at.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -60,18 +89,51 @@ const MAX_OUTPUT: usize = 16_000;
 /// not an address.
 const MAX_HOST_LEN: usize = 253;
 
-/// Run an SSH action, refused unless the host is permitted.
+/// The operator's limits, as the identity file's front matter states them.
 ///
-/// The check comes first, before anything is read from the input or any process started: a host the
-/// operator did not allow should not reach a connect attempt, an error message from ssh, or the
-/// network at all.
-pub async fn run_allowed(input: &serde_json::Value, cwd: &Path, allowed: Option<&[String]>) -> Result<String, String> {
+/// One value rather than two parameters, because the checks are always made together and a caller that
+/// passed one list without the other would be a bug waiting to happen. The two absences mean different
+/// things — see [`Target::permitted`] and [`Target::permits_jump`] — so they are kept as `Option`s
+/// rather than folded into empty `Vec`s.
+#[derive(Debug, Clone, Default)]
+pub struct Policy {
+    /// Destinations. `None` is no restriction.
+    pub allowed_hosts: Option<Vec<String>>,
+    /// Jump hosts. `None` is *no jump host permitted*: opt-in, unlike the destinations.
+    pub allowed_jump_hosts: Option<Vec<String>>,
+}
+
+/// Run an SSH action, refused unless the hosts it names are permitted.
+///
+/// The checks come first, before anything is read from the input beyond the host fields and before any
+/// process starts: a host the operator did not allow should not reach a connect attempt, an error
+/// message from ssh, or the network at all.
+///
+/// Both the destination and the jump are checked, and each against its own list — a routing hop is not
+/// a destination, so allowing an agent to reach a machine does not allow it to pass through one.
+pub async fn run_allowed(input: &serde_json::Value, cwd: &Path, policy: &Policy) -> Result<String, String> {
+    // Parsed before the permission checks so that a malformed host is reported as malformed rather
+    // than as unpermitted — the two are different problems and the second would be misleading.
     if let Some(host) = input.get("host").and_then(|v| v.as_str()) {
-        // Parsed before the permission check so that a malformed host is reported as malformed rather
-        // than as unpermitted — the two are different problems and the second would be misleading.
-        Target::parse(host)?.permitted(allowed)?;
+        Target::parse(host)?.permitted(policy.allowed_hosts.as_deref())?;
+    }
+    let jump = read_jump(input)?;
+    if let Some(jump) = &jump {
+        jump.permits_jump(policy.allowed_jump_hosts.as_deref())?;
     }
     run(input, cwd).await
+}
+
+/// Read and validate the `jump`, if one was asked for.
+///
+/// Validated by exactly the same parser as the destination, so the two cannot differ in what they
+/// accept — a jump host is an address in the same sense, and the dash guard matters just as much there
+/// (`-J -oProxyCommand=…` would otherwise be reachable through the jump).
+fn read_jump(input: &serde_json::Value) -> Result<Option<Target>, String> {
+    match input.get("jump").and_then(|v| v.as_str()).map(str::trim) {
+        None | Some("") => Ok(None),
+        Some(raw) => Target::parse(raw).map(Some).map_err(|e| format!("`jump`: {e}")),
+    }
 }
 
 pub async fn run(input: &serde_json::Value, _cwd: &Path) -> Result<String, String> {
@@ -89,10 +151,11 @@ pub async fn run(input: &serde_json::Value, _cwd: &Path) -> Result<String, Strin
         .get("forward_agent")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
+    let jump = read_jump(input)?;
 
     match action {
-        "command" => command(input, &target, forward_agent).await,
-        "keyscan" => keyscan(input, &target, forward_agent).await,
+        "command" => command(input, &target, jump.as_ref(), forward_agent).await,
+        "keyscan" => keyscan(input, &target, forward_agent, jump.is_some()).await,
         other => Err(format!("unknown action `{other}` — one of: command, keyscan")),
     }
 }
@@ -186,18 +249,11 @@ impl Target {
         }
     }
 
-    /// Whether an allow-list permits this target.
+    /// Whether the destination list permits this target.
     ///
-    /// `None` is the file saying nothing about hosts, which is not the same as an empty list: no
-    /// opinion versus nobody. An empty list denies everything, which is what a file that writes
+    /// `None` is the file saying nothing about destinations, which is not the same as an empty list:
+    /// no opinion versus nobody. An empty list denies everything, which is what a file that writes
     /// `AllowedHosts:` with no names has asked for.
-    ///
-    /// Two kinds of entry:
-    ///
-    /// * an exact host, compared without case — `dc1.servers.example.org`;
-    /// * a leading `*.` for a domain and its subdomains — `*.servers.example.org` matches
-    ///   `dc1.servers.example.org` but not `servers.example.org` itself, because a wildcard that also
-    ///   matched the bare domain is how a limit quietly becomes wider than it reads.
     ///
     /// The port is deliberately not part of the policy. A host list is about *where*, and a file that
     /// wanted to allow one port on a machine but not another would be describing a service rather
@@ -206,19 +262,7 @@ impl Target {
         let Some(allowed) = allowed else {
             return Ok(());
         };
-        let host = self.host.to_ascii_lowercase();
-        let matches = allowed.iter().any(|entry| {
-            let entry = entry.trim().to_ascii_lowercase();
-            entry.strip_prefix("*.").map_or_else(
-                // No wildcard: an exact host, compared without case.
-                || entry == host,
-                // `*.example.com` matches its subdomains and not `example.com` itself, because a
-                // wildcard that also matched the bare domain is how a limit quietly reads wider than
-                // it is.
-                |suffix| host.ends_with(&format!(".{suffix}")),
-            )
-        });
-        if matches {
+        if matches_list(&self.host, allowed) {
             return Ok(());
         }
         Err(format!(
@@ -227,12 +271,39 @@ impl Target {
              the operator's limit rather than something to work around — ask them to add the host if \
              it is needed.",
             self.display(),
-            if allowed.is_empty() {
-                "(empty — no host is allowed)".to_string()
-            } else {
-                allowed.join(", ")
-            }
+            render_list(allowed)
         ))
+    }
+
+    /// Whether the jump list grants this host.
+    ///
+    /// **Opt-in, unlike the destination list**: `None` permits no jump host at all, because jumping is
+    /// a capability rather than a range — a machine the connection passes through rather than another
+    /// place to connect. See the module doc for why the two lists disagree about absence.
+    ///
+    /// The refusal names the key to add, so the first attempt at a jump is a discoverable failure
+    /// rather than a dead end.
+    pub fn permits_jump(&self, allowed: Option<&[String]>) -> Result<(), String> {
+        match allowed {
+            Some(list) if matches_list(&self.host, list) => Ok(()),
+            Some(list) => Err(format!(
+                "`{}` is not in this session's AllowedJumpHosts, so this session may not route \
+                 through it. The list is: {}. A jump host is a machine the connection passes through \
+                 rather than a destination, so permitting one is a separate decision from permitting \
+                 where the session may go.",
+                self.display(),
+                render_list(list)
+            )),
+            None => Err(format!(
+                "this session may not use `{}` as a jump host, because no AllowedJumpHosts is set. \
+                 Jumping is opt-in: a jump host is a machine the connection passes through rather \
+                 than a destination, so it needs its own grant. Add to the identity file's front \
+                 matter:\n\n  AllowedJumpHosts: {}\n\nor ask the operator to. AllowedHosts does not \
+                 imply it, since allowing destinations is not the same as allowing a route to them.",
+                self.display(),
+                self.host
+            )),
+        }
     }
 
     /// How the target is named in a message the operator reads.
@@ -246,12 +317,43 @@ impl Target {
     }
 }
 
+/// Whether a host appears in a list of exact hosts and `*.` wildcards.
+///
+/// One matcher for both lists, so the two cannot drift into disagreeing about what `*.x` means —
+/// which would be a policy that reads the same and acts differently.
+///
+/// Two kinds of entry:
+///
+/// * an exact host, compared without case — `dc1.servers.example.org`;
+/// * a leading `*.` for a domain and its subdomains — `*.servers.example.org` matches
+///   `dc1.servers.example.org` but **not** `servers.example.org` itself, because a wildcard that also matched
+///   the bare domain is how a limit quietly becomes wider than it reads. The dot boundary matters for
+///   the same reason: `*.example.org` must not match `evil.example.org`.
+fn matches_list(host: &str, entries: &[String]) -> bool {
+    let host = host.to_ascii_lowercase();
+    entries.iter().any(|entry| {
+        let entry = entry.trim().to_ascii_lowercase();
+        entry
+            .strip_prefix("*.")
+            .map_or_else(|| entry == host, |suffix| host.ends_with(&format!(".{suffix}")))
+    })
+}
+
+/// A list as it reads in a message, with the empty case named rather than left blank.
+fn render_list(entries: &[String]) -> String {
+    if entries.is_empty() {
+        "(empty — nothing is allowed)".to_string()
+    } else {
+        entries.join(", ")
+    }
+}
+
 /// The argument vector for one `ssh`, ending at the destination.
 ///
 /// The caller appends the remote command, so this is what a test can assert on without a network: it
 /// is the whole of what ssh is told about *where* and *how*, and every flag in it is a decision
 /// written down rather than a default inherited from whatever config happens to be on the machine.
-fn ssh_args(target: &Target, forward_agent: bool, connect_timeout: u64) -> Vec<String> {
+fn ssh_args(target: &Target, jump: Option<&Target>, forward_agent: bool, connect_timeout: u64) -> Vec<String> {
     let mut args = vec![
         // No pseudo-terminal. A command run for an agent has nothing to render into, and asking for
         // a tty is how a command that expects one hangs.
@@ -265,9 +367,19 @@ fn ssh_args(target: &Target, forward_agent: bool, connect_timeout: u64) -> Vec<S
         format!("ConnectTimeout={connect_timeout}"),
         // Explicit, overriding a config that says `accept-new`: an unknown host must fail with an
         // error pointing at `keyscan`, so trust is an act rather than a side effect.
+        //
+        // Stated once and inherited by the jump hop: ssh applies the same options to the connection it
+        // makes to the bastion, so an unknown bastion fails before the destination is reached. That is
+        // the correct order — the hop that cannot be verified is the one to stop at.
         "-o".to_string(),
         "StrictHostKeyChecking=yes".to_string(),
     ];
+    // The jump host, as a `[user@]host[:port]` list. The user part is never set: the login is the
+    // operator's config, for the destination and for the hop alike.
+    if let Some(jump) = jump {
+        args.push("-J".to_string());
+        args.push(jump.display());
+    }
     if let Some(port) = target.port {
         args.push("-p".to_string());
         args.push(port.to_string());
@@ -277,7 +389,12 @@ fn ssh_args(target: &Target, forward_agent: bool, connect_timeout: u64) -> Vec<S
 }
 
 /// Run one command on the host.
-async fn command(input: &serde_json::Value, target: &Target, forward_agent: bool) -> Result<String, String> {
+async fn command(
+    input: &serde_json::Value,
+    target: &Target,
+    jump: Option<&Target>,
+    forward_agent: bool,
+) -> Result<String, String> {
     let remote = input
         .get("command")
         .and_then(|v| v.as_str())
@@ -297,7 +414,7 @@ async fn command(input: &serde_json::Value, target: &Target, forward_agent: bool
             Duration::from_secs(s).min(MAX_COMMAND_TIMEOUT)
         });
 
-    let mut args = ssh_args(target, forward_agent, CONNECT_TIMEOUT_SECS);
+    let mut args = ssh_args(target, jump, forward_agent, CONNECT_TIMEOUT_SECS);
     // The remote command is one argument, exactly as it would be on a command line. ssh hands it to
     // the host's shell unmodified, which is what makes a pipeline or a redirect work there — and is
     // also why nothing about the *local* invocation is a shell string.
@@ -346,9 +463,11 @@ async fn command(input: &serde_json::Value, target: &Target, forward_agent: bool
     let report = serde_json::json!({
         "host": target.display(),
         "command": remote,
-        // Reported because it changes what the remote command can reach: with the agent forwarded, a
-        // command on the host can use the operator's keys.
+        // Both reported because both change what the reader should assume about the result. With the
+        // agent forwarded, a command on the host can use the operator's keys; through a jump, the
+        // command ran on a machine reached by a route the operator had to grant separately.
         "agent_forwarded": forward_agent,
+        "via_jump": jump.map(Target::display),
         "exit_code": output.status.code(),
         "succeeded": output.status.success(),
         "wall_seconds": seconds,
@@ -359,7 +478,12 @@ async fn command(input: &serde_json::Value, target: &Target, forward_agent: bool
 }
 
 /// Report the host's public keys, and optionally trust them.
-async fn keyscan(input: &serde_json::Value, target: &Target, forward_agent: bool) -> Result<String, String> {
+async fn keyscan(
+    input: &serde_json::Value,
+    target: &Target,
+    forward_agent: bool,
+    asked_to_jump: bool,
+) -> Result<String, String> {
     let mut args = vec!["-T".to_string(), KEYSCAN_TIMEOUT_SECS.to_string()];
     if let Some(port) = target.port {
         args.push("-p".to_string());
@@ -443,6 +567,18 @@ async fn keyscan(input: &serde_json::Value, target: &Target, forward_agent: bool
         report.insert(
             "note_forward_agent".into(),
             serde_json::json!("keyscan opens no session, so `forward_agent` has no effect on it"),
+        );
+    }
+    if asked_to_jump {
+        // The same courtesy for `jump`: `ssh-keyscan` has no way to route through another host, and a
+        // caller who asked for one should be told it did not happen rather than assuming it did. It
+        // also matters for reading the result: these keys are the destination's own, seen directly.
+        report.insert(
+            "note_jump".into(),
+            serde_json::json!(
+                "keyscan connects directly and cannot route through a jump host, so `jump` had no \
+                 effect — the keys below came from the destination itself"
+            ),
         );
     }
 
@@ -624,13 +760,13 @@ pub fn spec() -> serde_json::Value {
     serde_json::json!({
         "name": "SSH",
         "description": "Two things over SSH, and nothing else may be configured. `command` runs one \
-                        non-interactive command on a host and returns its output. `keyscan` returns \
-                        a host's public keys, and with `trust: true` adds them to known_hosts. Only \
-                        a host and whether to forward the SSH agent can be set: no user, no extra \
-                        ssh options, no tunnels, no jump host, no key selection — so a jump to \
-                        another machine or a ProxyCommand is not reachable through this. It runs a \
-                        command on another machine, so it is judged in auto mode and refused in \
-                        plan-mode.",
+                        non-interactive command on a host and returns its output, optionally routed \
+                        through a jump host. `keyscan` returns a host's public keys, and with \
+                        `trust: true` adds them to known_hosts. Settable: a host, a jump host, and \
+                        whether to forward the SSH agent — no user, no extra ssh options, no tunnels, \
+                        no key selection. The host must be in the identity file's `AllowedHosts`, and \
+                        a jump host in its `AllowedJumpHosts`, which is opt-in. It runs a command on \
+                        another machine, so it is judged in auto mode and refused in plan-mode.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -638,6 +774,10 @@ pub fn spec() -> serde_json::Value {
                 "host": {
                     "type": "string",
                     "description": "A hostname, an IPv4 address, or either with a port: `host`, `10.0.0.1:2222`, `[2001:db8::1]:2222`. No user — the login comes from your own ssh config."
+                },
+                "jump": {
+                    "type": "string",
+                    "description": "Route through this host (ssh -J), `host` or `host:port`. It needs its own grant: the identity file must list it in `AllowedJumpHosts`, which is opt-in — `AllowedHosts` permits destinations, not routes to them. A jump is a machine the connection passes through. `keyscan` cannot use one and says so."
                 },
                 "forward_agent": {
                     "type": "boolean",
@@ -768,14 +908,14 @@ mod tests {
     #[test]
     fn the_ssh_arguments_state_every_choice_explicitly() {
         let target = Target::parse("dc1.example:2222").expect("parsed");
-        let args = ssh_args(&target, false, 10);
+        let args = ssh_args(&target, None, false, 10);
 
         // No terminal and no prompting: an agent cannot answer, so a prompt must be impossible.
         assert!(args.contains(&"-T".to_string()), "{args:?}");
         assert!(args.contains(&"BatchMode=yes".to_string()), "{args:?}");
         // Forwarding is stated either way, so a config that says `ForwardAgent yes` cannot decide it.
         assert!(args.contains(&"-a".to_string()), "off must be explicit: {args:?}");
-        let forwarded = ssh_args(&target, true, 10);
+        let forwarded = ssh_args(&target, None, true, 10);
         assert!(forwarded.contains(&"-A".to_string()), "{forwarded:?}");
         assert!(!forwarded.contains(&"-a".to_string()), "not both: {forwarded:?}");
         // Unknown hosts fail rather than being accepted, so trusting is a deliberate act.
@@ -807,7 +947,7 @@ mod tests {
     #[test]
     fn a_portless_target_gets_no_port_flag() {
         let target = Target::parse("host.example").expect("parsed");
-        let args = ssh_args(&target, false, 10);
+        let args = ssh_args(&target, None, false, 10);
         assert!(!args.contains(&"-p".to_string()), "{args:?}");
         assert_eq!(args.last().map(String::as_str), Some("host.example"), "{args:?}");
     }
@@ -919,23 +1059,45 @@ mod tests {
     }
 
     /// The schema says what may be set, and does not offer what may not.
+    ///
+    /// An address, a jump host and agent-forwarding are offered; a user, a key, an ssh option and a
+    /// tunnel are not. The list of property names is asserted exactly rather than by absence, so
+    /// adding a field means this test is edited deliberately — which is what should happen for
+    /// something that widens what the tool can be told.
     #[test]
-    fn the_schema_offers_only_a_host_and_forwarding() {
+    fn the_schema_offers_nothing_beyond_addresses_and_forwarding() {
         let spec = spec();
         assert_eq!(spec["name"], "SSH");
         let properties = spec["input_schema"]["properties"].as_object().expect("properties");
         let offered: Vec<&str> = properties.keys().map(String::as_str).collect();
         assert_eq!(
             offered,
-            ["action", "command", "forward_agent", "host", "timeout_secs", "trust"],
+            [
+                "action",
+                "command",
+                "forward_agent",
+                "host",
+                "jump",
+                "timeout_secs",
+                "trust"
+            ],
             "the schema must not offer a user, a key, or an ssh option"
         );
         assert_eq!(spec["input_schema"]["required"], serde_json::json!(["action", "host"]));
         // And the description says the omissions are the point, since a model reads it.
+        //
+        // "no jump host" was on this list until jumping was added. It is gone rather than kept, so the
+        // test states what is true now: the remaining omissions, and that a jump needs a grant of its
+        // own rather than riding on the destination list.
         let described = spec["description"].as_str().unwrap_or_default();
-        for phrase in ["no user", "no tunnels", "no jump host"] {
+        for phrase in ["no user", "no tunnels", "no key selection"] {
             assert!(described.contains(phrase), "should mention `{phrase}`: {described}");
         }
+        assert!(
+            described.contains("AllowedJumpHosts"),
+            "and that a jump is granted separately: {described}"
+        );
+        assert!(described.contains("AllowedHosts"), "as is the destination: {described}");
     }
 
     /// An unknown action is refused, naming the real ones.
@@ -1048,7 +1210,9 @@ mod tests {
         // An empty list denies everything, and says so rather than printing nothing.
         let empty: Vec<String> = Vec::new();
         let err = dc1.permitted(Some(&empty)).unwrap_err();
-        assert!(err.contains("empty — no host is allowed"), "{err}");
+        // "nothing is allowed" rather than "no host": the wording is shared with the jump list, where a
+        // host is not what is being denied.
+        assert!(err.contains("empty — nothing is allowed"), "{err}");
 
         // A port is not part of the policy: the list is about where, so an allowed host on another
         // port is still that host.
@@ -1074,7 +1238,10 @@ mod tests {
                 "command": "id"
             }),
             dir.path(),
-            Some(&allowed),
+            &Policy {
+                allowed_hosts: Some(allowed.clone()),
+                ..Policy::default()
+            },
         )
         .await
         .expect_err("must be refused");
@@ -1095,7 +1262,10 @@ mod tests {
                 "timeout_secs": 1
             }),
             dir.path(),
-            Some(&allowed),
+            &Policy {
+                allowed_hosts: Some(allowed.clone()),
+                ..Policy::default()
+            },
         )
         .await;
         // A machine with no route to `allowed.example` may fail either way; what matters is that any
@@ -1120,7 +1290,10 @@ mod tests {
             let err = run_allowed(
                 &serde_json::json!({"action": "command", "host": bad, "command": "id"}),
                 dir.path(),
-                Some(&allowed),
+                &Policy {
+                    allowed_hosts: Some(allowed.clone()),
+                    ..Policy::default()
+                },
             )
             .await
             .expect_err("must be refused");
@@ -1128,6 +1301,195 @@ mod tests {
                 !err.contains("AllowedHosts"),
                 "`{bad}` is malformed, not unpermitted: {err}"
             );
+        }
+    }
+
+    /// A jump host is granted, not limited: absent means none is permitted.
+    ///
+    /// This is the asymmetry with `AllowedHosts`, and it is the safety-relevant half. Destinations are
+    /// a *range* — silence has to mean unrestricted, since a tool whose job is connecting somewhere
+    /// cannot read silence as "nowhere" — while jumping is a *capability*, so silence means it was not
+    /// granted. Getting this backwards would let an agent route a connection through a machine the
+    /// destination list never mentioned.
+    #[test]
+    fn a_jump_host_needs_its_own_grant() {
+        let bastion = Target::parse("bastion.example").expect("parsed");
+        let listed = |hosts: &[&str]| -> Vec<String> { hosts.iter().map(|h| (*h).to_string()).collect() };
+
+        // **The asymmetry.** No jump list at all: refused, where no host list means allowed.
+        let err = bastion.permits_jump(None).unwrap_err();
+        assert!(err.contains("AllowedJumpHosts"), "{err}");
+        assert!(
+            err.contains("Jumping is opt-in"),
+            "the refusal should say why it is not implied: {err}"
+        );
+        // And it names the exact line to add, so the first attempt is a discoverable failure rather
+        // than a dead end.
+        assert!(
+            err.contains("AllowedJumpHosts: bastion.example"),
+            "the message should be copy-pasteable: {err}"
+        );
+        assert!(
+            err.contains("AllowedHosts does not imply it"),
+            "and should say what does not grant it: {err}"
+        );
+
+        // Granted: permitted.
+        assert!(bastion.permits_jump(Some(&listed(&["bastion.example"]))).is_ok());
+        // A wildcard, with the same dot-boundary rule as the destination list.
+        assert!(bastion.permits_jump(Some(&listed(&["*.example"]))).is_ok());
+        // A host that is not listed: refused, and the list is shown.
+        let err = bastion
+            .permits_jump(Some(&listed(&["other-bastion.example"])))
+            .unwrap_err();
+        assert!(err.contains("other-bastion.example"), "{err}");
+        assert!(err.contains("not in this session's AllowedJumpHosts"), "{err}");
+
+        // An empty list grants nothing, like every empty list.
+        let err = bastion.permits_jump(Some(&Vec::new())).unwrap_err();
+        assert!(err.contains("empty — nothing is allowed"), "{err}");
+
+        // A port is not part of the jump policy either, but the jump's own port is carried in the
+        // `-J` value — see the argv test.
+        let ported = Target::parse("bastion.example:2222").expect("parsed");
+        assert!(ported.permits_jump(Some(&listed(&["bastion.example"]))).is_ok());
+    }
+
+    /// The jump reaches the argv as `-J`, and its port rides along in that one value.
+    ///
+    /// `-J` takes a `[user@]host[:port]` list rather than a bare host, so the port has to be part of
+    /// the jump argument — a separate `-p` would set the *destination's* port, which is a different
+    /// thing and would look like it worked.
+    #[test]
+    fn a_jump_host_becomes_one_argument_carrying_its_own_port() {
+        let target = Target::parse("inner.example").expect("parsed");
+        let jump = Target::parse("bastion.example:2222").expect("parsed");
+
+        let plain = ssh_args(&target, None, false, 10);
+        assert!(
+            !plain.contains(&"-J".to_string()),
+            "no jump asked for means no -J: {plain:?}"
+        );
+
+        let routed = ssh_args(&target, Some(&jump), false, 10);
+        let at = routed.iter().position(|a| a == "-J").expect("a jump must produce -J");
+        assert_eq!(routed[at + 1], "bastion.example:2222", "{routed:?}");
+        // The destination is still last, so `-J`'s value cannot be mistaken for it.
+        assert_eq!(routed.last().map(String::as_str), Some("inner.example"), "{routed:?}");
+        // Nothing about the jump introduces a `-o`, an `-i` or a tunnel — the jump is an address in
+        // the same sense as the destination, passed through the same validation.
+        let options = routed
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| *a == "-o")
+            .filter_map(|(i, _)| routed.get(i + 1))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            options,
+            ["BatchMode=yes", "ConnectTimeout=10", "StrictHostKeyChecking=yes"],
+            "the jump must not add an option: {routed:?}"
+        );
+    }
+
+    /// A hostile jump is refused by the same parser as a hostile destination.
+    ///
+    /// `-J` takes a value that ssh splits on commas and at signs, so a jump beginning `-` would be an
+    /// injection point in its own right — `-J -oProxyCommand=…` is the shape to refuse.
+    #[tokio::test]
+    async fn a_hostile_jump_is_refused_before_anything_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = Policy {
+            allowed_hosts: Some(vec!["*.example".to_string()]),
+            // Even *granting* a hostile entry must not make it usable: the value is validated as an
+            // address first.
+            allowed_jump_hosts: Some(vec!["-oProxyCommand=id".to_string()]),
+        };
+        let err = run_allowed(
+            &serde_json::json!({
+                "action": "command",
+                "host": "inner.example",
+                "jump": "-oProxyCommand=id",
+                "command": "id"
+            }),
+            dir.path(),
+            &policy,
+        )
+        .await
+        .expect_err("must be refused");
+        assert!(
+            err.contains("`jump`:") && err.contains("may not begin with `-`"),
+            "the jump is malformed, and the message says which field: {err}"
+        );
+        assert!(
+            !err.contains("could not run ssh"),
+            "ssh must not have been invoked: {err}"
+        );
+    }
+
+    /// A jump that is not granted is refused before anything runs, and names what to add.
+    #[tokio::test]
+    async fn an_ungranted_jump_is_refused_with_the_key_to_add() {
+        let dir = tempfile::tempdir().unwrap();
+        // Destinations are restricted but no jump is granted: the case the asymmetry is about.
+        let policy = Policy {
+            allowed_hosts: Some(vec!["inner.example".to_string()]),
+            allowed_jump_hosts: None,
+        };
+        let err = run_allowed(
+            &serde_json::json!({
+                "action": "command",
+                "host": "inner.example",
+                "jump": "bastion.example",
+                "command": "id"
+            }),
+            dir.path(),
+            &policy,
+        )
+        .await
+        .expect_err("must be refused");
+        assert!(err.contains("AllowedJumpHosts"), "{err}");
+        assert!(err.contains("AllowedJumpHosts: bastion.example"), "{err}");
+        assert!(
+            !err.contains("could not run ssh"),
+            "ssh must not have been invoked: {err}"
+        );
+
+        // And an empty `jump` is not a jump: the field absent and the field blank mean the same, so a
+        // caller that always sends the key does not get refused for it.
+        let ok = run_allowed(
+            &serde_json::json!({
+                "action": "command",
+                "host": "inner.example",
+                "jump": "  ",
+                "command": "id",
+                "timeout_secs": 1
+            }),
+            dir.path(),
+            &policy,
+        )
+        .await;
+        if let Err(e) = ok {
+            assert!(
+                !e.contains("AllowedJumpHosts"),
+                "a blank jump is no jump, not an ungranted one: {e}"
+            );
+        }
+    }
+
+    /// The schema offers `jump` and says a grant is needed.
+    #[test]
+    fn the_schema_offers_a_jump() {
+        let spec = spec();
+        let properties = spec["input_schema"]["properties"].as_object().expect("properties");
+        assert!(properties.contains_key("jump"), "the jump must be settable");
+        let described = properties["jump"]["description"].as_str().unwrap_or_default();
+        assert!(
+            described.contains("AllowedJumpHosts"),
+            "and the schema must say a grant is needed: {described}"
+        );
+        // Still no user, no key, no option.
+        for forbidden in ["user", "identity", "key", "options", "tunnel", "proxy"] {
+            assert!(!properties.contains_key(forbidden), "`{forbidden}` must not be offered");
         }
     }
 }

@@ -20,7 +20,7 @@ mod packages;
 mod phpunit;
 mod read;
 mod spawn;
-mod ssh;
+pub mod ssh;
 mod tasks;
 mod write;
 
@@ -303,7 +303,7 @@ impl ToolSet {
                 if let Some(why) = gate.refusal("SSH") {
                     return Err(why.to_string());
                 }
-                ssh::run_allowed(input, cwd, self.allowed_hosts()).await
+                ssh::run_allowed(input, cwd, self.ssh_policy()).await
             }
             // Read-only, so never judged and never refused.
             "GitStatus" => git::status(input, cwd).await,
