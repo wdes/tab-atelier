@@ -122,6 +122,14 @@ Only the model is simulated.
 - **`disable`** / **`allow`** filter the built-in set. `"disable": ["Bash"]`
   removes shell access entirely; `allow` keeps only what it lists.
 - **`add`** contributes a tool the agent runs itself.
+
+  A custom tool may not take a built-in's name. The agent refuses to start if one
+  shadows the other, on the grounds that a familiar name with different behaviour
+  is worse than a refusal. The built-in names are `Read`, `Write`, `Edit`,
+  `FileTree`, `Bash`, `ListAgents`, `Delegate`, `Spawn`, `Tasks`, `PHPUnit`,
+  `Composer`, `Bun`, `GitStatus` and `GitCommit` — so the example's git tool is
+  `GitShortStatus`, and a config `add`ing a `GitStatus` of its own will not start.
+  Rename it, or add the built-in to `disable`.
 - **`judged`** defaults to `true`. Auto mode grades anything that executes
   unless the tool says otherwise, so the safe default is the default and a
   read-only tool states its own lower risk.

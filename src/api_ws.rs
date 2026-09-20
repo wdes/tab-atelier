@@ -1375,12 +1375,12 @@ mod tests {
     #[test]
     fn origin_ok_matching_host_accepted() {
         assert!(origin_ok(&req_with_headers(&[
-            ("origin", "https://example.org"),
-            ("host", "example.org"),
+            ("origin", "https://host.example.org"),
+            ("host", "host.example.org"),
         ])));
         assert!(origin_ok(&req_with_headers(&[
-            ("origin", "http://192.168.27.77:7890"),
-            ("host", "192.168.27.77:7890"),
+            ("origin", "http://192.0.2.10:7890"),
+            ("host", "192.0.2.10:7890"),
         ])));
     }
 
@@ -1388,16 +1388,16 @@ mod tests {
     fn origin_ok_mismatched_host_rejected() {
         assert!(!origin_ok(&req_with_headers(&[
             ("origin", "https://attacker.evil"),
-            ("host", "example.org"),
+            ("host", "host.example.org"),
         ])));
     }
 
     #[test]
     fn origin_ok_falls_back_to_forwarded_host_for_proxies() {
         assert!(origin_ok(&req_with_headers(&[
-            ("origin", "https://example.org"),
+            ("origin", "https://host.example.org"),
             ("host", "127.0.0.1:7890"),
-            ("x-forwarded-host", "example.org"),
+            ("x-forwarded-host", "host.example.org"),
         ])));
     }
 

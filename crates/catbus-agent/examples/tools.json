@@ -1,38 +1,49 @@
 {
-  "disable": ["Bash"],
-
+  "disable": [
+    "Bash"
+  ],
   "add": [
     {
-      "name": "GitStatus",
+      "name": "GitShortStatus",
       "description": "Show the working tree status: staged, unstaged and untracked changes, as `git status --short` prints them.",
       "schema": {
         "type": "object",
         "properties": {},
         "required": []
       },
-      "argv": ["git", "status", "--short"],
+      "argv": [
+        "git",
+        "status",
+        "--short"
+      ],
       "timeout_secs": 15,
       "judged": false
     },
-
     {
       "name": "GitLog",
-      "description": "Show recent commits, newest first. Optionally limit how many.",
+      "description": "Show recent commits, newest first, at most `max` of them. `max` is required: this format cannot express an optional flag that takes a value, because dropping one would leave the flag bare.",
       "schema": {
         "type": "object",
         "properties": {
           "max": {
             "type": "integer",
-            "description": "How many commits to show. Defaults to 10."
+            "description": "How many commits to show."
           }
         },
-        "required": []
+        "required": [
+          "max"
+        ]
       },
-      "argv": ["git", "log", "--oneline", "--max-count={max?}"],
+      "argv": [
+        "git",
+        "log",
+        "--oneline",
+        "--max-count",
+        "{max}"
+      ],
       "timeout_secs": 15,
       "judged": false
     },
-
     {
       "name": "CargoTest",
       "description": "Run the test suite for the current crate. Optionally filter by a substring of the test name.",
@@ -46,11 +57,14 @@
         },
         "required": []
       },
-      "argv": ["cargo", "test", "{filter?}"],
+      "argv": [
+        "cargo",
+        "test",
+        "{filter?}"
+      ],
       "timeout_secs": 300,
       "judged": true
     },
-
     {
       "name": "CargoCheck",
       "description": "Type-check the current crate without producing a binary. Faster than a full build.",
@@ -59,7 +73,10 @@
         "properties": {},
         "required": []
       },
-      "argv": ["cargo", "check"],
+      "argv": [
+        "cargo",
+        "check"
+      ],
       "timeout_secs": 300,
       "judged": true
     }
