@@ -1253,6 +1253,10 @@
     function connect() {
       // Clear any pending reconnect timer — we're connecting now.
       if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+      // Retire whatever we are replacing *before* opening another. An earlier socket left open
+      // stays alive and closes later, and that close used to arrive while the new socket was
+      // working — nulling it and marking the session down. See retireSocket().
+      retireSocket();
       let url;
       try { url = wsUrl(); }
       catch (e) { status.textContent = `bad url · ${e.message || e}`; return; }
@@ -1264,7 +1268,14 @@
         return;
       }
       ws.binaryType = "arraybuffer";
+      // The socket these handlers belong to, captured now: `ws` is reassigned by every later
+      // connect(), so a handler asking "am I still current?" by reading `ws` would always say yes.
+      // Comparing against this constant is what makes a stale event detectable.
+      const sock = ws;
       ws.onopen = () => {
+        // A socket that is no longer current opening is not news: connecting it must not clear the
+        // banner for a session whose own socket is still down, nor reset the backoff.
+        if (ws !== sock) return;
         reconnectAttempt = 0;
         status.textContent = `${TAB_NAME} · connected`;
         document.body.classList.remove("ws-down");
@@ -1273,6 +1284,9 @@
         sendFocus();
       };
       ws.onmessage = (ev) => {
+        // Output from a socket we have already replaced is out of order by definition, and painting
+        // it would interleave two sessions' bytes in one terminal.
+        if (ws !== sock) return;
         if (!(ev.data instanceof ArrayBuffer)) return; // ignore text frames
         const view = new Uint8Array(ev.data);
         if (view.length === 0) return;
@@ -1308,6 +1322,13 @@
         // race onclose's reconnect scheduling.
       };
       ws.onclose = (ev) => {
+        // **The bug.** This used to run for *any* socket's close, unconditionally: `ws = null`
+        // clobbered a live connection and the class marked a working session down, with nothing left
+        // to remove it — the live socket's onopen had already fired. The session then looked
+        // disconnected while still receiving output, and input went nowhere, because sends check
+        // `ws`. A close from a socket that is no longer current is not news: we replaced it on
+        // purpose and its own reconnect is already scheduled.
+        if (ws !== sock) return;
         ws = null;
         document.body.classList.add("ws-down");
         const banner = document.getElementById("ws-state-banner");
@@ -1336,9 +1357,28 @@
     }
 
     function scheduleReconnect() {
+      // Clear first. The 1008 branch above assigns `reconnectTimer` directly, so without this a
+      // lock retry and a normal retry could both be pending and both fire, opening two sockets — and
+      // the older one, left open, is what produced the stale close this file now guards against.
+      // One timer, one reconnect.
+      if (reconnectTimer) { clearTimeout(reconnectTimer); }
       reconnectAttempt = Math.min(reconnectAttempt + 1, 6);
       const delayMs = Math.min(1000 * 2 ** (reconnectAttempt - 1), 30000);
       reconnectTimer = setTimeout(connect, delayMs);
+    }
+
+    // Close the socket we are about to replace, detaching its handlers first so its close cannot
+    // reach the state machine at all. Belt to the `ws !== sock` guards' braces: those make a stale
+    // event harmless, this stops the socket existing to produce one.
+    function retireSocket() {
+      const old = ws;
+      if (!old) return;
+      ws = null;
+      old.onopen = null;
+      old.onmessage = null;
+      old.onerror = null;
+      old.onclose = null;
+      try { old.close(); } catch (e) { console.warn("retire:", e); }
     }
 
     if (!READ_ONLY) {

@@ -59,8 +59,22 @@ if ! command -v node >/dev/null 2>&1; then
   exit 1
 fi
 if (./crates/tab-atelier-proxy/web/smoke.mjs); then
-  printf '%s\n\n%s\n' '--- ok: dashboard renders' 'web-build: ok'
+  printf '%s\n' '--- ok: dashboard renders'
 else
   printf '%s\n\n%s\n' '--- FAILED: dashboard renders' 'web-build: FAILED' >&2
+  exit 1
+fi
+
+# The tab viewer's reconnect logic, driven in a stubbed browser.
+#
+# Here for the same reason as the render check above: it cannot fail a compile. The bug it guards
+# against — a superseded socket's close marking a live session down, so the viewer said "connection
+# lost" while output kept arriving and input went nowhere — type-checks, loads, and looks correct.
+# Only driving it shows the difference.
+printf '\n=== viewer reconnects\n'
+if (./assets/reconnect.mjs); then
+  printf '%s\n\n%s\n' '--- ok: viewer reconnects' 'web-build: ok'
+else
+  printf '%s\n\n%s\n' '--- FAILED: viewer reconnects' 'web-build: FAILED' >&2
   exit 1
 fi
