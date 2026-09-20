@@ -71,6 +71,13 @@ def read_tasks(home, cwd):
         return []
 
 
+# Every cwd a scenario has created, so cleanup removes what was actually made rather
+# than deriving paths from scenario names. The two differ — `identity_and_allowed_tools`
+# works in `identity_allowed` — and a derived path silently missed it, which is how one
+# artifact survived the first version of `cleanup`.
+CREATED_CWDS = []
+
+
 def agent_home(name):
     """The real HOME, and a scenario-specific working directory.
 
@@ -88,6 +95,8 @@ def agent_home(name):
     cwd = os.path.join(ROOT, name, "cwd")
     shutil.rmtree(os.path.join(ROOT, name), ignore_errors=True)
     os.makedirs(cwd, exist_ok=True)
+    if cwd not in CREATED_CWDS:
+        CREATED_CWDS.append(cwd)
     return home, cwd
 
 
@@ -588,7 +597,37 @@ def main():
     passed = sum(1 for r in results if r.get("pass"))
     print("-" * 100)
     print(f"{passed}/{len(results)} scenarios passed")
+    cleanup(names)
     return 0 if passed == len(results) else 1
+
+
+def cleanup(_names=None):
+    """Remove what the run wrote outside its own scratch directory.
+
+    The scenarios use the operator's real `$HOME`, so the agent resolves its relay the
+    way a tab does — which means the transcripts and task lists land in the operator's
+    real project and state directories. Nothing else would remove them, and leaving them
+    accumulates: one scenario's transcript is indistinguishable from a session the
+    operator actually had, which is worse than clutter.
+
+    Scoped by the marker every scenario cwd carries, so only this run's artifacts go.
+    The paths are computed with the same escaping the agent uses, rather than searched
+    for — a search that guesses is how this harness earlier mistook a working agent for
+    a broken one.
+    """
+    home = os.path.expanduser("~")
+    removed = 0
+    for cwd in CREATED_CWDS:
+        projects = os.path.join(home, ".claude", "projects", escape_cwd(cwd))
+        if os.path.isdir(projects):
+            shutil.rmtree(projects)
+            removed += 1
+        tasks = os.path.join(home, ".local", "state", "tab-atelier", "agent-tasks", f"{escape_cwd(cwd)}.json")
+        if os.path.isfile(tasks):
+            os.remove(tasks)
+            removed += 1
+    if removed:
+        log(f"cleaned {removed} artifact(s) from the real HOME")
 
 
 if __name__ == "__main__":
