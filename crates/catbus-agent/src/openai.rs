@@ -209,6 +209,31 @@ struct ChatUsage {
     prompt_tokens: u64,
     #[serde(default)]
     completion_tokens: u64,
+    /// Cached prompt tokens, as the OpenAI-compatible convention spells them.
+    ///
+    /// Two spellings are in the wild — `prompt_tokens_details.cached_tokens` from `OpenAI`, and a
+    /// flat `cached_tokens` from several compatible services — so both are read and either is
+    /// accepted. Services that do not cache simply omit them.
+    #[serde(default)]
+    cached_tokens: u64,
+    #[serde(default)]
+    prompt_tokens_details: Option<PromptTokensDetails>,
+}
+
+#[derive(Deserialize, Default)]
+struct PromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: u64,
+}
+
+impl ChatUsage {
+    /// The cached prompt tokens, from whichever field carried them.
+    fn cached_tokens(&self) -> u64 {
+        // The nested form wins when both are present, being the one OpenAI documents.
+        self.prompt_tokens_details
+            .as_ref()
+            .map_or(self.cached_tokens, |d| d.cached_tokens.max(self.cached_tokens))
+    }
 }
 
 /// Fold the first choice of a chat-completions response into the
@@ -248,6 +273,11 @@ pub fn into_messages_resp(resp: ChatResp) -> MessagesResp {
         usage: Usage {
             input_tokens: resp.usage.prompt_tokens,
             output_tokens: resp.usage.completion_tokens,
+            // OpenAI-compatible services report cached prompt tokens when they support caching;
+            // the field is optional and absent on most. Passed through so the cost arithmetic
+            // sees the same shape wherever the turn came from.
+            cache_read_input_tokens: resp.usage.cached_tokens(),
+            cache_creation_input_tokens: 0,
         },
     }
 }

@@ -393,11 +393,32 @@ impl Session {
     /// Persist cumulative token usage to a `{id}.tokens.json` sidecar
     /// alongside the transcript. Written after every prompt so
     /// tab-atelier can poll it from the session's project dir.
-    pub fn save_tokens(&self, input: u64, output: u64) -> Result<(), SessionError> {
+    /// What this session has already spent, read back from its sidecar.
+    ///
+    /// `None` for a fresh session, or for one whose sidecar is missing or unreadable — every
+    /// caller treats that as "nothing spent yet", which is the right default for a file that
+    /// only ever adds to itself.
+    ///
+    /// This is what makes a resume a continuation rather than a restart: without it, reopening a
+    /// session showed it having spent nothing, and the running totals in the status lines
+    /// started again from zero while the transcript behind them said otherwise.
+    #[must_use]
+    pub fn load_tokens(&self) -> Option<serde_json::Value> {
+        let path = self.project_dir.join(format!("{}.tokens.json", self.id));
+        let raw = std::fs::read_to_string(&path).ok()?;
+        serde_json::from_str(&raw).ok()
+    }
+
+    /// `input` and `output` stay at the top level because tab-atelier reads them there, and its
+    /// reader defaults a missing key to zero — so the grouped cost rides *beside* them in a
+    /// `cost` object rather than replacing them. A reader that does not know about `cost` sees
+    /// exactly the file it saw before, and one that does gets the amounts per currency.
+    pub fn save_tokens(&self, input: u64, output: u64, cost: &serde_json::Value) -> Result<(), SessionError> {
         let path = self.project_dir.join(format!("{}.tokens.json", self.id));
         let json = serde_json::to_string(&serde_json::json!({
             "input": input,
             "output": output,
+            "cost": cost,
         }))
         .expect("token JSON is always valid");
         std::fs::write(&path, json)?;

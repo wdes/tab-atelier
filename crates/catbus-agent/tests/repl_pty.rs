@@ -292,7 +292,11 @@ fn a_typo_is_treated_as_a_prompt_not_a_command() {
     // a prompt rather than as a command. Asserting on the connection error rather
     // than on a mode name is deliberate: it distinguishes "reached the model
     // path" from "silently ran a slash command".
-    let (_, seen) = type_and_expect("/automatic", "error");
+    // Waits for `error:` and not `error`: the needle is what the harness blocks on, and the word
+    // alone matches other lines — a log entry about a failed request, say — so the wait would
+    // return before the REPL had said anything, and the assertion below would then be reading
+    // output that was still arriving. The colon is what makes this the REPL's own line.
+    let (_, seen) = type_and_expect("/automatic", "error:");
     assert!(
         seen.contains("error:"),
         "a near-miss command should have been sent as a prompt; output was:\n{seen}"
@@ -331,13 +335,20 @@ const REPLY_WITH_USAGE: &str = r#"{
 /// The body has to be drained, not just the headers: the request carries the
 /// whole conversation and tool specs, and answering before it is fully read can
 /// reset the connection instead of replying.
-fn read_request(stream: &mut TcpStream) {
+/// Read one HTTP request, returning it as text.
+///
+/// The text is what lets a caller tell the app's startup price fetch (`GET`) from a turn
+/// (`POST`) — both arrive on the same port, and answering only one of them is the difference
+/// between a test that exercises a turn and one that answers the wrong request.
+fn read_request(stream: &mut TcpStream) -> String {
     let mut buf = Vec::new();
     let mut chunk = [0_u8; 8192];
     let header_end = loop {
-        let Ok(n) = stream.read(&mut chunk) else { return };
+        let Ok(n) = stream.read(&mut chunk) else {
+            return String::new();
+        };
         if n == 0 {
-            return;
+            return String::new();
         }
         buf.extend_from_slice(&chunk[..n]);
         if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
@@ -356,12 +367,15 @@ fn read_request(stream: &mut TcpStream) {
         })
         .unwrap_or(0);
     while buf.len() < header_end + length {
-        let Ok(n) = stream.read(&mut chunk) else { return };
+        let Ok(n) = stream.read(&mut chunk) else {
+            break;
+        };
         if n == 0 {
-            return;
+            break;
         }
         buf.extend_from_slice(&chunk[..n]);
     }
+    String::from_utf8_lossy(&buf).into_owned()
 }
 
 /// Serve one reply, after `delay`, and return the port.
@@ -372,10 +386,27 @@ fn spawn_delayed_relay(body: &'static str, delay: Duration) -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     std::thread::spawn(move || {
-        // One request is enough: a successful reply ends the turn, so the client
-        // makes exactly one.
-        if let Ok((mut stream, _)) = listener.accept() {
-            read_request(&mut stream);
+        // One *turn* is enough — a successful reply ends it — but the app makes two requests: a
+        // price fetch at startup, then the turn. So the loop accepts until the canned body has
+        // been served, and answers the price fetch without consuming it. Skipping this is how the
+        // GET ended up eating the only reply and the turn never finished.
+        let mut served = false;
+        while !served {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let raw = read_request(&mut stream);
+            if raw.starts_with("GET ") {
+                let prices = MOCK_PRICES;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
+                     connection: close\r\n\r\n{prices}",
+                    prices.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+                continue;
+            }
             std::thread::sleep(delay);
             let response = format!(
                 "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
@@ -383,10 +414,33 @@ fn spawn_delayed_relay(body: &'static str, delay: Duration) -> u16 {
             );
             let _ = stream.write_all(response.as_bytes());
             let _ = stream.flush();
+            served = true;
         }
     });
     port
 }
+
+/// The price list the mock serves for `GET /v1/models`.
+///
+/// Two models in two currencies, so the totals a session accumulates can be shown to group rather
+/// than to add: a session that used one reply from each has spent dollars and euros, and no single
+/// figure expresses that. The ids match the `model` the canned replies report, so a reply's model
+/// is one this catalog prices.
+const MOCK_PRICES: &str = r#"{
+    "models": [
+        { "id": "claude-sonnet-4-6", "name": "Claude Sonnet (mock)",
+          "amounts": [
+            { "currency": "USD", "unit_tokens": 1000000, "kind": "input", "price": 3.0 },
+            { "currency": "USD", "unit_tokens": 1000000, "kind": "output", "price": 15.0 },
+            { "currency": "USD", "unit_tokens": 1000000, "kind": "cache_read", "price": 0.3 }
+          ] },
+        { "id": "deepseek-flash", "name": "DeepSeek flash (mock)",
+          "amounts": [
+            { "currency": "EUR", "unit_tokens": 1000000, "kind": "input", "price": 2.0 },
+            { "currency": "EUR", "unit_tokens": 1000000, "kind": "output", "price": 10.0 }
+          ] }
+    ]
+}"#;
 
 /// The transcript as the test sees it, with colour escapes removed.
 ///
@@ -536,61 +590,146 @@ const REPLY_WITH_TABLE: &str = r###"{
     "usage": { "input_tokens": 10, "output_tokens": 10 }
 }"###;
 
-/// A table the model wrote reaches the screen as copy-pasteable markdown.
+/// The screen a terminal would be showing, given what the app wrote to it.
 ///
-/// The integration half of the renderer's unit tests, and it asserts a different
-/// thing on purpose. **Alignment cannot be checked here**: what a pty capture holds is
-/// ratatui's *diff stream*, not a screen. ratatui writes only the cells that changed,
-/// so a space that was already a space is never re-sent — the capture reads
-/// `makemeatable` for `make me a table` — and a repaint interleaves old and new frames
-/// with carriage returns. Comparing columns in that stream measures the encoder, not
-/// the screen. Column alignment is therefore asserted in `tui::markdown`'s unit tests,
-/// where the rendered lines are values rather than bytes.
+/// This is the point of the test below being worth anything. A pty capture is not a picture of a
+/// terminal: ratatui writes only the cells that changed since its last frame, and repaints by
+/// moving an absolute cursor, so the raw bytes contain no spaces that were already spaces — a
+/// typed `make me a table` arrives as `makemeatable` — and a repaint puts the old and new frame on
+/// one line separated by a carriage return. Asserting on that measures the encoder, not the
+/// screen, which is why the earlier version of this test could not check alignment at all and
+/// said so in its own doc comment.
 ///
-/// What a stream *can* prove, and what this pins: the reply goes through the renderer
-/// in the real binary (the heading marks are gone), the table's rows and values reach
-/// the screen, and what is emitted is pipes rather than box-drawing — which is exactly
-/// the copy-paste property, since box-drawing characters would render just as well and
-/// paste as mojibake.
+/// Feeding the bytes through a real VT parser instead gives the thing a person would be looking
+/// at: cells at positions, after every move and erase has been applied. A utility complained
+/// about the weak version of this test; this is the answer to it.
+///
+/// `rows` is deliberately larger than the pty's. The app draws an inline viewport from the size it
+/// is told, and everything above it is pushed into scrollback with `insert_before` — so on an
+/// emulator of exactly 24 rows the table would scroll out of the visible area and the assertion
+/// would be reading blank space. Emulating a taller screen keeps the whole session present without
+/// changing what the app renders.
+fn screen_of(captured: &str, rows: u16, cols: u16) -> Vec<String> {
+    let mut parser = vt100::Parser::new(rows, cols, 0);
+    parser.process(captured.as_bytes());
+    let screen = parser.screen();
+    // `size` rather than `rows`/`cols`: `rows` counts scrollback as well, and there is none here.
+    let (emulated_rows, emulated_cols) = screen.size();
+    (0..emulated_rows)
+        .map(|row| {
+            let line: String = (0..emulated_cols)
+                .map(|col| screen.cell(row, col).map_or(" ", vt100::Cell::contents))
+                .collect();
+            line.trim_end().to_owned()
+        })
+        .collect()
+}
+
+/// A table the model wrote must be **seen** as an aligned table, and paste as markdown.
+///
+/// Two properties that pull against each other, which is why they are asserted together:
+/// box-drawing characters would align beautifully and paste as mojibake, and raw markdown pastes
+/// perfectly and reads as a wall of pipes. Padding the cells and keeping the pipes is meant to
+/// satisfy both, and only a screen can show that it does.
 #[test]
-fn a_markdown_table_reaches_the_screen_as_pastes_back_markdown() {
+fn a_markdown_table_is_aligned_on_screen_and_pastes_back_as_markdown() {
     let port = spawn_delayed_relay(REPLY_WITH_TABLE, Duration::from_millis(0));
     let (ok, seen) = type_and_expect_at(port, &[], "make me a table", "Done.");
     assert!(ok, "the reply should have reached the screen:\n{seen}");
 
-    let plain = strip_ansi(&seen);
-
-    // The renderer ran: the heading's marks are gone and its text is present.
-    assert!(plain.contains("Results"), "the heading text should be shown:\n{plain}");
+    // The screen, after every cursor move and erase has been applied.
+    let screen = screen_of(&seen, 200, 80);
+    let rows: Vec<&str> = screen
+        .iter()
+        .map(String::as_str)
+        .filter(|line| line.trim_start().starts_with('|'))
+        .collect();
     assert!(
-        !plain.contains("##"),
-        "the heading marks should be consumed by the renderer, not printed:\n{plain}"
+        rows.len() >= 4,
+        "the header, the rule and the data rows should be on screen; the whole screen was:\n{}",
+        screen.join("\n")
     );
 
-    // The table arrived as pipes, and with its values, so a reader can select it.
-    let pipes = plain.matches('|').count();
-    assert!(
-        pipes >= 8,
-        "the table should be on screen as pipes, found {pipes}:\n{plain}"
-    );
-    for value in ["Name", "Count", "Note", "alpha", "beta", "gamma", "333"] {
-        assert!(plain.contains(value), "{value:?} is missing from:\n{plain}");
+    // --- aligned on screen -------------------------------------------------
+    // Every pipe lands in the same column in every row. Measured in characters, since the padding
+    // is a character count: a byte index would report a misalignment that is not on the screen.
+    let columns = |row: &str| -> Vec<usize> {
+        row.chars()
+            .enumerate()
+            .filter(|(_, c)| *c == '|')
+            .map(|(i, _)| i)
+            .collect()
+    };
+    let want = columns(rows[0]);
+    assert_eq!(want.len(), 4, "three columns means four pipes: {:?}", rows[0]);
+    for row in &rows {
+        assert_eq!(
+            columns(row),
+            want,
+            "columns must line up across every row:\n{}\n{}",
+            rows.join("\n"),
+            cells_shown(row)
+        );
     }
 
-    // And *not* as box-drawing, which is the copy-paste half of the requirement:
-    // those characters render beautifully and paste as mojibake, so seeing none is
-    // what makes the block safe to select and reuse.
+    // --- and pastes back as markdown ---------------------------------------
+    assert!(
+        rows.iter().any(|r| r.contains("---")),
+        "the rule row survives, which is what makes the selection markdown:\n{}",
+        rows.join("\n")
+    );
+    for row in &rows {
+        assert_eq!(row.matches('|').count(), 4, "each row is still a table row: {row}");
+    }
+    // Box-drawing would satisfy the alignment above and break this: it renders as a table and
+    // pastes as characters nobody can reuse.
     for glyph in [
         '\u{250c}', '\u{2500}', '\u{252c}', '\u{2510}', '\u{2502}', '\u{2514}', '\u{2534}', '\u{2518}',
     ] {
         assert!(
-            !plain.contains(glyph),
-            "box-drawing {glyph:?} would not survive a paste:\n{plain}"
+            !rows.iter().any(|r| r.contains(glyph)),
+            "box-drawing {glyph:?} would not survive a paste:\n{}",
+            rows.join("\n")
         );
     }
 
-    // The prose on both sides of the table is printed too.
-    assert!(plain.contains("Done."), "the text after the table:\n{plain}");
+    // --- the values and the prose around them ------------------------------
+    let screen_text = screen.join("\n");
+    for value in [
+        "Name",
+        "Count",
+        "Note",
+        "alpha",
+        "beta",
+        "gamma",
+        "333",
+        "second, longer",
+    ] {
+        assert!(
+            screen_text.contains(value),
+            "{value:?} is missing from the screen:\n{screen_text}"
+        );
+    }
+    assert!(
+        screen_text.contains("Results"),
+        "the heading text is shown:\n{screen_text}"
+    );
+    assert!(
+        !screen_text.contains("##"),
+        "the heading's marks were consumed by the renderer:\n{screen_text}"
+    );
+    assert!(
+        screen_text.contains("Done."),
+        "the text after the table is printed:\n{screen_text}"
+    );
+}
+
+/// Show a row's cells with their padding made visible, for a failure message.
+///
+/// A failing alignment assertion is otherwise almost impossible to read: the two rows look
+/// identical in a terminal dump and differ by one space somewhere in the middle.
+fn cells_shown(row: &str) -> String {
+    format!("{row:?}")
 }
 
 /// The colour flags still change what the *renderer* does, which is all they do now.

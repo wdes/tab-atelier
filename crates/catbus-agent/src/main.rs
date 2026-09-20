@@ -27,6 +27,7 @@ use clap::Parser;
 mod agent;
 mod ansi;
 mod cache;
+mod cost;
 mod guard;
 mod identity;
 mod openai;
@@ -286,6 +287,26 @@ fn resolve_tools(args: &Args) -> Result<(tools::ToolSet, identity::Identity), Bo
     Ok((narrowed, identity))
 }
 
+/// Ask the relay what it charges, without making the session wait for the answer.
+///
+/// In the background on purpose. A price list is an enhancement, and blocking on one before the
+/// session can be typed into is the wrong trade: against an endpoint that black-holes rather than
+/// refusing — a firewall, a typo'd host — the wait is the client's whole connect timeout, and the
+/// operator stares at a session that has not started for reasons nothing on screen explains. Found
+/// by a test that types at a REPL whose relay is a dead port: the prompt simply never appeared.
+///
+/// Until it lands, the totals show tokens with no amounts — the same state as a relay that serves
+/// no prices at all — so nothing waits on it and nothing depends on it succeeding. It is logged at
+/// `info`, because a relay without one is not a fault.
+fn fetch_prices_in_background(agent: &Arc<agent::Agent>) {
+    let agent = Arc::clone(agent);
+    tokio::spawn(async move {
+        if let Err(why) = agent.fetch_prices().await {
+            log::info!("no prices available: {why}");
+        }
+    });
+}
+
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     // REPL mode shares the tab with stdout, so even "to stderr" logs
@@ -420,6 +441,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .with_ansi(ansi)
             .with_identity(identity),
     );
+
+    fetch_prices_in_background(&agent);
 
     // An explicit mode wins over the one the session was last left in. Applied
     // here rather than in `Agent::new`, because the flag belongs to this launch

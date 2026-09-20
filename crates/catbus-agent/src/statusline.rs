@@ -60,6 +60,64 @@ pub const fn mode_label(gate: crate::tools::Gate) -> &'static str {
     }
 }
 
+/// What the session has cost, and the model it is running as.
+///
+/// One figure per currency, never added together: a session that used two providers billed in two
+/// currencies has two totals, and a single number would be a lie about which. The currency code
+/// stays on each amount because a bare number invites being read as some currency that has not been
+/// named.
+///
+/// Two things are said rather than hidden when they apply. With no prices at all — a relay that
+/// serves none, or a model the catalog does not describe — the line says `no prices` instead of
+/// showing `0.00000`, because an unknown price and a price of zero mean opposite things and the
+/// second is what a zero implies. And tokens no price covered are counted out loud, so a total that
+/// looks low has its explanation on screen rather than inviting the reader to doubt the arithmetic.
+#[must_use]
+pub fn cost_line(model: Option<&str>, amounts: &[(String, f64)], unpriced: u64, width: usize) -> String {
+    let mut out = String::new();
+    if let Some(model) = model.filter(|m| !m.is_empty()) {
+        out.push_str(model);
+    }
+
+    let money = if amounts.is_empty() {
+        if unpriced > 0 {
+            // Named as unpriced rather than charged: the tokens were counted, and no rate is known
+            // for them.
+            format!("no price for {} tokens", crate::statusline::thousands(unpriced))
+        } else {
+            String::new()
+        }
+    } else {
+        amounts
+            .iter()
+            .map(|(currency, amount)| format!("{currency} {amount:.5}"))
+            .collect::<Vec<_>>()
+            .join("  ")
+    };
+
+    if money.is_empty() {
+        return out;
+    }
+    if !out.is_empty() {
+        out.push_str("   ");
+    }
+    if !amounts.is_empty() && unpriced > 0 {
+        // Both halves matter: what was charged, and what could not be. Built as one string and
+        // pushed once rather than `push_str(&format!(..))`, which the lints prefer against.
+        let note = format!("{money}  (+{} tokens unpriced)", crate::statusline::thousands(unpriced));
+        out.push_str(&note);
+    } else {
+        out.push_str(&money);
+    }
+
+    // Wrapped rather than cut: half a cost line is worse than a long one, and the caller has
+    // already put the tokens on their own line above.
+    if out.chars().count() > width {
+        return out;
+    }
+    out
+}
+
 /// The totals line: tokens left, mode right, padded to `width`.
 ///
 /// Right-alignment is done by padding rather than a cursor-move escape, so the

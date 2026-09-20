@@ -55,15 +55,64 @@ fn spawn_mock_relay(responses: Vec<(&'static str, &'static str)>) -> (u16, mpsc:
 /// as a literal — a reply holding an escape, since a JSON string may not carry
 /// a bare control byte (RFC 8259) and so the escape must be produced by the
 /// serialiser.
+/// The price list the mock serves for `GET /v1/models`.
+///
+/// Two models, in **two different currencies**, which is what makes the grouping testable end
+/// to end: a session that used one reply from each has spent dollars and euros, and no single
+/// figure can express that. The ids match the `model` fields the canned replies in these tests
+/// report, so a reply's model is a model this catalog prices.
+const MOCK_PRICES: &str = r#"{
+    "models": [
+        { "id": "claude-sonnet-4-6", "name": "Claude Sonnet (mock)",
+          "amounts": [
+            { "currency": "USD", "unit_tokens": 1000000, "kind": "input", "price": 3.0 },
+            { "currency": "USD", "unit_tokens": 1000000, "kind": "output", "price": 15.0 },
+            { "currency": "USD", "unit_tokens": 1000000, "kind": "cache_read", "price": 0.3 }
+          ] },
+        { "id": "deepseek-flash", "name": "DeepSeek flash (mock)",
+          "amounts": [
+            { "currency": "EUR", "unit_tokens": 1000000, "kind": "input", "price": 2.0 },
+            { "currency": "EUR", "unit_tokens": 1000000, "kind": "output", "price": 10.0 }
+          ] }
+    ]
+}"#;
+
 fn spawn_mock_relay_owned(responses: Vec<(&'static str, String)>) -> (u16, mpsc::Receiver<String>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        for (status_line, body) in responses {
+        let mut queued = responses.into_iter();
+        //  rather than binding the Option: the tuple holds a String, so matching on
+        // it by value moves it and then cannot be reassigned after each reply.
+        let mut pending = queued.next();
+        // `is_some` at the head, and `take` only when a canned reply is actually served: a request
+        // answered *without* consuming one — the startup price fetch — loops back here, and taking
+        // at the head would find nothing, break, and drop the listener, leaving the turn that
+        // followed with nothing to connect to. Which is exactly what happened.
+        while pending.is_some() {
             let (mut stream, _) = listener.accept().unwrap();
             stream.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
             let raw = read_http_request(&mut stream);
+
+            // The app asks for prices once at startup. Answered here and **not** forwarded on
+            // the channel, and the queue is left untouched: a test asserts on the conversation,
+            // and a startup GET that consumed a canned reply would leave the turn that follows
+            // with nothing to answer it. (It did, before this.)
+            if raw.starts_with("GET ") {
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\
+                     \nconnection: close\r\n\r\n{}",
+                    MOCK_PRICES.len(),
+                    MOCK_PRICES
+                );
+                stream.write_all(resp.as_bytes()).unwrap();
+                stream.flush().unwrap();
+                continue;
+            }
+
+            // Taken only here, now that this request is known to want a canned reply.
+            let (status_line, body) = pending.take().expect("the loop checked there is one");
             tx.send(raw).unwrap();
             let resp = format!(
                 "{status_line}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
@@ -71,6 +120,7 @@ fn spawn_mock_relay_owned(responses: Vec<(&'static str, String)>) -> (u16, mpsc:
             );
             stream.write_all(resp.as_bytes()).unwrap();
             stream.flush().unwrap();
+            pending = queued.next();
         }
     });
     (port, rx)
@@ -2527,4 +2577,213 @@ fn a_reply_without_thinking_omits_the_reasoning_field() {
         reply.get("reasoning").is_none(),
         "an empty reasoning must not appear on the wire:\n{reply:#?}"
     );
+}
+/// A reply that reports one model, with a usage block whose kinds are all distinguishable.
+///
+/// The numbers are chosen so a total is checkable by eye: a million input, a million output, and a
+/// million cached, at prices where each kind contributes a different amount. A reply whose kinds
+/// were all the same number could not tell a mis-priced kind from a correct one.
+fn reply_from_model(model: &str) -> String {
+    format!(
+        r#"{{
+            "id": "msg_{model}", "type": "message", "role": "assistant", "model": "{model}",
+            "content": [{{ "type": "text", "text": "ok" }}],
+            "stop_reason": "end_turn",
+            "usage": {{
+                "input_tokens": 1100000,
+                "output_tokens": 1000000,
+                "cache_read_input_tokens": 100000,
+                "cache_creation_input_tokens": 0
+            }}
+        }}"#
+    )
+}
+
+/// Two turns, two providers, two currencies: the money is reported per currency and never added
+/// together, while the tokens are summed.
+///
+/// This is the case the whole shape exists for. A session that spans providers cannot have one
+/// total — dollars and euros do not add — so the amounts are an array grouped by currency, and the
+/// tokens, being counts, are one number per kind whatever served them. The model is the last one
+/// used, because "what am I running" has one answer even after a switch.
+///
+/// Asserted on the sidecar the session writes, which is the artifact tab-atelier reads and the one a
+/// resume restores from — not on the reply, which says nothing about totals.
+#[test]
+fn a_session_that_used_two_providers_reports_amounts_per_currency() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let socket = home.join("agent.sock");
+
+    let first = reply_from_model("claude-sonnet-4-6");
+    let second = reply_from_model("deepseek-flash");
+    let (port, _rx) = spawn_mock_relay_owned(vec![("HTTP/1.1 200 OK", first), ("HTTP/1.1 200 OK", second)]);
+    let (_agent, mut reader, mut stream) = spawn_agent_in(home, home, &socket, |cmd| {
+        cmd.args([
+            "--relay-url",
+            &format!("http://127.0.0.1:{port}"),
+            "--relay-token",
+            RELAY_TOKEN,
+        ]);
+    });
+
+    // First turn: the model priced in USD.
+    let reply = send_prompt(&mut stream, &mut reader, "one");
+    assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+    // Second turn: a model priced in EUR. The price list is fetched once, at startup, so this is
+    // also the check that one catalog covers a session whose model changes.
+    let reply = send_prompt(&mut stream, &mut reader, "two");
+    assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+
+    let totals = read_token_sidecar(home);
+
+    // --- tokens are counts, so they sum ------------------------------------
+    // 1,100,000 input each, of which 100,000 was a cached read, so the full-rate input is
+    // 1,000,000 per turn and 2,000,000 across the two.
+    assert_eq!(
+        totals["cost"]["tokens"]["in"], 2_000_000,
+        "input sums across providers: {totals}"
+    );
+    assert_eq!(totals["cost"]["tokens"]["out"], 2_000_000, "{totals}");
+    assert_eq!(
+        totals["cost"]["tokens"]["cache_read"], 200_000,
+        "and so do cached reads, counted in their own kind rather than as input: {totals}"
+    );
+
+    // --- money is not, so it is grouped ------------------------------------
+    let amounts = totals["cost"]["amounts"].as_array().expect("an array of amounts");
+    assert_eq!(
+        amounts.len(),
+        2,
+        "one provider billed in USD and one in EUR means two totals, never one: {amounts:?}"
+    );
+    let by_currency = |code: &str| -> f64 {
+        amounts
+            .iter()
+            .find(|a| a["currency"] == code)
+            .and_then(|a| a["amount"].as_f64())
+            .unwrap_or_else(|| panic!("no {code} entry in {amounts:?}"))
+    };
+    // USD, from the first turn only: 1 unit of input at 3.0, 1 of output at 15.0, and 0.1 of
+    // cached input at 0.3.
+    let usd = by_currency("USD");
+    assert!(
+        (usd - (3.0 + 15.0 + 0.03)).abs() < 1e-6,
+        "the USD turn should be 18.03, got {usd} in {amounts:?}"
+    );
+    // EUR, from the second: 1 unit of input at 2.0 and 1 of output at 10.0. This catalog lists no
+    // cache price for it, so the cached tokens contribute nothing rather than being charged at the
+    // input rate — which would have made this 12.2 instead of 12.0.
+    let eur = by_currency("EUR");
+    assert!(
+        (eur - 12.0).abs() < 1e-6,
+        "the EUR turn should be 12.0, got {eur} in {amounts:?}"
+    );
+
+    // --- the model is the last one used ------------------------------------
+    assert_eq!(
+        totals["cost"]["model"], "deepseek-flash",
+        "the model is the last used, not the first and not a list: {totals}"
+    );
+
+    // The flat keys tab-atelier reads are still there, unchanged in meaning.
+    assert_eq!(
+        totals["input"], 2_200_000,
+        "raw input tokens, cached included: {totals}"
+    );
+    assert_eq!(totals["output"], 2_000_000, "{totals}");
+}
+
+/// A resumed session carries its money and its counts.
+///
+/// The money is read back rather than recomputed: the price list arrives after the restore, and may
+/// have changed since, so recomputing would restate a session's history at today's prices. Without
+/// this, reopening a session showed it having spent nothing — the totals started again from zero
+/// while the transcript behind them said otherwise.
+#[test]
+fn a_resumed_session_keeps_the_amounts_it_had_spent() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let socket = home.join("agent.sock");
+
+    let (port, _rx) = spawn_mock_relay_owned(vec![("HTTP/1.1 200 OK", reply_from_model("claude-sonnet-4-6"))]);
+    let session_id = {
+        let (_agent, mut reader, mut stream) = spawn_agent_in(home, home, &socket, |cmd| {
+            cmd.args([
+                "--relay-url",
+                &format!("http://127.0.0.1:{port}"),
+                "--relay-token",
+                RELAY_TOKEN,
+            ]);
+        });
+        let reply = send_prompt(&mut stream, &mut reader, "spend something");
+        assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+        let mut files = Vec::new();
+        jsonl_files(home, &mut files);
+        assert_eq!(files.len(), 1, "one transcript: {files:?}");
+        files[0].file_stem().unwrap().to_str().unwrap().to_owned()
+    };
+
+    let before = read_token_sidecar(home);
+    let spent_usd = before["cost"]["amounts"][0]["amount"]
+        .as_f64()
+        .expect("an amount before the resume");
+    assert!(spent_usd > 0.0, "the first turn should have cost something: {before}");
+
+    // Resume it, and read the sidecar again *before* any further turn: what the restored session
+    // knows about itself, which is the thing that used to be zero.
+    let (port, _rx) = spawn_mock_relay_owned(vec![("HTTP/1.1 200 OK", reply_from_model("claude-sonnet-4-6"))]);
+    let (_agent, mut reader, mut stream) = spawn_agent_in(home, home, &socket, |cmd| {
+        cmd.args([
+            "--resume",
+            &session_id,
+            "--relay-url",
+            &format!("http://127.0.0.1:{port}"),
+            "--relay-token",
+            RELAY_TOKEN,
+        ]);
+    });
+    let reply = send_prompt(&mut stream, &mut reader, "carry on");
+    assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+
+    let after = read_token_sidecar(home);
+    let usd = after["cost"]["amounts"]
+        .as_array()
+        .expect("amounts")
+        .iter()
+        .find(|a| a["currency"] == "USD")
+        .and_then(|a| a["amount"].as_f64())
+        .expect("a USD amount after the resume");
+
+    assert!(
+        (usd - spent_usd.mul_add(2.0, 0.0)).abs() < 1e-6,
+        "the resumed session should have added to what it had already spent ({spent_usd}), not \
+         started again from zero: got {usd} in {after}"
+    );
+    assert_eq!(
+        after["cost"]["tokens"]["in"].as_u64().unwrap_or(0),
+        before["cost"]["tokens"]["in"].as_u64().unwrap_or(0) * 2,
+        "and the token counts carry on the same way: {after}"
+    );
+}
+
+/// The session's token sidecar, as tab-atelier and a resume both read it.
+fn read_token_sidecar(home: &Path) -> serde_json::Value {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(home.join(".claude").join("projects"))
+        .unwrap()
+        .flatten()
+    {
+        let path = entry.path();
+        if path.is_dir() {
+            for file in std::fs::read_dir(&path).unwrap().flatten() {
+                if file.file_name().to_string_lossy().ends_with(".tokens.json") {
+                    found.push(file.path());
+                }
+            }
+        }
+    }
+    assert_eq!(found.len(), 1, "expected one token sidecar: {found:?}");
+    let raw = std::fs::read_to_string(&found[0]).unwrap();
+    serde_json::from_str(&raw).expect("the sidecar is JSON")
 }

@@ -455,17 +455,41 @@ async fn report_turn(ui: &mut Ui, agent: &Agent, turn: &crate::agent::Turn) -> s
             ui.print_above(&turn.answer)?;
         }
     }
-    // Where the turn's cost went, under the turn it belongs to.
+    // Where the turn's cost went, under the turn it belongs to: the token counts on one line,
+    // then the money and the model on the next. Money gets its own line because it is grouped by
+    // currency — a session that spans providers has more than one figure — and folding that into
+    // the token line would make both harder to read.
     ui.print_above(&crate::statusline::totals_line(
         agent.total_tokens_in(),
         agent.total_tokens_out(),
         agent.gate(),
         crate::statusline::terminal_width(),
     ))?;
+    let costs = agent.costs();
+    let (model, amounts, unpriced) = costs.lock().map_or_else(
+        |_| (None, Vec::new(), 0),
+        |c| {
+            (
+                c.model().map(ToOwned::to_owned),
+                c.amounts(),
+                c.unpriced().input + c.unpriced().output + c.unpriced().cache_read + c.unpriced().cache_write,
+            )
+        },
+    );
+    let line = crate::statusline::cost_line(
+        model.as_deref(),
+        &amounts,
+        unpriced,
+        crate::statusline::terminal_width(),
+    );
+    if !line.is_empty() {
+        ui.print_above(&line)?;
+    }
     // The running totals beside the transcript, so tab-atelier can show them without
     // reading a log. A failure here is not worth interrupting the session for.
     let session = agent.active_session().await;
-    if let Err(e) = session.save_tokens(agent.total_tokens_in(), agent.total_tokens_out()) {
+    let cost = crate::cost::totals_of(&agent.costs());
+    if let Err(e) = session.save_tokens(agent.total_tokens_in(), agent.total_tokens_out(), &cost) {
         log::warn!("could not record token totals: {e}");
     }
     Ok(())
@@ -698,6 +722,16 @@ impl Repl<'_> {
         // swallowed. Nothing is echoed when it is queued: it is echoed when it *starts*,
         // because a prompt printed before the previous answer arrives would put the
         // transcript out of order.
+        // The model, on the busy line, because it is the one fact about a turn that the operator
+        // cannot get from the answer: two turns in one session can be served by different models,
+        // and which one answered changes what the reply means.
+        let model = self
+            .agent
+            .costs()
+            .lock()
+            .ok()
+            .and_then(|c| c.model().map(ToOwned::to_owned));
+        let model = model.map_or(String::new(), |m| format!("  {m}"));
         let waiting = match self.queued.len() {
             0 => String::new(),
             1 => "  · 1 queued".to_owned(),
@@ -708,7 +742,7 @@ impl Repl<'_> {
         if self.question.is_some() {
             return Some(format!("waiting for an answer to the question above{waiting}"));
         }
-        Some(format!("{}  {activity}{estimate}{waiting}", spinner.label()))
+        Some(format!("{}  {activity}{model}{estimate}{waiting}", spinner.label()))
     }
 
     /// Echo a prompt, copy it, and start its turn.

@@ -78,3 +78,4 @@ tempfile = "3"
 # `unsafe_code`, so calling libc's openpty directly is not an option. A
 # dev-dependency so it never reaches a release build.
 nix = { version = "0.31", features = ["term"] }
+vt100 = "0.16.2"

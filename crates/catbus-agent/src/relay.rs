@@ -34,6 +34,10 @@ pub const RELAY_PATH: &str = "/relay/anthropic";
 /// Path appended to the base URL to reach the Messages API.
 pub const MESSAGES_PATH: &str = "/v1/messages";
 
+/// Where the relay serves what it charges, one entry per model it can serve. Imitates the
+/// provider's own models endpoint so a relay needs no new convention.
+pub const MODELS_PATH: &str = "/v1/models";
+
 const ENV_URL: &str = "CATBUS_RELAY_URL";
 const ENV_TOKEN: &str = "CATBUS_RELAY_TOKEN";
 /// Point the resolver at a different `preferences.json`. Tests use it; so does
@@ -102,6 +106,16 @@ impl Relay {
     #[must_use]
     pub fn messages_url(&self) -> String {
         format!("{}{MESSAGES_PATH}", self.base_url)
+    }
+
+    /// Where the relay serves its prices.
+    ///
+    /// On the same origin as the messages endpoint, which is the point: a tab with no internet
+    /// still reaches it, because that origin is the app's own relay. The path imitates the
+    /// provider's models endpoint so a relay can serve it without inventing a convention.
+    #[must_use]
+    pub fn models_url(&self) -> String {
+        format!("{}{MODELS_PATH}", self.base_url)
     }
 
     /// The relay base URL, for diagnostics. Safe to print.

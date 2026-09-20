@@ -212,6 +212,13 @@ pub struct Agent {
     /// driving the session — the REPL or a socket client — and both need to reach it. Shared,
     /// so the tool can wait while the UI renders the question.
     asker: std::sync::Arc<crate::tools::ask::Asker>,
+    /// What this session has used, and what the relay says it costs.
+    ///
+    /// Restored from the session's sidecar rather than started empty: resuming continues a
+    /// session, and a session that forgot it had spent money the moment it was reopened would be
+    /// worse than showing no cost at all. The amounts are stored for exactly that reason — they
+    /// cannot be recomputed without the price list, and the price list may have changed.
+    costs: std::sync::Arc<std::sync::Mutex<crate::cost::Costs>>,
     /// The model this session runs as.
     ///
     /// Session state, not a launch flag: `/model` sets it, the sidecar remembers
@@ -279,6 +286,18 @@ impl Agent {
         // memory is lost exactly when the operator comes back to check it —
         // which is why `/auto` could look like it did nothing.
         let gate = session.saved_gate().unwrap_or(tools::Gate::Open);
+        // What this session had already spent, so a resume continues the count instead of
+        // starting from zero. Both halves matter: the token counts are what the status lines
+        // show, and the amounts cannot be recomputed here at all — the price list arrives later
+        // and may differ, so the money is read back as it was recorded.
+        let spent = session.load_tokens();
+        let restored = crate::cost::Costs::restore(spent.as_ref());
+        let seed = restored.tokens();
+        let costs = restored;
+        // The atomics the transcript and the sidecar read are seeded from the same file, so the
+        // two views of the session agree from the first turn onwards.
+        let tokens_in = std::sync::atomic::AtomicU64::new(seed.input);
+        let tokens_out = std::sync::atomic::AtomicU64::new(seed.output);
         // The session's own model, so reopening continues with it. Read once and
         // used for both the request and the identity decision below.
         let from_transcript = session.last_model();
@@ -314,6 +333,9 @@ impl Agent {
             // A fresh channel per agent; the REPL or a socket client reaches it through
             // `asker()`. See the field.
             asker: std::sync::Arc::new(crate::tools::ask::Asker::new()),
+            // Seeded from the sidecar, so a resumed session carries on from what it had spent
+            // rather than from zero. See `Session::load_tokens`.
+            costs: std::sync::Arc::new(std::sync::Mutex::new(costs)),
             // Built-in behaviour until an operator says otherwise. See
             // `crate::identity`.
             identity: crate::identity::Identity::Auto,
@@ -324,8 +346,8 @@ impl Agent {
             model: std::sync::Mutex::new(model),
             served_model: std::sync::Mutex::new(from_transcript),
             status: std::sync::Mutex::new(None),
-            tokens_in: std::sync::atomic::AtomicU64::new(0),
-            tokens_out: std::sync::atomic::AtomicU64::new(0),
+            tokens_in,
+            tokens_out,
             inflight_input_bytes: std::sync::atomic::AtomicU64::new(0),
             cancel: std::sync::Mutex::new(CancellationToken::new()),
         }
@@ -362,6 +384,72 @@ impl Agent {
     #[must_use]
     pub const fn asker(&self) -> &std::sync::Arc<crate::tools::ask::Asker> {
         &self.asker
+    }
+
+    /// The running totals. See [`crate::cost`].
+    #[must_use]
+    pub fn costs(&self) -> std::sync::Arc<std::sync::Mutex<crate::cost::Costs>> {
+        std::sync::Arc::clone(&self.costs)
+    }
+
+    /// Fetch what the relay charges, once, and remember it.
+    ///
+    /// Best-effort by design: a relay that serves no price list, or none this can read, leaves
+    /// the session counting tokens with no amounts rather than failing. Losing a price must not
+    /// cost a session, and an unknown price is not a price of zero — so a caller logs the
+    /// failure and the totals report `unpriced` instead of inventing a figure.
+    pub async fn fetch_prices(&self) -> Result<(), String> {
+        let Provider::Relay(relay) = &self.provider else {
+            // A hand-configured OpenAI-compatible endpoint has no relay to ask and no convention
+            // for what it charges. Counting tokens is all that is honest there.
+            return Err("prices come from a relay; this session runs against a direct endpoint".to_owned());
+        };
+        let url = relay.models_url();
+        let response = Self::with_relay_auth(relay, self.http.get(&url))
+            .header("accept", "application/json")
+            // Closing rather than pooling, even though this client pools everything else. The
+            // price list is fetched once, so a kept-alive connection buys nothing — and it costs
+            // something: a server that answers and then closes leaves a socket in the pool that
+            // the *next* request may pick up, and a POST is not retried, so the failure surfaces
+            // as the first real turn failing to send. Asking for a close makes the client discard
+            // the connection instead of trusting it.
+            .header("connection", "close")
+            .send()
+            .await
+            .map_err(|e| format!("could not reach {url}: {e}"))?;
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(format!(
+                "{url} did not serve a price list ({status}). A relay that has none is fine — \
+                 tokens are still counted."
+            ));
+        }
+        let catalog = crate::cost::Catalog::parse(&body)?;
+        if catalog.is_empty() {
+            return Err("the price list named no usable model".to_owned());
+        }
+        if let Ok(mut costs) = self.costs.lock() {
+            costs.set_catalog(catalog);
+        }
+        Ok(())
+    }
+
+    /// The headers every relay request carries.
+    ///
+    /// One construction for every call, because the auth is the last thing that should differ
+    /// between a request that works and one that does not: the models fetch and the messages
+    /// call must present the same credentials, or one of them fails with no visible reason.
+    fn with_relay_auth(relay: &Relay, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        let mut request = request
+            .header("x-api-key", relay.token())
+            .header("anthropic-version", claude_api::ANTHROPIC_VERSION);
+        if let Some((client_id, client_secret)) = relay.cloudflare_access() {
+            request = request
+                .header("CF-Access-Client-Id", client_id)
+                .header("CF-Access-Client-Secret", client_secret);
+        }
+        request
     }
 
     /// Whether this session's output may be styled.
@@ -644,7 +732,25 @@ impl Agent {
         *self.status.lock().expect("status mutex") = Some(crate::statusline::THINKING_MARKER.to_owned());
         let result = self.run_user_prompt_inner(text, &token).await;
         *self.status.lock().expect("status mutex") = None;
+        // The totals are persisted here rather than by whichever UI happens to be attached, so
+        // every path that runs a turn records them: the REPL, a socket client, and the app's own
+        // CLI. It was in the REPL's render path before, which meant a session driven over the
+        // socket never wrote a sidecar at all — and a resume then had nothing to restore, so the
+        // money and counts started again from zero.
+        self.save_totals().await;
         result
+    }
+
+    /// Write the running totals beside the transcript, and say nothing if it fails.
+    ///
+    /// Best-effort: the file is for a later resume and for tab-atelier to read, and neither is
+    /// worth failing a completed turn over — the answer is already in hand.
+    async fn save_totals(&self) {
+        let session = self.active_session().await;
+        let cost = crate::cost::totals_of(&self.costs);
+        if let Err(e) = session.save_tokens(self.total_tokens_in(), self.total_tokens_out(), &cost) {
+            log::warn!("could not record the token totals: {e}");
+        }
     }
 
     #[allow(clippy::too_many_lines)]
@@ -690,6 +796,13 @@ impl Agent {
                 .fetch_add(resp.usage.input_tokens, std::sync::atomic::Ordering::Relaxed);
             self.tokens_out
                 .fetch_add(resp.usage.output_tokens, std::sync::atomic::Ordering::Relaxed);
+            // And the priced view of the same turn. Recorded with the model the relay just
+            // reported, so a session that spans providers prices each turn at the rate of the
+            // model that actually served it — which is why the totals are grouped by currency
+            // rather than summed into one figure.
+            if let Ok(mut costs) = self.costs.lock() {
+                costs.record(&resp.model, resp.usage.tokens());
+            }
             // Persist a plain copy, not `resp.content` itself. The transcript is
             // a *shared* artifact read by clients with no terminal —
             // tab-atelier renders chat bubbles straight from it — so it stays
@@ -1482,11 +1595,43 @@ pub struct MessagesResp {
 }
 
 #[derive(Deserialize, Debug, Clone, Default)]
+// Every field ends in `_tokens` because they are the names the provider sends: serde matches on
+// them, so they cannot be tidied into something shorter without an alias for each. The lint is
+// about a *domain* type whose fields drift into a shared suffix, which is not this.
+#[allow(clippy::struct_field_names)]
 pub struct Usage {
     #[serde(default)]
     pub input_tokens: u64,
     #[serde(default)]
     pub output_tokens: u64,
+    /// Tokens served from the prompt cache rather than sent fresh.
+    ///
+    /// Kept because they are priced differently — roughly a tenth of an input token — and the
+    /// client sends three cache breakpoints on every request, so a cost computed from input and
+    /// output alone is wrong on nearly every turn. The relay passes these through; the client
+    /// was simply not reading them.
+    #[serde(default, alias = "cache_read_tokens", alias = "cached_tokens")]
+    pub cache_read_input_tokens: u64,
+    /// Tokens written into the prompt cache, which are billed above the normal input rate.
+    #[serde(default, alias = "cache_write_tokens")]
+    pub cache_creation_input_tokens: u64,
+}
+
+impl Usage {
+    /// The four kinds as one value, for the cost arithmetic.
+    #[must_use]
+    pub const fn tokens(&self) -> crate::cost::Tokens {
+        crate::cost::Tokens {
+            // `input_tokens` counts everything sent, cached reads included on some providers, so
+            // what is charged at the full input rate is the remainder. Subtracting is the
+            // conservative reading: it cannot double-charge a cached token the way treating the
+            // field as fresh input would.
+            input: self.input_tokens.saturating_sub(self.cache_read_input_tokens),
+            output: self.output_tokens,
+            cache_read: self.cache_read_input_tokens,
+            cache_write: self.cache_creation_input_tokens,
+        }
+    }
 }
 
 #[derive(Serialize, Clone)]
