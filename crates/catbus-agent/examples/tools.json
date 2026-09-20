@@ -4,19 +4,33 @@
   ],
   "add": [
     {
-      "name": "GitShortStatus",
-      "description": "Show the working tree status: staged, unstaged and untracked changes, as `git status --short` prints them.",
+      "name": "GitBisect",
+      "description": "List the commits between a revision known good and one known bad \u2014 the candidates a bisect would narrow down, newest first. Read-only, and a genuine gap: the built-in GitStatus shows the working tree, not history. The stateful workflow (`git bisect start`, `good`, `bad`, `run`, `reset`) is several commands and belongs in Bash; this is the query that tells you what you would be bisecting. Note the two placeholders in one argument: a *required* placeholder may be embedded in a larger argument like this, while an optional one may not.",
       "schema": {
         "type": "object",
-        "properties": {},
-        "required": []
+        "properties": {
+          "good": {
+            "type": "string",
+            "description": "A revision known to be good \u2014 a tag, a sha, or `HEAD~10`."
+          },
+          "bad": {
+            "type": "string",
+            "description": "A revision known to be bad, usually the newer of the two."
+          }
+        },
+        "required": [
+          "good",
+          "bad"
+        ]
       },
       "argv": [
         "git",
-        "status",
-        "--short"
+        "log",
+        "--oneline",
+        "--ancestry-path",
+        "{good}..{bad}"
       ],
-      "timeout_secs": 15,
+      "timeout_secs": 30,
       "judged": false
     },
     {

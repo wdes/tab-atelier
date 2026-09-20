@@ -76,8 +76,13 @@ pins it for a launch.
 | `Bash` | Run a shell command. |
 | `Tasks` | The agent's own task list for this directory — `add`, `list`, `start`, `done`, `block`, `drop`, `note`, `clear`. On disk, so it survives a long conversation; a sub-agent in the same directory shares it. |
 | `PHPUnit` | Run this project's PHPUnit and get structured results: counts, and one entry per failure with its test, `file:line`, message and diff already separated. |
-| `Composer` | `install`, `update`, or `run` a script from composer.json. Always non-interactive. |
-| `Bun` | `run` a script from package.json, or `install`. |
+| `Composer` | `install`, `update`, or `run` a script from composer.json. `scripts` lists what the project defines, with the author's descriptions where there are any. Always non-interactive. |
+| `Bun` | `run` a script from package.json, `install`, or `scripts` to list them. |
+
+Ask for `scripts` when you want to know what a project can run — it reads the manifest
+directly, so it answers even where the package manager is not installed. A `run` with a name
+the project does not define is refused with the real names, rather than being passed through
+to the package manager, whose error would say only what it could not find.
 | `GitStatus` | What is uncommitted: branch, ahead/behind, and the staged, unstaged, untracked and conflicted paths. Read-only. |
 | `GitCommit` | Commit a named set of files. It stages nothing you did not name; commits by path, so anything else already staged stays staged. |
 | `ListAgents` | Other agents running on this machine. |

@@ -31,7 +31,12 @@ const KEEP: usize = 4_000;
 
 /// `composer install`, `update`, or `run <script>`.
 pub async fn composer(input: &serde_json::Value, cwd: &Path) -> Result<String, String> {
-    let action = action_of(input, &["install", "update", "run"])?;
+    let action = action_of(input, &["install", "update", "run", "scripts"])?;
+    // Answered from the manifest without spawning anything: listing what a project defines is a
+    // read, so it works even where composer is not installed, and costs no process.
+    if action == "scripts" {
+        return list_scripts(cwd, "composer.json", Some("scripts-descriptions"));
+    }
     let program = find_composer(cwd)?;
 
     let mut args = vec![action.to_owned()];
@@ -44,7 +49,7 @@ pub async fn composer(input: &serde_json::Value, cwd: &Path) -> Result<String, S
     // scripts afterwards is the point of using its own composer rather than a raw download,
     // and skipping them silently would produce a tree that does not work.
     if action == "run" {
-        let script = required(input, "script", "which script to run")?;
+        let script = named_script(input, cwd, "composer.json", Some("scripts-descriptions"))?;
         // `--` before the script name, so a name that starts with a dash cannot become an
         // option to composer itself.
         args.push("--".to_owned());
@@ -57,9 +62,12 @@ pub async fn composer(input: &serde_json::Value, cwd: &Path) -> Result<String, S
     run(program, args, cwd, timeout_of(input), "composer").await
 }
 
-/// `bun run <script>`, or `bun install`.
+/// `bun run <script>`, `bun install`, or `bun scripts` to list them.
 pub async fn bun(input: &serde_json::Value, cwd: &Path) -> Result<String, String> {
-    let action = action_of(input, &["run", "install"])?;
+    let action = action_of(input, &["run", "install", "scripts"])?;
+    if action == "scripts" {
+        return list_scripts(cwd, "package.json", None);
+    }
     let program = find_on_path("bun").ok_or_else(|| {
         "no `bun` on PATH. Bun is not vendored per project the way composer is, so it has to \
          be installed where this process can see it."
@@ -68,7 +76,7 @@ pub async fn bun(input: &serde_json::Value, cwd: &Path) -> Result<String, String
 
     let mut args = vec![action.to_owned()];
     if action == "run" {
-        let script = required(input, "script", "which package.json script to run")?;
+        let script = named_script(input, cwd, "package.json", None)?;
         // `--` so a script named like a bun flag is not read as one.
         args.push("--".to_owned());
         args.push(script);
@@ -80,6 +88,112 @@ pub async fn bun(input: &serde_json::Value, cwd: &Path) -> Result<String, String
     args.push("--no-color".to_owned());
 
     run(program, args, cwd, timeout_of(input), "bun").await
+}
+
+/// The script name for a `run`, checked against what the project actually defines.
+///
+/// The point is the failure. The tool descriptions tell the model to run "a script from
+/// composer.json", and until this existed nothing read that file: a wrong name reached the
+/// package manager, which answered with its own error and no hint of what was available — so the
+/// model guessed again, or spent a `Read` to find out. Naming the real scripts in the error is
+/// the same shape `Tasks` uses for an unknown task id, and it usually saves a whole round trip.
+fn named_script(
+    input: &serde_json::Value,
+    cwd: &Path,
+    manifest: &str,
+    description_key: Option<&str>,
+) -> Result<String, String> {
+    let script = required(input, "script", "which script to run")?;
+    // A manifest that cannot be read must not refuse the run: the name may be correct, and the
+    // package manager is the authority on that. So this only *adds* to a failure.
+    let Ok(available) = project_scripts(cwd, manifest, description_key) else {
+        return Ok(script);
+    };
+    if available.is_empty() || available.iter().any(|(name, _)| *name == script) {
+        return Ok(script);
+    }
+    let names: Vec<String> = available.iter().map(|(name, _)| format!("`{name}`")).collect();
+    Err(format!(
+        "`{script}` is not a script in {manifest}. {} defines {}. Run `scripts` to see what each \
+         one does.",
+        manifest,
+        names.join(", ")
+    ))
+}
+
+/// The scripts a project defines, read from its manifest.
+///
+/// Read directly rather than by asking the package manager, so it answers where the tool is not
+/// installed and spawns nothing. Composer keeps descriptions in a separate `scripts-descriptions`
+/// map when the author wrote them; `package.json` has no such convention, so there the command
+/// itself is the useful thing to show.
+fn project_scripts(cwd: &Path, manifest: &str, description_key: Option<&str>) -> Result<Vec<(String, String)>, String> {
+    let path = cwd.join(manifest);
+    let raw = std::fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("{} is not valid JSON: {e}", path.display()))?;
+
+    let Some(scripts) = parsed.get("scripts").and_then(|v| v.as_object()) else {
+        return Ok(Vec::new());
+    };
+    let descriptions = description_key
+        .and_then(|key| parsed.get(key))
+        .and_then(|v| v.as_object());
+
+    Ok(scripts
+        .iter()
+        .map(|(name, body)| {
+            // A composer script is often a list of commands; `package.json`'s is always one
+            // string. Joined so either reads as one line.
+            let command = match body {
+                serde_json::Value::String(s) => s.clone(),
+                serde_json::Value::Array(items) => {
+                    items.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(" && ")
+                }
+                _ => String::new(),
+            };
+            let detail = descriptions
+                .and_then(|d| d.get(name))
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .map_or_else(|| truncate_chars(&command, 160), ToOwned::to_owned);
+            (name.clone(), detail)
+        })
+        .collect())
+}
+
+/// The `scripts` action: what the project defines, or that it defines none.
+fn list_scripts(cwd: &Path, manifest: &str, description_key: Option<&str>) -> Result<String, String> {
+    if !cwd.join(manifest).is_file() {
+        // Not an error: "this project has no composer.json" is the answer to the question
+        // asked, and an error would read as a fault to retry.
+        return Ok(format!(
+            "no {manifest} in {} — this project does not define scripts there.",
+            cwd.display()
+        ));
+    }
+    let scripts = project_scripts(cwd, manifest, description_key)?;
+    let report = serde_json::json!({
+        "manifest": manifest,
+        "count": scripts.len(),
+        "scripts": scripts
+            .iter()
+            .map(|(name, detail)| serde_json::json!({ "name": name, "detail": detail }))
+            .collect::<Vec<_>>(),
+    });
+    serde_json::to_string_pretty(&report).map_err(|e| format!("could not encode: {e}"))
+}
+
+/// Keep a string to `limit` characters, ending it cleanly.
+///
+/// Characters rather than bytes: this only ever renders, and cutting a multi-byte character in
+/// half would panic where it is used.
+fn truncate_chars(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.trim().to_owned();
+    }
+    let cut: String = text.chars().take(limit).collect();
+    format!("{}…", cut.trim_end())
 }
 
 /// Read the `action`, refusing anything not in `allowed`.
@@ -273,16 +387,18 @@ pub fn composer_spec() -> serde_json::Value {
         "name": "Composer",
         "description": "Run this project's composer: `install` (a lock file exists), `update` \
                         (re-resolve and rewrite the lock), or `run` a script defined in \
-                        composer.json. Always non-interactive, so it never stops to ask. \
-                        Returns JSON with the exit code and both output streams, bounded. It \
-                        runs the project's own scripts and plugins, so it is judged in auto \
+                        composer.json. `scripts` lists what this project defines — call it \
+                        first rather than guessing a name, and a `run` with a wrong name says \
+                        what the real ones are. Always non-interactive, so it never stops to \
+                        ask. Returns JSON with the exit code and both output streams, bounded. \
+                        It runs the project's own scripts and plugins, so it is judged in auto \
                         mode and refused in plan-mode. Anything beyond these verbs is a Bash \
                         call.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "action": { "type": "string", "enum": ["install", "update", "run"] },
-                "script": { "type": "string", "description": "For `run`: the script name from composer.json." },
+                "action": { "type": "string", "enum": ["install", "update", "run", "scripts"] },
+                "script": { "type": "string", "description": "For `run`: the script name. Use `scripts` to list them." },
                 "args": {
                     "type": "array",
                     "items": { "type": "string" },
@@ -300,14 +416,16 @@ pub fn bun_spec() -> serde_json::Value {
     serde_json::json!({
         "name": "Bun",
         "description": "Run this project's bun: `run` a script from package.json, or `install`. \
-                        Returns JSON with the exit code and both output streams, bounded. A \
+                        `scripts` lists what this project defines — call it first rather than \
+                        guessing a name, and a `run` with a wrong name says what the real ones \
+                        are. Returns JSON with the exit code and both output streams, bounded. A \
                         script is the project's own programme, so this is judged in auto mode \
                         and refused in plan-mode.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "action": { "type": "string", "enum": ["run", "install"] },
-                "script": { "type": "string", "description": "For `run`: the script name from package.json." },
+                "action": { "type": "string", "enum": ["run", "install", "scripts"] },
+                "script": { "type": "string", "description": "For `run`: the script name. Use `scripts` to list them." },
                 "args": {
                     "type": "array",
                     "items": { "type": "string" },
@@ -435,6 +553,160 @@ mod tests {
         assert_eq!(said, "/proj/vendor/bin/composer run -- test");
     }
 
+    /// A project's scripts are read from its manifest, with composer's descriptions where the
+    /// author wrote them.
+    ///
+    /// Both shapes are covered because they differ: a composer script may be a list, which is
+    /// joined into one line, and its description lives in a separate `scripts-descriptions` map;
+    /// a `package.json` script is one string with no description convention, so the command
+    /// itself is what is worth showing.
+    #[test]
+    fn a_projects_scripts_are_read_from_its_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("composer.json"),
+            r#"{
+                "scripts": {
+                    "test": "phpunit",
+                    "lint": ["php-cs-fixer fix", "phpstan analyse"],
+                    "fresh": "@php artisan migrate:fresh"
+                },
+                "scripts-descriptions": {
+                    "test": "Run the whole suite",
+                    "fresh": "Rebuild the database from scratch"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let scripts = project_scripts(dir.path(), "composer.json", Some("scripts-descriptions")).expect("reads");
+        let named = |n: &str| {
+            scripts
+                .iter()
+                .find(|(name, _)| name == n)
+                .map(|(_, detail)| detail.clone())
+        };
+
+        assert_eq!(scripts.len(), 3);
+        assert_eq!(named("test").as_deref(), Some("Run the whole suite"));
+        // A list becomes one line, so a multi-command script reads as one entry.
+        assert_eq!(named("lint").as_deref(), Some("php-cs-fixer fix && phpstan analyse"));
+        assert_eq!(named("fresh").as_deref(), Some("Rebuild the database from scratch"));
+
+        // package.json: the command is the detail, since there is no description key.
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts": {"dev": "vite", "build": "vite build"}}"#,
+        )
+        .unwrap();
+        let scripts = project_scripts(dir.path(), "package.json", None).expect("reads");
+        assert_eq!(scripts.len(), 2);
+        assert!(scripts.iter().any(|(n, d)| n == "dev" && d == "vite"));
+    }
+
+    /// Listing reports what a manifest defines, and says so plainly when there is none.
+    #[test]
+    fn listing_scripts_answers_with_or_without_a_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        // No manifest: the answer to the question, not an error to retry.
+        let said = list_scripts(dir.path(), "composer.json", Some("scripts-descriptions")).unwrap();
+        assert!(said.contains("no composer.json"), "{said}");
+
+        std::fs::write(dir.path().join("composer.json"), r#"{"scripts": {"test": "phpunit"}}"#).unwrap();
+        let said = list_scripts(dir.path(), "composer.json", Some("scripts-descriptions")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&said).expect("JSON");
+        assert_eq!(parsed["manifest"], "composer.json");
+        assert_eq!(parsed["count"], 1);
+        assert_eq!(parsed["scripts"][0]["name"], "test");
+
+        // A manifest with no scripts section at all: zero, not an error.
+        std::fs::write(dir.path().join("composer.json"), r#"{"name": "a/b"}"#).unwrap();
+        let said = list_scripts(dir.path(), "composer.json", None).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&said).expect("JSON");
+        assert_eq!(parsed["count"], 0);
+    }
+
+    /// A wrong script name is answered with the real ones.
+    ///
+    /// This is the round trip the tool exists to save: without it the wrong name reaches the
+    /// package manager, whose error says what *it* could not find and not what the project
+    /// defines — so the model guesses again, or spends a `Read` finding out.
+    #[test]
+    fn a_wrong_script_name_is_refused_with_the_real_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("composer.json"),
+            r#"{"scripts": {"test": "phpunit", "test:unit": "phpunit --testsuite unit"}}"#,
+        )
+        .unwrap();
+
+        let err = named_script(
+            &serde_json::json!({"script": "tests"}),
+            dir.path(),
+            "composer.json",
+            Some("scripts-descriptions"),
+        )
+        .unwrap_err();
+        assert!(err.contains("`tests` is not a script"), "{err}");
+        assert!(
+            err.contains("`test`") && err.contains("`test:unit`"),
+            "it must name the real ones: {err}"
+        );
+        assert!(err.contains("Run `scripts`"), "and say how to see more: {err}");
+
+        // A correct name passes through untouched.
+        let ok = named_script(
+            &serde_json::json!({"script": "test:unit"}),
+            dir.path(),
+            "composer.json",
+            None,
+        )
+        .expect("a real script");
+        assert_eq!(ok, "test:unit");
+    }
+
+    /// A manifest that cannot be read must not refuse a run.
+    ///
+    /// The name may be correct — a global composer script, say — and the package manager is the
+    /// authority on that. So this check only ever *adds* to a failure; it never causes one.
+    #[test]
+    fn an_unreadable_manifest_does_not_block_a_run() {
+        let dir = tempfile::tempdir().unwrap();
+        // No composer.json at all.
+        let ok = named_script(
+            &serde_json::json!({"script": "anything"}),
+            dir.path(),
+            "composer.json",
+            None,
+        )
+        .expect("nothing to check against, so nothing is refused");
+        assert_eq!(ok, "anything");
+
+        // Malformed JSON is the same: not this check's business to fail the run over.
+        std::fs::write(dir.path().join("composer.json"), "{ not json").unwrap();
+        let ok = named_script(
+            &serde_json::json!({"script": "anything"}),
+            dir.path(),
+            "composer.json",
+            None,
+        )
+        .expect("a broken manifest is not a reason to refuse");
+        assert_eq!(ok, "anything");
+    }
+
+    /// A long script command is cut, on a character boundary.
+    #[test]
+    fn a_long_script_command_is_bounded() {
+        let long = "é".repeat(400);
+        let cut = truncate_chars(&long, 50);
+        assert!(
+            cut.chars().count() <= 51,
+            "50 plus the ellipsis, got {}",
+            cut.chars().count()
+        );
+        assert!(cut.ends_with('…'), "and says it was cut: {cut}");
+        assert_eq!(truncate_chars("short", 50), "short");
+    }
     /// A vendored composer wins over the global one, and a full path is used rather than a
     /// bare name so the record says which was run.
     #[test]

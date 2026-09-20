@@ -71,32 +71,50 @@ that renders it needs to know that whoever it thinks it is.
 ```json
 {
   "disable": ["Bash"],
-  "allow": ["Read", "FileTree"],
   "add": [
     {
-      "name": "GitShortStatus",
-      "description": "Show the working tree status, briefly.",
-      "command": "git",
-      "args": ["status", "--short"],
-      "schema": { "type": "object", "properties": {}, "required": [] }
+      "name": "GitBisect",
+      "description": "List the commits between a good and a bad revision.",
+      "argv": ["git", "log", "--oneline", "--ancestry-path", "{good}..{bad}"],
+      "schema": {
+        "type": "object",
+        "properties": {
+          "good": { "type": "string" },
+          "bad": { "type": "string" }
+        },
+        "required": ["good", "bad"]
+      },
+      "timeout_secs": 30,
+      "judged": false
     }
   ]
 }
 ```
 
+The command is **`argv`**, one array — there is no `command` plus `args`. Each element becomes
+exactly one argument, so nothing is shell-parsed: a `good` of `v1.0; rm -rf /` is passed as a
+single argument, not run. That is also why an unknown key is a mistake worth catching: an
+extra `"command"` is ignored, and the config then fails on the missing `argv` rather than
+doing what it looks like it does.
+
 `disable` removes built-ins; `allow` keeps only what it lists. `disable` wins where they
 overlap, so a tool in both is off.
 
-`add` contributes a tool the agent runs itself: `command` plus `args`, with `{name}`
-placeholders filled from the arguments the model passes. An optional placeholder must be a
-whole argument — `["--max-count", "{max?}"]` — because dropping part of one would leave
-`--max-count` without its value. `[--max-count={max?}]` is refused at load, not at run.
+`add` contributes a tool the agent runs itself, from `argv` with `{name}` placeholders filled
+from the arguments the model passes. An *optional* placeholder must be a whole argument —
+`["--max-count", "{max?}"]` — because dropping part of one would leave `--max-count` without
+its value; `["--max-count={max?}"]` is refused at load, not at run. Required ones may be
+embedded, as `{good}..{bad}` above.
+
+`judged` defaults to **true**, so anything that executes is graded by auto mode unless the
+config says otherwise. A tool that only reads should say `"judged": false`: the author states
+a lower risk rather than the code assuming one.
 
 **A custom tool may not take a built-in's name.** The agent refuses to start if one shadows
 the other, on the grounds that a familiar name with different behaviour is worse than a
 refusal. The built-ins are `Read`, `Write`, `Edit`, `FileTree`, `Bash`, `ListAgents`,
 `Delegate`, `Spawn`, `Tasks`, `AskUserQuestion`, `PHPUnit`, `Composer`, `Bun`, `GitStatus`
-and `GitCommit` — hence `GitShortStatus` above.
+and `GitCommit` — hence the name above, which cannot be `GitStatus`.
 
 A working example is in the package at `/usr/share/doc/tab-atelier/tools.json`.
 
