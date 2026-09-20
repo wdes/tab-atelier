@@ -395,6 +395,9 @@ assets = [
     # the agent brief points at them by name.
     ["docs/self-organization.md", "/usr/share/doc/tab-atelier/", "644"],
     ["docs/fleet-playbook.md", "/usr/share/doc/tab-atelier/", "644"],
+    ["docs/agent-guide.md", "/usr/share/doc/tab-atelier/", "644"],
+    ["docs/config-guide.md", "/usr/share/doc/tab-atelier/", "644"],
+    ["crates/catbus-agent/examples/tools.json", "/usr/share/doc/tab-atelier/", "644"],
     # eSheep pets (the `pets` feature): a baked sprite sheet (<id>.png, alpha-keyed
     # + palette-quantized) beside its animation XML (<id>.xml), loaded at runtime
     # from here (dev falls back to ./assets/pets/).
@@ -460,6 +463,9 @@ assets = [
     # the agent brief points at them by name.
     ["docs/self-organization.md", "/usr/share/doc/tab-atelier-headless/", "644"],
     ["docs/fleet-playbook.md", "/usr/share/doc/tab-atelier-headless/", "644"],
+    ["docs/agent-guide.md", "/usr/share/doc/tab-atelier-headless/", "644"],
+    ["docs/config-guide.md", "/usr/share/doc/tab-atelier-headless/", "644"],
+    ["crates/catbus-agent/examples/tools.json", "/usr/share/doc/tab-atelier-headless/", "644"],
 ]
 # Service-account lifecycle (adduser/deluser) and unit enable/start
 # are handled by these scripts; cargo-deb installs them as the deb's

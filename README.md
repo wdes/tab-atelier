@@ -706,10 +706,12 @@ tab-atelier gossip                     # converge boards with configured remotes
 
 **Across machines**, a task's *home* is the host it was announced on, and taking it means claiming it there over the same `remote` endpoint the sidecar uses — so two machines can't hand out the same work. Everything else stays each host's own business.
 
-**The handbook** — both shipped in the deb at `/usr/share/doc/tab-atelier/`, so an agent on a machine with no checkout can still read them:
+**The handbook** — shipped in the deb at `/usr/share/doc/tab-atelier/`, so an agent on a machine with no checkout can still read them. The first two are written for **whoever is using the agent**, not for its developers:
 
 | | |
 |---|---|
+| [`docs/agent-guide.md`](docs/agent-guide.md) | using it: the commands, the three permission modes, every tool, how to answer a question it asks, and what its output means |
+| [`docs/config-guide.md`](docs/config-guide.md) | configuring it: where its files live, the identity file, choosing the tool set, and how an internet-disabled tab still reaches the relay |
 | [`docs/self-organization.md`](docs/self-organization.md) | the model: leases, contract net, gossip, the federation-vs-confederation distinction, and why this is CRDTs rather than Raft |
 | [`docs/fleet-playbook.md`](docs/fleet-playbook.md) | the operational side, written to be handed to an agent: fill a board, spawn workers, and — the part that matters — verify what they report |
 | [`docs/proxy.md`](docs/proxy.md) | `tab-atelier-proxy`: one Claude login shared by a team, with an account and a key per person instead of one token for everybody |
