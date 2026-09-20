@@ -267,6 +267,12 @@ pub struct TerminalView {
     /// Set by the PTY event-loop thread when the shell dies (see
     /// [`EventProxy::exited`]); read on the UI thread by `has_exited`.
     exited: Arc<std::sync::atomic::AtomicBool>,
+    /// Text a program in this tab asked to put on the clipboard, waiting to be
+    /// handed to gpui. See [`EventProxy::clipboard`] — the copy itself has to happen
+    /// on the UI thread, so it is parked here by the parser and drained by
+    /// [`Self::take_clipboard`].
+    #[cfg(feature = "gui")]
+    clipboard: Arc<std::sync::Mutex<Option<String>>>,
     scrollbar_dragging: Rc<Cell<bool>>,
     scroll_acc: Rc<Cell<f32>>,
     pub theme: ThemeName,
@@ -786,6 +792,8 @@ impl TerminalView {
         // Shell death arrives as `ChildExit` on this flag (see
         // `EventProxy::exited`) — no per-tab watcher loop needed.
         let exited = proxy.exited.clone();
+        #[cfg(feature = "gui")]
+        let clipboard = proxy.clipboard.clone();
 
         let recipe = SpawnRecipe {
             cwd: cwd.map(std::path::Path::to_path_buf),
@@ -812,6 +820,8 @@ impl TerminalView {
             pid: 0,
             spawn_recipe: Some(recipe),
             exited,
+            #[cfg(feature = "gui")]
+            clipboard,
             scrollbar_dragging: Rc::new(Cell::new(false)),
             scroll_acc: Rc::new(Cell::new(0.0)),
             theme: ThemeName::default(),
@@ -1045,6 +1055,17 @@ impl TerminalView {
 
     pub fn has_exited(&self) -> bool {
         self.exited.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Take any clipboards write this tab's programs asked for since the last call.
+    ///
+    /// Drained on the UI thread because putting something on the clipboard needs
+    /// gpui's `App`, which the parser callback has no access to. Taking rather than
+    /// peeking, so a value is delivered exactly once — a clippy that never cleared
+    /// would re-copy the same text on every sweep.
+    #[cfg(feature = "gui")]
+    pub fn take_clipboard(&self) -> Option<String> {
+        self.clipboard.lock().ok().and_then(|mut slot| slot.take())
     }
 
     /// Drop the render caches (previous frame's rows, shaped-glyph cache,

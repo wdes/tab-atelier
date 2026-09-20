@@ -1340,6 +1340,19 @@ impl AppState {
                                 break;
                             }
                         }
+                        // Anything in a tab that asked for the clipboard (OSC 52) is
+                        // handed to gpui here, because this is the UI thread and the
+                        // parser callback that received the request is not. Collected
+                        // first, then written: `write_to_clipboard` borrows `cx`, so
+                        // doing it inside the loop over `app.tabs` would not borrow-check.
+                        let asked: Vec<String> = app
+                            .tabs
+                            .iter()
+                            .filter_map(|tab| tab.view.read(cx).take_clipboard())
+                            .collect();
+                        for text in asked {
+                            cx.write_to_clipboard(ClipboardItem::new_string(text));
+                        }
                     }) else {
                         break;
                     };

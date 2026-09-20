@@ -93,6 +93,71 @@ pub enum Provider {
     OpenAiCompat(crate::openai::Config),
 }
 
+/// Turn a provider's error response into a sentence.
+///
+/// What this replaces, from a live session:
+///
+/// ```text
+/// error: api: 503 Service Unavailable: {"error":{"message":"Service is too busy. We
+/// advise users to temporarily switch to alternative LLM API service providers.",
+/// "type":"service_unavailable_error"
+/// ```
+///
+/// The useful sentence was in there, wrapped in braces and cut off mid-string by the
+/// truncation limit, with nothing to suggest it was the part worth reading. The
+/// envelope is the same on every provider this talks to — an `error` object with a
+/// `message` and a `type` — so it is worth unwrapping rather than printing.
+///
+/// A body that does not match is printed as it came. A shape we do not recognise is
+/// still information, and inventing an explanation for it would be worse than showing
+/// it.
+fn api_error(status: reqwest::StatusCode, body: &str) -> String {
+    /// What a person needs from an unrecognisable body: the start of it.
+    const BODY_LIMIT: usize = 300;
+
+    let parsed = serde_json::from_str::<serde_json::Value>(body).ok();
+    let field = |path: &str| {
+        parsed
+            .as_ref()
+            .and_then(|v| v.pointer(path))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    };
+
+    let mut out = status.to_string();
+    if let Some(kind) = field("/error/type") {
+        let _ = write!(out, " — {kind}");
+    }
+    // `error` holding a bare string is the other common shape, and a top-level
+    // `message` is what a proxy that unwraps one level less produces.
+    let message = field("/error/message")
+        .or_else(|| field("/message"))
+        .or_else(|| field("/error"));
+    // `write!` rather than `push_str(&format!(..))`: it takes the value by reference
+    // itself, so there is no intermediate `String` to borrow and no borrow for clippy
+    // to object to.
+    let _ = write!(
+        out,
+        ": {}",
+        message.map_or_else(
+            || truncate(body.trim(), BODY_LIMIT),
+            |message| truncate(message, BODY_LIMIT),
+        )
+    );
+
+    // What happened, not what to do about it. The provider's own sentence is printed
+    // whole, advice and all — trimming an arbitrary message would be string surgery on
+    // text whose shape we do not own — so adding advice here would contradict it
+    // ("switch providers" against "try again"), and the operator can read the
+    // provider's suggestion for themselves. What they cannot see is that this process
+    // already waited and tried, which is the fact worth adding.
+    if crate::retry::is_retryable(status.as_u16()) {
+        out.push_str("\n  retried, and the provider was still failing");
+    }
+    out
+}
+
 /// What one turn produced.
 ///
 /// `answer` and `reasoning` are separate channels rather than one string, because
@@ -986,10 +1051,14 @@ impl Agent {
         })
         .await?;
         if !status.is_success() {
-            return Err(AgentError::Api(format!("{status}: {}", truncate(&text, 2000))));
+            return Err(AgentError::Api(api_error(status, &text)));
         }
-        serde_json::from_str::<MessagesResp>(&text)
-            .map_err(|e| AgentError::Api(format!("decode: {e}; body was: {}", truncate(&text, 2000))))
+        serde_json::from_str::<MessagesResp>(&text).map_err(|e| {
+            AgentError::Api(format!(
+                "the reply from the relay did not decode: {e}\n  first bytes: {}",
+                truncate(&text, 400)
+            ))
+        })
     }
 
     /// Same turn, different wire: translate our Anthropic-shaped
@@ -1019,7 +1088,7 @@ impl Agent {
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return Err(AgentError::Api(format!("{status}: {body}")));
+            return Err(AgentError::Api(api_error(status, &body)));
         }
         let raw = resp
             .json::<crate::openai::ChatResp>()
@@ -1595,5 +1664,87 @@ mod tests {
         ] {
             assert!(!is_local_command_noise(real), "should be kept: {real}");
         }
+    }
+
+    /// A provider error is shown as the provider's own sentence.
+    ///
+    /// The body is the one a live session hit, verbatim: a 503 with the useful
+    /// sentence inside a JSON envelope, cut off mid-string by the old truncation and
+    /// printed with its braces, so nothing suggested it was worth reading.
+    #[test]
+    fn a_provider_error_is_unwrapped_into_a_sentence() {
+        let body = r#"{"error":{"message":"Service is too busy. We advise users to temporarily switch to alternative LLM API service providers.","type":"service_unavailable_error"}}"#;
+        let said = api_error(reqwest::StatusCode::SERVICE_UNAVAILABLE, body);
+
+        assert!(said.starts_with("503 Service Unavailable"), "{said}");
+        assert!(
+            said.contains("Service is too busy"),
+            "the provider's own sentence is the useful part: {said}"
+        );
+        assert!(
+            said.contains("service_unavailable_error"),
+            "and its type names itself in the provider's vocabulary: {said}"
+        );
+        // No envelope survives into what a person reads.
+        assert!(!said.contains('{') && !said.contains('"'), "unwrapped: {said}");
+        // The provider's sentence is printed whole, advice included: trimming an
+        // arbitrary message is string surgery on text whose shape we do not own. What
+        // is added is the fact the operator cannot otherwise see — that the retries
+        // have already happened — and deliberately not advice, which would argue with
+        // the sentence right above it.
+        assert!(
+            said.contains("switch to alternative LLM API service providers"),
+            "the provider's own words are kept whole: {said}"
+        );
+        assert!(
+            said.contains("retried, and the provider was still failing"),
+            "and the fact of the retries is added: {said}"
+        );
+    }
+
+    /// A hint only where the retry layer has already given up.
+    #[test]
+    fn only_a_retryable_status_mentions_retrying() {
+        let body = r#"{"error":{"message":"bad tool schema","type":"invalid_request_error"}}"#;
+        let said = api_error(reqwest::StatusCode::BAD_REQUEST, body);
+        assert!(said.contains("bad tool schema"), "{said}");
+        assert!(
+            !said.contains("retried"),
+            "a 400 is not retried, so the hint would be a lie: {said}"
+        );
+    }
+
+    /// The other two envelopes, and a body that is not JSON at all.
+    ///
+    /// A shape we do not recognise is still information: printing it beats inventing
+    /// an explanation for it.
+    #[test]
+    fn an_unrecognised_body_is_shown_rather_than_explained() {
+        // `error` as a bare string.
+        let said = api_error(reqwest::StatusCode::UNAUTHORIZED, r#"{"error":"no token"}"#);
+        assert!(said.contains("no token"), "{said}");
+
+        // A top-level `message`, from a proxy that unwraps one level less.
+        let said = api_error(reqwest::StatusCode::TOO_MANY_REQUESTS, r#"{"message":"slow down"}"#);
+        assert!(said.contains("slow down"), "{said}");
+        assert!(said.contains("retried"), "429 is retryable too: {said}");
+
+        // Not JSON: shown as it came, bounded.
+        let said = api_error(reqwest::StatusCode::BAD_GATEWAY, "<html>502 Bad Gateway</html>");
+        assert!(said.contains("502 Bad Gateway"), "{said}");
+        assert!(said.starts_with("502 Bad Gateway"), "{said}");
+
+        // Empty: still a sentence, not a dangling colon.
+        let said = api_error(reqwest::StatusCode::INTERNAL_SERVER_ERROR, "");
+        assert!(said.starts_with("500 Internal Server Error"), "{said}");
+    }
+
+    /// A very long message is cut, so one provider response cannot fill the screen.
+    #[test]
+    fn a_long_message_is_bounded() {
+        let long = "x".repeat(5_000);
+        let body = format!(r#"{{"error":{{"message":"{long}"}}}}"#);
+        let said = api_error(reqwest::StatusCode::BAD_GATEWAY, &body);
+        assert!(said.len() < 1_000, "bounded, got {}", said.len());
     }
 }

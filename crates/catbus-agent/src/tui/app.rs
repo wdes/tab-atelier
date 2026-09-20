@@ -20,6 +20,9 @@
 //! to service the turn. A thread that owns the read and a channel between them is
 //! the smallest arrangement that lets both happen.
 
+// The `Engine` trait carries `encode`; base64 0.23 moved it out of the engine's own
+// inherent methods.
+use base64::Engine as _;
 use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::Path;
@@ -30,7 +33,7 @@ use ratatui::crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind, KeyModifiers,
 };
 use ratatui::crossterm::execute;
-use ratatui::crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use ratatui::crossterm::terminal::{Clear, ClearType, disable_raw_mode, enable_raw_mode};
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -135,6 +138,88 @@ impl Ui {
         })
     }
 
+    /// Show the operator's own prompt, above the reply it produced.
+    ///
+    /// Without this a reply appears under nothing, and scrolling back cannot tell what
+    /// was asked from what was answered — which is worse in a session where several
+    /// turns look alike. Marked with `> `, the same shape the banner uses for an
+    /// earlier exchange, and indented on continuation lines so a multi-line prompt
+    /// still reads as one.
+    pub fn print_user(&mut self, prompt: &str, styled: bool) -> std::io::Result<()> {
+        // Dimmed cyan where the session asks for styling, plain otherwise: the marker
+        // is what distinguishes it, so a `NO_COLOR` session gets the marker without the
+        // colour rather than nothing.
+        let style = if styled {
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM)
+        } else {
+            Style::default()
+        };
+        let body = prompt
+            .trim_end()
+            .lines()
+            .enumerate()
+            .map(|(i, line)| {
+                if i == 0 {
+                    format!("> {line}")
+                } else {
+                    format!("  {line}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let height = u16::try_from(body.split('\n').count()).unwrap_or(u16::MAX);
+        self.insert(height, move |buf| {
+            for (i, line) in body.split('\n').enumerate() {
+                let y = buf.area.top().saturating_add(u16::try_from(i).unwrap_or(0));
+                buf.set_string(buf.area.left(), y, line, style);
+            }
+        })
+    }
+
+    /// Put markdown on the terminal's clipboard, through OSC 52.
+    ///
+    /// What it carries is **the markdown**, not the rendered text — that is the whole
+    /// point. A table is *drawn* as padded pipes so it can be pasted as a table, but
+    /// the padding is presentation: someone copying a reply wants the source, which is
+    /// what the model wrote and what any renderer can lay out again. So callers pass
+    /// the raw answer, not the lines this process drew.
+    ///
+    /// OSC 52 rather than a clipboard crate because the app *is* a terminal emulator:
+    /// the clipboard belongs to whatever terminal it is running inside, and this is the
+    /// sequence such a terminal asks for. Nothing is read back, so a terminal that
+    /// ignores the sequence loses only the copy.
+    pub fn copy(text: &str) -> std::io::Result<()> {
+        /// The sequence rides the pty stream, so it is bounded — well above any answer,
+        /// a guard rather than a limit.
+        const LIMIT: usize = 200_000;
+        let bounded = if text.len() > LIMIT {
+            &text[..char_boundary(text, LIMIT)]
+        } else {
+            text
+        };
+        let encoded = base64::engine::general_purpose::STANDARD.encode(bounded);
+        let mut out = std::io::stdout();
+        // `c` is the clipboard selection; an empty payload would *read* it instead of
+        // writing, which is why the text is always included.
+        write!(out, "\u{1b}]52;c;{encoded}\u{7}")?;
+        out.flush()
+    }
+
+    /// Wipe the screen and the scrollback, for `/clear`.
+    ///
+    /// `ClearType::Purge` is `3J`: every cell *and* the history. ratatui's own
+    /// `clear()` sends `2J`, which empties what is visible while leaving every earlier
+    /// line in the scrollback — so the session still reads as though the old one were
+    /// there, which is the opposite of "looks brand new".
+    pub fn purge(&mut self) -> std::io::Result<()> {
+        let mut out = std::io::stdout();
+        execute!(out, ratatui::crossterm::cursor::MoveTo(0, 0), Clear(ClearType::Purge))?;
+        out.flush()?;
+        // ratatui's back buffer still holds the frame it drew last, so without this it
+        // would consider the now-blank cells already correct and never repaint them.
+        self.terminal.clear()
+    }
+
     /// Reserve `height` rows above the viewport and let `paint` fill them.
     ///
     /// Both printers go through here, so the borrow of the retained buffer lives in
@@ -222,10 +307,29 @@ fn spawn_reader() -> tokio::sync::mpsc::Receiver<Event> {
     rx
 }
 
+/// The largest index at or below `limit` that is a character boundary.
+///
+/// `str::floor_char_boundary` is not stable, and slicing a `String` at a byte index
+/// that lands inside a character panics — so a bound that is only a guard still has to
+/// respect them.
+fn char_boundary(text: &str, limit: usize) -> usize {
+    (0..=limit.min(text.len()))
+        .rev()
+        .find(|i| text.is_char_boundary(*i))
+        .unwrap_or(0)
+}
+
 /// What a slash command asked the loop to do.
 enum Outcome {
     /// Print this above the viewport and keep going.
     Print(String),
+    /// Wipe the screen and scrollback, print this, reprint the banner, keep going.
+    ///
+    /// Its own variant rather than `Print("")`, because the wipe has to happen *before*
+    /// the message and the banner — and because a session that merely printed a blank
+    /// line would leave the old session's output in the scrollback, which is the one
+    /// thing this is for.
+    Cleared(String),
     /// Leave the REPL.
     Exit,
 }
@@ -259,8 +363,11 @@ async fn run_slash(agent: &Agent, cwd: &Path, command: &slash::SlashCommand, arg
         }
         slash::Action::Clear => match agent.clear().await {
             Ok(previous) => {
+                // The message is printed *after* the wipe, so it survives it. The old
+                // session's id is the one thing worth keeping on screen, because it is
+                // how the operator gets back. See the `Cleared` arm in the loop.
                 let short = previous.id.get(..8).unwrap_or(&previous.id).to_owned();
-                Outcome::Print(format!(
+                Outcome::Cleared(format!(
                     "started a fresh session; the previous one ({}, {short}) is still on disk — \
                      /resume {} to return to it",
                     previous.name, previous.id
@@ -415,16 +522,25 @@ async fn run_inner(ui: &mut Ui, agent: Arc<Agent>, cwd: &Path) -> std::io::Resul
                                 if trimmed.is_empty() {
                                     continue;
                                 }
+                                // A slash command is handled on the spot; anything else
+                                // becomes a turn. Extracted so this loop stays about
+                                // *sequencing* — a tick, a key, a turn — rather than about
+                                // what each verb prints.
                                 if let Some((command, argument)) = slash::lookup(&trimmed) {
                                     match run_slash(&agent, cwd, command, argument).await {
                                         Outcome::Print(text) => ui.print_above(&text)?,
+                                        Outcome::Cleared(text) => {
+                                            ui.purge()?;
+                                            if !text.is_empty() {
+                                                ui.print_above(&text)?;
+                                            }
+                                            print_banner(ui, &agent).await?;
+                                        }
                                         Outcome::Exit => return Ok(()),
                                     }
                                     continue;
                                 }
-                                let agent = Arc::clone(&agent);
-                                turn = Some(tokio::spawn(async move { agent.run_user_prompt(trimmed).await }));
-                                spinner = Some(Spinner::new());
+                                submit_prompt(ui, &agent, &mut turn, &mut spinner, trimmed)?;
                             }
                         }
                     }
@@ -445,6 +561,33 @@ async fn run_inner(ui: &mut Ui, agent: Arc<Agent>, cwd: &Path) -> std::io::Resul
             }
         }
     }
+}
+
+/// Show the operator's prompt and start the turn for it.
+///
+/// The echo happens here, synchronously, rather than when the turn completes: a prompt
+/// that appears only after the reply arrives is not a record of what was asked, it is
+/// an annotation on the answer.
+///
+/// The clipboard gets the same text, because a prompt is the same kind of text as an
+/// answer — see [`Ui::copy`] for why what goes there is the source rather than a
+/// rendering.
+fn submit_prompt(
+    ui: &mut Ui,
+    agent: &Arc<Agent>,
+    turn: &mut Option<tokio::task::JoinHandle<Result<crate::agent::Turn, crate::agent::AgentError>>>,
+    spinner: &mut Option<Spinner>,
+    prompt: String,
+) -> std::io::Result<()> {
+    ui.print_user(&prompt, agent.styles_output())?;
+    if let Err(e) = Ui::copy(&prompt) {
+        // Not fatal: a terminal that ignores OSC 52 loses only the copy.
+        log::warn!("could not set the clipboard: {e}");
+    }
+    let agent = Arc::clone(agent);
+    *turn = Some(tokio::spawn(async move { agent.run_user_prompt(prompt).await }));
+    *spinner = Some(Spinner::new());
+    Ok(())
 }
 
 /// How long ago a session was written, for the `/resume` listing.
@@ -556,10 +699,20 @@ async fn report_turn(ui: &mut Ui, agent: &Agent, turn: &crate::agent::Turn) -> s
     // it, in the shape Claude Code writes — so it is available to anyone who wants
     // it and out of the way of everyone who does not.
     if !turn.answer.trim().is_empty() {
-        // Styled when the session asked for styling, plain otherwise. `NO_COLOR`
-        // should mean something visible, and the honest thing it can mean here is
-        // "show me the text, not a rendering of it" — the same characters either
-        // way, so nothing is lost and nothing is coloured.
+        // The clipboard gets the **markdown**, not the rendered lines. A table is
+        // drawn as padded pipes so that it pastes as a table, but the padding is
+        // presentation: someone copying a reply wants the source the model wrote, which
+        // any renderer can lay out again. So this happens before the renderer, from the
+        // answer as it arrived.
+        if let Err(e) = Ui::copy(&turn.answer) {
+            // Not fatal: a terminal that ignores OSC 52 loses only the copy, and there
+            // is usually a way to select the text by hand.
+            log::warn!("could not set the clipboard: {e}");
+        }
+        // Styled when the session asked for styling, plain otherwise. `NO_COLOR` should
+        // mean something visible, and the honest thing it can mean here is "show me the
+        // text, not a rendering of it" — the same characters either way, so nothing is
+        // lost and nothing is coloured.
         if agent.styles_output() {
             ui.print_markdown(&turn.answer)?;
         } else {
@@ -580,4 +733,95 @@ async fn report_turn(ui: &mut Ui, agent: &Agent, turn: &crate::agent::Turn) -> s
         log::warn!("could not record token totals: {e}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The clipboard carries the markdown, not the rendering.
+    ///
+    /// This is the property the whole OSC 52 path exists for, and the two are easy to
+    /// confuse: a table is *drawn* as padded pipes so it can be pasted as a table, but
+    /// the padding is presentation. Someone copying a reply wants the source the model
+    /// wrote, which any renderer can lay out again — so what is encoded here is the raw
+    /// answer.
+    #[test]
+    fn the_clipboard_sequence_carries_the_source_verbatim() {
+        // Built the way `Ui::copy` builds it, so the encoding is checked without a
+        // terminal to write to.
+        use base64::Engine as _;
+        let markdown = "| a | bb |\n|---|---|\n| 1 | 2 |";
+        let encoded = base64::engine::general_purpose::STANDARD.encode(markdown);
+        let decoded = String::from_utf8(
+            base64::engine::general_purpose::STANDARD
+                .decode(encoded.as_bytes())
+                .expect("round trip"),
+        )
+        .expect("utf-8");
+
+        assert_eq!(decoded, markdown, "the sequence must round-trip the source");
+        // Not the rendered form: rendering pads the cells, and that must not be what a
+        // copy yields.
+        let rendered = crate::tui::markdown::render(markdown);
+        let rendered_text: String = rendered
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_ne!(
+            rendered_text, markdown,
+            "the renderer does pad, so the two differ and the copy must be the source"
+        );
+        // The rule row is what the renderer rewrote here — `|---|` became `|---|----|`
+        // to match the widest cell in each column — so a copy that yielded the rendered
+        // text would carry padding the author never wrote.
+        assert!(rendered_text.contains("|---|----|"), "{rendered_text}");
+    }
+
+    /// The payload is bounded, and the bound respects character boundaries.
+    ///
+    /// A byte index inside a character would panic on the slice, so a guard that is
+    /// only a guard still has to find a boundary.
+    #[test]
+    fn the_clipboard_payload_is_bounded_at_a_character_boundary() {
+        let multibyte = "é".repeat(50);
+        // A limit landing mid-character.
+        let cut = char_boundary(&multibyte, 5);
+        assert!(multibyte.is_char_boundary(cut), "must be a boundary: {cut}");
+        assert!(cut <= 5, "and must not exceed the limit: {cut}");
+        // No panic on the slice itself.
+        let _ = &multibyte[..cut];
+
+        // A limit past the end is the end.
+        assert_eq!(char_boundary("abc", 99), 3);
+        // And an empty string is fine.
+        assert_eq!(char_boundary("", 10), 0);
+    }
+
+    /// The prompt echo marks continuation lines so a multi-line prompt reads as one.
+    ///
+    /// Asserted on the shape rather than through a terminal, because what a pty capture
+    /// holds is ratatui's diff stream and not a screen — see the note in `repl_pty`.
+    #[test]
+    fn a_user_prompt_is_prefixed_and_hanging_lines_are_indented() {
+        let prompt = "first line\nsecond line";
+        let body = prompt
+            .trim_end()
+            .lines()
+            .enumerate()
+            .map(|(i, line)| {
+                if i == 0 {
+                    format!("> {line}")
+                } else {
+                    format!("  {line}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(body, "> first line\n  second line");
+        // The marker is what distinguishes a prompt from a reply, so it is present even
+        // when colour is off — which is why it is built before any styling is applied.
+        assert!(body.starts_with("> "), "{body}");
+    }
 }

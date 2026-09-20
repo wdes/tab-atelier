@@ -46,6 +46,18 @@ pub struct EventProxy {
     /// poll. Shared with `TerminalView::exited`.
     #[cfg(feature = "gui")]
     pub exited: Arc<std::sync::atomic::AtomicBool>,
+    /// Text a program in the tab asked to put on the clipboard (OSC 52).
+    ///
+    /// A slot rather than a direct copy, because the copy has to happen on the UI
+    /// thread: writing to the clipboard needs gpui's `App`, and this callback runs on
+    /// the parser thread with none. So it is filled here and drained by the app's
+    /// sweep, the same arrangement as [`Self::exited`].
+    ///
+    /// `Option` rather than a bool because the *text* is the message. A second write
+    /// before the drain replaces the first, which is the right resolution: a clipboard
+    /// holds one value, and the later copy is the one the operator just asked for.
+    #[cfg(feature = "gui")]
+    pub clipboard: Arc<Mutex<Option<String>>>,
 }
 
 impl EventProxy {
@@ -79,8 +91,28 @@ impl EventListener for EventProxy {
                 self.exited.store(true, std::sync::atomic::Ordering::Relaxed);
                 return;
             }
+            // A clipboard **write** — OSC 52 — from whatever is running in the tab.
+            //
+            // catbus-agent uses this to put its raw markdown on the clipboard, because it
+            // is a TUI and has no clipboard of its own: the clipboard belongs to the
+            // terminal it runs inside, and this is the sequence asking for it. The text
+            // arrives already decoded by alacritty — it strips the base64 and the
+            // terminator — so it is stored as it is.
+            //
+            // Deliberately *not* routed through the input channel below: that sends
+            // bytes **to** the pty as though they had been typed, which would write the
+            // clipboard value back into the child.
+            #[cfg(feature = "gui")]
+            AlacrittyEvent::ClipboardStore(_, text) => {
+                if let Ok(mut slot) = self.clipboard.lock() {
+                    *slot = Some(text);
+                }
+                return;
+            }
             // Answer OSC colour queries (OSC 4 palette / 10 fg / 11 bg /
-            // 12 cursor). Without a reply the query times out and the app
+            // 12 cursor).
+            //
+            // Without a reply the query times out and the app
             // assumes a default (near-black) background — Claude Code then
             // computes its diff highlight colours for that imagined bg, and
             // those clash with our real navy theme (added lines render a
