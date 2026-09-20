@@ -27,8 +27,64 @@ const source = readFileSync(join(here, "main.js"), "utf8");
 /** Every socket the viewer opened, in order. */
 const sockets = [];
 
+/** Every XHR the viewer opened, in order, so an upload can be driven from the test. */
+const requests = [];
+
 /** Timers scheduled but not yet fired, so a reconnect can be stepped through deterministically. */
 const timers = [];
+
+/**
+ * Just enough `XMLHttpRequest` to run an upload and decide its outcome.
+ *
+ * The viewer's upload writes progress into the status line and, before the fix, never put the real
+ * status back — so the line kept `uploading photo.jpg · 100%` stuck at the bottom of the screen.
+ * Driving the request from here is what makes that assertable: the handler that clears it only runs
+ * when the request ends, and nothing else can end it.
+ */
+class FakeXhr {
+    constructor() {
+        this.upload = { addEventListener: (name, fn) => { this._upload[name] = fn; } };
+        this._upload = {};
+        this._events = {};
+        this.readyState = 0;
+        this.status = 0;
+        this.responseText = "";
+        this.sent = null;
+        requests.push(this);
+    }
+
+    open(method, url) {
+        this.method = method;
+        this.url = url;
+    }
+
+    setRequestHeader() {}
+
+    addEventListener(name, fn) {
+        this._events[name] = fn;
+    }
+
+    send(body) {
+        this.sent = body;
+    }
+
+    /** The server-side progress report. */
+    fireProgress(loaded, total) {
+        this._upload.progress?.({ lengthComputable: true, loaded, total });
+    }
+
+    /** The server-side reply. */
+    fireLoad(status = 201, body = '{"path":"inbox/photo.jpg"}') {
+        this.status = status;
+        this.responseText = body;
+        this._events.load?.({});
+    }
+
+    /** The network giving up. */
+    fireError() {
+        this._events.error?.({});
+    }
+}
 
 class FakeSocket {
     static CONNECTING = 0;
@@ -73,11 +129,47 @@ class FakeSocket {
     }
 }
 
-/** The element the viewer asks for by id. Real enough for `classList` to be assertable. */
+/**
+ * A real element for the ids this test reads or writes, and a stub for the rest.
+ *
+ * `#status` has to be genuine: its text is one of the two things under test, so it must be readable
+ * and writable. A `Proxy` gives that while every other property — the dozens of methods the viewer
+ * calls on other elements — stays a stub, so growing a call in the viewer does not break this test.
+ */
+function fakeElement() {
+    const classes = new Set();
+    return new Proxy(
+        {
+            textContent: "",
+            classList: {
+                add: (c) => classes.add(c),
+                remove: (c) => classes.delete(c),
+                contains: (c) => classes.has(c),
+            },
+            style: {},
+            dataset: {},
+            _classes: classes,
+        },
+        {
+            get: (target, key) => (key in target ? target[key] : stub(String(key))),
+            set: (target, key, value) => {
+                target[key] = value;
+                return true;
+            },
+        },
+    );
+}
+
+/** The element the viewer asks for by id. */
 function fakeDocument() {
     const classes = new Set();
     const listeners = new Map();
-    const element = () => stub("element");
+    // The two elements this test touches are real; the rest are shared stubs.
+    const elements = new Map();
+    const byId = (id) => {
+        if (!elements.has(id)) elements.set(id, fakeElement());
+        return elements.get(id);
+    };
     const body = {
         classList: {
             add: (c) => classes.add(c),
@@ -91,12 +183,10 @@ function fakeDocument() {
     };
     return {
         body,
-        // The banner is the thing under test, so its class set is real. Everything else is a stub
-        // — the viewer queries dozens of elements and this test is not about any of them.
-        getElementById: () => element(),
-        querySelector: () => element(),
+        getElementById: byId,
+        querySelector: () => fakeElement(),
         querySelectorAll: () => [],
-        createElement: () => element(),
+        createElement: () => fakeElement(),
         addEventListener: (name, fn) => {
             listeners.set(name, [...(listeners.get(name) ?? []), fn]);
         },
@@ -104,6 +194,7 @@ function fakeDocument() {
         visibilityState: "visible",
         _classes: classes,
         _listeners: listeners,
+        _byId: byId,
     };
 }
 
@@ -133,6 +224,7 @@ function stub(name = "stub") {
 
 function loadViewer() {
     sockets.length = 0;
+    requests.length = 0;
     timers.length = 0;
     const document = fakeDocument();
     const sandbox = {
@@ -148,6 +240,8 @@ function loadViewer() {
         },
         navigator: { userAgent: "node", clipboard: undefined },
         WebSocket: FakeSocket,
+        XMLHttpRequest: FakeXhr,
+        FormData: function () { return { append: () => {} }; },
         Terminal: function () { return stub("term"); },
         requestAnimationFrame: (fn) => fn(),
         fetch: () => Promise.resolve(stub("response")),
@@ -312,6 +406,54 @@ console.log("reconnect behaviour\n");
         "and firing it opens exactly one socket",
         sockets.length === before + 1,
         `${sockets.length - before} sockets were opened by one timer`,
+    );
+}
+
+// --- 4. the status line does not keep an upload's progress --------------------
+//
+// Reported: a status line stuck at the bottom showing an upload that had finished. `uploadFile`
+// writes `uploading name · N%` into `#status` and, before the fix, never put the real status back —
+// and the only other writer is `renderStatus`, which runs on a meta message. So the line kept the
+// last progress report after every upload, and a batch showed a stale percentage between files.
+{
+    const { sandbox, document } = loadViewer();
+    const status = document.getElementById("status");
+    check("the status element starts empty", status.textContent === "");
+
+    const uploading = sandbox.uploadFile({ name: "photo.jpg", size: 1000 });
+    const request = requests.at(-1);
+
+    request.fireProgress(470, 1000);
+    check(
+        "progress is shown while uploading",
+        status.textContent.includes("uploading photo.jpg") && status.textContent.includes("47%"),
+        `the progress line read ${JSON.stringify(status.textContent)}`,
+    );
+
+    request.fireLoad(201);
+    await uploading;
+    check(
+        "a finished upload steps the progress line aside",
+        !status.textContent.includes("uploading"),
+        `the status line kept ${JSON.stringify(status.textContent)} — which is the reported stuck \
+line`,
+    );
+    check(
+        "leaving the session's real status",
+        status.textContent.includes("connected") || status.textContent.length > 0,
+        "the line was left blank rather than restored",
+    );
+
+    // The other way an upload ends: the network gives up. Same restore, and an error to explain it.
+    const failing = sandbox.uploadFile({ name: "big.zip", size: 999 });
+    const second = requests.at(-1);
+    second.fireProgress(310, 999);
+    second.fireError();
+    await failing;
+    check(
+        "a failed upload does not keep its progress either",
+        !status.textContent.includes("uploading"),
+        `the status line kept ${JSON.stringify(status.textContent)}`,
     );
 }
 

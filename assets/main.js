@@ -571,6 +571,14 @@
           }
         });
         xhr.addEventListener("load", () => {
+          // The upload is over, whatever happened, so put the real status back. Nothing else
+          // clears it: the progress handler above writes `uploading … · N%` and the only other
+          // writer is `renderStatus`, which runs on a meta message. So the status line kept the
+          // last progress line — `uploading photo.jpg · 100%` — pinned at the bottom of the
+          // screen after every upload, which is what was reported. Restored here rather than at
+          // the end of the batch so a single-file upload clears it too, and so a batch shows the
+          // real status between files rather than a stale percentage.
+          renderStatus();
           if (xhr.status === 201 || xhr.status === 200) {
             // Parse the server's response for the relative path
             // ("inbox/<name>") and offer it as a click-to-copy
@@ -590,6 +598,10 @@
           }
         });
         xhr.addEventListener("error", () => {
+          // A dropped network is the other way an upload ends without a `load`, and it needs the
+          // same restore: an error toast plus a status line reading `uploading … · 47%` forever is
+          // worse than either alone.
+          renderStatus();
           toast(`upload failed: network error`);
           resolve(null);
         });
