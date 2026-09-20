@@ -1006,9 +1006,6 @@ impl Agent {
                 // will actually look.
                 let vetted: Option<String> = if gate.judges() && self.tools.changes_the_world(name) {
                     *self.status.lock().expect("status mutex") = Some(format!("checking {name}"));
-                    // The same tool name the status row shows, so the tab's label and the agent's own
-                    // spinner cannot disagree about what is running.
-                    self.report_status(crate::applink::State::Thinking, Some((*name).to_owned()));
                     let history = { self.active.read().await.history.clone() };
                     let verdict = self.judge_action(name, input, &history).await;
                     let record = format!("auto checked {name}: {}", verdict.summary());
@@ -1025,6 +1022,13 @@ impl Agent {
                 } else {
                     None
                 };
+
+                // Reported for **every** tool call, not only the judged ones. It was inside the branch
+                // above, so a session running in `open` mode — the default — never sent a label and the
+                // tab's indicator stayed on `thinking` with nothing naming the tool. The label is the
+                // same name the status row shows, so the tab and the agent cannot disagree about what
+                // is running.
+                self.report_status(crate::applink::State::Thinking, Some((*name).to_owned()));
 
                 let (mut content, is_error) = tokio::select! {
                     out = self.tools.dispatch(name, input, &session.cwd, gate, &self.asker) => {
