@@ -94,20 +94,36 @@ fn spawn_mock_relay_owned(responses: Vec<(&'static str, String)>) -> (u16, mpsc:
             let (mut stream, _) = listener.accept().unwrap();
             stream.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
             let raw = read_http_request(&mut stream);
+            // A connection that carried nothing — opened and abandoned. Skipped without consuming a
+            // canned reply, so a client that does this does not eat the answer meant for its next
+            // request.
+            if raw.is_empty() {
+                continue;
+            }
 
             // The app asks for prices once at startup. Answered here and **not** forwarded on
             // the channel, and the queue is left untouched: a test asserts on the conversation,
             // and a startup GET that consumed a canned reply would leave the turn that follows
             // with nothing to answer it. (It did, before this.)
-            if raw.starts_with("GET ") {
+            // Only the messages path consumes a canned reply. Anything else the client may send —
+            // the startup price fetch, or any future chatter — is answered without touching the queue,
+            // so it cannot eat the reply meant for a turn. Learned the hard way: a status POST to the
+            // mock consumed one and the turn then failed for no visible reason.
+            if !raw.contains("/relay/anthropic/v1/messages ") {
+                let (status, body) = if raw.starts_with("GET ") {
+                    ("200 OK", MOCK_PRICES)
+                } else {
+                    // Accepted and discarded: fire-and-forget requests do not care, and answering
+                    // keeps a client from waiting.
+                    ("204 No Content", "")
+                };
                 let resp = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\
-                     \nconnection: close\r\n\r\n{}",
-                    MOCK_PRICES.len(),
-                    MOCK_PRICES
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\
+                     \nconnection: close\r\n\r\n{body}",
+                    body.len()
                 );
-                stream.write_all(resp.as_bytes()).unwrap();
-                stream.flush().unwrap();
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
                 continue;
             }
 
@@ -130,9 +146,18 @@ fn spawn_mock_relay_owned(responses: Vec<(&'static str, String)>) -> (u16, mpsc:
 fn read_http_request(stream: &mut TcpStream) -> String {
     let mut buf = Vec::new();
     let mut chunk = [0_u8; 4096];
+    // An empty return means "this connection carried no request" — the peer closed, or went quiet.
+    //
+    // It used to panic, which killed the mock's whole thread on the first connection that closed
+    // without sending: every later request then failed with `error sending request` and nothing said
+    // why. A client that opens a connection and abandons it is ordinary — reqwest's pool does it, and
+    // the agent's startup price fetch made it happen — so a test server has to tolerate it the way a
+    // real one does. The mock loops skip an empty read without consuming a canned reply.
     let header_end = loop {
-        let n = stream.read(&mut chunk).unwrap();
-        assert!(n > 0, "connection closed mid-request");
+        let n = match stream.read(&mut chunk) {
+            Ok(0) | Err(_) => return String::new(),
+            Ok(n) => n,
+        };
         buf.extend_from_slice(&chunk[..n]);
         if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
             break pos + 4;
@@ -150,9 +175,13 @@ fn read_http_request(stream: &mut TcpStream) -> String {
         })
         .unwrap_or(0);
     while buf.len() < header_end + content_length {
-        let n = stream.read(&mut chunk).unwrap();
-        assert!(n > 0, "connection closed mid-body");
-        buf.extend_from_slice(&chunk[..n]);
+        // A body that never arrives is the same case as a request that never came: the peer went
+        // away. Reported as an empty request rather than a panic, so one abandoned connection cannot
+        // take the mock's thread down with it.
+        match stream.read(&mut chunk) {
+            Ok(0) | Err(_) => return String::new(),
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+        }
     }
     String::from_utf8_lossy(&buf).to_string()
 }

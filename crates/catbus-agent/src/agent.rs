@@ -206,6 +206,12 @@ pub struct Agent {
     /// Whether this session's output may be styled. Read through
     /// [`Self::styles_output`], which is the only place that decides.
     ansi: bool,
+    /// This session's id, kept here so a status report can name it without awaiting a lock.
+    ///
+    /// `active` holds the session behind an `RwLock`, and the id changes on `swap_session`. Reporting
+    /// status is fire-and-forget and must never delay a turn, so reading it from a dedicated mutex is
+    /// what lets the report start in a spawned task with no await before it.
+    session_id: std::sync::Mutex<String>,
     /// The channel a question from [`crate::tools::ask`] travels down.
     ///
     /// On the agent rather than inside the tool, because the answer comes from whatever is
@@ -286,6 +292,8 @@ impl Agent {
         // memory is lost exactly when the operator comes back to check it —
         // which is why `/auto` could look like it did nothing.
         let gate = session.saved_gate().unwrap_or(tools::Gate::Open);
+        // Read now, before `session` is moved into the `Arc` below.
+        let session_id = session.id.clone();
         // What this session had already spent, so a resume continues the count instead of
         // starting from zero. Both halves matter: the token counts are what the status lines
         // show, and the amounts cannot be recomputed here at all — the price list arrives later
@@ -332,6 +340,7 @@ impl Agent {
             ansi: false,
             // A fresh channel per agent; the REPL or a socket client reaches it through
             // `asker()`. See the field.
+            session_id: std::sync::Mutex::new(session_id),
             asker: std::sync::Arc::new(crate::tools::ask::Asker::new()),
             // Seeded from the sidecar, so a resumed session carries on from what it had spent
             // rather than from zero. See `Session::load_tokens`.
@@ -384,6 +393,31 @@ impl Agent {
     #[must_use]
     pub const fn asker(&self) -> &std::sync::Arc<crate::tools::ask::Asker> {
         &self.asker
+    }
+
+    /// Tell tab-atelier what this session is doing, when tab-atelier is what is running it.
+    ///
+    /// Spawned rather than awaited: a status report is the least important thing in the process and
+    /// must not add latency to a turn, so the task is left to finish on its own. [`crate::applink`]
+    /// does nothing at all when there is no app, which is the ordinary case for a standalone install.
+    fn report_status(&self, state: crate::applink::State, label: Option<String>) {
+        let Some(endpoint) = crate::applink::endpoint() else {
+            return;
+        };
+        let session = self.session_id.lock().map(|id| id.clone()).unwrap_or_default();
+        if session.is_empty() {
+            return;
+        }
+        tokio::spawn(async move {
+            crate::applink::report(&endpoint, state, label.as_deref(), &session).await;
+        });
+    }
+
+    /// This session's id, for a caller that has to name it — the exit report in `main`, which runs
+    /// after the REPL has returned and cannot await a lock.
+    #[must_use]
+    pub fn session_id_for_report(&self) -> String {
+        self.session_id.lock().map(|id| id.clone()).unwrap_or_default()
     }
 
     /// The running totals. See [`crate::cost`].
@@ -666,10 +700,18 @@ impl Agent {
     /// from the new transcript so the model has full context.
     pub async fn swap_session(&self, new_session: Session) -> Result<(), AgentError> {
         let history = rebuild_history(&new_session.project_dir, &new_session.id);
+        // The id is updated too, and before the swap is visible: a different session is a different
+        // transcript, and the app would otherwise keep the old id and resume the wrong conversation
+        // when the tab is reopened. Set first so a report cannot land under a stale id.
+        if let Ok(mut id) = self.session_id.lock() {
+            new_session.id.clone_into(&mut id);
+        }
         *self.active.write().await = ActiveSession {
             session: Arc::new(new_session),
             history,
         };
+        // And said once, so the app has the new id immediately rather than at the next turn.
+        self.report_status(crate::applink::State::Waiting, None);
         Ok(())
     }
 
@@ -730,8 +772,13 @@ impl Agent {
             slot.clone()
         };
         *self.status.lock().expect("status mutex") = Some(crate::statusline::THINKING_MARKER.to_owned());
+        // What the tab's indicator shows for the whole of a turn.
+        self.report_status(crate::applink::State::Thinking, None);
         let result = self.run_user_prompt_inner(text, &token).await;
         *self.status.lock().expect("status mutex") = None;
+        // And when it is over: the operator is the one being waited on now, which is what the app's
+        // `waiting` means for a Claude Code tab too.
+        self.report_status(crate::applink::State::Waiting, None);
         // The totals are persisted here rather than by whichever UI happens to be attached, so
         // every path that runs a turn records them: the REPL, a socket client, and the app's own
         // CLI. It was in the REPL's render path before, which meant a session driven over the
@@ -959,6 +1006,9 @@ impl Agent {
                 // will actually look.
                 let vetted: Option<String> = if gate.judges() && self.tools.changes_the_world(name) {
                     *self.status.lock().expect("status mutex") = Some(format!("checking {name}"));
+                    // The same tool name the status row shows, so the tab's label and the agent's own
+                    // spinner cannot disagree about what is running.
+                    self.report_status(crate::applink::State::Thinking, Some((*name).to_owned()));
                     let history = { self.active.read().await.history.clone() };
                     let verdict = self.judge_action(name, input, &history).await;
                     let record = format!("auto checked {name}: {}", verdict.summary());

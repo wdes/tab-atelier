@@ -26,6 +26,7 @@ use clap::Parser;
 
 mod agent;
 mod ansi;
+mod applink;
 mod cache;
 mod cost;
 mod guard;
@@ -58,14 +59,17 @@ struct Args {
     #[arg(long)]
     cwd: Option<PathBuf>,
 
-    /// Resume an existing session by id. Without this flag the
-    /// newest session in the working directory is auto-resumed
-    /// (use --new-session to override).
+    /// Resume an existing session by id. Without it a **new** session is started: continuing an
+    /// earlier conversation is always explicit, so reopening a tab does not silently carry on
+    /// whichever one was last in this directory, and two agents here cannot share a history.
     #[arg(long)]
     resume: Option<String>,
 
-    /// Force a brand-new session even when a previous transcript
-    /// exists in this cwd. Default behaviour is to resume.
+    /// Accepted and does nothing: a new session is the default.
+    ///
+    /// Kept because callers pass it — the app's tab launcher and the `Spawn` tool both name a fresh
+    /// session explicitly — and a flag that vanished would be a break for them. `--resume` still
+    /// wins over it when both are given.
     #[arg(long)]
     new_session: bool,
 
@@ -287,6 +291,21 @@ fn resolve_tools(args: &Args) -> Result<(tools::ToolSet, identity::Identity), Bo
     Ok((narrowed, identity))
 }
 
+/// Apply `--gate`, if the launcher gave one.
+///
+/// An explicit mode wins over the one the session was last left in. Applied here rather than in
+/// `Agent::new` because the flag belongs to this launch while the saved mode belongs to the session —
+/// and it is written back, so pinning a tab once is enough. An unknown word is a hard error: it was
+/// typed by a launcher, so it is a mistake to fix rather than something to default away.
+async fn apply_launch_gate(agent: &Arc<agent::Agent>, word: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(word) = word else {
+        return Ok(());
+    };
+    let gate = tools::parse_gate(word).ok_or_else(|| format!("unknown --gate `{word}` — one of: open, auto, plan"))?;
+    agent.set_gate(gate).await;
+    Ok(())
+}
+
 /// Ask the relay what it charges, without making the session wait for the answer.
 ///
 /// In the background on purpose. A price list is an enhancement, and blocking on one before the
@@ -298,6 +317,23 @@ fn resolve_tools(args: &Args) -> Result<(tools::ToolSet, identity::Identity), Bo
 /// Until it lands, the totals show tokens with no amounts — the same state as a relay that serves
 /// no prices at all — so nothing waits on it and nothing depends on it succeeding. It is logged at
 /// `info`, because a relay without one is not a fault.
+/// Tell the app this tab now has an agent, before the first turn.
+///
+/// The id is the point: it is what the app stores and hands back through `--resume`, so without this a
+/// reopened tab would start a blank session and the conversation would look lost. `waiting`, not
+/// `thinking` — an agent sitting at its prompt is waiting for the operator.
+///
+/// Spawned like every report but the exit one, so start-up does not wait on a request to the app.
+fn announce_to_app(agent: &Arc<agent::Agent>) {
+    let Some(endpoint) = applink::endpoint() else {
+        return;
+    };
+    let session = agent.session_id_for_report();
+    tokio::spawn(async move {
+        applink::report(&endpoint, applink::State::Waiting, None, &session).await;
+    });
+}
+
 fn fetch_prices_in_background(agent: &Arc<agent::Agent>) {
     let agent = Arc::clone(agent);
     tokio::spawn(async move {
@@ -451,16 +487,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     fetch_prices_in_background(&agent);
 
-    // An explicit mode wins over the one the session was last left in. Applied
-    // here rather than in `Agent::new`, because the flag belongs to this launch
-    // while the saved mode belongs to the session — and it is written back, so
-    // pinning a tab once is enough. An unknown word is a hard error: it was typed
-    // by a launcher, so it is a mistake to fix, not something to default away.
-    if let Some(word) = args.gate.as_deref() {
-        let gate =
-            tools::parse_gate(word).ok_or_else(|| format!("unknown --gate `{word}` — one of: open, auto, plan"))?;
-        agent.set_gate(gate).await;
-    }
+    announce_to_app(&agent);
+
+    apply_launch_gate(&agent, args.gate.as_deref()).await?;
 
     // Stated at start-up, because "which mode am I in" is the first thing an
     // operator needs when a write went through that they expected to be checked,
@@ -487,7 +516,21 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         // task removes its file in Drop on a best-effort basis.
         socket_task.abort();
     }
+    goodbye_to_app(&agent).await;
     Ok(())
+}
+
+/// The last word to the app: this agent is gone, so its tab's indicator should stop rather than keep
+/// showing whatever it was last doing.
+///
+/// Awaited, unlike every other report. The process is about to end, so a spawned task would be
+/// cancelled before it sent anything — and this is the one report whose absence leaves a wrong answer
+/// on screen rather than a stale one.
+async fn goodbye_to_app(agent: &Arc<agent::Agent>) {
+    let Some(endpoint) = applink::endpoint() else {
+        return;
+    };
+    applink::report(&endpoint, applink::State::Idle, None, &agent.session_id_for_report()).await;
 }
 
 ///
