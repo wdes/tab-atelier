@@ -978,107 +978,69 @@ fn transcript_text(home: &Path) -> String {
     std::fs::read_to_string(&files[0]).unwrap()
 }
 
-/// The `--no-tui` default is the plain instruction, because the reader is
-/// whatever is on the socket — often a phone or an API client with no terminal.
-/// This is the regression for the reported bug: the session used to be told to
-/// emit SGR unconditionally, so those readers showed `[36m` as literal text.
+/// One instruction, and it is markdown.
+///
+/// The regression this replaces: the session used to be told to emit SGR escapes,
+/// so a reader with no terminal — a phone, an API client, a mirror — showed `[36m`
+/// as literal text, which is the emphasis turning into noise. The instruction is now
+/// markdown for every sink, and this says so from both sides, because "one
+/// instruction" is the property rather than any particular wording.
 #[test]
-fn a_reader_without_a_terminal_is_not_taught_escape_sequences() {
-    let dir = tempfile::tempdir().unwrap();
-    let (port, rx) = spawn_mock_relay(vec![("HTTP/1.1 200 OK", FINAL_ROUND)]);
-    let socket = dir.path().join("agent.sock");
-    let (_agent, mut reader, mut stream) = spawn_agent_at(dir.path(), &socket, port);
+fn the_instruction_is_markdown_for_every_sink() {
+    let mut seen = Vec::new();
+    for ansi in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let (port, rx) = spawn_mock_relay(vec![("HTTP/1.1 200 OK", FINAL_ROUND)]);
+        let socket = dir.path().join("agent.sock");
+        let (_agent, mut reader, mut stream) = spawn_agent(dir.path(), &socket, |cmd| {
+            cmd.args([
+                "--relay-url",
+                &format!("http://127.0.0.1:{port}"),
+                "--relay-token",
+                RELAY_TOKEN,
+            ]);
+            if ansi {
+                cmd.arg("--ansi");
+            }
+        });
 
-    send_prompt(&mut stream, &mut reader, "hi");
-    let body = body_of(&rx.recv_timeout(Duration::from_secs(5)).unwrap());
-    let instructions = body["system"][1]["text"].as_str().expect("instructions block");
-
-    assert!(
-        instructions.contains("Do NOT use markdown or ANSI escape sequences"),
-        "a non-terminal reader must be told to avoid escapes:\n{instructions}"
-    );
-    assert!(
-        !instructions.contains('\u{1b}'),
-        "the plain instruction must not demonstrate escapes:\n{instructions:?}"
-    );
-    // Swapping the instruction text must not disturb the block the upstream
-    // requires to come first.
-    assert!(
-        body["system"][0]["text"]
+        send_prompt(&mut stream, &mut reader, "hi");
+        let body = body_of(&rx.recv_timeout(Duration::from_secs(5)).unwrap());
+        let instructions = body["system"][1]["text"]
             .as_str()
-            .unwrap()
-            .starts_with("You are Claude Code")
-    );
+            .expect("instructions block")
+            .to_owned();
+
+        assert!(
+            instructions.contains("Write markdown"),
+            "the model must be asked for markdown (ansi={ansi}):\n{instructions}"
+        );
+        // The forbidding form, not the inviting one: the old instruction *told* the
+        // model to use escapes, and a check for the word "ANSI" alone cannot tell
+        // those apart.
+        assert!(
+            instructions.contains("Do NOT emit ANSI escape sequences"),
+            "escapes must be forbidden, not requested (ansi={ansi}):\n{instructions}"
+        );
+        assert!(
+            !instructions.contains('\u{1b}'),
+            "and the instruction must not demonstrate one (ansi={ansi}):\n{instructions:?}"
+        );
+        seen.push(instructions);
+    }
+    assert_eq!(seen[0], seen[1], "--ansi must not change what the model is asked for");
 }
 
-/// `--ansi` opts back in, for a caller that knows its pipe renders escapes.
-#[test]
-fn ansi_is_opt_in_for_a_session_whose_stdout_is_not_a_terminal() {
-    let dir = tempfile::tempdir().unwrap();
-    let (port, rx) = spawn_mock_relay(vec![("HTTP/1.1 200 OK", FINAL_ROUND)]);
-    let socket = dir.path().join("agent.sock");
-    let (_agent, mut reader, mut stream) = spawn_agent(dir.path(), &socket, |cmd| {
-        cmd.args([
-            "--relay-url",
-            &format!("http://127.0.0.1:{port}"),
-            "--relay-token",
-            RELAY_TOKEN,
-            "--ansi",
-        ]);
-    });
-
-    send_prompt(&mut stream, &mut reader, "hi");
-    let body = body_of(&rx.recv_timeout(Duration::from_secs(5)).unwrap());
-    let instructions = body["system"][1]["text"].as_str().expect("instructions block");
-    assert!(
-        instructions.contains("terminal emulator"),
-        "--ansi must select the terminal instruction:\n{instructions}"
-    );
-}
-
-/// The instruction is a request, not a guarantee, so escapes are also filtered
-/// on the way out — and the transcript is a *separate* reader that needs its
-/// own filtering, because a reply reaches it as the model sent it rather than
-/// through the socket path.
-#[test]
-fn escapes_are_stripped_from_the_reply_and_from_the_transcript() {
-    let dir = tempfile::tempdir().unwrap();
-    let (port, _rx) = spawn_mock_relay_owned(vec![("HTTP/1.1 200 OK", round_with_escapes())]);
-    let socket = dir.path().join("agent.sock");
-    let (_agent, mut reader, mut stream) = spawn_agent_at(dir.path(), &socket, port);
-
-    let reply = send_prompt(&mut stream, &mut reader, "hi");
-    assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
-    let text = reply["text"].as_str().unwrap();
-    assert_eq!(
-        text, "My tools (a literal [0m stays) and cyan.",
-        "escapes stripped, and text that merely looks like one kept"
-    );
-    assert!(!text.contains('\u{1b}'), "socket reply kept an escape: {text:?}");
-
-    // Checked in both forms: `serde_json` writes a control byte as its
-    // six-character JSON spelling, so a raw-byte check alone would pass on a
-    // transcript that still holds an escape.
-    let transcript = transcript_text(dir.path());
-    assert!(
-        !transcript.contains("\\u001b") && !transcript.contains('\u{1b}'),
-        "transcript kept an escape:\n{transcript}"
-    );
-    assert!(
-        transcript.contains("My tools (a literal [0m stays) and cyan."),
-        "transcript should hold the stripped prose:\n{transcript}"
-    );
-}
-
-/// The transcript is plain whichever sink the session has.
+/// Escapes are removed whichever sink the session has.
 ///
-/// A terminal session may legitimately keep its colour in the answer, but the
-/// transcript is shared and read by something that renders text — so the two
-/// viewers differ on purpose. Pinned because the easy simplification — filtering
-/// `resp.content` once and using it for both — silently puts escapes back in
-/// front of the bubble renderer.
+/// The other half of the same bug, and the one that survived the first fix: a
+/// session with a terminal attached kept the model's escapes, on the reasoning that
+/// the terminal would interpret them. A live session showed the flaw — the REPL
+/// draws through ratatui and emits its own styling, so an escape from the model is
+/// never wanted, and what a sink *declares* is not what it does. `--ansi` is the
+/// case that used to keep them.
 #[test]
-fn the_transcript_stays_plain_even_when_the_reply_keeps_colour() {
+fn escapes_are_stripped_whichever_sink_the_session_has() {
     let dir = tempfile::tempdir().unwrap();
     let (port, _rx) = spawn_mock_relay_owned(vec![("HTTP/1.1 200 OK", round_with_escapes())]);
     let socket = dir.path().join("agent.sock");
@@ -1096,84 +1058,63 @@ fn the_transcript_stays_plain_even_when_the_reply_keeps_colour() {
     assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
     let text = reply["text"].as_str().unwrap();
     assert!(
-        text.contains('\u{1b}'),
-        "--ansi means the terminal gets its colour: {text:?}"
+        !text.contains('\u{1b}'),
+        "even with --ansi, a reply must carry no escape a terminal did not ask for: {text:?}"
+    );
+    assert!(text.contains("My tools"), "stripping must not eat the text: {text:?}");
+    // The fixture holds a bare `[0m` with no ESC byte in front of it, on purpose:
+    // stripping removes the escape *sequence*, and text that merely looks like one
+    // is text. Losing it would mean the filter was matching on the shape rather than
+    // on the control character.
+    assert!(
+        text.contains("a literal [0m stays"),
+        "a bare [0m is characters, not an escape: {text:?}"
     );
 
     let transcript = transcript_text(dir.path());
     assert!(
         !transcript.contains("\\u001b") && !transcript.contains('\u{1b}'),
-        "the transcript is read by a renderer, so it stays plain:\n{transcript}"
-    );
-    assert!(
-        transcript.contains("My tools (a literal [0m stays) and cyan."),
-        "transcript should hold the stripped prose:\n{transcript}"
+        "the transcript stays plain:\n{transcript}"
     );
 }
 
-/// An explicit `--ansi` outranks the ambient colour convention.
+/// `--ansi` and `NO_COLOR` no longer reach the prompt, so neither can change it.
 ///
-/// This is the one precedence step observable from out here: the harness always
-/// runs `--no-tui` with a piped stdout, so a bare `NO_COLOR` can only *confirm*
-/// the plain default and would pass either way. Setting the flag on top is the
-/// case where the two sources disagree, and the flag has to win — otherwise
-/// `NO_COLOR` inherited from a shell profile would make `--ansi` unusable.
-///
-/// The other combinations live in `ansi::allow_escapes`'s unit tests, which can
-/// express "a terminal that `NO_COLOR` overrides" directly; no subprocess test
-/// can, since a test's stdout is never a tty.
+/// Pinned because it is a deliberate loss rather than an oversight: the flag now
+/// decides whether the *REPL* styles its rendering (see `Agent::styles_output`), and
+/// that is not observable from the socket — a client reading `done.text` gets the
+/// same characters either way. A future change that reintroduced a second
+/// instruction variant would fail here, which is the point.
 #[test]
-fn an_explicit_ansi_flag_outranks_no_color() {
-    let dir = tempfile::tempdir().unwrap();
-    let (port, rx) = spawn_mock_relay(vec![("HTTP/1.1 200 OK", FINAL_ROUND)]);
-    let socket = dir.path().join("agent.sock");
-    let (_agent, mut reader, mut stream) = spawn_agent(dir.path(), &socket, |cmd| {
-        cmd.env("NO_COLOR", "1").args([
-            "--relay-url",
-            &format!("http://127.0.0.1:{port}"),
-            "--relay-token",
-            RELAY_TOKEN,
-            "--ansi",
-        ]);
-    });
+fn the_colour_flags_no_longer_shape_the_instruction() {
+    let mut seen = Vec::new();
+    for env in [
+        &[][..],
+        &[("NO_COLOR", "1")][..],
+        &[("NO_COLOR", "1"), ("CATBUS_ANSI", "0")][..],
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let (port, rx) = spawn_mock_relay(vec![("HTTP/1.1 200 OK", FINAL_ROUND)]);
+        let socket = dir.path().join("agent.sock");
+        let (_agent, mut reader, mut stream) = spawn_agent(dir.path(), &socket, |cmd| {
+            cmd.args([
+                "--relay-url",
+                &format!("http://127.0.0.1:{port}"),
+                "--relay-token",
+                RELAY_TOKEN,
+            ]);
+            cmd.arg("--ansi");
+            for (key, value) in env {
+                cmd.env(key, value);
+            }
+        });
 
-    send_prompt(&mut stream, &mut reader, "hi");
-    let body = body_of(&rx.recv_timeout(Duration::from_secs(5)).unwrap());
-    let instructions = body["system"][1]["text"].as_str().expect("instructions block");
-    assert!(
-        instructions.contains("terminal emulator"),
-        "--ansi must beat NO_COLOR, got:\n{instructions}"
-    );
-}
-
-/// The same pair in the other order: `NO_COLOR` with no flag is plain.
-///
-/// Pinned even though the harness's own default already produces a plain
-/// instruction, because it is the shape tab-atelier actually creates — its
-/// `new_tab_env` sets `NO_COLOR=1` for agent-requested tabs — and a regression
-/// that let escapes through when `NO_COLOR` is set would otherwise go unnoticed
-/// here.
-#[test]
-fn an_agent_tab_marked_no_color_gets_the_plain_instruction() {
-    let dir = tempfile::tempdir().unwrap();
-    let (port, rx) = spawn_mock_relay(vec![("HTTP/1.1 200 OK", FINAL_ROUND)]);
-    let socket = dir.path().join("agent.sock");
-    let (_agent, mut reader, mut stream) = spawn_agent(dir.path(), &socket, |cmd| {
-        cmd.env("NO_COLOR", "1").args([
-            "--relay-url",
-            &format!("http://127.0.0.1:{port}"),
-            "--relay-token",
-            RELAY_TOKEN,
-        ]);
-    });
-
-    send_prompt(&mut stream, &mut reader, "hi");
-    let body = body_of(&rx.recv_timeout(Duration::from_secs(5)).unwrap());
-    let instructions = body["system"][1]["text"].as_str().expect("instructions block");
-    assert!(
-        instructions.contains("Do NOT use markdown or ANSI escape sequences"),
-        "NO_COLOR must select the plain instruction:\n{instructions}"
-    );
+        send_prompt(&mut stream, &mut reader, "hi");
+        let body = body_of(&rx.recv_timeout(Duration::from_secs(5)).unwrap());
+        seen.push(body["system"][1]["text"].as_str().unwrap_or_default().to_owned());
+    }
+    assert_eq!(seen[0], seen[1], "NO_COLOR must not change the instruction");
+    assert_eq!(seen[1], seen[2], "nor an explicit opt-out");
 }
 
 // ---------------------------------------------------------------------------

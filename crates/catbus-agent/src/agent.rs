@@ -49,39 +49,38 @@ const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
 /// was 200.
 const MAX_OUTPUT_TOKENS: u32 = 8192;
 
-/// Static portion of the second system block, when a terminal will render it.
+/// What the model is asked to write, and why it changed.
 ///
-/// Both system blocks are now `&'static str`: the working directory and the
-/// permission mode used to be formatted into a block here, which put mutable
-/// bytes in the middle of the prompt and invalidated everything after them on
-/// every toggle. They travel in a trailing turn instead — see [`cache`].
+/// Nothing session-specific may be added to this text: the working directory and
+/// the permission mode travel in a trailing turn instead (see [`cache`]), because
+/// putting mutable bytes in the middle of the prompt invalidates everything after
+/// them on every toggle.
 ///
-/// Nothing session-specific may be added to this text. If it can change while
-/// the agent runs, it belongs in the env turn.
-const INSTRUCTIONS_TERMINAL: &str = "Your text replies are rendered directly in a terminal emulator \
-    that supports ANSI colour and formatting — use ANSI SGR escapes \
-    (bold, colours, etc.) to make output readable. Do NOT use \
-    markdown — no asterisks, no backtick fences, no hashes. \
-    Use ANSI instead: \x1b[1m for bold, \x1b[32m for green, \
-    \x1b[33m for yellow, \x1b[31m for red, \x1b[36m for cyan, \
-    \x1b[0m to reset.";
-
-/// The same slot when *no* terminal will render the answer.
+/// This used to ask for ANSI SGR escapes on a terminal sink and plain prose on
+/// others. Both were wrong. Asking for escapes made the model's own formatting
+/// survive only where something interpreted it — a live session answered into a
+/// sink that rendered nothing and arrived as literal `[1;36m`, which is emphasis
+/// turning into noise. And escapes are expensive: an SGR sequence is its own
+/// token run on every emphasised word, in a request whose history is re-sent
+/// every turn.
 ///
-/// One session is read by several clients and only some have a terminal: the
-/// REPL prints to one, but the socket, the transcript an API client mirrors,
-/// and a phone showing the same conversation do not. Asking for SGR there is
-/// asking for literal `[1m` in the text — the emphasis arrives as noise. So the
-/// request has to match the sink, and this is the variant for the sinks that
-/// interpret nothing.
+/// Markdown is the one instruction that works for every sink at once. The REPL
+/// renders it (see `tui::markdown`), so a terminal gets bold headings and aligned
+/// tables; anything that renders nothing — the socket, the phone, the transcript
+/// a mirror reads — gets `**bold**`, which is legible and, unlike an escape,
+/// survives a copy-paste. There is no second variant, because there is no longer
+/// a case where the answer should be shaped differently.
 ///
-/// Markdown stays out for the same reason it is out of the terminal text:
-/// plain prose is what reads correctly with nothing in between.
-const INSTRUCTIONS_PLAIN: &str = "Your text replies are shown as plain text. Do NOT use markdown or \
-    ANSI escape sequences — no asterisks, no backtick fences, no hashes, \
-    no colour codes: they are displayed literally and make the answer \
-    harder to read. Write plain prose in short sentences. For lists, use a \
-    hyphen or a number at the start of each line with no other decoration.";
+/// The width note is not decoration: a table the terminal has to wrap is not a
+/// table, and the renderer cannot unwrap one after the fact.
+const INSTRUCTIONS_MARKDOWN: &str = "Your text replies are rendered in a terminal that renders \
+    markdown. Write markdown: `#` or `##` for headings, `**bold**` for emphasis, \
+    `- ` for bullets, `1. ` for numbered steps, and `` `code` `` for anything \
+    literal. For tabular data use a pipe table — a header row, a `|---|---|` \
+    rule line, then the rows — and keep it narrow enough to read in 80 columns, \
+    because a table that has to wrap is not a table. Do NOT emit ANSI escape \
+    sequences or colour codes: they are shown literally, they cannot be copied, \
+    and they are stripped before your answer is displayed.";
 
 /// Which API backend answers this session's prompts. Chosen once at
 /// startup from the CLI; the tool loop is backend-agnostic.
@@ -139,10 +138,8 @@ pub struct Agent {
     /// array leads the body, so a set that varied between requests would
     /// invalidate every breakpoint behind it. See [`crate::tools::ToolSet`].
     tools: tools::ToolSet,
-    /// Whether the answer is written to a terminal that renders escape
-    /// sequences. Chooses between [`INSTRUCTIONS_TERMINAL`] and
-    /// [`INSTRUCTIONS_PLAIN`] — see [`Self::with_ansi`] for why the default is
-    /// the conservative one.
+    /// Whether this session's output may be styled. Read through
+    /// [`Self::styles_output`], which is the only place that decides.
     ansi: bool,
     /// The model this session runs as.
     ///
@@ -277,16 +274,6 @@ impl Agent {
     /// touched. The state turn is rendered into each request by
     /// [`Self::call_relay`], always last, so the model always sees the current
     /// mode and no historical turn ever holds a stale one.
-    /// Whether this session's answers may carry ANSI escapes.
-    ///
-    /// Exposed so a caller that renders a reply asks the same value the system
-    /// prompt was built from — the two deciding separately is how a model gets
-    /// told to use escapes and then has them printed literally.
-    #[must_use]
-    pub const fn renders_escapes(&self) -> bool {
-        self.ansi
-    }
-
     /// What the turn in flight is doing, if anything — a tool name, or a phase.
     ///
     /// Set by the tool loop and cleared when the turn ends. Read by a UI that wants
@@ -295,6 +282,19 @@ impl Agent {
     #[must_use]
     pub fn status(&self) -> Option<String> {
         self.status.lock().expect("status mutex").clone()
+    }
+
+    /// Whether this session's output may be styled.
+    ///
+    /// `--ansi` / `NO_COLOR` used to decide the prompt's wording and whether a reply
+    /// was filtered. Neither is true now: the prompt is markdown for every sink, and
+    /// escapes are always stripped. What is left, and what this flag should always
+    /// have meant, is whether the *renderer* styles what it shows — a terminal that
+    /// renders markdown gets headings and tables, and `NO_COLOR` gets the same text
+    /// with the syntax visible and nothing coloured.
+    #[must_use]
+    pub const fn styles_output(&self) -> bool {
+        self.ansi
     }
 
     /// The model this session runs as. See the field for why it is not a flag.
@@ -421,31 +421,6 @@ impl Agent {
     pub fn with_identity(mut self, identity: crate::identity::Identity) -> Self {
         self.identity = identity;
         self
-    }
-
-    /// The instruction text matching this agent's sink.
-    ///
-    /// Both variants are `&'static str`, so this stays a borrow and the prompt
-    /// prefix remains cacheable — a value built here would put a fresh
-    /// allocation in the middle of the cached region on every turn.
-    const fn instructions(&self) -> &'static str {
-        if self.ansi {
-            INSTRUCTIONS_TERMINAL
-        } else {
-            INSTRUCTIONS_PLAIN
-        }
-    }
-
-    /// The reply as this agent's sink should receive it.
-    ///
-    /// The instruction text is a request, not a guarantee. A model can ignore
-    /// it, half-apply it, or have emitted escapes before the sink changed — a
-    /// session resumed by a later process writing somewhere else. Filtering on
-    /// the way out means a reader with no terminal never sees `[1m`, whatever
-    /// the model chose to send. When `ansi` is set the text is passed through
-    /// untouched, because there the terminal *is* interpreting it.
-    fn for_sink(&self, text: String) -> String {
-        if self.ansi { text } else { ansi::strip_owned(text) }
     }
 
     /// Grade one proposed action, in auto mode.
@@ -749,8 +724,8 @@ impl Agent {
                     );
                 }
                 return Ok(Turn {
-                    answer: self.for_sink(final_text),
-                    reasoning: self.for_sink(reasoning),
+                    answer: for_sink(final_text),
+                    reasoning: for_sink(reasoning),
                 });
             }
 
@@ -858,8 +833,8 @@ impl Agent {
                  raise CATBUS_MAX_ROUNDS to allow more]\x1b[0m"
             );
             Ok(Turn {
-                answer: self.for_sink(final_text),
-                reasoning: self.for_sink(reasoning),
+                answer: for_sink(final_text),
+                reasoning: for_sink(reasoning),
             })
         }
     }
@@ -921,7 +896,7 @@ impl Agent {
         // let a model emit markdown into a terminal that cannot render it.
         system.push(SystemBlock {
             kind: "text",
-            text: std::borrow::Cow::Borrowed(self.instructions()),
+            text: std::borrow::Cow::Borrowed(INSTRUCTIONS_MARKDOWN),
         });
         let body = MessagesReq {
             model: &session_model,
@@ -1028,7 +1003,7 @@ impl Agent {
         // put mutable bytes at the very front — the defect this change exists
         // to remove. `build_request` appends it after the history instead, for
         // the same reason it goes last on the relay wire.
-        let system = self.instructions().to_owned();
+        let system = INSTRUCTIONS_MARKDOWN.to_owned();
         let tool_specs = self.tools.specs().to_vec();
         let state = cache::env_text(&active.session.cwd.display().to_string(), self.gate().as_str());
         let body = crate::openai::build_request(&cfg.model, &system, &state, &tool_specs, &active.history);
@@ -1097,9 +1072,29 @@ fn rebuild_history(project_dir: &std::path::Path, id: &str) -> Vec<ApiMessage> {
                 // round-trip as an empty Plain string or an empty
                 // Blocks array.
                 let content = match content_owned {
-                    serde_json::Value::String(s) if !s.is_empty() => ApiContent::Plain(s),
+                    serde_json::Value::String(s) if !s.is_empty() => {
+                        // A Claude Code transcript records the operator's *local*
+                        // commands as user turns: `/clear`, `/exit`, and the output
+                        // they printed. They are not conversation — nobody said them
+                        // to the model — and replayed they cost tokens, fill the
+                        // window and read as though the operator had typed
+                        // `<command-name>/exit</command-name>` at the agent. See
+                        // [`is_local_command_noise`].
+                        if is_local_command_noise(&s) {
+                            continue;
+                        }
+                        ApiContent::Plain(s)
+                    }
                     arr @ serde_json::Value::Array(_) => {
                         let blocks: Vec<Block> = serde_json::from_value(arr).unwrap_or_default();
+                        // The same scaffolding can arrive as a text block.
+                        let blocks: Vec<Block> = blocks
+                            .into_iter()
+                            .filter(|b| match b {
+                                Block::Text { text } => !is_local_command_noise(text),
+                                _ => true,
+                            })
+                            .collect();
                         if blocks.is_empty() {
                             continue;
                         }
@@ -1224,6 +1219,58 @@ fn plain_content(content: &[Block]) -> Vec<Block> {
             other => other.clone(),
         })
         .collect()
+}
+
+/// The reply as any sink should receive it.
+///
+/// The instruction is a request, not a guarantee. A model can ignore it, half-apply
+/// it, or have learned the old instruction and kept emitting escapes — a session
+/// resumed from a transcript written before this changed is exactly that case. So
+/// escapes are removed on the way out rather than trusted not to arrive.
+///
+/// This used to pass escapes through when a terminal was attached, on the reasoning
+/// that the terminal would interpret them. A live session showed the flaw: what a
+/// sink *declares* is not what it does. The REPL draws through ratatui, which emits
+/// its own styling, so an escape from the model is never wanted — and the other
+/// sinks never wanted one at all.
+///
+/// Free rather than a method because it no longer depends on the agent: there is one
+/// behaviour for every sink, which is the point of the change. Both channels are
+/// filtered, including the reasoning, which the socket still sends even though the
+/// REPL no longer prints it.
+fn for_sink(text: String) -> String {
+    ansi::strip_owned(text)
+}
+
+/// Whether a transcript entry is Claude Code's scaffolding for a local command,
+/// rather than something the operator said to the model.
+///
+/// Found in a live payload: a session resumed from a Claude Code transcript carried
+/// four user turns nobody wrote —
+///
+/// ```text
+/// <local-command-caveat>Caveat: …</local-command-caveat>
+/// <command-name>/clear</command-name>
+/// <local-command-stdout>Bye!</local-command-stdout>
+/// ```
+///
+/// — which the model then read as things the operator had told it. They cost tokens
+/// on every request, since history is re-sent each turn, and they are confusing in
+/// exactly the way a stray `/exit` in a prompt is confusing.
+///
+/// Matched at the start of the text, not anywhere in it, so a message that *quotes*
+/// one of these markers is left alone: the operator quoting a command is talking to
+/// the model, and only the scaffolding itself is not.
+fn is_local_command_noise(text: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "<local-command-caveat>",
+        "<local-command-stdout>",
+        "<command-name>",
+        "<command-message>",
+        "<command-args>",
+    ];
+    let trimmed = text.trim_start();
+    MARKERS.iter().any(|marker| trimmed.starts_with(marker))
 }
 
 /// Anthropic's API requires every `tool_use` in an assistant turn to
@@ -1521,5 +1568,32 @@ mod tests {
             messages[2]["content"][0]["tool_use_id"], "t1",
             "and the call is still answered"
         );
+    }
+
+    /// Local-command scaffolding is not conversation.
+    ///
+    /// Taken from a live request's payload, which carried four user turns nobody
+    /// had written: a `/clear`, an `/exit`, their caveats and their output. The
+    /// model read them as things the operator had said.
+    #[test]
+    fn local_command_scaffolding_is_not_replayed_as_a_user_turn() {
+        for noise in [
+            "<local-command-caveat>Caveat: the messages below…</local-command-caveat>",
+            "<command-name>/clear</command-name>",
+            "  <command-name>/exit</command-name>\n<command-message>exit</command-message>",
+            "<local-command-stdout>Bye!</local-command-stdout>",
+        ] {
+            assert!(is_local_command_noise(noise), "should be skipped: {noise}");
+        }
+
+        // A real message is kept, including one that *mentions* a command — the
+        // operator quoting a command is talking to the model.
+        for real in [
+            "explain what /clear does",
+            "the output said <local-command-stdout>Bye!</local-command-stdout> but",
+            "read the parser",
+        ] {
+            assert!(!is_local_command_noise(real), "should be kept: {real}");
+        }
     }
 }

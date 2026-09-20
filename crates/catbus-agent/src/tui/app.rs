@@ -46,7 +46,6 @@ use crate::tui::spinner::Spinner;
 /// feels immediate, slow enough to cost nothing.
 const TICK: Duration = Duration::from_millis(60);
 
-/// The viewport is the input line, plus a status line when something is happening.
 /// How many earlier exchanges the banner shows when a session is resumed.
 ///
 /// A few, not all: the point is to show where the session was, and a resumed
@@ -105,23 +104,43 @@ impl Ui {
     /// written once and scrolls away naturally, instead of being part of the area
     /// the app repaints.
     pub fn print_above(&mut self, text: &str) -> std::io::Result<()> {
-        self.print_above_styled(text, Style::default())
+        let height = u16::try_from(text.trim_end_matches('\n').split('\n').count()).unwrap_or(u16::MAX);
+        let body = text.trim_end_matches('\n').to_owned();
+        self.insert(height, move |buf| {
+            for (i, line) in body.split('\n').enumerate() {
+                let y = buf.area.top().saturating_add(u16::try_from(i).unwrap_or(0));
+                buf.set_string(buf.area.left(), y, line, Style::default());
+            }
+        })
     }
 
-    /// The same, in a given style. Used for the model's reasoning, which is shown
-    /// dimmed so it reads as context rather than as the answer.
-    pub fn print_above_styled(&mut self, text: &str, style: Style) -> std::io::Result<()> {
-        let lines: Vec<&str> = text.trim_end_matches('\n').split('\n').collect();
+    /// Print an answer: rendered as markdown, above the viewport.
+    ///
+    /// The model is asked for markdown (see `agent::INSTRUCTIONS_MARKDOWN`), so this
+    /// is where headings, emphasis and tables become something a terminal shows
+    /// rather than something it spells out. The characters that are printed are the
+    /// rendered text, which matters for tables: see `tui::markdown` for why they are
+    /// padded pipes rather than box-drawing.
+    pub fn print_markdown(&mut self, text: &str) -> std::io::Result<()> {
+        let lines = crate::tui::markdown::render(text);
         if lines.is_empty() {
             return Ok(());
         }
         let height = u16::try_from(lines.len()).unwrap_or(u16::MAX);
-        self.terminal.insert_before(height, |buf| {
+        self.insert(height, move |buf| {
             for (i, line) in lines.iter().enumerate() {
                 let y = buf.area.top().saturating_add(u16::try_from(i).unwrap_or(0));
-                buf.set_string(buf.area.left(), y, line, style);
+                buf.set_line(buf.area.left(), y, line, buf.area.width);
             }
         })
+    }
+
+    /// Reserve `height` rows above the viewport and let `paint` fill them.
+    ///
+    /// Both printers go through here, so the borrow of the retained buffer lives in
+    /// one place and a caller cannot capture something that outlives the closure.
+    fn insert(&mut self, height: u16, paint: impl Fn(&mut ratatui::buffer::Buffer)) -> std::io::Result<()> {
+        self.terminal.insert_before(height, paint)
     }
 
     /// Repaint the viewport: the prompt and the line, and a status row when busy.
@@ -531,16 +550,21 @@ fn format_turn(text: &str, prefix: &str) -> String {
 /// which is the same value the system prompt was built from, so a model told not to
 /// emit escapes is not then shown them.
 async fn report_turn(ui: &mut Ui, agent: &Agent, turn: &crate::agent::Turn) -> std::io::Result<()> {
-    if !turn.reasoning.is_empty() {
-        let style = if agent.renders_escapes() {
-            Style::default().add_modifier(Modifier::DIM)
-        } else {
-            Style::default()
-        };
-        ui.print_above_styled(&turn.reasoning, style)?;
-    }
+    // The reasoning is **not** printed. It is the model's working, and the operator
+    // asked for the answer; showing both doubles what there is to read at the exact
+    // moment there is something to read. It is not discarded — the transcript keeps
+    // it, in the shape Claude Code writes — so it is available to anyone who wants
+    // it and out of the way of everyone who does not.
     if !turn.answer.trim().is_empty() {
-        ui.print_above(&turn.answer)?;
+        // Styled when the session asked for styling, plain otherwise. `NO_COLOR`
+        // should mean something visible, and the honest thing it can mean here is
+        // "show me the text, not a rendering of it" — the same characters either
+        // way, so nothing is lost and nothing is coloured.
+        if agent.styles_output() {
+            ui.print_markdown(&turn.answer)?;
+        } else {
+            ui.print_above(&turn.answer)?;
+        }
     }
     // Where the turn's cost went, under the turn it belongs to.
     ui.print_above(&crate::statusline::totals_line(
