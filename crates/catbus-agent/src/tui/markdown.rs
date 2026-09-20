@@ -122,8 +122,49 @@ fn is_rule_row(line: &str) -> bool {
 fn cells(line: &str) -> Vec<String> {
     let t = line.trim();
     let inner = t.strip_prefix('|').unwrap_or(t);
-    let inner = inner.strip_suffix('|').unwrap_or(inner);
-    inner.split('|').map(|c| c.trim().to_owned()).collect()
+    // A trailing pipe the author escaped is content, not a delimiter: `| a \|` is one
+    // cell holding `a |`, and stripping it would eat the pipe and leave the backslash.
+    let inner = if ends_with_unescaped_pipe(inner) {
+        &inner[..inner.len() - 1]
+    } else {
+        inner
+    };
+
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut chars = inner.chars().peekable();
+    while let Some(c) = chars.next() {
+        // `\|` is a literal pipe inside a cell, and it is kept as written: the paste
+        // has to stay valid markdown, and a bare `|` in a cell would split the row when
+        // it is pasted back. Same reasoning as padding instead of drawing boxes — what
+        // is on screen and what is copied have to agree.
+        if c == '\\' && chars.peek() == Some(&'|') {
+            current.push('\\');
+            current.push(chars.next().expect("peeked"));
+            continue;
+        }
+        if c == '|' {
+            out.push(current.trim().to_owned());
+            current = String::new();
+            continue;
+        }
+        current.push(c);
+    }
+    out.push(current.trim().to_owned());
+    out
+}
+
+/// Whether a string ends with a `|` that is not escaped by a backslash.
+///
+/// The escape is a backslash, itself escapable — so what decides it is the *parity* of
+/// the run of backslashes before the pipe: an even count (including none) escapes
+/// nothing, and an odd count leaves the pipe escaped.
+fn ends_with_unescaped_pipe(text: &str) -> bool {
+    if !text.ends_with('|') {
+        return false;
+    }
+    let backslashes = text[..text.len() - 1].chars().rev().take_while(|c| *c == '\\').count();
+    backslashes.is_multiple_of(2)
 }
 
 /// Render a pipe table as an aligned pipe table.
@@ -445,6 +486,71 @@ That is all.";
 
     /// A table missing a cell is padded rather than dropped, so a ragged table still
     /// renders as a table instead of crashing or collapsing.
+    /// A pipe escaped inside a cell is content, not a delimiter.
+    ///
+    /// Documenting a shell command in a table is ordinary — `a | b` is a pipeline —
+    /// and a splitter that ignores the escape turns one cell into two, shifting every
+    /// column after it. The escape is kept in the output rather than resolved to a bare
+    /// pipe, for the same reason the padding is: what is on screen and what is copied
+    /// have to agree, and a bare pipe in a pasted cell would split the row there.
+    #[test]
+    fn an_escaped_pipe_in_a_cell_does_not_split_the_row() {
+        let rendered = render("| Command | Effect |\n|---|---|\n| `cat f \\| grep x` | filters |\n| plain | two |");
+        let text = copied(&rendered);
+        let rows: Vec<&str> = text.lines().filter(|l| l.starts_with('|')).collect();
+        assert_eq!(rows.len(), 4, "header, rule, two data rows:\n{text}");
+        // A two-column row carries three pipes. The row holding the escaped pipe
+        // carries four — three delimiters and the literal — and that difference is the
+        // whole test: a splitter that ignored the escape would give five and shift the
+        // columns after it.
+        assert_eq!(rows[0].matches('|').count(), 3, "header: {}", rows[0]);
+        assert_eq!(rows[2].matches('|').count(), 4, "the row with the escape: {}", rows[2]);
+        assert_eq!(rows[3].matches('|').count(), 3, "the plain row: {}", rows[3]);
+        assert!(
+            text.contains(r"\|"),
+            "the escape survives so the paste stays valid:\n{text}"
+        );
+        assert!(text.contains("filters"), "and the cell after it is intact:\n{text}");
+        // The escaped pipe did not become a column boundary: `filters` stays in the
+        // second column, aligned with `two`.
+        // The escaped pipe did not become a column boundary: the second column's text
+        // starts at the same index in every row, header included — past the widest cell
+        // of the first column, which is the escaped command.
+        let starts = [
+            rows[0].find("Effect").expect("header"),
+            rows[2].find("filters").expect("the cell after the escape"),
+            rows[3].find("two").expect("the plain row"),
+        ];
+        assert_eq!(
+            starts, [starts[0]; 3],
+            "the second column must start at one index for every row:\n{text}"
+        );
+    }
+
+    /// A trailing escaped pipe is content too, not the row's closing delimiter.
+    #[test]
+    fn a_trailing_escaped_pipe_does_not_close_the_row() {
+        // One cell whose value ends with a literal pipe.
+        let rendered = render(r"| a | b \|");
+        let text = copied(&rendered);
+        assert!(text.contains(r"\|"), "the escape is kept: {text}");
+        // Two cells, so three delimiters counting the escape.
+        assert_eq!(text.matches('|').count(), 3, "{text}");
+    }
+
+    /// The parity rule: an escaped backslash does not escape the pipe after it.
+    #[test]
+    fn the_pipe_delimiter_is_decided_by_backslash_parity() {
+        assert!(ends_with_unescaped_pipe("a|"), "a bare pipe closes the row");
+        assert!(!ends_with_unescaped_pipe(r"a\|"), "one backslash escapes it");
+        assert!(
+            ends_with_unescaped_pipe(r"a\\|"),
+            "two escape the backslash, not the pipe"
+        );
+        assert!(!ends_with_unescaped_pipe(r"a\\\|"), "three escapes the pipe again");
+        assert!(!ends_with_unescaped_pipe("a"), "no pipe at all");
+    }
+
     #[test]
     fn a_ragged_table_is_padded_to_its_widest_row() {
         let rendered = render("| a | b |\n|---|---|\n| only-a |\n| x | y |");
