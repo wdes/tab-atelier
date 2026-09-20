@@ -9,7 +9,8 @@ lands. Nothing is pushed: pushes need the Nitrokey.
 | T1 | `Tasks` tool for catbus-agent — a task list with actions on the items | **done** |
 | T2 | `/auto` does not work | **done** |
 | T3 | Right-click "Catbus" should not be offered when the tab already has an agent | **done** |
-| T4 | Thinking traces are not surfaced | **needs a decision** |
+| T4 | Thinking traces are not surfaced | **done** (transcript + REPL dimmed) |
+| T8 | Migrate the agent's TUI to ratatui | **done** (spinner written in-tree) |
 | T5 | Approval logging — nothing records what the gate allowed | **done** |
 | T6 | Model on launch — pick a model per tab | **done** (`/model`, session state) |
 | T7 | Identity file (`---` front matter, `AllowedTools:`) — approved earlier | **done** |
@@ -58,3 +59,28 @@ Already landed this session, for reference: the empty-content 400, the resume
 history bug, `is_error` round-trip, `end_turn` + `tool_use`, the `Spawn` tool,
 the boot collision guard, the local relay for internet-disabled tabs, the slash
 command table, and the GUI status line.
+
+## T8: the ratatui migration
+
+`ratatui-spinner` is **not** usable, and the reason is worth keeping: the published
+crate is a namespace reservation. Its README says it "intentionally exposes no public
+API yet", and the whole crate is a 39-byte `lib.rs` that includes that README — 1389
+bytes of tarball, no code. `github.com/ratatui/ratatui-spinner` 404s as well, and the
+prototype the name probably referred to (`joshka/ratatui-spinner`, "design prototype
+for time-aware spinner widgets") is gone too. So the spinner is written in
+`tui/spinner.rs`, keeping the one idea the name should carry: a spinner that looks
+identical after five seconds and after five minutes tells the operator nothing, so
+the cadence slows and the glyphs coarsen as a turn drags on.
+
+Three findings from the migration that should not have to be rediscovered:
+
+- **A newline from anything but a terminal is Ctrl-J.** Driven from a pty, `/auto\n`
+  arrives as `Char('a') Char('u') Char('t') Char('o') Char('j')` with CONTROL,
+  because LF *is* Ctrl-J and is not `Enter`. Handling only `Enter` means the text is
+  echoed correctly and the last key is swallowed, so the line never submits.
+- **An inline viewport must not be resized.** Growing it from one row to two while a
+  turn runs makes the terminal reflow the screen and reorders output already pushed
+  above it. A fixed two-row viewport costs one blank line and removes the class.
+- **`Some(ev) = events.recv()` in a `select!` never matches `None`,** so a dead input
+  reader silently switched the REPL off while it went on redrawing. A REPL that draws
+  but cannot be typed into is worse than one that stops.
