@@ -1027,6 +1027,7 @@ dependencies = [
  "ratatui",
  "reedline",
  "reqwest",
+ "roxmltree",
  "serde",
  "serde_json",
  "strip-ansi-escapes",

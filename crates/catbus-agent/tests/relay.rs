@@ -747,7 +747,12 @@ fn tools_config(dir: &Path) -> PathBuf {
         "disable": ["Bash"],
         "add": [
             {
-                "name": "GitStatus",
+                // Deliberately *not* a built-in's name: a custom tool that shadows one makes
+                // the agent refuse to start, and the built-in list has grown since this
+                // fixture was written (`GitStatus` is one of them now). That refusal is the
+                // behaviour `a_custom_tool_may_not_shadow_a_builtin` checks; here the point is
+                // only that an argv tool works.
+                "name": "GitShortStatus",
                 "description": "Show the working tree status.",
                 "schema": { "type": "object", "properties": {}, "required": [] },
                 "argv": ["git", "status", "--short"],
@@ -799,7 +804,7 @@ fn configured_tools_execute_for_real() {
     let (port, rx) = spawn_mock_relay(vec![
         (
             "HTTP/1.1 200 OK",
-            Box::leak(tool_round("call_git", "GitStatus", "{}").into_boxed_str()),
+            Box::leak(tool_round("call_git", "GitShortStatus", "{}").into_boxed_str()),
         ),
         (
             "HTTP/1.1 200 OK",
@@ -868,7 +873,7 @@ fn configured_tools_execute_for_real() {
         names.contains(&"Read"),
         "disabling Bash must not take the built-ins nobody asked to remove: {names:?}"
     );
-    for wanted in ["GitStatus", "CargoVersion", "GitLogLimit"] {
+    for wanted in ["GitShortStatus", "CargoVersion", "GitLogLimit"] {
         assert!(names.contains(&wanted), "{wanted} missing from {names:?}");
     }
 

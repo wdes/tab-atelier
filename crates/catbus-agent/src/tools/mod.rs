@@ -13,7 +13,10 @@ mod config;
 mod delegate;
 mod edit;
 mod filetree;
+mod git;
 mod list_agents;
+mod packages;
+mod phpunit;
 mod read;
 mod spawn;
 mod tasks;
@@ -104,6 +107,9 @@ impl Gate {
                     "Plan-mode is on. Describe what you want done instead of starting a sub-agent — \
                      a sub-agent begins with the gate open, so this would plan nothing."
                 }
+                "PHPUnit" => "Plan-mode is on. Describe what the tests should check instead of running them.",
+                "GitCommit" => "Plan-mode is on. Say what you would commit instead of committing it.",
+                "Composer" | "Bun" => "Plan-mode is on. Describe the commands you would run instead of running them.",
                 _ => "Plan-mode is on. Describe the command instead of running it.",
             }),
             Self::Open | Self::Auto => None,
@@ -173,7 +179,10 @@ pub fn parse_gate(name: &str) -> Option<Gate> {
 /// Not `const`: comparing `&str` is not allowed in a const fn on stable.
 #[must_use]
 pub fn changes_the_world(name: &str) -> bool {
-    matches!(name, "Write" | "Edit" | "Bash")
+    matches!(
+        name,
+        "Write" | "Edit" | "Bash" | "PHPUnit" | "GitCommit" | "Composer" | "Bun"
+    )
 }
 
 /// Run a tool by name, under whatever gate is in force.
@@ -257,6 +266,38 @@ impl ToolSet {
             // it — and plan-mode should allow it, since writing down a plan is
             // what plan-mode is for. See `tasks`'s module doc.
             "Tasks" => tasks::run(input, cwd),
+            // Both run project code — a composer or bun script is the project's own
+            // programme, and an install runs its hooks — so both are judged in auto mode
+            // and refused in plan mode. See `changes_the_world`.
+            "Composer" => {
+                if let Some(why) = gate.refusal("Composer") {
+                    return Err(why.to_string());
+                }
+                packages::composer(input, cwd).await
+            }
+            "Bun" => {
+                if let Some(why) = gate.refusal("Bun") {
+                    return Err(why.to_string());
+                }
+                packages::bun(input, cwd).await
+            }
+            // Read-only, so never judged and never refused.
+            "GitStatus" => git::status(input, cwd).await,
+            // Refused in plan-mode and judged in auto mode: it writes to the repository.
+            "GitCommit" => {
+                if let Some(why) = gate.refusal("GitCommit") {
+                    return Err(why.to_string());
+                }
+                git::commit(input, cwd).await
+            }
+            // Runs project code, so it is judged like the shell is — see
+            // `changes_the_world` — and refused in plan-mode.
+            "PHPUnit" => {
+                if let Some(why) = gate.refusal("PHPUnit") {
+                    return Err(why.to_string());
+                }
+                phpunit::run(input, cwd).await
+            }
             other => Err(format!("unknown tool: {other}")),
         }
     }
@@ -340,6 +381,11 @@ pub fn builtin_specs() -> Vec<serde_json::Value> {
         spawn::spec(),
         // Likewise, and built from the same `ACTIONS` array the dispatch uses.
         tasks::spec(),
+        phpunit::spec(),
+        git::status_spec(),
+        git::commit_spec(),
+        packages::composer_spec(),
+        packages::bun_spec(),
         serde_json::json!({
             "name": "Bash",
             "description": "Run a shell command in the agent's working directory. Default 10-minute timeout; pass timeout_secs (up to 3600) for long builds. Refused in plan-mode.",

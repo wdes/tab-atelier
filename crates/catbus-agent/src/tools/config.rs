@@ -568,10 +568,15 @@ mod tests {
         // Spawn is the most recent addition (FileTree before it).
         let mut expected = vec![
             "Bash",
+            "Bun",
+            "Composer",
             "Delegate",
             "Edit",
             "FileTree",
+            "GitCommit",
+            "GitStatus",
             "ListAgents",
+            "PHPUnit",
             "Read",
             "Spawn",
             "Tasks",
@@ -659,6 +664,49 @@ mod tests {
         // unknown-name path; an empty list is the empty path.
         let err = set.narrowed_to(&[]).unwrap_err();
         assert!(err.contains("no tools at all"), "{err}");
+    }
+
+    /// The example config the README points at must actually work.
+    ///
+    /// It did not, and nothing noticed. `examples/tools.json` declared
+    /// `--max-count={max?}`, which the validator refuses — an optional placeholder must be a
+    /// whole argv element — so loading the documented example failed outright. The test that
+    /// exercises custom tools passes its own inline config, which is why the breakage survived:
+    /// the file the README calls "a working set" was never loaded by anything.
+    ///
+    /// A shipped example is a promise, so it is read from disk and validated here.
+    #[test]
+    fn the_shipped_example_config_loads() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("examples")
+            .join("tools.json");
+        let raw = std::fs::read_to_string(&path).expect("the example should exist");
+        let parsed: serde_json::Value = serde_json::from_str(&raw).expect("and be valid JSON");
+
+        // Loading is the real assertion: `load` runs the whole validator, including the rule
+        // the example used to break.
+        let set = ToolSet::load(Some(&path)).expect("the shipped example must load");
+
+        // And every tool it names survived, so a config cannot load into an empty set.
+        for tool in parsed["add"].as_array().expect("an `add` list") {
+            let name = tool["name"].as_str().expect("a name");
+            assert!(
+                set.offers(name),
+                "the example declares {name}, which did not survive loading"
+            );
+        }
+        // The custom names must not collide with a built-in, either — the other way this file
+        // can stop working as the built-in list grows. Checked through `builtin()` rather than
+        // a list of names written out here, so it follows the real set.
+        let builtins = ToolSet::builtin();
+        for tool in parsed["add"].as_array().expect("an `add` list") {
+            let name = tool["name"].as_str().expect("a name");
+            assert!(
+                !builtins.offers(name),
+                "{name} is a built-in's name, so a config adding it would make the agent \
+                 refuse to start. Rename it in the example."
+            );
+        }
     }
 
     /// The order of the specs is content: the tool array leads the body, so a
