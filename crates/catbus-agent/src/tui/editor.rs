@@ -32,6 +32,13 @@ pub enum Action {
     Exit,
     /// Cancel the current line, as Ctrl-C does.
     Cancel,
+    /// Wipe the screen and the scrollback, then start an empty line — Ctrl-L.
+    ///
+    /// The screen is the terminal's, not the editor's, so the editor only asks for it; the caller
+    /// clears and redraws. The line goes with it: a blank screen with the old command still sitting on
+    /// the prompt is neither one thing nor the other, and Ctrl-L is what an operator presses to get
+    /// back to a clean slate.
+    ClearScreen,
 }
 
 /// The line being edited, plus its history.
@@ -183,10 +190,12 @@ impl Editor {
                 self.kill_word();
                 Action::Continue
             }
+            // Ctrl-L is a screen wipe, as it is in every shell and in readline. It used to clear the
+            // *line*, which is Ctrl-U's job and was already bound — so the key did something an
+            // operator would not expect and the screen never cleared.
             KeyCode::Char('l') if ctrl => {
-                self.chars.clear();
-                self.cursor = 0;
-                Action::Continue
+                self.clear();
+                Action::ClearScreen
             }
             KeyCode::Char(ch) if !ctrl => {
                 self.chars.insert(self.cursor, ch);
@@ -442,6 +451,33 @@ mod tests {
             assert_eq!(e.handle(key(KeyCode::Char(ch))), Action::Submit("go".into()));
             assert!(!e.line().contains(ch), "the newline must not be inserted");
         }
+    }
+
+    /// Ctrl-L is a screen wipe, and it clears the line with it.
+    ///
+    /// It used to clear only the *line* — which is Ctrl-U's job, already bound — so the key did
+    /// something unexpected and the screen never cleared. A wipe leaves nothing on the prompt, since a
+    /// blank screen with the old command still displayed is neither state.
+    #[test]
+    fn ctrl_l_asks_for_a_screen_wipe_and_empties_the_line() {
+        let mut e = Editor::new();
+        type_text(&mut e, "half a command");
+        assert_eq!(e.handle(ctrl('l')), Action::ClearScreen);
+        assert_eq!(e.line(), "", "the line goes with the screen");
+        assert_eq!(e.cursor(), 0);
+
+        // Ctrl-U still clears the line without touching the screen: the two are different jobs.
+        let mut e = Editor::new();
+        type_text(&mut e, "text");
+        assert_eq!(e.handle(ctrl('u')), Action::Continue);
+        assert_eq!(e.line(), "");
+        // And the line is recoverable from history after a wipe, because a submitted line is stored.
+        let mut e = Editor::new();
+        type_text(&mut e, "kept");
+        e.handle(key(KeyCode::Enter));
+        assert_eq!(e.handle(ctrl('l')), Action::ClearScreen);
+        e.handle(key(KeyCode::Up));
+        assert_eq!(e.line(), "kept", "a wipe must not lose history");
     }
 
     #[test]

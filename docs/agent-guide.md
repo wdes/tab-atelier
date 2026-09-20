@@ -95,8 +95,8 @@ the package manager, whose error would say only what it could not find.
 
 `SSH` is two actions and both take almost nothing:
 
-    SSH { action: command, host: dc1.servers.example.org, command: "uptime" }
-    SSH { action: keyscan, host: dc1.servers.example.org }
+    SSH { action: command, host: dc1.example.org, command: "uptime" }
+    SSH { action: keyscan, host: dc1.example.org }
 
 Only `host` — a name, an address, or either with a port — plus `jump` and `forward_agent` may be set.
 There is no user, no extra ssh option, no key selection and no tunnel, so none of those is reachable

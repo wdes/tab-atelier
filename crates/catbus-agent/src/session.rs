@@ -48,22 +48,22 @@ pub struct Session {
 ///
 /// `last_uuid` is seeded from the resumed transcript's last entry
 /// so `parentUuid` chaining stays intact across the restart.
-pub fn open(cwd: &Path, resume_id: Option<&str>, new_session: bool) -> Result<Session, SessionError> {
+/// `_new_session` is retained because callers pass it — the CLI flag and the `Spawn` tool both name
+/// a fresh session explicitly — but it no longer decides anything: **a fresh session is the default
+/// now.** It used to be the other way round, and the surprise was real: a tab reopened continued
+/// whichever conversation was last in that directory, and two agents in one directory silently shared
+/// a history. Continuing an earlier session is only ever explicit, through `resume_id`.
+pub fn open(cwd: &Path, resume_id: Option<&str>, _new_session: bool) -> Result<Session, SessionError> {
     let home = std::env::var_os("HOME").ok_or(SessionError::NoHome)?;
     let project_dir = PathBuf::from(home)
         .join(".claude")
         .join("projects")
         .join(escape_cwd(cwd));
     std::fs::create_dir_all(&project_dir)?;
-    // Three-way decision; `map_or_else` would obscure it.
-    #[allow(clippy::option_if_let_else)]
-    let id = if let Some(id) = resume_id {
-        id.to_string()
-    } else if new_session {
-        Uuid::new_v4().to_string()
-    } else {
-        latest_session_id(&project_dir).unwrap_or_else(|| Uuid::new_v4().to_string())
-    };
+    // An explicit id is the only way to continue an earlier session, and it wins even when
+    // `--new-session` is also passed: a caller that names a session means that session, and every
+    // existing caller passes `--new-session` as a matter of course. Anything else is fresh.
+    let id = resume_id.map_or_else(|| Uuid::new_v4().to_string(), ToString::to_string);
     let transcript = project_dir.join(format!("{id}.jsonl"));
     let file = OpenOptions::new().create(true).append(true).open(&transcript)?;
     let last_uuid = last_entry_uuid(&transcript).ok().flatten();
@@ -95,31 +95,6 @@ fn gate_sidecar(project_dir: &Path, id: &str) -> PathBuf {
 /// Path of the `.model` sidecar: the model chosen for this session.
 fn model_sidecar(project_dir: &Path, id: &str) -> PathBuf {
     project_dir.join(format!("{id}.model"))
-}
-
-/// Newest `.jsonl` stem in `dir`, ignoring zero-byte files (those
-/// are sessions that were opened but never written to — typically
-/// crashes immediately after start). Returns the session id.
-fn latest_session_id(dir: &Path) -> Option<String> {
-    let mut best: Option<(String, std::time::SystemTime)> = None;
-    for entry in std::fs::read_dir(dir).ok()?.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
-            continue;
-        }
-        let Ok(meta) = entry.metadata() else { continue };
-        if meta.len() == 0 {
-            continue;
-        }
-        let Ok(mtime) = meta.modified() else { continue };
-        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-            continue;
-        };
-        if best.as_ref().is_none_or(|(_, t)| mtime > *t) {
-            best = Some((stem.to_string(), mtime));
-        }
-    }
-    best.map(|(id, _)| id)
 }
 
 /// One rendered exchange for the resume preview.

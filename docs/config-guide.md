@@ -61,12 +61,12 @@ be used:
 
     ---
     AllowedTools: Read, FileTree, SSH
-    AllowedHosts: dc1.servers.example.org, *.staging.example.org
+    AllowedHosts: dc1.example.org, *.staging.example.org
     ---
     You are Tabby, a PHP and VueJS master.
 
-An entry is either an exact host or a leading `*.` for a domain and its subdomains. `*.example.com`
-matches `api.example.com` and not `example.com` itself, deliberately: a wildcard that also covered
+An entry is either an exact host or a leading `*.` for a domain and its subdomains. `*.example.org`
+matches `api.example.org` and not `example.org` itself, deliberately: a wildcard that also covered
 the bare domain would be wider than it reads. There is no CIDR syntax — `10.0.0.0/8` is not a
 hostname and is refused — so a range has to be written as the names or domains in it.
 
@@ -77,8 +77,8 @@ The check happens before anything runs, so a host that is not listed never reach
 attempt. It is the operator's limit rather than a suggestion, and the refusal says so and names the
 list, so an agent reports it rather than trying to work around it.
 
-A port is not part of the policy. `AllowedHosts` is about where, so `dc1.servers.example.org` also
-permits `dc1.servers.example.org:2222`.
+A port is not part of the policy. `AllowedHosts` is about where, so `dc1.example.org` also
+permits `dc1.example.org:2222`.
 
 ### Routing through a jump host
 

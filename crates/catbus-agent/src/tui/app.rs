@@ -275,10 +275,23 @@ impl Ui {
     /// there, which is the opposite of "looks brand new".
     pub fn purge(&mut self) -> std::io::Result<()> {
         let mut out = std::io::stdout();
-        execute!(out, ratatui::crossterm::cursor::MoveTo(0, 0), Clear(ClearType::Purge))?;
+        // **Two erases, and both are needed.** `3J` is "erase saved lines" — the scrollback — and does
+        // nothing to what is on screen. The visible cells go with `2J`. An earlier version sent only
+        // `3J`, trusting the name `ClearType::Purge` ("All plus history"); the report was immediate and
+        // exact: `/clear` did not clear the screen.
+        //
+        // `2J` then `3J`, and the cursor home first, so the two erases do not fight over where the
+        // cursor ends up. Written as raw sequences rather than one `Clear(Purge)` because no single
+        // `ClearType` means both.
+        execute!(
+            out,
+            ratatui::crossterm::cursor::MoveTo(0, 0),
+            Clear(ClearType::All),
+            Clear(ClearType::Purge)
+        )?;
         out.flush()?;
-        // ratatui's back buffer still holds the frame it drew last, so without this it
-        // would consider the now-blank cells already correct and never repaint them.
+        // ratatui's back buffer still holds the frame it drew last, so without this it would consider
+        // the now-blank cells already correct and never repaint them.
         self.terminal.clear()
     }
 
@@ -978,6 +991,14 @@ impl Repl<'_> {
                 // A blank line above the viewport, so abandoned text scrolls out of the
                 // way rather than looking like output.
                 self.ui.print_above("")?;
+                Ok(Flow::Continue)
+            }
+            Action::ClearScreen => {
+                // The wipe itself, then the loop redraws the prompt line on its next pass — which is
+                // what leaves "an empty prompt line" rather than a blank terminal with no cursor
+                // affordance at all. The banner is not reprinted: this is a screen wipe, not a new
+                // session, and `/clear` is the command that starts one.
+                self.ui.purge()?;
                 Ok(Flow::Continue)
             }
             Action::Exit => Ok(Flow::Exit),

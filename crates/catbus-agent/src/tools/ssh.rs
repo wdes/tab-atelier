@@ -328,7 +328,7 @@ impl Target {
 /// * a leading `*.` for a domain and its subdomains — `*.servers.example.org` matches
 ///   `dc1.servers.example.org` but **not** `servers.example.org` itself, because a wildcard that also matched
 ///   the bare domain is how a limit quietly becomes wider than it reads. The dot boundary matters for
-///   the same reason: `*.example.org` must not match `evil.example.org`.
+///   the same reason: `*.example.org` must not match `evilexample.com`.
 fn matches_list(host: &str, entries: &[String]) -> bool {
     let host = host.to_ascii_lowercase();
     entries.iter().any(|entry| {
@@ -825,9 +825,12 @@ mod tests {
         assert_eq!(bare_v6.port, None);
 
         // Whitespace is tolerated, because a copy-paste carries it.
-        assert_eq!(Target::parse("  host.example  ").expect("trimmed").host, "host.example");
+        assert_eq!(
+            Target::parse("  host.example.org  ").expect("trimmed").host,
+            "host.example.org"
+        );
         // And a name may carry a dash or an underscore, which is why those are allowed.
-        assert!(Target::parse("my-host_1.example.com").is_ok());
+        assert!(Target::parse("my-host_1.example.org").is_ok());
     }
 
     /// The safety property: a host cannot become an ssh option.
@@ -946,24 +949,24 @@ mod tests {
     /// A portless host has no `-p`, and the host is still last.
     #[test]
     fn a_portless_target_gets_no_port_flag() {
-        let target = Target::parse("host.example").expect("parsed");
+        let target = Target::parse("host.example.org").expect("parsed");
         let args = ssh_args(&target, None, false, 10);
         assert!(!args.contains(&"-p".to_string()), "{args:?}");
-        assert_eq!(args.last().map(String::as_str), Some("host.example"), "{args:?}");
+        assert_eq!(args.last().map(String::as_str), Some("host.example.org"), "{args:?}");
     }
 
     /// A line that is not shaped like a key is not appended to a file ssh trusts.
     #[test]
     fn only_key_shaped_lines_are_worth_trusting() {
         assert!(is_host_key_line(
-            "host.example ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI..."
+            "host.example.org ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI..."
         ));
         assert!(is_host_key_line("10.0.0.1 ecdsa-sha2-nistp256 AAAAE2VjZHNh..."));
         assert!(is_host_key_line("[2001:db8::1]:22 sk-ssh-ed25519@openssh.com AAAA..."));
         // Not keys: prose, a comment, an empty line, a two-field line, a name that is not a type.
-        assert!(!is_host_key_line("# host.example SSH-2.0-OpenSSH_10.0"));
-        assert!(!is_host_key_line("host.example ssh-ed25519"));
-        assert!(!is_host_key_line("host.example not-a-key-type AAAA"));
+        assert!(!is_host_key_line("# host.example.org SSH-2.0-OpenSSH_10.0"));
+        assert!(!is_host_key_line("host.example.org ssh-ed25519"));
+        assert!(!is_host_key_line("host.example.org not-a-key-type AAAA"));
         assert!(!is_host_key_line("just some words here"));
         assert!(!is_host_key_line(""));
     }
@@ -977,7 +980,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
         let home = tempfile::tempdir().unwrap();
 
-        let key = "host.example ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIexamplekey".to_string();
+        let key = "host.example.org ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIexamplekey".to_string();
         let lines = vec![&key];
 
         let first = trust_keys_in(home.path(), &lines).expect("writes");
@@ -1105,7 +1108,7 @@ mod tests {
     async fn an_unknown_action_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let err = run(
-            &serde_json::json!({"action": "tunnel", "host": "host.example"}),
+            &serde_json::json!({"action": "tunnel", "host": "host.example.org"}),
             dir.path(),
         )
         .await
@@ -1127,7 +1130,7 @@ mod tests {
     async fn a_command_needs_a_command_and_a_safe_host() {
         let dir = tempfile::tempdir().unwrap();
         let missing = run(
-            &serde_json::json!({"action": "command", "host": "host.example"}),
+            &serde_json::json!({"action": "command", "host": "host.example.org"}),
             dir.path(),
         )
         .await
@@ -1135,7 +1138,7 @@ mod tests {
         assert!(missing.contains("missing `command`"), "{missing}");
 
         let blank = run(
-            &serde_json::json!({"action": "command", "host": "host.example", "command": "   "}),
+            &serde_json::json!({"action": "command", "host": "host.example.org", "command": "   "}),
             dir.path(),
         )
         .await
@@ -1168,25 +1171,25 @@ mod tests {
     #[test]
     fn an_allow_list_permits_only_what_it_names() {
         let listed = |hosts: &[&str]| -> Vec<String> { hosts.iter().map(|h| (*h).to_string()).collect() };
-        let dc1 = Target::parse("dc1.servers.example.org").expect("parsed");
+        let host = Target::parse("dc1.servers.example.org").expect("parsed");
 
         // No list: no opinion.
-        assert!(dc1.permitted(None).is_ok(), "silence is not a prohibition");
+        assert!(host.permitted(None).is_ok(), "silence is not a prohibition");
 
         // An exact host, with case and surrounding space tolerated — an operator writing
-        // `DC18.Servers.WDES.EU` in a config meant that host, and refusing over case would be a
+        // `DC1.SERVERS.EXAMPLE.ORG` in a config meant that host, and refusing over case would be a
         // puzzle rather than a limit.
-        assert!(dc1.permitted(Some(&listed(&["dc1.servers.example.org"]))).is_ok());
-        assert!(dc1.permitted(Some(&listed(&[" DC18.SERVERS.WDES.EU "]))).is_ok());
+        assert!(host.permitted(Some(&listed(&["dc1.servers.example.org"]))).is_ok());
+        assert!(host.permitted(Some(&listed(&[" DC1.SERVERS.EXAMPLE.ORG "]))).is_ok());
 
         // A wildcard covers subdomains…
-        assert!(dc1.permitted(Some(&listed(&["*.servers.example.org"]))).is_ok());
+        assert!(host.permitted(Some(&listed(&["*.servers.example.org"]))).is_ok());
         // …and not the bare domain, which is the whole reason for the leading `*.`: a wildcard that
         // also matched `servers.example.org` would be wider than it reads.
         let bare = Target::parse("servers.example.org").expect("parsed");
         assert!(
             bare.permitted(Some(&listed(&["*.servers.example.org"]))).is_err(),
-            "`*.example.com` must not match `example.com` itself"
+            "`*.example.org` must not match `example.org` itself"
         );
         // And not a domain that merely ends with the same letters.
         let sneak = Target::parse("evilservers.example.org").expect("parsed");
@@ -1198,7 +1201,7 @@ mod tests {
         // A host not in the list is refused, and the message says where the limit comes from — an
         // agent reading it should understand this is the operator's decision, not a bug to work
         // around.
-        let err = dc1.permitted(Some(&listed(&["other.example"]))).unwrap_err();
+        let err = host.permitted(Some(&listed(&["other.example"]))).unwrap_err();
         assert!(err.contains("dc1.servers.example.org"), "{err}");
         assert!(err.contains("AllowedHosts"), "{err}");
         assert!(err.contains("other.example"), "the list is shown: {err}");
@@ -1209,7 +1212,7 @@ mod tests {
 
         // An empty list denies everything, and says so rather than printing nothing.
         let empty: Vec<String> = Vec::new();
-        let err = dc1.permitted(Some(&empty)).unwrap_err();
+        let err = host.permitted(Some(&empty)).unwrap_err();
         // "nothing is allowed" rather than "no host": the wording is shared with the jump list, where a
         // host is not what is being denied.
         assert!(err.contains("empty — nothing is allowed"), "{err}");
