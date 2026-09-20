@@ -19,43 +19,30 @@
 //! the text, a count with separators, a missing estimate, the mode changing
 //! mid-session — can be tested without a tty.
 
-/// Spinner frames — simple ASCII so any font renders them.
-pub const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-
-/// Width assumed when the terminal size cannot be read — piped output, or a pty
-/// that never got a size. 80 because it is the width every terminal honours.
-const FALLBACK_WIDTH: usize = 80;
-
-/// The label used while waiting on the model, before any tool is involved.
-///
-/// The agent's status is the lower-case `"thinking"`; the REPL presents it
-/// capitalised, and [`spinner_line`] compares against this constant rather than
-/// a literal so the two cannot drift.
-pub const THINKING: &str = "Thinking";
-
-/// `1234567` → `1,234,567`.
-///
-/// Token counts reach six digits on a long session, where an unseparated number
-/// is genuinely hard to read at a glance — which is the whole point of putting
-/// it on screen.
-#[must_use]
-pub fn thousands(n: u64) -> String {
-    let digits = n.to_string();
-    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
-    for (i, ch) in digits.chars().enumerate() {
-        // A separator every three digits from the right, and never leading.
-        if i > 0 && (digits.len() - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(ch);
-    }
-    out
-}
-
 /// `1,234 in - 567 out` — the left-hand field of the totals line.
 #[must_use]
 pub fn tokens_label(tokens_in: u64, tokens_out: u64) -> String {
     format!("{} in - {} out", thousands(tokens_in), thousands(tokens_out))
+}
+
+/// A count with thousands separators: `1234` becomes `1,234`.
+///
+/// Hand-rolled rather than pulled in: the alternative is a dependency for four
+/// lines, and the separators are load-bearing here — a raw `12345` read at a glance
+/// is hard to size, and these numbers are the one piece of the status line an
+/// operator actually compares across turns.
+#[must_use]
+pub fn thousands(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        // A separator every third digit, counted from the right.
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// The gate, as the operator thinks of it.
@@ -118,26 +105,17 @@ pub const fn estimate_input_tokens(bytes: usize) -> u64 {
     (bytes / BYTES_PER_TOKEN) as u64
 }
 
-/// The live line, with the leading `\r\x1b[K` that repaints the previous frame.
+/// The label shown while the model is thinking and has not called a tool.
+pub const THINKING: &str = "Thinking";
+
+/// The marker the agent puts in its status while it waits on the model.
 ///
-/// `tokens` is the in-flight estimate, or `None` before a request has been
-/// serialised — in which case the count is omitted rather than shown as `~0`,
-/// because `~0 tokens in` claims a measurement of zero when in fact nothing has
-/// been measured yet.
-///
-/// `\r` parks the cursor at column 0 and `\x1b[K` erases to end-of-line, so a
-/// shorter line never leaves the tail of a longer one behind — the same reason
-/// the spinner already used them when the activity could change from a long tool
-/// name to the short word "thinking".
-#[must_use]
-pub fn spinner_line(frame: usize, activity: &str, tokens: Option<u64>) -> String {
-    let spinner = SPINNER[frame % SPINNER.len()];
-    // The `~` marks this as the local estimate, not the server's count. An
-    // absent estimate yields an empty string: see the doc comment for why it is
-    // omitted rather than rendered as `~0`.
-    let count = tokens.map_or_else(String::new, |n| format!(" - ~{} tokens in", thousands(n)));
-    format!("\r\x1b[K\x1b[36m{spinner}\x1b[0m {activity}{count}")
-}
+/// Distinct from [`THINKING`], which is the label: the agent's marker is internal
+/// and lower-case, and the label is what an operator reads. Both live here so the
+/// comparison in [`activity_label`] has one spelling to match and `agent` has one
+/// spelling to set — a rename on either side used to surface as a spinner reading
+/// "thinking" in lower case.
+pub const THINKING_MARKER: &str = "thinking";
 
 /// The activity text for a spinner frame: the agent's status, presented.
 ///
@@ -145,12 +123,15 @@ pub fn spinner_line(frame: usize, activity: &str, tokens: Option<u64>) -> String
 /// description it wrote for exactly this purpose, so it is passed through as-is.
 #[must_use]
 pub fn activity_label(status: &str) -> String {
-    if status == "thinking" {
+    if status == THINKING_MARKER {
         THINKING.to_owned()
     } else {
         status.to_owned()
     }
 }
+
+/// Column width assumed when the terminal will not say.
+const FALLBACK_WIDTH: usize = 80;
 
 /// The terminal's width in columns, or [`FALLBACK_WIDTH`].
 ///
@@ -234,37 +215,6 @@ mod tests {
     }
 
     #[test]
-    fn the_spinner_line_names_the_activity_and_the_count() {
-        let line = spinner_line(0, THINKING, Some(1_234));
-        assert!(line.contains("Thinking"), "{line:?}");
-        assert!(line.contains("~1,234 tokens in"), "{line:?}");
-        // The dash is what the format is specified with.
-        assert!(line.contains("Thinking - ~1,234 tokens in"), "{line:?}");
-    }
-
-    #[test]
-    fn the_count_is_marked_as_an_estimate() {
-        // The `~` is the whole honesty story for this field: the server reports
-        // `usage` only in its final response, so anything shown *during* the
-        // download is local arithmetic on the payload length. Without the marker
-        // it reads as an authoritative figure.
-        let line = spinner_line(0, THINKING, Some(99));
-        assert!(line.contains('~'), "an estimate must be marked: {line:?}");
-    }
-
-    #[test]
-    fn no_estimate_omits_the_count_rather_than_showing_zero() {
-        // `~0 tokens in` would claim a measurement of zero when nothing has been
-        // measured yet. Better to say nothing about tokens at all.
-        let line = spinner_line(0, THINKING, None);
-        assert!(line.contains("Thinking"), "{line:?}");
-        assert!(!line.contains("tokens"), "no count should be shown: {line:?}");
-        assert!(!line.contains('~'), "{line:?}");
-        // Still a valid repaint line.
-        assert!(line.starts_with("\r\x1b[K"), "{line:?}");
-    }
-
-    #[test]
     fn the_estimate_scales_with_payload_size() {
         // A rough ratio, but it must be monotonic and sane: a bigger payload
         // never estimates fewer tokens, and the order of magnitude holds.
@@ -286,29 +236,8 @@ mod tests {
         let typical_request_bytes = 30_000;
         let est = estimate_input_tokens(typical_request_bytes);
         assert!(est > 1_000, "a 30 kB request should not estimate as {est} tokens");
-        assert!(spinner_line(0, THINKING, Some(est)).contains("tokens in"));
-    }
-
-    #[test]
-    fn the_spinner_line_erases_the_previous_frame_first() {
-        // Without these a shorter line leaves the tail of a longer one behind —
-        // which is exactly how "Bash: grep -ri ..." used to bleed into
-        // "thinking ... ri" before the erase was added.
-        let line = spinner_line(0, THINKING, Some(0));
-        assert!(line.starts_with("\r\x1b[K"), "{line:?}");
-    }
-
-    #[test]
-    fn the_spinner_animates_and_wraps() {
-        // Frames advance, and a large frame index must not panic — the counter is
-        // never reset, so it will exceed the frame list on a long session.
-        let first = spinner_line(0, THINKING, Some(0));
-        let second = spinner_line(1, THINKING, Some(0));
-        assert_ne!(first, second, "the spinner does not animate");
-        let wrapped = spinner_line(SPINNER.len(), THINKING, Some(0));
-        assert_eq!(wrapped, first, "frame {} should wrap to frame 0", SPINNER.len());
-        // Far beyond the frame list, and no panic.
-        let _ = spinner_line(usize::MAX, THINKING, Some(0));
+        // And it is a number the display path can render.
+        assert!(est.to_string().len() >= 4, "a 30 kB request showed {est}");
     }
 
     #[test]
@@ -322,11 +251,11 @@ mod tests {
 
     #[test]
     fn the_thinking_label_matches_what_the_agent_reports() {
-        // `activity_label` compares against "thinking", which is the literal the
-        // agent sets. Hard-coded in two places, so pinned here: a rename on
-        // either side would otherwise surface as a spinner that reads
-        // "thinking - 0 tokens in" in lower case.
+        // The label and the marker are different strings on purpose, and the
+        // agent sets the marker: a rename on either side would otherwise surface
+        // as a spinner reading "thinking" in lower case.
         assert_eq!(THINKING, "Thinking");
-        assert_eq!(activity_label("thinking"), THINKING);
+        assert_eq!(THINKING_MARKER, "thinking");
+        assert_eq!(activity_label(THINKING_MARKER), THINKING);
     }
 }

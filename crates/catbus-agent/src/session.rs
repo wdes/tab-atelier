@@ -372,8 +372,17 @@ pub fn list_sessions(cwd: &Path) -> Vec<(String, String, std::time::SystemTime)>
         }
         let Ok(mtime) = meta.modified() else { continue };
         if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+            // A session's label: its `/rename`d name, or failing that the opening
+            // prompt. A bare UUID in a listing is not something anyone recognises,
+            // and the first thing that was asked is what the operator remembers —
+            // which is what `first_prompt` exists for.
             let name = load_session_name(&dir, stem);
-            out.push((stem.to_string(), name, mtime));
+            let label = if name.is_empty() {
+                first_prompt(&p, 60).unwrap_or_default()
+            } else {
+                name
+            };
+            out.push((stem.to_string(), label, mtime));
         }
     }
     out.sort_by_key(|(_, _, t)| std::cmp::Reverse(*t));

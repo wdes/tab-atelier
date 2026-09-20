@@ -287,6 +287,16 @@ impl Agent {
         self.ansi
     }
 
+    /// What the turn in flight is doing, if anything — a tool name, or a phase.
+    ///
+    /// Set by the tool loop and cleared when the turn ends. Read by a UI that wants
+    /// to say more than "busy": the difference between waiting on a model and
+    /// waiting on a `Bash` command is the difference between patience and alarm.
+    #[must_use]
+    pub fn status(&self) -> Option<String> {
+        self.status.lock().expect("status mutex").clone()
+    }
+
     /// The model this session runs as. See the field for why it is not a flag.
     #[must_use]
     pub fn model(&self) -> String {
@@ -576,7 +586,7 @@ impl Agent {
             *slot = CancellationToken::new();
             slot.clone()
         };
-        *self.status.lock().expect("status mutex") = Some("thinking".into());
+        *self.status.lock().expect("status mutex") = Some(crate::statusline::THINKING_MARKER.to_owned());
         let result = self.run_user_prompt_inner(text, &token).await;
         *self.status.lock().expect("status mutex") = None;
         result
@@ -614,7 +624,7 @@ impl Agent {
             if cancel.is_cancelled() {
                 return Err(AgentError::Cancelled);
             }
-            *self.status.lock().expect("status mutex") = Some("thinking".into());
+            *self.status.lock().expect("status mutex") = Some(crate::statusline::THINKING_MARKER.to_owned());
             let resp = tokio::select! {
                 res = self.call_messages() => res?,
                 () = cancel.cancelled() => return Err(AgentError::Cancelled),

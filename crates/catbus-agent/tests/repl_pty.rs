@@ -453,15 +453,62 @@ fn a_turn_paints_the_spinner_and_then_the_totals_line() {
     );
 }
 
+/// Whether the text contains a CSI cursor-position sequence: `ESC [ <r> ; <c> H`.
+///
+/// Looked for structurally rather than as a literal, because the sequence that
+/// immediately precedes a paint is often an SGR colour (`ESC [ 38;5;8;49 m`) and
+/// taking the *last* escape finds that instead of the move. Both are `ESC [`, and
+/// only the final byte distinguishes them.
+fn has_cursor_move(text: &str) -> bool {
+    text.match_indices('\u{1b}').any(|(i, _)| {
+        let rest = &text[i + 1..];
+        let Some(params) = rest.strip_prefix('[') else {
+            return false;
+        };
+        let mut chars = params.chars();
+        let mut digits = 0;
+        // Parameter bytes: digits and separators, at least one.
+        while matches!(chars.clone().next(), Some(c) if c.is_ascii_digit() || c == ';') {
+            chars.next();
+            digits += 1;
+        }
+        // Then the final byte. `H` is "cursor position".
+        digits > 0 && chars.next() == Some('H')
+    })
+}
+
 #[test]
 fn the_spinner_repaints_rather_than_appending() {
-    // The erase sequence is what keeps a long activity label from bleeding into
-    // the next frame. Asserted against the raw bytes, since stripping ANSI would
-    // remove the very thing under test.
+    // The property is that the status row is *repainted*, so a long activity label
+    // cannot accumulate: each frame replaces the last. The previous renderer did that
+    // by hand — back to column 0, erase to end of line — and this test asserted those
+    // exact bytes (`\r\x1b[K`). ratatui repaints by diffing its buffer against the
+    // previous one and writing only the cells that changed, so the erase sequence is
+    // simply absent and the byte assertion stopped describing anything.
+    //
+    // Within this capture there is only one frame to look at, for a reason worth
+    // recording: the expectation stops at `tokens in`, and that text is painted on the
+    // *first* status frame. So the two things that can be checked here are that the
+    // animation started, and that the frame was painted at a cursor position rather
+    // than written as a new line — which is exactly the difference between repainting
+    // and appending, and is what the old assertion was reaching for.
     let port = spawn_delayed_relay(REPLY_WITH_USAGE, Duration::from_secs(2));
     let (_, seen) = type_and_expect_at(port, &[], "hello", "tokens in");
+
     assert!(
-        seen.contains("\r\u{1b}[K"),
-        "the spinner must erase the previous frame before drawing: {seen:?}"
+        "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏".chars().any(|c| seen.contains(c)),
+        "a spinner frame should be on screen: {seen:?}"
+    );
+
+    let at = seen.find("Thinking").expect("the activity label should be on screen");
+    let before = &seen[at.saturating_sub(40)..at];
+    assert!(
+        has_cursor_move(before),
+        "the status row must be painted at a cursor position, not appended as a line; \
+         bytes before the label: {before:?}"
+    );
+    assert!(
+        !before.ends_with('\n') && !before.ends_with("\r\n"),
+        "the label must not be written on a line of its own: {before:?}"
     );
 }

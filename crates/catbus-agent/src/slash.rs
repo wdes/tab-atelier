@@ -30,6 +30,8 @@ pub enum Action {
     Rename,
     /// List this cwd's previous sessions, or switch to the one named.
     Resume,
+    /// Show or choose the model this session runs as.
+    Model,
     /// Leave the REPL, as Ctrl-D does.
     Exit,
 }
@@ -102,6 +104,10 @@ const RESUME_NAME: &str = "/resume";
 const RESUME_ARG: &str = "<id>";
 const RESUME_DESCRIPTION: &str = "list previous sessions in this cwd, or switch to one in-place";
 
+const MODEL_NAME: &str = "/model";
+const MODEL_ARG: &str = "<name>";
+const MODEL_DESCRIPTION: &str = "show the model this session runs as, or switch to another";
+
 const EXIT_NAME: &str = "/exit";
 const EXIT_DESCRIPTION: &str = "quit (same as /quit, or Ctrl-D)";
 const EXIT_ALIASES: &[&str] = &["/quit"];
@@ -156,6 +162,13 @@ pub const COMMANDS: &[SlashCommand] = &[
         aliases: &[],
         arg: Some(RESUME_ARG),
         action: Action::Resume,
+    },
+    SlashCommand {
+        name: MODEL_NAME,
+        description: MODEL_DESCRIPTION,
+        aliases: &[],
+        arg: Some(MODEL_ARG),
+        action: Action::Model,
     },
     SlashCommand {
         name: EXIT_NAME,
