@@ -21,3 +21,10 @@ crates/tab-atelier-proxy/assets/vendor/bootstrap.min.css
 # see crates/tab-atelier-proxy/assets/README-typescript.md — so a package
 # build never needs Node, and these never belong in the repo.
 crates/tab-atelier-proxy/web/node_modules/
+
+# Python bytecode. Derived from the scripts in scripts/ and regenerated on import.
+# Four of them were committed by an `git add -A` in a commit about SPDX headers, which
+# made every `python3 scripts/…` run dirty the tree — and a routine cleanup of that
+# dirt deleted tracked files, because they looked like build output.
+__pycache__/
+*.py[cod]
