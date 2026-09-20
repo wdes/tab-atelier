@@ -382,11 +382,14 @@ async fn print_banner(ui: &mut Ui, agent: &Agent) -> std::io::Result<()> {
     let version = env!("CARGO_PKG_VERSION");
     let name = agent.session_name().await;
     let id = agent.session_id().await;
-    let short = id.get(..8).unwrap_or(&id).to_owned();
+    // The **full** uuid, not an abbreviation. It is short only when there is no name, and it was always
+    // abbreviated before — which is the wrong way round for the one thing the line is for: this is where
+    // an operator finds the id to hand to `--resume`, and eight characters is not enough to give back.
+    // The name is the human label; the uuid is the handle.
     let label = if name.is_empty() {
-        short
+        id.clone()
     } else {
-        format!("{name}  ({short})")
+        format!("{name}  {id}")
     };
 
     let mut out = format!("catbus-agent v{version}  {label}\n");
@@ -542,7 +545,14 @@ enum Outcome {
 /// where one that prints is not.
 async fn run_slash(agent: &Agent, cwd: &Path, command: &slash::SlashCommand, argument: &str) -> Outcome {
     match command.action {
-        slash::Action::Help => Outcome::Print(slash::help_text()),
+        // The session id appended here rather than inside `help_text`, which is a pure function of the
+        // command table and knows nothing about a session. It belongs on the help output because
+        // `--resume <id>` is the command an operator reaches for when they want this conversation back,
+        // and it was previously findable only by reading the transcript directory.
+        slash::Action::Help => {
+            let id = agent.session_id().await;
+            Outcome::Print(format!("{}\nthis session: {id}", slash::help_text()))
+        }
         slash::Action::Exit => Outcome::Exit,
         slash::Action::Model => {
             if argument.is_empty() {
