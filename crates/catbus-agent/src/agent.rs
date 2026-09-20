@@ -206,6 +206,12 @@ pub struct Agent {
     /// Whether this session's output may be styled. Read through
     /// [`Self::styles_output`], which is the only place that decides.
     ansi: bool,
+    /// The channel a question from [`crate::tools::ask`] travels down.
+    ///
+    /// On the agent rather than inside the tool, because the answer comes from whatever is
+    /// driving the session — the REPL or a socket client — and both need to reach it. Shared,
+    /// so the tool can wait while the UI renders the question.
+    asker: std::sync::Arc<crate::tools::ask::Asker>,
     /// The model this session runs as.
     ///
     /// Session state, not a launch flag: `/model` sets it, the sidecar remembers
@@ -305,6 +311,9 @@ impl Agent {
             // Opting in is a one-line change for the launcher, which is the
             // only party that knows what stdout actually is.
             ansi: false,
+            // A fresh channel per agent; the REPL or a socket client reaches it through
+            // `asker()`. See the field.
+            asker: std::sync::Arc::new(crate::tools::ask::Asker::new()),
             // Built-in behaviour until an operator says otherwise. See
             // `crate::identity`.
             identity: crate::identity::Identity::Auto,
@@ -347,6 +356,12 @@ impl Agent {
     #[must_use]
     pub fn status(&self) -> Option<String> {
         self.status.lock().expect("status mutex").clone()
+    }
+
+    /// The question channel. See the field.
+    #[must_use]
+    pub const fn asker(&self) -> &std::sync::Arc<crate::tools::ask::Asker> {
+        &self.asker
     }
 
     /// Whether this session's output may be styled.
@@ -849,7 +864,7 @@ impl Agent {
                 };
 
                 let (mut content, is_error) = tokio::select! {
-                    out = self.tools.dispatch(name, input, &session.cwd, gate) => {
+                    out = self.tools.dispatch(name, input, &session.cwd, gate, &self.asker) => {
                         out.map_or_else(|e| (format!("Error: {e}"), true), |out| (out, false))
                     }
                     () = cancel.cancelled() => return Err(AgentError::Cancelled),

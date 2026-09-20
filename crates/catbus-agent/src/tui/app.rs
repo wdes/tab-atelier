@@ -49,6 +49,59 @@ use crate::tui::spinner::Spinner;
 /// feels immediate, slow enough to cost nothing.
 const TICK: Duration = Duration::from_millis(60);
 
+/// Resolve what the operator typed into the labels they chose.
+///
+/// Accepts a number (1-based, as shown) or a label, compared case-insensitively and trimmed.
+/// A number out of range is refused with the range, because `4` when three were offered is a
+/// typo and answering option 3 instead would be silent.
+fn pick(question: &crate::tools::ask::Question, tokens: &[&str]) -> Result<Vec<String>, String> {
+    if tokens.is_empty() {
+        return Err("no choice given".to_owned());
+    }
+    if !question.multi && tokens.len() > 1 {
+        return Err(format!(
+            "`{}` takes one choice, but {} were given. Send them one at a time, or ask for a \
+             multi-select question.",
+            question.header,
+            tokens.len()
+        ));
+    }
+    let mut chosen = Vec::with_capacity(tokens.len());
+    for token in tokens {
+        let token = token.trim();
+        // A number, if it is one.
+        if let Ok(number) = token.parse::<usize>() {
+            if number == 0 || number > question.options.len() {
+                return Err(format!(
+                    "`{token}` is not one of the {} options for `{}` — they are numbered 1 to {}.",
+                    question.options.len(),
+                    question.header,
+                    question.options.len()
+                ));
+            }
+            let label = question.options[number - 1].label.clone();
+            if !chosen.contains(&label) {
+                chosen.push(label);
+            }
+            continue;
+        }
+        // Otherwise a label, matched without case or surrounding space.
+        if let Some(option) = question.options.iter().find(|o| o.label.eq_ignore_ascii_case(token)) {
+            if !chosen.contains(&option.label) {
+                chosen.push(option.label.clone());
+            }
+        } else {
+            let labels: Vec<&str> = question.options.iter().map(|o| o.label.as_str()).collect();
+            return Err(format!(
+                "`{token}` is not an option for `{}` — the choices are {}.",
+                question.header,
+                labels.join(", ")
+            ));
+        }
+    }
+    Ok(chosen)
+}
+
 /// How many prompts may wait while a turn runs.
 ///
 /// A cap rather than unbounded, because the queue is invisible except for its count:
@@ -608,6 +661,13 @@ struct Repl<'a> {
     spinner: Option<Spinner>,
     /// Prompts typed while it was running, in the order they were given.
     queued: std::collections::VecDeque<String>,
+    /// The question the agent is waiting on, and the id to answer it by.
+    ///
+    /// Polled from the asker rather than pushed to this loop, because the ask happens inside a
+    /// tool call on another task and this loop is where it gets rendered. Held so the question
+    /// is printed once rather than every tick, and so a submitted line can be read as an answer
+    /// while one is open.
+    question: Option<(u64, Vec<crate::tools::ask::Question>)>,
 }
 
 /// What the loop should do after handling something.
@@ -643,6 +703,11 @@ impl Repl<'_> {
             1 => "  · 1 queued".to_owned(),
             n => format!("  · {n} queued"),
         };
+        // A question replaces the spinner, because the turn is not progressing — it is waiting
+        // on the operator, and saying "Thinking" while it waits on a person would be a lie.
+        if self.question.is_some() {
+            return Some(format!("waiting for an answer to the question above{waiting}"));
+        }
         Some(format!("{}  {activity}{estimate}{waiting}", spinner.label()))
     }
 
@@ -706,6 +771,112 @@ impl Repl<'_> {
         })
     }
 
+    /// Read a submitted line as an answer to the open question.
+    ///
+    /// The line is numbers or labels — `2`, `1,3` for a multi-select, or the label itself. Both
+    /// are accepted because both are natural: a numbered list invites a number, and typing the
+    /// label is what someone does when the label is shorter than the number of looking it up.
+    /// Anything unrecognised says what was not understood rather than answering something else.
+    fn answered(&mut self, id: u64, questions: &[crate::tools::ask::Question], line: &str) -> std::io::Result<Flow> {
+        let input = line.trim();
+        if input.is_empty() {
+            return Ok(Flow::Continue);
+        }
+        let mut chosen: Vec<Vec<String>> = Vec::with_capacity(questions.len());
+        for (index, question) in questions.iter().enumerate() {
+            // With several questions open, `1a`-style input would be needed to tell them apart;
+            // since a line answers all of them, each question gets the same tokens. In practice
+            // a multi-question call is answered one number per question, so this reads the
+            // token at this question's position when there are as many tokens as questions.
+            let tokens: Vec<&str> = input
+                .split([',', ' '])
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .collect();
+            let mine: Vec<&str> = if questions.len() > 1 && tokens.len() == questions.len() {
+                vec![tokens[index]]
+            } else if questions.len() > 1 {
+                // More than one question and not enough tokens to go round: refuse rather
+                // than guess which question was meant.
+                self.ui.print_above(&format!(
+                    "{} questions are open, so answer all of them: one choice each, \
+                     comma-separated (for example `1,2`).",
+                    questions.len()
+                ))?;
+                return Ok(Flow::Continue);
+            } else {
+                tokens.clone()
+            };
+
+            let picked = match pick(question, &mine) {
+                Ok(picked) => picked,
+                Err(why) => {
+                    self.ui.print_above(&why)?;
+                    return Ok(Flow::Continue);
+                }
+            };
+            chosen.push(picked);
+        }
+
+        if self.agent.asker().answer(id, chosen) {
+            self.question = None;
+            self.ui.print_above("answered")?;
+        } else {
+            // The question closed between rendering and answering — it timed out, or the turn
+            // was cancelled. Saying so beats silence, and the answer is genuinely not used.
+            self.question = None;
+            self.ui
+                .print_above("that question is no longer open — the answer was not used")?;
+        }
+        Ok(Flow::Continue)
+    }
+
+    /// Render a newly-asked question, if one has appeared.
+    ///
+    /// The question is printed once per id, not once per tick: it arrives from another task
+    /// while the turn runs, so this loop is the only place it can be shown, and a question
+    /// repeated every 60ms would flood the scrollback.
+    fn show_pending_question(&mut self) -> std::io::Result<()> {
+        let asked = self.agent.asker().pending();
+        match (asked, &self.question) {
+            (Some((id, _)), Some((shown, _))) if *shown == id => return Ok(()),
+            (Some((id, questions)), _) => {
+                let mut out = String::new();
+                for (question, q) in questions.iter().enumerate() {
+                    if questions.len() > 1 {
+                        let _ = writeln!(out, "{}. {}", question + 1, q.prompt);
+                    } else {
+                        let _ = writeln!(out, "{}", q.prompt);
+                    }
+                    for (i, option) in q.options.iter().enumerate() {
+                        if option.description.is_empty() {
+                            let _ = writeln!(out, "  {}. {}", i + 1, option.label);
+                        } else {
+                            let _ = writeln!(out, "  {}. {} — {}", i + 1, option.label, option.description);
+                        }
+                    }
+                    if q.multi {
+                        let _ = writeln!(out, "  (several may be chosen: e.g. `1,3`)");
+                    }
+                }
+                let _ = write!(out, "answer with a number");
+                if questions.len() > 1 {
+                    let _ = write!(out, " (one per question, comma-separated)");
+                }
+                let _ = writeln!(out, ", or the label itself");
+                self.ui.print_above(out.trim_end())?;
+                self.question = Some((id, questions));
+            }
+            (None, Some(_)) => {
+                // Gone: answered from somewhere else, or timed out. Cleared so a later line is
+                // a prompt again rather than an answer to a question that is over.
+                self.question = None;
+            }
+            (None, None) => {}
+        }
+        Ok(())
+    }
+
     /// Handle one submitted line: queue it, run it as a command, or start a turn.
     ///
     /// Everything queues while a turn is in flight, *including* slash commands, so the
@@ -713,6 +884,14 @@ impl Repl<'_> {
     /// leaving is not a turn, and waiting for one to finish before obeying it would make
     /// the command feel broken.
     async fn submitted(&mut self, line: String) -> std::io::Result<Flow> {
+        // A question takes precedence over everything: while one is open, a submitted line is
+        // an answer, not a prompt. Queueing it would be worse than useless — the question is
+        // what the turn is blocked on, so a queued prompt could not run until it is answered
+        // anyway, and treating it as an answer is what the operator obviously means.
+        if let Some((id, questions)) = self.question.clone() {
+            return self.answered(id, &questions, &line);
+        }
+
         let trimmed = line.trim().trim_matches('`').to_owned();
         if trimmed.is_empty() {
             return Ok(Flow::Continue);
@@ -830,6 +1009,7 @@ async fn run_inner(ui: &mut Ui, agent: Arc<Agent>, cwd: &Path) -> std::io::Resul
         turn: None,
         spinner: None,
         queued: std::collections::VecDeque::new(),
+        question: None,
     };
 
     // The banner, once, before the first prompt: what version is running, which session,
@@ -838,6 +1018,9 @@ async fn run_inner(ui: &mut Ui, agent: Arc<Agent>, cwd: &Path) -> std::io::Resul
     print_banner(repl.ui, &repl.agent).await?;
 
     loop {
+        // A question asked from inside the running turn, before drawing: this loop is the only
+        // place it can be shown, and showing it is what lets the operator answer.
+        repl.show_pending_question()?;
         let status = repl.status();
         let prompt = prompt_for(&repl.agent).await;
         repl.ui.draw(&prompt, &repl.editor, status.as_deref())?;

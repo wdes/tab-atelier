@@ -8,6 +8,7 @@
 
 use std::path::Path;
 
+pub mod ask;
 mod bash;
 mod config;
 mod delegate;
@@ -207,6 +208,10 @@ impl ToolSet {
         input: &serde_json::Value,
         cwd: &Path,
         gate: Gate,
+        // The asker rather than the whole agent: it is the only thing a tool needs from the
+        // session, and one can be built without a session — which is what makes the dispatch
+        // tests below possible at all.
+        asker: &std::sync::Arc<ask::Asker>,
     ) -> Result<String, String> {
         // Membership first: an unoffered name is refused here, so the `match`
         // below can never be reached by a tool the operator withheld.
@@ -248,6 +253,10 @@ impl ToolSet {
             // *target* agent against its own state, not by this one.
             "ListAgents" => list_agents::run(input, cwd).await,
             "Delegate" => delegate::run(input, cwd).await,
+            // Deliberately before any gate check: asking is not an action, so nothing about it
+            // should be refused. A judge that could refuse a question leaves the agent with
+            // nothing to do but guess, and plan-mode needs questions to clarify a plan.
+            "AskUserQuestion" => ask::run(asker, input).await,
             // Not in `changes_the_world`: the child inherits this gate and judges
             // its own actions, which is the reasoning in that function's comment.
             // What *is* enforced here is that a child cannot be started from
@@ -385,6 +394,7 @@ pub fn builtin_specs() -> Vec<serde_json::Value> {
         git::status_spec(),
         git::commit_spec(),
         packages::composer_spec(),
+        ask::spec(),
         packages::bun_spec(),
         serde_json::json!({
             "name": "Bash",
@@ -527,12 +537,15 @@ mod tests {
             .build()
             .unwrap();
         let set = ToolSet::from_config(minimal_config()).unwrap();
+        // A bare asker: nothing in this test asks a question, and one can be built without a
+        // session — which is the reason `dispatch` takes the asker rather than the agent.
+        let asker = std::sync::Arc::new(ask::Asker::new());
         let gate = Gate::Open;
         let cwd = std::path::Path::new("/tmp");
 
         for withheld in ["Bash", "Edit", "Delegate", "ListAgents", "ReadFile"] {
             let err = runtime
-                .block_on(set.dispatch(withheld, &serde_json::json!({}), cwd, gate))
+                .block_on(set.dispatch(withheld, &serde_json::json!({}), cwd, gate, &asker))
                 .expect_err("a tool outside the set must not dispatch");
             assert_eq!(err, format!("unknown tool: {withheld}"), "wrong refusal for {withheld}");
         }
@@ -545,6 +558,7 @@ mod tests {
                 &serde_json::json!({"path": "/nonexistent-xyz", "depth": 1}),
                 cwd,
                 gate,
+                &asker,
             ))
             .expect_err("a missing path should still error");
         assert!(

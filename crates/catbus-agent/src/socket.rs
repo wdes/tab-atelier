@@ -119,25 +119,38 @@ async fn handle(stream: UnixStream, agent: Arc<Agent>) -> Result<(), SocketError
             }
         };
         match req {
-            Request::Prompt { text } => match agent.run_user_prompt(text).await {
-                Ok(reply) => {
-                    let turn = reply;
-                    write_line(
-                        &mut write_half,
-                        &Response::Done {
-                            text: turn.answer,
-                            // Carried beside the answer, never inside it: a client
-                            // that does not know this field sees exactly the reply
-                            // it saw before.
-                            reasoning: turn.reasoning,
-                        },
-                    )
-                    .await?;
+            Request::Prompt { text } => {
+                match run_watching_for_questions(&mut lines, &mut write_half, &agent, text).await {
+                    Ok(Some(turn)) => {
+                        write_line(
+                            &mut write_half,
+                            &Response::Done {
+                                text: turn.answer,
+                                // Carried beside the answer, never inside it: a client
+                                // that does not know this field sees exactly the reply
+                                // it saw before.
+                                reasoning: turn.reasoning,
+                            },
+                        )
+                        .await?;
+                    }
+                    // The client went away mid-turn: nothing to write to, so stop.
+                    Ok(None) => break,
+                    Err(e) => {
+                        write_line(&mut write_half, &Response::Error { message: e.to_string() }).await?;
+                    }
                 }
-                Err(e) => {
-                    write_line(&mut write_half, &Response::Error { message: e.to_string() }).await?;
-                }
-            },
+            }
+            // An answer with no turn running: the question is over, and saying so beats
+            // silence so the client knows its answer was not used.
+            Request::Answer { id, chosen } => {
+                let _ = agent.asker().answer(id, chosen);
+                write_line(
+                    &mut write_half,
+                    &Response::done("no question is open; the answer was not used"),
+                )
+                .await?;
+            }
             Request::SetPlanMode { on } => {
                 let gate = if on { tools::Gate::Plan } else { tools::Gate::Open };
                 agent.set_gate(gate).await;
@@ -179,6 +192,110 @@ async fn handle(stream: UnixStream, agent: Arc<Agent>) -> Result<(), SocketError
         }
     }
     Ok(())
+}
+
+/// Run a prompt, sending any question that arises while it runs.
+///
+/// A question can only appear *during* a turn — `AskUserQuestion` is a tool, so it is called
+/// from inside the loop — which means the connection is already busy running this prompt when
+/// the question needs to go out. So the two are raced: the prompt future, and a poll for a
+/// question to forward. Polling is the simple answer here and a poll is cheap; the alternative
+/// is a channel from the asker to this function, which would be more plumbing than a 100ms
+/// check of one `Mutex`.
+///
+/// Each question is sent once, tracked by its id: a question that stayed pending for minutes
+/// must not be re-sent every tick, and the id is what changes when a new one replaces it.
+async fn run_watching_for_questions(
+    lines: &mut tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
+    write_half: &mut tokio::net::unix::OwnedWriteHalf,
+    agent: &Arc<Agent>,
+    text: String,
+) -> Result<Option<crate::agent::Turn>, SocketError> {
+    /// How often to look for a question. Fast enough to feel immediate, slow enough to be free.
+    const POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+    let mut run = std::pin::pin!(agent.run_user_prompt(text));
+    let mut sent: Option<u64> = None;
+    loop {
+        tokio::select! {
+            result = &mut run => {
+                return Ok(Some(
+                    result.map_err(|e| SocketError::Io(std::io::Error::other(e.to_string())))?,
+                ));
+            }
+            // An answer arriving mid-turn. Reading it *here* is the part that is easy to get
+            // wrong, and was: with only the prompt and the poll raced, the question went out,
+            // the client answered, and the answer could never be read — because the request
+            // loop that reads it is the very call blocked awaiting this prompt. The symptom is
+            // a turn that hangs until the ask times out, with a question on the client's screen
+            // and an answer already sent.
+            line = lines.next_line() => {
+                let Some(line) = line? else {
+                    // The client hung up mid-turn. The turn is abandoned rather than left
+                    // running with nobody to hear its answer.
+                    return Ok(None);
+                };
+                if line.trim().is_empty() {
+                    continue;
+                }
+                match serde_json::from_str::<Request>(&line) {
+                    Ok(Request::Answer { id, chosen }) => {
+                        let said = if agent.asker().answer(id, chosen) {
+                            "answered"
+                        } else {
+                            "that question is no longer open; the answer was not used"
+                        };
+                        write_line(write_half, &Response::done(said)).await?;
+                    }
+                    Ok(other) => {
+                        write_line(
+                            write_half,
+                            &Response::Error {
+                                message: format!(
+                                    "a turn is already running, so `{}` cannot be handled yet — \
+                                     the only request that works mid-turn is `answer`.",
+                                    request_name(&other)
+                                ),
+                            },
+                        )
+                        .await?;
+                    }
+                    Err(e) => {
+                        write_line(
+                            write_half,
+                            &Response::Error {
+                                message: format!("malformed request: {e}"),
+                            },
+                        )
+                        .await?;
+                    }
+                }
+            }
+            () = tokio::time::sleep(POLL) => {
+                if let Some((id, questions)) = agent.asker().pending()
+                    && sent != Some(id)
+                {
+                    // A write failure here must not lose the turn: the question is dropped and
+                    // the ask times out, which it already handles.
+                    if write_line(write_half, &Response::Question { id, questions }).await.is_err() {
+                        log::warn!("could not send a question; the client will not see it");
+                    }
+                    sent = Some(id);
+                }
+            }
+        }
+    }
+}
+
+/// A request's name, for a message that says which one was refused.
+const fn request_name(req: &Request) -> &'static str {
+    match req {
+        Request::Prompt { .. } => "prompt",
+        Request::Answer { .. } => "answer",
+        Request::SetPlanMode { .. } => "set_plan_mode",
+        Request::SetGate { .. } => "set_gate",
+        Request::Clear => "clear",
+    }
 }
 
 async fn write_line(stream: &mut tokio::net::unix::OwnedWriteHalf, resp: &Response) -> Result<(), SocketError> {
@@ -227,6 +344,15 @@ enum Request {
     /// the reply names the transcript that was left behind so the client can
     /// show the user how to get it back.
     Clear,
+    /// Answer the question a [`Response::Question`] asked.
+    ///
+    /// The `id` is echoed from that response, so an answer arriving after its question has
+    /// expired — or after a second one replaced it — is ignored rather than delivered to the
+    /// wrong question. `chosen` is one list of labels per question, in the order asked.
+    Answer {
+        id: u64,
+        chosen: Vec<Vec<String>>,
+    },
 }
 
 #[derive(Serialize)]
@@ -247,6 +373,14 @@ enum Response {
     },
     Error {
         message: String,
+    },
+    /// A question from [`crate::tools::ask`], waiting for an [`Request::Answer`].
+    ///
+    /// Carries the `id` the answer must echo, so an answer that arrives after this question
+    /// has expired is ignored rather than delivered to the next one.
+    Question {
+        id: u64,
+        questions: Vec<crate::tools::ask::Question>,
     },
 }
 

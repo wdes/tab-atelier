@@ -567,6 +567,7 @@ mod tests {
         // someone makes here rather than a side effect of registering a spec.
         // Spawn is the most recent addition (FileTree before it).
         let mut expected = vec![
+            "AskUserQuestion",
             "Bash",
             "Bun",
             "Composer",
