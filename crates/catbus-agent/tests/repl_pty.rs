@@ -390,13 +390,21 @@ fn spawn_delayed_relay(body: &'static str, delay: Duration) -> u16 {
 
 /// The transcript as the test sees it, with colour escapes removed.
 ///
-/// Needed because the spinner and the totals line both carry SGR, and a literal
-/// search for `12,345 in` would otherwise have to interleave escape codes that
-/// the test does not care about.
+/// Needed for two reasons. The spinner and the totals line both carry SGR, and a
+/// literal search for `12,345 in` would otherwise have to interleave escape codes the
+/// test does not care about. And ratatui repaints a line by returning to its start, so
+/// a capture holds the old frame and the new one with a carriage return between them —
+/// which turns `the bytes we sent` into `the lines a reader sees`, and is what a table
+/// needs before its columns can be compared.
 fn strip_ansi(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
     while let Some(ch) = chars.next() {
+        // A paint that overwrites begins with CR; on screen nothing of the old frame
+        // remains, so it is not part of the text.
+        if ch == '\r' {
+            continue;
+        }
         if ch != '\u{1b}' {
             out.push(ch);
             continue;
@@ -511,4 +519,98 @@ fn the_spinner_repaints_rather_than_appending() {
         !before.ends_with('\n') && !before.ends_with("\r\n"),
         "the label must not be written on a line of its own: {before:?}"
     );
+}
+
+/// A canned reply whose text is markdown with a table in it.
+///
+/// The width is not arbitrary: the pty is 80 columns, and the instruction tells the
+/// model to keep a table narrow enough to read in 80 — so this is the shape the
+/// requirement is about, not a convenient one.
+const REPLY_WITH_TABLE: &str = r###"{
+    "id": "msg_table",
+    "type": "message",
+    "role": "assistant",
+    "model": "claude-sonnet-4-6",
+    "content": [{ "type": "text", "text": "## Results\n\n| Name | Count | Note |\n|------|-------|------|\n| alpha | 1 | first |\n| beta | 22 | second, longer |\n| gamma | 333 | third |\n\nDone." }],
+    "stop_reason": "end_turn",
+    "usage": { "input_tokens": 10, "output_tokens": 10 }
+}"###;
+
+/// A table the model wrote reaches the screen as copy-pasteable markdown.
+///
+/// The integration half of the renderer's unit tests, and it asserts a different
+/// thing on purpose. **Alignment cannot be checked here**: what a pty capture holds is
+/// ratatui's *diff stream*, not a screen. ratatui writes only the cells that changed,
+/// so a space that was already a space is never re-sent — the capture reads
+/// `makemeatable` for `make me a table` — and a repaint interleaves old and new frames
+/// with carriage returns. Comparing columns in that stream measures the encoder, not
+/// the screen. Column alignment is therefore asserted in `tui::markdown`'s unit tests,
+/// where the rendered lines are values rather than bytes.
+///
+/// What a stream *can* prove, and what this pins: the reply goes through the renderer
+/// in the real binary (the heading marks are gone), the table's rows and values reach
+/// the screen, and what is emitted is pipes rather than box-drawing — which is exactly
+/// the copy-paste property, since box-drawing characters would render just as well and
+/// paste as mojibake.
+#[test]
+fn a_markdown_table_reaches_the_screen_as_pastes_back_markdown() {
+    let port = spawn_delayed_relay(REPLY_WITH_TABLE, Duration::from_millis(0));
+    let (ok, seen) = type_and_expect_at(port, &[], "make me a table", "Done.");
+    assert!(ok, "the reply should have reached the screen:\n{seen}");
+
+    let plain = strip_ansi(&seen);
+
+    // The renderer ran: the heading's marks are gone and its text is present.
+    assert!(plain.contains("Results"), "the heading text should be shown:\n{plain}");
+    assert!(
+        !plain.contains("##"),
+        "the heading marks should be consumed by the renderer, not printed:\n{plain}"
+    );
+
+    // The table arrived as pipes, and with its values, so a reader can select it.
+    let pipes = plain.matches('|').count();
+    assert!(
+        pipes >= 8,
+        "the table should be on screen as pipes, found {pipes}:\n{plain}"
+    );
+    for value in ["Name", "Count", "Note", "alpha", "beta", "gamma", "333"] {
+        assert!(plain.contains(value), "{value:?} is missing from:\n{plain}");
+    }
+
+    // And *not* as box-drawing, which is the copy-paste half of the requirement:
+    // those characters render beautifully and paste as mojibake, so seeing none is
+    // what makes the block safe to select and reuse.
+    for glyph in [
+        '\u{250c}', '\u{2500}', '\u{252c}', '\u{2510}', '\u{2502}', '\u{2514}', '\u{2534}', '\u{2518}',
+    ] {
+        assert!(
+            !plain.contains(glyph),
+            "box-drawing {glyph:?} would not survive a paste:\n{plain}"
+        );
+    }
+
+    // The prose on both sides of the table is printed too.
+    assert!(plain.contains("Done."), "the text after the table:\n{plain}");
+}
+
+/// The colour flags still change what the *renderer* does, which is all they do now.
+///
+/// `--ansi` used to pick a prompt variant and decide whether a reply was filtered;
+/// both are gone. What is left is whether the REPL styles its rendering, and that is
+/// invisible to a client reading the socket — so the visible difference is only in a
+/// terminal, which is what this checks.
+#[test]
+fn no_colour_prints_the_markdown_unrendered() {
+    let port = spawn_delayed_relay(REPLY_WITH_TABLE, Duration::from_millis(0));
+    let (ok, seen) = type_and_expect_at(port, &[("NO_COLOR", "1")], "make me a table", "Done.");
+    assert!(ok, "the reply should have reached the screen:\n{seen}");
+    let plain = strip_ansi(&seen);
+    // The text is all there — nothing is lost to the colour opt-out — but the marks
+    // are shown rather than rendered, because that is what "no colour, no styling"
+    // means. The same characters reach the socket either way.
+    assert!(
+        plain.contains("## Results"),
+        "with no colour the markdown is shown as written:\n{plain}"
+    );
+    assert!(plain.contains("Done."), "{plain}");
 }
