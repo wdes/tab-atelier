@@ -54,6 +54,31 @@ permission list with a typo in it should say so.
 A file whose body is blank but whose front matter names tools still limits them; that is how
 you say "no identity, but only these tools".
 
+### Limiting which hosts SSH may reach
+
+`AllowedHosts` does the same job for the `SSH` tool — where it may connect, rather than what may
+be used:
+
+    ---
+    AllowedTools: Read, FileTree, SSH
+    AllowedHosts: dc1.servers.example.org, *.staging.example.org
+    ---
+    You are Tabby, a PHP and VueJS master.
+
+An entry is either an exact host or a leading `*.` for a domain and its subdomains. `*.example.com`
+matches `api.example.com` and not `example.com` itself, deliberately: a wildcard that also covered
+the bare domain would be wider than it reads.
+
+Leaving `AllowedHosts` out means no opinion — every host the session can reach is reachable.
+Writing it with no names at all (`AllowedHosts:`) means the opposite: no host is allowed.
+
+The check happens before anything runs, so a host that is not listed never reaches a connection
+attempt. It is the operator's limit rather than a suggestion, and the refusal says so and names the
+list, so an agent reports it rather than trying to work around it.
+
+A port is not part of the policy. `AllowedHosts` is about where, so `dc1.servers.example.org` also
+permits `dc1.servers.example.org:2222`.
+
 The rendering instructions are appended after your text and are not yours to replace: they
 describe the terminal, not the model, and a model told to write markdown into a terminal
 that renders it needs to know that whoever it thinks it is.

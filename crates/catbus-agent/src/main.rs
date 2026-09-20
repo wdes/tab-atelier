@@ -437,7 +437,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let agent = Arc::new(
         agent::Agent::new(provider, session)
             .with_judge(judge_model, monitor_prompt)
-            .with_tools(tool_set)
+            // The identity file's `AllowedHosts`, enforced by the SSH tool itself: the tool needs it
+            // mid-call, and the dispatcher is where a tool is reached.
+            .with_tools(tool_set.with_allowed_hosts(identity.allowed_hosts()))
             .with_ansi(ansi)
             .with_identity(identity),
     );

@@ -20,6 +20,7 @@ mod packages;
 mod phpunit;
 mod read;
 mod spawn;
+mod ssh;
 mod tasks;
 mod write;
 
@@ -111,6 +112,7 @@ impl Gate {
                 "PHPUnit" => "Plan-mode is on. Describe what the tests should check instead of running them.",
                 "GitCommit" => "Plan-mode is on. Say what you would commit instead of committing it.",
                 "Composer" | "Bun" => "Plan-mode is on. Describe the commands you would run instead of running them.",
+                "SSH" => "Plan-mode is on. Describe what you would run on the host instead of running it.",
                 _ => "Plan-mode is on. Describe the command instead of running it.",
             }),
             Self::Open | Self::Auto => None,
@@ -172,6 +174,9 @@ pub fn parse_gate(name: &str) -> Option<Gate> {
 /// own exception, and the reason auto mode is usable at all: an agent that had
 /// to pass a safety check to read a file would be slower than plan-mode.
 ///
+/// `SSH` is judged because it runs a command on another machine, which is a change wherever it
+/// lands — and refused in plan-mode for the same reason `Bash` is.
+///
 /// `Delegate` is not judged here because the child inherits this gate and
 /// judges its own actions. Judging the spawn as well would charge twice for one
 /// decision and block on the parent's guess about work the child will actually
@@ -182,7 +187,7 @@ pub fn parse_gate(name: &str) -> Option<Gate> {
 pub fn changes_the_world(name: &str) -> bool {
     matches!(
         name,
-        "Write" | "Edit" | "Bash" | "PHPUnit" | "GitCommit" | "Composer" | "Bun"
+        "Write" | "Edit" | "Bash" | "PHPUnit" | "GitCommit" | "Composer" | "Bun" | "SSH"
     )
 }
 
@@ -290,6 +295,16 @@ impl ToolSet {
                 }
                 packages::bun(input, cwd).await
             }
+            // Runs a command on another machine, so it is judged in auto mode and refused in plan
+            // mode — the same treatment as the shell. Its own inputs are only a host and the
+            // agent-forwarding flag; an identity file may additionally restrict which hosts are
+            // reachable at all. See `ssh`'s module doc for what the flags exclude and why.
+            "SSH" => {
+                if let Some(why) = gate.refusal("SSH") {
+                    return Err(why.to_string());
+                }
+                ssh::run_allowed(input, cwd, self.allowed_hosts()).await
+            }
             // Read-only, so never judged and never refused.
             "GitStatus" => git::status(input, cwd).await,
             // Refused in plan-mode and judged in auto mode: it writes to the repository.
@@ -393,6 +408,7 @@ pub fn builtin_specs() -> Vec<serde_json::Value> {
         phpunit::spec(),
         git::status_spec(),
         git::commit_spec(),
+        ssh::spec(),
         packages::composer_spec(),
         ask::spec(),
         packages::bun_spec(),

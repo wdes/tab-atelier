@@ -39,13 +39,18 @@ pub enum Identity {
         text: String,
         /// Tool names the prompt file permits, if it said.
         allowed_tools: Option<Vec<String>>,
+        /// Hosts the `SSH` tool may reach, if it said.
+        allowed_hosts: Option<Vec<String>>,
     },
     /// Send no identity block at all.
     ///
     /// Carries tool limits all the same: a file whose body is blank but whose
     /// front matter names `AllowedTools` is still a statement about tools, and
     /// dropping it here would ignore a limit the operator wrote.
-    Omitted { allowed_tools: Option<Vec<String>> },
+    Omitted {
+        allowed_tools: Option<Vec<String>>,
+        allowed_hosts: Option<Vec<String>>,
+    },
 }
 
 impl Identity {
@@ -58,7 +63,21 @@ impl Identity {
     pub fn allowed_tools(&self) -> Option<&[String]> {
         match self {
             Self::Auto => None,
-            Self::Text { allowed_tools, .. } | Self::Omitted { allowed_tools } => allowed_tools.as_deref(),
+            Self::Text { allowed_tools, .. } | Self::Omitted { allowed_tools, .. } => allowed_tools.as_deref(),
+        }
+    }
+
+    /// The hosts the operator's file limits SSH to, if it said.
+    ///
+    /// Its own accessor rather than one limit-typed value, because the two restrict different things
+    /// and a file may state either alone: `AllowedTools` says which tools exist, `AllowedHosts` says
+    /// where SSH may go. `None` is no opinion, not "nothing allowed" — see
+    /// [`crate::tools::ToolSet::allowed_hosts`].
+    #[must_use]
+    pub fn allowed_hosts(&self) -> Option<&[String]> {
+        match self {
+            Self::Auto => None,
+            Self::Text { allowed_hosts, .. } | Self::Omitted { allowed_hosts, .. } => allowed_hosts.as_deref(),
         }
     }
 }
@@ -121,21 +140,26 @@ fn load_at(inline: Option<&str>, file: Option<&Path>, default: &Path) -> Result<
         return Ok(Identity::Text {
             text: text.to_owned(),
             allowed_tools: None,
+            allowed_hosts: None,
         });
     }
 
     if let Some(path) = file {
         let raw =
             std::fs::read_to_string(path).map_err(|e| format!("cannot read identity file {}: {e}", path.display()))?;
-        let (text, allowed_tools) = parse_prompt(&raw).map_err(|e| format!("identity file {}: {e}", path.display()))?;
-        if text.trim().is_empty() {
+        let parsed = parse_prompt(&raw).map_err(|e| format!("identity file {}: {e}", path.display()))?;
+        if parsed.body.trim().is_empty() {
             return Err(format!(
                 "identity file {} has no prompt — remove it, or put the prompt after the front \
                  matter",
                 path.display()
             ));
         }
-        return Ok(Identity::Text { text, allowed_tools });
+        return Ok(Identity::Text {
+            text: parsed.body,
+            allowed_tools: parsed.allowed_tools,
+            allowed_hosts: parsed.allowed_hosts,
+        });
     }
 
     let default = default.to_path_buf();
@@ -147,13 +171,45 @@ fn load_at(inline: Option<&str>, file: Option<&Path>, default: &Path) -> Result<
         // hide a permissions problem behind "the agent ignores my prompt".
         Err(e) => return Err(format!("cannot read identity file {}: {e}", default.display())),
     };
-    let (text, allowed_tools) = parse_prompt(&raw).map_err(|e| format!("identity file {}: {e}", default.display()))?;
-    if text.trim().is_empty() {
-        // A blank body is how the operator says "send no identity" — but the front
-        // matter was still written, so its tool list travels with it.
-        return Ok(Identity::Omitted { allowed_tools });
+    let parsed = parse_prompt(&raw).map_err(|e| format!("identity file {}: {e}", default.display()))?;
+    if parsed.body.trim().is_empty() {
+        // A blank body is how the operator says "send no identity" — but the front matter was still
+        // written, so the limits it declares travel with it. A file that says only
+        // `AllowedHosts: …` is a statement about hosts, and a document that also silences the
+        // identity.
+        return Ok(Identity::Omitted {
+            allowed_tools: parsed.allowed_tools,
+            allowed_hosts: parsed.allowed_hosts,
+        });
     }
-    Ok(Identity::Text { text, allowed_tools })
+    Ok(Identity::Text {
+        text: parsed.body,
+        allowed_tools: parsed.allowed_tools,
+        allowed_hosts: parsed.allowed_hosts,
+    })
+}
+
+/// What a prompt file states: the prompt, and the limits its front matter declares.
+///
+/// Two separate lists rather than one, because they limit different things — which tools, and which
+/// hosts — and a file that means to restrict one should not silently have to state the other.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Parsed {
+    pub body: String,
+    /// `AllowedTools`: which tools the file's author is willing to have.
+    pub allowed_tools: Option<Vec<String>>,
+    /// `AllowedHosts`: which hosts the `SSH` tool may connect to.
+    pub allowed_hosts: Option<Vec<String>>,
+}
+
+/// A comma-separated list from a header, trimmed and without empties.
+fn split_list(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
 }
 
 /// Split optional front matter from the prompt body.
@@ -162,16 +218,24 @@ fn load_at(inline: Option<&str>, file: Option<&Path>, default: &Path) -> Result<
 /// to the next line that is exactly `---`. That closing line is required: without
 /// it the whole file is a header, which is almost certainly not what was meant, so
 /// it is an error rather than a prompt that silently begins with dashes.
-pub fn parse_prompt(raw: &str) -> Result<(String, Option<Vec<String>>), String> {
+pub fn parse_prompt(raw: &str) -> Result<Parsed, String> {
     let mut lines = raw.lines();
     let first = lines.next().unwrap_or_default();
     if first.trim_end_matches('\r') != "---" {
         // No front matter: the whole input is the prompt, preserved as written
         // apart from a leading blank line.
-        return Ok((raw.trim_start_matches('\n').to_owned(), None));
+        return Ok(Parsed {
+            body: raw.trim_start_matches('\n').to_owned(),
+            allowed_tools: None,
+            allowed_hosts: None,
+        });
     }
 
     let mut allowed_tools: Option<Vec<String>> = None;
+    // The hosts the `SSH` tool may reach. A limit on where, where `AllowedTools` is a limit on what —
+    // and the more useful of the two for the tool that runs commands on other machines: a tool list
+    // says ssh may be used, this says where.
+    let mut allowed_hosts: Option<Vec<String>> = None;
     let mut closed = false;
     let mut body_start = 0;
     for (index, line) in lines.by_ref().enumerate() {
@@ -189,14 +253,10 @@ pub fn parse_prompt(raw: &str) -> Result<(String, Option<Vec<String>>), String> 
             continue;
         };
         if key.trim().eq_ignore_ascii_case("AllowedTools") {
-            allowed_tools = Some(
-                value
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|name| !name.is_empty())
-                    .map(ToOwned::to_owned)
-                    .collect::<Vec<_>>(),
-            );
+            allowed_tools = Some(split_list(value));
+        }
+        if key.trim().eq_ignore_ascii_case("AllowedHosts") {
+            allowed_hosts = Some(split_list(value));
         }
     }
     if !closed {
@@ -212,7 +272,11 @@ pub fn parse_prompt(raw: &str) -> Result<(String, Option<Vec<String>>), String> 
         .join("\n")
         .trim_start_matches('\n')
         .to_owned();
-    Ok((body, allowed_tools))
+    Ok(Parsed {
+        body,
+        allowed_tools,
+        allowed_hosts,
+    })
 }
 
 /// Whether a model name identifies an Anthropic model.
@@ -236,21 +300,31 @@ mod tests {
 
     #[test]
     fn a_file_without_front_matter_is_all_prompt() {
-        let (text, tools) = parse_prompt("You are a parrot.").unwrap();
+        let Parsed {
+            body: text,
+            allowed_tools: tools,
+            ..
+        } = parse_prompt("You are a parrot.").unwrap();
         assert_eq!(text, "You are a parrot.");
         assert_eq!(tools, None);
     }
 
     #[test]
     fn front_matter_yields_the_prompt_after_it() {
-        let (text, tools) = parse_prompt("---\nAllowedTools: Write, Read\n---\nYou are a parrot.\n").unwrap();
+        let Parsed {
+            body: text,
+            allowed_tools: tools,
+            ..
+        } = parse_prompt("---\nAllowedTools: Write, Read\n---\nYou are a parrot.\n").unwrap();
         assert_eq!(tools.as_deref(), Some(&["Write".to_string(), "Read".to_string()][..]));
         assert_eq!(text, "You are a parrot.");
     }
 
     #[test]
     fn allowed_tools_tolerates_odd_spacing_and_trailing_commas() {
-        let (_, tools) = parse_prompt("---\nAllowedTools:  Write ,Read , , Edit ,\n---\nhi\n").unwrap();
+        let Parsed {
+            allowed_tools: tools, ..
+        } = parse_prompt("---\nAllowedTools:  Write ,Read , , Edit ,\n---\nhi\n").unwrap();
         assert_eq!(
             tools.as_deref(),
             Some(&["Write".to_string(), "Read".to_string(), "Edit".to_string()][..])
@@ -259,7 +333,11 @@ mod tests {
 
     #[test]
     fn an_empty_allowed_tools_line_means_none_named() {
-        let (text, tools) = parse_prompt("---\nAllowedTools:\n---\nhi\n").unwrap();
+        let Parsed {
+            body: text,
+            allowed_tools: tools,
+            ..
+        } = parse_prompt("---\nAllowedTools:\n---\nhi\n").unwrap();
         assert_eq!(tools, Some(Vec::new()));
         assert_eq!(text, "hi");
     }
@@ -269,12 +347,16 @@ mod tests {
     /// one does not know.
     #[test]
     fn an_unknown_header_key_is_ignored() {
-        let (text, tools) = parse_prompt("---\nAuthor: williamdes\nAllowedTools: Read\n---\nhi\n").unwrap();
+        let Parsed {
+            body: text,
+            allowed_tools: tools,
+            ..
+        } = parse_prompt("---\nAuthor: williamdes\nAllowedTools: Read\n---\nhi\n").unwrap();
         assert_eq!(text, "hi");
         assert_eq!(tools.as_deref(), Some(&["Read".to_string()][..]));
 
         // A stray line with no colon at all, too.
-        let (text, _) = parse_prompt("---\nnot a header line\n---\nhi\n").unwrap();
+        let Parsed { body: text, .. } = parse_prompt("---\nnot a header line\n---\nhi\n").unwrap();
         assert_eq!(text, "hi");
     }
 
@@ -290,7 +372,8 @@ mod tests {
     /// part of the prompt, which matters because markdown uses them as rules.
     #[test]
     fn a_delimiter_in_the_body_is_not_a_delimiter() {
-        let (text, _) = parse_prompt("---\nAllowedTools: Read\n---\npara one\n---\npara two\n").unwrap();
+        let Parsed { body: text, .. } =
+            parse_prompt("---\nAllowedTools: Read\n---\npara one\n---\npara two\n").unwrap();
         assert_eq!(text, "para one\n---\npara two");
     }
 
@@ -298,7 +381,11 @@ mod tests {
     /// `load` that decides a blank prompt is "send nothing".
     #[test]
     fn front_matter_with_no_body_gives_an_empty_prompt() {
-        let (text, tools) = parse_prompt("---\nAllowedTools: Read\n---\n").unwrap();
+        let Parsed {
+            body: text,
+            allowed_tools: tools,
+            ..
+        } = parse_prompt("---\nAllowedTools: Read\n---\n").unwrap();
         assert_eq!(text, "");
         assert_eq!(tools.as_deref(), Some(&["Read".to_string()][..]));
     }
@@ -307,7 +394,7 @@ mod tests {
     fn the_body_keeps_its_own_formatting() {
         // Only leading blank lines are dropped; indentation and inner spacing are
         // the author's.
-        let (text, _) = parse_prompt("---\n---\n\n  indented\n\ttabbed\nlast").unwrap();
+        let Parsed { body: text, .. } = parse_prompt("---\n---\n\n  indented\n\ttabbed\nlast").unwrap();
         assert_eq!(text, "  indented\n\ttabbed\nlast");
     }
 
@@ -340,7 +427,8 @@ mod tests {
             identity,
             Identity::Text {
                 text: "from the flag".into(),
-                allowed_tools: None
+                allowed_tools: None,
+                allowed_hosts: None,
             }
         );
     }
@@ -376,7 +464,8 @@ mod tests {
             identity,
             Identity::Text {
                 text: "You are a parrot.".into(),
-                allowed_tools: Some(vec!["Write".into(), "Read".into()])
+                allowed_tools: Some(vec!["Write".into(), "Read".into()]),
+                allowed_hosts: None,
             }
         );
     }
@@ -399,7 +488,10 @@ mod tests {
         std::fs::write(&target, "   \n").unwrap();
         assert_eq!(
             load_at(None, None, &target).unwrap(),
-            Identity::Omitted { allowed_tools: None }
+            Identity::Omitted {
+                allowed_tools: None,
+                allowed_hosts: None,
+            }
         );
 
         // Front matter with no body is blank too, so it means "no identity" —
@@ -409,7 +501,8 @@ mod tests {
         assert_eq!(
             load_at(None, None, &target).unwrap(),
             Identity::Omitted {
-                allowed_tools: Some(vec!["Read".into()])
+                allowed_tools: Some(vec!["Read".into()]),
+                allowed_hosts: None,
             }
         );
 
@@ -419,7 +512,8 @@ mod tests {
             load_at(None, None, &target).unwrap(),
             Identity::Text {
                 text: "You are a parrot.".into(),
-                allowed_tools: None
+                allowed_tools: None,
+                allowed_hosts: None,
             }
         );
 

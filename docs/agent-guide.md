@@ -78,19 +78,43 @@ pins it for a launch.
 | `PHPUnit` | Run this project's PHPUnit and get structured results: counts, and one entry per failure with its test, `file:line`, message and diff already separated. |
 | `Composer` | `install`, `update`, or `run` a script from composer.json. `scripts` lists what the project defines, with the author's descriptions where there are any. Always non-interactive. |
 | `Bun` | `run` a script from package.json, `install`, or `scripts` to list them. |
-
-Ask for `scripts` when you want to know what a project can run — it reads the manifest
-directly, so it answers even where the package manager is not installed. A `run` with a name
-the project does not define is refused with the real names, rather than being passed through
-to the package manager, whose error would say only what it could not find.
 | `GitStatus` | What is uncommitted: branch, ahead/behind, and the staged, unstaged, untracked and conflicted paths. Read-only. |
 | `GitCommit` | Commit a named set of files. It stages nothing you did not name; commits by path, so anything else already staged stays staged. |
 | `ListAgents` | Other agents running on this machine. |
 | `Delegate` | Ask one of them something, and wait. |
 | `Spawn` | Start a new agent for one task, take its reply, and stop it. |
+| `SSH` | Run one non-interactive command on a host (`command`), or report a host's public keys (`keyscan`). Only a host and whether to forward the agent can be set — see below. |
 | `AskUserQuestion` | Ask you to choose, when a decision is yours. |
 
-`PHPUnit`, `Composer`, `Bun`, `GitCommit` and `Spawn` all run project code, so `auto` judges
+Ask a package tool for `scripts` when you want to know what a project can run — it reads the
+manifest directly, so it answers even where the package manager is not installed. A `run` with a
+name the project does not define is refused with the real names, rather than being passed through to
+the package manager, whose error would say only what it could not find.
+
+### What SSH may do
+
+`SSH` is two actions and both take almost nothing:
+
+    SSH { action: command, host: dc1.servers.example.org, command: "uptime" }
+    SSH { action: keyscan, host: dc1.servers.example.org }
+
+Only `host` — a name, an address, or either with a port — and `forward_agent` may be set. There is no
+user, no extra ssh option, no key selection, no jump host and no tunnel, so none of those is
+reachable through it. The login is whatever your own ssh config says.
+
+`command` runs one non-interactive command and returns its output. It cannot prompt: ssh runs with
+no terminal and in batch mode, so a command that needs a password or an answer fails instead of
+hanging.
+
+`keyscan` reports the host's public keys. It trusts nothing on its own — pass `trust: true` to add
+them to `~/.ssh/known_hosts`, and note that they are whatever answered at that address, so compare
+the fingerprints before relying on them. A host that is not in `known_hosts` gets a refusal that
+points at `keyscan`, so running a command never trusts a host as a side effect.
+
+`forward_agent` forwards your SSH agent for that connection, which means a command on the host can
+use your keys. Off unless asked; that is the whole point of the flag and the whole risk of it.
+
+`PHPUnit`, `Composer`, `Bun`, `GitCommit`, `SSH` and `Spawn` all run project code, so `auto` judges
 them and `plan` refuses them. `Read`, `FileTree`, `GitStatus` and `ListAgents` change
 nothing and are never judged. `Tasks` writes only to the agent's own state directory, so it
 is allowed even in plan mode — a plan is what plan mode is for.
