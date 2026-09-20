@@ -30,7 +30,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ratatui::crossterm::event::{
-    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind, KeyModifiers,
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
 };
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{Clear, ClearType, disable_raw_mode, enable_raw_mode};
@@ -48,6 +48,15 @@ use crate::tui::spinner::Spinner;
 /// How often the viewport is repainted while idle. Fast enough that a keypress
 /// feels immediate, slow enough to cost nothing.
 const TICK: Duration = Duration::from_millis(60);
+
+/// How many prompts may wait while a turn runs.
+///
+/// A cap rather than unbounded, because the queue is invisible except for its count:
+/// someone who queues twenty has lost track of what is coming, and the requests cost
+/// money. Five is enough for "here are the next few things" and small enough to keep
+/// track of. A prompt over the cap is refused with a message, never dropped silently —
+/// and it is in the editor's history either way.
+const QUEUE_LIMIT: usize = 5;
 
 /// How many earlier exchanges the banner shows when a session is resumed.
 ///
@@ -222,13 +231,13 @@ impl Ui {
 
     /// Reserve `height` rows above the viewport and let `paint` fill them.
     ///
-    /// Both printers go through here, so the borrow of the retained buffer lives in
-    /// one place and a caller cannot capture something that outlives the closure.
+    /// Both printers go through here, so the borrow of the retained buffer lives in one
+    /// place and a caller cannot capture something that outlives the closure.
     fn insert(&mut self, height: u16, paint: impl Fn(&mut ratatui::buffer::Buffer)) -> std::io::Result<()> {
         self.terminal.insert_before(height, paint)
     }
 
-    /// Repaint the viewport: the prompt and the line, and a status row when busy.
+    /// Repaint the viewport: the prompt and the line, and a status row under them.
     pub fn draw(&mut self, prompt: &str, editor: &Editor, status: Option<&str>) -> std::io::Result<()> {
         let prompt = prompt.to_owned();
         let line = editor.line();
@@ -256,8 +265,8 @@ impl Ui {
                 Paragraph::new(status_line),
                 Rect::new(area.left(), input_y.saturating_add(1), area.width, 1),
             );
-            // Put the terminal's cursor where the editor says it is, so typing
-            // appears where the operator expects it.
+            // Put the terminal's cursor where the editor says it is, so typing appears
+            // where the operator expects it.
             let column = area
                 .left()
                 .saturating_add(prompt_width)
@@ -268,332 +277,6 @@ impl Ui {
     }
 }
 
-/// Read key events on a thread of its own and forward them.
-///
-/// A plain `event::read()` blocks, and it has to be able to sit and wait: a
-/// blocking read inside the async loop would stop the loop from servicing the turn
-/// in flight, and `spawn_blocking` per read would add a task per keystroke for no
-/// benefit.
-fn spawn_reader() -> tokio::sync::mpsc::Receiver<Event> {
-    let (tx, rx) = tokio::sync::mpsc::channel(64);
-    std::thread::spawn(move || {
-        loop {
-            // Short poll so the thread notices a closed channel promptly instead of
-            // waiting out a long read after the app has gone.
-            match event::poll(Duration::from_millis(120)) {
-                Ok(true) => match event::read() {
-                    Ok(ev) => {
-                        if tx.blocking_send(ev).is_err() {
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        log::warn!("terminal read failed, so keys stop arriving: {e}");
-                        break;
-                    }
-                },
-                Ok(false) => {
-                    if tx.is_closed() {
-                        break;
-                    }
-                }
-                Err(e) => {
-                    log::warn!("terminal poll failed, so keys stop arriving: {e}");
-                    break;
-                }
-            }
-        }
-    });
-    rx
-}
-
-/// The largest index at or below `limit` that is a character boundary.
-///
-/// `str::floor_char_boundary` is not stable, and slicing a `String` at a byte index
-/// that lands inside a character panics — so a bound that is only a guard still has to
-/// respect them.
-fn char_boundary(text: &str, limit: usize) -> usize {
-    (0..=limit.min(text.len()))
-        .rev()
-        .find(|i| text.is_char_boundary(*i))
-        .unwrap_or(0)
-}
-
-/// What a slash command asked the loop to do.
-enum Outcome {
-    /// Print this above the viewport and keep going.
-    Print(String),
-    /// Wipe the screen and scrollback, print this, reprint the banner, keep going.
-    ///
-    /// Its own variant rather than `Print("")`, because the wipe has to happen *before*
-    /// the message and the banner — and because a session that merely printed a blank
-    /// line would leave the old session's output in the scrollback, which is the one
-    /// thing this is for.
-    Cleared(String),
-    /// Leave the REPL.
-    Exit,
-}
-
-/// Run one slash command.
-///
-/// Every arm builds a string rather than writing to the terminal, because output
-/// now goes through the viewport — and because a function that returns its text is
-/// testable, where one that prints is not.
-async fn run_slash(agent: &Agent, cwd: &Path, command: &slash::SlashCommand, argument: &str) -> Outcome {
-    match command.action {
-        slash::Action::Help => Outcome::Print(slash::help_text()),
-        slash::Action::Exit => Outcome::Exit,
-        slash::Action::Model => {
-            if argument.is_empty() {
-                Outcome::Print(format!("model = {}", agent.model()))
-            } else {
-                match agent.set_model(argument).await {
-                    Ok(()) => Outcome::Print(format!("model = {}\n(in use from the next request)", argument.trim())),
-                    Err(e) => Outcome::Print(format!("error: {e}")),
-                }
-            }
-        }
-        slash::Action::Gate => {
-            if let Some(gate) = crate::gate_command(command.name) {
-                agent.set_gate(gate).await;
-                Outcome::Print(format!("gate = {}", gate.as_str()))
-            } else {
-                Outcome::Print(format!("no mode named {}", command.name))
-            }
-        }
-        slash::Action::Clear => match agent.clear().await {
-            Ok(previous) => {
-                // The message is printed *after* the wipe, so it survives it. The old
-                // session's id is the one thing worth keeping on screen, because it is
-                // how the operator gets back. See the `Cleared` arm in the loop.
-                let short = previous.id.get(..8).unwrap_or(&previous.id).to_owned();
-                Outcome::Cleared(format!(
-                    "started a fresh session; the previous one ({}, {short}) is still on disk — \
-                     /resume {} to return to it",
-                    previous.name, previous.id
-                ))
-            }
-            Err(e) => Outcome::Print(format!("error: could not clear: {e}")),
-        },
-        slash::Action::Rename => {
-            if argument.is_empty() {
-                Outcome::Print("usage: /rename <name>".to_owned())
-            } else {
-                match agent.rename_session(argument).await {
-                    Ok(()) => Outcome::Print(format!("session renamed to {argument}")),
-                    Err(e) => Outcome::Print(format!("error: {e}")),
-                }
-            }
-        }
-        slash::Action::Resume => {
-            if argument.is_empty() {
-                let entries = crate::session::list_sessions(cwd);
-                if entries.is_empty() {
-                    Outcome::Print("no previous sessions in this directory".to_owned())
-                } else {
-                    let mut out = String::from("previous sessions in this directory:");
-                    for (id, name, when) in entries {
-                        let label = if name.is_empty() {
-                            id
-                        } else {
-                            format!("{}  {id}", name.trim())
-                        };
-                        let _ = write!(out, "\n  {label}  ({})", ago_label(when));
-                    }
-                    Outcome::Print(out)
-                }
-            } else {
-                match crate::session::open(cwd, Some(argument), false) {
-                    Ok(new_session) => {
-                        let id = new_session.id.clone();
-                        let name = new_session.session_name();
-                        match agent.swap_session(new_session).await {
-                            Ok(()) => {
-                                let label = if name.is_empty() { id } else { format!("{name}  {id}") };
-                                Outcome::Print(format!("switched to session {label}"))
-                            }
-                            Err(e) => Outcome::Print(format!("error: {e}")),
-                        }
-                    }
-                    Err(e) => Outcome::Print(format!("error: {e}")),
-                }
-            }
-        }
-    }
-}
-
-/// The REPL.
-///
-/// Never returns an error for something the operator did — a failed turn is printed
-/// and the loop continues, because losing the session over one bad request would be
-/// worse than the failure. Errors are reserved for the terminal itself.
-pub async fn run(agent: Arc<Agent>, cwd: &Path) -> std::io::Result<()> {
-    let mut ui = Ui::enter()?;
-    // Every exit path has to restore the terminal, including a panic, or the shell
-    // is left in raw mode with no echo.
-    let outcome = run_inner(&mut ui, agent, cwd).await;
-    let _ = ui.leave();
-    outcome
-}
-
-async fn run_inner(ui: &mut Ui, agent: Arc<Agent>, cwd: &Path) -> std::io::Result<()> {
-    // The banner, once, before the first prompt: what version is running, which
-    // session, which mode. It goes above the viewport into scrollback, so it stays
-    // readable rather than being repainted. Its own writes are not part of the loop.
-    print_banner(ui, &agent).await?;
-
-    let mut editor = Editor::new();
-    let mut events = spawn_reader();
-    let mut tick = tokio::time::interval(TICK);
-    // `MissedTickBehavior::Delay` keeps a slow frame from queuing a burst of
-    // catch-up ticks, which would make the spinner jump after a stall.
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
-    // The turn in flight, if any, and the spinner that describes it.
-    let mut turn: Option<tokio::task::JoinHandle<Result<crate::agent::Turn, crate::agent::AgentError>>> = None;
-    let mut spinner: Option<Spinner> = None;
-
-    loop {
-        let status = turn.as_ref().map(|_| {
-            let spinner = spinner.get_or_insert_with(Spinner::new);
-            // The agent reports `thinking` while it waits on the model and a tool
-            // name while it runs one; `activity_label` presents the former and
-            // passes the latter through.
-            let activity = crate::statusline::activity_label(&agent.status().unwrap_or_else(|| "thinking".to_owned()));
-            // The input estimate is the local count of what was sent, marked `~` so
-            // it is never mistaken for the server's. Omitted rather than shown as
-            // zero before a request has been measured.
-            let estimate = agent.inflight_input_estimate().map_or(String::new(), |n| {
-                format!("  ~{} tokens in", crate::statusline::thousands(n))
-            });
-            format!("{}  {activity}{estimate}", spinner.label())
-        });
-        let prompt = prompt_for(&agent).await;
-        ui.draw(&prompt, &editor, status.as_deref())?;
-
-        tokio::select! {
-            _ = tick.tick() => {}
-
-            received = events.recv() => {
-                let Some(ev) = received else {
-                    // The reader is gone: without it there is no way to type, and a
-                    // REPL that draws but cannot be typed into is worse than one
-                    // that says so and stops.
-                    ui.print_above("error: the terminal reader stopped, so input is no longer possible")?;
-                    return Ok(());
-                };
-                match ev {
-                    // A pasted block is its own event because bracketed paste is on:
-                    // it lands as text, so a newline in it cannot submit a prompt.
-                    Event::Paste(text) => editor.paste(&text),
-                    Event::Key(key) => {
-                        // Only presses: a release or a repeat is not a keystroke.
-                        if key.kind != KeyEventKind::Press {
-                            continue;
-                        }
-                        // While a turn runs, the editor is read-only and Ctrl-C
-                        // cancels the turn — the one key that must work mid-flight.
-                        if turn.is_some() {
-                            if key.code == KeyCode::Char('c')
-                                && key.modifiers.contains(KeyModifiers::CONTROL)
-                            {
-                                if let Some(handle) = turn.take() {
-                                    handle.abort();
-                                }
-                                spinner = None;
-                                agent.cancel_current();
-                                ui.print_above("^C cancelled")?;
-                            }
-                            continue;
-                        }
-                        match editor.handle(key) {
-                            Action::Continue => {}
-                            Action::Cancel => {
-                                editor.clear();
-                                ui.print_above("")?;
-                            }
-                            Action::Exit => {
-                                ui.print_above("")?;
-                                return Ok(());
-                            }
-                            Action::Submit(text) => {
-                                editor.clear();
-                                let trimmed = text.trim().trim_matches('`').to_owned();
-                                if trimmed.is_empty() {
-                                    continue;
-                                }
-                                // A slash command is handled on the spot; anything else
-                                // becomes a turn. Extracted so this loop stays about
-                                // *sequencing* — a tick, a key, a turn — rather than about
-                                // what each verb prints.
-                                if let Some((command, argument)) = slash::lookup(&trimmed) {
-                                    match run_slash(&agent, cwd, command, argument).await {
-                                        Outcome::Print(text) => ui.print_above(&text)?,
-                                        Outcome::Cleared(text) => {
-                                            ui.purge()?;
-                                            if !text.is_empty() {
-                                                ui.print_above(&text)?;
-                                            }
-                                            print_banner(ui, &agent).await?;
-                                        }
-                                        Outcome::Exit => return Ok(()),
-                                    }
-                                    continue;
-                                }
-                                submit_prompt(ui, &agent, &mut turn, &mut spinner, trimmed)?;
-                            }
-                        }
-                    }
-                    // Resize is handled by ratatui on the next draw.
-                    _ => {}
-                }
-            }
-
-            result = async { turn.as_mut().expect("guarded").await }, if turn.is_some() => {
-                turn = None;
-                spinner = None;
-                match result {
-                    Ok(Ok(turn)) => report_turn(ui, &agent, &turn).await?,
-                    Ok(Err(e)) => ui.print_above(&format!("error: {e}"))?,
-                    Err(join) if join.is_cancelled() => {}
-                    Err(join) => ui.print_above(&format!("error: turn failed: {join}"))?,
-                }
-            }
-        }
-    }
-}
-
-/// Show the operator's prompt and start the turn for it.
-///
-/// The echo happens here, synchronously, rather than when the turn completes: a prompt
-/// that appears only after the reply arrives is not a record of what was asked, it is
-/// an annotation on the answer.
-///
-/// The clipboard gets the same text, because a prompt is the same kind of text as an
-/// answer — see [`Ui::copy`] for why what goes there is the source rather than a
-/// rendering.
-fn submit_prompt(
-    ui: &mut Ui,
-    agent: &Arc<Agent>,
-    turn: &mut Option<tokio::task::JoinHandle<Result<crate::agent::Turn, crate::agent::AgentError>>>,
-    spinner: &mut Option<Spinner>,
-    prompt: String,
-) -> std::io::Result<()> {
-    ui.print_user(&prompt, agent.styles_output())?;
-    if let Err(e) = Ui::copy(&prompt) {
-        // Not fatal: a terminal that ignores OSC 52 loses only the copy.
-        log::warn!("could not set the clipboard: {e}");
-    }
-    let agent = Arc::clone(agent);
-    *turn = Some(tokio::spawn(async move { agent.run_user_prompt(prompt).await }));
-    *spinner = Some(Spinner::new());
-    Ok(())
-}
-
-/// How long ago a session was written, for the `/resume` listing.
-///
-/// Relative rather than absolute: the question this answers is "which of these is
-/// the one I was just in", and a timestamp makes the operator do the subtraction.
 fn ago_label(when: std::time::SystemTime) -> String {
     let Ok(age) = when.elapsed() else {
         // A file stamped in the future (a clock change) — say so rather than
@@ -735,6 +418,468 @@ async fn report_turn(ui: &mut Ui, agent: &Agent, turn: &crate::agent::Turn) -> s
     Ok(())
 }
 
+/// The largest index at or below `limit` that is a character boundary.
+///
+/// `str::floor_char_boundary` is not stable, and slicing a `String` at a byte index
+/// that lands inside a character panics — so a bound that is only a guard still has to
+/// respect them.
+fn char_boundary(text: &str, limit: usize) -> usize {
+    (0..=limit.min(text.len()))
+        .rev()
+        .find(|i| text.is_char_boundary(*i))
+        .unwrap_or(0)
+}
+
+/// What a slash command asked the loop to do.
+enum Outcome {
+    /// Print this above the viewport and keep going.
+    Print(String),
+    /// Wipe the screen and scrollback, print this, reprint the banner, keep going.
+    ///
+    /// Its own variant rather than `Print("")`, because the wipe has to happen *before*
+    /// the message and the banner — and because a session that merely printed a blank
+    /// line would leave the old session's output in the scrollback, which is the one
+    /// thing this is for.
+    Cleared(String),
+    /// Leave the REPL.
+    Exit,
+}
+
+/// Run one slash command.
+///
+/// Every arm builds a string rather than writing to the terminal, because output now
+/// goes through the viewport — and because a function that returns its text is testable,
+/// where one that prints is not.
+async fn run_slash(agent: &Agent, cwd: &Path, command: &slash::SlashCommand, argument: &str) -> Outcome {
+    match command.action {
+        slash::Action::Help => Outcome::Print(slash::help_text()),
+        slash::Action::Exit => Outcome::Exit,
+        slash::Action::Model => {
+            if argument.is_empty() {
+                Outcome::Print(format!("model = {}", agent.model()))
+            } else {
+                match agent.set_model(argument).await {
+                    Ok(()) => Outcome::Print(format!("model = {}\n(in use from the next request)", argument.trim())),
+                    Err(e) => Outcome::Print(format!("error: {e}")),
+                }
+            }
+        }
+        slash::Action::Gate => {
+            if let Some(gate) = crate::gate_command(command.name) {
+                agent.set_gate(gate).await;
+                Outcome::Print(format!("gate = {}", gate.as_str()))
+            } else {
+                Outcome::Print(format!("no mode named {}", command.name))
+            }
+        }
+        slash::Action::Clear => match agent.clear().await {
+            Ok(previous) => {
+                // The message is printed *after* the wipe, so it survives it. The old
+                // session's id is the one thing worth keeping on screen, because it is
+                // how the operator gets back. See the `Cleared` arm in the loop.
+                let short = previous.id.get(..8).unwrap_or(&previous.id).to_owned();
+                Outcome::Cleared(format!(
+                    "started a fresh session; the previous one ({}, {short}) is still on disk — \
+                     /resume {} to return to it",
+                    previous.name, previous.id
+                ))
+            }
+            Err(e) => Outcome::Print(format!("error: could not clear: {e}")),
+        },
+        slash::Action::Rename => {
+            if argument.is_empty() {
+                Outcome::Print("usage: /rename <name>".to_owned())
+            } else {
+                match agent.rename_session(argument).await {
+                    Ok(()) => Outcome::Print(format!("session renamed to {argument}")),
+                    Err(e) => Outcome::Print(format!("error: {e}")),
+                }
+            }
+        }
+        slash::Action::Resume => {
+            if argument.is_empty() {
+                let entries = crate::session::list_sessions(cwd);
+                if entries.is_empty() {
+                    Outcome::Print("no previous sessions in this directory".to_owned())
+                } else {
+                    let mut out = String::from("previous sessions in this directory:");
+                    for (id, name, when) in entries {
+                        let label = if name.is_empty() {
+                            id
+                        } else {
+                            format!("{}  {id}", name.trim())
+                        };
+                        let _ = write!(out, "\n  {label}  ({})", ago_label(when));
+                    }
+                    Outcome::Print(out)
+                }
+            } else {
+                match crate::session::open(cwd, Some(argument), false) {
+                    Ok(new_session) => {
+                        let id = new_session.id.clone();
+                        let name = new_session.session_name();
+                        match agent.swap_session(new_session).await {
+                            Ok(()) => {
+                                let label = if name.is_empty() { id } else { format!("{name}  {id}") };
+                                Outcome::Print(format!("switched to session {label}"))
+                            }
+                            Err(e) => Outcome::Print(format!("error: {e}")),
+                        }
+                    }
+                    Err(e) => Outcome::Print(format!("error: {e}")),
+                }
+            }
+        }
+    }
+}
+
+/// The REPL.
+///
+/// Never returns an error for something the operator did — a failed turn is printed and
+/// the loop continues, because losing the session over one bad request would be worse
+/// than the failure. Errors are reserved for the terminal itself.
+pub async fn run(agent: Arc<Agent>, cwd: &Path) -> std::io::Result<()> {
+    let mut ui = Ui::enter()?;
+    // Every exit path has to restore the terminal, including a panic, or the shell is
+    // left in raw mode with no echo.
+    let outcome = run_inner(&mut ui, agent, cwd).await;
+    let _ = ui.leave();
+    outcome
+}
+
+/// Read key events on a thread of its own and forward them.
+///
+/// A plain `event::read()` blocks, and it has to be able to sit and wait: a blocking
+/// read inside the async loop would stop the loop from servicing the turn in flight, and
+/// `spawn_blocking` per read would add a task per keystroke for no benefit.
+///
+/// The reader reports why it stopped rather than vanishing. When it dies the channel
+/// closes, and `run_inner` treats that as fatal and says so — a REPL that draws but
+/// cannot be typed into is worse than one that ends.
+fn spawn_reader() -> tokio::sync::mpsc::Receiver<Event> {
+    let (tx, rx) = tokio::sync::mpsc::channel(64);
+    std::thread::spawn(move || {
+        loop {
+            // Short poll so the thread notices a closed channel promptly instead of waiting
+            // out a long read after the app has gone.
+            match event::poll(Duration::from_millis(120)) {
+                Ok(true) => match event::read() {
+                    Ok(ev) => {
+                        if tx.blocking_send(ev).is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("terminal read failed, so keys stop arriving: {e}");
+                        break;
+                    }
+                },
+                Ok(false) => {
+                    if tx.is_closed() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    log::warn!("terminal poll failed, so keys stop arriving: {e}");
+                    break;
+                }
+            }
+        }
+    });
+    rx
+}
+
+/// The loop's state, so that handling one key is a function rather than a hundred lines
+/// inside a `select!`.
+///
+/// It also makes the queue testable: everything the key handler touches is a field here,
+/// so the parts worth testing — what Enter does mid-turn, what Ctrl-C clears, what runs
+/// next — can be driven with no terminal at all. That matters, because the only other way
+/// to exercise this loop is through a pty, and a regression in submitting took a terminal
+/// emulator to find the last time.
+struct Repl<'a> {
+    ui: &'a mut Ui,
+    agent: Arc<Agent>,
+    cwd: &'a Path,
+    editor: Editor,
+    /// The turn in flight, if any.
+    turn: Option<tokio::task::JoinHandle<Result<crate::agent::Turn, crate::agent::AgentError>>>,
+    /// The spinner describing it.
+    spinner: Option<Spinner>,
+    /// Prompts typed while it was running, in the order they were given.
+    queued: std::collections::VecDeque<String>,
+}
+
+/// What the loop should do after handling something.
+enum Flow {
+    /// Keep looping.
+    Continue,
+    /// Leave the REPL.
+    Exit,
+}
+
+impl Repl<'_> {
+    /// The status row: the spinner, what the agent is doing, the input estimate, and how
+    /// much is waiting.
+    fn status(&mut self) -> Option<String> {
+        self.turn.as_ref()?;
+        let spinner = self.spinner.get_or_insert_with(Spinner::new);
+        // The agent reports `thinking` while it waits on the model and a tool name while
+        // it runs one; `activity_label` presents the former and passes the latter
+        // through.
+        let activity = crate::statusline::activity_label(&self.agent.status().unwrap_or_else(|| "thinking".to_owned()));
+        // The input estimate is the local count of what was sent, marked `~` so it is
+        // never mistaken for the server's. Omitted rather than shown as zero before a
+        // request has been measured.
+        let estimate = self.agent.inflight_input_estimate().map_or(String::new(), |n| {
+            format!("  ~{} tokens in", crate::statusline::thousands(n))
+        });
+        // What is waiting, so a queued prompt is visibly waiting rather than apparently
+        // swallowed. Nothing is echoed when it is queued: it is echoed when it *starts*,
+        // because a prompt printed before the previous answer arrives would put the
+        // transcript out of order.
+        let waiting = match self.queued.len() {
+            0 => String::new(),
+            1 => "  · 1 queued".to_owned(),
+            n => format!("  · {n} queued"),
+        };
+        Some(format!("{}  {activity}{estimate}{waiting}", spinner.label()))
+    }
+
+    /// Echo a prompt, copy it, and start its turn.
+    fn start(&mut self, prompt: String) -> std::io::Result<()> {
+        self.ui.print_user(&prompt, self.agent.styles_output())?;
+        if let Err(e) = Ui::copy(&prompt) {
+            // Not fatal: a terminal that ignores OSC 52 loses only the copy.
+            log::warn!("could not set the clipboard: {e}");
+        }
+        let agent = Arc::clone(&self.agent);
+        self.turn = Some(tokio::spawn(async move { agent.run_user_prompt(prompt).await }));
+        self.spinner = Some(Spinner::new());
+        Ok(())
+    }
+
+    /// Report a finished turn, then start whatever was queued behind it.
+    async fn finished(
+        &mut self,
+        result: Result<Result<crate::agent::Turn, crate::agent::AgentError>, tokio::task::JoinError>,
+    ) -> std::io::Result<()> {
+        self.turn = None;
+        self.spinner = None;
+        match result {
+            Ok(Ok(turn)) => report_turn(self.ui, &self.agent, &turn).await?,
+            Ok(Err(e)) => self.ui.print_above(&format!("error: {e}"))?,
+            Err(join) if join.is_cancelled() => {}
+            Err(join) => self.ui.print_above(&format!("error: turn failed: {join}"))?,
+        }
+        // Started here rather than when it was queued, so the transcript reads in order:
+        // answer, then the prompt that prompted the next one. Nothing is left to start
+        // after a cancellation, because that path clears the queue.
+        if let Some(next) = self.queued.pop_front() {
+            self.start(next)?;
+        }
+        Ok(())
+    }
+
+    /// Abort the turn in flight, and be explicit about what happens to the queue.
+    fn cancel(&mut self) -> std::io::Result<()> {
+        if let Some(handle) = self.turn.take() {
+            handle.abort();
+        }
+        self.spinner = None;
+        self.agent.cancel_current();
+        let dropped = self.queued.len();
+        // The queue goes with it: Ctrl-C is the abort key, and a prompt that ran anyway
+        // afterwards would be a surprise rather than an abort. Nothing is lost — a
+        // submitted line is in the editor's history, so Up brings it back — and the
+        // message says so, because otherwise it reads as data loss.
+        self.queued.clear();
+        self.ui.print_above(&match dropped {
+            0 => "^C cancelled this turn".to_owned(),
+            1 => "^C cancelled this turn, and dropped the queued prompt (it is in your history \
+                  — Up to recall it)"
+                .to_owned(),
+            n => format!(
+                "^C cancelled this turn, and dropped {n} queued prompts (they are in your \
+                 history — Up to recall them)"
+            ),
+        })
+    }
+
+    /// Handle one submitted line: queue it, run it as a command, or start a turn.
+    ///
+    /// Everything queues while a turn is in flight, *including* slash commands, so the
+    /// transcript stays in the order things were asked. `/exit` is the one exception:
+    /// leaving is not a turn, and waiting for one to finish before obeying it would make
+    /// the command feel broken.
+    async fn submitted(&mut self, line: String) -> std::io::Result<Flow> {
+        let trimmed = line.trim().trim_matches('`').to_owned();
+        if trimmed.is_empty() {
+            return Ok(Flow::Continue);
+        }
+        match submit_action(self.turn.is_some(), self.queued.len(), &trimmed) {
+            Submit::Refuse => {
+                self.ui.print_above(&format!(
+                    "already {QUEUE_LIMIT} prompts waiting — this one was not queued (it is in \
+                     your history)"
+                ))?;
+                return Ok(Flow::Continue);
+            }
+            Submit::Queue => {
+                self.queued.push_back(trimmed);
+                return Ok(Flow::Continue);
+            }
+            Submit::Now => {}
+        }
+        if let Some((command, argument)) = slash::lookup(&trimmed) {
+            match run_slash(&self.agent, self.cwd, command, argument).await {
+                Outcome::Print(text) => self.ui.print_above(&text)?,
+                Outcome::Cleared(text) => {
+                    self.ui.purge()?;
+                    if !text.is_empty() {
+                        self.ui.print_above(&text)?;
+                    }
+                    print_banner(self.ui, &self.agent).await?;
+                }
+                Outcome::Exit => return Ok(Flow::Exit),
+            }
+            return Ok(Flow::Continue);
+        }
+        self.start(trimmed)?;
+        Ok(Flow::Continue)
+    }
+
+    /// Handle one key.
+    async fn on_key(&mut self, key: KeyEvent) -> std::io::Result<Flow> {
+        // While a turn runs the line stays editable — a turn can take minutes, and a
+        // locked editor is what makes a session feel stuck. Ctrl-C is the exception: it
+        // is the abort key, and there is nothing else to do with it mid-flight.
+        if self.turn.is_some() && key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.cancel()?;
+            return Ok(Flow::Continue);
+        }
+        match self.editor.handle(key) {
+            Action::Continue => Ok(Flow::Continue),
+            Action::Cancel => {
+                self.editor.clear();
+                // A blank line above the viewport, so abandoned text scrolls out of the
+                // way rather than looking like output.
+                self.ui.print_above("")?;
+                Ok(Flow::Continue)
+            }
+            Action::Exit => Ok(Flow::Exit),
+            Action::Submit(text) => {
+                self.editor.clear();
+                self.submitted(text).await
+            }
+        }
+    }
+}
+
+/// What a submitted line should do.
+#[derive(Debug, PartialEq, Eq)]
+enum Submit {
+    /// Run it now.
+    Now,
+    /// Wait: a turn is in flight.
+    Queue,
+    /// Refuse: too much is already waiting.
+    Refuse,
+}
+
+/// Decide what a submitted line does, given the state it arrives in.
+///
+/// Separated from the effects so the *policy* can be tested without a terminal: the
+/// interesting cases are all about timing — a line typed mid-turn queues, a full queue
+/// refuses, and `/exit` acts regardless — and driving them through a pty would test the
+/// terminal as much as the decision.
+///
+/// Everything queues while a turn is in flight, *including* slash commands, so the
+/// transcript stays in the order things were asked. `/exit` is the one exception:
+/// leaving is not a turn, and waiting for one to finish before obeying it would make the
+/// command feel broken.
+fn submit_action(turn_in_flight: bool, queued: usize, line: &str) -> Submit {
+    if !turn_in_flight || slash_is_exit(line) {
+        return Submit::Now;
+    }
+    if queued >= QUEUE_LIMIT {
+        Submit::Refuse
+    } else {
+        Submit::Queue
+    }
+}
+
+/// Whether a line names `/exit` or one of its aliases — the commands that act even
+/// mid-turn.
+fn slash_is_exit(line: &str) -> bool {
+    slash::lookup(line).is_some_and(|(command, _)| matches!(command.action, slash::Action::Exit))
+}
+
+async fn run_inner(ui: &mut Ui, agent: Arc<Agent>, cwd: &Path) -> std::io::Result<()> {
+    let mut events = spawn_reader();
+    let mut tick = tokio::time::interval(TICK);
+    // `MissedTickBehavior::Delay` keeps a slow frame from queuing a burst of catch-up
+    // ticks, which would make the spinner jump after a stall.
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    let mut repl = Repl {
+        ui,
+        agent,
+        cwd,
+        editor: Editor::new(),
+        turn: None,
+        spinner: None,
+        queued: std::collections::VecDeque::new(),
+    };
+
+    // The banner, once, before the first prompt: what version is running, which session,
+    // which mode. It goes above the viewport into scrollback, so it stays readable rather
+    // than being repainted.
+    print_banner(repl.ui, &repl.agent).await?;
+
+    loop {
+        let status = repl.status();
+        let prompt = prompt_for(&repl.agent).await;
+        repl.ui.draw(&prompt, &repl.editor, status.as_deref())?;
+
+        tokio::select! {
+            _ = tick.tick() => {}
+
+            received = events.recv() => {
+                let Some(ev) = received else {
+                    // The reader is gone: without it there is no way to type, and a REPL
+                    // that draws but cannot be typed into is worse than one that says so
+                    // and stops.
+                    repl.ui.print_above(
+                        "error: the terminal reader stopped, so input is no longer possible",
+                    )?;
+                    return Ok(());
+                };
+                match ev {
+                    // A pasted block is its own event because bracketed paste is on: it
+                    // lands as text, so a newline in it cannot submit a prompt.
+                    Event::Paste(text) => repl.editor.paste(&text),
+                    Event::Key(key) => {
+                        // Only presses: a release or a repeat is not a keystroke.
+                        if key.kind != KeyEventKind::Press {
+                            continue;
+                        }
+                        if matches!(repl.on_key(key).await?, Flow::Exit) {
+                            return Ok(());
+                        }
+                    }
+                    // Resize is handled by ratatui on the next draw.
+                    _ => {}
+                }
+            }
+
+            result = async { repl.turn.as_mut().expect("guarded").await }, if repl.turn.is_some() => {
+                repl.finished(result).await?;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -797,6 +942,45 @@ mod tests {
         assert_eq!(char_boundary("abc", 99), 3);
         // And an empty string is fine.
         assert_eq!(char_boundary("", 10), 0);
+    }
+
+    /// Type-ahead: a line typed while a turn runs is queued, not refused.
+    ///
+    /// The behaviour this replaces took every key but Ctrl-C and dropped it, so the editor
+    /// was read-only for the whole of a turn — which can be minutes, and is what makes a
+    /// session feel locked. The policy now: queue, refuse only when the queue is full, and
+    /// let  through because leaving is not a turn.
+    #[test]
+    fn a_line_typed_mid_turn_queues_and_a_full_queue_refuses() {
+        // Idle: run it.
+        assert_eq!(submit_action(false, 0, "read the parser"), Submit::Now);
+
+        // Mid-turn: queue it.
+        assert_eq!(submit_action(true, 0, "read the parser"), Submit::Queue);
+
+        // Mid-turn with room left: still queues, right up to the cap.
+        assert_eq!(submit_action(true, QUEUE_LIMIT - 1, "one more"), Submit::Queue);
+
+        // At the cap: refused, with a message, rather than dropped silently — the
+        // operator is told and the line is still in the editor's history.
+        assert_eq!(submit_action(true, QUEUE_LIMIT, "too many"), Submit::Refuse);
+        assert_eq!(submit_action(true, QUEUE_LIMIT + 5, "way too many"), Submit::Refuse);
+    }
+
+    ///  acts even mid-turn, and so do its aliases.
+    ///
+    /// Leaving is not a turn: waiting for one to finish before obeying it would make the
+    /// command feel broken, and the operator asking to leave mid-answer means leave now.
+    #[test]
+    fn exit_acts_even_while_a_turn_runs() {
+        for line in ["/exit", "/quit"] {
+            assert_eq!(submit_action(true, 0, line), Submit::Now, "{line} must not wait");
+        }
+        // And a slash command that is *not* exit waits its turn, so the transcript stays
+        // in the order things were asked.
+        assert_eq!(submit_action(true, 0, "/model"), Submit::Queue);
+        assert_eq!(submit_action(true, 0, "/help"), Submit::Queue);
+        assert_eq!(submit_action(true, 0, "/clear"), Submit::Queue);
     }
 
     /// The prompt echo marks continuation lines so a multi-line prompt reads as one.
