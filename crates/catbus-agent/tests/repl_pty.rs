@@ -642,7 +642,25 @@ fn screen_of(captured: &str, rows: u16, cols: u16) -> Vec<String> {
     (0..emulated_rows)
         .map(|row| {
             let line: String = (0..emulated_cols)
-                .map(|col| screen.cell(row, col).map_or(" ", vt100::Cell::contents))
+                .map(|col| {
+                    // An untouched cell reports `""`, but a blank terminal cell *is* a space — and
+                    // the difference matters here. ratatui writes only the cells that changed, and
+                    // an unstyled space is indistinguishable from a blank cell, so it is skipped.
+                    // Mapping `""` to `""` would therefore erase every space the app did not style,
+                    // and the failure would look like the app dropping text when it had rendered
+                    // it perfectly.
+                    screen.cell(row, col).map_or_else(
+                        || " ".to_owned(),
+                        |cell| {
+                            let contents = cell.contents();
+                            if contents.is_empty() {
+                                " ".to_owned()
+                            } else {
+                                contents.to_owned()
+                            }
+                        },
+                    )
+                })
                 .collect();
             line.trim_end().to_owned()
         })
@@ -862,7 +880,16 @@ fn repl_against(port: u16) -> (Pty, KillOnDrop, tempfile::TempDir) {
 
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_catbus-agent"));
     cmd.env("HOME", &home)
-        .env("RUST_LOG", "info")
+        // Quiet, and not just for tidiness. The agent logs with `tracing` to stdout, and this test
+        // asserts on the rendered screen — but the log writer does not know ratatui owns the
+        // screen, so an INFO line lands wherever the cursor happens to be. Mid-viewport that
+        // overwrites the prompt, and ratatui does not repaint it, because its own buffer still
+        // holds the text it thinks is there. Whether the log arrives before or after a paint is
+        // timing, so at `info` the screen assertions are flaky rather than wrong.
+        //
+        // The underlying defect is real and is not this test's to fix — the agent should route
+        // its logs through `Ui::print_above`, or to a file, once the TUI owns the terminal.
+        .env("RUST_LOG", "error")
         .env_remove("NO_COLOR")
         .env_remove("CLICOLOR")
         .env_remove("CATBUS_ANSI")
@@ -1004,5 +1031,113 @@ fn the_question_panel_sends_the_ticked_label_and_the_note() {
     assert!(
         pty.drain_until(&mut seen, "Hello there.", Duration::from_secs(20)),
         "the turn should continue once the question is answered:\n{seen}"
+    );
+}
+
+/// A relay that answers every turn plainly, and hands over the first request body.
+///
+/// The body is the only place a submitted prompt is visible to a test: the request is what the
+/// agent sends upstream, so a newline that survived the editor and the socket is a literal `\n`
+/// inside the JSON `text` field.
+fn spawn_capturing_relay() -> (u16, mpsc::Receiver<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut captured = false;
+        loop {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let raw = read_request(&mut stream);
+            // The startup price fetch shares the port but is not a turn.
+            let is_turn = !raw.starts_with("GET ");
+            let body = if is_turn { REPLY_WITH_USAGE } else { MOCK_PRICES };
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
+                 connection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+            if is_turn && !captured {
+                captured = true;
+                let _ = tx.send(raw);
+            }
+        }
+    });
+    (port, rx)
+}
+
+/// Shift+Enter puts a newline in the prompt, and the newline reaches the API.
+///
+/// The bytes sent are the literal kitty-protocol sequence, which is the whole point of the test:
+/// it is what tab-atelier's `keystroke_to_bytes` emits once catbus has pushed
+/// `DISAMBIGUATE_ESCAPE_CODES`, and what crossterm decodes back into `Enter` + SHIFT. Encoding it by
+/// hand here covers the contract both sides have to agree on — a change to either that broke the
+/// agreement would fail here and nowhere else.
+///
+/// Two things are checked, because they can fail independently: that the prompt *displays* as two
+/// rows (the viewport grew and wrapped), and that the newline survives into the request.
+#[test]
+fn shift_enter_puts_a_newline_in_the_prompt() {
+    let (port, captured) = spawn_capturing_relay();
+    let (mut pty, _child, _home) = repl_against(port);
+
+    let mut seen = String::new();
+    assert!(
+        pty.drain_until(&mut seen, "/help", Duration::from_secs(20)),
+        "the REPL never drew its prompt:\n{seen}"
+    );
+    pty.send("first line");
+    // Shift+Enter, as the kitty protocol encodes it: ESC [ 13 ; 2 u.
+    pty.send("\u{1b}[13;2u");
+    pty.send("second line");
+
+    // The two lines have to be drawn on separate rows, and this has to be checked *before*
+    // submitting: Enter clears the prompt out of the viewport, so afterwards there is nothing on
+    // the live screen to check. A screen is the only place the newline is visible at all, since
+    // ratatui repaints only the cells that changed and the prompt therefore never appears
+    // contiguously in the raw byte stream.
+    // 60 rows, not the pty's 24: `screen_of` documents that the emulated screen has to be
+    // *taller* than the terminal, or what the app pushes above its inline viewport scrolls out of
+    // the visible area and the assertion reads blank space.
+    assert!(
+        pty.drain_until_screen(
+            &mut seen,
+            60,
+            |screen| screen.contains("first line") && screen.contains("second line"),
+            Duration::from_secs(15)
+        ),
+        "both lines must be on screen:\n{}",
+        screen_of(&seen, 60, 80)
+            .iter()
+            .enumerate()
+            .map(|(i, row)| format!("{i:>2}|{row}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    let screen = screen_of(&seen, 60, 80).join("\n");
+    let rows: Vec<&str> = screen.lines().collect();
+    let first = rows.iter().position(|row| row.contains("first line"));
+    let second = rows.iter().position(|row| row.contains("second line"));
+    assert!(
+        matches!((first, second), (Some(a), Some(b)) if b > a),
+        "the two lines must be on separate rows, in order:\n{screen}"
+    );
+
+    // Then submit, and check what the buffer actually held. The request is the ground truth: it
+    // carries the prompt as JSON, so a newline that survived the editor and the socket is a
+    // literal `\n` inside the `text` field — the bytes on the wire being a backslash and an `n`,
+    // which is what a raw string literal matches. Their being *contiguous* is also the proof that
+    // the prompt stayed one message: two messages could not produce a single text value holding
+    // both lines.
+    pty.send("\r");
+    let raw = captured
+        .recv_timeout(Duration::from_secs(20))
+        .expect("the prompt must reach the relay");
+    assert!(
+        raw.contains(r"first line\nsecond line"),
+        "the newline must survive into the request:\n{raw}"
     );
 }

@@ -31,6 +31,7 @@ use std::time::Duration;
 
 use ratatui::crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{Clear, ClearType, disable_raw_mode, enable_raw_mode};
@@ -124,10 +125,11 @@ enum PanelAction {
 
 /// The tick-box UI for a pending question.
 ///
-/// The prompt viewport is only two rows (`VIEWPORT_ROWS`), so the panel is one row of
-/// windowed options and one row of hints. Everything the old typed path could do is reachable
-/// from the keyboard without typing a label: arrows move, space ticks, tab changes question,
-/// `n` opens a note. Nothing is submitted until enter, so a half-made choice is never sent.
+/// The panel draws into the top two rows of the prompt band (`Ui::rows`), so the rows the band
+/// reserved for a multi-line prompt are simply left blank while a question is being asked.
+/// Everything the old typed path could do is reachable from the keyboard without typing a label:
+/// arrows move, space ticks, tab changes question, `n` opens a note. Nothing is submitted until
+/// enter, so a half-made choice is never sent.
 #[derive(Debug)]
 struct Panel {
     /// One tick-box list per question, in the order asked.
@@ -362,19 +364,61 @@ const QUEUE_LIMIT: usize = 5;
 /// is still there to scroll past.
 const BANNER_EXCHANGES: usize = 4;
 
-/// The viewport is two rows: the input line, and a status row under it.
+/// The viewport is a fixed band: the prompt rows, and a status row under them.
 ///
-/// Fixed, deliberately, rather than growing a row while a turn runs. Resizing an
-/// inline viewport makes the terminal reflow what is already on screen, and the
-/// output pushed above it (`insert_before`) can be reordered by that — the reply and
-/// the line that follows it are the two things whose order matters, and they were
-/// the two that came out wrong. A blank second row costs one line and removes the
-/// whole class of problem.
-const VIEWPORT_ROWS: u16 = 2;
-
+/// Fixed, deliberately, rather than growing and shrinking with the prompt. Resizing an
+/// inline viewport makes the terminal reflow what is already on screen, and the output
+/// pushed above it (`insert_before`) can be reordered by that — the reply and the line
+/// that follows it are the two things whose order matters, and they were the two that
+/// came out wrong. A blank row costs one line and removes the whole class of problem.
+///
+/// Since multi-line prompts arrived, the same hazard rules out changing the height at
+/// all: an inline viewport's height is fixed at construction (`Terminal::viewport` is
+/// private) and re-building the `Terminal` re-runs `compute_inline_size`, whose last act
+/// is an unconditional `append_lines(height - 1)` — so a rebuild would scroll the
+/// conversation by the band's height every time the prompt grew a row. The band is
+/// therefore sized once, from the terminal's height (see [`prompt_rows`]), and the
+/// `Ui::draw` code shows as much of a long prompt as fits in it and scrolls the rest.
+///
 /// Owns the terminal and knows how to put text above the viewport.
 pub struct Ui {
     terminal: Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
+    /// The height of the prompt band, in rows, chosen once when the terminal is taken.
+    ///
+    /// Fixed for the life of the session, because ratatui does not allow an inline viewport to
+    /// change height: `Terminal::viewport` is private, and rebuilding the `Terminal` re-runs
+    /// `compute_inline_size`, which ends with an unconditional `append_lines(height - 1)`. So a
+    /// rebuild for a prompt that grew by one row would append four lines and scroll the
+    /// operator's conversation by four — the failure that made this a fixed band instead of a
+    /// growing one.
+    ///
+    /// What is left is to reserve the room up front and use as much of it as the buffer needs,
+    /// leaving the rest blank. The used rows come first and the blanks last, so the gap sits at
+    /// the bottom of the screen where empty space is unremarkable, rather than between the
+    /// conversation and the prompt where it would read as a bug.
+    rows: u16,
+    /// Whether the keyboard-enhancement flags were pushed, so `leave` knows whether to pop
+    /// them. Tracked rather than popped unconditionally because sending a pop that was never
+    /// pushed is at best noise and at worst unbalances a stack the terminal is keeping, and
+    /// because the push can fail on a terminal that does not implement it.
+    enhanced: bool,
+}
+
+/// Pop the keyboard-enhancement flags if `leave` never got to run.
+///
+/// The pop matters more than most teardown: a terminal left in the enhanced mode keeps
+/// reporting keys in the modified CSI-u form, so the *shell* afterwards sees keystrokes it
+/// does not understand. An unwind is the realistic case — a panic in a draw path — and it
+/// would otherwise take the operator's terminal with it. The normal path sets
+/// [`Ui::enhanced`] to false after popping, so this is a no-op then.
+impl Drop for Ui {
+    fn drop(&mut self) {
+        if self.enhanced {
+            let mut out = std::io::stdout();
+            let _ = execute!(out, PopKeyboardEnhancementFlags);
+            let _ = out.flush();
+        }
+    }
 }
 
 impl Ui {
@@ -387,13 +431,36 @@ impl Ui {
         enable_raw_mode()?;
         let mut out = std::io::stdout();
         execute!(out, EnableBracketedPaste)?;
+        // Ask the terminal to disambiguate its escape codes, which is what makes
+        // Shift+Enter reportable at all: without it a terminal sends the same byte for
+        // Enter and Shift+Enter, and no amount of decoding can tell them apart. Pushed
+        // once for the session and popped on the way out — see `enhanced`, because
+        // leaving it pushed after the app exits would keep the operator's terminal in a
+        // modified key-reporting mode.
+        //
+        // Pushed unconditionally rather than after a capability query: crossterm 0.29 has
+        // no `supports_keyboard_enhancement`, and a terminal that does not know the
+        // sequence ignores it. Nothing is lost by asking.
+        let enhanced = execute!(
+            out,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )
+        .is_ok();
+        // The band has to be sized before the terminal is built, because the inline viewport's
+        // height is fixed at construction and cannot be revised afterwards — see `Ui::rows`.
+        let height = ratatui::crossterm::terminal::size().map_or(24, |(_, rows)| rows);
+        let rows = prompt_rows(height);
         let terminal = Terminal::with_options(
             ratatui::backend::CrosstermBackend::new(out),
             TerminalOptions {
-                viewport: Viewport::Inline(VIEWPORT_ROWS),
+                viewport: Viewport::Inline(rows),
             },
         )?;
-        Ok(Self { terminal })
+        Ok(Self {
+            terminal,
+            rows,
+            enhanced,
+        })
     }
 
     /// Give the terminal back. Called on every exit path, including the error one.
@@ -402,6 +469,10 @@ impl Ui {
         // not overwrite app output.
         self.terminal.show_cursor()?;
         let mut out = std::io::stdout();
+        if self.enhanced {
+            execute!(out, PopKeyboardEnhancementFlags)?;
+            self.enhanced = false;
+        }
         execute!(out, DisableBracketedPaste)?;
         disable_raw_mode()?;
         out.flush()
@@ -547,52 +618,84 @@ impl Ui {
         self.terminal.insert_before(height, paint)
     }
 
-    /// Repaint the viewport: the prompt and the line, and a status row under them.
+    /// Repaint the viewport: the prompt and the buffer, and a status row under them.
+    ///
+    /// The band is a fixed height (`Ui::rows`), so a wrapped or multi-line prompt is shown in
+    /// as many rows as it needs, up to the band, and scrolls inside it past that. The rows that
+    /// are used come first and the remainder stay blank, so the empty space is at the bottom of
+    /// the screen rather than between the conversation and the prompt.
     pub fn draw(&mut self, prompt: &str, editor: &Editor, status: Option<&str>) -> std::io::Result<()> {
         let prompt = prompt.to_owned();
-        let line = editor.line();
-        let cursor = editor.cursor();
+        let (before, after) = editor.line_at_cursor();
         let status = status.map(ToOwned::to_owned);
-        self.terminal.draw(|frame| {
+        let size = self.terminal.size()?;
+        let width = usize::from(size.width).max(1);
+        let wrapped = wrap_prompt(&prompt, &before, &after, width);
+        // The band's last row is the status row whenever the buffer needs all of the others.
+        let text_rows = usize::from(self.rows.saturating_sub(1)).max(1);
+        let shown = wrapped.rows.len().min(text_rows);
+        // Keep the cursor's row on screen when the buffer is taller than the band. The window
+        // ends at the cursor rather than centring on it, because the line being typed is the one
+        // that has to be visible, and the rows above it are context.
+        let scroll = if wrapped.cursor_row >= shown {
+            wrapped.cursor_row - shown + 1
+        } else {
+            0
+        };
+        let cursor_row = wrapped.cursor_row.saturating_sub(scroll);
+        let cursor_col = wrapped.cursor_col;
+        let rows = wrapped.rows;
+        let prefixes = wrapped.prompt_prefix;
+        let band = self.rows;
+        self.terminal.draw(move |frame| {
             let area = frame.area();
-            let input_y = area.top();
+            let top = area.top();
             let prompt_style = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
-            let prompt_width = u16::try_from(prompt.chars().count()).unwrap_or(0);
-            frame.render_widget(
-                Paragraph::new(Line::from(vec![Span::styled(prompt.clone(), prompt_style)])),
-                Rect::new(area.left(), input_y, prompt_width, 1),
-            );
-            frame.render_widget(
-                Paragraph::new(Line::from(line.clone())),
-                Rect::new(area.left().saturating_add(prompt_width), input_y, area.width, 1),
-            );
-            // Rendered whether or not there is a status, so the row is cleared when a
-            // turn ends instead of keeping the last spinner frame on screen.
+            for (offset, row) in rows.iter().skip(scroll).take(shown).enumerate() {
+                let y = top.saturating_add(u16::try_from(offset).unwrap_or(0));
+                let prefix = prefixes.get(scroll + offset).copied().unwrap_or(0);
+                let (head, tail) = split_at_chars(row, prefix);
+                let line = if head.is_empty() {
+                    Line::from(Span::raw(tail.to_owned()))
+                } else {
+                    Line::from(vec![
+                        Span::styled(head.to_owned(), prompt_style),
+                        Span::raw(tail.to_owned()),
+                    ])
+                };
+                frame.render_widget(Paragraph::new(line), Rect::new(area.left(), y, area.width, 1));
+            }
+            // Directly under the buffer rather than pinned to the bottom of the band: the status
+            // describes the turn the prompt belongs to, and three blank rows between them would
+            // read as a gap. The rows below stay blank, which is the bottom of the screen and so
+            // looks like nothing at all.
+            let status_offset = u16::try_from(shown).unwrap_or(0);
+            let status_y = top
+                .saturating_add(status_offset)
+                .min(top.saturating_add(band).saturating_sub(1));
             let status_line = status.map_or_else(Line::default, |status| {
                 Line::from(Span::styled(status, Style::default().fg(Color::DarkGray)))
             });
             frame.render_widget(
                 Paragraph::new(status_line),
-                Rect::new(area.left(), input_y.saturating_add(1), area.width, 1),
+                Rect::new(area.left(), status_y, area.width, 1),
             );
-            // Put the terminal's cursor where the editor says it is, so typing appears
-            // where the operator expects it.
-            let column = area
-                .left()
-                .saturating_add(prompt_width)
-                .saturating_add(u16::try_from(cursor).unwrap_or(0));
-            frame.set_cursor_position((column, input_y));
+            // Put the terminal's cursor where the editor says it is, so typing appears where
+            // the operator expects it — including on a wrapped or multi-line buffer, which is
+            // the whole reason the row is computed rather than assumed to be the first.
+            frame.set_cursor_position((
+                area.left().saturating_add(u16::try_from(cursor_col).unwrap_or(0)),
+                top.saturating_add(u16::try_from(cursor_row).unwrap_or(0)),
+            ));
         })?;
         Ok(())
     }
 
     /// Repaint the viewport as the question panel, in place of the prompt.
     ///
-    /// The viewport is exactly two rows (`VIEWPORT_ROWS`), so the panel is one row of options
-    /// and one row that is either the note being typed or the key hints. The note takes the
-    /// second row rather than opening a third because the height is fixed at construction —
-    /// there is no `resize` for an inline viewport — and the options must not be the row that
-    /// scrolls off.
+    /// The panel is one row of options and one row that is either the note being typed or the
+    /// key hints. It draws into the top of the band, so the remaining reserved rows stay blank —
+    /// which the next frame clears, because ratatui repaints any cell that changed.
     fn draw_panel(
         &mut self,
         panel: &Panel,
@@ -656,6 +759,127 @@ impl Ui {
         })?;
         Ok(())
     }
+}
+
+/// How many rows the prompt band reserves, given the terminal's height: text rows plus the
+/// status row.
+///
+/// Five rows shows a four-line prompt in full, which is a pasted block or several Shift+Enter
+/// lines; past that the buffer scrolls inside the band. It is capped at half the terminal so a
+/// long prompt cannot take the screen, floored at two so there is always a row for the prompt
+/// and a row for its status, and floored again by the terminal's own height so it never asks
+/// for more rows than exist.
+fn prompt_rows(height: u16) -> u16 {
+    const WANTED: u16 = 5;
+    let half = (height / 2).max(1);
+    WANTED.min(half).max(2).min(height.max(1))
+}
+
+/// The prompt and the buffer, broken into the rows the terminal will actually show.
+#[derive(Debug, PartialEq, Eq)]
+struct Wrapped {
+    /// One entry per visual row. Never empty: an empty buffer still needs the row the cursor
+    /// sits on.
+    rows: Vec<String>,
+    /// How many of each row's leading characters belong to the prompt, so the prompt can be
+    /// drawn in its own style. Parallel to `rows`.
+    prompt_prefix: Vec<usize>,
+    /// Which row the cursor is on, and its column in that row.
+    cursor_row: usize,
+    cursor_col: usize,
+}
+
+/// Start a new visual row if the current one is already full.
+///
+/// A free function rather than a closure inside [`wrap_prompt`] because it needs both vectors
+/// mutably at once, and its own the row-buffer state it mutates is the only thing it consults.
+fn break_if_full(rows: &mut Vec<String>, prefixes: &mut Vec<usize>, width: usize) {
+    if rows.last().is_some_and(|row| row.chars().count() >= width) {
+        rows.push(String::new());
+        prefixes.push(0);
+    }
+}
+
+/// Where the cursor sits right now: at the end of the last row.
+fn cursor_here(rows: &[String]) -> (usize, usize) {
+    (
+        rows.len().saturating_sub(1),
+        rows.last().map_or(0, |row| row.chars().count()),
+    )
+}
+
+/// Break `prompt + before + after` into visual rows `width` columns wide.
+///
+/// One function produces both the rows and the cursor's place in them, because they must not
+/// be able to disagree: if the row count came from one piece of arithmetic and the cursor from
+/// another, the cursor would land on the wrong line the moment they drifted — and it would
+/// only ever be wrong for text nobody had tested.
+///
+/// The prompt is simply the first characters of the first row, so it wraps with the rest
+/// rather than being special-cased; `prompt_prefix` records how much of each row to style.
+///
+/// Breaks by character count, which is what the editor already counts in. A double-width
+/// character therefore occupies two columns while counting as one, so a line of CJK wraps a
+/// character or two early. That is the same approximation the prompt already makes when it
+/// positions the cursor, and matching it beats being right in one place and wrong in another.
+fn wrap_prompt(prompt: &str, before: &str, after: &str, width: usize) -> Wrapped {
+    let width = width.max(1);
+    let prompt_chars = prompt.chars().count();
+    let cursor_index = prompt_chars + before.chars().count();
+
+    let mut rows: Vec<String> = vec![String::new()];
+    let mut prompt_prefix: Vec<usize> = vec![0];
+    let mut cursor: Option<(usize, usize)> = None;
+
+    for (i, ch) in prompt.chars().chain(before.chars()).chain(after.chars()).enumerate() {
+        if ch == '\n' {
+            // The cursor at this index belongs at the end of the row the newline ends, before
+            // the break — a newline is the one character that does not push the cursor onward.
+            if i == cursor_index {
+                cursor = Some(cursor_here(&rows));
+            }
+            rows.push(String::new());
+            prompt_prefix.push(0);
+            continue;
+        }
+        if i == cursor_index {
+            // Break first if the row is full: the cursor belongs at the start of the row this
+            // character will land on, not past the end of the one it overflows.
+            break_if_full(&mut rows, &mut prompt_prefix, width);
+            cursor = Some(cursor_here(&rows));
+        }
+        break_if_full(&mut rows, &mut prompt_prefix, width);
+        if let Some(last) = rows.last_mut() {
+            last.push(ch);
+        }
+        if i < prompt_chars
+            && let Some(prefix) = prompt_prefix.last_mut()
+        {
+            *prefix += 1;
+        }
+    }
+    // Past the last character, the cursor is at the end of the buffer — wrapping to a fresh row
+    // if that row is full, because that is where a terminal would put it.
+    let (cursor_row, cursor_col) = cursor.unwrap_or_else(|| {
+        break_if_full(&mut rows, &mut prompt_prefix, width);
+        cursor_here(&rows)
+    });
+
+    Wrapped {
+        rows,
+        prompt_prefix,
+        cursor_row,
+        cursor_col,
+    }
+}
+
+/// Split a string into its first `at` characters and the rest.
+///
+/// By character, not by byte: a multi-byte character split down the middle is a panic, and the
+/// prompt is arbitrary text.
+fn split_at_chars(text: &str, at: usize) -> (&str, &str) {
+    let byte = text.char_indices().nth(at).map_or(text.len(), |(index, _)| index);
+    text.split_at(byte)
 }
 
 /// The key hints that fit on the note row, after the note itself.
@@ -1874,5 +2098,126 @@ mod tests {
         // The marker is what distinguishes a prompt from a reply, so it is present even
         // when colour is off — which is why it is built before any styling is applied.
         assert!(body.starts_with("> "), "{body}");
+    }
+    /// A short prompt and an empty buffer is one row, which is what the viewport has always been
+    /// sized for. If this regressed, every session would grow the prompt area for nothing.
+    #[test]
+    fn a_short_prompt_is_one_row() {
+        let w = wrap_prompt("> ", "", "", 40);
+        assert_eq!(w.rows, ["> "]);
+        assert_eq!(w.cursor_row, 0);
+        assert_eq!(w.cursor_col, 2, "past the prompt, where typing lands");
+    }
+
+    /// Text longer than the terminal wraps onto more rows, and the prompt is part of the text —
+    /// it is the first characters of the first row, not a fixed-width gutter that the wrapping
+    /// has to account for separately.
+    #[test]
+    fn a_long_line_wraps_onto_more_rows() {
+        // 4 columns, prompt is 2, so 2 columns of text per row.
+        let w = wrap_prompt("> ", "abcd", "", 4);
+        assert_eq!(w.rows, ["> ab", "cd"]);
+        assert_eq!(w.cursor_row, 1, "the cursor is past the wrapped text");
+        assert_eq!(w.cursor_col, 2);
+        // The prompt's own characters are marked so they can be styled, and only in the first row.
+        assert_eq!(w.prompt_prefix, [2, 0]);
+    }
+
+    /// A newline in the buffer starts a new row, regardless of how much room was left. This is
+    /// the whole point of Shift+Enter: the operator decides where the line ends.
+    #[test]
+    fn a_newline_starts_a_row() {
+        let w = wrap_prompt("> ", "ab\ncd", "", 40);
+        assert_eq!(w.rows, ["> ab", "cd"]);
+        assert_eq!(w.prompt_prefix, [2, 0]);
+        assert_eq!((w.cursor_row, w.cursor_col), (1, 2));
+    }
+
+    /// A blank line in the middle is a row of its own — collapsing it would silently rewrite the
+    /// prompt the operator typed.
+    #[test]
+    fn a_blank_line_is_its_own_row() {
+        let w = wrap_prompt("> ", "a\n\nb", "", 40);
+        assert_eq!(w.rows, ["> a", "", "b"]);
+        assert_eq!(w.rows.len(), 3);
+    }
+
+    /// The cursor lands at the end of the row the newline ends, not at the start of the next row.
+    /// This is the case that is easy to get wrong by exactly one, and it is visible: the cursor
+    /// appears on the wrong line while typing a multi-line prompt.
+    #[test]
+    fn the_cursor_sits_before_a_newline_it_is_on() {
+        // Cursor between "ab" and "\ncd" — index 5 of "> ab\ncd" is offset 2 into the text.
+        let w = wrap_prompt("> ", "ab", "\ncd", 40);
+        assert_eq!((w.cursor_row, w.cursor_col), (0, 4), "end of the first row");
+    }
+
+    /// A cursor at the very end of a full row wraps to the start of the next one, which is where
+    /// a terminal would show it — putting it past the last column would be off the drawing area,
+    /// since columns are `0..width`.
+    #[test]
+    fn the_cursor_at_a_full_row_wraps_to_the_next_one() {
+        // Prompt 2 + buffer 2 fills a 4-column row exactly.
+        let w = wrap_prompt("> ", "ab", "", 4);
+        // The second row is empty and exists only to hold the cursor; without it the cursor would
+        // have to be drawn one column past the end of the row.
+        assert_eq!(w.rows, ["> ab", ""]);
+        assert_eq!((w.cursor_row, w.cursor_col), (1, 0), "wrapped to a fresh row");
+    }
+
+    /// Every row is at most the terminal's width. If this ever fails, the prompt would overwrite
+    /// the rows above the viewport instead of wrapping inside it.
+    #[test]
+    fn no_row_is_wider_than_the_terminal() {
+        let text = "the quick brown fox jumps over the lazy dog and keeps on going";
+        for width in 1..40 {
+            let w = wrap_prompt("> ", text, "", width);
+            for row in &w.rows {
+                assert!(row.chars().count() <= width.max(1), "row {row:?} exceeds width {width}");
+            }
+            // And nothing is lost in the wrapping: the rows are exactly the input, re-broken.
+            let joined: String = w.rows.concat();
+            assert_eq!(joined, format!("> {text}"), "width {width} lost or gained text");
+        }
+    }
+
+    /// A zero-width terminal must not panic or loop — the width comes from the terminal, and a
+    /// resize to nothing is possible mid-draw.
+    #[test]
+    fn a_zero_width_terminal_does_not_panic() {
+        let w = wrap_prompt("> ", "abc", "", 0);
+        assert!(w.cursor_row < w.rows.len());
+        let w = wrap_prompt("", "", "", 0);
+        assert_eq!(w.rows, [""]);
+        assert_eq!((w.cursor_row, w.cursor_col), (0, 0));
+    }
+
+    /// The cursor is always inside the rows that are drawn. The drawing code uses this to place
+    /// the terminal cursor, so a row past the end would put it off-screen.
+    #[test]
+    fn the_cursor_is_always_within_the_rows() {
+        for (prompt, before, after) in [
+            ("> ", "", ""),
+            ("> ", "abc", ""),
+            ("> ", "", "abc"),
+            ("> ", "a", "b"),
+            ("", "\n\n", ""),
+            ("long prompt here", "text\nmore", "\n"),
+        ] {
+            for width in 1..12 {
+                let w = wrap_prompt(prompt, before, after, width);
+                let row = w.rows.get(w.cursor_row);
+                assert!(
+                    row.is_some(),
+                    "{prompt:?}/{before:?}/{after:?} @{width}: row out of range"
+                );
+                assert!(
+                    w.cursor_col <= row.unwrap().chars().count(),
+                    "{prompt:?}/{before:?}/{after:?} @{width}: col {} past row {:?}",
+                    w.cursor_col,
+                    row.unwrap()
+                );
+            }
+        }
     }
 }

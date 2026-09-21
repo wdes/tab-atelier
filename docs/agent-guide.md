@@ -20,6 +20,18 @@ until the current turn finishes, so the transcript stays in the order you asked 
 `Ctrl-C` aborts the turn and clears anything queued — the queued lines are in your history,
 so the up arrow brings them back.
 
+A prompt can be several lines. **Shift+Enter** (or **Alt+Enter**) inserts a newline instead
+of sending, so you can lay out a list or a small script and send it whole; Enter is still
+what sends. A newline does not submit, so a pasted block of several lines arrives as one
+message rather than sending itself at the first line break.
+
+Anything longer than the terminal is wide wraps onto the next row, and the prompt area
+reserves room for several rows, so a long or multi-line prompt stays readable while you
+write it. Past that it scrolls inside the prompt area, keeping the row you are typing on.
+
+Shift+Enter needs the terminal to report it distinctly, which most modern ones do; where it
+does not, Alt+Enter always works.
+
 `Ctrl-D` leaves. `Ctrl-U`, `Ctrl-W`, `Ctrl-A`, `Ctrl-E` and the arrows work as they do in
 a shell, and history is per session.
 

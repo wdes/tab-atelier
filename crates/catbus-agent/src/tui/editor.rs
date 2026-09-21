@@ -100,18 +100,59 @@ impl Editor {
         self.browsing = None;
     }
 
-    /// Append text, as a paste does. Newlines become spaces.
+    /// Append text, as a paste does.
     ///
-    /// A pasted multi-line block must not submit itself on its first newline, and a
-    /// buffer holding newlines would need a multi-line input area to be readable at
-    /// all. Folding them to spaces keeps one logical line — which is what a prompt
-    /// is — and is the behaviour the operator gets from a shell's bracketed paste.
+    /// Newlines are kept. They used to be folded to spaces, on the reasoning that a
+    /// buffer holding newlines "would need a multi-line input area to be readable" —
+    /// which the prompt now has, so the reason is gone. Folding also quietly rewrote
+    /// what was pasted: a block of shell commands or a list pasted into a prompt arrived
+    /// as one long sentence, and there was no way to say otherwise.
+    ///
+    /// Submitting on the first newline is still avoided, and avoided a different way:
+    /// this is a paste *event*, not a run of keypresses, so nothing here can submit.
+    /// `\r\n` is normalised to `\n` so a paste from another terminal does not end up
+    /// with a stray carriage return that would rewind the cursor when drawn.
     pub fn paste(&mut self, text: &str) {
-        for ch in text.chars() {
-            let ch = if ch == '\n' || ch == '\r' { ' ' } else { ch };
+        let mut chars = text.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '\r' {
+                // A lone `\r` is a newline too; a `\r\n` pair is one newline, not two.
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                self.chars.insert(self.cursor, '\n');
+                self.cursor += 1;
+                continue;
+            }
             self.chars.insert(self.cursor, ch);
             self.cursor += 1;
         }
+    }
+
+    /// A newline at the cursor, as Shift+Enter inserts.
+    ///
+    /// The newline is an ordinary character in `chars`, which is the whole trick: every
+    /// editing primitive here is written against character indices and keeps working
+    /// unchanged. Only *drawing* cares where the lines fall, and that lives in the UI.
+    pub fn newline(&mut self) {
+        self.chars.insert(self.cursor, '\n');
+        self.cursor += 1;
+        self.browsing = None;
+    }
+
+    /// Split at the cursor: the text before it, and the text after.
+    ///
+    /// The two halves join back into exactly `line()` with the cursor between them, so a
+    /// caller can lay each out as its own wrapped block without this having to know
+    /// anything about columns. Keeping the cursor *between* the halves rather than inside
+    /// one of them is what lets the caller place it unambiguously.
+    #[must_use]
+    pub fn line_at_cursor(&self) -> (String, String) {
+        let cursor = self.cursor.min(self.chars.len());
+        (
+            self.chars[..cursor].iter().collect(),
+            self.chars[cursor..].iter().collect(),
+        )
     }
 
     /// The history, oldest first.
@@ -129,9 +170,19 @@ impl Editor {
     pub fn handle(&mut self, key: KeyEvent) -> Action {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
 
         match key.code {
-            KeyCode::Enter if ctrl || alt => Action::Continue,
+            // A newline, not a submit, so a prompt can be several lines. Shift is the key that
+            // means this; Alt is taken as well because a terminal only reports Shift+Enter
+            // distinctly if it implements the keyboard-enhancement protocol, while Alt+Enter
+            // has a classic encoding every terminal already sends. Ctrl+Enter stays ignored: it
+            // has no agreed meaning, and inventing one would be worse than doing nothing.
+            KeyCode::Enter if shift || alt => {
+                self.newline();
+                Action::Continue
+            }
+            KeyCode::Enter if ctrl => Action::Continue,
             // Three encodings of "the line is finished", and they are not
             // interchangeable by accident:
             //
@@ -545,15 +596,22 @@ mod tests {
         assert_eq!(e.history()[0], format!("line {}", 20));
     }
 
-    /// Pasting several lines must not submit on the first newline, and must not
-    /// leave newlines in a buffer that renders as one line.
+    /// Pasting several lines must not submit on the first newline — the block arrives whole, and
+    /// it is the *next* Enter that sends it. This used to be guaranteed by stripping the
+    /// newlines; now they are kept, so the guarantee rests on paste being a paste event and not a
+    /// run of keypresses.
     #[test]
-    fn a_paste_folds_newlines_and_never_submits() {
+    fn a_paste_keeps_newlines_and_never_submits() {
         let mut e = Editor::new();
         e.paste("first line\nsecond line\r\nthird");
-        assert_eq!(e.line(), "first line second line  third");
-        assert!(!e.line().contains('\n'), "a rendered line cannot hold newlines");
-        assert!(!e.is_blank(), "a pasted block leaves a non-blank line");
+        // The whole block is still in the buffer: nothing was consumed as a submission.
+        assert_eq!(e.line(), "first line\nsecond line\nthird");
+        assert!(!e.is_blank(), "a pasted block leaves a non-blank buffer");
+        // And it takes an explicit Enter to send it, newlines and all.
+        assert_eq!(
+            e.handle(key(KeyCode::Enter)),
+            Action::Submit("first line\nsecond line\nthird".into())
+        );
     }
 
     /// Every cursor position is a character boundary, so multibyte text cannot be
@@ -594,5 +652,140 @@ mod tests {
         assert_eq!(e.line(), "");
         assert_eq!(e.cursor(), 0);
         assert!(e.is_blank());
+    }
+    fn with_mods(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, modifiers)
+    }
+
+    /// Shift+Enter is a newline, not a submit — the whole point of multi-line prompts. It must
+    /// not submit, and it must not be swallowed either: the newline has to land in the buffer.
+    #[test]
+    fn shift_enter_inserts_a_newline_instead_of_submitting() {
+        let mut e = Editor::new();
+        type_text(&mut e, "first");
+        assert_eq!(
+            e.handle(with_mods(KeyCode::Enter, KeyModifiers::SHIFT)),
+            Action::Continue,
+            "Shift+Enter must not submit"
+        );
+        type_text(&mut e, "second");
+        assert_eq!(e.line(), "first\nsecond");
+        // And Enter still submits the whole thing, newline included — the newline is part of
+        // the prompt, not a formatting device the editor strips.
+        assert_eq!(e.handle(key(KeyCode::Enter)), Action::Submit("first\nsecond".into()));
+    }
+
+    /// Alt+Enter does the same, because a terminal only reports Shift+Enter distinctly if it
+    /// implements the keyboard-enhancement protocol, while Alt+Enter has a classic encoding
+    /// every terminal already sends. Operators on a terminal that cannot do CSI-u still get a
+    /// newline.
+    #[test]
+    fn alt_enter_also_inserts_a_newline() {
+        let mut e = Editor::new();
+        type_text(&mut e, "a");
+        assert_eq!(e.handle(with_mods(KeyCode::Enter, KeyModifiers::ALT)), Action::Continue);
+        type_text(&mut e, "b");
+        assert_eq!(e.line(), "a\nb");
+    }
+
+    /// Ctrl+Enter has no agreed meaning, so it does nothing rather than guessing one — and in
+    /// particular it must not submit, since a terminal that reports every modifier distinctly
+    /// would otherwise turn a stray modifier into a sent prompt.
+    #[test]
+    fn ctrl_enter_neither_submits_nor_inserts() {
+        let mut e = Editor::new();
+        type_text(&mut e, "keep me");
+        assert_eq!(
+            e.handle(with_mods(KeyCode::Enter, KeyModifiers::CONTROL)),
+            Action::Continue
+        );
+        assert_eq!(e.line(), "keep me", "nothing inserted");
+    }
+
+    /// A pasted block keeps its newlines. It used to have them folded to spaces, which quietly
+    /// rewrote what was pasted: a list of shell commands arrived as one long sentence.
+    #[test]
+    fn a_pasted_block_keeps_its_newlines() {
+        let mut e = Editor::new();
+        e.paste("cargo fmt\ncargo clippy\ncargo test");
+        assert_eq!(e.line(), "cargo fmt\ncargo clippy\ncargo test");
+        assert_eq!(e.cursor(), e.line().chars().count(), "cursor ends after the paste");
+    }
+
+    /// A paste from another terminal arrives with CRLF. Both bytes are one newline, and the CR
+    /// must not survive: a stray carriage return would make the drawn line rewind.
+    #[test]
+    fn paste_normalises_carriage_returns() {
+        let mut e = Editor::new();
+        e.paste("one\r\ntwo\rthree");
+        assert_eq!(e.line(), "one\ntwo\nthree");
+        assert!(!e.line().contains('\r'), "no carriage returns survive");
+    }
+
+    /// The drawing code needs the buffer either side of the cursor, so it can lay each half out
+    /// without knowing anything about columns. The two halves must rejoin into the whole buffer.
+    #[test]
+    fn the_cursor_splits_the_buffer_for_drawing() {
+        let mut e = Editor::new();
+        e.set_line("abc\ndef");
+        // `set_line` leaves the cursor at the end.
+        assert_eq!(e.line_at_cursor(), ("abc\ndef".to_owned(), String::new()));
+        assert_eq!(e.cursor(), 7);
+
+        // Four lefts: index 3, which is the end of the first row — the boundary the split has to
+        // get right, because the newline itself sits between the halves.
+        for _ in 0..4 {
+            e.handle(key(KeyCode::Left));
+        }
+        assert_eq!(e.line_at_cursor(), ("abc".to_owned(), "\ndef".to_owned()));
+
+        // And one more, index 2: mid-row, with the newline in the trailing half.
+        e.handle(key(KeyCode::Left));
+        assert_eq!(e.line_at_cursor(), ("ab".to_owned(), "c\ndef".to_owned()));
+
+        // The halves always rejoin into the whole buffer, wherever the cursor is.
+        let (before, after) = e.line_at_cursor();
+        assert_eq!(format!("{before}{after}"), e.line());
+    }
+
+    /// Backspace at the start of a line joins it to the previous one, and the newline itself is
+    /// what gets deleted — an editor that left the newline behind would grow a blank line.
+    #[test]
+    fn backspace_across_a_newline_joins_the_lines() {
+        let mut e = Editor::new();
+        type_text(&mut e, "first");
+        e.handle(with_mods(KeyCode::Enter, KeyModifiers::SHIFT));
+        type_text(&mut e, "second");
+        assert_eq!(e.line(), "first\nsecond");
+        // Back over `second`, then over the newline itself.
+        for _ in 0.."second".len() {
+            e.handle(key(KeyCode::Backspace));
+        }
+        assert_eq!(e.line(), "first\n");
+        e.handle(key(KeyCode::Backspace));
+        assert_eq!(e.line(), "first", "the newline goes, joining the lines");
+    }
+
+    /// A multi-line prompt that is only newlines and spaces is still blank, so Enter on it is
+    /// refused like any other blank line — otherwise a stray Shift+Enter plus Enter would send
+    /// an empty message, which is a 400.
+    #[test]
+    fn a_whitespace_only_multi_line_buffer_is_still_blank() {
+        let mut e = Editor::new();
+        e.paste("\n   \n");
+        assert!(e.is_blank());
+        assert_eq!(e.handle(key(KeyCode::Enter)), Action::Continue);
+    }
+    /// Spaces are ordinary characters and must survive typing, including several in a row. The
+    /// prompt is prose; collapsing or dropping whitespace would silently rewrite what was sent.
+    #[test]
+    fn typing_keeps_spaces_exactly() {
+        let mut e = Editor::new();
+        type_text(&mut e, "first line");
+        assert_eq!(e.line(), "first line");
+        type_text(&mut e, "   double gap");
+        assert_eq!(e.line(), "first line   double gap");
+        // Three gaps: one between the words, three from the second group, one before "gap".
+        assert_eq!(e.line().matches(' ').count(), 5);
     }
 }
