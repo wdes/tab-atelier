@@ -101,7 +101,7 @@ Always pass `-p tab-atelier` — a bare `cargo deb` in this workspace can packag
 **Session**
 - Tabs, working directories, and full terminal output persisted across restarts
 - Active tab selection restored on startup
-- **Agent auto-resume**: tabs that were running `catbus-agent` or `claude` at last save reopen with `catbus-agent --resume <uuid>` / `claude --resume <uuid>` typed into the freshly-spawned shell
+- **Agent auto-resume**: tabs that were running `catbus-agent`, `claude` or `codex` at last save reopen with `catbus-agent --resume <uuid>` / `claude --resume <uuid>` / `codex resume <uuid>` typed into the freshly-spawned shell
 
 **Preferences**
 - Theme selection (Dark, Tomorrow Night Blue, Light)
@@ -620,7 +620,15 @@ When a tab carries both `agent_kind` and `agent_session_id` in `tabs.json`, the 
 |---|---|
 | `catbus` | `catbus-agent --resume <uuid>` (plus ` --plan` if the agent was in plan mode at save time) |
 | `claude` | `claude --resume <uuid>` |
+| `codex` | `codex resume <uuid>` |
 | anything else | no-op |
+
+The shape differs per CLI: Claude takes a `--resume` **flag**, codex a `resume`
+**subcommand**. Codex has no hook wired on this machine, so `agent_session_id` is
+discovered by matching the tab's working directory against the `session_meta`
+header of its rollouts (`~/.codex/sessions/…/rollout-*.jsonl`). Launch it through
+`scripts/codex-agent.sh` to have that stamped, along with a state and a label.
+See [docs/agent-support-research.md](docs/agent-support-research.md).
 
 If the agent CLI is no longer on `PATH`, the shell prints `command not found` and the tab is otherwise unaffected.
 
