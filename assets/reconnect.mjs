@@ -226,6 +226,11 @@ function loadViewer() {
     sockets.length = 0;
     requests.length = 0;
     timers.length = 0;
+    // Key handlers registered on the terminal, so a test can invoke the real one rather than a
+    // copy of its logic. `stub()` is a Proxy whose `set` trap accepts and discards, so assigning
+    // the handler onto the stub and reading it back would return another stub — the Terminal stub
+    // therefore wraps it in a Proxy that keeps the one function we need.
+    const keyHandlers = [];
     const document = fakeDocument();
     const sandbox = {
         TAB: { key: "12", name: "a tab", buildHash: "test" },
@@ -242,7 +247,20 @@ function loadViewer() {
         WebSocket: FakeSocket,
         XMLHttpRequest: FakeXhr,
         FormData: function () { return { append: () => {} }; },
-        Terminal: function () { return stub("term"); },
+        Terminal: function () {
+            const term = stub("term");
+            // `attachCustomKeyEventHandler` is a *method* in xterm.js — the viewer registers its
+            // handler by calling `term.attachCustomKeyEventHandler(fn)`, not by assignment — so the
+            // handler has to be captured on `get`. A set trap would silently capture nothing, and
+            // the test would then pass by asserting against a handler that was never registered.
+            return new Proxy(term, {
+                get: (target, key) =>
+                    key === "attachCustomKeyEventHandler"
+                        ? (fn) => { keyHandlers.push(fn); }
+                        : Reflect.get(target, key),
+                set: () => true,
+            });
+        },
         requestAnimationFrame: (fn) => fn(),
         fetch: () => Promise.resolve(stub("response")),
         // Timers are captured rather than scheduled so a reconnect can be stepped through without
@@ -277,7 +295,7 @@ function loadViewer() {
     vm.createContext(sandbox);
     // The script ends by calling `connect()`, so loading it is the first connection.
     vm.runInContext(source, sandbox, { filename: "main.js" });
-    return { sandbox, document };
+    return { sandbox, document, keyHandlers };
 }
 
 // --- assertions ---------------------------------------------------------------
@@ -454,6 +472,76 @@ line`,
         "a failed upload does not keep its progress either",
         !status.textContent.includes("uploading"),
         `the status line kept ${JSON.stringify(status.textContent)}`,
+    );
+}
+
+// --- Shift+Enter: a newline, not a submit -------------------------------------
+//
+// xterm.js sends a bare `\r` for Shift+Enter, which is indistinguishable from Enter, so the
+// newline has to be encoded in the viewer. These checks cover both halves: that the decision is
+// right, and that the decision is actually wired to the wire — the second is the one that fails
+// silently when a handler is registered but never consulted.
+
+{
+    const { sandbox, keyHandlers } = loadViewer();
+
+    // The pure decision, called directly. `\x1b[13;2u` is kitty-protocol Enter with the shift
+    // modifier, which is what tab-atelier emits and crossterm decodes.
+    const shifted = sandbox.shiftEnterBytes({ key: "Enter", shiftKey: true });
+    check(
+        "Shift+Enter encodes as the kitty-protocol sequence",
+        shifted instanceof Uint8Array
+            && Array.from(shifted).join(",") === "27,91,49,51,59,50,117",
+        `got ${shifted ? Array.from(shifted).join(",") : String(shifted)}`,
+    );
+    check(
+        "a plain Enter is left to xterm",
+        sandbox.shiftEnterBytes({ key: "Enter", shiftKey: false }) === null,
+        "plain Enter must not be intercepted, or submitting would break",
+    );
+    check(
+        "no other key is intercepted",
+        sandbox.shiftEnterBytes({ key: "a", shiftKey: true }) === null
+            && sandbox.shiftEnterBytes({ key: "Tab", shiftKey: true }) === null,
+        "Shift+A and Shift+Tab must not become newlines",
+    );
+    check(
+        "an absent event does not throw",
+        sandbox.shiftEnterBytes(undefined) === null && sandbox.shiftEnterBytes(null) === null,
+        "the handler is called with whatever the browser passes",
+    );
+
+    // The wiring: the handler the viewer registered has to route Shift+Enter to the socket and
+    // stop xterm emitting its own `\r` as well.
+    check(
+        "the viewer registers a key handler",
+        keyHandlers.length === 1,
+        `expected one handler, found ${keyHandlers.length}`,
+    );
+    const socket = sockets.at(-1);
+    socket.readyState = FakeSocket.OPEN;
+    const consumed = keyHandlers[0]({ type: "keydown", key: "Enter", shiftKey: true, preventDefault() {}, stopPropagation() {} });
+    const frame = socket.sent.at(-1);
+    check(
+        "Shift+Enter is sent and consumed",
+        consumed === false && frame && frame[0] === 0x01
+            && Array.from(frame.slice(1)).join(",") === "27,91,49,51,59,50,117",
+        `consumed=${consumed} frame=${frame ? Array.from(frame).join(",") : "none"}`,
+    );
+    check(
+        "Shift+Enter does not also send a carriage return",
+        socket.sent.length === 1,
+        `expected one frame, got ${socket.sent.length}`,
+    );
+
+    // And a plain Enter must fall through to xterm rather than being swallowed, or nothing
+    // would ever submit.
+    const before = socket.sent.length;
+    const passed = keyHandlers[0]({ type: "keydown", key: "Enter", shiftKey: false, preventDefault() {}, stopPropagation() {} });
+    check(
+        "a plain Enter falls through to xterm",
+        passed === true && socket.sent.length === before,
+        `returned ${passed} after ${socket.sent.length - before} extra frames`,
     );
 }
 

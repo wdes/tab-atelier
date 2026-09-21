@@ -308,6 +308,24 @@
           ev.preventDefault();
           return true;
         }
+        // Shift+Enter: a newline in the prompt rather than a submit.
+        //
+        // xterm.js has no binding for this and would send a bare `\r`, which
+        // is indistinguishable from Enter — so the choice has to be encoded
+        // here or not at all. `\x1b[13;2u` is the kitty-protocol form for
+        // Shift+Enter, the same one tab-atelier's `keystroke_to_bytes` emits
+        // when an app asks for it. Returning false suppresses xterm's own
+        // output, so the terminal receives one sequence and not two.
+        //
+        // The server needs no change: frames go to the pty as bytes, and
+        // `ImeDedup` passes anything starting with ESC straight through.
+        const newlineBytes = shiftEnterBytes(ev);
+        if (newlineBytes) {
+          ev.preventDefault();
+          ev.stopPropagation();
+          sendInputBytes(newlineBytes);
+          return false;
+        }
         return true;
       });
     }
@@ -386,7 +404,7 @@
           payload = "\x1b" + payload;
         }
         const enc = new TextEncoder().encode(payload);
-        try { ws.send(encodeFrame(0x01, enc)); } catch {}
+        sendInputBytes(enc);
         if (ctrlSticky) { ctrlSticky = false; }
         if (altSticky) { altSticky = false; }
         renderKbdHeader();
@@ -413,6 +431,10 @@
         // Shift+Tab / back-tab (CSI Z). A soft keyboard can't produce it, and
         // Claude Code uses it to cycle modes — so give mobile a dedicated key.
         { label: "⇧TAB", bytes: "\x1b[Z" },
+        // Shift+Enter: a newline in the prompt rather than a submit. A soft
+        // keyboard cannot send a modified Enter at all, and the kitty-protocol
+        // form is the only encoding that distinguishes it from plain Enter.
+        { label: "⇧⏎", bytes: "\x1b[13;2u" },
         { label: "CTRL", type: "ctrl" },
         { label: "ALT", type: "alt" },
         { icon: "←", bytes: "\x1b[D" },
@@ -689,9 +711,8 @@
         e.preventDefault();
         const landed = await uploadFiles(files, { rename: true });
         if (!landed.length) return;
-        if (serverLocked || !ws || ws.readyState !== WebSocket.OPEN) return;
         const text = landed.join(" ") + " ";
-        try { ws.send(encodeFrame(0x01, new TextEncoder().encode(text))); } catch { /* swallow */ }
+        sendInputBytes(new TextEncoder().encode(text));
       });
       // Mobile / touch fallback: the hidden <input type=file> opens the
       // system picker (files, Photos, Drive, …); the ⬆-upload toolbar button
@@ -1246,6 +1267,39 @@
       return out;
     }
 
+    // Send keystrokes to the pty, if there is anything to send them to.
+    //
+    // One path for input bytes: `term.onData`, the mobile key toolbar and the
+    // Shift+Enter handler all go through here, so "is the socket usable" cannot
+    // be forgotten at one of them. A send on a closed socket throws, and
+    // swallowing that silently means a keystroke disappears with no symptom —
+    // so the guard is in one place that is easy to read rather than three that
+    // have to agree.
+    function sendInputBytes(bytes) {
+      if (serverLocked) return;
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      try { ws.send(encodeFrame(0x01, bytes)); } catch { /* link died mid-send */ }
+    }
+
+    // The bytes for a Shift+Enter, or null for any other key.
+    //
+    // A pure function so the decision can be tested without a terminal
+    // (`assets/reconnect.mjs` calls it directly). It has to exist because
+    // xterm.js sends a bare `\r` for Shift+Enter, making it indistinguishable
+    // from Enter — the newline has to be encoded here or not at all.
+    //
+    // `\x1b[13;2u` is the kitty-protocol form: key code 13 (Enter), modifier 2
+    // (shift). It is what tab-atelier's `keystroke_to_bytes` emits when an
+    // application has asked for disambiguated keys, and what crossterm decodes
+    // into `Enter` + SHIFT, which is what the prompt listens for.
+    //
+    // `ev.shiftKey && ev.key === "Enter"` and not `isComposing`: an IME-entered
+    // Enter is a real Enter and should submit.
+    function shiftEnterBytes(ev) {
+      if (!ev || ev.key !== "Enter" || !ev.shiftKey) return null;
+      return Uint8Array.from([0x1b, 0x5b, 0x31, 0x33, 0x3b, 0x32, 0x75]);
+    }
+
     // Tell the server the user FOCUSED this tab (tag 0x0b, payload-less), which
     // is what updates the "last used" / MRU ordering. Sent only when we're
     // actually looking at the tab (page visible), so a background reconnect
@@ -1406,11 +1460,9 @@
       term.onData(data => {
         // xterm.js's disableStdin should already suppress these, but
         // a tab that locks mid-session may have keypresses already
-        // in flight. Also short-circuit if the socket isn't open.
+        // in flight.
         if (serverLocked) return;
-        if (!ws || ws.readyState !== WebSocket.OPEN) return;
-        const payload = new TextEncoder().encode(data);
-        try { ws.send(encodeFrame(0x01, payload)); } catch { /* swallow */ }
+        sendInputBytes(new TextEncoder().encode(data));
         // Timestamp for the RTT estimate (every key), then optimistically
         // echo it locally if predictions are active.
         predSentAt = performance.now();
