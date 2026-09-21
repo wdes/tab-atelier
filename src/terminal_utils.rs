@@ -21,6 +21,13 @@ const fn xterm_modifier(ks: &Keystroke) -> u8 {
 }
 
 // Based on Zed's crates/terminal/src/mappings/keys.rs (Apache-2.0 / GPL-3.0)
+//
+// The classic encodings are ambiguous for modified keys — a modified Enter has no representation
+// at all, and Shift+Tab only got one by convention (`\x1b[Z`) — so an application that wants to
+// tell them apart pushes the "disambiguate escape codes" keyboard mode, and keys are then sent in
+// the CSI-u form. `mode` carries that flag in from the grid, so this emits CSI-u only for an
+// application that asked for it, and the legacy bytes otherwise. Getting that condition wrong is
+// invisible to this function's tests and breaks the prompt of every application that did not ask.
 pub fn keystroke_to_bytes(ks: &Keystroke, mode: TermMode) -> Option<Vec<u8>> {
     let key = ks.key.as_str();
     let ctrl = ks.modifiers.control;
@@ -28,8 +35,17 @@ pub fn keystroke_to_bytes(ks: &Keystroke, mode: TermMode) -> Option<Vec<u8>> {
     let shift = ks.modifiers.shift;
     let has_mod = ctrl || alt || shift;
     let app_cursor = mode.contains(TermMode::APP_CURSOR);
+    // An application that pushed the "disambiguate escape codes" keyboard mode wants
+    // modified keys in the CSI-u form, because the legacy encodings are ambiguous: a
+    // modified Enter has no classic representation at all. Enter is `13`, and the modifier
+    // field is the same 1-based sum `xterm_modifier` already computes.
+    let disambiguate = mode.contains(TermMode::DISAMBIGUATE_ESC_CODES);
 
     let bytes = match key {
+        "enter" if disambiguate && has_mod => format!("\x1b[13;{m}u", m = xterm_modifier(ks)).into_bytes(),
+        // Legacy forms, for applications that have not asked for CSI-u. Shift+Enter is `\x0a`
+        // here and not `\r`, which is the whole reason a multi-line prompt can work — but it
+        // only helps if the reader can tell them apart, which is what the CSI-u arm is for.
         "enter" if shift => b"\x0a".to_vec(),
         "enter" if alt => b"\x1b\x0d".to_vec(),
         "enter" => b"\r".to_vec(),
@@ -245,6 +261,69 @@ mod tests {
             keystroke_to_bytes(&ks("enter", None, alt()), NORMAL),
             Some(b"\x1b\x0d".to_vec())
         );
+    }
+
+    /// When the application has asked for disambiguated escape codes, a modified Enter goes out
+    /// as CSI-u. This is what makes Shift+Enter distinguishable from Enter at all: the legacy
+    /// pair above is `\x0a` versus `\r`, and most terminal libraries fold both into one key.
+    #[test]
+    fn modified_enter_is_csi_u_when_disambiguated() {
+        const DIS: TermMode = TermMode::DISAMBIGUATE_ESC_CODES;
+        assert_eq!(
+            keystroke_to_bytes(&ks("enter", None, shift()), DIS),
+            Some(b"\x1b[13;2u".to_vec())
+        );
+        assert_eq!(
+            keystroke_to_bytes(&ks("enter", None, alt()), DIS),
+            Some(b"\x1b[13;3u".to_vec())
+        );
+        assert_eq!(
+            keystroke_to_bytes(&ks("enter", None, ctrl()), DIS),
+            Some(b"\x1b[13;5u".to_vec())
+        );
+        assert_eq!(
+            keystroke_to_bytes(&ks("enter", None, ctrl_shift()), DIS),
+            Some(b"\x1b[13;6u".to_vec())
+        );
+    }
+
+    /// Unmodified Enter is `\r` whether or not disambiguation is on. An application that enabled
+    /// CSI-u still has to be sent the bare carriage return for its own yes/no prompts, and a
+    /// CSI-u `\x1b[13u` there would be read as nothing at all.
+    #[test]
+    fn unmodified_enter_stays_a_carriage_return() {
+        assert_eq!(
+            keystroke_to_bytes(&ks("enter", None, no_mod()), TermMode::DISAMBIGUATE_ESC_CODES),
+            Some(b"\r".to_vec())
+        );
+    }
+
+    /// `DISAMBIGUATE_ESC_CODES` is a *keyboard* mode, so it must not disturb anything else. This
+    /// is the guard against the change above leaking into every other key: with the flag set,
+    /// every other keystroke has to encode exactly as it does without it.
+    #[test]
+    fn the_disambiguate_flag_changes_only_enter() {
+        const DIS: TermMode = TermMode::DISAMBIGUATE_ESC_CODES;
+        for (key, char_, mods) in [
+            ("tab", None, no_mod()),
+            ("tab", None, shift()),
+            ("escape", None, no_mod()),
+            ("up", None, no_mod()),
+            ("down", None, ctrl()),
+            ("left", None, alt()),
+            ("right", None, shift()),
+            ("home", None, no_mod()),
+            ("backspace", None, no_mod()),
+            ("space", None, no_mod()),
+            ("f5", None, no_mod()),
+            ("a", Some("a"), no_mod()),
+            ("a", Some("a"), ctrl()),
+            ("z", Some("z"), ctrl_shift()),
+        ] {
+            let plain = keystroke_to_bytes(&ks(key, char_, mods), NORMAL);
+            let flagged = keystroke_to_bytes(&ks(key, char_, mods), DIS);
+            assert_eq!(plain, flagged, "{key} encodes differently with the flag set");
+        }
     }
 
     #[test]
