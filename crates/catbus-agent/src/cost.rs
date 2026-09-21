@@ -107,6 +107,24 @@ impl Tokens {
         self.input == 0 && self.output == 0 && self.cache_read == 0 && self.cache_write == 0
     }
 
+    /// Every token of every kind.
+    ///
+    /// The sum is what a *rate* applies to as a whole when no per-kind rate is known, which is the
+    /// case that produced a confusing number: this figure and the `in - out` on the totals line
+    /// counted different things, and neither said which. The difference is the cache, which on a
+    /// session with prompt caching is most of the tokens — so a reader comparing the two had no way
+    /// to reconcile them.
+    #[must_use]
+    pub const fn total(self) -> u64 {
+        self.input + self.output + self.cache_read + self.cache_write
+    }
+
+    /// The cache kinds together, for saying what part of [`Self::total`] the totals line leaves out.
+    #[must_use]
+    pub const fn cached(self) -> u64 {
+        self.cache_read + self.cache_write
+    }
+
     /// The counts, as JSON.
     #[must_use]
     pub fn to_json(self) -> serde_json::Value {

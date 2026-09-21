@@ -1067,14 +1067,8 @@ async fn report_turn(ui: &mut Ui, agent: &Agent, turn: &crate::agent::Turn) -> s
     ))?;
     let costs = agent.costs();
     let (model, amounts, unpriced) = costs.lock().map_or_else(
-        |_| (None, Vec::new(), 0),
-        |c| {
-            (
-                c.model().map(ToOwned::to_owned),
-                c.amounts(),
-                c.unpriced().input + c.unpriced().output + c.unpriced().cache_read + c.unpriced().cache_write,
-            )
-        },
+        |_| (None, Vec::new(), crate::cost::Tokens::default()),
+        |c| (c.model().map(ToOwned::to_owned), c.amounts(), c.unpriced()),
     );
     let line = crate::statusline::cost_line(
         model.as_deref(),

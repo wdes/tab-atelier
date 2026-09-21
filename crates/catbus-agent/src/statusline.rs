@@ -79,19 +79,36 @@ pub const fn mode_label(gate: crate::tools::Gate) -> &'static str {
 /// second is what a zero implies. And tokens no price covered are counted out loud, so a total that
 /// looks low has its explanation on screen rather than inviting the reader to doubt the arithmetic.
 #[must_use]
-pub fn cost_line(model: Option<&str>, amounts: &[(String, f64)], unpriced: u64, width: usize) -> String {
+pub fn cost_line(
+    model: Option<&str>,
+    amounts: &[(String, f64)],
+    unpriced: crate::cost::Tokens,
+    width: usize,
+) -> String {
     let mut out = String::new();
     if let Some(model) = model.filter(|m| !m.is_empty()) {
         out.push_str(model);
     }
 
     let money = if amounts.is_empty() {
-        if unpriced > 0 {
+        if unpriced.is_empty() {
+            // Nothing was counted at all, so there is no cost to claim — the word `no price` over
+            // zero tokens would read as a failure on a session that has not run a turn yet.
+            String::new()
+        } else {
             // Named as unpriced rather than charged: the tokens were counted, and no rate is known
             // for them.
-            format!("no price for {} tokens", crate::statusline::thousands(unpriced))
-        } else {
-            String::new()
+            //
+            // The cache is spelled out when there is any, because otherwise this number looks wrong
+            // next to the totals line — which counts only `in - out`. On a cached session the cache
+            // is most of the total, so the two figures differed by millions with nothing on screen
+            // to explain it. Saying which part is cache makes the arithmetic check out: the four
+            // counts here sum to this number.
+            format!(
+                "no price for {} tokens{}",
+                crate::statusline::thousands(unpriced.total()),
+                cache_note(unpriced)
+            )
         }
     } else {
         amounts
@@ -107,10 +124,14 @@ pub fn cost_line(model: Option<&str>, amounts: &[(String, f64)], unpriced: u64, 
     if !out.is_empty() {
         out.push_str("   ");
     }
-    if !amounts.is_empty() && unpriced > 0 {
+    if !amounts.is_empty() && !unpriced.is_empty() {
         // Both halves matter: what was charged, and what could not be. Built as one string and
         // pushed once rather than `push_str(&format!(..))`, which the lints prefer against.
-        let note = format!("{money}  (+{} tokens unpriced)", crate::statusline::thousands(unpriced));
+        let note = format!(
+            "{money}  (+{} tokens unpriced{})",
+            crate::statusline::thousands(unpriced.total()),
+            cache_note(unpriced)
+        );
         out.push_str(&note);
     } else {
         out.push_str(&money);
@@ -122,6 +143,19 @@ pub fn cost_line(model: Option<&str>, amounts: &[(String, f64)], unpriced: u64, 
         return out;
     }
     out
+}
+
+/// ", of which N cache" when any of the tokens are cache reads or writes, else nothing.
+///
+/// The totals line counts only input and output. Saying which part of *this* figure is cache is what
+/// makes the two reconcilable on screen, instead of leaving the reader to wonder why one number is
+/// several times the other. Empty when there is no cache, so the note does not appear where it would
+/// explain nothing.
+fn cache_note(tokens: crate::cost::Tokens) -> String {
+    if tokens.cached() == 0 {
+        return String::new();
+    }
+    format!(", of which {} cache", crate::statusline::thousands(tokens.cached()))
 }
 
 /// The totals line: tokens left, mode right, padded to `width`.
@@ -558,5 +592,87 @@ mod tests {
             activity.label(THINKING_MARKER, start + Duration::from_secs(5)),
             THINKING
         );
+    }
+    fn tokens(input: u64, output: u64, cache_read: u64, cache_write: u64) -> crate::cost::Tokens {
+        crate::cost::Tokens {
+            input,
+            output,
+            cache_read,
+            cache_write,
+        }
+    }
+
+    /// With no rate known, the line says so and names the total — and the figures have to add up
+    /// against the totals line, which is the bug this exists for.
+    ///
+    /// The totals line counts only input and output. The unpriced figure counts all four kinds,
+    /// because a rate applies to the whole request. On a cached session the cache is most of it, so
+    /// the two numbers differed by millions with nothing on screen to explain why — the broken
+    /// display read `1,520,678 in - 90,732 out` next to `no price for 8,470,892 tokens`.
+    #[test]
+    fn the_unpriced_total_says_how_much_of_it_is_cache() {
+        let line = cost_line(
+            Some("deepseek-flash"),
+            &[],
+            tokens(1_520_678, 90_732, 6_000_000, 859_482),
+            200,
+        );
+        // The total is all four kinds: 1,520,678 + 90,732 + 6,000,000 + 859,482 = 8,470,892.
+        assert!(line.contains("no price for 8,470,892 tokens"), "{line}");
+        assert!(line.contains("deepseek-flash"), "{line}");
+        // And the cache share is named, so the difference from `in - out` is explicable rather than
+        // mysterious. 6,000,000 + 859,482 = 6,859,482.
+        assert!(line.contains("of which 6,859,482 cache"), "{line}");
+        // The arithmetic the reader needs is checkable from the screen: total - cache = in + out.
+        assert_eq!(8_470_892 - 6_859_482, 1_520_678 + 90_732);
+    }
+
+    /// With no cache there is nothing to explain, so the note is absent rather than `of which 0
+    /// cache` — a note that explains nothing is noise.
+    #[test]
+    fn no_cache_means_no_cache_note() {
+        let line = cost_line(Some("gpt-4"), &[], tokens(100, 20, 0, 0), 200);
+        assert!(line.contains("no price for 120 tokens"), "{line}");
+        assert!(!line.contains("cache"), "there is no cache to name: {line}");
+    }
+
+    /// Priced tokens show the money, and unpriced tokens *beside* it — both facts matter, and
+    /// dropping either would hide work that happened.
+    #[test]
+    fn a_priced_mix_still_reports_the_unpriced_remainder() {
+        let amounts = vec![("USD".to_owned(), 1.2345)];
+        let line = cost_line(Some("claude-sonnet-4-6"), &amounts, tokens(500, 100, 2000, 0), 200);
+        assert!(line.contains("USD"), "{line}");
+        assert!(line.contains("1.23"), "{line}");
+        // The remainder is reported with its cache share, since 2,000 of those are cache.
+        assert!(line.contains("+2,600 tokens unpriced"), "{line}");
+        assert!(line.contains("of which 2,000 cache"), "{line}");
+    }
+
+    /// Nothing counted at all produces no cost claim, rather than the word "no price" over zero
+    /// tokens — which would read as a failure on a session that has simply not run a turn yet.
+    #[test]
+    fn nothing_counted_says_nothing() {
+        let line = cost_line(Some("m"), &[], crate::cost::Tokens::default(), 200);
+        assert_eq!(line.trim(), "m");
+        assert!(!line.contains("no price"), "{line}");
+    }
+
+    /// Every kind of token counts towards the unpriced total, so a session that is *all* cache —
+    /// which a cached conversation mostly is — does not report zero.
+    #[test]
+    fn cache_only_tokens_are_not_reported_as_nothing() {
+        let line = cost_line(None, &[], tokens(0, 0, 5_000, 1_000), 200);
+        assert!(line.contains("no price for 6,000 tokens"), "{line}");
+        assert!(line.contains("of which 6,000 cache"), "{line}");
+    }
+
+    /// `cached` is the sum of both cache kinds, which is what the note prints.
+    #[test]
+    fn the_cache_share_is_both_kinds() {
+        assert_eq!(tokens(1, 1, 10, 5).cached(), 15);
+        assert_eq!(tokens(1, 1, 0, 0).cached(), 0);
+        // And the total is everything, cache included.
+        assert_eq!(tokens(1, 1, 10, 5).total(), 17);
     }
 }
