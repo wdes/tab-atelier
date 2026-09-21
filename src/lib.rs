@@ -989,7 +989,11 @@ pub const fn cli_binary_name() -> &'static str {
 /// no spaces, no shell metacharacters, and an unknown verb simply exits 2.
 #[must_use]
 pub fn is_daemon_kind(kind: &str) -> bool {
-    !matches!(kind, "catbus" | "claude")
+    // Kinds handled by an EXTERNAL agent CLI must be listed here, or they fall
+    // through to "daemon" — i.e. they would be relaunched as one of our own
+    // subcommands (`tab-atelier codex`), which does not exist. Adding an agent
+    // therefore means two edits: here and in `build_agent_resume_command`.
+    !matches!(kind, "catbus" | "claude" | "codex")
         && (2..=24).contains(&kind.len())
         && kind.starts_with(|c: char| c.is_ascii_lowercase())
         && kind.chars().all(|c| c.is_ascii_lowercase() || c == '-')
@@ -1020,6 +1024,13 @@ pub fn build_agent_resume_command(kind: &str, session_id: &str, plan: Option<boo
             Some(format!("catbus-agent --resume {session_id}{flag}"))
         }
         "claude" => Some(format!("claude --resume {session_id}")),
+        // Codex resumes through a SUBCOMMAND, not a flag: `codex resume <UUID>`.
+        // The UUID is the one in the rollout filename
+        // (`~/.codex/sessions/<y>/<m>/<d>/rollout-<ts>-<UUID>.jsonl`), also
+        // repeated in its `session_meta` header. Unlike Claude there is no hook
+        // to hand it over, so the tab works it out from the working directory —
+        // see [`codex_session_id_for_dir`].
+        "codex" => Some(format!("codex resume {session_id}")),
         // The ⛑ brain watchdog has no session to resume — it's a standalone
         // tool that re-attaches to every OTHER tab over the local API, so
         // restore just relaunches it. `session_id` is unused. Brain predates
@@ -1385,7 +1396,8 @@ pub struct TabState {
     pub agent_session_id: Option<String>,
     /// Durable — which agent CLI owns the persisted `agent_session_id`.
     /// Known values: "catbus" (catbus-agent), "claude" (official
-    /// Claude Code CLI). Free-form string for future agents.
+    /// Claude Code CLI), "codex" (the `codex` CLI, resumed via
+    /// `codex resume <uuid>`). Free-form string for future agents.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_kind: Option<String>,
     /// Durable — whether the agent was in plan / read-only mode at
@@ -4419,6 +4431,13 @@ mod tests {
             build_agent_resume_command("claude", "sess-1", None).unwrap(),
             "claude --resume sess-1"
         );
+        // Codex resumes through a subcommand, not a flag — the shape differs
+        // from Claude's and is easy to get wrong.
+        assert_eq!(
+            build_agent_resume_command("codex", "01a0b392-2f3b", None).unwrap(),
+            "codex resume 01a0b392-2f3b"
+        );
+        assert!(!is_daemon_kind("codex"));
         assert!(!is_daemon_kind("claude") && !is_daemon_kind("catbus"));
         // Even flagged, anything that isn't a plain lowercase verb is refused:
         // the relaunch is always OUR binary plus one subcommand, leaving no
