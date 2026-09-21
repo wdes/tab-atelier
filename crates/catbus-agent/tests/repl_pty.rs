@@ -210,6 +210,10 @@ fn type_and_expect_at(port: u16, env: &[(&str, &str)], line: &str, expect: &str)
         .env_remove("CLICOLOR")
         .env_remove("CATBUS_ANSI")
         .env_remove("CATBUS_TOOLS_CONFIG")
+        // The log path follows XDG_STATE_HOME, so leaving an operator's value in place would
+        // write the tests' logs into their real state directory — and, worse, make the routing
+        // assertions below depend on whatever they happen to have configured.
+        .env_remove("XDG_STATE_HOME")
         .env_remove("CATBUS_PREFERENCES")
         .args([
             "--new-session",
@@ -248,8 +252,15 @@ fn type_and_expect_at(port: u16, env: &[(&str, &str)], line: &str, expect: &str)
     assert!(ready, "the REPL never drew its prompt; output so far:\n{seen}");
 
     pty.send(&format!("{line}\n"));
-    let matched = pty.drain_until(&mut seen, expect, Duration::from_secs(20));
-    (matched, seen)
+    let on_screen = pty.drain_until(&mut seen, expect, Duration::from_secs(20));
+
+    // The colour and gate verdicts are *log* lines — this helper's caller says so — and the log
+    // now goes to a file rather than the terminal, because a line on the terminal lands
+    // mid-viewport and the TUI will not repaint it. So the file is part of what this reports, or a
+    // test observing a verdict through its log would fail for a reason unrelated to the verdict.
+    let log = std::fs::read_to_string(home.join(".local/state/tab-atelier/catbus-agent.log")).unwrap_or_default();
+    let matched = on_screen || log.contains(expect);
+    (matched, format!("{seen}\n--- log ---\n{log}"))
 }
 
 /// The colour verdict the binary reaches from its environment.
@@ -880,20 +891,22 @@ fn repl_against(port: u16) -> (Pty, KillOnDrop, tempfile::TempDir) {
 
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_catbus-agent"));
     cmd.env("HOME", &home)
-        // Quiet, and not just for tidiness. The agent logs with `tracing` to stdout, and this test
-        // asserts on the rendered screen — but the log writer does not know ratatui owns the
-        // screen, so an INFO line lands wherever the cursor happens to be. Mid-viewport that
-        // overwrites the prompt, and ratatui does not repaint it, because its own buffer still
-        // holds the text it thinks is there. Whether the log arrives before or after a paint is
-        // timing, so at `info` the screen assertions are flaky rather than wrong.
-        //
-        // The underlying defect is real and is not this test's to fix — the agent should route
-        // its logs through `Ui::print_above`, or to a file, once the TUI owns the terminal.
-        .env("RUST_LOG", "error")
+        // Loud, deliberately. This test asserts on the rendered screen, and it used to need
+        // `RUST_LOG=error` to stop an INFO line landing wherever the cursor happened to be and
+        // overwriting the prompt — ratatui will not repaint those cells, because its own buffer
+        // still holds the text it thinks is there. That is fixed: with the TUI up, the log goes to
+        // a file under the temp HOME instead of stderr. Running at `info` is therefore the
+        // regression test for it — if the routing ever reverts, a log line lands mid-viewport and
+        // the screen assertions below fail on the words spliced into the prompt.
+        .env("RUST_LOG", "info")
         .env_remove("NO_COLOR")
         .env_remove("CLICOLOR")
         .env_remove("CATBUS_ANSI")
         .env_remove("CATBUS_TOOLS_CONFIG")
+        // The log path follows XDG_STATE_HOME, so leaving an operator's value in place would
+        // write the tests' logs into their real state directory — and, worse, make the routing
+        // assertions below depend on whatever they happen to have configured.
+        .env_remove("XDG_STATE_HOME")
         .env_remove("CATBUS_PREFERENCES")
         .args([
             "--new-session",
@@ -1139,5 +1152,55 @@ fn shift_enter_puts_a_newline_in_the_prompt() {
     assert!(
         raw.contains(r"first line\nsecond line"),
         "the newline must survive into the request:\n{raw}"
+    );
+}
+
+/// With the TUI up, the log goes to a file — and *not* to the screen.
+///
+/// Both halves are asserted because either alone is satisfiable the wrong way: a log that is never
+/// written at all passes a "screen is clean" check, and a log written to the screen passes a "a
+/// log exists" check. The screen half is the one that was broken in a real session, where an INFO
+/// line landed mid-prompt and ratatui would not repaint it, because its buffer still held the text
+/// it believed was there.
+#[test]
+fn the_tui_writes_its_log_to_a_file_and_not_the_screen() {
+    // Port 9 is the discard port: this test never sends a prompt, so the relay is never contacted.
+    // Not `mut`: this test never sends a key, it only reads what the app drew and logged.
+    let (pty, _child, home) = repl_against(9);
+    let mut seen = String::new();
+    assert!(
+        pty.drain_until(&mut seen, "/help", Duration::from_secs(20)),
+        "the REPL never drew its prompt:\n{seen}"
+    );
+
+    // The child's state dir is under the temp HOME, since the harness clears XDG_STATE_HOME.
+    let log = home.path().join(".local/state/tab-atelier/catbus-agent.log");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut contents = String::new();
+    while Instant::now() < deadline {
+        contents = std::fs::read_to_string(&log).unwrap_or_default();
+        // An `info`-level line proves the file target is what raised the floor, rather than an
+        // empty file having been created and the real logs still going somewhere else.
+        if contents.contains("listening on") || contents.contains("offering") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        !contents.is_empty(),
+        "the agent must log to {} — the file was empty or missing",
+        log.display()
+    );
+    assert!(
+        contents.contains("listening on") || contents.contains("offering"),
+        "the file must carry the info-level lines, not only warnings:\n{contents}"
+    );
+
+    // And nothing of the sort reached the terminal. `env_logger`'s format puts the module path and
+    // the level in every line, so any one of these catches a stray one.
+    let raw = strip_ansi(&seen);
+    assert!(
+        !raw.contains("catbus_agent]") && !raw.contains("catbus_agent::") && !raw.contains("INFO"),
+        "a log line reached the screen, where ratatui will not repaint over it:\n{raw}"
     );
 }

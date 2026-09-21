@@ -31,6 +31,7 @@ mod cache;
 mod cost;
 mod guard;
 mod identity;
+mod logging;
 mod openai;
 mod relay;
 mod retry;
@@ -345,14 +346,9 @@ fn fetch_prices_in_background(agent: &Arc<agent::Agent>) {
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
-    // REPL mode shares the tab with stdout, so even "to stderr" logs
-    // print in the same window. Quiet the floor to `warn` unless the
-    // user explicitly set RUST_LOG — the socket-only path still gets
-    // info-level chatter because nobody's reading those tabs.
-    let default_level = if args.no_tui { "info" } else { "warn" };
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default_level))
-        .target(env_logger::Target::Stderr)
-        .init();
+    // Destination and level floor are decided together, because the floor depends on the
+    // destination — a log sharing the terminal with the TUI has to be quiet. See `logging`.
+    logging::init(args.no_tui);
 
     // Resolved early, because the code below moves fields out of `args` — the cwd
     // and the provider's own config — and these two need to read it. The logger is

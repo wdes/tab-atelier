@@ -186,9 +186,21 @@ address, or an internet-disabled tab's agent will not find it.
 
 ## Seeing what happened
 
-The agent logs to stderr: `RUST_LOG=catbus_agent=debug catbus-agent` for detail, including
-every tool the model called, what the gate decided, and what the relay reported serving. In
-a tab, the log is below the visible floor, so `tab-atelier log` is the way to read it.
+The agent logs at `info` and up. **Where** depends on the mode, because the TUI owns the
+terminal: a log line written to stderr lands wherever the cursor happens to be, and the TUI
+will not repaint it — so it reads as words spliced into your prompt.
+
+- **With the TUI** (the default): `$XDG_STATE_HOME/tab-atelier/catbus-agent.log`, else
+  `~/.local/state/tab-atelier/catbus-agent.log`. Truncated at each start, so it always
+  describes the run that just happened. This is the log to read when the TUI itself is
+  misbehaving.
+- **`--no-tui`**: stderr, since nothing is drawing on those tabs and a log in place is more
+  useful than a file.
+
+`RUST_LOG` overrides the level either way — `RUST_LOG=catbus_agent=debug catbus-agent` for
+every tool the model called, what the gate decided, and what the relay reported serving. If
+the state directory is not writable the agent says so once and falls back to stderr at
+`warn`, rather than silently keeping a log nobody can find.
 
 `--check` reports which runtime libraries are present and which directories are in use —
 the first thing to run when it will not start.
