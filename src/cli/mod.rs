@@ -5,9 +5,17 @@
 /// `tab-atelier claude [ARGS…]` — clear the grid + `exec claude` (a correct,
 /// no-fuss agent launcher; see the module docs).
 pub mod agent;
+/// 🐊 `tab-atelier aligator` / `swamp` — the deterministic input router.
+///
+/// Drains a typed swamp queue and delivers each entry into its target Claude
+/// tab, regulated (round-robin, rate-limit, dedup, anti-ping-pong).
+pub mod aligator;
 pub mod bench;
 pub mod bench_lag;
 pub mod brain;
+/// `tab-atelier clarify` — controlled context refresh via in-place re-home
+/// (sibling of aligator/brain).
+pub mod clarify;
 pub mod claude_hook;
 /// The single shared client-subcommand router used by both the GUI
 /// (`src/main.rs`) and the headless daemon ([`dispatch`]).
