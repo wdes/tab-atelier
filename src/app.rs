@@ -1430,6 +1430,7 @@ impl AppState {
             // is rejected by the auth gate's non-empty guard, so the brief
             // pre-start window can't authorise anyone.
             master_token: String::new(),
+            dashboard_share_token: String::new(),
             active: 0,
             #[cfg(feature = "energy")]
             power: Vec::new(),
