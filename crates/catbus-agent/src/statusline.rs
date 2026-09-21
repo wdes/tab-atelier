@@ -177,14 +177,21 @@ pub const THINKING_MARKER: &str = "thinking";
 
 /// The activity text for a spinner frame: the agent's status, presented.
 ///
-/// The agent reports `"thinking"` lower-case; every other status is a tool
-/// description it wrote for exactly this purpose, so it is passed through as-is.
-#[must_use]
+/// The agent reports `"thinking"` lower-case while it waits on the model, and a tool description
+/// once it starts calling tools. The tool description says what the *tool* is doing but not that
+/// the model is still working, and a status that dropped "Thinking" made the two states look
+/// unrelated — the operator lost the thread of "it is thinking, and right now it is reading this
+/// file". So the tool is shown *alongside* the thinking label:
+///
+/// ```text
+/// ⠋  Thinking
+/// ⠋  Thinking - Read(src/handlers.rs)
+/// ```
 pub fn activity_label(status: &str) -> String {
     if status == THINKING_MARKER {
         THINKING.to_owned()
     } else {
-        status.to_owned()
+        format!("{THINKING} - {status}")
     }
 }
 
@@ -299,12 +306,18 @@ mod tests {
     }
 
     #[test]
-    fn a_tool_activity_is_passed_through_unchanged() {
-        // The agent writes these for display, so they are shown verbatim; only
-        // the lower-case status word is prettified.
+    fn a_tool_activity_is_shown_beside_the_thinking_label() {
+        // The tool says what is being done; "Thinking" says the model is still working on it.
+        // Both are wanted, because dropping either loses information the operator was using.
         assert_eq!(activity_label("thinking"), "Thinking");
-        assert_eq!(activity_label("Bash: grep -ri foo"), "Bash: grep -ri foo");
-        assert_eq!(activity_label("Read: src/main.rs"), "Read: src/main.rs");
+        assert_eq!(
+            activity_label("Read(src/handlers.rs)"),
+            "Thinking - Read(src/handlers.rs)"
+        );
+        assert_eq!(activity_label("Bash(cargo test)"), "Thinking - Bash(cargo test)");
+        // The judge's status goes through the same composition: it is another thing the model is
+        // doing while the turn runs, so it reads the same way.
+        assert_eq!(activity_label("checking Bash"), "Thinking - checking Bash");
     }
 
     #[test]

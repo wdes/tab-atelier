@@ -1588,36 +1588,82 @@ fn truncate_at_orphan_tool_use(out: &mut Vec<ApiMessage>) {
     out.truncate(keep);
 }
 
-/// Build a short human-readable label for the spinner while a tool runs.
-/// For Bash we include the first 60 chars of the command so it's clear
-/// what's executing; for Read/Write/Edit we show the filename.
+/// Build the label the spinner shows while a tool runs, as `Name(subject)`.
+///
+/// `Read(src/handlers.rs)` rather than `Read: src/handlers.rs`: the name and its subject read as
+/// one token, and the `Thinking - ` the status row puts in front already separates the tool from
+/// everything else.
 fn tool_status_label(name: &str, input: &serde_json::Value) -> String {
-    match name {
-        "Bash" => {
-            let cmd = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
-            let short: String = cmd.chars().take(60).collect();
-            let ellipsis = if cmd.len() > 60 { "…" } else { "" };
-            format!("Bash: {short}{ellipsis}")
+    tool_subject(input).map_or_else(|| name.to_owned(), |subject| format!("{name}({subject})"))
+}
+
+/// The value worth naming for a tool call, or `None` for one that its own name already describes.
+///
+/// An allow-list of fields rather than a scan of whatever the call happens to carry, because
+/// which field identifies a call is a judgement about the tool and not something derivable from
+/// its schema. `path` or `command` says what the call *does*; `content`, `note` or `prompt` is
+/// the payload it carries, and `Write(the file is now updated)` would name the text instead of
+/// the file. Nothing is shown for a call with none of these fields — `ListAgents` is the real
+/// case, since its arguments are absent by design.
+///
+/// Ordered by how much each field identifies the call: where it points beats what it does, and
+/// both beat what it filters on. So `SSH(dc18…)` names the machine rather than the command, and
+/// a `PHPUnit` run against a path shows the path rather than its test filter.
+fn tool_subject(input: &serde_json::Value) -> Option<String> {
+    const IDENTIFYING: [&str; 8] = [
+        "path",
+        "host",
+        "command",
+        "target",
+        "task",
+        "action",
+        "testsuite",
+        "filter",
+    ];
+    for field in IDENTIFYING {
+        let Some(value) = input.get(field).and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        if value.is_empty() {
+            continue;
         }
-        "Read" | "Write" | "Edit" => {
-            let path = input.get("path").and_then(|v| v.as_str()).unwrap_or("?");
-            // Show only the last two components so long paths don't overflow.
-            // `file_name()` + `parent().and_then(|p| p.file_name())` gets us
-            // both in O(1) without the previous quadruple-collect dance.
-            let p = std::path::Path::new(path);
-            let short = match (p.file_name(), p.parent().and_then(|par| par.file_name())) {
-                (Some(file), Some(parent)) => format!("{}/{}", parent.to_string_lossy(), file.to_string_lossy()),
-                (Some(file), None) => file.to_string_lossy().into_owned(),
-                _ => path.to_string(),
-            };
-            format!("{name}: {short}")
-        }
-        "Delegate" => {
-            let target = input.get("target").and_then(|v| v.as_str()).unwrap_or("?");
-            format!("Delegate → {target}")
-        }
-        other => other.to_string(),
+        return Some(if field == "path" {
+            short_path(value)
+        } else {
+            clip(value, MAX_SUBJECT_CHARS)
+        });
     }
+    None
+}
+
+/// How much of a command, task or filter to show before eliding. The status row shares its width
+/// with the spinner and the token counts, so the label has to stay a glance rather than a read.
+const MAX_SUBJECT_CHARS: usize = 60;
+
+/// A path reduced to its last two components, so a deep path cannot overflow the status row.
+///
+/// `file_name` plus the parent's `file_name` gets both without collecting the whole path.
+fn short_path(path: &str) -> String {
+    let parsed = std::path::Path::new(path);
+    match (parsed.file_name(), parsed.parent().and_then(std::path::Path::file_name)) {
+        (Some(file), Some(parent)) => {
+            format!("{}/{}", parent.to_string_lossy(), file.to_string_lossy())
+        }
+        (Some(file), None) => file.to_string_lossy().into_owned(),
+        _ => path.to_owned(),
+    }
+}
+
+/// The first `max` characters, with an ellipsis when there are more.
+///
+/// Counted in characters, not bytes. The code this replaces compared `cmd.len()` — bytes —
+/// against a 60-*character* truncation, so a command containing any non-ASCII character reported
+/// itself as over-long while its text still fitted.
+fn clip(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_owned();
+    }
+    text.chars().take(max).chain(std::iter::once('…')).collect()
 }
 
 // --- API wire types --------------------------------------------------------
@@ -1960,5 +2006,108 @@ mod tests {
         let body = format!(r#"{{"error":{{"message":"{long}"}}}}"#);
         let said = api_error(reqwest::StatusCode::BAD_GATEWAY, &body);
         assert!(said.len() < 1_000, "bounded, got {}", said.len());
+    }
+    /// A tool label names the call as `Name(subject)`, with the subject shortened so a deep path
+    /// cannot overflow the status row.
+    #[test]
+    fn a_tool_label_names_the_subject() {
+        let read = serde_json::json!({"path": "crates/catbus-agent/src/tools/mod.rs"});
+        assert_eq!(tool_status_label("Read", &read), "Read(tools/mod.rs)");
+        // A bare filename has no parent component to show.
+        assert_eq!(
+            tool_status_label("Read", &serde_json::json!({"path": "Cargo.toml"})),
+            "Read(Cargo.toml)"
+        );
+        // Bash shows what is running, not a path.
+        assert_eq!(
+            tool_status_label("Bash", &serde_json::json!({"command": "cargo test"})),
+            "Bash(cargo test)"
+        );
+        // Spawn and Delegate name what they act on.
+        assert_eq!(
+            tool_status_label("Spawn", &serde_json::json!({"task": "review the diff"})),
+            "Spawn(review the diff)"
+        );
+        assert_eq!(
+            tool_status_label("Delegate", &serde_json::json!({"target": "Reviewer", "prompt": "x"})),
+            "Delegate(Reviewer)"
+        );
+        // Git names its action, since that is what the call does.
+        assert_eq!(
+            tool_status_label("Git", &serde_json::json!({"action": "commit", "files": []})),
+            "Git(commit)"
+        );
+    }
+
+    /// A subject is what the call acts *on*, so where a call points beats what it does — and a
+    /// payload is never chosen. Showing the payload would produce labels like
+    /// `Write(the file is now updated)`, which name the text instead of the file.
+    #[test]
+    fn a_payload_is_never_the_subject() {
+        // SSH: the machine matters more than the command being sent to it.
+        let ssh = serde_json::json!({"action": "command", "host": "dc18.servers.example.org", "command": "uptime"});
+        assert_eq!(tool_status_label("SSH", &ssh), "SSH(dc18.servers.example.org)");
+
+        // A Write whose only argument is the text it is writing says nothing: the path is what
+        // identifies the call, and without it the tool's own name is the honest label.
+        let write = serde_json::json!({"content": "the file is now updated"});
+        assert_eq!(tool_status_label("Write", &write), "Write");
+
+        // An empty string is not a subject either — it would render an empty pair of brackets.
+        assert_eq!(tool_status_label("Read", &serde_json::json!({"path": ""})), "Read");
+        // And a tool with no arguments at all is just its name.
+        assert_eq!(tool_status_label("ListAgents", &serde_json::json!({})), "ListAgents");
+    }
+
+    /// The spinner's activity text puts the tool beside "Thinking" rather than replacing it, so
+    /// the operator can see that the model is still working and what it is working on.
+    #[test]
+    fn the_status_row_shows_the_tool_while_thinking() {
+        let read = serde_json::json!({"path": "src/handlers.rs"});
+        assert_eq!(crate::statusline::activity_label("thinking"), "Thinking");
+        assert_eq!(
+            crate::statusline::activity_label(&tool_status_label("Read", &read)),
+            "Thinking - Read(src/handlers.rs)"
+        );
+    }
+
+    /// A long command is clipped with an ellipsis, counted in characters so a non-ASCII character
+    /// neither splits nor claims to be longer than it is.
+    #[test]
+    fn a_long_subject_is_clipped_by_characters() {
+        let long = "x".repeat(200);
+        let label = tool_status_label("Bash", &serde_json::json!({"command": long}));
+        // `Bash(` + 60 characters + `…` + `)`
+        assert_eq!(label.chars().count(), 5 + 60 + 1 + 1);
+        assert!(label.ends_with("…)"));
+        assert!(label.starts_with("Bash(x"));
+
+        // Exactly at the limit: no ellipsis, since nothing was left out.
+        let exact = "y".repeat(60);
+        assert_eq!(
+            tool_status_label("Bash", &serde_json::json!({"command": exact})),
+            format!("Bash({exact})")
+        );
+
+        // One multi-byte character over: counted as one character, not its byte length.
+        let multibyte = "é".repeat(61);
+        let clipped = clip(&multibyte, 60);
+        assert_eq!(clipped.chars().count(), 61, "60 characters plus the ellipsis");
+        assert!(clipped.ends_with('…'));
+        // 61 `é` is 122 bytes, so a byte-based clip would have mangled the text.
+        assert!(clipped.starts_with('é'));
+    }
+
+    /// A path is shortened to its last two components for display, but only for display: the
+    /// label is never used to open anything.
+    #[test]
+    fn a_path_is_shortened_to_two_components() {
+        assert_eq!(short_path("a/b/c/d.rs"), "c/d.rs");
+        assert_eq!(short_path("d.rs"), "d.rs");
+        assert_eq!(short_path("/x/y.rs"), "x/y.rs");
+        // A trailing slash is normalised away by `Path`, so a directory path still shortens to
+        // two components rather than echoing its own separator back.
+        assert_eq!(short_path("a/b/"), "a/b");
+        assert_eq!(short_path("a/b/c/"), "b/c");
     }
 }
