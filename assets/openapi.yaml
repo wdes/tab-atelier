@@ -25,6 +25,8 @@ tags:
     description: Tab list, I/O and per-tab state
   - name: tokens
     description: Master token + share-link token management
+  - name: task
+    description: Typed task queue with an atomic claim (pull-fabric, primitive #11)
 paths:
   /tabs:
     get:
@@ -496,6 +498,160 @@ paths:
               schema: { type: object, properties: { token: { type: string } } }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "500": { description: Could not persist token }
+  /task/{queue}/push:
+    post:
+      tags: [task]
+      summary: Enqueue a task onto a queue
+      description: >
+        Append a task to the named queue. Master token only. An optional `to`
+        role gates the claim (capacity), and `priority` orders the drain
+        (higher first). Returns the new task id.
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: queue, in: path, required: true, schema: { type: string }, description: Queue name (sanitised to one path component) }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [payload]
+              properties:
+                payload: { type: string, description: Opaque payload handed to the claimer }
+                priority: { type: integer, minimum: 0, maximum: 255, default: 0 }
+                to: { type: string, description: "Role required to claim (capacity gate); omit for claimable-by-any" }
+      responses:
+        "201":
+          description: Enqueued
+          content:
+            application/json:
+              schema: { type: object, properties: { id: { type: string } } }
+        "400": { description: Missing/invalid payload }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "500": { description: Enqueue failed }
+  /task/{queue}/claim:
+    post:
+      tags: [task]
+      summary: Atomically claim the next task
+      description: >
+        Claim the next claimable task (queued, or an expired-lease orphan) on the
+        queue. Serialized behind the daemon's single-writer lock, so two
+        concurrent claims yield exactly one winner. `claimed_by` is the owner
+        tab-id; `role` (optional) overrides the card-derived capacity role;
+        `lease_secs` sets the lease TTL. 204 when nothing is claimable.
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: queue, in: path, required: true, schema: { type: string } }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                claimed_by: { type: string, description: Owner tab-id (default "anon") }
+                role: { type: string, description: Capacity role override (else read off the caller's card) }
+                lease_secs: { type: integer, minimum: 0, description: Lease TTL in seconds (default ~2100) }
+      responses:
+        "200":
+          description: Claimed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: { type: string }
+                  payload: { type: string }
+                  lease_until: { type: integer, description: Lease expiry (unix-millis) }
+        "204": { description: Nothing claimable }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /task/{id}/beat:
+    post:
+      tags: [task]
+      summary: Renew the lease on a claimed task
+      description: >
+        Push the lease of a task the caller owns (`claimed_by`) forward by
+        `lease_secs`, keeping the claim alive past its TTL. Master token only.
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string }, description: Task id }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                claimed_by: { type: string }
+                lease_secs: { type: integer, minimum: 0 }
+      responses:
+        "200":
+          description: Renewed
+          content:
+            application/json:
+              schema: { type: object, properties: { lease_until: { type: integer } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409": { description: Not the current claimer (lease lost or task gone) }
+  /task/{id}/done:
+    post:
+      tags: [task]
+      summary: Complete a claimed task
+      description: >
+        Mark task `id` done. Honoured only while the caller (`claimed_by`) still
+        holds a valid lease; a late done from an orphaned claimer is refused
+        (409 stale). Idempotent for the owner. Master token only.
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties: { claimed_by: { type: string } }
+      responses:
+        "200":
+          description: Completed (or idempotent/unknown-id)
+          content:
+            application/json:
+              schema: { type: object, properties: { done: { type: string } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409": { description: Stale — lease expired or task re-claimed }
+  /task/{queue}/list:
+    get:
+      tags: [task]
+      summary: Read-only view of a queue
+      description: >
+        Project each task's current state (queued / claimed@peer / done) WITHOUT
+        mutating anything; an expired-lease claim reads as queued (reclaimable).
+        A missing queue reads as an empty list.
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: queue, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: Queue read-model
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  queue: { type: string }
+                  tasks:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: string }
+                        priority: { type: integer }
+                        state: { type: string, enum: [queued, claimed, done] }
+                        claimedBy: { type: string }
+                        leaseUntil: { type: integer }
+                        to: { type: string }
+        "401": { $ref: "#/components/responses/Unauthorized" }
 components:
   securitySchemes:
     bearerAuth:
