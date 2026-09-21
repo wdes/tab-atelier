@@ -144,8 +144,8 @@ pub async fn run(asker: &std::sync::Arc<Asker>, input: &serde_json::Value) -> Re
         .and_then(serde_json::Value::as_u64)
         .map_or(DEFAULT_TIMEOUT, |s| Duration::from_secs(s).min(MAX_TIMEOUT));
 
-    let answers = asker.ask(questions, timeout).await;
-    Ok(report(answers.as_deref(), timeout))
+    let reply = asker.ask(questions, timeout).await;
+    Ok(report(reply.as_ref(), timeout))
 }
 
 /// The tool result, for answers or for nobody answering.
@@ -153,8 +153,8 @@ pub async fn run(asker: &std::sync::Arc<Asker>, input: &serde_json::Value) -> Re
 /// One shape either way, so the model reads the same structure whether or not it was answered,
 /// and `answered: false` is a fact it can act on rather than a failure to retry.
 #[must_use]
-pub fn report(answers: Option<&[Answer]>, timeout: Duration) -> String {
-    let value = answers.map_or_else(
+pub fn report(reply: Option<&Reply>, timeout: Duration) -> String {
+    let value = reply.map_or_else(
         || {
             serde_json::json!({
                 "answered": false,
@@ -166,17 +166,40 @@ pub fn report(answers: Option<&[Answer]>, timeout: Duration) -> String {
                 ),
             })
         },
-        |answers| {
-            serde_json::json!({
+        |reply| {
+            let mut value = serde_json::json!({
                 "answered": true,
-                "answers": answers
+                "answers": reply
+                    .answers
                     .iter()
                     .map(|a| serde_json::json!({ "question": a.question, "chosen": a.chosen }))
                     .collect::<Vec<_>>(),
-            })
+            });
+            // Present only when the operator wrote one, so the model is not drawn to read
+            // an empty string as an instruction to say nothing.
+            if let Some(note) = reply.note.as_deref() {
+                value["note"] = serde_json::Value::String(note.to_owned());
+            }
+            value
         },
     );
     serde_json::to_string_pretty(&value).unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"))
+}
+
+/// What the operator sent back.
+///
+/// One reply per question set, because that is what the person at the keyboard produces: they
+/// answer every question and then press enter once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reply {
+    /// One answer per question, in the order asked.
+    pub answers: Vec<Answer>,
+    /// Free text the operator attached to the whole reply, if they typed any.
+    ///
+    /// This is the one thing a fixed list of labels cannot express — "the second one, but only
+    /// if the migration has already been applied" — so it is passed through verbatim rather
+    /// than parsed. `None` means they wrote nothing, which is not the same as an empty note.
+    pub note: Option<String>,
 }
 
 /// What the operator chose for one question.
@@ -186,6 +209,19 @@ pub struct Answer {
     pub question: String,
     /// The chosen labels. More than one only for a multi-select question.
     pub chosen: Vec<String>,
+}
+
+/// The labels ticked for each question, plus the note attached to the reply.
+///
+/// This is the raw material of a [`Reply`], and all [`Asker::answer`] can know on its own: the
+/// questions stay in the slot and are read back by [`Asker::ask`] when it wakes, which is how
+/// the answer can echo the question it belongs to without the caller carrying the text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Chosen {
+    /// One list of ticked labels per question, in the order asked.
+    pub labels: Vec<Vec<String>>,
+    /// Free text attached to the whole reply, if the operator typed any.
+    pub note: Option<String>,
 }
 
 /// The channel a question travels down: whatever is driving the session.
@@ -200,16 +236,39 @@ pub struct Asker {
     next_id: std::sync::atomic::AtomicU64,
 }
 
+/// Clears the pending slot when the ask goes away, however it goes away.
+///
+/// Without this, a cancelled turn is a trap: the ask future is dropped mid-await, so nothing
+/// reaches the cleanup at the end of [`Asker::ask`], and the slot keeps the question — which a
+/// polling UI would then render forever, since the only way to clear it was to answer a
+/// question whose answer is no longer wanted. Dropped on the normal path too, where it finds
+/// the slot already empty and does nothing.
+struct ForgetOnDrop<'a> {
+    pending: &'a std::sync::Mutex<Option<Pending>>,
+    id: u64,
+}
+
+impl Drop for ForgetOnDrop<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut slot) = self.pending.lock()
+            && slot.as_ref().is_some_and(|pending| pending.id == self.id)
+        {
+            *slot = None;
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Pending {
     id: u64,
     questions: Vec<Question>,
-    /// Taken by whoever answers: one list of chosen labels per question, in the order asked.
+    /// Taken by whoever answers: the ticked labels per question, in the order asked, and the
+    /// note attached to the reply.
     ///
     /// An `Option` because answering *takes* it, while the questions stay in the slot for
     /// [`Asker::ask`] to read back — which is how the answer can echo the questions it belongs
     /// to without the ask cloning their text beforehand.
-    reply: Option<tokio::sync::oneshot::Sender<Vec<Vec<String>>>>,
+    reply: Option<tokio::sync::oneshot::Sender<Chosen>>,
 }
 
 impl Asker {
@@ -229,7 +288,7 @@ impl Asker {
     /// is awaited, so by then the first has timed out or been answered; the replace is a safety
     /// net for a cancelled turn, not a queue. Queuing questions nobody is reading would grow
     /// without bound, and the second question is the one the operator is being shown.
-    pub async fn ask(&self, questions: Vec<Question>, timeout: Duration) -> Option<Vec<Answer>> {
+    pub async fn ask(&self, questions: Vec<Question>, timeout: Duration) -> Option<Reply> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let id = self
             .next_id
@@ -242,6 +301,12 @@ impl Asker {
                 reply: Some(tx),
             });
         }
+        // Taken as soon as the slot is filled, so every exit from here — answered, timed out,
+        // or the whole ask cancelled and dropped — clears the question.
+        let _forget = ForgetOnDrop {
+            pending: &self.pending,
+            id,
+        };
         // The wait is the whole point, so an unanswered question takes the full time.
         let chosen = tokio::time::timeout(timeout, rx).await.ok()?.ok()?;
         // Taken on the way out — question and all — so a UI that polls does not render a
@@ -254,16 +319,17 @@ impl Asker {
             .and_then(|mut slot| slot.take())
             .map(|pending| pending.questions)
             .unwrap_or_default();
-        Some(
-            asked
+        Some(Reply {
+            answers: asked
                 .into_iter()
-                .zip(chosen)
+                .zip(chosen.labels)
                 .map(|(question, chosen)| Answer {
                     question: question.prompt,
                     chosen,
                 })
                 .collect(),
-        )
+            note: chosen.note,
+        })
     }
 
     /// The question waiting for an answer, if any, with the id to answer it by.
@@ -281,12 +347,13 @@ impl Asker {
         Some((id, questions))
     }
 
-    /// Answer the pending question.
+    /// Answer the pending question: the ticked labels per question, plus the note attached to
+    /// the whole reply.
     ///
     /// `false` if the id does not match, which is what a stale answer looks like — from a UI
     /// that rendered the same question twice, say. Ignoring it is right: the question it was
     /// answering is over, and delivering it would answer the next one with the previous choice.
-    pub fn answer(&self, id: u64, chosen: Vec<Vec<String>>) -> bool {
+    pub fn answer(&self, id: u64, chosen: Chosen) -> bool {
         let Ok(mut slot) = self.pending.lock() else {
             return false;
         };
@@ -316,8 +383,12 @@ pub fn spec() -> serde_json::Value {
                         destructive step is wanted, which environment to touch. Prefer this \
                         over guessing: a wrong assumption is only discovered after the work. \
                         Each question offers at least two labelled options, and the answer \
-                        comes back as the chosen label. If nobody answers, you are told so — \
-                        decide for yourself then, and say what you assumed.",
+                        comes back as the chosen label — the person ticks choices in a list \
+                        rather than typing, so keep the labels short and make them \
+                        distinguishable at a glance. They may also attach a note to the \
+                        reply, which comes back beside the labels; read it as the reason for \
+                        the choice, not as a replacement for one. If nobody answers, you are \
+                        told so — decide for yourself then, and say what you assumed.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -478,23 +549,94 @@ mod tests {
     /// multi-question reply is unambiguous about which answer belongs to which question.
     #[test]
     fn an_answered_question_echoes_the_question_with_the_choice() {
-        let answers = vec![
-            Answer {
-                question: "Which schema?".to_owned(),
-                chosen: vec!["normalised".to_owned()],
-            },
-            Answer {
-                question: "Which environments?".to_owned(),
-                chosen: vec!["staging".to_owned(), "production".to_owned()],
-            },
-        ];
-        let said = report(Some(&answers), Duration::from_mins(10));
+        let reply = Reply {
+            answers: vec![
+                Answer {
+                    question: "Which schema?".to_owned(),
+                    chosen: vec!["normalised".to_owned()],
+                },
+                Answer {
+                    question: "Which environments?".to_owned(),
+                    chosen: vec!["staging".to_owned(), "production".to_owned()],
+                },
+            ],
+            note: None,
+        };
+        let said = report(Some(&reply), Duration::from_mins(10));
         let parsed: serde_json::Value = serde_json::from_str(&said).expect("JSON");
         assert_eq!(parsed["answered"], true);
         assert_eq!(parsed["answers"][0]["question"], "Which schema?");
         assert_eq!(parsed["answers"][0]["chosen"][0], "normalised");
         // A multi-select answer carries every choice, in the order given.
         assert_eq!(parsed["answers"][1]["chosen"].as_array().expect("chosen").len(), 2);
+        // No note written means no note key at all: an empty string would read as an
+        // instruction to say nothing, which is not what "they typed nothing" means.
+        assert!(
+            parsed.get("note").is_none(),
+            "an absent note must not be reported as an empty one: {said}"
+        );
+    }
+
+    /// A note is the one thing a fixed list of labels cannot express, so it has to survive
+    /// the round trip intact — and only when it was actually written.
+    #[test]
+    fn a_note_is_carried_and_only_when_written() {
+        let with_note = Reply {
+            answers: vec![Answer {
+                question: "Which migration?".to_owned(),
+                chosen: vec!["squash".to_owned()],
+            }],
+            note: Some("only if the migration has already been applied".to_owned()),
+        };
+        let said = report(Some(&with_note), Duration::from_mins(10));
+        let parsed: serde_json::Value = serde_json::from_str(&said).expect("JSON");
+        assert_eq!(parsed["note"], "only if the migration has already been applied");
+        // Beside the choice, not instead of it: the note qualifies the tick.
+        assert_eq!(parsed["answers"][0]["chosen"][0], "squash");
+
+        // An empty note is the same as none — the panel trims, and nothing else should
+        // invent a difference the operator did not make.
+        let blank = Reply {
+            answers: vec![Answer {
+                question: "Which migration?".to_owned(),
+                chosen: vec![String::new()],
+            }],
+            note: None,
+        };
+        let said = report(Some(&blank), Duration::from_mins(10));
+        let parsed: serde_json::Value = serde_json::from_str(&said).expect("JSON");
+        assert!(parsed.get("note").is_none());
+    }
+
+    /// A note can stand in for a choice — "none of these, and here is why" — so an empty
+    /// answer with a note has to reach the model as exactly that, not be refused as malformed.
+    #[tokio::test]
+    async fn a_note_can_stand_in_for_a_choice() {
+        let asker = std::sync::Arc::new(Asker::new());
+        let answerer = std::sync::Arc::clone(&asker);
+        let questions = vec![Question::parse(&a_question()).expect("question")];
+        let answers = answerer.clone();
+        let reply_task = tokio::spawn(async move { asker.ask(questions, Duration::from_secs(5)).await });
+        let (id, _) = loop {
+            if let Some(pending) = answers.pending() {
+                break pending;
+            }
+            tokio::task::yield_now().await;
+        };
+        // Nothing ticked, but a note written: the tick-box UI refuses to send this, and the
+        // wire must still carry it, because a client may legitimately answer that way.
+        assert!(answerer.answer(
+            id,
+            Chosen {
+                labels: vec![Vec::new()],
+                note: Some("neither — keep the old column".to_owned()),
+            }
+        ));
+        let reply = reply_task.await.expect("no panic").expect("answered");
+        assert_eq!(reply.answers.len(), 1);
+        assert!(reply.answers[0].chosen.is_empty());
+        assert_eq!(reply.answers[0].question, "Which schema should the migration use?");
+        assert_eq!(reply.note.as_deref(), Some("neither — keep the old column"));
     }
 
     /// The ask round-trips: what one task asks, another answers.
@@ -515,23 +657,51 @@ mod tests {
             assert_eq!(questions.len(), 1);
             assert_eq!(questions[0].options.len(), 2);
             assert!(
-                answerer.answer(id, vec![vec!["json column".to_owned()]]),
+                answerer.answer(
+                    id,
+                    Chosen {
+                        labels: vec![vec!["json column".to_owned()]],
+                        note: None,
+                    }
+                ),
                 "the id from `pending` must be the one to answer by"
             );
         });
 
         let questions = vec![Question::parse(&a_question()).expect("parses")];
-        let answers = asker
+        let reply = asker
             .ask(questions, Duration::from_secs(5))
             .await
             .expect("answered in time");
         responder.await.expect("responder");
 
-        assert_eq!(answers.len(), 1);
-        assert_eq!(answers[0].question, "Which schema should the migration use?");
-        assert_eq!(answers[0].chosen, vec!["json column".to_owned()]);
+        assert_eq!(reply.answers.len(), 1);
+        assert_eq!(reply.answers[0].question, "Which schema should the migration use?");
+        assert_eq!(reply.answers[0].chosen, vec!["json column".to_owned()]);
+        assert_eq!(reply.note, None);
         // And it is no longer pending, so a UI stops rendering it.
         assert!(asker.pending().is_none(), "an answered question must not stay pending");
+    }
+
+    /// A question whose ask was cancelled must stop being pending, or a UI that polls keeps
+    /// drawing a question nobody can answer — and answering it would report success into a
+    /// reply channel whose reader is gone.
+    #[tokio::test]
+    async fn a_cancelled_ask_stops_being_pending() {
+        let asker = std::sync::Arc::new(Asker::new());
+        let questions = vec![Question::parse(&a_question()).expect("parses")];
+        let poller = std::sync::Arc::clone(&asker);
+        let ask = tokio::spawn(async move { asker.ask(questions, Duration::from_secs(30)).await.is_some() });
+        // Wait until it is up, then cancel it the way an aborted turn would.
+        loop {
+            if poller.pending().is_some() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        ask.abort();
+        assert!(ask.await.expect_err("aborted").is_cancelled());
+        assert!(poller.pending().is_none(), "a dropped ask must forget its question");
     }
 
     /// A stale answer is ignored: one carrying an id that is no longer pending must not be
@@ -540,14 +710,26 @@ mod tests {
     async fn a_stale_answer_is_refused() {
         let asker = Asker::new();
         // Nothing pending at all.
-        assert!(!asker.answer(99, vec![vec!["x".to_owned()]]));
+        assert!(!asker.answer(
+            99,
+            Chosen {
+                labels: vec![vec!["x".to_owned()]],
+                note: None,
+            }
+        ));
 
         // Ask with a short timeout so it expires, then answer with its id: too late.
         let questions = vec![Question::parse(&a_question()).expect("parses")];
         let expired = asker.ask(questions, Duration::from_millis(20)).await;
         assert!(expired.is_none(), "nobody answered, so the ask gives up");
         assert!(
-            !asker.answer(1, vec![vec!["too late".to_owned()]]),
+            !asker.answer(
+                1,
+                Chosen {
+                    labels: vec![vec!["too late".to_owned()]],
+                    note: Some("and this note goes nowhere".to_owned()),
+                }
+            ),
             "and the id is dead"
         );
     }

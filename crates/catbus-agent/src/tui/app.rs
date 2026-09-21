@@ -49,57 +49,301 @@ use crate::tui::spinner::Spinner;
 /// feels immediate, slow enough to cost nothing.
 const TICK: Duration = Duration::from_millis(60);
 
-/// Resolve what the operator typed into the labels they chose.
+/// A tick-box list for one question, and the cursor inside it.
+#[derive(Debug)]
+struct Ticks {
+    /// One flag per option, parallel to `question.options`.
+    on: Vec<bool>,
+    /// Which option the cursor is on. Always a valid index while `on` is non-empty.
+    at: usize,
+}
+
+impl Ticks {
+    fn new(question: &crate::tools::ask::Question) -> Self {
+        Self {
+            on: vec![false; question.options.len()],
+            at: 0,
+        }
+    }
+
+    /// Move the cursor by `delta`, wrapping.
+    ///
+    /// Wrapping rather than clamping so that reaching the last option and pressing down again
+    /// lands on the first, which is what a short list wants — the operator never has to
+    /// reverse direction to get back.
+    fn move_by(&mut self, delta: isize) {
+        let len = self.on.len();
+        if len == 0 {
+            return;
+        }
+        let len = isize::try_from(len).unwrap_or(isize::MAX);
+        let at = isize::try_from(self.at).unwrap_or(0);
+        self.at = usize::try_from((at + delta).rem_euclid(len)).unwrap_or(0);
+    }
+
+    /// Tick the option under the cursor, or untick it.
+    ///
+    /// A single-choice question behaves like a radio: ticking one clears the rest. Unticking
+    /// is allowed, because a reply of "none of these" has to be expressible — and the note is
+    /// then the place to say why.
+    fn toggle(&mut self, question: &crate::tools::ask::Question) {
+        let Some(flag) = self.on.get_mut(self.at) else {
+            return;
+        };
+        *flag = !*flag;
+        if *flag && !question.multi {
+            for (i, other) in self.on.iter_mut().enumerate() {
+                if i != self.at {
+                    *other = false;
+                }
+            }
+        }
+    }
+
+    /// The labels ticked, in the order they were offered rather than the order ticked, so the
+    /// answer reads the way the question did.
+    fn chosen(&self, question: &crate::tools::ask::Question) -> Vec<String> {
+        question
+            .options
+            .iter()
+            .zip(&self.on)
+            .filter(|(_, on)| **on)
+            .map(|(option, _)| option.label.clone())
+            .collect()
+    }
+}
+
+/// What the panel wants the loop to do about a key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PanelAction {
+    /// Redraw and wait for the next key.
+    Handled,
+    /// Enter was pressed, or the note was finished: send the reply.
+    Submit,
+}
+
+/// The tick-box UI for a pending question.
 ///
-/// Accepts a number (1-based, as shown) or a label, compared case-insensitively and trimmed.
-/// A number out of range is refused with the range, because `4` when three were offered is a
-/// typo and answering option 3 instead would be silent.
-fn pick(question: &crate::tools::ask::Question, tokens: &[&str]) -> Result<Vec<String>, String> {
-    if tokens.is_empty() {
-        return Err("no choice given".to_owned());
-    }
-    if !question.multi && tokens.len() > 1 {
-        return Err(format!(
-            "`{}` takes one choice, but {} were given. Send them one at a time, or ask for a \
-             multi-select question.",
-            question.header,
-            tokens.len()
-        ));
-    }
-    let mut chosen = Vec::with_capacity(tokens.len());
-    for token in tokens {
-        let token = token.trim();
-        // A number, if it is one.
-        if let Ok(number) = token.parse::<usize>() {
-            if number == 0 || number > question.options.len() {
-                return Err(format!(
-                    "`{token}` is not one of the {} options for `{}` — they are numbered 1 to {}.",
-                    question.options.len(),
-                    question.header,
-                    question.options.len()
-                ));
-            }
-            let label = question.options[number - 1].label.clone();
-            if !chosen.contains(&label) {
-                chosen.push(label);
-            }
-            continue;
-        }
-        // Otherwise a label, matched without case or surrounding space.
-        if let Some(option) = question.options.iter().find(|o| o.label.eq_ignore_ascii_case(token)) {
-            if !chosen.contains(&option.label) {
-                chosen.push(option.label.clone());
-            }
-        } else {
-            let labels: Vec<&str> = question.options.iter().map(|o| o.label.as_str()).collect();
-            return Err(format!(
-                "`{token}` is not an option for `{}` — the choices are {}.",
-                question.header,
-                labels.join(", ")
-            ));
+/// The prompt viewport is only two rows (`VIEWPORT_ROWS`), so the panel is one row of
+/// windowed options and one row of hints. Everything the old typed path could do is reachable
+/// from the keyboard without typing a label: arrows move, space ticks, tab changes question,
+/// `n` opens a note. Nothing is submitted until enter, so a half-made choice is never sent.
+#[derive(Debug)]
+struct Panel {
+    /// One tick-box list per question, in the order asked.
+    ticks: Vec<Ticks>,
+    /// Which question the cursor is in.
+    question: usize,
+    /// The note field. Kept across leaving and re-entering note mode so a note typed, left,
+    /// and come back to is not lost — which is the whole reason to leave in the first place.
+    note: Editor,
+    /// Whether keys go to the note instead of the options.
+    typing: bool,
+}
+
+impl Panel {
+    fn new(questions: &[crate::tools::ask::Question]) -> Self {
+        Self {
+            ticks: questions.iter().map(Ticks::new).collect(),
+            question: 0,
+            note: Editor::new(),
+            typing: false,
         }
     }
-    Ok(chosen)
+
+    /// The question the cursor is in, if the set is non-empty.
+    fn current<'q>(&self, questions: &'q [crate::tools::ask::Question]) -> Option<&'q crate::tools::ask::Question> {
+        questions.get(self.question)
+    }
+
+    fn ticks_mut(&mut self) -> Option<&mut Ticks> {
+        self.ticks.get_mut(self.question)
+    }
+
+    /// Move to another question, wrapping, and land anywhere inside it.
+    fn move_question(&mut self, delta: isize, questions: &[crate::tools::ask::Question]) {
+        let len = questions.len();
+        if len == 0 {
+            return;
+        }
+        let len = isize::try_from(len).unwrap_or(isize::MAX);
+        let at = isize::try_from(self.question).unwrap_or(0);
+        self.question = usize::try_from((at + delta).rem_euclid(len)).unwrap_or(0);
+    }
+
+    /// Tick the option under the cursor, in the question the cursor is in.
+    ///
+    /// The question is read out of the `questions` slice rather than from `self`, which is what
+    /// lets the two borrows coexist: taking the question from `self` and the ticks from `self`
+    /// would need one borrow to be mutable and the other not.
+    fn tick_current(&mut self, questions: &[crate::tools::ask::Question]) {
+        let Some(question) = questions.get(self.question) else {
+            return;
+        };
+        let Some(ticks) = self.ticks.get_mut(self.question) else {
+            return;
+        };
+        ticks.toggle(question);
+    }
+
+    /// Whether anything was actually said — a box ticked, or a note written.
+    ///
+    /// Used to keep enter from sending an entirely empty reply, which the model would have to
+    /// interpret: "the operator declined" and "the operator's finger slipped" look identical.
+    fn says_something(&self) -> bool {
+        self.ticks.iter().any(|t| t.on.iter().any(|on| *on)) || !self.note.line().trim().is_empty()
+    }
+
+    /// Handle one key. `questions` is passed in because the panel holds ticks, not the text.
+    fn handle(&mut self, key: KeyEvent, questions: &[crate::tools::ask::Question]) -> PanelAction {
+        if self.typing {
+            // Enter and Escape are read here rather than delegated, because the editor is
+            // deliberately strict about both: it refuses Enter on a blank line (a stray Enter
+            // must not become a prompt) and binds nothing to Escape. In the note that makes
+            // Enter a dead end on a reply that is already answered by its ticks, and leaves no
+            // way back to the boxes — so the panel gives the two keys the meaning this screen
+            // wants and passes everything else through.
+            match key.code {
+                KeyCode::Enter | KeyCode::Char('\n' | '\r') => return PanelAction::Submit,
+                KeyCode::Esc | KeyCode::BackTab => {
+                    self.typing = false;
+                    return PanelAction::Handled;
+                }
+                _ => {}
+            }
+            return match self.note.handle(key) {
+                // Ctrl-J, or ctrl-d on an empty note: "the note is finished". Both mean send,
+                // because the reply is ticks *and* note and there is nothing else to do with
+                // it. An entirely empty reply is refused by the caller, with a message.
+                Action::Submit(_) | Action::Exit => PanelAction::Submit,
+                // Ctrl-C reaches the panel only if the loop let it through, and ctrl-l is a
+                // repaint: neither should send. The note is kept.
+                Action::Cancel | Action::ClearScreen | Action::Continue => PanelAction::Handled,
+            };
+        }
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                if let Some(ticks) = self.ticks_mut() {
+                    ticks.move_by(-1);
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if let Some(ticks) = self.ticks_mut() {
+                    ticks.move_by(1);
+                }
+            }
+            KeyCode::Tab => self.move_question(1, questions),
+            KeyCode::BackTab => self.move_question(-1, questions),
+            KeyCode::Char(' ') => self.tick_current(questions),
+            KeyCode::Char('n') => self.typing = true,
+            // Escape and enter both send: escape is what someone presses when they have ticked
+            // what they wanted and cannot see a reason to type anything more, and refusing it
+            // would leave them hunting for the one key that works.
+            KeyCode::Esc | KeyCode::Enter => return PanelAction::Submit,
+            _ => {}
+        }
+        PanelAction::Handled
+    }
+
+    /// The reply, ready for the wire.
+    fn chosen(&self, questions: &[crate::tools::ask::Question]) -> crate::tools::ask::Chosen {
+        let note = self.note.line().trim().to_owned();
+        crate::tools::ask::Chosen {
+            labels: questions
+                .iter()
+                .zip(&self.ticks)
+                .map(|(question, ticks)| ticks.chosen(question))
+                .collect(),
+            // `None`, not `Some("")`: the difference between "wrote nothing" and "wrote an
+            // empty note" matters to whoever reads it, and the model is told only the first.
+            note: (!note.is_empty()).then_some(note),
+        }
+    }
+
+    /// The option row, windowed to `width` columns.
+    ///
+    /// Windowing rather than truncating keeps the option under the cursor visible: the cursor
+    /// is what the arrows move, so scrolling it out of view would make the UI unusable on a
+    /// narrow terminal — and the labels come from a model, so their length is not ours to bound.
+    fn options_row(&self, question: &crate::tools::ask::Question, width: usize) -> String {
+        let Some(ticks) = self.ticks.get(self.question) else {
+            return String::new();
+        };
+        let mut cells: Vec<String> = question
+            .options
+            .iter()
+            .enumerate()
+            .map(|(i, option)| {
+                let box_ = if ticks.on.get(i).copied().unwrap_or(false) {
+                    'x'
+                } else {
+                    ' '
+                };
+                let arrow = if i == ticks.at { '▸' } else { ' ' };
+                format!("{arrow}[{box_}] {}", option.label)
+            })
+            .collect();
+        // Mark which of the set this is, so three questions are not answered blind.
+        if self.ticks.len() > 1 {
+            let position = self.question + 1;
+            let total = self.ticks.len();
+            // `get_mut` and not `cells[self.question]`: a question with no options has no cell to
+            // write the marker into, and the marking is decoration — losing it beats a panic on a
+            // value the panel did not author.
+            if let Some(cell) = cells.get_mut(self.question) {
+                let _ = write!(cell, " ({position}/{total})");
+            }
+        }
+        let joined = cells.join("  ");
+        if joined.chars().count() <= width {
+            return joined;
+        }
+        // Too wide: show a window around the cursor, which is what the arrows move and so the
+        // one thing that must stay visible. Neighbours are pulled in while they fit.
+        let at = ticks.at.min(cells.len().saturating_sub(1));
+        let (mut start, mut end) = (at, at);
+        let mut used = cells[at].chars().count();
+        loop {
+            let mut grew = false;
+            if let Some(next) = cells.get(end + 1) {
+                let cost = next.chars().count() + 2;
+                if used + cost + 2 <= width {
+                    end += 1;
+                    used += cost;
+                    grew = true;
+                }
+            }
+            if start > 0 {
+                let cost = cells[start - 1].chars().count() + 2;
+                if used + cost + 2 <= width {
+                    start -= 1;
+                    used += cost;
+                    grew = true;
+                }
+            }
+            if !grew {
+                break;
+            }
+        }
+        let (before, after) = (start > 0, end + 1 < cells.len());
+        let budget = width.saturating_sub(usize::from(before) + usize::from(after));
+        let mut window: Vec<String> = cells[start..=end].to_vec();
+        let total = window.iter().map(|c| c.chars().count()).sum::<usize>() + 2 * window.len().saturating_sub(1);
+        if total > budget {
+            // Only the cursor's own label can still be over budget after the walk above, so it
+            // is trimmed in place — the marker stays, the middle of a long label goes.
+            let over = total - budget;
+            let label = window[at - start].clone();
+            let keep = label.chars().count().saturating_sub(over + 1);
+            window[at - start] = label.chars().take(keep).collect::<String>() + "…";
+        }
+        format!(
+            "{}{}{}",
+            if before { "…" } else { "" },
+            window.join("  "),
+            if after { "…" } else { "" }
+        )
+    }
 }
 
 /// How many prompts may wait while a turn runs.
@@ -341,6 +585,122 @@ impl Ui {
         })?;
         Ok(())
     }
+
+    /// Repaint the viewport as the question panel, in place of the prompt.
+    ///
+    /// The viewport is exactly two rows (`VIEWPORT_ROWS`), so the panel is one row of options
+    /// and one row that is either the note being typed or the key hints. The note takes the
+    /// second row rather than opening a third because the height is fixed at construction —
+    /// there is no `resize` for an inline viewport — and the options must not be the row that
+    /// scrolls off.
+    fn draw_panel(
+        &mut self,
+        panel: &Panel,
+        questions: &[crate::tools::ask::Question],
+        status: Option<&str>,
+    ) -> std::io::Result<()> {
+        let status = status.map(ToOwned::to_owned);
+        self.terminal.draw(|frame| {
+            let area = frame.area();
+            let top = area.top();
+            let width = usize::from(area.width);
+            let options = panel
+                .current(questions)
+                .map_or_else(String::new, |question| panel.options_row(question, width));
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    options,
+                    // Bold, because this row is the question: the prompt text scrolled past
+                    // above and the options did not, so the eye needs somewhere to land.
+                    Style::default().add_modifier(Modifier::BOLD),
+                ))),
+                Rect::new(area.left(), top, area.width, 1),
+            );
+            let second = Rect::new(area.left(), top.saturating_add(1), area.width, 1);
+            if panel.typing {
+                // The one place in the panel where text is written rather than chosen, so it
+                // is coloured differently from the boxes and carries the terminal's cursor.
+                let label = "note: ";
+                let label_width = u16::try_from(label.chars().count()).unwrap_or(0);
+                let note_style = Style::default().fg(Color::Magenta);
+                // The hint row is this row while the note is open, so what the keys do has to
+                // be said here instead — the note covers the boxes, and the note was opened
+                // from them, so "enter sends" is the one thing the operator cannot see.
+                let used = label.chars().count() + panel.note.line().chars().count();
+                let tail = note_hint(panel, width.saturating_sub(used));
+                frame.render_widget(
+                    Paragraph::new(Line::from(vec![
+                        Span::styled(label, note_style.add_modifier(Modifier::BOLD)),
+                        Span::styled(panel.note.line(), note_style),
+                        Span::styled(tail, Style::default().fg(Color::DarkGray)),
+                    ])),
+                    second,
+                );
+                let column = area
+                    .left()
+                    .saturating_add(label_width)
+                    .saturating_add(u16::try_from(panel.note.cursor()).unwrap_or(0))
+                    .min(area.right().saturating_sub(1));
+                frame.set_cursor_position((column, top.saturating_add(1)));
+            } else {
+                let hint = panel_hint(panel, questions, width);
+                let line = match status.as_deref() {
+                    Some(status) if !status.is_empty() => format!("{hint}  ·  {status}"),
+                    _ => hint,
+                };
+                frame.render_widget(
+                    Paragraph::new(Line::from(Span::styled(line, Style::default().fg(Color::DarkGray)))),
+                    second,
+                );
+            }
+        })?;
+        Ok(())
+    }
+}
+
+/// The key hints that fit on the note row, after the note itself.
+///
+/// Empty when there is no room, which is honest: the note is what is being written, and a hint
+/// squeezed against it would be read as part of the note.
+fn note_hint(panel: &Panel, width: usize) -> String {
+    let tail = if panel.note.line().trim().is_empty() {
+        "  (enter sends, esc back to the choices)"
+    } else {
+        "  (enter sends, esc back)"
+    };
+    if tail.chars().count() <= width {
+        tail.to_owned()
+    } else if width >= 2 {
+        // Never worth a half-word: say the one thing that finishes the reply, or nothing.
+        "  ↵".to_owned()
+    } else {
+        String::new()
+    }
+}
+
+/// The key hints under the panel, trimmed to whatever the terminal is wide enough for.
+///
+/// Short by necessity — it can share its row with the spinner — but it has to name the tick
+/// key, because space is not an obvious choice for "select" and the panel is the only place a
+/// choice is made. Falls back to shorter phrasings rather than truncating, since a hint cut
+/// mid-word is worse than a shorter one.
+fn panel_hint(panel: &Panel, questions: &[crate::tools::ask::Question], width: usize) -> String {
+    let mut full = String::from("↑↓ move  space tick");
+    if questions.len() > 1 {
+        full.push_str("  tab next");
+    }
+    full.push_str("  n note  enter send");
+    if !panel.note.line().trim().is_empty() {
+        // The note is off screen while the boxes are on it, so its existence has to be
+        // advertised somewhere — otherwise it is written, left, and invisible until sent.
+        full.push_str("  [note]");
+    }
+    for candidate in [full.as_str(), "space tick  n note  enter", "space tick  enter", "enter"] {
+        if candidate.chars().count() <= width {
+            return candidate.to_owned();
+        }
+    }
+    "enter".to_owned()
 }
 
 fn ago_label(when: std::time::SystemTime) -> String {
@@ -712,9 +1072,13 @@ struct Repl<'a> {
     ///
     /// Polled from the asker rather than pushed to this loop, because the ask happens inside a
     /// tool call on another task and this loop is where it gets rendered. Held so the question
-    /// is printed once rather than every tick, and so a submitted line can be read as an answer
-    /// while one is open.
+    /// is printed once rather than every tick, and so the ticker knows a question is open
+    /// without re-locking the asker.
     question: Option<(u64, Vec<crate::tools::ask::Question>)>,
+    /// The tick-box UI for it, while one is open. Boxes rather than a typed line because a
+    /// question is a choice, and a choice is easier to make by moving a cursor than by
+    /// transcribing a label exactly.
+    panel: Option<Panel>,
 }
 
 /// What the loop should do after handling something.
@@ -834,57 +1198,33 @@ impl Repl<'_> {
     /// are accepted because both are natural: a numbered list invites a number, and typing the
     /// label is what someone does when the label is shorter than the number of looking it up.
     /// Anything unrecognised says what was not understood rather than answering something else.
-    fn answered(&mut self, id: u64, questions: &[crate::tools::ask::Question], line: &str) -> std::io::Result<Flow> {
-        let input = line.trim();
-        if input.is_empty() {
+    /// Send the reply the operator built in the panel.
+    ///
+    /// Nothing is sent until enter, so a half-made choice never leaves the terminal — and the
+    /// labels sent are the ones the panel holds, in the order the question offered them, so
+    /// the model sees the same words it wrote.
+    fn submit_panel(&mut self, id: u64, questions: &[crate::tools::ask::Question]) -> std::io::Result<Flow> {
+        let Some(panel) = self.panel.as_ref() else {
+            return Ok(Flow::Continue);
+        };
+        if !panel.says_something() {
+            // Refused rather than sent: an empty reply is indistinguishable from a mis-key, and
+            // the note is right there for "none of these".
+            self.ui
+                .print_above("nothing chosen yet — tick an option with space, or press `n` for a note")?;
             return Ok(Flow::Continue);
         }
-        let mut chosen: Vec<Vec<String>> = Vec::with_capacity(questions.len());
-        for (index, question) in questions.iter().enumerate() {
-            // With several questions open, `1a`-style input would be needed to tell them apart;
-            // since a line answers all of them, each question gets the same tokens. In practice
-            // a multi-question call is answered one number per question, so this reads the
-            // token at this question's position when there are as many tokens as questions.
-            let tokens: Vec<&str> = input
-                .split([',', ' '])
-                .map(str::trim)
-                .filter(|t| !t.is_empty())
-                .collect();
-            let mine: Vec<&str> = if questions.len() > 1 && tokens.len() == questions.len() {
-                vec![tokens[index]]
-            } else if questions.len() > 1 {
-                // More than one question and not enough tokens to go round: refuse rather
-                // than guess which question was meant.
-                self.ui.print_above(&format!(
-                    "{} questions are open, so answer all of them: one choice each, \
-                     comma-separated (for example `1,2`).",
-                    questions.len()
-                ))?;
-                return Ok(Flow::Continue);
-            } else {
-                tokens.clone()
-            };
-
-            let picked = match pick(question, &mine) {
-                Ok(picked) => picked,
-                Err(why) => {
-                    self.ui.print_above(&why)?;
-                    return Ok(Flow::Continue);
-                }
-            };
-            chosen.push(picked);
-        }
-
+        let chosen = panel.chosen(questions);
         if self.agent.asker().answer(id, chosen) {
-            self.question = None;
             self.ui.print_above("answered")?;
         } else {
             // The question closed between rendering and answering — it timed out, or the turn
             // was cancelled. Saying so beats silence, and the answer is genuinely not used.
-            self.question = None;
             self.ui
                 .print_above("that question is no longer open — the answer was not used")?;
         }
+        self.question = None;
+        self.panel = None;
         Ok(Flow::Continue)
     }
 
@@ -893,41 +1233,36 @@ impl Repl<'_> {
     /// The question is printed once per id, not once per tick: it arrives from another task
     /// while the turn runs, so this loop is the only place it can be shown, and a question
     /// repeated every 60ms would flood the scrollback.
+    ///
+    /// Only the prompt text goes to scrollback — the options live in the panel, which tracks
+    /// the cursor and the ticks. Printing them here as well would put a frozen copy of the
+    /// choices above a live one, and the frozen one would be the one that scrolls away.
     fn show_pending_question(&mut self) -> std::io::Result<()> {
         let asked = self.agent.asker().pending();
         match (asked, &self.question) {
             (Some((id, _)), Some((shown, _))) if *shown == id => return Ok(()),
             (Some((id, questions)), _) => {
                 let mut out = String::new();
-                for (question, q) in questions.iter().enumerate() {
+                for (index, question) in questions.iter().enumerate() {
                     if questions.len() > 1 {
-                        let _ = writeln!(out, "{}. {}", question + 1, q.prompt);
+                        let _ = writeln!(out, "{}. {}", index + 1, question.prompt);
                     } else {
-                        let _ = writeln!(out, "{}", q.prompt);
+                        let _ = writeln!(out, "{}", question.prompt);
                     }
-                    for (i, option) in q.options.iter().enumerate() {
-                        if option.description.is_empty() {
-                            let _ = writeln!(out, "  {}. {}", i + 1, option.label);
-                        } else {
-                            let _ = writeln!(out, "  {}. {} — {}", i + 1, option.label, option.description);
-                        }
-                    }
-                    if q.multi {
-                        let _ = writeln!(out, "  (several may be chosen: e.g. `1,3`)");
+                    if question.options.is_empty() {
+                        let _ = writeln!(out, "  (no options offered — answer in a note)");
                     }
                 }
-                let _ = write!(out, "answer with a number");
-                if questions.len() > 1 {
-                    let _ = write!(out, " (one per question, comma-separated)");
-                }
-                let _ = writeln!(out, ", or the label itself");
                 self.ui.print_above(out.trim_end())?;
+                self.panel = Some(Panel::new(&questions));
                 self.question = Some((id, questions));
             }
             (None, Some(_)) => {
-                // Gone: answered from somewhere else, or timed out. Cleared so a later line is
-                // a prompt again rather than an answer to a question that is over.
+                // Gone: answered from somewhere else, or timed out. Cleared so the panel stops
+                // drawing and a later line is a prompt again rather than an answer to a
+                // question that is over.
                 self.question = None;
+                self.panel = None;
             }
             (None, None) => {}
         }
@@ -941,14 +1276,15 @@ impl Repl<'_> {
     /// leaving is not a turn, and waiting for one to finish before obeying it would make
     /// the command feel broken.
     async fn submitted(&mut self, line: String) -> std::io::Result<Flow> {
-        // A question takes precedence over everything: while one is open, a submitted line is
-        // an answer, not a prompt. Queueing it would be worse than useless — the question is
-        // what the turn is blocked on, so a queued prompt could not run until it is answered
-        // anyway, and treating it as an answer is what the operator obviously means.
-        if let Some((id, questions)) = self.question.clone() {
-            return self.answered(id, &questions, &line);
+        // A question takes precedence over everything: while one is open the panel owns the
+        // keyboard, so this is only reachable if the panel was somehow bypassed (a paste, say).
+        // Saying where the answer goes beats silently queueing a prompt that could not run —
+        // the question is what the turn is blocked on.
+        if self.question.is_some() {
+            self.ui
+                .print_above("a question is open — tick an option with space, then enter")?;
+            return Ok(Flow::Continue);
         }
-
         let trimmed = line.trim().trim_matches('`').to_owned();
         if trimmed.is_empty() {
             return Ok(Flow::Continue);
@@ -987,6 +1323,23 @@ impl Repl<'_> {
 
     /// Handle one key.
     async fn on_key(&mut self, key: KeyEvent) -> std::io::Result<Flow> {
+        // An open question owns the keyboard: its panel is drawn where the prompt would be, so
+        // the arrows and space must move a cursor and tick a box rather than editing a line the
+        // operator cannot see. Ctrl-C still aborts — the panel is not a trap.
+        if let Some((id, questions)) = self.question.clone() {
+            if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                self.cancel()?;
+                return Ok(Flow::Continue);
+            }
+            let action = self
+                .panel
+                .as_mut()
+                .map_or(PanelAction::Handled, |panel| panel.handle(key, &questions));
+            if action == PanelAction::Submit {
+                return self.submit_panel(id, &questions);
+            }
+            return Ok(Flow::Continue);
+        }
         // While a turn runs the line stays editable — a turn can take minutes, and a
         // locked editor is what makes a session feel stuck. Ctrl-C is the exception: it
         // is the abort key, and there is nothing else to do with it mid-flight.
@@ -1075,6 +1428,7 @@ async fn run_inner(ui: &mut Ui, agent: Arc<Agent>, cwd: &Path) -> std::io::Resul
         spinner: None,
         queued: std::collections::VecDeque::new(),
         question: None,
+        panel: None,
     };
 
     // The banner, once, before the first prompt: what version is running, which session,
@@ -1087,8 +1441,15 @@ async fn run_inner(ui: &mut Ui, agent: Arc<Agent>, cwd: &Path) -> std::io::Resul
         // place it can be shown, and showing it is what lets the operator answer.
         repl.show_pending_question()?;
         let status = repl.status();
-        let prompt = prompt_for(&repl.agent).await;
-        repl.ui.draw(&prompt, &repl.editor, status.as_deref())?;
+        // An open question is drawn where the prompt would be, because that is where the
+        // operator is looking and a panel below a live-looking prompt invites typing into
+        // the wrong thing.
+        if let (Some(panel), Some((_, questions))) = (repl.panel.as_ref(), repl.question.as_ref()) {
+            repl.ui.draw_panel(panel, questions, status.as_deref())?;
+        } else {
+            let prompt = prompt_for(&repl.agent).await;
+            repl.ui.draw(&prompt, &repl.editor, status.as_deref())?;
+        }
 
         tokio::select! {
             _ = tick.tick() => {}
@@ -1131,6 +1492,264 @@ async fn run_inner(ui: &mut Ui, agent: Arc<Agent>, cwd: &Path) -> std::io::Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A two-option question, as the tool would hand one over.
+    fn question(prompt: &str, multi: bool) -> crate::tools::ask::Question {
+        crate::tools::ask::Question {
+            header: "schema".to_owned(),
+            prompt: prompt.to_owned(),
+            options: vec![
+                crate::tools::ask::Choice {
+                    label: "normalised".to_owned(),
+                    description: String::new(),
+                },
+                crate::tools::ask::Choice {
+                    label: "json column".to_owned(),
+                    description: String::new(),
+                },
+            ],
+            multi,
+        }
+    }
+
+    /// A single-choice question behaves like a radio, because a reply that names two labels
+    /// for one question is not something the model can act on.
+    #[test]
+    fn ticking_a_single_choice_clears_the_last_one() {
+        let q = question("Which schema?", false);
+        let mut panel = Panel::new(std::slice::from_ref(&q));
+        assert!(!panel.typing, "a question with options starts on the boxes");
+
+        panel.handle(key(KeyCode::Char(' ')), std::slice::from_ref(&q));
+        assert_eq!(panel.chosen(std::slice::from_ref(&q)).labels[0], ["normalised"]);
+
+        panel.handle(key(KeyCode::Down), std::slice::from_ref(&q));
+        panel.handle(key(KeyCode::Char(' ')), std::slice::from_ref(&q));
+        assert_eq!(
+            panel.chosen(std::slice::from_ref(&q)).labels[0],
+            ["json column"],
+            "the second tick replaces the first on a single-choice question"
+        );
+
+        // And ticking it again leaves nothing chosen, so "none of these" is expressible.
+        panel.handle(key(KeyCode::Char(' ')), std::slice::from_ref(&q));
+        assert!(panel.chosen(std::slice::from_ref(&q)).labels[0].is_empty());
+        assert!(!panel.says_something(), "nothing ticked and no note is empty");
+    }
+
+    /// Several may be chosen on a multi-select question, and the answer lists them in the
+    /// order the question offered rather than the order they were ticked — so the reply reads
+    /// the way the question did.
+    #[test]
+    fn a_multi_select_keeps_every_tick_in_the_order_offered() {
+        let q = question("Which environments?", true);
+        let mut panel = Panel::new(std::slice::from_ref(&q));
+        // Tick the second, then the first.
+        panel.handle(key(KeyCode::Down), std::slice::from_ref(&q));
+        panel.handle(key(KeyCode::Char(' ')), std::slice::from_ref(&q));
+        panel.handle(key(KeyCode::Up), std::slice::from_ref(&q));
+        panel.handle(key(KeyCode::Char(' ')), std::slice::from_ref(&q));
+        assert_eq!(
+            panel.chosen(std::slice::from_ref(&q)).labels[0],
+            ["normalised", "json column"],
+            "offered order, not ticked order"
+        );
+    }
+
+    /// The cursor wraps at both ends: with a short list, having to reverse direction to get
+    /// back to the first option is a needless obstacle.
+    #[test]
+    fn the_cursor_wraps_at_both_ends() {
+        let q = question("Which schema?", false);
+        let mut panel = Panel::new(std::slice::from_ref(&q));
+        let at = |panel: &Panel| panel.ticks[0].at;
+        assert_eq!(at(&panel), 0);
+        panel.handle(key(KeyCode::Up), std::slice::from_ref(&q));
+        assert_eq!(at(&panel), 1, "up from the first lands on the last");
+        panel.handle(key(KeyCode::Down), std::slice::from_ref(&q));
+        assert_eq!(at(&panel), 0, "and down from the last comes back");
+    }
+
+    /// A note is sent beside the choices, and only when something was actually typed — an
+    /// empty note would read to the model as an instruction to say nothing.
+    #[test]
+    fn a_note_is_optional_and_trimmed() {
+        let q = question("Which schema?", false);
+        let mut panel = Panel::new(std::slice::from_ref(&q));
+        panel.handle(key(KeyCode::Char(' ')), std::slice::from_ref(&q));
+
+        // Off the boxes and into the note.
+        panel.handle(key(KeyCode::Char('n')), std::slice::from_ref(&q));
+        assert!(panel.typing, "`n` opens the note");
+        assert!(panel.says_something(), "the tick alone is enough to send");
+
+        for c in " only if applied ".chars() {
+            panel.handle(key(KeyCode::Char(c)), std::slice::from_ref(&q));
+        }
+        let chosen = panel.chosen(std::slice::from_ref(&q));
+        assert_eq!(chosen.labels[0], ["normalised"], "the tick survives the note");
+        assert_eq!(chosen.note.as_deref(), Some("only if applied"), "trimmed");
+
+        // Escape leaves the note field without sending, and keeps what was typed — leaving to
+        // re-read the options must not throw the note away.
+        assert_eq!(
+            panel.handle(key(KeyCode::Esc), std::slice::from_ref(&q)),
+            PanelAction::Handled
+        );
+        assert!(!panel.typing);
+        assert_eq!(
+            panel.chosen(std::slice::from_ref(&q)).note.as_deref(),
+            Some("only if applied")
+        );
+
+        // A note of nothing but spaces is not a note.
+        let mut blank = Panel::new(std::slice::from_ref(&q));
+        blank.handle(key(KeyCode::Char('n')), std::slice::from_ref(&q));
+        blank.handle(key(KeyCode::Char(' ')), std::slice::from_ref(&q));
+        assert!(
+            blank.chosen(std::slice::from_ref(&q)).note.is_none(),
+            "whitespace is not a note"
+        );
+    }
+
+    /// Enter in the note sends the whole reply. Stopping to press enter twice — once to leave
+    /// the note, once to send — would be a puzzle with no signpost.
+    #[test]
+    fn enter_in_the_note_sends_the_reply() {
+        let q = question("Which schema?", false);
+        let mut panel = Panel::new(std::slice::from_ref(&q));
+        panel.handle(key(KeyCode::Char(' ')), std::slice::from_ref(&q));
+        panel.handle(key(KeyCode::Char('n')), std::slice::from_ref(&q));
+        assert_eq!(
+            panel.handle(key(KeyCode::Enter), std::slice::from_ref(&q)),
+            PanelAction::Submit
+        );
+    }
+
+    /// Several questions at once: tab moves between them and each keeps its own ticks, which
+    /// is the whole reason the panel holds a list rather than one.
+    #[test]
+    fn tab_moves_between_questions_and_the_ticks_stay_apart() {
+        let first = question("Which schema?", false);
+        let mut second = question("Which environment?", false);
+        second.options[0].label = "staging".to_owned();
+        second.options[1].label = "production".to_owned();
+        let questions = vec![first, second];
+        let mut panel = Panel::new(&questions);
+
+        panel.handle(key(KeyCode::Char(' ')), &questions);
+        panel.handle(key(KeyCode::Tab), &questions);
+        assert_eq!(panel.question, 1);
+        panel.handle(key(KeyCode::Down), &questions);
+        panel.handle(key(KeyCode::Char(' ')), &questions);
+        // Tab wraps, so a set is a cycle rather than a dead end.
+        panel.handle(key(KeyCode::Tab), &questions);
+        assert_eq!(panel.question, 0);
+        panel.handle(key(KeyCode::BackTab), &questions);
+        assert_eq!(panel.question, 1);
+
+        let chosen = panel.chosen(&questions);
+        assert_eq!(chosen.labels[0], ["normalised"], "the first is untouched");
+        assert_eq!(chosen.labels[1], ["production"]);
+    }
+
+    /// The answer the panel builds is the shape the wire and the tool expect, one list per
+    /// question in the order asked.
+    #[test]
+    fn the_reply_holds_one_choice_list_per_question() {
+        let questions = vec![question("One?", false), question("Two?", true)];
+        let mut panel = Panel::new(&questions);
+        panel.handle(key(KeyCode::Char(' ')), &questions);
+        panel.handle(key(KeyCode::Tab), &questions);
+        panel.handle(key(KeyCode::Char(' ')), &questions);
+        // The cursor has to move between ticks: space toggles the option it is on, so pressing
+        // it twice in one place is tick-then-untick, not two ticks.
+        panel.handle(key(KeyCode::Down), &questions);
+        panel.handle(key(KeyCode::Char(' ')), &questions);
+        let chosen = panel.chosen(&questions);
+        assert_eq!(
+            chosen.labels,
+            vec![
+                vec!["normalised".to_owned()],
+                vec!["normalised".to_owned(), "json column".to_owned()],
+            ]
+        );
+    }
+
+    /// The options are windowed around the cursor when the terminal is too narrow, because
+    /// the labels come from a model and their length is not ours to bound — and the cursor is
+    /// the thing the arrows move, so it is the one that must stay visible.
+    #[test]
+    fn a_long_option_list_is_windowed_around_the_cursor() {
+        let mut q = question("Which schema?", false);
+        q.options = (0..12)
+            .map(|i| crate::tools::ask::Choice {
+                label: format!("option-number-{i}"),
+                description: String::new(),
+            })
+            .collect();
+        let mut panel = Panel::new(std::slice::from_ref(&q));
+
+        let wide = panel.options_row(&q, 300);
+        assert!(
+            wide.contains("option-number-11") && !wide.contains('…'),
+            "everything fits, so nothing is hidden: {wide}"
+        );
+        // The cursor's own option is always on screen, however narrow the terminal.
+        for _ in 0..11 {
+            panel.handle(key(KeyCode::Down), std::slice::from_ref(&q));
+        }
+        assert_eq!(panel.ticks[0].at, 11);
+        let narrow = panel.options_row(&q, 24);
+        assert!(
+            narrow.contains("option-number-11"),
+            "the cursor must never scroll out of view: {narrow}"
+        );
+        assert!(narrow.chars().count() <= 24, "and the row must fit the width: {narrow}");
+        assert!(narrow.starts_with('…'), "there is more before it: {narrow}");
+    }
+
+    /// Replace the question with a test one that has no options.
+    ///
+    /// `Question::parse` requires at least two, so there is no way to build one from JSON — but
+    /// the panel must still behave if it ever sees one, and `Panel` is a plain struct in this
+    /// module, so the case is reachable from here.
+    fn without_options(question: &crate::tools::ask::Question) -> crate::tools::ask::Question {
+        crate::tools::ask::Question {
+            options: Vec::new(),
+            ..question.clone()
+        }
+    }
+
+    /// An option-less question has nothing to tick, so the panel must not leave the operator on
+    /// an empty option row with no way to answer. `n` is still the way in.
+    #[test]
+    fn a_question_with_no_options_is_still_answerable() {
+        let q = without_options(&question("What should the budget be?", false));
+        // A second question as well, so the option row has to draw the "n/m" position marker for
+        // a question that has no cells to put it in — the one place an empty option list could
+        // index out of bounds.
+        let questions = vec![q.clone(), question("And which one?", false)];
+        let mut panel = Panel::new(&questions);
+        assert!(!panel.ticks[0].on.iter().any(|on| *on), "nothing to tick");
+        assert_eq!(panel.ticks[0].on.len(), 0, "and no boxes to draw either");
+        assert_eq!(panel.options_row(&q, 80), "", "so the row is empty, not a panic");
+
+        // Pressing space on nothing must not panic or invent a tick.
+        panel.handle(key(KeyCode::Char(' ')), &questions);
+        assert!(!panel.says_something());
+        // And the note is still the way to answer it.
+        panel.handle(key(KeyCode::Char('n')), &questions);
+        panel.handle(key(KeyCode::Char('3')), &questions);
+        let chosen = panel.chosen(&questions);
+        assert!(chosen.labels[0].is_empty());
+        assert_eq!(chosen.note.as_deref(), Some("3"));
+    }
+
+    /// One key event, as the loop would see it.
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
 
     /// The clipboard carries the markdown, not the rendering.
     ///

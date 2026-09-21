@@ -143,8 +143,10 @@ async fn handle(stream: UnixStream, agent: Arc<Agent>) -> Result<(), SocketError
             }
             // An answer with no turn running: the question is over, and saying so beats
             // silence so the client knows its answer was not used.
-            Request::Answer { id, chosen } => {
-                let _ = agent.asker().answer(id, chosen);
+            Request::Answer { id, chosen, note } => {
+                let _ = agent
+                    .asker()
+                    .answer(id, crate::tools::ask::Chosen { labels: chosen, note });
                 write_line(
                     &mut write_half,
                     &Response::done("no question is open; the answer was not used"),
@@ -239,8 +241,11 @@ async fn run_watching_for_questions(
                     continue;
                 }
                 match serde_json::from_str::<Request>(&line) {
-                    Ok(Request::Answer { id, chosen }) => {
-                        let said = if agent.asker().answer(id, chosen) {
+                    Ok(Request::Answer { id, chosen, note }) => {
+                        let said = if agent.asker().answer(
+                            id,
+                            crate::tools::ask::Chosen { labels: chosen, note },
+                        ) {
                             "answered"
                         } else {
                             "that question is no longer open; the answer was not used"
@@ -352,6 +357,10 @@ enum Request {
     Answer {
         id: u64,
         chosen: Vec<Vec<String>>,
+        /// Free text the operator attached to the whole reply — the one thing a fixed list of
+        /// labels cannot express. Optional, so a client that predates it is unaffected.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
     },
 }
 

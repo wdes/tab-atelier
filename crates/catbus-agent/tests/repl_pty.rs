@@ -134,6 +134,30 @@ impl Pty {
         }
         seen.contains(needle)
     }
+
+    /// Drain output until the rendered screen satisfies `pred`, or time out.
+    ///
+    /// Needed in place of [`Pty::drain_until`] for the question panel, because ratatui diffs its
+    /// buffer: a repaint writes only the cells that *changed*, so a value that appears on screen
+    /// never shows up in the stream as contiguous text. Typing into the note is the clearest case
+    /// — each keystroke changes one cell, so the typed word is spread across many paints with
+    /// escape sequences between the letters. Emulating the screen is the only view of what the
+    /// operator actually sees.
+    fn drain_until_screen(&self, seen: &mut String, rows: u16, pred: impl Fn(&str) -> bool, within: Duration) -> bool {
+        let deadline = Instant::now() + within;
+        loop {
+            if pred(&screen_of(seen, rows, 80).join("\n")) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                // One last look, in case the final paint landed as the deadline passed.
+                return pred(&screen_of(seen, rows, 80).join("\n"));
+            }
+            // A needle nothing can match: this only pumps the channel for a moment, so the loop
+            // re-renders on every 100ms of output rather than spinning.
+            let _ = self.drain_until(seen, "\u{0}no such needle\u{0}", Duration::from_millis(100));
+        }
+    }
 }
 
 /// Stop the child on the way out, so a failed assertion cannot leave a process
@@ -752,4 +776,233 @@ fn no_colour_prints_the_markdown_unrendered() {
         "with no colour the markdown is shown as written:\n{plain}"
     );
     assert!(plain.contains("Done."), "{plain}");
+}
+
+/// A reply that asks a question instead of answering, as the tool-use path would.
+const REPLY_ASKING: &str = r#"{
+    "id": "msg_ask",
+    "type": "message",
+    "role": "assistant",
+    "model": "claude-sonnet-4-6",
+    "content": [{
+        "type": "tool_use",
+        "id": "toolu_ask",
+        "name": "AskUserQuestion",
+        "input": {
+            "questions": [{
+                "question": "Which one should it be?",
+                "header": "pick",
+                "multiSelect": false,
+                "options": [
+                    { "label": "first", "description": "the first one" },
+                    { "label": "second", "description": "the second one" }
+                ]
+            }]
+        }
+    }],
+    "stop_reason": "tool_use",
+    "usage": { "input_tokens": 100, "output_tokens": 20 }
+}"#;
+
+/// A relay that asks a question, then keeps the request that carries the answer.
+///
+/// Two posts: the first gets [`REPLY_ASKING`], so the app draws the panel and blocks on the
+/// answer; the second can only exist once the question has been answered, because it carries the
+/// tool result. That second request is sent down the channel because it is the only place the
+/// operator's keystrokes become visible to a test — the answer is a tool result inside the request
+/// body, and nothing on screen shows it. The turn is then ended with a plain reply so the screen
+/// settles and the test can prove the turn resumed rather than just stopping.
+fn spawn_asking_relay() -> (u16, mpsc::Receiver<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut posts = 0;
+        loop {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let raw = read_request(&mut stream);
+            // The startup price fetch shares the port but is not a turn.
+            let body = if raw.starts_with("GET ") {
+                MOCK_PRICES
+            } else {
+                posts += 1;
+                if posts == 1 { REPLY_ASKING } else { REPLY_WITH_USAGE }
+            };
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
+                 connection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+            if posts == 2 {
+                let _ = tx.send(raw);
+                return;
+            }
+        }
+    });
+    (port, rx)
+}
+
+/// A REPL on a pty with the **full** tool set, handed back so keys can be sent mid-turn.
+///
+/// [`type_and_expect_at`] cannot do this job: it sends one line and returns, and this test has to
+/// stay in the middle of a turn to press keys while the agent is blocked on the answer. The tool
+/// set is left at its default because `AskUserQuestion` is not in `MINIMAL_TOOLS`.
+///
+/// The temp home is returned rather than dropped, because the child's config and socket live in it
+/// — a `TempDir` that goes out of scope takes the directory out from under a live process.
+fn repl_against(port: u16) -> (Pty, KillOnDrop, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().to_path_buf();
+    // Not `mut`: `send` takes `&mut self`, and the caller owns it by then.
+    let pty = Pty::open();
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_catbus-agent"));
+    cmd.env("HOME", &home)
+        .env("RUST_LOG", "info")
+        .env_remove("NO_COLOR")
+        .env_remove("CLICOLOR")
+        .env_remove("CATBUS_ANSI")
+        .env_remove("CATBUS_TOOLS_CONFIG")
+        .env_remove("CATBUS_PREFERENCES")
+        .args([
+            "--new-session",
+            "--cwd",
+            home.to_str().unwrap(),
+            "--socket",
+            home.join("agent.sock").to_str().unwrap(),
+            "--relay-url",
+            &format!("http://127.0.0.1:{port}"),
+            "--relay-token",
+            "tap_pty_test",
+        ]);
+    let child = cmd
+        .stdin(pty.stdio())
+        .stdout(pty.stdio())
+        .stderr(pty.stdio())
+        .spawn()
+        .expect("spawn catbus-agent");
+    (pty, KillOnDrop(child), dir)
+}
+/// The question panel is driven by tick-box keystrokes, and what they put on the wire is the
+/// chosen *label* and the note — a seam no unit test reaches, because the panel and the socket
+/// sit on opposite sides of a task boundary. A pty is the only place both are real.
+///
+/// The keys are the terminal bytes a keyboard would send, so this pins the decoding too: a
+/// panel that understood `j`/`k` but not the arrow keys would pass every unit test and fail here.
+#[test]
+fn the_question_panel_sends_the_ticked_label_and_the_note() {
+    let (port, answered) = spawn_asking_relay();
+    let (mut pty, _child, _home) = repl_against(port);
+
+    let mut seen = String::new();
+    assert!(
+        pty.drain_until(&mut seen, "/help", Duration::from_secs(20)),
+        "the REPL never drew its prompt:\n{seen}"
+    );
+    pty.send("ask me something\n");
+    assert!(
+        pty.drain_until(&mut seen, "Which one should it be?", Duration::from_secs(30)),
+        "the question never appeared:\n{seen}"
+    );
+    // The prompt text and the panel come from the same loop iteration but are flushed as
+    // separate writes, so waiting on the question alone races the paint. Everything below reads
+    // the *screen*, because the panel is drawn in the viewport and a repaint emits only the cells
+    // that changed — the raw stream is not a picture of anything.
+    assert!(
+        pty.drain_until_screen(
+            &mut seen,
+            60,
+            |screen| screen.contains("[ ] first") && screen.contains("[ ] second"),
+            Duration::from_secs(30)
+        ),
+        "the panel never painted its options:\n{}",
+        screen_of(&seen, 60, 80).join("\n")
+    );
+
+    // `ESC [ B` is the down arrow: move to the second option, then tick it with space.
+    pty.send("\u{1b}[B");
+    pty.send(" ");
+    assert!(
+        pty.drain_until_screen(
+            &mut seen,
+            60,
+            |screen| screen.contains("[x] second"),
+            Duration::from_secs(15)
+        ),
+        "space must tick the option the cursor moved to:\n{}",
+        screen_of(&seen, 60, 80).join("\n")
+    );
+    // The cursor mark has to sit on the ticked option, or the operator cannot tell which box
+    // space will hit — and a tick on the wrong option is a silently wrong answer.
+    assert!(
+        screen_of(&seen, 60, 80).join("\n").contains("▸[x] second"),
+        "the cursor must be on the option that was ticked:\n{}",
+        screen_of(&seen, 60, 80).join("\n")
+    );
+
+    // `n` opens the note, which covers the hint row — so `note:` is the only new text that
+    // proves the field is open and taking keys.
+    pty.send("n");
+    assert!(
+        pty.drain_until_screen(
+            &mut seen,
+            60,
+            |screen| screen.contains("note:"),
+            Duration::from_secs(15)
+        ),
+        "`n` must open the note field:\n{}",
+        screen_of(&seen, 60, 80).join("\n")
+    );
+
+    // Typed with no terminator, because Enter sends. Each keystroke changes one cell, so the
+    // word is only ever whole on the reconstructed screen.
+    pty.send("only-if-applied");
+    assert!(
+        pty.drain_until_screen(
+            &mut seen,
+            60,
+            |screen| screen.contains("only-if-applied"),
+            Duration::from_secs(15)
+        ),
+        "what is typed must appear in the note:\n{}",
+        screen_of(&seen, 60, 80).join("\n")
+    );
+
+    // Enter sends: the note is the last thing written, so requiring a second Enter here would be
+    // a dead end with nothing on screen to signpost it.
+    pty.send("\r");
+
+    let raw = answered
+        .recv_timeout(Duration::from_secs(20))
+        .expect("the answer must produce a second request");
+    // The answer is the tool *result*, a JSON string inside the request body, so its quotes are
+    // escaped — unlike the `"label": …` of the tool *input*, which is a nested object. That is
+    // what makes `\"second\"` a statement about the answer rather than about the question.
+    assert!(raw.contains(r#"\"chosen\""#), "the reply must carry the choices: {raw}");
+    assert!(
+        raw.contains(r#"\"second\""#),
+        "the ticked label must reach the wire: {raw}"
+    );
+    assert!(
+        !raw.contains(r#"\"first\""#),
+        "the option that was not ticked must not be sent: {raw}"
+    );
+    assert!(
+        raw.contains("only-if-applied"),
+        "the note must reach the wire beside the choice: {raw}"
+    );
+    assert!(
+        raw.contains("Which one should it be?"),
+        "and the answer must name the question it answers: {raw}"
+    );
+
+    // The turn resumed rather than stopping at the answer.
+    assert!(
+        pty.drain_until(&mut seen, "Hello there.", Duration::from_secs(20)),
+        "the turn should continue once the question is answered:\n{seen}"
+    );
 }

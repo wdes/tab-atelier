@@ -130,16 +130,29 @@ changes the world.
 ## Being asked a question
 
 The agent stops and asks rather than guessing when a choice is yours — which of two
-schemas, whether a destructive step is wanted. The question appears with numbered options:
+schemas, whether a destructive step is wanted. The question appears in the scrollback, and
+the choices take over the prompt line as a tick-box list:
 
     Which schema should the migration use?
-      1. normalised — a table for line items
-      2. json column — faster to ship
-    answer with a number, or the label itself
+    ▸[ ] normalised  [ ] json column
 
-Answer with `2`, with `json column`, or `1,3` for a question that takes several. An answer
-it cannot read is reported rather than guessed at. If you are not there, it gives up and
-tells the agent so, and the agent is expected to decide and say what it assumed.
+Move with the arrow keys (or `j`/`k`), tick with space, and press enter to send. On a
+question that takes several, tick as many as you like; on one that takes a single answer,
+ticking a second clears the first. `tab` moves to the next question when the agent asked a
+few at once, and `↑↓` wrap around, so you never have to reverse direction to get back.
+
+Press `n` to attach a note to the reply — the one thing a fixed list of labels cannot
+express ("the second one, but only if the migration has already been applied"). The note is
+sent alongside the choices, never instead of them. Escape leaves the note field with what you
+typed intact; enter sends the whole reply, note and all. `ctrl-c` aborts the turn instead of
+answering.
+
+Enter with nothing ticked and nothing written is refused, rather than sent: an empty reply
+looks the same as a slip of the finger. To say "none of these", write it in a note.
+
+If you are not there, the question times out, the tool reports that nobody answered, and the
+agent is expected to decide and say what it assumed. The same question can also be answered
+from a socket client, which sees the question and sends the choices back.
 
 ## When something goes wrong
 
