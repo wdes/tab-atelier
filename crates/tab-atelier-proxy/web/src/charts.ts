@@ -154,10 +154,14 @@ function fmtCount(n: number): string {
 const UNIT_STEPS: Partial<Record<TokenUnit, readonly (readonly [number, string])[]>> = {
   wh: [[1e9, "GWh"], [1e6, "MWh"], [1e3, "kWh"]],
   gco2: [[1e6, "tCO₂e"], [1e3, "kgCO₂e"]],
-  // Bottoming out at 1, not 1e3, because a priced hour is routinely a fraction
-  // of a cent: without the `µ$` floor a cheap hour prints as `0.00`, which is
-  // indistinguishable from an hour nothing was spent in.
-  usd: [[1e6, "$"], [1e3, "m$"], [1, "µ$"]],
+  // `usd` is absent on purpose. Stepping is what moves the prefix off the
+  // figures and onto the axis name (`566.8` beneath `kWh`), and money cannot
+  // afford that: the same chart writes `$0.900` in its tooltip and in its panel
+  // totals, so an axis of bare `600` under an `m$` heading contradicts both.
+  // `m$` and `µ$` are not anyone's notation for dollars either. Money keeps its
+  // symbol on every figure instead — `money()` below, reached by `fmt` in
+  // `TokensChart`, which is also where the resolution a step used to provide is
+  // preserved.
 };
 
 /** Micro-USD as currency, with the symbol leading: `$25.90`, `$0.0312`. */
@@ -165,8 +169,14 @@ function money(micro: number): string {
   const dollars = micro / 1e6;
   // Decimals follow the magnitude: cents for a real sum, more only when the
   // whole figure is smaller than one — an hourly cost of $0.004 printed as
-  // `$0.00` is indistinguishable from an hour that cost nothing.
-  const places = dollars >= 1 ? 2 : dollars >= 0.01 ? 3 : 4;
+  // `$0.00` is indistinguishable from an hour that cost nothing. The lowest
+  // band carries that argument past the cent: a priced hour is routinely a
+  // fraction of a cent, and six places resolve a micro-dollar, so `$0.000030`
+  // still reads as spent. That is the resolution the `µ$` unit step used to
+  // supply, folded into the figure rather than into the axis name. The zero
+  // line takes cents instead, since a tick at `$0.000000` is noise about money
+  // rather than the absence of it.
+  const places = dollars === 0 ? 2 : dollars >= 1 ? 2 : dollars >= 0.01 ? 3 : dollars >= 0.0001 ? 4 : 6;
   return `$${dollars.toFixed(places)}`;
 }
 
@@ -540,16 +550,24 @@ const TokensChart = Vue.defineComponent({
     // totals and the tooltip on one unit without each call site knowing. The
     // magnitude moves into the axis name, so `566.8` + `kWh` — never `566.8k`
     // + `Wh`, which reads as a different number.
+    //
+    // Money is the exception, and it is handled here rather than in `unitName`
+    // so the heading and the figures cannot drift apart: with no unit steps the
+    // axis name falls back to a bare `$`, and `fmtCount` would then round a real
+    // hour to `0.00`. `money()` keeps the symbol on every figure instead.
     fmt(n: number): string {
+      if (this.unit === "usd") return money(n);
       const v = convertTokens(n, this.unit);
       const step = this.unitStep;
       return step === undefined ? fmtCount(v) : fmtCount(v / step[0]);
     },
     // The tooltip prints a figure, not a position on an axis, so it cannot lean
     // on the axis name for its unit the way tick labels do — `0.03 in` is not a
-    // price. Money names itself; every other unit keeps the stepped form.
+    // price. That is the choice `fmt` already makes, money included; asking it
+    // rather than repeating the decision is what keeps a figure from being the
+    // one call site somebody forgets to teach about a unit.
     tip(n: number): string {
-      return this.unit === "usd" ? money(n) : this.fmt(n);
+      return this.fmt(n);
     },
     // The panel totals label themselves rather than borrowing the axis name:
     // a window total can sit a step above the tallest single hour. Money writes
