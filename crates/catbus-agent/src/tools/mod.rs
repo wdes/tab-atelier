@@ -15,9 +15,12 @@ mod delegate;
 mod edit;
 mod filetree;
 mod git;
+pub mod glob;
+mod grep;
 mod list_agents;
 mod packages;
 mod phpunit;
+mod plouf;
 mod read;
 mod spawn;
 pub mod ssh;
@@ -45,13 +48,23 @@ pub use config::ToolSet;
 /// `allow` this list in a tools config to run such an agent:
 ///
 /// ```json
-/// { "allow": ["Read", "Write", "FileTree"] }
+/// { "allow": ["Read", "Write", "FileTree", "Grep"] }
 /// ```
 ///
-/// Kept as a `const` rather than left to each config so that this list, the
-/// tool specs, and the integration test that drives the trio all name the same
-/// three tools.
-pub const MINIMAL_TOOLS: &[&str] = &["Read", "Write", "FileTree"];
+/// Kept as a `const` rather than left to each config so that this list, the tool
+/// specs, and the integration test that drives them all name the same set — and
+/// so that adding a tool to the constrained preset is one edit, not a hunt.
+pub const MINIMAL_TOOLS: &[&str] = &["Read", "Write", "FileTree", "Grep"];
+
+/// Version-control state, always skipped by the tools that walk a project.
+///
+/// An enumerated list rather than a pattern: these are the only directories whose *contents* are not
+/// meant to be read, and naming them keeps every other dotfile visible. `.git` is the important one
+/// — it is the single directory most likely to be larger than the project it belongs to.
+///
+/// Here rather than in `filetree` because `Grep` prunes the same set: two copies would eventually
+/// disagree, and a directory one tool skipped would be a directory the other walked.
+pub const VCS_DIRS: &[&str] = &[".git", ".hg", ".svn", ".bzr"];
 
 /// What the agent is currently allowed to do.
 ///
@@ -189,12 +202,38 @@ pub fn parse_gate(name: &str) -> Option<Gate> {
 /// do.
 ///
 /// Not `const`: comparing `&str` is not allowed in a const fn on stable.
+/// Whether this tool is one whose *action* decides whether it writes, rather than its name.
+///
+/// One tool with many actions cannot be answered by its name: `Git show` reads while `Git push`
+/// writes, and `Plouf files` reads while `Plouf index` writes. Naming them here gives that fact one
+/// home, so a third action-based tool cannot leave one of the callers behind.
+#[must_use]
+pub fn action_decides_writes(name: &str) -> bool {
+    matches!(name, "Git" | "Plouf")
+}
+
+/// Whether `action` of an action-based tool writes.
+///
+/// `false` for an unknown or missing action — which is also what the tool itself will refuse, so the
+/// two agree rather than one of them guessing.
+#[must_use]
+pub fn action_writes(name: &str, action: &str) -> bool {
+    match name {
+        "Git" => git::action_writes(action),
+        "Plouf" => plouf::action_writes(action),
+        _ => false,
+    }
+}
+
+/// Whether a tool name changes the world, for the tools its own name cannot answer.
 #[must_use]
 pub fn changes_the_world(name: &str) -> bool {
     matches!(
         name,
         // `Git` is deliberately absent: its eight actions differ — three read, five write — so a bare
         // tool name cannot answer the question, and the dispatcher asks `git::action_writes` instead.
+        // `Plouf` is absent for the same reason: six of its seven actions only ask the code graph,
+        // and `index` writes the graph directory. `Grep` is absent because it only ever reads.
         "Write" | "Edit" | "Bash" | "PHPUnit" | "Composer" | "Bun" | "SSH"
     )
 }
@@ -207,7 +246,7 @@ pub fn changes_the_world(name: &str) -> bool {
 /// The spec list is what withholds a capability (a minimal set simply never
 /// lists `Bash`), and a model does hallucinate familiar tool names — so without
 /// this check the withholding would be advice rather than a limit, and an agent
-/// configured with three tools could still run a shell by asking for one.
+/// configured with a handful of tools could still run a shell by asking for one.
 ///
 /// A method on [`ToolSet`] rather than a free function because a custom tool
 /// needs the set's own definitions to run: its `argv`, its timeout, and whether
@@ -243,6 +282,9 @@ impl ToolSet {
             // see what is on disk would leave `Write` unusable and make
             // plan-mode a dead end rather than a pause.
             "FileTree" => filetree::run(input, cwd).await,
+            // Async and off the runtime: the walk happens on a blocking thread (see `grep`), so this
+            // awaits rather than blocking the socket.
+            "Grep" => grep::run(input, cwd).await,
             "Write" => {
                 if let Some(why) = gate.refusal("Write") {
                     return Err(why.to_string());
@@ -334,6 +376,18 @@ impl ToolSet {
                 }
                 phpunit::run(input, cwd).await
             }
+            // Same treatment as `Git`: one tool with actions, and only `index` writes, so the gate is
+            // asked about the action. Asking questions of the code graph is reading, and refusing it
+            // in plan-mode would make plan-mode unable to explore the code it is planning changes to.
+            "Plouf" => {
+                let action = input.get("action").and_then(|v| v.as_str()).unwrap_or("");
+                if plouf::action_writes(action)
+                    && let Some(why) = gate.refusal("Plouf")
+                {
+                    return Err(why.to_string());
+                }
+                plouf::run(input, cwd).await
+            }
             other => Err(format!("unknown tool: {other}")),
         }
     }
@@ -369,6 +423,8 @@ pub fn builtin_specs() -> Vec<serde_json::Value> {
         // Defined in its own module so its schema and the limits it enforces
         // cannot drift apart.
         filetree::spec(),
+        grep::spec(),
+        plouf::spec(),
         serde_json::json!({
             "name": "Write",
             "description": "Write a file from scratch. Overwrites existing content. Refused in plan-mode.",
@@ -488,7 +544,7 @@ mod tests {
     fn the_minimal_set_is_exactly_read_write_and_filetree() {
         // Guards the definition of "minimal" itself. Widening it silently would
         // hand every restricted agent a capability nobody asked it to have.
-        assert_eq!(MINIMAL_TOOLS, ["Read", "Write", "FileTree"]);
+        assert_eq!(MINIMAL_TOOLS, ["Read", "Write", "FileTree", "Grep"]);
     }
 
     #[test]

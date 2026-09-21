@@ -59,6 +59,15 @@ strip-ansi-escapes = "0.2"
 # This is ripgrep's walker: the same rules `rg` applies, global ignore file
 # included.
 ignore = "0.4"
+# Glob matching for `FileTree`'s `glob` action and `Grep`'s `glob` filter. Declared
+# directly rather than reached through `ignore`, which already depends on it, so the
+# use is visible: this is the same matcher ripgrep uses for `-g`, so a pattern that
+# works in `rg -g` works here.
+globset = "0.4"
+# Pattern matching for `Grep`. The `regex` syntax rather than a glob or a literal
+# substring, because that is what a tool called Grep means to whoever calls it — a
+# literal would make `^fn ` and `->\s*Self` silently match nothing.
+regex = "1"
 # Terminal width, for right-aligning the mode on the status line. Tiny and
 # purpose-built — it reads TIOCGWINSZ and nothing else, and its only dependency
 # (rustix, for termios) is already in the tree, so this adds one crate and no

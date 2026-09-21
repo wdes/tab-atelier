@@ -88,10 +88,10 @@ const fn yes() -> bool {
 
 /// Accepted by `--tools-config` in place of a JSON path.
 ///
-/// The minimal set is three short names, and an operator who wants "no shell"
+/// The minimal set is four short names, and an operator who wants "no shell"
 /// on one run should not have to create a file to say so — so
 /// `--tools-config minimal` is the shorthand for
-/// `{"allow": ["Read", "Write", "FileTree"]}`. The set itself lives in
+/// `{"allow": ["Read", "Write", "FileTree", "Grep"]}`. The set itself lives in
 /// [`super::MINIMAL_TOOLS`], so the keyword and the documented list cannot
 /// drift.
 pub const MINIMAL_KEYWORD: &str = "minimal";
@@ -100,7 +100,7 @@ pub const MINIMAL_KEYWORD: &str = "minimal";
 ///
 /// Exposed rather than inlined into [`load`] so a caller building a set in
 /// code asks for the same thing the keyword does, instead of re-listing the
-/// three names and inventing a fourth definition of "minimal".
+/// names and inventing a second definition of "minimal".
 #[must_use]
 pub fn minimal_config() -> ToolConfig {
     ToolConfig {
@@ -384,31 +384,32 @@ impl ToolSet {
         if let Some(tool) = self.custom.get(name) {
             return tool.judged;
         }
-        // `Git` cannot be answered by its name: three of its eight actions read and five write, so the
-        // action is what decides. Answered as writing here — the safe direction, since judging a read
-        // costs one judge call where failing to judge a push means it happens unexamined.
-        if name == "Git" {
+        // A tool whose action decides cannot be answered by its name: `Git show` reads and `Git push`
+        // writes; `Plouf files` reads and `Plouf index` writes. Answered as writing here — the safe
+        // direction, since judging a read costs one judge call where failing to judge a write means it
+        // happens unexamined. [`Self::call_changes_the_world`] gives the per-call answer.
+        if crate::tools::action_decides_writes(name) {
             return true;
         }
         crate::tools::changes_the_world(name)
     }
 
-    /// Whether **this call** changes the world, which for `Git` depends on the action.
+    /// Whether **this call** changes the world, which for an action-based tool depends on the action.
     ///
     /// The judge site needs this rather than [`Self::changes_the_world`]: judging the tool name alone
-    /// would spend a judge call on `git show` and — worse — judge a push as though it were a read if the
-    /// answer went the other way. One `Git` tool with eight actions means the question can only be
+    /// would spend a judge call on `git show`, and — worse — judge a push as though it were a read if
+    /// the answer went the other way. One tool with eight actions means the question can only be
     /// answered from the input.
     #[must_use]
     pub fn call_changes_the_world(&self, name: &str, input: &serde_json::Value) -> bool {
-        if name != "Git" {
+        if !crate::tools::action_decides_writes(name) {
             return self.changes_the_world(name);
         }
         if !self.offers(name) {
             return false;
         }
         let action = input.get("action").and_then(|v| v.as_str()).unwrap_or("");
-        crate::tools::git::action_writes(action)
+        crate::tools::action_writes(name, action)
     }
 
     /// Substitute `{param}` placeholders into `argv`.
@@ -634,8 +635,10 @@ mod tests {
             "Edit",
             "FileTree",
             "Git",
+            "Grep",
             "ListAgents",
             "PHPUnit",
+            "Plouf",
             "Read",
             "SSH",
             "Spawn",

@@ -12,7 +12,7 @@
 //!
 //! Exactly two things, and both are reported rather than silent:
 //!
-//! 1. **Version-control directories** ([`VCS_DIRS`]). Machine state that no one
+//! 1. **Version-control directories** ([`super::VCS_DIRS`]). Machine state that no one
 //!    reads, and `.git` is the one directory guaranteed to dwarf the project it
 //!    sits in. Skipped even outside a repository, because a stray `.git` is
 //!    still not something to walk.
@@ -69,14 +69,6 @@ pub const DEFAULT_MAX_ENTRIES: usize = 200;
 /// operator should hear about it.
 pub const MAX_ENTRIES_CEILING: usize = 2000;
 
-/// Version-control state, always skipped.
-///
-/// An enumerated list rather than a pattern: these are the only directories
-/// whose *contents* are not meant to be read, and naming them keeps every other
-/// dotfile visible. `.git` is the important one — it is the single directory
-/// most likely to be larger than the project it belongs to.
-const VCS_DIRS: &[&str] = &[".git", ".hg", ".svn", ".bzr"];
-
 /// One entry to render.
 struct Row {
     /// Path relative to the listed root, exactly as printed. Stored rather than
@@ -99,7 +91,7 @@ struct Stats {
     dirs: usize,
     files: usize,
     links: usize,
-    /// Directories skipped by [`VCS_DIRS`].
+    /// Directories skipped by [`super::VCS_DIRS`].
     vcs_skipped: usize,
     /// Directories the walk could not read.
     unreadable: usize,
@@ -110,11 +102,35 @@ pub async fn run(input: &serde_json::Value, cwd: &Path) -> Result<String, String
         .get("path")
         .and_then(|v| v.as_str())
         .ok_or_else(|| "missing path".to_string())?;
-    let depth = input.get("depth").and_then(serde_json::Value::as_u64).ok_or_else(|| {
-        "missing depth: pass how many levels deep to list, e.g. depth 1 for just this \
-             directory's contents"
-            .to_string()
-    })?;
+    // Compiled here so a bad pattern fails with a message that can teach the escaping, rather than
+    // somewhere inside the walk where the only thing it could say is that nothing matched.
+    let glob = match input
+        .get("glob")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|pattern| !pattern.is_empty())
+    {
+        Some(pattern) => Some(super::glob::matcher(pattern)?),
+        None => None,
+    };
+    // Required without a glob: "list this directory" needs to know how deep, and guessing is how a
+    // model ends up believing it saw a whole tree. With a glob it is optional, because the *pattern*
+    // is what selects — a glob means "at any depth", and honouring a depth of 1 would make `**/*.rs`
+    // silently miss most of what it asked for. When both are given, depth caps the walk rather than
+    // being ignored, since ignoring a value the caller passed is its own kind of wrong answer.
+    let depth = match input.get("depth").and_then(serde_json::Value::as_u64) {
+        Some(depth) => Some(depth),
+        None if glob.is_some() => None,
+        None => {
+            return Err(
+                "missing depth: pass how many levels deep to list, e.g. depth 1 for just this \
+                 directory's contents. (Optional when a `glob` is given, which searches at any \
+                 depth.)"
+                    .to_owned(),
+            );
+        }
+    };
+    let depth = depth.unwrap_or(MAX_DEPTH as u64);
     let max_entries = input
         .get("max_entries")
         .and_then(serde_json::Value::as_u64)
@@ -165,7 +181,16 @@ pub async fn run(input: &serde_json::Value, cwd: &Path) -> Result<String, String
         if !meta.is_dir() {
             return Err(format!("{}: not a directory", root.display()));
         }
-        Ok(render(&root, depth, max_entries, Options { show_ignored, show_vcs }))
+        Ok(render(
+            &root,
+            depth,
+            max_entries,
+            &Options {
+                show_ignored,
+                show_vcs,
+                glob,
+            },
+        ))
     })
     .await
     .map_err(|e| format!("listing failed: {e}"))??;
@@ -179,16 +204,21 @@ pub async fn run(input: &serde_json::Value, cwd: &Path) -> Result<String, String
 /// default to false, and mixing them up would produce a listing that is wrong in
 /// a way that still looks plausible — `show_vcs` accidentally set would silently
 /// dump a whole `.git` into the context window.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 struct Options {
     /// Include entries the project's ignore rules exclude.
     show_ignored: bool,
     /// Include version-control directories.
     show_vcs: bool,
+    /// Only list paths matching this pattern, at any depth.
+    ///
+    /// A compiled matcher rather than the pattern string so the failure to compile happens once, in
+    /// the caller, with a message that can teach the escaping — see [`super::glob::matcher`].
+    glob: Option<globset::GlobMatcher>,
 }
 
 /// Walk and format.
-fn render(root: &Path, max_depth: usize, max_entries: usize, options: Options) -> String {
+fn render(root: &Path, max_depth: usize, max_entries: usize, options: &Options) -> String {
     let (mut rows, mut stats, truncated) = collect(root, max_depth, max_entries, options);
     // Sorted by path, in byte order — the order `sort` and `rg --files` produce,
     // so the listing matches what the model has seen from those tools. Two
@@ -209,14 +239,18 @@ fn render(root: &Path, max_depth: usize, max_entries: usize, options: Options) -
 /// Separate from [`format_listing`] so neither outgrows a readable length, and so
 /// the interesting failure modes — a truncated walk, an unreadable directory —
 /// are values passed between them rather than flags threaded through formatting.
-fn collect(root: &Path, max_depth: usize, max_entries: usize, options: Options) -> (Vec<Row>, Stats, bool) {
+fn collect(root: &Path, max_depth: usize, max_entries: usize, options: &Options) -> (Vec<Row>, Stats, bool) {
     // Counted inside the filter closure, which runs during iteration and so
     // needs interior mutability. An `Arc<AtomicUsize>` rather than a plain
     // atomic: `filter_entry` takes the closure by value, so the count has to
     // outlive the builder for the totals line to read it.
     let pruned = Arc::new(AtomicUsize::new(0));
     let pruned_in_filter = Arc::clone(&pruned);
-
+    // The flag the filter closure needs, copied out before the closure is built: `filter_entry`
+    // takes a `'static` closure, so it cannot borrow `options` — and this is a `bool`, so copying
+    // it costs nothing and keeps the closure free of the lifetime entirely. `options` is still
+    // usable for the eager builder calls below, which are not closures.
+    let show_vcs = options.show_vcs;
     let mut builder = ignore::WalkBuilder::new(root);
     builder
         .max_depth(Some(max_depth))
@@ -259,9 +293,12 @@ fn collect(root: &Path, max_depth: usize, max_entries: usize, options: Options) 
             if entry.depth() == 0 {
                 return true;
             }
-            let is_vcs = entry.file_name().to_str().is_some_and(|name| VCS_DIRS.contains(&name));
+            let is_vcs = entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| super::VCS_DIRS.contains(&name));
             if is_vcs {
-                if options.show_vcs {
+                if show_vcs {
                     return true;
                 }
                 pruned_in_filter.fetch_add(1, Ordering::Relaxed);
@@ -278,6 +315,15 @@ fn collect(root: &Path, max_depth: usize, max_entries: usize, options: Options) 
             Ok(entry) => {
                 if entry.depth() == 0 {
                     continue;
+                }
+                // A match is not an entry to count: with a glob, the walk passes over everything
+                // that does not match, and counting those as entries would fill the budget with
+                // paths the caller never asked to see.
+                if let Some(glob) = &options.glob {
+                    let shown = entry.path().strip_prefix(root).unwrap_or_else(|_| entry.path());
+                    if !super::glob::matches(glob, shown) {
+                        continue;
+                    }
                 }
                 // Stop at the budget rather than collecting everything and
                 // slicing: "there is more" is known one entry past the limit,
@@ -309,13 +355,23 @@ fn collect(root: &Path, max_depth: usize, max_entries: usize, options: Options) 
 ///
 /// Uses `write!` rather than `push_str(&format!(..))`: the same output without
 /// building and dropping a `String` per line.
-fn format_listing(root: &Path, rows: &[Row], stats: &Stats, truncated: bool, options: Options) -> String {
+fn format_listing(root: &Path, rows: &[Row], stats: &Stats, truncated: bool, options: &Options) -> String {
     // A generous initial size: a listing is a handful of short lines, and
     // starting from scratch would reallocate a few times on a large tree.
     let mut out = String::with_capacity(64 + rows.len() * 32);
     // `writeln!` on a `String` cannot fail, so the results are discarded rather
     // than unwrapped — an infallible call has nothing to report.
     let _ = writeln!(out, "{}", root.display());
+    // A filtered listing has to say it is filtered. Without this the output is indistinguishable
+    // from a walk of the whole project, and "the file is not there" is concluded from a list that
+    // was never trying to contain it.
+    if let Some(glob) = &options.glob {
+        let _ = writeln!(
+            out,
+            "matching {} (at any depth; other paths are not listed)",
+            glob.glob()
+        );
+    }
     // Flat paths relative to the root, one per line. Every line is then usable
     // verbatim as the `path` of a `Read` or `Write`, which is the property that
     // matters most: a path the model has to *derive* from indentation is a path
@@ -358,7 +414,7 @@ fn format_listing(root: &Path, rows: &[Row], stats: &Stats, truncated: bool, opt
             "{} version-control {} skipped ({})",
             stats.vcs_skipped,
             plural(stats.vcs_skipped, "directory", "directories"),
-            VCS_DIRS.join(", ")
+            super::VCS_DIRS.join(", ")
         );
     }
     if stats.unreadable > 0 {
@@ -405,7 +461,7 @@ fn row_for(entry: &ignore::DirEntry, root: &Path) -> Row {
 /// opened — most of all the *global* one, which is per-machine and so makes the
 /// same directory list differently for two people. Only presence is checked;
 /// counting what each rule matched would mean walking the tree twice.
-fn ignore_note(root: &Path, options: Options) -> Option<String> {
+fn ignore_note(root: &Path, options: &Options) -> Option<String> {
     let mut sources = Vec::new();
     if root.join(".gitignore").is_file() {
         sources.push(".gitignore".to_string());
@@ -499,9 +555,13 @@ pub fn spec() -> serde_json::Value {
                 },
                 "depth": {
                     "type": "integer",
-                    "description": format!("How many levels deep to list. 1 lists only this directory's immediate contents. Must be between 1 and {MAX_DEPTH}."),
+                    "description": format!("How many levels deep to list. 1 lists only this directory's immediate contents. Must be between 1 and {MAX_DEPTH}. Required unless `glob` is given, in which case it is optional and caps the search — a glob is matched at any depth, so `glob` alone searches the whole tree."),
                     "minimum": 1,
                     "maximum": MAX_DEPTH
+                },
+                "glob": {
+                    "type": "string",
+                    "description": "Only list paths matching this pattern, at any depth. Matched against both the path and the file name, so `*.rs` finds Rust files in subdirectories as well as here. `**` crosses directories and `{a,b}` is an alternation. Use this instead of guessing a filename, and instead of walking depth by depth."
                 },
                 "max_entries": {
                     "type": "integer",
@@ -516,7 +576,7 @@ pub fn spec() -> serde_json::Value {
                     "description": "Include version-control directories (`.git`, `.hg`, …) and their contents. Default false. Usually only wanted when the repository's own state is the question."
                 }
             },
-            "required": ["path", "depth"]
+            "required": ["path"]
         }
     })
 }
@@ -699,7 +759,9 @@ mod tests {
         // a lowercased copy of it, because the skip compares names exactly: an
         // entry whose spelling later diverges in case from what a tool creates
         // would leave this test passing while the real skip did nothing.
-        for name in VCS_DIRS {
+        // `crate::tools` and not `super`: inside this test module `super` is `filetree`, and the
+        // list moved up to the parent so `Grep` could share it.
+        for name in crate::tools::VCS_DIRS {
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path();
             fs::create_dir_all(root.join(name)).unwrap();
@@ -736,7 +798,7 @@ mod tests {
         // project. Every entry added here is a directory an agent can no longer
         // see by default, so growth should be a deliberate decision — which is
         // why the count is asserted rather than merely commented.
-        assert_eq!(VCS_DIRS, [".git", ".hg", ".svn", ".bzr"]);
+        assert_eq!(crate::tools::VCS_DIRS, [".git", ".hg", ".svn", ".bzr"]);
     }
 
     #[test]
@@ -955,7 +1017,84 @@ mod tests {
         let depth = &spec["input_schema"]["properties"]["depth"];
         assert_eq!(depth["maximum"], MAX_DEPTH);
         assert_eq!(depth["minimum"], 1);
-        assert_eq!(spec["input_schema"]["required"], serde_json::json!(["path", "depth"]));
+        // Only `path` is required. `depth` is required in practice unless a `glob` is given, and a
+        // schema cannot express that condition — so it says so in the field's description, and the
+        // code refuses a missing depth with a message that repeats it.
+        assert_eq!(spec["input_schema"]["required"], serde_json::json!(["path"]));
+    }
+
+    /// `depth` is demanded only when the caller has not given a glob: a glob selects at any depth, so
+    /// requiring a level as well would ask for something the walk does not use.
+    #[tokio::test]
+    async fn depth_is_required_without_a_glob_and_optional_with_one() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+
+        let why = run(&serde_json::json!({ "path": "." }), dir.path())
+            .await
+            .expect_err("a missing depth must be refused");
+        assert!(why.contains("missing depth"), "{why}");
+        assert!(why.contains("glob"), "the message must name the alternative: {why}");
+
+        let out = run(&serde_json::json!({ "path": ".", "glob": "*.rs" }), dir.path())
+            .await
+            .expect("a glob makes the depth optional");
+        assert!(out.contains("main.rs"), "{out}");
+        // And the listing says it was filtered, so an absent path is not read as proof it does not
+        // exist.
+        assert!(out.contains("matching *.rs"), "{out}");
+    }
+
+    /// A glob reaches into subdirectories, which is the whole point — walking depth by depth to find
+    /// a file whose directory you do not know is what this replaces.
+    #[tokio::test]
+    async fn a_glob_searches_at_any_depth() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("a/b/c")).unwrap();
+        std::fs::write(dir.path().join("a/b/c/deep.rs"), "fn deep() {}\n").unwrap();
+        std::fs::write(dir.path().join("top.rs"), "fn top() {}\n").unwrap();
+        std::fs::write(dir.path().join("a/b/c/other.ts"), "x\n").unwrap();
+
+        let out = run(&serde_json::json!({ "path": ".", "glob": "*.rs" }), dir.path())
+            .await
+            .unwrap();
+        assert!(out.contains("deep.rs"), "three levels down must be found:\n{out}");
+        assert!(out.contains("top.rs"), "{out}");
+        assert!(!out.contains("other.ts"), "the glob must filter:\n{out}");
+    }
+
+    /// A depth still caps the walk when both are given. Ignoring a value the caller passed would be
+    /// its own wrong answer — and the reason this is documented rather than silent.
+    #[tokio::test]
+    async fn a_depth_caps_a_glob_walk() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("a/b/c")).unwrap();
+        std::fs::write(dir.path().join("a/b/c/deep.rs"), "fn deep() {}\n").unwrap();
+        std::fs::write(dir.path().join("top.rs"), "fn top() {}\n").unwrap();
+
+        let out = run(
+            &serde_json::json!({ "path": ".", "glob": "*.rs", "depth": 1 }),
+            dir.path(),
+        )
+        .await
+        .unwrap();
+        assert!(out.contains("top.rs"), "{out}");
+        assert!(
+            !out.contains("deep.rs"),
+            "a depth of 1 must not reach three levels down:\n{out}"
+        );
+    }
+
+    /// A glob that cannot compile is refused with a message that teaches the escaping, rather than
+    /// being passed to the walker where the only thing it could report is that nothing matched.
+    #[tokio::test]
+    async fn a_bad_glob_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let why = run(&serde_json::json!({ "path": ".", "glob": "[unclosed" }), dir.path())
+            .await
+            .expect_err("must be refused");
+        assert!(why.contains("not a valid glob"), "{why}");
     }
 
     #[test]

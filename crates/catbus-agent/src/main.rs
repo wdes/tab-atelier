@@ -189,7 +189,7 @@ struct Args {
     /// prompt cache on every turn.
     ///
     /// The literal word `minimal` is accepted instead of a path, as a
-    /// shorthand for `{"allow": ["Read", "Write", "FileTree"]}` — a file-editing
+    /// shorthand for `{"allow": ["Read", "Write", "FileTree", "Grep"]}` — a file-editing
     /// agent with no shell. A name that is neither a path nor `minimal` is an
     /// error rather than a silent fallback to the full set.
     #[arg(long, env = "CATBUS_TOOLS_CONFIG")]
