@@ -2701,20 +2701,20 @@ impl AppState {
                 let Some(tab) = self.tabs.iter_mut().find(|t| *t.id == upd.tab_id) else {
                     continue;
                 };
-                // "__clear__" sentinel from a POST with state=idle.
-                // Wipes BOTH the transient state and the durable
-                // session attachment, so the LED actually disappears
-                // on Claude Code's SessionEnd hook (otherwise the
-                // grey "session attached" dot would stick around).
-                if upd.label.as_deref() == Some("__clear__") {
+                if upd.wipe_attachment {
                     tab.agent_state = None;
                     tab.agent_session_id = None;
                     tab.agent_kind = None;
                     tab.agent_plan_mode = None;
                 } else {
-                    tab.agent_state = Some(crate::AgentStateSnapshot {
-                        state: upd.state,
-                        label: upd.label,
+                    // `state: None` (the wire's "idle") takes the indicator
+                    // down. The metadata below still applies either way, so
+                    // an update that names its session parks the LED *and*
+                    // leaves the tab resumable — which is what codex's
+                    // wrapper does on exit.
+                    tab.agent_state = upd.state.map(|state| crate::AgentStateSnapshot {
+                        state,
+                        label: upd.label.clone(),
                         updated_at: std::time::Instant::now(),
                     });
                     if upd.session_id.is_some() {

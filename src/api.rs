@@ -550,6 +550,14 @@ impl crate::schedule::LockState for SnapshotTab {
     }
 }
 
+/// The `label` that means "forget this tab's agent attachment", not
+/// "display this text": Claude Code's `SessionEnd` hook sends it so the
+/// grey *session attached* dot doesn't outlive the session. Kept as a
+/// wire value (rather than a fourth `state`) so that hooks written
+/// against older builds keep working, and used only by callers that
+/// mean it — a bare `state: "idle"` just parks the indicator.
+pub const WIPE_LABEL: &str = "__clear__";
+
 /// A status update queued by `POST /tabs/by-id/{id}/status` — drained
 /// by the main loop, which writes both the transient `agent_state`
 /// snapshot and the durable `agent_session_id` / `agent_kind` /
@@ -557,13 +565,19 @@ impl crate::schedule::LockState for SnapshotTab {
 #[derive(Clone, Debug)]
 pub struct PendingStatusUpdate {
     pub tab_id: String,
-    pub state: crate::AgentState,
+    /// `None` = take the indicator down (the wire's `"idle"`). The
+    /// metadata fields below are applied either way, so an update that
+    /// names its session can park the indicator *and* stay resumable.
+    pub state: Option<crate::AgentState>,
     pub label: Option<String>,
     pub session_id: Option<String>,
     pub agent_kind: Option<String>,
     pub plan_mode: Option<bool>,
     /// `--daemon`: this tab is a session-less daemon to relaunch on restart.
     pub daemon: Option<bool>,
+    /// Drop the durable attachment as well (see [`WIPE_LABEL`]). The
+    /// metadata fields above are ignored when this is set.
+    pub wipe_attachment: bool,
 }
 
 /// A queued relay-config change (the CLI `relay via <ep>` / `relay egress`).
@@ -6503,33 +6517,115 @@ mod tests {
         assert_eq!(status_code(&resp), 200);
         let s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let upd = s.pending_status_updates.last().unwrap();
-        let (tab_id, agent_state, label, session_id, agent_kind) = (
+        let (tab_id, agent_state, label, session_id, agent_kind, wipe) = (
             upd.tab_id.clone(),
             upd.state,
             upd.label.clone(),
             upd.session_id.clone(),
             upd.agent_kind.clone(),
+            upd.wipe_attachment,
         );
         drop(s);
         assert_eq!(tab_id, "tab-a");
-        assert_eq!(agent_state, crate::AgentState::Thinking);
+        assert_eq!(agent_state, Some(crate::AgentState::Thinking));
         assert_eq!(label.as_deref(), Some("building"));
         assert_eq!(session_id.as_deref(), Some("sess-9"));
         assert_eq!(agent_kind.as_deref(), Some("claude"));
-        // "idle" ⇒ the wipe marker.
-        let idle = r#"{"state":"idle"}"#;
+        assert!(!wipe, "a plain state update must never detach the session");
+    }
+
+    #[test]
+    fn idle_parks_the_indicator_and_still_attaches_the_session() {
+        // The distinction that matters for agents with no hook: `idle` must be
+        // able to say "no longer thinking" AND "this is the session to resume",
+        // in one call. Only the `__clear__` label detaches.
+        let (port, state, token) = spawn_server();
+        let post = |body: &str| {
+            status_code(&request(
+                port,
+                &format!(
+                    "POST /tabs/by-id/tab-a/status HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len(),
+                ),
+            ))
+        };
+        assert_eq!(
+            post(r#"{"state":"idle","sessionId":"codex-1","agentKind":"codex","label":"done"}"#),
+            200
+        );
+        let (state_now, label, session_id, kind, wipe) = {
+            let locked = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let upd = locked.pending_status_updates.last().unwrap();
+            let out = (
+                upd.state,
+                upd.label.clone(),
+                upd.session_id.clone(),
+                upd.agent_kind.clone(),
+                upd.wipe_attachment,
+            );
+            // Let the guard go before asserting, so nothing is held while the test runs on.
+            drop(locked);
+            out
+        };
+        assert_eq!(state_now, None, "idle takes the indicator down");
+        assert_eq!(label, None, "a parked indicator has nothing to render a label on");
+        assert_eq!(session_id.as_deref(), Some("codex-1"), "still resumable");
+        assert_eq!(kind.as_deref(), Some("codex"));
+        assert!(!wipe);
+
+        // A bare idle carries nothing, so it must not claim a session either.
+        assert_eq!(post(r#"{"state":"idle"}"#), 200);
+        let (state_now, session_id, kind, wipe) = {
+            let locked = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let upd = locked.pending_status_updates.last().unwrap();
+            let out = (
+                upd.state,
+                upd.session_id.clone(),
+                upd.agent_kind.clone(),
+                upd.wipe_attachment,
+            );
+            drop(locked);
+            out
+        };
+        assert_eq!(state_now, None);
+        assert_eq!(session_id, None);
+        assert_eq!(kind, None);
+        assert!(!wipe);
+    }
+
+    #[test]
+    fn clear_label_detaches_instead_of_rendering() {
+        // Claude Code's SessionEnd hook sends `{"state":"idle","label":"__clear__"}`
+        // and means "forget the attachment", not "show this text" — so the label
+        // must never survive as display text.
+        let (port, state, token) = spawn_server();
+        let payload = r#"{"state":"idle","label":"__clear__","sessionId":"gone","agentKind":"claude"}"#;
         let resp = request(
             port,
             &format!(
-                "POST /tabs/by-id/tab-a/status HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\n\r\n{idle}",
-                idle.len(),
+                "POST /tabs/by-id/tab-a/status HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\n\r\n{payload}",
+                payload.len(),
             ),
         );
         assert_eq!(status_code(&resp), 200);
-        let label = {
-            let s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            s.pending_status_updates.last().unwrap().label.clone()
+        assert!(body(&resp).contains(r#""cleared":true"#));
+        let (wipe, label, session_id, kind, state_now) = {
+            let locked = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let upd = locked.pending_status_updates.last().unwrap();
+            let out = (
+                upd.wipe_attachment,
+                upd.label.clone(),
+                upd.session_id.clone(),
+                upd.agent_kind.clone(),
+                upd.state,
+            );
+            drop(locked);
+            out
         };
-        assert_eq!(label.as_deref(), Some("__clear__"));
+        assert!(wipe);
+        assert_eq!(label, None, "the sentinel is a verb, not text");
+        assert_eq!(session_id, None);
+        assert_eq!(kind, None);
+        assert_eq!(state_now, None, "and the indicator comes down");
     }
 }

@@ -553,6 +553,11 @@ tab-atelier set-status <state> [--label <hint>] \
                                 [--plan|--no-plan]
 
 # state: idle | thinking | waiting | error
+#
+# `idle` takes the indicator down but keeps whatever --session / --kind it was
+# given, so a wrapper with no hook of its own can say "not working any more" and
+# "here is the session to resume" in one call. The durable attachment is dropped
+# only by `--label __clear__`, which `claude-hook session-end` sends.
 ```
 
 The CLI silently exits 0 when `_TAB_ID` is unset (i.e. invoked outside a tab), so it is safe to call unconditionally from `.bashrc` snippets, agents, or build hooks.
