@@ -1028,8 +1028,8 @@ pub fn build_agent_resume_command(kind: &str, session_id: &str, plan: Option<boo
         // The UUID is the one in the rollout filename
         // (`~/.codex/sessions/<y>/<m>/<d>/rollout-<ts>-<UUID>.jsonl`), also
         // repeated in its `session_meta` header. Unlike Claude there is no hook
-        // to hand it over, so the tab works it out from the working directory —
-        // see [`codex_session_id_for_dir`].
+        // to hand it over, so `scripts/codex-agent.sh` works it out from the
+        // working directory and stamps it over `set-status`.
         "codex" => Some(format!("codex resume {session_id}")),
         // The ⛑ brain watchdog has no session to resume — it's a standalone
         // tool that re-attaches to every OTHER tab over the local API, so

@@ -1067,12 +1067,19 @@ mod tests {
     /// tunnel are not. The list of property names is asserted exactly rather than by absence, so
     /// adding a field means this test is edited deliberately — which is what should happen for
     /// something that widens what the tool can be told.
+    ///
+    /// Sorted before comparing, because the order the keys come out in is not a promise:
+    /// `serde_json` keeps them in a `BTreeMap` (sorted) unless a dependency turns on its
+    /// `preserve_order` feature, which makes the map insertion-ordered. The workspace test run
+    /// enables it, so asserting the raw order passes for one package and fails for the workspace
+    /// over a difference no caller can observe. What matters is which names are offered.
     #[test]
     fn the_schema_offers_nothing_beyond_addresses_and_forwarding() {
         let spec = spec();
         assert_eq!(spec["name"], "SSH");
         let properties = spec["input_schema"]["properties"].as_object().expect("properties");
-        let offered: Vec<&str> = properties.keys().map(String::as_str).collect();
+        let mut offered: Vec<&str> = properties.keys().map(String::as_str).collect();
+        offered.sort_unstable();
         assert_eq!(
             offered,
             [

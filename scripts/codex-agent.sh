@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MPL-2.0
 # Launch `codex` as a tracked tab-atelier agent.
 #
 # tab-atelier learns an agent's kind, session id and state from the agent
@@ -43,8 +44,13 @@ session_for_cwd() {
     fi
   done < <(find "$dir" -name 'rollout-*.jsonl' -printf '%T@ %p\n' 2>/dev/null | sort -rn | cut -d' ' -f2-)
   [[ -n "$newest" ]] || return 1
-  # The UUID in the filename IS the session id (verified against session_meta).
-  basename "$newest" | sed -E 's/^rollout-[0-9T-]+-//; s/\.jsonl$//'
+  # The UUID in the filename IS the session id (verified against session_meta,
+  # see docs/agent-support-research.md). Anchor the strip on the full ISO stamp:
+  # a `[0-9T-]+` class is greedy and eats the UUID's own first segment whenever
+  # that segment happens to be all digits, e.g. rollout-…-1234-5678-… would be
+  # cut down to "5678-…" and `codex resume` would then fail.
+  basename "$newest" \
+    | sed -E 's/^rollout-[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}-[0-9]{2}-[0-9]{2}-//; s/\.jsonl$//'
 }
 
 # Agent-written one-liner for a session id, from codex's own index. Empty when
@@ -59,22 +65,25 @@ label_for_session() {
 # ── launch ───────────────────────────────────────────────────────────────────
 # Declare "running" before handing over: from the tab's point of view the agent
 # is thinking as soon as it is launched.
-status --state thinking --label "codex (démarrage)"
+status --state thinking --label "codex (starting)"
 
 codex "$@"
 rc=$?
 
 # On exit, refresh the facts now that codex has written its rollout. A session
-# that finished cleanly is idle; a non-zero exit is an error worth showing.
+# that finished cleanly is idle — the indicator goes down but the session stays
+# attached and resumable; a non-zero exit is an error worth showing.
 sid=$(session_for_cwd || true)
 label=$(label_for_session "$sid")
-[[ -n "$label" ]] || label="codex (terminé)"
+[[ -n "$label" ]] || label="codex (finished)"
 
+# `--opt=value` throughout: codex's own thread_name is arbitrary text and would
+# otherwise be taken for a flag if it happened to start with a dash.
 if (( rc == 0 )); then
-  # shellcheck disable=SC2086
-  status --state idle ${sid:+--session "$sid"} --label "$label"
+  args=(--state=idle "--label=$label")
 else
-  # shellcheck disable=SC2086
-  status --state error ${sid:+--session "$sid"} --label "$label (code $rc)"
+  args=(--state=error "--label=$label (code $rc)")
 fi
+[[ -n "$sid" ]] && args+=("--session=$sid")
+status "${args[@]}"
 exit "$rc"
