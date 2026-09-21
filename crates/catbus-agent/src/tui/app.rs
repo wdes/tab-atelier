@@ -1290,6 +1290,10 @@ struct Repl<'a> {
     turn: Option<tokio::task::JoinHandle<Result<crate::agent::Turn, crate::agent::AgentError>>>,
     /// The spinner describing it.
     spinner: Option<Spinner>,
+    /// Decides which activity the status row may name, on a clock. Held across the turn rather than
+    /// per frame, because it is the memory of what was recently named that makes the debounce and
+    /// the lingering check work — see [`crate::statusline::Activity`].
+    activity: crate::statusline::Activity,
     /// Prompts typed while it was running, in the order they were given.
     queued: std::collections::VecDeque<String>,
     /// The question the agent is waiting on, and the id to answer it by.
@@ -1320,9 +1324,14 @@ impl Repl<'_> {
         self.turn.as_ref()?;
         let spinner = self.spinner.get_or_insert_with(Spinner::new);
         // The agent reports `thinking` while it waits on the model and a tool name while
-        // it runs one; `activity_label` presents the former and passes the latter
-        // through.
-        let activity = crate::statusline::activity_label(&self.agent.status().unwrap_or_else(|| "thinking".to_owned()));
+        // it runs one. `Activity` decides which of those the row is allowed to name: it holds a
+        // name back until the activity has been up long enough to read, and leaves a check
+        // behind when one finishes, so a run of fast tools cannot strobe names and a tool that
+        // did finish is distinguishable from one that never started.
+        let activity = self.activity.label(
+            &self.agent.status().unwrap_or_else(|| "thinking".to_owned()),
+            std::time::Instant::now(),
+        );
         // The input estimate is the local count of what was sent, marked `~` so it is
         // never mistaken for the server's. Omitted rather than shown as zero before a
         // request has been measured.
@@ -1650,6 +1659,7 @@ async fn run_inner(ui: &mut Ui, agent: Arc<Agent>, cwd: &Path) -> std::io::Resul
         editor: Editor::new(),
         turn: None,
         spinner: None,
+        activity: crate::statusline::Activity::new(),
         queued: std::collections::VecDeque::new(),
         question: None,
         panel: None,

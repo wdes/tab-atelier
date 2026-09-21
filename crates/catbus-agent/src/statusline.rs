@@ -18,6 +18,12 @@
 //! numbers is a function here, where the edge cases — a terminal narrower than
 //! the text, a count with separators, a missing estimate, the mode changing
 //! mid-session — can be tested without a tty.
+//!
+//! The one piece of state is [`Activity`], which decides *which* activity is worth
+//! showing; it takes the clock as an argument rather than reading it, so its timing
+//! rules are testable too.
+
+use std::time::{Duration, Instant};
 
 /// `1,234 in - 567 out` — the left-hand field of the totals line.
 #[must_use]
@@ -195,6 +201,100 @@ pub fn activity_label(status: &str) -> String {
     }
 }
 
+/// The glyph beside an activity that has just finished.
+pub const DONE: &str = "✓";
+
+/// How long an activity must have been running before the row names it.
+///
+/// A tool that returns in five milliseconds would otherwise paint its name on the row for a single
+/// frame, and a run of fast tools strobes through names nobody can read. Long enough to hide the
+/// fast ones, short enough that a real tool — a `Bash` that takes a second, a fetch — is named
+/// almost at once.
+const DEBOUNCE: Duration = Duration::from_millis(150);
+
+/// How long a finished activity's check stays on the row.
+///
+/// The check is the only signal that something *completed* rather than merely started, so it has to
+/// outlast a glance; and it has to be gone before the next activity, or the row would claim two
+/// things were running.
+const LINGER: Duration = Duration::from_millis(600);
+
+/// Turns the agent's status into what the row shows, with an eye on the clock and not only on the
+/// text.
+///
+/// [`activity_label`] formats a status; this decides *which* status is worth showing. Both rules
+/// are about time:
+///
+/// - **Debounce.** A name is held back until it has been up for [`DEBOUNCE`], and the row says
+///   plain `Thinking` until then. Otherwise every fast tool flashes its name for a frame.
+/// - **Lingering check.** When an activity ends the row would snap straight back to `Thinking`,
+///   discarding the fact that it ended at all — so the name stays for [`LINGER`] with [`DONE`]
+///   beside it. That is what makes "it read that file" distinguishable from "it has not started",
+///   which in a bare spinner are the same picture.
+///
+/// Stateful by necessity, and `now` is passed in rather than read from the clock, so the timing
+/// rules can be tested without sleeping.
+#[derive(Debug, Default)]
+pub struct Activity {
+    /// The activity being shown, and when it first appeared. `None` when the row is between
+    /// activities — which is the normal state while the model is being called.
+    running: Option<(String, Instant)>,
+    /// An activity that finished recently, and when, so its check can linger.
+    finished: Option<(String, Instant)>,
+}
+
+impl Activity {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// What the row should say for `status`, at `now`.
+    pub fn label(&mut self, status: &str, now: Instant) -> String {
+        if status == THINKING_MARKER {
+            // The model is being called again, which means whatever was running has finished. The
+            // transition is the only signal available: the agent reports the tool while it runs and
+            // the bare marker afterwards, with nothing in between to say the tool returned.
+            if let Some((label, at)) = self.running.take() {
+                // Only an activity that was actually *named* earns a check. One that came and went
+                // inside the debounce never appeared on the row, so marking it done would be a
+                // check with nothing to refer to — it would flash for an activity the operator
+                // never saw start.
+                if now.saturating_duration_since(at) >= DEBOUNCE {
+                    self.finished = Some((label, now));
+                }
+            }
+            if let Some((label, at)) = &self.finished
+                && now.saturating_duration_since(*at) < LINGER
+            {
+                return format!("{} {DONE}", activity_label(label));
+            }
+            // The check has been up long enough, or there was nothing to check.
+            self.finished = None;
+            return THINKING.to_owned();
+        }
+
+        // A new activity supersedes a lingering check: the row describes what is happening now, and
+        // leaving a stale check beside a running tool would claim both.
+        self.finished = None;
+        match &self.running {
+            Some((label, at)) if label == status => {
+                if now.saturating_duration_since(*at) >= DEBOUNCE {
+                    activity_label(status)
+                } else {
+                    // Real, but too new to be worth a name yet.
+                    THINKING.to_owned()
+                }
+            }
+            _ => {
+                // First sight of it: start the clock and say nothing yet.
+                self.running = Some((status.to_owned(), now));
+                THINKING.to_owned()
+            }
+        }
+    }
+}
+
 /// Column width assumed when the terminal will not say.
 const FALLBACK_WIDTH: usize = 80;
 
@@ -328,5 +428,135 @@ mod tests {
         assert_eq!(THINKING, "Thinking");
         assert_eq!(THINKING_MARKER, "thinking");
         assert_eq!(activity_label(THINKING_MARKER), THINKING);
+    }
+
+    /// A fast activity is never named: it is held back until it has been running long enough to be
+    /// worth reading, so a run of quick tools does not strobe names across the row.
+    #[test]
+    fn a_fast_activity_is_never_named() {
+        let mut activity = Activity::new();
+        let start = Instant::now();
+        assert_eq!(activity.label("Read(a.rs)", start), THINKING);
+
+        // Still within the debounce window: no name yet, and not because the rules forgot it.
+        assert_eq!(
+            activity.label("Read(a.rs)", start + DEBOUNCE / 2),
+            THINKING,
+            "half the debounce is not long enough"
+        );
+
+        // Past it, the name appears.
+        assert_eq!(activity.label("Read(a.rs)", start + DEBOUNCE), "Thinking - Read(a.rs)");
+    }
+
+    /// The clock restarts for a *different* activity: a tool that is replaced by another has not
+    /// earned its own name yet, even though the previous one had.
+    #[test]
+    fn the_debounce_restarts_for_each_activity() {
+        let mut activity = Activity::new();
+        let start = Instant::now();
+        assert_eq!(activity.label("Read(a.rs)", start), THINKING);
+        assert_eq!(activity.label("Read(a.rs)", start + DEBOUNCE), "Thinking - Read(a.rs)");
+
+        // A second tool arriving after the first has been showing is still new.
+        let second = start + DEBOUNCE + Duration::from_millis(10);
+        assert_eq!(activity.label("Bash(cargo test)", second), THINKING);
+        assert_eq!(
+            activity.label("Bash(cargo test)", second + DEBOUNCE),
+            "Thinking - Bash(cargo test)"
+        );
+    }
+
+    /// Take an activity from first sight to named, returning the instant it was named.
+    ///
+    /// Two calls, because naming is not the first sight of a status: the debounce starts when the
+    /// row first sees it, so a test that jumps straight to `start + DEBOUNCE` is really asserting
+    /// about a clock that began at that moment. Spelling the sequence out keeps the tests honest
+    /// about which call starts the clock.
+    fn named(activity: &mut Activity, status: &str, start: Instant) -> Instant {
+        assert_eq!(
+            activity.label(status, start),
+            THINKING,
+            "the first sight of an activity must be debounced"
+        );
+        let shown = start + DEBOUNCE;
+        assert_eq!(
+            activity.label(status, shown),
+            activity_label(status),
+            "the name must appear once the debounce has passed"
+        );
+        shown
+    }
+
+    /// A finished activity leaves a check behind rather than vanishing, because the check is the
+    /// only signal that it *completed* — while it runs and after it finished, the model is thinking
+    /// either way.
+    #[test]
+    fn a_finished_activity_lingers_with_a_check() {
+        let mut activity = Activity::new();
+        let start = Instant::now();
+        let running = named(&mut activity, "Read(a.rs)", start);
+
+        // The agent reports the marker again: the tool returned.
+        assert_eq!(activity.label(THINKING_MARKER, running), "Thinking - Read(a.rs) ✓");
+        // And it stays for a moment, so it can actually be seen.
+        assert_eq!(
+            activity.label(THINKING_MARKER, running + LINGER / 2),
+            "Thinking - Read(a.rs) ✓"
+        );
+        // Then goes, leaving the row as the plain label.
+        assert_eq!(
+            activity.label(THINKING_MARKER, running + LINGER),
+            THINKING,
+            "the check must not stay forever"
+        );
+    }
+
+    /// A tool that finished while the row was still inside its debounce leaves no check: nothing was
+    /// ever named, so there is nothing to mark as done — and a check for an unread name would be a
+    /// flicker with no referent.
+    #[test]
+    fn a_tool_that_returns_before_the_debounce_leaves_no_check() {
+        let mut activity = Activity::new();
+        let start = Instant::now();
+        assert_eq!(activity.label("Read(a.rs)", start), THINKING);
+        // Gone again before it was ever named.
+        assert_eq!(activity.label(THINKING_MARKER, start + DEBOUNCE / 2), THINKING);
+    }
+
+    /// A new activity clears a lingering check: the row describes what is happening now, and a
+    /// check beside a running tool would claim both had finished.
+    #[test]
+    fn a_new_activity_clears_the_check() {
+        let mut activity = Activity::new();
+        let start = Instant::now();
+        let running = named(&mut activity, "Read(a.rs)", start);
+        assert_eq!(activity.label(THINKING_MARKER, running), "Thinking - Read(a.rs) ✓");
+
+        // The next tool starts while the check is still up; it is new, so it is debounced and the
+        // stale check must be gone.
+        let next = running + Duration::from_millis(50);
+        assert_eq!(
+            activity.label("Bash(cargo test)", next),
+            THINKING,
+            "the check must not survive into the next activity"
+        );
+        assert_eq!(
+            activity.label("Bash(cargo test)", next + DEBOUNCE),
+            "Thinking - Bash(cargo test)"
+        );
+    }
+
+    /// The row starts as plain `Thinking` on a fresh turn, and stays there while the model is being
+    /// called — no check for work that has not happened yet.
+    #[test]
+    fn a_turn_starts_with_nothing_to_check() {
+        let mut activity = Activity::new();
+        let start = Instant::now();
+        assert_eq!(activity.label(THINKING_MARKER, start), THINKING);
+        assert_eq!(
+            activity.label(THINKING_MARKER, start + Duration::from_secs(5)),
+            THINKING
+        );
     }
 }
