@@ -40,10 +40,37 @@ const TIMEOUT: Duration = Duration::from_mins(5);
 const MAX_OUTPUT_CHARS: usize = 24_000;
 
 /// The actions this tool offers, in the order the schema lists them.
-const ACTIONS: &[&str] = &["orient", "callers", "sig", "find", "grep", "files", "index"];
+///
+/// This is `plouf-rs`'s own subcommand list, minus `statusline` (it renders a Claude Code status
+/// line from harness JSON on stdin, which is not something a tool call can use) and `help`.
+///
+/// Taken from `plouf-rs --help` rather than inferred. The first version of this list was inferred,
+/// and an agent driving the tool found the two errors within minutes: `files` does not exist, and
+/// `find` takes no `--kind`. Both were my invention, and both failed only at runtime — the tests
+/// passed because they asserted the argv my code built rather than the argv the CLI accepts.
+const ACTIONS: &[&str] = &[
+    "orient",
+    "find",
+    "sig",
+    "body",
+    "callers",
+    "grep",
+    "twin",
+    "tests",
+    "uses",
+    "missing",
+    "dead-code",
+    "tables",
+    "table",
+    "index",
+];
 
-/// The actions that take a positional query or subject.
-const QUERYING: &[&str] = &["orient", "callers", "sig", "find", "grep", "index"];
+/// The actions that take no subject: they answer about the graph as a whole.
+const NO_SUBJECT: &[&str] = &["missing", "dead-code", "tables"];
+
+/// The one action whose subject is a path to walk rather than a name to look up, and so the one that
+/// must be confined to the project — it writes a graph directory beside what it is given.
+const TAKES_A_PATH: &[&str] = &["index"];
 
 /// Whether an action changes anything on disk.
 ///
@@ -132,35 +159,43 @@ fn argv(input: &serde_json::Value, cwd: &Path) -> Result<Vec<String>, String> {
 
     let mut args = vec![action.to_owned()];
 
-    if action == "index" {
-        // The one action whose subject is a path to walk rather than a name to look up, and so the
-        // one that must be confined to the project: it writes a graph directory beside what it is
-        // given.
+    // Every querying subcommand takes exactly one positional: a term, a symbol id, a translation key
+    // or a table name, depending on the action. One field for all of them, because the CLI makes no
+    // distinction — having `query` for most actions and `text` for `grep` was my invention too.
+    if !NO_SUBJECT.contains(&action) {
         let value = required(input, "query", action)?;
-        args.push(inside(cwd, "query", value)?);
-    } else if QUERYING.contains(&action) {
-        // `files` takes no subject: it lists what the graph knows about.
-        let field = if action == "grep" { "text" } else { "query" };
-        let value = required(input, field, action)?;
-        // `sig` and `callers` take a *path*; the others take a search string. Only the path needs
-        // confining, but a leading dash is refused for both.
-        if action == "sig" || action == "callers" {
-            args.push(inside(cwd, field, value)?);
+        // Only `index` is confined: it is the one subject that is a path to walk, and it writes a
+        // graph directory beside it. Everything else is a name to look up in a read-only query, so a
+        // slash in it means nothing to the filesystem.
+        if TAKES_A_PATH.contains(&action) {
+            args.push(inside(cwd, "query", value)?);
         } else {
-            args.push(safe_arg(field, value)?);
+            args.push(safe_arg("query", value)?);
         }
     }
 
-    if action == "find"
-        && let Some(kind) = input.get("kind").and_then(serde_json::Value::as_str)
-    {
-        args.push("--kind".to_owned());
-        args.push(safe_arg("kind", kind)?);
+    // `body` truncates by default and can be asked for the whole thing. Worth exposing: the
+    // truncated form is the right default for a model's context, and the full form is what a caller
+    // wants when the truncated one says the body matters.
+    if action == "body" && bool_field(input, "full") {
+        args.push("--full".to_owned());
     }
 
-    // Only passed when the caller names a graph directory. `plouf-rs` has its own default, and
-    // guessing at it here would break the moment it changed — so the default is left to the tool
-    // that owns it.
+    // `table` reads a schema JSON, which is a path and so confined like a path.
+    if action == "table"
+        && let Some(schema) = input
+            .get("schema")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    {
+        args.push("--schema".to_owned());
+        args.push(inside(cwd, "schema", schema)?);
+    }
+
+    // Only passed when the caller names a graph directory. `plouf-rs` has its own default
+    // (`build/plouf-rs-out`), and repeating it here would break the moment it changed — so the
+    // default is left to the tool that owns it.
     if let Some(out) = input
         .get("out")
         .and_then(serde_json::Value::as_str)
@@ -172,6 +207,11 @@ fn argv(input: &serde_json::Value, cwd: &Path) -> Result<Vec<String>, String> {
     }
 
     Ok(args)
+}
+
+/// A boolean input field, defaulting to false.
+fn bool_field(input: &serde_json::Value, field: &str) -> bool {
+    input.get(field).and_then(serde_json::Value::as_bool).unwrap_or(false)
 }
 
 /// A required non-empty string input, named in the error so a caller can correct itself in one step.
@@ -234,37 +274,49 @@ fn short(text: &str, max: usize) -> String {
 pub fn spec() -> serde_json::Value {
     serde_json::json!({
         "name": "Plouf",
-        "description": "Ask the `plouf-rs` code graph about this project: what calls a function, \
-                        what a file declares, what a fuzzy name refers to. Answers structure \
-                        questions that Grep can only answer by listing every textual match — \
-                        `Plouf callers` names the call sites, where `Grep` returns every \
-                        occurrence of the word. Requires the graph to have been built: run \
-                        `index` once per project, then the read-only actions are fast.",
+        "description": "Ask the `plouf-rs` code graph about this project. Answers structure \
+                        questions that Grep can only answer by listing every textual match: \
+                        `callers` names the call sites where `Grep` returns every occurrence of the \
+                        word, and `sig`/`body` give a symbol's declaration and source where `Read` \
+                        would make you open the whole file. `tests` says which tests cover a \
+                        symbol, `twin` finds its same-name twin in another language, `uses` finds \
+                        translation-key usage, `dead-code` finds what nothing references, and \
+                        `tables`/`table` read a DB schema. Requires the graph to have been built: \
+                        run `index` once per project, then the read-only actions are fast.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "action": {
                     "type": "string",
                     "enum": ACTIONS,
-                    "description": "`orient` ranks what a fuzzy query might mean; `callers` lists \
-                                    call sites of a path; `sig` shows a file's declarations; \
-                                    `find` searches declarations by name; `grep` searches the \
-                                    indexed sources; `files` lists what is indexed; `index` \
-                                    builds or refreshes the graph (the only action that writes).",
+                    "description": "What to ask. Found by name: `find` (symbols whose name contains \
+                                    the query), `sig` (a symbol's declaration line), `body` (its \
+                                    source), `callers` (what references it), `tests` (tests that \
+                                    cover it), `twin` (same name in another language/file). In \
+                                    content: `grep` (search code, comments and strings, printing \
+                                    the enclosing symbol of each hit). Overview: `orient` (one \
+                                    compact shot at a symbol). Gaps: `missing`, `dead-code`. Data: \
+                                    `uses` (translation keys), `tables`, `table`. And `index` \
+                                    builds or refreshes the graph — the only action that writes.",
                 },
                 "query": {
                     "type": "string",
-                    "description": "What to look for: a symbol, a phrase, or — for `sig`, `callers` \
-                                    and `index` — a path inside the working directory.",
+                    "description": "The subject: a symbol id or a name fragment for the symbol \
+                                    actions, a keyword for `grep`, a translation key for `uses`, a \
+                                    table name for `table`, or a path inside the working directory \
+                                    for `index`. Omit it for `missing`, `dead-code` and `tables`, \
+                                    which answer about the whole graph.",
                 },
-                "text": {
-                    "type": "string",
-                    "description": "What to search for with the `grep` action.",
+                "full": {
+                    "type": "boolean",
+                    "description": "With `body`: print the whole body instead of the truncated one. \
+                                    Truncated is the better default for reading; ask for the whole \
+                                    thing when the truncated body shows the part that matters.",
                 },
-                "kind": {
+                "schema": {
                     "type": "string",
-                    "description": "With `find`: restrict to a declaration kind, e.g. `class`, \
-                                    `function`, `method`, `interface`.",
+                    "description": "With `table`: path to the schema JSON, inside the working \
+                                    directory. Defaults to what plouf-rs expects.",
                 },
                 "out": {
                     "type": "string",
@@ -286,46 +338,97 @@ mod tests {
         argv(input, &PathBuf::from("/project"))
     }
 
-    /// Each action builds the command it names, with the subject in the position `plouf-rs` expects
-    /// and no extra words. A wrong argv here is a tool that always fails.
+    /// Each action builds the command it names, with its one positional where `plouf-rs` expects it.
+    ///
+    /// The list is `plouf-rs`'s own, taken from `plouf-rs --help`. This test previously asserted a
+    /// `files` action and a `--kind` flag on `find`, neither of which exists: both were invented, and
+    /// the test passed anyway because it compared against the argv this code builds rather than the
+    /// argv the CLI accepts. A test cannot catch that by itself — only running the real binary can,
+    /// which is how it was found.
     #[test]
     fn each_action_builds_its_command() {
-        assert_eq!(
-            args(&serde_json::json!({ "action": "orient", "query": "auth" })).unwrap(),
-            ["orient", "auth"]
-        );
-        assert_eq!(
-            args(&serde_json::json!({ "action": "callers", "query": "src/auth.rs" })).unwrap(),
-            ["callers", "src/auth.rs"]
-        );
-        assert_eq!(
-            args(&serde_json::json!({ "action": "sig", "query": "src/auth.rs" })).unwrap(),
-            ["sig", "src/auth.rs"]
-        );
-        assert_eq!(
-            args(&serde_json::json!({ "action": "grep", "text": "verify" })).unwrap(),
-            ["grep", "verify"]
-        );
-        assert_eq!(args(&serde_json::json!({ "action": "files" })).unwrap(), ["files"]);
+        for (action, query) in [
+            ("orient", "auth"),
+            ("find", "Auth"),
+            ("sig", "App\\Auth"),
+            ("body", "App\\Auth"),
+            ("callers", "App\\Auth"),
+            ("grep", "verify_token"),
+            ("twin", "Auth"),
+            ("uses", "auth.failed"),
+            ("tests", "App\\Auth"),
+            ("table", "users"),
+        ] {
+            assert_eq!(
+                args(&serde_json::json!({ "action": action, "query": query })).unwrap(),
+                [action, query],
+                "`{action}` takes its subject as one bare positional"
+            );
+        }
         assert_eq!(
             args(&serde_json::json!({ "action": "index", "query": "src" })).unwrap(),
             ["index", "src"]
         );
     }
 
-    /// `find` takes a kind, and it goes in as the flag with its value — the only flag this tool
-    /// offers, and one that carries no path or command of its own.
+    /// The three actions that answer about the whole graph take no subject, so they must not demand
+    /// one — and a `query` they do not use must not be passed through as a stray argument.
     #[test]
-    fn find_passes_its_kind() {
+    fn the_graph_wide_actions_take_no_subject() {
+        for action in NO_SUBJECT {
+            assert_eq!(
+                args(&serde_json::json!({ "action": action })).unwrap(),
+                [action.to_string()],
+                "`{action}` needs no subject"
+            );
+            assert_eq!(
+                args(&serde_json::json!({ "action": action, "query": "ignored" })).unwrap(),
+                [action.to_string()],
+                "`{action}` must not pass an unused subject: plouf-rs takes no positional"
+            );
+        }
+    }
+
+    /// `find` takes no `--kind`. It was invented here and a real agent run discovered it, so this
+    /// pins the absence: a caller asking for one gets a plain `find`.
+    #[test]
+    fn find_does_not_invent_a_kind_flag() {
         assert_eq!(
             args(&serde_json::json!({ "action": "find", "query": "Auth", "kind": "class" })).unwrap(),
-            ["find", "Auth", "--kind", "class"]
+            ["find", "Auth"],
+            "plouf-rs has no --kind on find, so a `kind` input must be ignored rather than passed"
         );
-        // Absent, it is simply not passed, so plouf-rs applies its own default.
+    }
+
+    /// `body` truncates by default and can be asked for the whole thing — the flag `plouf-rs` really
+    /// has, and the reason the truncated default is worth keeping.
+    #[test]
+    fn body_can_ask_for_the_whole_thing() {
         assert_eq!(
-            args(&serde_json::json!({ "action": "find", "query": "Auth" })).unwrap(),
-            ["find", "Auth"]
+            args(&serde_json::json!({ "action": "body", "query": "App\\Auth" })).unwrap(),
+            ["body", "App\\Auth"]
         );
+        assert_eq!(
+            args(&serde_json::json!({ "action": "body", "query": "App\\Auth", "full": true })).unwrap(),
+            ["body", "App\\Auth", "--full"]
+        );
+        // `full` is meaningless on any other action and must not leak onto one.
+        assert_eq!(
+            args(&serde_json::json!({ "action": "sig", "query": "App\\Auth", "full": true })).unwrap(),
+            ["sig", "App\\Auth"]
+        );
+    }
+
+    /// `table` reads a schema file, which is a path, so it is confined like one.
+    #[test]
+    fn table_takes_a_schema_path_inside_the_project() {
+        assert_eq!(
+            args(&serde_json::json!({ "action": "table", "query": "users", "schema": "db/schema.json" })).unwrap(),
+            ["table", "users", "--schema", "db/schema.json"]
+        );
+        let why = args(&serde_json::json!({ "action": "table", "query": "users", "schema": "/etc/passwd" }))
+            .expect_err("an absolute schema path must be refused");
+        assert!(why.contains("inside the working directory"), "{why}");
     }
 
     /// The graph directory is only passed when a caller names one, because `plouf-rs` owns its own
@@ -333,12 +436,12 @@ mod tests {
     #[test]
     fn the_graph_directory_is_optional() {
         assert_eq!(
-            args(&serde_json::json!({ "action": "files", "out": "build/graph" })).unwrap(),
-            ["files", "-o", "build/graph"]
+            args(&serde_json::json!({ "action": "tables", "out": "build/graph" })).unwrap(),
+            ["tables", "-o", "build/graph"]
         );
         assert_eq!(
-            args(&serde_json::json!({ "action": "files", "out": "  " })).unwrap(),
-            ["files"],
+            args(&serde_json::json!({ "action": "tables", "out": "  " })).unwrap(),
+            ["tables"],
             "an empty value is not a directory"
         );
     }
@@ -348,9 +451,6 @@ mod tests {
     #[test]
     fn a_leading_dash_cannot_become_a_flag() {
         let why = args(&serde_json::json!({ "action": "orient", "query": "--out=/etc" })).expect_err("must be refused");
-        assert!(why.contains("may not start with `-`"), "{why}");
-        let why = args(&serde_json::json!({ "action": "find", "query": "x", "kind": "--exec" }))
-            .expect_err("must be refused");
         assert!(why.contains("may not start with `-`"), "{why}");
     }
 
@@ -366,11 +466,29 @@ mod tests {
                 "for {bad} the message should say why: {why}"
             );
         }
-        // And a path that only *looks* suspicious is fine.
+        // A slug is not a path, so a slash in a symbol name is not confined — confining it would
+        // refuse the ordinary `App\Auth` spelling that plouf-rs itself prints.
         assert_eq!(
-            args(&serde_json::json!({ "action": "index", "query": "src/lib.rs" })).unwrap(),
-            ["index", "src/lib.rs"]
+            args(&serde_json::json!({ "action": "sig", "query": "src/Auth.php:App\\Auth" })).unwrap(),
+            ["sig", "src/Auth.php:App\\Auth"]
         );
+    }
+
+    /// The action list is `plouf-rs`'s own subcommands, and the ones that are deliberately absent are
+    /// absent for a reason worth stating.
+    #[test]
+    fn the_actions_are_the_clis_own_subcommands() {
+        // `files` does not exist. It was invented in the first version of this tool, and a real agent
+        // run found it by being told to use it.
+        assert!(!ACTIONS.contains(&"files"), "plouf-rs has no `files` subcommand");
+        // `statusline` renders a Claude Code status line from harness JSON on stdin, which a tool
+        // call cannot supply, so it is not offered.
+        assert!(!ACTIONS.contains(&"statusline"));
+        assert!(!ACTIONS.contains(&"help"));
+        // The ones an agent orienting in a codebase most needs are present.
+        for wanted in ["orient", "find", "sig", "body", "callers", "grep", "tests", "index"] {
+            assert!(ACTIONS.contains(&wanted), "`{wanted}` should be offered");
+        }
     }
 
     /// An unknown or missing action is refused with the list, so a caller can correct itself in one
@@ -386,24 +504,24 @@ mod tests {
         assert!(why.contains("`action` is required"), "{why}");
     }
 
-    /// A querying action without its subject is refused, naming the field it wants — the failure a
+    /// A subject-taking action without a subject is refused, naming the field it wants — the failure a
     /// caller sees most often, so it is worth being specific about.
     #[test]
     fn a_missing_subject_is_refused_by_name() {
         let why = args(&serde_json::json!({ "action": "grep" })).expect_err("must be refused");
-        assert!(why.contains("`text` is required"), "{why}");
-        let why = args(&serde_json::json!({ "action": "orient" })).expect_err("must be refused");
         assert!(why.contains("`query` is required"), "{why}");
         // Whitespace is not a subject.
-        let why = args(&serde_json::json!({ "action": "grep", "text": "   " })).expect_err("must be refused");
-        assert!(why.contains("`text` is required"), "{why}");
+        let why = args(&serde_json::json!({ "action": "grep", "query": "   " })).expect_err("must be refused");
+        assert!(why.contains("`query` is required"), "{why}");
+        // But a graph-wide action needs none.
+        assert!(args(&serde_json::json!({ "action": "missing" })).is_ok());
     }
 
     /// Only `index` writes, which is what lets a read-only session still use the graph.
     #[test]
     fn only_index_writes() {
         assert!(action_writes("index"));
-        for read_only in ["orient", "callers", "sig", "find", "grep", "files"] {
+        for read_only in ACTIONS.iter().filter(|a| **a != "index") {
             assert!(!action_writes(read_only), "{read_only} must not count as a write");
         }
     }
@@ -421,10 +539,21 @@ mod tests {
             .map(|value| value.as_str().expect("a string"))
             .collect();
         assert_eq!(offered, ACTIONS);
+        // And the fields the code reads are the fields the schema documents.
+        let properties = spec["input_schema"]["properties"].as_object().expect("properties");
+        for field in ["action", "query", "full", "schema", "out"] {
+            assert!(properties.contains_key(field), "the schema must document `{field}`");
+        }
+        for gone in ["text", "kind"] {
+            assert!(
+                !properties.contains_key(gone),
+                "`{gone}` was invented and must not be offered"
+            );
+        }
     }
 
-    /// Long output is cut and says so, because a truncated answer that looks complete is how a
-    /// model reports a partial picture as the whole one.
+    /// Long output is cut and says so, because a truncated answer that looks complete is how a model
+    /// reports a partial picture as the whole one.
     #[test]
     fn long_output_is_truncated_visibly() {
         let long = "x".repeat(100);
