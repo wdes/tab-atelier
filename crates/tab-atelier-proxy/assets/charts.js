@@ -23,11 +23,18 @@
     const H = 200;
     // ── Units for the token chart ───────────────────────────────────────────────
     //
-    // The token chart counts tokens. The toggle in its header asks a different
-    // question — what those tokens cost in energy — and answers it with a published
-    // ESTIMATE, not a measurement. Two consequences run through everything below:
-    // the source is carried into the UI wherever a converted figure appears, and a
-    // conversion never touches a provider's own token numbers.
+    // The token chart counts tokens. The toggle in its header asks two different
+    // questions about them, and the answers are not the same kind of thing.
+    //
+    // Energy (`Wh`, `gCO₂e`) is a published ESTIMATE extrapolated from a per-prompt
+    // figure, so the source is carried into the UI wherever a converted value
+    // appears and a conversion never touches a provider's own token numbers.
+    //
+    // Money (`$`) is a RECORD rather than an estimate. The server writes the amount
+    // beside the tokens as it serves them, so a bar is what the hour was charged —
+    // not a rate applied to a count after the fact, which would drift every time the
+    // price list changed and silently re-price history. Where no amount was
+    // recorded, the bar is absent rather than estimated; `moneyNote` says so.
     /** What the token chart's y-axis and totals are expressed in. */
     const TOKEN_UNITS = ["tokens", "wh", "gco2", "usd"];
     const UNIT_LABEL = {
@@ -72,10 +79,15 @@
     };
     /** The full caveat, shown verbatim wherever a money figure appears. */
     function moneyNote() {
-        return (`Indicative, from ${SOURCE_PRICE.unit}: ${SOURCE_PRICE.value}. Priced on the ` +
-            `server, one rate per account, with the peak window applied to the hours it ` +
-            `covers. An account served by another model is priced at the cheapest one ` +
-            `its provider still offers, so read it as a close estimate, not an invoice.`);
+        return (`What each hour was charged, recorded by the server as the tokens were used ` +
+            `and stored beside them. It is a record, not a re-estimate: it does not move ` +
+            `when the price list changes, and it cannot be recomputed into a different ` +
+            `answer later. The hours were priced at the rates in force when each call was ` +
+            `made — ${SOURCE_PRICE.unit}, ${SOURCE_PRICE.value} — with the peak window ` +
+            `applied to the hour it covers. Hours recorded before amounts were stored ` +
+            `carry no amount and are drawn as gaps rather than filled with today's ` +
+            `prices, which would be a figure about the price list rather than about the ` +
+            `traffic.`);
     }
     /** Convert a token count into `unit`; `tokens` passes straight through. */
     /**

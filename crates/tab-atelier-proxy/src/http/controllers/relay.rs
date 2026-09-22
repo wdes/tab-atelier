@@ -413,7 +413,7 @@ pub(crate) async fn shape_and_admit(
         .with_header("retry-after", retry_after.to_string());
         // A refused call still happened, and an operator looking at a quiet
         // graph should see the refusals.
-        record(state, &account.id, None, usage::Tokens::default(), 429);
+        record(state, &account.id, None, None, usage::Tokens::default(), 429);
         return Err(resp);
     }
     Ok((body, route, compaction, local))
@@ -988,7 +988,7 @@ pub(crate) fn forward(
     if meta_tx.send(Ok((status, ctype))).is_err() {
         // The client is gone, but the call was still made and still cost
         // tokens — so it is recorded anyway, just without a body to read.
-        record(&f.state, &f.account_id, None, usage::Tokens::default(), status);
+        record(&f.state, &f.account_id, None, None, usage::Tokens::default(), status);
         // The capture is still filed: the request WAS made and the client
         // hanging up does not unmake it. No token counts, because the
         // response was never read.
@@ -999,7 +999,14 @@ pub(crate) fn forward(
     let mut excerpt = Vec::new();
     let dropped = pump(&mut reader, wire, is_sse, status, &mut sniffer, &mut excerpt, body_tx);
     let (model, tokens) = sniffer.finish();
-    record(&f.state, &f.account_id, model.as_deref(), tokens, status);
+    record(
+        &f.state,
+        &f.account_id,
+        Some(f.route.provider_id.as_str()),
+        model.as_deref(),
+        tokens,
+        status,
+    );
     log::info!(
         "proxy: {status} for {}: {} in / {} out ({} cache read, {} cache write) reply: {}",
         model.as_deref().unwrap_or(&f.route.model_id),
@@ -1119,9 +1126,46 @@ pub(crate) fn observe_upstream(
     }
 }
 
-pub(crate) fn record(state: &State, account_id: &str, model: Option<&str>, tokens: usage::Tokens, status: u16) {
+pub(crate) fn record(
+    state: &State,
+    account_id: &str,
+    provider: Option<&str>,
+    model: Option<&str>,
+    tokens: usage::Tokens,
+    status: u16,
+) {
+    // Priced before the usage lock is taken, and with the registry guard
+    // released in between: the lock order here is store, then registry, then
+    // store, and holding both at once would invite a deadlock.
+    let cost = charge(state, provider, model, &tokens);
     let mut u = state.usage.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    u.record(account_id, model, tokens, (200..300).contains(&status));
+    u.record(account_id, model, tokens, (200..300).contains(&status), cost);
+}
+
+/// What a batch of tokens cost, at the rates in force when it arrived.
+///
+/// Captured here rather than derived when the graph is drawn. A figure worked
+/// out at report time is multiplied by whatever the rate table says *now*, so a
+/// month of history would be re-priced at today's rates and a price edit — or a
+/// peak window moving — would rewrite what an hour cost last month. The amount
+/// is stored beside the tokens it paid for, and cannot move afterwards.
+///
+/// Same formula the live view uses, so the stored total and the number under a
+/// chart at read time agree; the only difference is *when* the rate is read.
+fn charge(state: &State, provider: Option<&str>, model: Option<&str>, tokens: &usage::Tokens) -> Option<usage::Cost> {
+    if tokens.is_zero() {
+        return None;
+    }
+    let now = usage::now_secs();
+    // A cache write is a first read that pays full price, so it is charged at
+    // the miss rate beside the reads.
+    let price = {
+        let registry = state.registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        registry.billing_price(provider, model)?.at(now)
+    };
+    let cache_read = tokens.cache_read.saturating_add(tokens.cache_write);
+    let (in_micro, out_micro) = price.split_micro(cache_read, tokens.input, tokens.output);
+    Some(usage::Cost { in_micro, out_micro })
 }
 
 pub(crate) fn upstream_url(base: &str, wire: provider::Wire, path: &str) -> String {

@@ -151,6 +151,7 @@ mod tests {
                     ..crate::usage::Tokens::default()
                 },
                 true,
+                None,
             );
 
         let reply = usage_report(&state, "window=24h");

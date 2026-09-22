@@ -120,6 +120,31 @@ impl Tokens {
     }
 }
 
+/// What a batch of tokens was charged, in micro-USD, priced when it was used.
+///
+/// Stored rather than derived. The graph is read long after the traffic, and a
+/// figure computed at read time is multiplied by whatever the rate table says
+/// *now* — so a month of history would be re-priced at today's rates, and a
+/// price edit or a moved peak window would silently rewrite the past. An amount
+/// recorded beside the tokens it paid for cannot move.
+///
+/// Micro-USD, and the same in/out split the chart draws, so what the far end
+/// charged and what the graph shows are the same number written once.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Cost {
+    pub in_micro: i128,
+    pub out_micro: i128,
+}
+
+impl Cost {
+    /// Add another batch's charge, saturating rather than wrapping: a total that
+    /// silently overflows is worse than one that stops at the ceiling.
+    pub const fn add(&mut self, other: Self) {
+        self.in_micro = self.in_micro.saturating_add(other.in_micro);
+        self.out_micro = self.out_micro.saturating_add(other.out_micro);
+    }
+}
+
 /// One hour of one account's activity.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Bucket {
@@ -143,6 +168,13 @@ pub struct Bucket {
     /// charged.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub by_model: BTreeMap<String, Tokens>,
+    /// What this hour was charged, priced at the moment it was used.
+    ///
+    /// `None` for an hour nobody has priced, which includes every hour recorded
+    /// before this field existed. Absent rather than zero, so a reader has to
+    /// decide what to do about it instead of reading a free hour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost: Option<Cost>,
 }
 
 /// One account's history.
@@ -449,7 +481,12 @@ impl Store {
     }
 
     /// File one call against an account.
-    pub fn record(&mut self, account_id: &str, model: Option<&str>, tokens: Tokens, ok: bool) {
+    ///
+    /// `cost` is what the call was charged, priced by the caller at the moment
+    /// of the request. It is passed in rather than resolved here because this
+    /// store has no view of the rate table — and because a rate read at report
+    /// time is a rate that can move under a number already written.
+    pub fn record(&mut self, account_id: &str, model: Option<&str>, tokens: Tokens, ok: bool, cost: Option<Cost>) {
         let hour = hour_of(now_secs());
         let entry = self.accounts.entry(account_id.to_owned()).or_default();
 
@@ -470,6 +507,12 @@ impl Store {
             bucket.errors += 1;
         }
         bucket.tokens.add(tokens);
+        // Only when something was actually billed. A refused call carries no
+        // tokens and so no charge, and recording a zero would make an hour of
+        // nothing but failures read as costing `$0.00` rather than as unpriced.
+        if let Some(cost) = cost.filter(|_| !tokens.is_zero()) {
+            bucket.cost.get_or_insert_with(Cost::default).add(cost);
+        }
         if let Some(m) = model.filter(|_| !tokens.is_zero()) {
             bucket.by_model.entry(m.to_owned()).or_default().add(tokens);
         }
@@ -574,6 +617,29 @@ impl Store {
             }
         }
         (calls, errors, tokens)
+    }
+
+    /// What the hours in `span` add up to, as charged when each was used.
+    ///
+    /// `None` when no hour in the span carries a charge, which includes every
+    /// span recorded before costs were stored. Absent rather than zero, so the
+    /// caller decides whether to price the gap from the current table instead of
+    /// reading it as free.
+    ///
+    /// This total is stable in a way a computed one cannot be: each hour is
+    /// charged at its own instant, so it already knows whether it was peak, and
+    /// no re-reading of the same span can change it.
+    #[must_use]
+    pub fn cost_total(&self, id: &str, span: Span) -> Option<Cost> {
+        let mut total: Option<Cost> = None;
+        if let Some(a) = self.accounts.get(id) {
+            for b in a.buckets.iter().filter(|b| b.hour >= span.first && b.hour <= span.last) {
+                if let Some(cost) = b.cost {
+                    total.get_or_insert_with(Cost::default).add(cost);
+                }
+            }
+        }
+        total
     }
 
     /// A dense hourly series over `span`.
@@ -1105,6 +1171,7 @@ mod tests {
                 ..Tokens::default()
             },
             true,
+            None,
         );
         s.record(
             "ada",
@@ -1115,8 +1182,9 @@ mod tests {
                 ..Tokens::default()
             },
             true,
+            None,
         );
-        s.record("grace", Some("claude-haiku-4-5"), Tokens::default(), false);
+        s.record("grace", Some("claude-haiku-4-5"), Tokens::default(), false, None);
 
         let (calls, errors, t) = s.totals("ada", all());
         assert_eq!((calls, errors), (2, 0));
@@ -1133,6 +1201,88 @@ mod tests {
         let ada = s.for_account("ada").expect("ada");
         assert_eq!(ada.buckets.len(), 1, "two calls in the same hour share a bucket");
         assert_eq!(ada.by_model.get("claude-opus-5").map(Tokens::total), Some(19));
+    }
+
+    /// A charge is kept as it was charged, and adds up across hours.
+    ///
+    /// The point of storing it: the amount is decided once, by the caller that
+    /// saw the request, and this store only carries it. Nothing here can consult
+    /// a rate table, so nothing here can re-price an hour later — which is what
+    /// makes a month of history stable while the price list moves under it.
+    #[test]
+    fn a_charge_is_kept_as_recorded_and_sums_across_hours() {
+        let mut s = Store::load(tmp("cost"));
+        let spend = Tokens {
+            input: 10,
+            output: 5,
+            ..Tokens::default()
+        };
+
+        s.record(
+            "ada",
+            Some("claude-opus-5"),
+            spend,
+            true,
+            Some(Cost {
+                in_micro: 100,
+                out_micro: 40,
+            }),
+        );
+        // A refused call carries no tokens and so no charge; it must not create
+        // a priced hour out of nothing.
+        s.record(
+            "ada",
+            Some("claude-opus-5"),
+            Tokens::default(),
+            false,
+            Some(Cost {
+                in_micro: 999,
+                out_micro: 999,
+            }),
+        );
+
+        // The span is hour-aligned, like every span the store is asked for.
+        // Buckets are keyed by the hour that *contains* the call, so a span of a
+        // few seconds around "now" misses the very bucket the call was filed in
+        // whenever the clock is not near the top of the hour — which is almost
+        // always. The first version of this test did exactly that.
+        let total = s.cost_total("ada", hours(1));
+        let total = total.expect("the hour carries a charge");
+        assert_eq!(
+            (total.in_micro, total.out_micro),
+            (100, 40),
+            "the refused call contributed nothing"
+        );
+
+        // An hour outside the span is not counted, so a window means what it says.
+        let future = hours(1);
+        let elsewhere = s.cost_total(
+            "ada",
+            Span {
+                first: future.last + HOUR,
+                last: future.last + 2 * HOUR,
+            },
+        );
+        assert_eq!(elsewhere, None, "no hour in that span was charged");
+
+        // And an account with no charged hours is unpriced, not free: the caller
+        // needs to tell "cost nothing" from "no amount was ever recorded".
+        assert_eq!(s.cost_total("grace", hours(24)), None);
+    }
+
+    /// A total that overflows must stop, not wrap into a negative bill.
+    #[test]
+    fn a_cost_total_saturates_rather_than_wrapping() {
+        let mut total = Cost {
+            in_micro: i128::MAX,
+            out_micro: i128::MIN,
+        };
+        total.add(Cost {
+            in_micro: 1_000,
+            out_micro: -1_000,
+        });
+        assert_eq!(total.in_micro, i128::MAX, "clamped at the ceiling");
+        assert_eq!(total.out_micro, i128::MIN, "clamped at the floor");
     }
 
     /// Which model was billed, hour by hour — not just in the all-time total.
@@ -1152,9 +1302,9 @@ mod tests {
             output: 100,
             ..Tokens::default()
         };
-        s.record("ada", Some("claude-opus-5"), opus, true);
-        s.record("ada", Some("claude-haiku-4-5"), haiku, true);
-        s.record("ada", Some("claude-haiku-4-5"), haiku, true);
+        s.record("ada", Some("claude-opus-5"), opus, true, None);
+        s.record("ada", Some("claude-haiku-4-5"), haiku, true, None);
+        s.record("ada", Some("claude-haiku-4-5"), haiku, true, None);
 
         let bucket = &s.for_account("ada").expect("ada").buckets[0];
         assert_eq!(bucket.calls, 3);
@@ -1186,6 +1336,7 @@ mod tests {
                 ..Tokens::default()
             },
             true,
+            None,
         );
         let series = s.series("ada", hours(24));
         assert_eq!(series.len(), 24, "a fixed-width window, gaps included");
@@ -1210,6 +1361,7 @@ mod tests {
                 ..Tokens::default()
             },
             true,
+            None,
         );
         s.save().expect("save");
 
@@ -1238,6 +1390,7 @@ mod tests {
                 ..Tokens::default()
             },
             true,
+            None,
         );
         s.record(
             "grace",
@@ -1247,6 +1400,7 @@ mod tests {
                 ..Tokens::default()
             },
             true,
+            None,
         );
         s.save().expect("save");
 
