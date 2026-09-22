@@ -13,6 +13,7 @@
 
 pub mod account;
 pub mod inspect;
+pub mod models;
 pub mod pressure;
 pub mod provider;
 pub mod status;
@@ -23,6 +24,7 @@ pub(crate) use account::{
     RemovedKeyEnvelope,
 };
 pub(crate) use inspect::{InspectStateResource, InspectStatusResource};
+pub(crate) use models::PriceListResource;
 pub(crate) use pressure::PressureResource;
 pub(crate) use provider::providers_json;
 pub(crate) use status::{CredentialsResource, OkResource};

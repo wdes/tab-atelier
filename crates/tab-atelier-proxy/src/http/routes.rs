@@ -37,7 +37,7 @@ use rocket::http::Status;
 use rocket::{Route, State, catch, delete, get, head, options, post, routes};
 
 use crate::http::body::Json;
-use crate::http::controllers::{account, hello, inspect, key, mapping, me, provider, relay, usage, web};
+use crate::http::controllers::{account, hello, inspect, key, mapping, me, models, provider, relay, usage, web};
 use crate::http::guards::{Admin, Arrival, ClientKey};
 use crate::http::raw::Raw;
 use crate::http::requests::compact::SetCompact;
@@ -82,11 +82,21 @@ pub(crate) async fn relay_post(
 
 /// A relayed read.
 ///
-/// A GET carries no conversation, but it does carry the caller's identity —
-/// Claude Code asks which models exist — and that answer comes from the provider
-/// rather than from this proxy, so it is relayed like anything else.
+/// A GET carries no conversation, but it does carry the caller's identity — and
+/// that answer is usually the provider's rather than this proxy's, so it is
+/// relayed like anything else.
+///
+/// One path is the exception. `/v1/models` is where a client both picks a model
+/// and prices the turns it has already made, and no upstream answers it
+/// usefully: `DeepSeek`'s list carries no rates, and the Anthropic-shaped surface
+/// this hop is configured against does not serve the route at all, so forwarding
+/// it returned 404 and left the agent's turns counted but unpriced. The registry
+/// holds the rates, so that one path is answered from here.
 #[get("/relay/anthropic/<sub..>")]
 pub(crate) async fn relay_get(state: &State<Arc<AppState>>, arrival: Arrival, who: ClientKey, sub: PathBuf) -> Reply {
+    if models::is_price_list(&sub) {
+        return models::models(state);
+    }
     relay::anthropic(
         state,
         relay::Relay::new(&who.account, &who.key_id, &arrival, &sub, bytes::Bytes::new()),
