@@ -419,7 +419,15 @@ pub(crate) async fn shape_and_admit(
     Ok((body, route, compaction, local))
 }
 
-pub(crate) fn shape_body(
+/// Shape a request body for the far end: rename the model, compact, govern the
+/// tools, rewrite the Claude Code identity. Returns the body, what compaction
+/// removed, and any local tools injected.
+///
+/// Public so the cache-stability tests in `tests/cache_stability.rs` can drive
+/// the real pipeline rather than a copy of it. The order of these passes is
+/// load-bearing — each one's comment says what breaks if it moves — and a copy
+/// in a test would keep passing after the original was reordered.
+pub fn shape_body(
     body: &Bytes,
     route: &routing::Route,
     requested: &str,

@@ -89,6 +89,32 @@ use serde::{Deserialize, Serialize};
 /// a long session sheds most of its bulk.
 pub const KEEP_TURNS: usize = 6;
 
+/// How many qualifying messages may sit past the window before the boundary moves.
+///
+/// The window is counted back from the end, so with the plain rule it slides by
+/// one message per turn — and each slide rewrites a message the client has
+/// already sent. A provider whose cache matches a **strict prefix** answers that
+/// by re-processing everything from the change to the end of the prompt, so the
+/// price of eliding one turn is the whole retained window, paid again on every
+/// turn. That is not hypothetical: the fleet's non-Anthropic traffic re-bills
+/// ~6,400 tokens a turn at 391,000 of context, flat across 25,000 to 744,000,
+/// which is about the six turns this window keeps. Anthropic's cache absorbs the
+/// same rewrite without re-billing, which is why the effect showed up on one
+/// model and not the others.
+///
+/// Eliding a batch at a time does the same elision for a fraction of the
+/// invalidation: the boundary moves once every this many turns instead of every
+/// turn. The cost is that up to `ELIDE_BATCH - 1` extra turns ride inside the
+/// window, so it keeps between `KEEP_TURNS` and `KEEP_TURNS + ELIDE_BATCH - 1`
+/// turns. Those extra turns are served from cache, which is the cheap way to
+/// carry them; moving the boundary continuously is what pays for them over and
+/// over.
+///
+/// Four rather than more, because the turns held back are *not* elided and so
+/// are carried at full size — this bounds that at three turns while already
+/// cutting the re-billed span by about two and a half.
+pub const ELIDE_BATCH: usize = 4;
+
 /// What a provider's compaction pass removes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -262,7 +288,21 @@ fn already_elided(content: &serde_json::Value) -> bool {
 /// turns this layer actually acts on. Counting *all* messages instead would
 /// make the window shrink whenever a turn happened to contain nothing of the
 /// relevant kind, which is how a "keep 6" rule quietly keeps 3.
+///
+/// The boundary is quantised to whole `ELIDE_BATCH`es, so it moves once every
+/// few turns rather than continuously. That is the whole point of the constant:
+/// a boundary sliding one message per turn re-stubs a message the client has
+/// already sent on every turn, and a strict prefix cache re-processes
+/// everything behind each of those rewrites.
 fn window_start(messages: &[serde_json::Value], keep: usize, qualifies: impl Fn(&serde_json::Value) -> bool) -> usize {
+    let total = messages.iter().filter(|m| qualifies(m)).count();
+    if total <= keep {
+        return 0;
+    }
+    // Hold back the batches not yet due. With `total - keep` a multiple of the
+    // batch this keeps exactly `keep`; otherwise it keeps the remainder as well
+    // and the boundary stays put until the next whole batch has accumulated.
+    let keep = keep + (total - keep) % ELIDE_BATCH;
     let mut seen = 0;
     for i in (0..messages.len()).rev() {
         if qualifies(&messages[i]) {
@@ -621,6 +661,81 @@ mod tests {
                 "the kept tool results must be byte-identical: {id}"
             );
         }
+    }
+
+    /// The real property: the boundary advances a whole batch at a time.
+    ///
+    /// The window is counted back from the end, so the plain rule advances it by
+    /// one message per turn, and each advance stubs a message the client has
+    /// already sent. A provider whose cache matches a strict prefix re-processes
+    /// everything from that message to the end of the prompt, so the cost is the
+    /// retained window — paid again on every single turn.
+    ///
+    /// "Never rewrite an already-sent message" is not the property to assert,
+    /// because it is impossible while eliding anything at all: a message is sent
+    /// the moment it appears, so any elision of it is a rewrite of it. The
+    /// achievable property is that the boundary moves once per batch, which is
+    /// what divides the cost by `ELIDE_BATCH`.
+    #[test]
+    fn the_elision_boundary_advances_a_batch_at_a_time() {
+        /// Comfortably past `KEEP_TURNS`, so the boundary has room to move.
+        const GROWN: usize = 24;
+
+        let mut body = body();
+        let mut sent: Vec<Vec<u8>> = Vec::new();
+        let mut rewrote_on: Vec<usize> = Vec::new();
+
+        for turn in 0..GROWN {
+            let _ = apply(&mut body, Compact::Tools);
+            let now: Vec<Vec<u8>> = messages(&body).iter().map(serialized).collect();
+
+            if sent
+                .iter()
+                .enumerate()
+                .any(|(i, was)| now.get(i).is_some_and(|message| message != was))
+            {
+                rewrote_on.push(turn);
+            }
+            sent = now;
+            push_turn(&mut body, turn);
+        }
+
+        assert!(
+            !rewrote_on.is_empty(),
+            "nothing the client had already sent was rewritten over {GROWN} turns, so this test \
+             asserted nothing"
+        );
+        for pair in rewrote_on.windows(2) {
+            let apart = pair[1] - pair[0];
+            assert!(
+                apart >= ELIDE_BATCH - 1,
+                "the boundary advanced twice within {apart} turn(s) — on turns {rewrote_on:?}. \
+                 Elision is meant to move a batch of {ELIDE_BATCH} messages at once; moving it per \
+                 turn re-processes the retained window on every turn, which is what a strict \
+                 prefix cache charges for."
+            );
+        }
+    }
+
+    /// One more turn in the shape [`body`] builds: a user turn carrying a
+    /// `tool_result`, then the assistant turn that answers it.
+    fn push_turn(body: &mut serde_json::Value, i: usize) {
+        let list = body["messages"].as_array_mut().expect("messages");
+        list.push(json!({
+            "role": "user",
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": format!("call_{i:02}"),
+                "content": "r".repeat(1000 + i),
+            }],
+        }));
+        list.push(json!({
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "t".repeat(200 + i), "signature": format!("sig{i:02}")},
+                {"type": "tool_use", "id": format!("call_{i:02}"), "name": "Bash", "input": {"command": "ls"}},
+            ],
+        }));
     }
 
     /// The one elision class where the loss is semantic rather than bulk.
