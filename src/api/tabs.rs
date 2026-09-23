@@ -100,6 +100,7 @@ pub(super) fn list<W: Write>(
                 .collect(),
             resident_memory_bytes: t.resident_memory_bytes,
             tokens: t.tokens,
+            in_handoff: crate::hotswap::frozen(),
         })
         .collect();
     #[cfg(feature = "energy")]
