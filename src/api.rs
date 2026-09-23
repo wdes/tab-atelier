@@ -14,6 +14,7 @@ mod blackboard_route;
 mod catbus;
 mod claims_route;
 mod claude_only;
+mod decisions_route;
 mod env;
 mod files;
 mod fleet_route;
@@ -1468,6 +1469,20 @@ fn respond_json<W: Write>(stream: &mut W, status: u16, body: &str) {
     );
 }
 
+/// Like [`respond_json`], but for a raw body with a caller-chosen content type.
+///
+/// Used by the `/decisions/file` KIOSK viewer, which serves decision bundles as
+/// `text/plain` (or a rendered `text/html` page) rather than JSON.
+fn respond_bytes<W: Write>(stream: &mut W, status: u16, content_type: &str, body: &[u8]) {
+    let reason = if status == 200 { "OK" } else { "Error" };
+    let _ = write!(
+        stream,
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\n{ROBOTS_TAG}Content-Length: {}\r\n\r\n",
+        body.len()
+    );
+    let _ = stream.write_all(body);
+}
+
 /// Like [`respond_json`], plus `Access-Control-Allow-Origin: *`.
 ///
 /// Used only for `/fleet`, and only for requests that arrived on loopback, so
@@ -1645,7 +1660,7 @@ fn handle_connection<S: Read + Write>(
     };
     let raw_path = parts[1].to_string();
 
-    let (path, query_token, query_lines, query_since, query_crc, query_name, query_path) =
+    let (path, query_token, query_lines, query_since, query_crc, query_name, query_path, query_include_archived) =
         if let Some((p, q)) = raw_path.split_once('?') {
             let qt = q
                 .split('&')
@@ -1665,9 +1680,14 @@ fn handle_connection<S: Read + Write>(
                 .and_then(|s| u32::from_str_radix(s, 16).ok());
             let qn = q.split('&').find_map(|pair| pair.strip_prefix("name=")).map(url_decode);
             let qp = q.split('&').find_map(|pair| pair.strip_prefix("path=")).map(url_decode);
-            (p.to_string(), qt, ql, qs, qc, qn, qp)
+            // PD2 (#kiosk): `?includeArchived[=true|1]` surfaces archived decisions
+            // (`state:archived`) in the KIOSK panel; the default hides them.
+            let qia = q
+                .split('&')
+                .any(|pair| matches!(pair, "includeArchived" | "includeArchived=true" | "includeArchived=1"));
+            (p.to_string(), qt, ql, qs, qc, qn, qp, qia)
         } else {
-            (raw_path, None, None, None, None, None, None)
+            (raw_path, None, None, None, None, None, None, false)
         };
     // Strip a trailing slash so a path like `/tabs/.../view/` (added
     // by some reverse proxies / Cloudflare Tunnel normalisation)
@@ -1945,6 +1965,22 @@ fn handle_connection<S: Read + Write>(
         ("GET", "/fleet") => fleet_route::get(stream, state, from_loopback),
         ("GET", "/blackboard") => blackboard_route::list(stream, query_since),
         ("POST", "/blackboard") => blackboard_route::merge(stream, &body_bytes),
+        // PD2 (#kiosk): the KIOSK cross-project decision panel. `POST /decisions/{id}/
+        // {read|tranch}` transits state (event-sourced APPEND under the daemon lock,
+        // read-back gated); `GET /decisions[?includeArchived]` is the folded read-model.
+        ("POST", p) if p.starts_with("/decisions/") && (p.ends_with("/read") || p.ends_with("/tranch")) => {
+            decisions_route::mutate(stream, state, p, &body_bytes);
+        }
+        ("GET", "/decisions") => decisions_route::list(stream, query_include_archived),
+        // #kiosk bug1: serve a bundle's content, SANDBOXED to the outbox — the KIOSK
+        // links point here (with the page token) instead of at the raw path (which 401s).
+        ("GET", "/decisions/file") => decisions_route::file(stream, query_path.as_deref()),
+        // Volet-2 (#kiosk 3 onglets): the Rapports tab lists top-level outbox reports;
+        // the Grille d'intention tab POSTs a folded intention → a server-named intent-<ts>.md
+        // in the outbox sandbox (filename server-generated → traversal-safe). Both share the
+        // /decisions/file viewer + the same dashboard-token gate as the decisions.
+        ("GET", "/reports") => decisions_route::reports(stream),
+        ("POST", "/intent") => decisions_route::intent(stream, &body_bytes),
         ("GET", "/env") => env::list_global(stream),
         ("GET", p) if p.starts_with("/tabs/") && p.ends_with("/env") => env::list_tab(stream, state, p),
         ("POST", "/env") => env::set_global(stream, state, &body_bytes),
