@@ -19,11 +19,12 @@ path = "src/lib.rs"
 # The server side of the hop: hyper terminates the browser connection, ureq is
 # the blocking client to the daemon. Same pair as `tab-atelier-proxy`, so the
 # two crates cannot drift apart.
-hyper = { version = "1", features = ["server", "http1", "http2"] }
+hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 http = "1"
 bytes = "1"
+serde_json = "1"
 # Blocking HTTP for the upstream hop: the request is read, replayed and handed
 # back, so async buys nothing on that side and ureq keeps the tree small.
 ureq = { version = "3" }
