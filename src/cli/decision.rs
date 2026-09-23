@@ -347,6 +347,23 @@ fn move_file(src: &Path, dst: &Path) -> std::io::Result<()> {
     std::fs::remove_file(src)
 }
 
+/// Is `id` a decision id we may safely `join` onto a directory — one path segment, no escape?
+///
+/// VALIDATES, never TRANSFORMS (deliberately NOT `sanitize_basename`, which STRIPS
+/// separators instead of refusing): the caller REJECTS an invalid id, so a hostile
+/// `../x` / `a/b` can never climb out of the archive root. Charset `A-Za-z0-9._-`;
+/// empty, `.`, `..` and anything over 128 chars are refused.
+#[must_use]
+pub fn valid_decision_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id != "."
+        && id != ".."
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
 /// Move each existing file of `files` into `<outbox>/_archive/AAAA-MM/<id>/`.
 ///
 /// ``PD3b``: the per-decision `<id>` sub-dir NAMESPACES the archive, so two decisions that
@@ -362,6 +379,14 @@ pub fn archive_files(
     files: &[String],
     unix_secs: u64,
 ) -> std::io::Result<Vec<(String, String)>> {
+    // B1: refuse a hostile id BEFORE the join (this fn is `pub` — the guard lives here so
+    // every caller is covered, not just the two in-file ones).
+    if !valid_decision_id(id) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid decision id: {id:?}"),
+        ));
+    }
     let dir = outbox.join("_archive").join(archive_month(unix_secs)).join(id);
     let mut moved = Vec::new();
     for f in files {
@@ -434,6 +459,14 @@ fn archived_moves(events: &[DecisionEvent]) -> Vec<ArchivedMove> {
 /// # Errors
 /// Propagates a move / append I/O error.
 pub fn archive_decision(log: &Path, outbox: &Path, id: &str, unix_secs: u64) -> std::io::Result<String> {
+    // B1: same guard, so the id join below is self-evidently safe (no reliance on
+    // `archive_files` erroring first).
+    if !valid_decision_id(id) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid decision id: {id:?}"),
+        ));
+    }
     let body = std::fs::read_to_string(log).unwrap_or_default();
     let events: Vec<DecisionEvent> = parse_decisions(&body).into_iter().filter(|e| e.id == id).collect();
     let files = events
@@ -1130,6 +1163,25 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    // B1 ⭐ the id guard: `../x` (and empty / overlong / slashed) ids are REFUSED, and the
+    // archive never creates a dir for a hostile id (no escape from the outbox root).
+    #[test]
+    fn valid_decision_id_refuses_traversal_empty_and_overlong() {
+        assert!(valid_decision_id("ra1c"));
+        assert!(valid_decision_id("dep.2_x-3"));
+
+        let long = "a".repeat(129);
+        for bad in ["", ".", "..", "../x", "a/b", "/abs", "x y", long.as_str()] {
+            assert!(!valid_decision_id(bad), "must refuse {bad:?}");
+        }
+
+        // …and the archive refuses BEFORE any join/mkdir: `../escape` lands nowhere.
+        let outbox = TmpOutbox::new();
+        let err = archive_files(outbox.path(), "../escape", &[], 1_756_700_000).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(archive_decision(Path::new("/nonexistent-decisions.jsonl"), outbox.path(), "..", 0).is_err());
     }
 
     // PD3 ⭐ REAL-FS (anti built≠wired, NO mock): a REAL bundle file on disk is physically
