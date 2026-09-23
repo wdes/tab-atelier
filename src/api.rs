@@ -1978,7 +1978,7 @@ fn handle_connection<S: Read + Write>(
         // Volet-2 (#kiosk 3 onglets): the Rapports tab lists top-level outbox reports;
         // the Grille d'intention tab POSTs a folded intention → a server-named intent-<ts>.md
         // in the outbox sandbox (filename server-generated → traversal-safe). Both share the
-        // /decisions/file viewer + the same dashboard-token gate as the decisions.
+        // /decisions/file viewer + the same master-only gate as the decisions.
         ("GET", "/reports") => decisions_route::reports(stream),
         ("POST", "/intent") => decisions_route::intent(stream, &body_bytes),
         ("GET", "/env") => env::list_global(stream),

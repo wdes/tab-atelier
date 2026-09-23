@@ -391,7 +391,7 @@ pub(in crate::api) fn reports<S: Write>(stream: &mut S) {
 /// traversal and no overwrite of an existing bundle. The body is `{content:"…markdown…"}`
 /// (the client folds the Given/When/Then fields into markdown); it is written VERBATIM as
 /// text — the `/decisions/file` viewer renders it XSS-safe (escape-first) on read, so no
-/// markup from the payload is ever executed. Narrow write scope (dashboard token, same outbox
+/// markup from the payload is ever executed. Narrow write scope (master-only, same outbox
 /// sandbox as the decisions). Returns 200 `{path, name}` — the bare `outbox/…` the viewer resolves.
 pub(in crate::api) fn intent<S: Write>(stream: &mut S, body_bytes: &[u8]) {
     #[derive(serde::Deserialize, Default)]
