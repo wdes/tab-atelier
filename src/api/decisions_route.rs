@@ -335,7 +335,10 @@ pub(in crate::api) fn mutate<S: Write>(stream: &mut S, state: &Arc<Mutex<TabSnap
     });
     drop(guard);
     if landed {
-        respond_json(stream, 200, &format!(r#"{{"{verb}":"{id}"}}"#));
+        // Built through serde (never string-formatted): `verb` is the dynamic KEY and `id`
+        // comes from the URL, so both get escaped by the serializer.
+        let body = serde_json::to_string(&serde_json::json!({ (verb): id })).unwrap_or_default();
+        respond_json(stream, 200, &body);
     } else {
         error_json(stream, 500, "decision: read-back failed");
     }
@@ -409,7 +412,12 @@ pub(in crate::api) fn intent<S: Write>(stream: &mut S, body_bytes: &[u8]) {
     // Digits-only, server-clock name — traversal-impossible by construction.
     let name = format!("intent-{}.md", crate::unix_millis());
     match std::fs::write(base.join(&name), content.as_bytes()) {
-        Ok(()) => respond_json(stream, 200, &format!(r#"{{"path":"outbox/{name}","name":"{name}"}}"#)),
+        Ok(()) => {
+            // Same rule as `mutate`: serialized, not `format!`-interpolated (`name` lands twice).
+            let body = serde_json::to_string(&serde_json::json!({ "path": format!("outbox/{name}"), "name": name }))
+                .unwrap_or_default();
+            respond_json(stream, 200, &body);
+        }
         Err(_) => error_json(stream, 500, "intent: write failed"),
     }
 }
