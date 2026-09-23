@@ -21,6 +21,41 @@ use super::{TabSnapshot, error_json, respond_bytes, respond_json, url_decode};
 /// (collapsing `..` and symlinks) and must live under the canonicalized outbox — anything
 /// outside (the source tree, `~/.ssh`, `/etc/…`) is refused 403. Served as text/plain.
 /// READ-ONLY.
+// ---------------------------------------------------------------------------
+// Route path seams. The routes read their two on-disk roots through `outbox_root()`
+// / `decisions_log()`. In production these are exactly `decision::outbox_base()` /
+// `decision::decisions_path()`; under `cfg(test)` a THREAD-LOCAL override (pinned by
+// `route_tests`) points them at a tempdir. A thread-local rather than `env::set_var`,
+// which is `unsafe` (denied crate-wide) and process-global — it would race parallel
+// tests for no benefit.
+// ---------------------------------------------------------------------------
+#[cfg(not(test))]
+fn outbox_root() -> std::path::PathBuf {
+    crate::cli::decision::outbox_base()
+}
+#[cfg(not(test))]
+fn decisions_log() -> std::path::PathBuf {
+    crate::cli::decision::decisions_path()
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_OUTBOX: std::cell::RefCell<Option<std::path::PathBuf>> = const { std::cell::RefCell::new(None) };
+    static TEST_DECISIONS: std::cell::RefCell<Option<std::path::PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+fn outbox_root() -> std::path::PathBuf {
+    TEST_OUTBOX
+        .with(|c| c.borrow().clone())
+        .unwrap_or_else(crate::cli::decision::outbox_base)
+}
+#[cfg(test)]
+fn decisions_log() -> std::path::PathBuf {
+    TEST_DECISIONS
+        .with(|c| c.borrow().clone())
+        .unwrap_or_else(crate::cli::decision::decisions_path)
+}
+
 pub(in crate::api) fn file<S: Write>(stream: &mut S, path_q: Option<&str>) {
     let Some(raw) = path_q.filter(|s| !s.trim().is_empty()) else {
         error_json(stream, 400, "decisions file: ?path= is required");
@@ -35,7 +70,7 @@ pub(in crate::api) fn file<S: Write>(stream: &mut S, path_q: Option<&str>) {
     //    (`_archive/` lives under the outbox, so it keeps its whole segment).
     //  - anything else → taken as-is (an absolute path); the canonicalize + confinement
     //    check below still gates it to the sandbox.
-    let base_dir = crate::cli::decision::outbox_base();
+    let base_dir = outbox_root();
     let requested = raw
         .strip_prefix("~/")
         .map(|rest| std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(rest))
@@ -255,9 +290,7 @@ pub(in crate::api) fn list<S: Write>(stream: &mut S, include_archived: bool) {
 /// verdict is meaningless — mirrors the CLI's `--verdict` requirement). Optional
 /// `{by}`. Archiving the `files[]` is PD3.
 pub(in crate::api) fn mutate<S: Write>(stream: &mut S, state: &Arc<Mutex<TabSnapshot>>, p: &str, body_bytes: &[u8]) {
-    use crate::cli::decision::{
-        DecisionEvent, DecisionKind, append_line, archive_decision, decisions_path, outbox_base, parse_decisions,
-    };
+    use crate::cli::decision::{DecisionEvent, DecisionKind, append_line, archive_decision, parse_decisions};
 
     #[derive(serde::Deserialize, Default)]
     struct MarkBody {
@@ -301,7 +334,7 @@ pub(in crate::api) fn mutate<S: Write>(stream: &mut S, state: &Arc<Mutex<TabSnap
         verdict,
         ..Default::default()
     };
-    let path = decisions_path();
+    let path = decisions_log();
 
     // Under the daemon lock: append the state event, then (on tranch) ARCHIVE — the
     // ruling triggers filing the bundle under _archive/AAAA-MM/ + appending the `archived`
@@ -317,7 +350,7 @@ pub(in crate::api) fn mutate<S: Write>(stream: &mut S, state: &Arc<Mutex<TabSnap
     let expected = if kind == DecisionKind::Tranched {
         // The state transition is recorded even if no file moved; a hard move I/O error
         // 500s (the `tranched` event stands — the ruling isn't lost).
-        if let Err(e) = archive_decision(&path, &outbox_base(), &id, now) {
+        if let Err(e) = archive_decision(&path, &outbox_root(), &id, now) {
             drop(guard);
             error_json(stream, 500, &format!("decision tranch: archive failed — {e}"));
             return;
@@ -351,7 +384,7 @@ pub(in crate::api) fn mutate<S: Write>(stream: &mut S, state: &Arc<Mutex<TabSnap
 /// missing outbox reads empty. The remote-share link (volet 3) is a CLIENT concern layered on
 /// `path` later — NOT built here (clean seam).
 pub(in crate::api) fn reports<S: Write>(stream: &mut S) {
-    let base = crate::cli::decision::outbox_base();
+    let base = outbox_root();
     let mut items: Vec<(u64, String)> = Vec::new();
     if let Ok(rd) = std::fs::read_dir(&base) {
         for ent in rd.flatten() {
@@ -404,7 +437,7 @@ pub(in crate::api) fn intent<S: Write>(stream: &mut S, body_bytes: &[u8]) {
         error_json(stream, 400, "intent: non-empty content is required");
         return;
     }
-    let base = crate::cli::decision::outbox_base();
+    let base = outbox_root();
     if std::fs::create_dir_all(&base).is_err() {
         error_json(stream, 500, "intent: outbox unavailable");
         return;
@@ -474,5 +507,179 @@ mod md_viewer_tests {
             "title present + escaped"
         );
         assert!(page.contains("<h1>Hi</h1>"), "body is the rendered markdown");
+    }
+}
+
+/// Route-level tests (B3): the KIOSK decision routes driven through their real entry
+/// points with a `Vec<u8>` sink, so a refusal or a shape change is caught at the
+/// BOUNDARY, not just in the pure helpers. The two on-disk roots are pinned to a
+/// tempdir via the thread-local seams above (hermetic, no env, no shared state, no
+/// sleeps — safe under the default parallel test runner).
+#[cfg(test)]
+mod route_tests {
+    use super::{file, intent, mutate, reports};
+    use std::sync::{Arc, Mutex};
+
+    fn status_code(response: &str) -> u16 {
+        response
+            .lines()
+            .next()
+            .unwrap()
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+    fn body(response: &str) -> &str {
+        response.split("\r\n\r\n").nth(1).unwrap_or("")
+    }
+
+    /// Run `f` with both route roots pinned under `dir` (an `outbox/` subdir is made,
+    /// as the routes expect it to exist), then unpin. The pins are thread-local, so
+    /// parallel tests never see them.
+    fn with_roots<T>(dir: &std::path::Path, f: impl FnOnce() -> T) -> T {
+        std::fs::create_dir_all(dir.join("outbox")).unwrap();
+        super::TEST_OUTBOX.with(|c| *c.borrow_mut() = Some(dir.join("outbox")));
+        super::TEST_DECISIONS.with(|c| *c.borrow_mut() = Some(dir.join("decisions.jsonl")));
+        let out = f();
+        super::TEST_OUTBOX.with(|c| *c.borrow_mut() = None);
+        super::TEST_DECISIONS.with(|c| *c.borrow_mut() = None);
+        out
+    }
+
+    /// B1 (ITEM-1): a hostile id is refused 400 at the ROUTE boundary, BEFORE the
+    /// `{"<verb>": id}` reply and before anything is joined onto the archive root.
+    #[test]
+    fn mutate_refuses_a_hostile_decision_id_before_the_join() {
+        let dir = tempfile::tempdir().unwrap();
+        with_roots(dir.path(), || {
+            let state = Arc::new(Mutex::new(super::super::test_snapshot(vec![])));
+            // Traversal, encoded traversal, separator, and empty — a wrong SHAPE is a
+            // 400, never a 404, and never a join.
+            for p in [
+                "/decisions/../x/read",
+                "/decisions/..%2Fx/read",
+                "/decisions/a%2Fb/tranch",
+                "/decisions//read",
+            ] {
+                let mut out = Vec::new();
+                mutate(&mut out, &state, p, br#"{"verdict":"ok"}"#);
+                let resp = String::from_utf8(out).unwrap();
+                assert_eq!(status_code(&resp), 400, "{p} must be refused: {resp}");
+                assert!(resp.contains("invalid decision id"), "{p}: {resp}");
+            }
+            // The refusal precedes any write: the event log was never created.
+            assert!(
+                !dir.path().join("decisions.jsonl").exists(),
+                "no event for a hostile id"
+            );
+        });
+    }
+
+    /// Happy path: a well-formed id is recorded, and the reply is the SERIALIZED
+    /// `{"read": id}` (not a hand-formatted string that a quote in `id` could break).
+    #[test]
+    fn mutate_recorded_read_answers_200_with_the_id() {
+        let dir = tempfile::tempdir().unwrap();
+        with_roots(dir.path(), || {
+            let state = Arc::new(Mutex::new(super::super::test_snapshot(vec![])));
+            let mut out = Vec::new();
+            mutate(&mut out, &state, "/decisions/dec.2_x-3/read", b"");
+            let resp = String::from_utf8(out).unwrap();
+            assert_eq!(status_code(&resp), 200, "{resp}");
+            assert_eq!(body(&resp), r#"{"read":"dec.2_x-3"}"#, "serialized reply: {resp}");
+            let log = std::fs::read_to_string(dir.path().join("decisions.jsonl")).unwrap();
+            assert!(log.contains(r#""id":"dec.2_x-3""#), "event appended: {log}");
+            assert!(log.contains(r#""kind":"read""#), "kind recorded: {log}");
+        });
+    }
+
+    /// `file`: the outbox sandbox holds at the route (an absolute path outside, and an
+    /// `outbox/../` that canonicalizes back out, are both refused 403 — the content
+    /// never leaks); a path INSIDE is served, with a `.md` RENDERED to HTML.
+    #[test]
+    fn file_confines_the_outbox_and_serves_what_is_inside_it() {
+        let dir = tempfile::tempdir().unwrap();
+        with_roots(dir.path(), || {
+            let outbox = dir.path().join("outbox");
+            std::fs::write(outbox.join("ok.md"), "# hi\n").unwrap();
+            let secret = dir.path().join("secret.txt");
+            std::fs::write(&secret, "top-secret").unwrap();
+
+            // Inside: 200, rendered (not raw markdown).
+            let mut out = Vec::new();
+            file(&mut out, Some("outbox/ok.md"));
+            let resp = String::from_utf8(out).unwrap();
+            assert_eq!(status_code(&resp), 200, "{resp}");
+            assert!(resp.contains("<h1>hi</h1>"), "rendered html: {resp}");
+
+            // Outside (absolute) and `outbox/../` (collapsed back out): both 403, no leak.
+            for p in [secret.to_str().unwrap(), "outbox/../secret.txt"] {
+                let mut out = Vec::new();
+                file(&mut out, Some(p));
+                let resp = String::from_utf8(out).unwrap();
+                assert_eq!(status_code(&resp), 403, "{p} must stay in the sandbox: {resp}");
+                assert!(!resp.contains("top-secret"), "content must never leak: {resp}");
+            }
+
+            // A missing bundle is a plain 404.
+            let mut out = Vec::new();
+            file(&mut out, Some("outbox/nope.md"));
+            assert_eq!(status_code(&String::from_utf8(out).unwrap()), 404);
+
+            // No `?path=` at all is a 400.
+            let mut out = Vec::new();
+            file(&mut out, None);
+            assert_eq!(status_code(&String::from_utf8(out).unwrap()), 400);
+        });
+    }
+
+    /// `reports` lists only top-level `*.md`/`*.markdown` bundles (skipping dirs,
+    /// dotfiles, other extensions) as the bare `outbox/<name>` the viewer resolves;
+    /// `intent` writes a server-named bundle on non-empty content and refuses 400 on empty.
+    #[test]
+    fn reports_lists_markdown_bundles_and_intent_writes_a_named_one() {
+        let dir = tempfile::tempdir().unwrap();
+        with_roots(dir.path(), || {
+            let outbox = dir.path().join("outbox");
+            std::fs::write(outbox.join("a.md"), "A").unwrap();
+            std::fs::write(outbox.join("b.markdown"), "B").unwrap();
+            std::fs::write(outbox.join("skip.txt"), "x").unwrap();
+            std::fs::write(outbox.join(".hidden.md"), "h").unwrap();
+            std::fs::create_dir_all(outbox.join("_archive")).unwrap();
+
+            let mut out = Vec::new();
+            reports(&mut out);
+            let resp = String::from_utf8(out).unwrap();
+            assert_eq!(status_code(&resp), 200, "{resp}");
+            let listed = body(&resp);
+            assert!(listed.contains(r#""outbox/a.md""#), "{listed}");
+            assert!(listed.contains(r#""outbox/b.markdown""#), "{listed}");
+            assert!(!listed.contains("skip.txt"), "non-markdown skipped: {listed}");
+            assert!(!listed.contains("_archive"), "the archive dir is skipped: {listed}");
+            assert!(!listed.contains(".hidden"), "dotfiles are skipped: {listed}");
+
+            // Non-empty content → 200 + a server-clock `intent-<ts>.md` name.
+            let mut out = Vec::new();
+            intent(&mut out, br##"{"content":"# Grille\n\nGiven x"}"##);
+            let resp = String::from_utf8(out).unwrap();
+            assert_eq!(status_code(&resp), 200, "{resp}");
+            let w = body(&resp);
+            assert!(w.contains(r#""path":"outbox/intent-"#), "{w}");
+            assert!(w.contains(r#""name":"intent-"#), "{w}");
+
+            // Empty (or whitespace-only) content is refused 400 and writes nothing.
+            let mut out = Vec::new();
+            intent(&mut out, br#"{"content":"   "}"#);
+            assert_eq!(status_code(&String::from_utf8(out).unwrap()), 400);
+
+            let intents = std::fs::read_dir(&outbox)
+                .unwrap()
+                .flatten()
+                .filter(|e| e.file_name().to_string_lossy().starts_with("intent-"))
+                .count();
+            assert_eq!(intents, 1, "only the valid intent lands on disk");
+        });
     }
 }
