@@ -1356,6 +1356,9 @@ pub fn run() -> std::io::Result<()> {
                 &mut last_state_hash,
                 true,
             );
+            // Freeze *before* snapshotting the rings: bytes read into the
+            // live ring after the snapshot would be missing from the dump.
+            crate::hotswap::freeze_and_settle();
             let sources: Vec<crate::hotswap::HandoffSource> = tabs
                 .iter()
                 .filter_map(|tab| {

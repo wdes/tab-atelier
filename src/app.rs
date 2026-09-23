@@ -3303,6 +3303,9 @@ impl AppState {
     fn hot_swap(&mut self, cx: &mut Context<Self>) {
         crate::hotswap::clear_upgrade_request();
         self.flush_all_state(cx);
+        // Freeze *before* snapshotting the rings: bytes read into the
+        // live ring after the snapshot would be missing from the dump.
+        crate::hotswap::freeze_and_settle();
         let mut sources = Vec::new();
         for tab in &self.tabs {
             let view = tab.view.read(cx);

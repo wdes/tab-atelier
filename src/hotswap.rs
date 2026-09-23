@@ -91,6 +91,23 @@ pub fn set_frozen(frozen: bool) {
     FREEZE.store(frozen, Ordering::SeqCst);
 }
 
+/// Park the PTY readers and let in-flight reads finish, *before* the
+/// caller snapshots the rings.
+///
+/// This ordering is the whole point: bytes that arrive between an early
+/// snapshot and a late freeze are consumed by the reader into the live
+/// ring, but never reach the dumped ring — punching a hole in the
+/// viewer's post-exec scrollback. Freeze first, then snapshot.
+///
+/// Idempotent: a second call finds the readers already parked and
+/// returns without a second settle sleep.
+pub fn freeze_and_settle() {
+    if FREEZE.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    std::thread::sleep(std::time::Duration::from_millis(30));
+}
+
 #[cfg(unix)]
 pub use unix::*;
 
@@ -378,12 +395,12 @@ mod unix {
     /// no longer exists); on failure all side effects are rolled back
     /// and the caller keeps running.
     pub fn exec_swap(sources: &[HandoffSource]) -> io::Error {
-        // Park the PTY readers, then give in-flight reads a moment to
-        // finish so the ring dumps below are byte-consistent with what
-        // alacritty consumed. Bytes arriving after this stay in the
-        // kernel PTY buffers and are read by the post-exec process.
+        // The caller froze and settled (`freeze_and_settle`) *before*
+        // snapshotting `sources`, so the rings handed to us are already
+        // complete up to the freeze — that ordering is what closes the
+        // snapshot/freeze gap. Re-assert it here (idempotently) so a
+        // direct caller of `hot_swap` is parked too; no second sleep.
         FREEZE.store(true, Ordering::SeqCst);
-        std::thread::sleep(std::time::Duration::from_millis(30));
 
         let state_base = crate::platform::state_base_dir();
         let dir = crate::state_dir(&state_base);
@@ -820,6 +837,79 @@ mod unix {
             drop(pty);
             // The AdoptedPty reaped the child, so this waitpid comes
             // back ECHILD; it's here for the Child-handle bookkeeping.
+            let _ = child.wait();
+        }
+
+        #[test]
+        fn freeze_before_snapshot_keeps_every_pre_freeze_byte() {
+            // F1 regression: the caller must freeze *before* snapshotting
+            // the ring. Every byte written up to `freeze_and_settle` has to
+            // be in the ring at snapshot time, and nothing written after may
+            // sneak in (it stays in the kernel buffer for the post-exec
+            // process). Snapshot first and the in-between bytes reach only
+            // the live ring — a hole in the viewer's post-exec scrollback.
+            use std::io::Write as _;
+            let was = super::super::frozen();
+            super::super::set_frozen(false);
+
+            // The child only has to outlive `adopt`'s liveness probe; the
+            // bytes under test are written by us through the pipe's write
+            // end.
+            let (read_end, mut write_end) = std::io::pipe().unwrap();
+            let mut child = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg("sleep 5")
+                .spawn()
+                .unwrap();
+            let ws = WindowSize {
+                num_lines: 24,
+                num_cols: 80,
+                cell_width: 8,
+                cell_height: 16,
+            };
+            let pty = AdoptedPty::adopt(OwnedFd::from(read_end), child.id(), ws).unwrap();
+            let ring = std::sync::Arc::new(std::sync::Mutex::new(crate::pty_ring::PtyRing::with_capacity(4096)));
+            let mut tap = crate::pty_ring::PtyTap::new(pty, ring.clone());
+
+            // Bytes preceding the freeze, drained by the reader into the
+            // ring.
+            write_end.write_all(b"before-freeze").unwrap();
+            let mut buf = [0u8; 64];
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                match tap.read(&mut buf) {
+                    Ok(0) => panic!("EOF before the pre-freeze bytes were drained"),
+                    Ok(_) => break,
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                        assert!(std::time::Instant::now() < deadline, "pre-freeze bytes never arrived");
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(e) => panic!("read failed: {e}"),
+                }
+            }
+
+            super::super::freeze_and_settle();
+            // Idempotent: a second call is a no-op, not a second settle.
+            super::super::freeze_and_settle();
+
+            let snapshot = ring.lock().unwrap().since(0);
+            assert_eq!(
+                snapshot, b"before-freeze",
+                "the post-freeze snapshot must hold every pre-freeze byte"
+            );
+
+            // Post-freeze bytes are parked: the reader must not consume
+            // them, so they cannot fall outside the dumped snapshot.
+            write_end.write_all(b"after-freeze").unwrap();
+            assert_eq!(
+                tap.read(&mut buf).unwrap_err().kind(),
+                ErrorKind::WouldBlock,
+                "a frozen reader leaves post-freeze bytes in the kernel buffer"
+            );
+            assert_eq!(ring.lock().unwrap().since(0), snapshot);
+
+            super::super::set_frozen(was);
+            let _ = child.kill();
             let _ = child.wait();
         }
 
