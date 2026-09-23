@@ -247,6 +247,8 @@ pub fn dispatch(name: &str, rest: &[String]) -> Option<i32> {
         "gossip" => super::gossip::run(rest),
         "prune" => super::prune::run(rest),
         "backlog" => super::backlog::run(rest),
+        // KIOSK (PD1): the cross-project decision log.
+        "decision" => super::decision::run(rest),
         "note" => team::run_note(rest),
         "notes" => team::run_notes(rest),
         "handoff" => team::run_handoff(rest),
