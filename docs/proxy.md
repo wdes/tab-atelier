@@ -278,7 +278,8 @@ paste this shape in by hand:
       "auth": {"kind": "api_key_file", "path": "/var/lib/tab-atelier-proxy/provider-deepseek.key"},
       "preference": 10, "enabled": true,
       "models": [
-        {"id": "deepseek-flash", "class": "balanced", "relative_cost": 15},
+        {"id": "deepseek-flash", "class": "balanced", "relative_cost": 15,
+         "price": {"cache_hit": 3000, "input": 150000, "output": 600000}},
         {"id": "deepseek-v4-pro", "class": "heavy", "relative_cost": 66,
          "deprecated": true,
          "note": "withdrawn 2026-09-14; requests are served by deepseek-flash at Flash prices"}
@@ -307,6 +308,38 @@ environment.
 *different price*. A router that kept offering it would report a cost and a
 capability that are both about to stop being true, so deprecated models are
 listed, never routed to, and never probed.
+
+### What an hour cost
+
+`price` is the model's published rate per 1M tokens — cached input, uncached
+input, generated output. When a request is served, the amount is **computed once
+from that triple and stored beside the tokens it paid for**, in the hour bucket
+it belongs to, with the peak multiplier of the hour it was served in. The
+dashboard then draws the stored figure. It never prices anything at draw time,
+because a rate read from *today's* table and applied to a *month-old* token
+count is a number nobody was ever billed — and for a vendor that moved a price
+in between, it is wrong by exactly the amount that moved.
+
+**A model with no `price` records no money.** Not zero: nothing. `$0.00` is a
+claim that the tokens were free, and absence is the truth — the hop counts its
+tokens and its hours draw a gap. The subscription hop does this because a flat
+plan has no per-token cost to state, and the metered models the presets list
+without a rate do it too. `relative_cost` cannot stand in: it is one scalar the
+router orders providers by, and a real triple is needed to bill — `deepseek-v4-pro`'s
+shape across hit:miss:out is 1:30:90 against Flash's 1:50:200, so scaling one
+model's rates by another's ratio is wrong on two of the three.
+
+The rates in `providers.json` are the copy that bills, so they have to survive
+a save. The provider form rebuilds every model from `id:class:relative_cost`
+text, which has no room for a triple, and a provider written before the field
+existed deserialises without one — either way the row keeps serving and stops
+pricing. A save carries an existing rate over by model id, and a row that has
+none takes back the rate the shipped catalogue publishes for that model id, as
+it is loaded. That lookup can only return rates this repository actually records,
+so a deliberately unpriced model stays unpriced and a rate set by hand is left
+alone. A provider that ends up with no rate at all is named in the log at load:
+nothing errors and no token is lost, which is exactly why the one symptom — a
+money figure that never appears — has to be said out loud.
 
 ### Peak pricing
 

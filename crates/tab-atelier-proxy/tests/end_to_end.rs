@@ -448,6 +448,101 @@ fn the_cli_and_the_server_agree_on_where_the_files_are() {
     );
 }
 
+/// An hour a saved-without-its-rate provider served records what it cost.
+///
+/// The config is the shape the provider form writes: `id:class:relative_cost`
+/// and no rate, because the form has no field for one. That is what every
+/// provider in production looks like after a single save, and it is the whole
+/// reason the money unit was empty — the hop kept serving, kept counting tokens,
+/// and had no rate to charge them at. `relative_cost` is a ranking number the
+/// router orders providers by, not a price, so it cannot stand in for one.
+///
+/// The amount asserted is worked out by hand from the rates the catalogue
+/// publishes, so this fails if the arithmetic drifts: the mock reports 11
+/// uncached input tokens and 7 generated ones, and at $0.15/1M in and $0.60/1M
+/// out that is 1.65 and 4.2 micro-dollars, floored to whole micro-dollars —
+/// which is what an hour stores.
+#[test]
+fn a_provider_that_lost_its_rate_still_records_a_cost() {
+    let scratch = Scratch::new("rate-repair");
+    let upstream = capturing_upstream(scratch.path().join("captured.json"));
+    let port = free_port();
+
+    cli(scratch.path(), &["add", "Ada", "Lovelace", "ada@example.org"]);
+    let minted = cli(scratch.path(), &["add-key", "ada@example.org", "laptop"]);
+    let key = minted
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("key: "))
+        .expect("the CLI prints the key exactly once")
+        .to_owned();
+
+    let config = scratch.path().join("config");
+    std::fs::create_dir_all(&config).expect("config dir");
+    let key_file = config.join("deepseek.key");
+    std::fs::write(&key_file, "sk-mock\n").expect("key file");
+    let providers = format!(
+        concat!(
+            r#"{{"providers":[{{"id":"deepseek","label":"DeepSeek (mock)","wire":"anthropic","#,
+            r#""base_url":"http://127.0.0.1:{upstream}","auth":{{"kind":"api_key_file","path":"{key}"}},"#,
+            r#""models":[{{"id":"deepseek-flash","class":"balanced","relative_cost":15}}],"#,
+            r#""preference":0,"enabled":true}}],"#,
+            r#""mappings":[{{"from":"claude-sonnet-5","to":"deepseek-flash"}}]}}"#,
+        ),
+        upstream = upstream,
+        key = key_file.display(),
+    );
+    std::fs::write(config.join("providers.json"), providers).expect("providers.json");
+
+    let mut child = Command::new(BIN)
+        .args(["serve", "--listen", &format!("127.0.0.1:{port}")])
+        .env("TAB_ATELIER_PROXY_CONFIG", &config)
+        .env("TAB_ATELIER_PROXY_STATE", scratch.path().join("state"))
+        .env("HOME", scratch.path().join("home"))
+        .env("RUST_LOG", "warn")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn the proxy");
+    wait_until_listening(port, &mut child);
+    let _serving = Serving(child);
+
+    let payload = concat!(
+        r#"{"model":"claude-sonnet-5","max_tokens":16,"#,
+        r#""messages":[{"role":"user","content":"hi"}]}"#,
+    );
+    let resp = http(
+        port,
+        &format!(
+            "POST /relay/anthropic/v1/messages HTTP/1.1\r\nHost: x\r\nx-api-key: {key}\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+            payload.len()
+        ),
+    );
+    assert!(resp.starts_with("HTTP/1.1 200"), "proxied call failed:\n{resp}");
+
+    let usage_root = scratch.path().join("state/usage");
+    let mut found = None;
+    for _ in 0..50 {
+        if let Some(f) = first_usage_file(&usage_root) {
+            found = Some(f);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let file = found.unwrap_or_else(|| panic!("no usage file appeared under {}", usage_root.display()));
+    let recorded = std::fs::read_to_string(&file).expect("read usage");
+
+    assert!(
+        recorded.contains("deepseek-flash"),
+        "the hour must record the model the vendor billed: {recorded}"
+    );
+    assert!(
+        recorded.contains(r#""cost":{"in_micro":1,"out_micro":4}"#),
+        "the hour must record what it cost, priced where it was served \
+         rather than left empty for want of a rate: {recorded}"
+    );
+}
+
 /// The identity rewrite reaches tool descriptions, proven on the wire.
 ///
 /// This is the regression it was written for and missed. Claude Code puts its

@@ -667,6 +667,41 @@ impl Provider {
             Auth::ApiKeyFile { path } => std::fs::metadata(path).is_ok_and(|m| m.len() > 0),
         }
     }
+
+    /// Put back the rates the catalogue publishes for models this row leaves
+    /// unpriced.
+    ///
+    /// A price is a property of the vendor's list, not of an operator's edit,
+    /// and nothing outside this file can set one: the provider form rebuilds
+    /// every model from `id:class:relative_cost` text and [`parse_models`] has
+    /// no field for a rate, so a single save drops the triple from the row. The
+    /// same happens to a file written before the rates existed at all, because
+    /// `price` is `#[serde(default)]` and simply deserialises to `None`. Either
+    /// way the provider keeps working and keeps counting tokens, while every
+    /// hour it serves draws no money — an empty money unit that looks like a
+    /// broken chart rather than a missing figure.
+    ///
+    /// Filling from the catalogue turns that loss into a recoverable one. It can
+    /// only restore what the catalogue itself declares, so a model deliberately
+    /// left unpriced stays unpriced, and a rate set by hand is left alone.
+    pub fn adopt_published_rates(&mut self) {
+        for model in &mut self.models {
+            if model.price.is_none() && !model.deprecated {
+                model.price = published_price(&model.id);
+            }
+        }
+    }
+
+    /// Whether not one model it serves carries a rate.
+    ///
+    /// Not a fault on its own: the subscription hop is unpriced by design, since
+    /// a flat plan has no per-token cost to state. It is worth saying out loud
+    /// all the same, because the only visible symptom is a money figure that
+    /// never appears.
+    #[must_use]
+    pub fn has_no_recorded_rate(&self) -> bool {
+        !self.models.iter().any(|m| !m.deprecated && m.price.is_some())
+    }
 }
 
 /// A provider an operator can add in one click, with its models and prices.
@@ -865,6 +900,34 @@ impl Preset {
             },
         }
     }
+
+    /// The models a preset ships, without configuring a whole provider.
+    ///
+    /// Delegates to [`Preset::provider_named`] so the rates written beside the
+    /// model list stay the only copy of them: a second table here would be one
+    /// more thing to leave behind when a vendor moves a price. The key path it
+    /// builds on the way is discarded, and no directory is read or written.
+    #[must_use]
+    pub fn models(self) -> Vec<Model> {
+        self.provider_named(Path::new(""), "catalogue").models
+    }
+}
+
+/// The rate the shipped catalogue records for a model id.
+///
+/// This is how a row that lost its price gets it back — see
+/// [`Provider::adopt_published_rates`]. It answers only for models whose rates
+/// this repository actually records, and that limit is the point: the
+/// subscription hop has no per-token price at all, and the metered models the
+/// presets list without one stay that way. A lookup that can only return what
+/// the presets say cannot invent a figure for either.
+#[must_use]
+pub fn published_price(model_id: &str) -> Option<Price> {
+    Preset::ALL
+        .iter()
+        .flat_map(|preset| preset.models())
+        .find(|model| model.id == model_id && !model.deprecated)
+        .and_then(|model| model.price)
 }
 
 /// Where a provider's key file lives: beside `providers.json`, `0600`.
@@ -1007,7 +1070,15 @@ impl Registry {
             return Self::default();
         };
         match serde_json::from_str::<Self>(&raw) {
-            Ok(r) if !r.providers.is_empty() => {
+            Ok(mut r) if !r.providers.is_empty() => {
+                // A row can be missing rates it ought to have: the form cannot
+                // express one, and a file older than the field deserialises
+                // without them. Put back what the catalogue publishes before
+                // anything reads them, so that a provider which was saved once
+                // does not cost nothing for ever.
+                for p in &mut r.providers {
+                    p.adopt_published_rates();
+                }
                 // Loud at LOAD, not only at the first request that would have
                 // used it. A provider that can never be used still sits in the
                 // file looking configured, and the operator's next question is
@@ -1016,6 +1087,18 @@ impl Registry {
                 for p in &r.providers {
                     if let Some(why) = p.unusable_reason() {
                         log::error!("provider {} is UNUSABLE: {why}", p.id);
+                    }
+                    // And one step quieter: usable, but with no rate recorded
+                    // for anything it serves, so its hours will draw no money.
+                    // Nothing errors and no token is lost — which is why it has
+                    // to be said here. The only symptom is a figure that never
+                    // appears, and an operator cannot tell a missing price from
+                    // a broken chart.
+                    if p.enabled && p.has_no_recorded_rate() {
+                        log::warn!(
+                            "provider {} serves models with no recorded rate, so its hours show no cost",
+                            p.id
+                        );
                     }
                 }
                 r
@@ -2056,5 +2139,128 @@ mod tests {
         std::fs::write(&path, "{ not json").expect("write");
         assert_eq!(Registry::load(&path).providers.len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The repair can only hand back what this repository actually records.
+    ///
+    /// That limit is the whole safety argument for it: a model left unpriced on
+    /// purpose must stay unpriced, or the dashboard starts stating costs nobody
+    /// published. Each of the four answers here is a claim about the catalogue,
+    /// so a preset that gains or drops a rate will fail this test rather than
+    /// silently widen what the repair is willing to invent.
+    #[test]
+    fn only_the_rate_the_catalogue_publishes_is_handed_back() {
+        assert!(
+            published_price("deepseek-flash").is_some(),
+            "the one priced model in the tree must answer, or the repair does nothing"
+        );
+        for unpriced in [
+            // No triple to hand back, for two different reasons. The preset
+            // records this one's published rates in a comment and deliberately
+            // leaves `price` unset, because `billing_price` skips deprecated
+            // models and a price there could never be selected for billing.
+            "deepseek-v4-pro",
+            // And this one is listed with no rate anywhere at all.
+            "gpt-5.6-sol",
+            // The subscription hop has no per-token cost at all.
+            "claude-opus-5",
+            // And nothing that was never heard of.
+            "no-such-model",
+        ] {
+            assert!(
+                published_price(unpriced).is_none(),
+                "{unpriced} has no rate recorded in the catalogue; \
+                 a repair must not manufacture one"
+            );
+        }
+    }
+
+    /// A file whose rows lost their rates gets them back as it is read.
+    ///
+    /// This is the case that makes the money unit work again for a provider
+    /// already in use: it was saved through the form, so its `price` is gone
+    /// from disk, and no later save can bring it back on its own.
+    #[test]
+    fn loading_a_row_that_lost_its_rate_takes_the_catalogue_back() {
+        let dir = std::env::temp_dir().join(format!("ta-proxy-rate-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("providers.json");
+
+        let mut r = Registry::default();
+        let mut deepseek = Preset::Deepseek.provider(&dir);
+        let published = deepseek
+            .models
+            .iter()
+            .find(|m| m.id == "deepseek-flash")
+            .and_then(|m| m.price)
+            .expect("the preset ships a rate");
+        for model in &mut deepseek.models {
+            model.price = None;
+        }
+        r.providers.push(deepseek);
+        r.save(&path).expect("save");
+
+        let back = Registry::load(&path);
+        let restored = back
+            .providers
+            .iter()
+            .find(|p| p.id == "deepseek")
+            .and_then(|p| p.models.iter().find(|m| m.id == "deepseek-flash"))
+            .and_then(|m| m.price);
+        assert_eq!(
+            restored,
+            Some(published),
+            "a row saved without a rate must come back with the published one"
+        );
+
+        // And the row that was never priced stays that way, so the repair
+        // cannot be mistaken for a general "price everything" pass.
+        let anthropic = back
+            .providers
+            .iter()
+            .find(|p| p.id == "anthropic")
+            .expect("the default row is still there");
+        assert!(
+            anthropic.has_no_recorded_rate(),
+            "the subscription hop records no rate, and none is invented for it"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A rate set by hand is not the repair's to change.
+    ///
+    /// Only an absent one is filled, so an operator who priced a model the
+    /// catalogue does not know keeps their figure — and gets to keep it through
+    /// every later save, since the repair and the save-preserve agree on it.
+    #[test]
+    fn a_recorded_rate_is_left_alone_by_the_repair() {
+        let mine = Price {
+            cache_hit: 1,
+            input: 3,
+            output: 4,
+        };
+        let mut p = Provider {
+            id: "by-hand".to_owned(),
+            wire: Wire::Anthropic,
+            base_url: "https://api.deepseek.com/anthropic".to_owned(),
+            auth: Auth::ApiKeyEnv { var: "K".to_owned() },
+            models: vec![Model::new("deepseek-flash", Class::Balanced, 15).priced(1, 3, 4)],
+            preference: 10,
+            enabled: true,
+            peak: None,
+        };
+        p.adopt_published_rates();
+        assert_eq!(
+            p.models[0].price,
+            Some(mine),
+            "the catalogue overwrote a rate that was already recorded"
+        );
+
+        // The same row with the rate missing does take the published one, which
+        // is what separates this from a no-op.
+        p.models[0].price = None;
+        p.adopt_published_rates();
+        assert_eq!(p.models[0].price, published_price("deepseek-flash"));
+        assert!(p.models[0].price.is_some(), "and there was one to take");
     }
 }
