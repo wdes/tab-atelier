@@ -1,0 +1,41 @@
+[package]
+name = "tab-atelier-dashboard"
+version = "0.1.0-dev"
+edition = "2024"
+license = "MPL-2.0"
+description = "Web dashboard host for tab-atelier: serves the GUI assets and reverse-proxies the daemon"
+repository = "https://github.com/wdes/tab-atelier"
+publish = false
+
+[[bin]]
+name = "tab-atelier-dashboard"
+path = "src/main.rs"
+
+[lib]
+name = "tab_atelier_dashboard"
+path = "src/lib.rs"
+
+[dependencies]
+# The server side of the hop: hyper terminates the browser connection, ureq is
+# the blocking client to the daemon. Same pair as `tab-atelier-proxy`, so the
+# two crates cannot drift apart.
+hyper = { version = "1", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+http = "1"
+bytes = "1"
+# Blocking HTTP for the upstream hop: the request is read, replayed and handed
+# back, so async buys nothing on that side and ureq keeps the tree small.
+ureq = { version = "3" }
+tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "net", "sync", "time", "io-util", "macros", "signal"] }
+# `stream::poll_fn` bridges the blocking reader thread to the SSE body hyper
+# streams back. `std` is what exposes it.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+
+[lints.rust]
+unsafe_code = "forbid"
