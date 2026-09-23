@@ -435,6 +435,13 @@ mod unix {
             tabs,
         };
 
+        // Read the agent reaper's provenance record before we drop it:
+        // if the exec below fails, `rollback` must put these exact bytes
+        // back, or the next boot's reap would SIGKILL agents we meant to
+        // keep.
+        let record_path = crate::agent_reaper::record_path(&state_base);
+        let reaper_record = std::fs::read(&record_path).ok();
+
         let rollback = |err: io::Error| {
             for s in sources {
                 let _ = rustix::io::fcntl_setfd(&s.master, rustix::io::FdFlags::CLOEXEC);
@@ -443,6 +450,9 @@ mod unix {
                 let _ = std::fs::remove_file(p);
             }
             let _ = std::fs::remove_file(&manifest_path);
+            if let Some(bytes) = &reaper_record {
+                let _ = std::fs::write(&record_path, bytes);
+            }
             FREEZE.store(false, Ordering::SeqCst);
             err
         };
@@ -465,7 +475,7 @@ mod unix {
         // A hot swap is a clean handover: drop the agent reaper's
         // provenance record so the new image's boot reap doesn't SIGKILL
         // the (alive, wanted) agents it is about to inherit.
-        let _ = std::fs::remove_file(crate::agent_reaper::record_path(&state_base));
+        let _ = std::fs::remove_file(&record_path);
 
         let exe = reexec_path();
         info!("hotswap: exec {} with {} live tab(s)", exe.display(), sources.len());
