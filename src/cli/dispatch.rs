@@ -550,6 +550,14 @@ pub enum Commands {
         args: Vec<String>,
     },
 
+    /// KIOSK (PD1): the cross-project decision log
+    /// (`decision push|read|tranch|list [--includeArchived]`).
+    Decision {
+        /// Passed straight through to `cli::decision::run`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
     /// Exchange blackboard entries with configured remotes: `gossip`.
     ///
     /// Anti-entropy, not replication: the log is a grow-only set, so a round
@@ -986,6 +994,7 @@ fn command_exit_code(cli: Cli) -> Option<i32> {
         Commands::Gossip { args } => crate::cli::client::run("gossip", &args),
         Commands::Prune { args } => crate::cli::client::run("prune", &args),
         Commands::Backlog { args } => crate::cli::client::run("backlog", &args),
+        Commands::Decision { args } => crate::cli::client::run("decision", &args),
         Commands::Token => crate::cli::client::run("token", &[]),
         Commands::RotateTokens => crate::cli::client::run("rotate-tokens", &[]),
         Commands::ResetMasterToken => crate::cli::client::run("reset-master-token", &[]),
