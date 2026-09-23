@@ -1475,6 +1475,12 @@ mod tests {
     /// fixture — only that the table routes them somewhere.
     #[test]
     fn every_subcommand_routes_through_the_table() {
+        // The blackboard path is process-global, so every mutator shares this lock;
+        // without it this test swaps the board out from under a concurrent one that
+        // asserts on its own temp file (e.g. the decision tranch path).
+        let _guard = crate::cli::team::BOARD_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = tempfile::tempdir().expect("tempdir");
         crate::cli::team::set_blackboard_path(Some(dir.path().join("blackboard.jsonl")));
         crate::claims::set_registry_path(Some(dir.path().join("claims.json")));
