@@ -138,6 +138,43 @@ impl Config {
     }
 }
 
+/// Deadlines for the upstream hop, one per stage that must produce something.
+///
+/// Split out from [`Upstream`] so a test can compress them and still exercise
+/// the real timeout paths instead of waiting out the production values.
+#[derive(Debug, Clone, Copy)]
+struct HopTimeouts {
+    resolve: Option<Duration>,
+    connect: Option<Duration>,
+    send_request: Option<Duration>,
+    send_body: Option<Duration>,
+    /// Deadline for the RESPONSE HEADERS to arrive.
+    ///
+    /// `None` on purpose, and it must stay that way. ureq keeps this stage armed
+    /// while the body is being read: its deadline is fixed at the moment the
+    /// headers landed, so a non-`None` value caps the TOTAL life of the body,
+    /// killing a healthy stream at a fixed age. Waiting for headers is still
+    /// bounded — the `send_request` deadline covers that window.
+    recv_response: Option<Duration>,
+    /// Idle deadline on the response body: a stream that keeps producing
+    /// survives however long it likes, one that goes quiet this long is dead.
+    /// This, not `recv_response`, is what bounds a body.
+    recv_body: Option<Duration>,
+}
+
+impl Default for HopTimeouts {
+    fn default() -> Self {
+        Self {
+            resolve: Some(Duration::from_secs(5)),
+            connect: Some(Duration::from_secs(10)),
+            send_request: Some(Duration::from_secs(10)),
+            send_body: Some(Duration::from_secs(30)),
+            recv_response: None,
+            recv_body: Some(Duration::from_mins(5)),
+        }
+    }
+}
+
 /// The daemon base URL plus the agent used to reach it.
 ///
 /// One agent for the whole process: it owns the connection pool, and it is the
@@ -149,7 +186,7 @@ struct Upstream {
 }
 
 impl Upstream {
-    fn new(base: String) -> Self {
+    fn new(base: String, timeouts: HopTimeouts) -> Self {
         let agent = ureq::Agent::config_builder()
             // A 404 from the daemon is a 404 for the browser, not an upstream
             // failure to be rewritten into a 502.
@@ -157,20 +194,12 @@ impl Upstream {
             // The browser follows redirects, and its cookie/authorization
             // handling must see the real target.
             .max_redirects(0)
-            // Every stage that must produce SOMETHING gets a deadline, so a
-            // wedged daemon fails the request instead of holding the worker
-            // thread and the browser connection forever.
-            .timeout_resolve(Some(Duration::from_secs(5)))
-            .timeout_connect(Some(Duration::from_secs(10)))
-            .timeout_send_request(Some(Duration::from_secs(10)))
-            .timeout_send_body(Some(Duration::from_secs(30)))
-            .timeout_recv_response(Some(Duration::from_secs(30)))
-            // Idle timeout on the response body, NOT a cap on its total life:
-            // a stream that keeps producing survives, one that goes quiet for
-            // five minutes is treated as dead. No `timeout_global` — that one
-            // covers the whole call including the body, which would cut a
-            // healthy long-lived stream at a fixed age.
-            .timeout_recv_body(Some(Duration::from_mins(5)))
+            .timeout_resolve(timeouts.resolve)
+            .timeout_connect(timeouts.connect)
+            .timeout_send_request(timeouts.send_request)
+            .timeout_send_body(timeouts.send_body)
+            .timeout_recv_response(timeouts.recv_response)
+            .timeout_recv_body(timeouts.recv_body)
             .build()
             .new_agent();
         Self { base, agent }
@@ -195,7 +224,13 @@ pub async fn run(cfg: Config) -> std::io::Result<()> {
 /// Does not return errors: a failed `accept` is retried and a failed connection
 /// is dropped. The `Result` matches [`run`]'s shape for callers.
 pub async fn serve(listener: tokio::net::TcpListener, upstream: String) -> std::io::Result<()> {
-    let upstream = Arc::new(Upstream::new(upstream));
+    serve_with(listener, upstream, HopTimeouts::default()).await
+}
+
+/// [`serve`] with explicit hop deadlines. Tests use it to compress the timeouts
+/// so they exercise the real paths without waiting out the production values.
+async fn serve_with(listener: tokio::net::TcpListener, upstream: String, timeouts: HopTimeouts) -> std::io::Result<()> {
+    let upstream = Arc::new(Upstream::new(upstream, timeouts));
     loop {
         let (stream, _peer) = match listener.accept().await {
             Ok(pair) => pair,
@@ -382,9 +417,52 @@ fn tokio_stream_of(
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write as _;
     use std::io::{Read, Write};
 
     use super::*;
+
+    /// Factor applied to the production hop deadlines in tests that exercise a
+    /// timeout path, so they run in well under a second instead of minutes.
+    const SCALE: u32 = 100;
+
+    /// Floor for the scaled idle deadline; see [`scaled`]. Must stay comfortably
+    /// above [`DRIP_GAP`] that a scheduler hiccup cannot trip it.
+    const MIN_IDLE_DEADLINE: Duration = Duration::from_secs(10);
+
+    /// Drip scenario for the liveness test: this many chunks, this far apart.
+    ///
+    /// The gap is deliberately **over a second**. ureq applies its deadlines as
+    /// socket timeouts, turning an already-elapsed one into a 1s floor rather
+    /// than into "do not wait" (`NextTimeout::not_zero`). A sub-second gap is
+    /// therefore masked by that floor and cannot tell an armed `recv_response`
+    /// from an unset one — a drip paced faster than 1s passes either way, which
+    /// is how an earlier version of this very test stayed blind to the bug it
+    /// was written to catch.
+    const DRIP_CHUNKS: usize = 3;
+    const DRIP_GAP: Duration = Duration::from_millis(1_200);
+    const DRIP_TOTAL: Duration = Duration::from_millis(3_600);
+
+    /// Shrink every armed deadline by `factor`, leaving `None` as `None`.
+    ///
+    /// `recv_response`'s `None` is the point of the exercise: it must survive
+    /// scaling untouched.
+    ///
+    /// The idle (`recv_body`) deadline gets a floor. Scaling it by the same
+    /// factor would leave it barely above the drip gap, so a loaded machine
+    /// stretching one sleep would turn the liveness test flaky for a reason
+    /// that has nothing to do with what it tests. It only fires when the stream
+    /// stalls, so keeping it generous costs no wall-clock time.
+    fn scaled(mut timeouts: HopTimeouts, factor: u32) -> HopTimeouts {
+        let shrink = |d: Option<Duration>| d.map(|d| d / factor);
+        timeouts.resolve = shrink(timeouts.resolve);
+        timeouts.connect = shrink(timeouts.connect);
+        timeouts.send_request = shrink(timeouts.send_request);
+        timeouts.send_body = shrink(timeouts.send_body);
+        timeouts.recv_response = shrink(timeouts.recv_response);
+        timeouts.recv_body = timeouts.recv_body.map(|d| (d / factor).max(MIN_IDLE_DEADLINE));
+        timeouts
+    }
 
     /// Read one request off a socket, stopping at the end of its head.
     fn read_request_head(stream: &mut impl Read) -> String {
@@ -444,10 +522,11 @@ mod tests {
         port
     }
 
-    /// Upstream that answers `Transfer-Encoding: chunked` and sends its body in
-    /// two spaced writes, to prove the response is relayed as it arrives rather
-    /// than buffered until the connection closes.
-    fn spawn_streaming_upstream() -> u16 {
+    /// Upstream that answers `Transfer-Encoding: chunked` and drips its body
+    /// one chunk per `gap`, so a test can prove the response is relayed as it
+    /// arrives rather than buffered, and that a slow-but-alive stream is not
+    /// killed at a fixed age.
+    fn spawn_dripping_upstream(chunks: usize, gap: Duration) -> u16 {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         std::thread::spawn(move || {
@@ -458,12 +537,13 @@ mod tests {
                     stream,
                     "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n"
                 );
-                for chunk in [b"data: one\n\n".as_slice(), b"data: two\n\n"] {
+                for i in 0..chunks {
+                    let chunk = format!("data: {i}\n\n");
                     let _ = write!(stream, "{:x}\r\n", chunk.len());
-                    let _ = stream.write_all(chunk);
+                    let _ = stream.write_all(chunk.as_bytes());
                     let _ = stream.write_all(b"\r\n");
                     let _ = stream.flush();
-                    std::thread::sleep(Duration::from_millis(50));
+                    std::thread::sleep(gap);
                 }
                 let _ = stream.write_all(b"0\r\n\r\n");
                 let _ = stream.flush();
@@ -472,8 +552,13 @@ mod tests {
         port
     }
 
-    /// Bind the dashboard on an ephemeral port and run it on its own runtime.
+    /// Bind the dashboard on an ephemeral port and run it on its own runtime,
+    /// with the production hop deadlines.
     fn spawn_dashboard(upstream_port: u16) -> u16 {
+        spawn_dashboard_with(upstream_port, HopTimeouts::default())
+    }
+
+    fn spawn_dashboard_with(upstream_port: u16, timeouts: HopTimeouts) -> u16 {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         listener.set_nonblocking(true).unwrap();
@@ -486,7 +571,7 @@ mod tests {
                 .unwrap();
             rt.block_on(async move {
                 let listener = tokio::net::TcpListener::from_std(listener).unwrap();
-                serve(listener, upstream).await.unwrap();
+                serve_with(listener, upstream, timeouts).await.unwrap();
             });
         });
         port
@@ -610,13 +695,62 @@ mod tests {
 
     #[test]
     fn relays_a_streamed_response_whole() {
-        let upstream = spawn_streaming_upstream();
+        let upstream = spawn_dripping_upstream(2, Duration::from_millis(50));
         let port = spawn_dashboard(upstream);
 
         let (status, ctype, body) = get(port, "/api/stream");
         assert_eq!(status, 200);
         assert_eq!(ctype, "text/event-stream");
-        assert_eq!(body, "data: one\n\ndata: two\n\n");
+        assert_eq!(body, "data: 0\n\ndata: 1\n\n");
+    }
+
+    /// A slow-but-alive stream must outlive every deadline that stays armed
+    /// while its body is being read.
+    ///
+    /// The deadlines are scaled down by [`SCALE`] so the test is fast. The point
+    /// is the shape of the config, not its absolute numbers: with
+    /// `recv_response` unset the stream survives however long it keeps
+    /// producing; arm it with ANY value and ureq kills this drip at that value,
+    /// because its deadline is fixed when the headers land.
+    #[test]
+    fn a_slow_but_alive_stream_outlives_the_other_deadlines() {
+        let timeouts = scaled(HopTimeouts::default(), SCALE);
+        // Preconditions, so a later tweak to the scenario cannot quietly make
+        // this test vacuous.
+        for armed in [timeouts.send_request, timeouts.send_body, timeouts.recv_response]
+            .into_iter()
+            .flatten()
+        {
+            assert!(
+                armed < DRIP_TOTAL,
+                "the drip ({DRIP_TOTAL:?}) must outlast the {armed:?} deadline to prove anything"
+            );
+        }
+        assert!(
+            DRIP_GAP < timeouts.recv_body.unwrap(),
+            "a gap between chunks must stay under the idle deadline"
+        );
+
+        let upstream = spawn_dripping_upstream(DRIP_CHUNKS, DRIP_GAP);
+        let port = spawn_dashboard_with(upstream, timeouts);
+
+        let (status, ctype, body) = get(port, "/api/stream");
+        assert_eq!((status, ctype.as_str()), (200, "text/event-stream"), "body: {body}");
+        let expected: String = (0..DRIP_CHUNKS).fold(String::new(), |mut acc, i| {
+            write!(acc, "data: {i}\n\n").unwrap();
+            acc
+        });
+        assert_eq!(body, expected, "the slow stream was cut short");
+    }
+
+    /// `recv_response` must stay unset: it is the one stage ureq leaves armed
+    /// while reading the body, so giving it a value caps a stream's total life.
+    #[test]
+    fn the_response_deadline_is_not_armed() {
+        assert!(
+            HopTimeouts::default().recv_response.is_none(),
+            "arming recv_response kills a healthy long-lived stream at a fixed age"
+        );
     }
 
     #[test]
@@ -644,10 +778,10 @@ mod tests {
     #[test]
     fn a_silent_upstream_answers_502_instead_of_hanging() {
         let upstream = spawn_silent_upstream();
-        let port = spawn_dashboard(upstream);
+        // Compressed deadlines, so the test does not wait out the production
+        // values to prove the same code path.
+        let port = spawn_dashboard_with(upstream, scaled(HopTimeouts::default(), SCALE));
 
-        // The hop's `recv_response` deadline is 30s; allow a generous margin so
-        // the assertion is about the timeout firing, not about its exact value.
         let started = std::time::Instant::now();
         let (status, ctype, body) = get(port, "/api/tabs");
         let elapsed = started.elapsed();
@@ -658,8 +792,8 @@ mod tests {
             "upstream_unavailable"
         );
         assert!(
-            elapsed < Duration::from_mins(1),
-            "the 502 must come from a timeout, took {elapsed:?}"
+            elapsed < Duration::from_secs(5),
+            "the 502 must come from a deadline, took {elapsed:?}"
         );
         // The internal detail must not reach the client.
         assert!(!body.contains("timeout"), "upstream error detail leaked: {body}");
