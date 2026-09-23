@@ -60,6 +60,8 @@ pub mod tasks;
 /// verbs (dispatch handles send-a-prompt-and-wait; this is the rest).
 pub mod team;
 pub mod tokens;
+/// `tab-atelier upgrade` — hot-swap the running binary, tabs stay live.
+pub mod upgrade;
 /// `tab-atelier announce / bid / award / take / done` — the verbs an agent
 /// uses to join the fleet and pick up work on its own.
 pub mod work;
@@ -201,7 +203,14 @@ mod help_tests {
         /// Files allowed to read `env::args`, with the reason. Empty, and meant
         /// to stay that way: a process has one command line, so it gets one
         /// parser.
-        const ALLOWED: &[(&str, &str)] = &[];
+        const ALLOWED: &[(&str, &str)] = &[(
+            "hotswap.rs",
+            "`--handoff <manifest>` is an internal marker the pre-exec binary appends to its own \
+             argv for its successor (see `crate::hotswap::adopt_from_args`). It is declared in \
+             `Cli` so clap tolerates it, but that field is never read: adoption re-derives the \
+             manifest path from raw argv so it can also *strip* the pair before the successor \
+             re-parses (see `passthrough_args`).",
+        )];
 
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut stack = vec![root];
