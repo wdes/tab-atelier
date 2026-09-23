@@ -606,8 +606,11 @@ pub(crate) struct Forward {
     is_post: bool,
     content_type: String,
     client_beta: Option<String>,
-    /// The client's own Claude Code identity headers, forwarded verbatim.
-    /// See [`passthrough_headers`].
+    /// The client's own headers, minus the ones that must never leave.
+    ///
+    /// Held whole rather than pre-filtered, because which of them to send
+    /// depends on the destination, and that is not known when they are read.
+    /// See [`passthrough_headers`] and [`headers_for_hop`].
     client_headers: Vec<(String, String)>,
     body: Bytes,
     weight: u32,
@@ -643,7 +646,12 @@ pub(crate) struct Forward {
     state: Arc<State>,
 }
 
-const FORWARDED_HEADERS: &[&str] = &[
+/// Headers the proxy sends on every hop, whatever the vendor.
+///
+/// The client's Claude Code identity: it is the fingerprint Anthropic's OAuth
+/// path expects, and this proxy is not it, so a request that arrives without
+/// them is given the ones in [`claude_api::api_headers`] instead.
+const CLIENT_IDENTITY_HEADERS: &[&str] = &[
     "user-agent",
     "x-app",
     "x-claude-code-session-id",
@@ -655,23 +663,86 @@ const FORWARDED_HEADERS: &[&str] = &[
     "accept",
 ];
 
-/// Prefix allowlist, for the SDK's telemetry headers (`x-stainless-lang`,
-/// `-os`, `-runtime`, `-retry-count`, …). They are enumerated by the SDK
-/// version, not by us, so matching the prefix is what keeps this from going
-/// stale on the client's next upgrade.
-const FORWARDED_PREFIXES: &[&str] = &["x-stainless-"];
+/// Prefix match, for the SDK's telemetry headers (`x-stainless-lang`, `-os`,
+/// `-runtime`, `-retry-count`, …). They are enumerated by the SDK version, not
+/// by us, so matching the prefix is what keeps this from going stale on the
+/// client's next upgrade.
+const CLIENT_IDENTITY_PREFIXES: &[&str] = &["x-stainless-"];
 
-/// Collect the headers of [`FORWARDED_HEADERS`] / [`FORWARDED_PREFIXES`].
+/// Headers that must never leave, however unrecognised the rest may be.
+///
+/// This is a denylist, and that direction is the point. It used to be an
+/// allowlist, which is a promise to keep pace with a client that does not tell
+/// us when it adds a header: everything not named was dropped on the way to the
+/// vendor, silently and unlogged. Anthropic's gateway guidance names that as the
+/// first way a proxy breaks a new server-side feature — "one that strips or
+/// rewrites request headers … including ones the gateway doesn't recognize" —
+/// and the feature it eats here is auto mode's safety classifier, which rides
+/// inside the session's own model requests and cannot run if what announces it
+/// never arrives. So the default is to forward, and only these are withheld.
+const DROPPED_HEADERS: &[&str] = &[
+    // The client's own credentials. The vendor is told the provider's key, and
+    // the route is what decides which; carrying the client's along would hand
+    // the account's Anthropic token to whatever vendor that route picked.
+    "authorization",
+    "x-api-key",
+    "cookie",
+    "proxy-authorization",
+    // Framing. The body is shaped on the way through, so its length here is
+    // already wrong, and connection state belongs to a hop rather than a relay.
+    "host",
+    "content-length",
+    "connection",
+    "keep-alive",
+    "transfer-encoding",
+    "te",
+    "trailer",
+    "upgrade",
+    // Set on the way out, or merged rather than replaced: forwarding the
+    // client's copy as well would send it twice, and for `anthropic-beta` would
+    // undo the union with the flags the OAuth credential requires.
+    "content-type",
+    "anthropic-beta",
+    // Withheld so responses stay readable. The usage sniffer counts tokens out
+    // of the response body as it passes, and it can only count what it can read.
+    "accept-encoding",
+];
+
+/// The client's headers, minus [`DROPPED_HEADERS`].
+///
+/// Everything else is kept, including names this proxy has never heard of: an
+/// unrecognised header is far more likely to be one Claude Code has just started
+/// sending than a reason to withhold. Credentials go here, at the edge, so a
+/// full set never sits on a [`Forward`] waiting to be copied out.
 pub(crate) fn passthrough_headers(headers: &http::HeaderMap) -> Vec<(String, String)> {
     headers
         .iter()
         .filter_map(|(name, value)| {
             let n = name.as_str();
-            let keep = FORWARDED_HEADERS.contains(&n) || FORWARDED_PREFIXES.iter().any(|p| n.starts_with(p));
+            let sendable = !DROPPED_HEADERS.contains(&n);
             // Non-UTF-8 header values cannot be re-sent and are not something
             // Anthropic emits; dropping one is better than failing the call.
-            keep.then(|| value.to_str().ok().map(|v| (n.to_owned(), v.to_owned())))?
+            sendable.then(|| value.to_str().ok().map(|v| (n.to_owned(), v.to_owned())))?
         })
+        .collect()
+}
+
+/// Narrow that set to the identity headers, for a hop that is not Anthropic.
+///
+/// Only the Anthropic hop is given the unrecognised ones. The server-side checks
+/// this exists for are Anthropic's, so a vendor that is not Anthropic has none
+/// to reach, and a session id, an account id or a workspace id carried to a
+/// third party buys nothing while telling that party who is calling.
+pub(crate) fn headers_for_hop(client: &[(String, String)], subscription: bool) -> Vec<(String, String)> {
+    if subscription {
+        return client.to_vec();
+    }
+    client
+        .iter()
+        .filter(|(n, _)| {
+            CLIENT_IDENTITY_HEADERS.contains(&n.as_str()) || CLIENT_IDENTITY_PREFIXES.iter().any(|p| n.starts_with(p))
+        })
+        .cloned()
         .collect()
 }
 
@@ -886,7 +957,12 @@ pub(crate) fn upstream_headers(
     ));
     // The client's Claude Code identity travels with the request — it is the
     // fingerprint Anthropic's OAuth path expects, and we are not it.
-    hdrs.extend(f.client_headers.iter().cloned());
+    // The client's Claude Code identity travels with the request — it is the
+    // fingerprint Anthropic's OAuth path expects, and this proxy is not it. On
+    // the subscription hop that means every header the client sent, so that a
+    // feature Anthropic gates on one this proxy has not heard of still sees it;
+    // elsewhere, only the identity set. See [`headers_for_hop`].
+    hdrs.extend(headers_for_hop(&f.client_headers, f.uses_the_subscription));
     // A client that sent none of them (a curl smoke test, another SDK) still
     // has to look like Claude Code upstream, so fill in what is missing rather
     // than either overriding the real client or sending nothing.
@@ -1402,5 +1478,118 @@ mod tests {
         );
         assert_eq!(after, body, "nothing to change, so nothing is rebuilt");
         assert!(local.is_empty());
+    }
+
+    /// A field the proxy has no type for survives being rebuilt.
+    ///
+    /// Auto mode's safety classifier rides inside the session's own model
+    /// requests — in a field this proxy has no type for — and answers in one.
+    /// The body travels as `Bytes` and is parsed only when a pass has something
+    /// to change, so a name the proxy cannot pronounce is carried rather than
+    /// dropped. A typed request struct would have discarded it here, silently,
+    /// which is the third failure Anthropic's gateway guidance names: "a gateway
+    /// that rejects or fails to preserve `safeguards`".
+    #[test]
+    fn a_field_the_proxy_has_no_type_for_survives_a_rebuild() {
+        let route = routing::Route {
+            provider_id: "p".to_owned(),
+            model_id: "chosen-by-router".to_owned(),
+            class: provider::Class::Balanced,
+            kind: classifier::Kind::Work,
+            changed_from: Some("asked-for".to_owned()),
+            reason: None,
+        };
+        let body = Bytes::from(
+            r#"{"model":"asked-for","safeguards":{"mode":"auto"},"messages":[{"role":"user","content":"hi"}]}"#,
+        );
+
+        let (after, _, _) = shape_body(
+            &body,
+            &route,
+            "asked-for",
+            crate::compact::Compact::None,
+            &crate::tools::Policy::default(),
+            true,
+            crate::identity::Vendor::Anthropic,
+        );
+        let text = String::from_utf8_lossy(&after);
+        assert!(
+            text.contains(r#""safeguards":{"mode":"auto"}"#),
+            "a field the proxy cannot name must reach the vendor intact: {text}"
+        );
+    }
+
+    /// A header the proxy has never heard of is forwarded, not dropped.
+    ///
+    /// This is what lets a server-side feature Claude Code has not told us about
+    /// work at all: the client announces it with a header, and a proxy that sends
+    /// only the names it recognises is the first failure the gateway guidance
+    /// lists — "one that strips or rewrites request headers … including ones the
+    /// gateway doesn't recognize". The allowlist that did exactly that is why
+    /// auto mode's classifier could not be handed to this gateway.
+    #[test]
+    fn an_unrecognised_header_is_forwarded() {
+        let mut h = http::HeaderMap::new();
+        h.insert("x-something-new", "yes".parse().expect("ascii"));
+        h.insert("anthropic-client-version", "1.2.3".parse().expect("ascii"));
+
+        let kept = passthrough_headers(&h);
+        let names: Vec<&str> = kept.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"x-something-new"), "{names:?}");
+        assert!(names.contains(&"anthropic-client-version"), "{names:?}");
+    }
+
+    /// Credentials and framing never travel in the client's header set.
+    ///
+    /// The route decides which key a vendor is given, so forwarding the client's
+    /// along as well would hand the account's own Anthropic token to whatever
+    /// vendor routing picked — a different thing entirely from forwarding a
+    /// capability header. The framing ones would be wrong rather than merely
+    /// leaky: the body is shaped on the way through, so a length copied from the
+    /// client misdescribes what is sent, and `accept-encoding` is withheld so the
+    /// usage sniffer can read the response it counts tokens out of.
+    #[test]
+    fn credentials_and_framing_are_dropped_at_the_edge() {
+        let mut h = http::HeaderMap::new();
+        h.insert("authorization", "Bearer sk-ant-secret".parse().expect("ascii"));
+        h.insert("x-api-key", "sk-ant-secret".parse().expect("ascii"));
+        h.insert("cookie", "session=secret".parse().expect("ascii"));
+        h.insert("accept-encoding", "gzip".parse().expect("ascii"));
+        h.insert("content-length", "42".parse().expect("ascii"));
+
+        let kept = passthrough_headers(&h);
+        assert!(kept.is_empty(), "nothing here may be forwarded, got {kept:?}");
+    }
+
+    /// Only the Anthropic hop is given the headers this proxy cannot name.
+    ///
+    /// The server-side checks those exist for are Anthropic's, so a vendor that
+    /// is not Anthropic has none to reach — and a session id or an account id
+    /// sent to a third party buys nothing while telling that party who is
+    /// calling. Narrowing it is the point of carrying the set whole instead of
+    /// filtering it where it is read.
+    #[test]
+    fn a_vendor_that_is_not_anthropic_gets_only_the_identity_headers() {
+        let client = vec![
+            ("user-agent".to_owned(), "claude-cli/2.1.280".to_owned()),
+            ("x-stainless-lang".to_owned(), "js".to_owned()),
+            ("x-something-new".to_owned(), "yes".to_owned()),
+            ("x-account-id".to_owned(), "acct_1".to_owned()),
+        ];
+
+        let to_anthropic = headers_for_hop(&client, true);
+        assert_eq!(
+            to_anthropic.len(),
+            4,
+            "the subscription hop is given everything the client sent"
+        );
+
+        let to_a_vendor = headers_for_hop(&client, false);
+        let names: Vec<&str> = to_a_vendor.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["user-agent", "x-stainless-lang"],
+            "identity and SDK telemetry only"
+        );
     }
 }

@@ -107,6 +107,60 @@ auto mode is failing — is work and costs nothing, while a missed classifier is
 exempted from nothing and leaves the old behaviour. False negatives are the safe
 direction.
 
+## Running the classifier server-side
+
+Anthropic now offers to take this call off the client: the gateway that already
+fronts the traffic is asked to run the check itself, announced with the
+`auto-mode-classifier-2026-07-16` beta. Claude Code prefers that arrangement when
+it sees a third-party base URL, and this proxy is one — so it tries, and
+everything below decides whether the arrangement is reachable.
+
+The client is explicit when it is not. Asked to run the check and refused, it
+says so once per session and falls back to doing it itself, with the verdict
+still billed:
+
+> We're changing auto mode to no longer charge for classifier requests in Claude
+> Code. However, this session isn't eligible because your requests go through
+> `<gateway>`, which isn't compatible with this update. Nothing breaks: auto mode
+> keeps working, and its classifier requests are billed as before.
+
+Anthropic's gateway guidance names three ways a gateway fails it, and this proxy
+now answers each:
+
+| Failure it names | What this proxy does |
+|---|---|
+| "strips or rewrites request headers, including ones the gateway doesn't recognize" | Forwards **every** header the client sent except a short denylist. It used to send an allowlist and drop the rest silently, which is this failure exactly. |
+| "rejects request bodies that carry unknown top-level fields" | The body stays `Bytes` until a pass has something to change, and is re-serialised from parsed JSON, so a field this crate has no type for is carried. |
+| "rejects or fails to preserve `safeguards`" | The same, in both directions: on the Anthropic wire the response is passed through as raw bytes, so what the vendor returns arrives unaltered. |
+
+### What the header change is scoped to
+
+Only the Anthropic hop is given the headers this proxy cannot name. The
+server-side checks they exist for are Anthropic's, so a vendor that is not
+Anthropic has none to reach — and a session id, an account id or a workspace id
+sent to a third party buys nothing while telling that party who is calling. The
+subscription credential is what selects the wide set, since it is the hop that
+actually reaches Anthropic.
+
+Never forwarded, on any hop: the client's own credentials (`authorization`,
+`x-api-key`, `cookie`, `proxy-authorization`). The route decides which key a
+vendor is given, so carrying the client's along would hand the account's own
+token to whatever vendor routing picked. Nor the framing headers, which would be
+wrong rather than merely leaky — the body is shaped in flight, so a length copied
+from the client misdescribes what is sent — and not `accept-encoding`, because
+the usage sniffer counts tokens out of the response body as it passes and can
+only count what it can read.
+
+### Why this matters beyond the verdict
+
+Handing the check to the gateway is the difference between paying for it and not.
+Run client-side, every gated action is a second Messages call against the
+subscription, exempt from compaction and carrying the whole transcript — the cost
+described above. Run server-side it stops being a model call at all, which is
+what "no longer charge for classifier requests" means. That is the same spend
+[`proxy-compaction.md`](proxy-compaction.md) deliberately leaves alone, so it is
+unaffected by anything done to the transcript.
+
 ## See also
 
 * [`proxy-compaction.md`](proxy-compaction.md) — the pass this is exempt from.
