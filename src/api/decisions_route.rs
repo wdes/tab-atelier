@@ -270,8 +270,11 @@ pub(in crate::api) fn mutate<S: Write>(stream: &mut S, state: &Arc<Mutex<TabSnap
         return;
     };
     let id = url_decode(id_enc);
-    if id.trim().is_empty() {
-        error_json(stream, 400, "empty decision id");
+    // B1: refuse a hostile id at the trust boundary — charset/length, and no `.`/`..`/slash
+    // — so the id can never be `join`ed out of the archive root (400, not a 404: the shape
+    // is wrong, not the routing).
+    if !crate::cli::decision::valid_decision_id(&id) {
+        error_json(stream, 400, "invalid decision id");
         return;
     }
     let kind = match verb {
