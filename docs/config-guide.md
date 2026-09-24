@@ -9,6 +9,7 @@ has. Written for someone with the package installed and no checkout.
 |---|---|---|
 | `~/.config/tab-atelier/preferences.json` | The relay endpoint. The agent reads this for its URL and token, so a tab needs no flags. | `tab-atelier` writes it; `/etc/tab-atelier/preferences.json` is the fallback for a fresh install. |
 | `~/.config/tab-atelier/catbus-agent/identity.md` | The system prompt. See below. | You. |
+| `<cwd>/.catbus/identity.md` | The system prompt for one directory. See below. | You. Ignored by git, not committed. |
 | `~/.config/tab-atelier/catbus-agent/tools.json` | Which tools the agent has. See below. | You, passed with `--tools-config`. |
 | `~/.claude/projects/<escaped-cwd>/<id>.jsonl` | The transcript, one file per session. | The agent. |
 | `~/.claude/projects/<escaped-cwd>/<id>.name` | A session's `/rename`d name. | The agent. |
@@ -53,6 +54,20 @@ permission list with a typo in it should say so.
 
 A file whose body is blank but whose front matter names tools still limits them; that is how
 you say "no identity, but only these tools".
+
+### Per-directory identities
+
+A working directory can carry its own identity at `<cwd>/.catbus/identity.md`. It is the more
+specific statement, so it wins over the one above, and it is how a project says who its agent
+is without that answer depending on which machine the tab runs on. `.catbus/` is worth
+ignoring rather than committing: the front matter is where `AllowedHosts` and
+`AllowedJumpHosts` live, and a host limit describes where the work runs rather than the work.
+
+The search is `--identity`, then `--identity-file`, then `<cwd>/.catbus/identity.md`, then the
+one above. The first two are *named*, so a name that does not resolve is an error; the last two
+are *found*, so one that is absent is not a statement and the search carries on. A found file
+that exists but has a blank body is a statement — it silences the identity, and being nearer
+it silences the ones behind it too, which is how a directory turns off a prompt it inherits.
 
 ### Limiting which hosts SSH may reach
 

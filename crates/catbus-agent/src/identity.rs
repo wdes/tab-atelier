@@ -21,6 +21,10 @@
 //! owns it. A blank file means "send no identity at all". Nothing supplied means
 //! the built-in behaviour, except that the Claude line is dropped once the relay
 //! has reported a model that is not Anthropic — see [`Identity::Auto`].
+//!
+//! Such a file is looked for in two places: the one the operator's machine keeps
+//! ([`path`]) and the one the working directory keeps ([`project_path`]). The
+//! project's own file wins, because it is the more specific statement.
 
 use std::path::{Path, PathBuf};
 
@@ -128,25 +132,42 @@ fn path_from(xdg_config: Option<String>, home: Option<String>) -> PathBuf {
     base.join("tab-atelier").join("catbus-agent").join("identity.md")
 }
 
+/// Path of the identity file a working directory keeps for itself.
+///
+/// `<cwd>/.catbus/identity.md`. The directory is meant to be ignored by version
+/// control rather than committed: the file can carry tool and host limits, and a
+/// limit is a statement about the machine it runs on rather than about the work.
+#[must_use]
+pub fn project_path(cwd: &Path) -> PathBuf {
+    cwd.join(".catbus").join("identity.md")
+}
+
 /// Resolve the identity from an inline string and/or an explicit file path.
 ///
-/// Precedence: `inline`, then `file`, then the built-in [`path`]. The line between
-/// the last two is the one that matters, and it is about intent rather than
-/// existence:
+/// Precedence: `inline`, then `file`, then the directory's own file, then the
+/// built-in [`path`]. The line between the last three is the one that matters, and
+/// it is about intent rather than existence:
 ///
 /// * A file the operator **named** — `--identity-file`, which is also what
 ///   `CATBUS_IDENTITY_FILE` sets — must be readable and must hold a prompt. Both
 ///   failures are errors, because a name that does not resolve is a typo and
 ///   should be loud rather than quietly ignored.
-/// * The **built-in** location is a convenience: absent means [`Identity::Auto`],
-///   and present-but-blank means [`Identity::Omitted`], which is how an operator
-///   says "send no identity block" without deleting the file's front matter.
-pub fn load(inline: Option<&str>, file: Option<&Path>) -> Result<Identity, String> {
-    load_at(inline, file, &path())
+/// * The two **convenience** locations are found rather than named: absent means
+///   the search continues, and present-but-blank means [`Identity::Omitted`],
+///   which is how an operator says "send no identity block" without deleting the
+///   file's front matter.
+///
+/// `cwd` is the directory the session runs in, which is `--cwd` when the launcher
+/// gave one — not the process's own, so that a jailed agent finds the jail's file.
+pub fn load(inline: Option<&str>, file: Option<&Path>, cwd: &Path) -> Result<Identity, String> {
+    let project = project_path(cwd);
+    let machine = path();
+    load_at(inline, file, &[&project, &machine])
 }
 
-/// [`load`] with the default path passed in, for the same reason as [`path_from`].
-fn load_at(inline: Option<&str>, file: Option<&Path>, default: &Path) -> Result<Identity, String> {
+/// [`load`] with the convenience locations passed in, for the same reason as
+/// [`path_from`]. Nearest first.
+fn load_at(inline: Option<&str>, file: Option<&Path>, convenience: &[&Path]) -> Result<Identity, String> {
     if let Some(text) = inline {
         let trimmed = text.trim();
         if trimmed.is_empty() {
@@ -181,33 +202,45 @@ fn load_at(inline: Option<&str>, file: Option<&Path>, default: &Path) -> Result<
         });
     }
 
-    let default = default.to_path_buf();
-    let raw = match std::fs::read_to_string(&default) {
-        Ok(raw) => raw,
-        // Absent is the ordinary case.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Identity::Auto),
-        // Present but unreadable is not ordinary, and silently falling back would
-        // hide a permissions problem behind "the agent ignores my prompt".
-        Err(e) => return Err(format!("cannot read identity file {}: {e}", default.display())),
-    };
-    let parsed = parse_prompt(&raw).map_err(|e| format!("identity file {}: {e}", default.display()))?;
-    if parsed.body.trim().is_empty() {
-        // A blank body is how the operator says "send no identity" — but the front matter was still
-        // written, so the limits it declares travel with it. A file that says only
-        // `AllowedHosts: …` is a statement about hosts, and a document that also silences the
-        // identity.
-        return Ok(Identity::Omitted {
+    // Convenience locations, nearest first. An absent one is not a statement —
+    // it just means this directory has nothing to say — so the search moves on,
+    // and only running out of candidates falls back to the built-in behaviour.
+    //
+    // A present-but-blank one does stop the search, in either location, because
+    // the operator who deliberately wrote a blank body and a front matter meant
+    // the silence to apply here.
+    for candidate in convenience {
+        let raw = match std::fs::read_to_string(candidate) {
+            Ok(raw) => raw,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            // Present but unreadable is not ordinary, and silently falling back
+            // would hide a permissions problem behind "the agent ignores my
+            // prompt".
+            Err(e) => {
+                return Err(format!("cannot read identity file {}: {e}", candidate.display()));
+            }
+        };
+        log::info!("identity taken from {}", candidate.display());
+        let parsed = parse_prompt(&raw).map_err(|e| format!("identity file {}: {e}", candidate.display()))?;
+        if parsed.body.trim().is_empty() {
+            // A blank body is how the operator says "send no identity" — but the front matter was
+            // still written, so the limits it declares travel with it. A file that says only
+            // `AllowedHosts: …` is a statement about hosts, and a document that also silences the
+            // identity.
+            return Ok(Identity::Omitted {
+                allowed_tools: parsed.allowed_tools,
+                allowed_hosts: parsed.allowed_hosts,
+                allowed_jump_hosts: parsed.allowed_jump_hosts,
+            });
+        }
+        return Ok(Identity::Text {
+            text: parsed.body,
             allowed_tools: parsed.allowed_tools,
             allowed_hosts: parsed.allowed_hosts,
             allowed_jump_hosts: parsed.allowed_jump_hosts,
         });
     }
-    Ok(Identity::Text {
-        text: parsed.body,
-        allowed_tools: parsed.allowed_tools,
-        allowed_hosts: parsed.allowed_hosts,
-        allowed_jump_hosts: parsed.allowed_jump_hosts,
-    })
+    Ok(Identity::Auto)
 }
 
 /// What a prompt file states: the prompt, and the limits its front matter declares.
@@ -329,6 +362,122 @@ fn non_empty_env(name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The two-arg form the tests below want. The convenience locations are passed
+    /// in only by the tests that mean to exercise the search, so that no test reads
+    /// the identity file belonging to the machine it happens to run on.
+    fn load(inline: Option<&str>, file: Option<&Path>) -> Result<Identity, String> {
+        load_at(inline, file, &[])
+    }
+
+    #[test]
+    fn a_project_identity_file_is_found_at_the_working_directory() {
+        assert_eq!(
+            project_path(Path::new("/srv/app")),
+            Path::new("/srv/app/.catbus/identity.md")
+        );
+    }
+
+    /// The point of looking in the project at all: a working directory that keeps
+    /// its own file gets its own identity, not the machine's.
+    #[test]
+    fn the_projects_file_wins_over_the_machines() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let project_file = project_path(&project);
+        std::fs::create_dir_all(project_file.parent().unwrap()).unwrap();
+        std::fs::write(&project_file, "You are the project's agent.").unwrap();
+
+        let machine = dir.path().join("machine.md");
+        std::fs::write(&machine, "You are the machine's agent.").unwrap();
+
+        let identity = load_at(None, None, &[&project_file, &machine]).unwrap();
+        assert_eq!(
+            identity,
+            Identity::Text {
+                text: "You are the project's agent.".into(),
+                allowed_tools: None,
+                allowed_hosts: None,
+                allowed_jump_hosts: None,
+            }
+        );
+    }
+
+    /// A directory with no file of its own says nothing, so the search continues —
+    /// this is the difference between the project location and an explicitly named
+    /// file, whose absence is an error.
+    #[test]
+    fn a_directory_with_no_file_falls_through_to_the_machines() {
+        let dir = tempfile::tempdir().unwrap();
+        let machine = dir.path().join("machine.md");
+        std::fs::write(&machine, "You are the machine's agent.").unwrap();
+
+        let absent = dir.path().join("nowhere/.catbus/identity.md");
+        let identity = load_at(None, None, &[&absent, &machine]).unwrap();
+        assert_eq!(
+            identity,
+            Identity::Text {
+                text: "You are the machine's agent.".into(),
+                allowed_tools: None,
+                allowed_hosts: None,
+                allowed_jump_hosts: None,
+            }
+        );
+    }
+
+    /// Front matter with a blank body means "send no identity". In the project
+    /// location that is a deliberate local silence, so it must stop the search
+    /// rather than let the machine's prompt speak instead.
+    #[test]
+    fn a_blank_project_file_silences_the_machines_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_file = dir.path().join("project.md");
+        std::fs::write(&project_file, "---\nAllowedHosts: example.com\n---\n").unwrap();
+        let machine = dir.path().join("machine.md");
+        std::fs::write(&machine, "You are the machine's agent.").unwrap();
+
+        let identity = load_at(None, None, &[&project_file, &machine]).unwrap();
+        assert_eq!(
+            identity,
+            Identity::Omitted {
+                allowed_tools: None,
+                allowed_hosts: Some(vec!["example.com".into()]),
+                allowed_jump_hosts: None,
+            }
+        );
+    }
+
+    /// Neither location present is the ordinary case, and the built-in behaviour.
+    #[test]
+    fn no_file_anywhere_is_the_built_in_behaviour() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a/.catbus/identity.md");
+        let b = dir.path().join("b/identity.md");
+        assert_eq!(load_at(None, None, &[&a, &b]).unwrap(), Identity::Auto);
+    }
+
+    /// An explicit file still outranks every convenience location, so a launcher
+    /// that pins one cannot be overridden by a file dropped in the directory.
+    #[test]
+    fn an_explicit_file_outranks_the_projects() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_file = dir.path().join("project.md");
+        std::fs::write(&project_file, "You are the project's agent.").unwrap();
+        let pinned = dir.path().join("pinned.md");
+        std::fs::write(&pinned, "You are the pinned agent.").unwrap();
+
+        let identity = load_at(None, Some(&pinned), &[&project_file]).unwrap();
+        assert_eq!(
+            identity,
+            Identity::Text {
+                text: "You are the pinned agent.".into(),
+                allowed_tools: None,
+                allowed_hosts: None,
+                allowed_jump_hosts: None,
+            }
+        );
+    }
 
     #[test]
     fn a_file_without_front_matter_is_all_prompt() {
@@ -516,12 +665,12 @@ mod tests {
         let target = dir.path().join("chosen.md");
 
         // Absent: built-in behaviour.
-        assert_eq!(load_at(None, None, &target).unwrap(), Identity::Auto);
+        assert_eq!(load_at(None, None, &[target.as_path()]).unwrap(), Identity::Auto);
 
         // Blank: send nothing.
         std::fs::write(&target, "   \n").unwrap();
         assert_eq!(
-            load_at(None, None, &target).unwrap(),
+            load_at(None, None, &[target.as_path()]).unwrap(),
             Identity::Omitted {
                 allowed_tools: None,
                 allowed_hosts: None,
@@ -534,7 +683,7 @@ mod tests {
         // written deliberately.
         std::fs::write(&target, "---\nAllowedTools: Read\n---\n").unwrap();
         assert_eq!(
-            load_at(None, None, &target).unwrap(),
+            load_at(None, None, &[target.as_path()]).unwrap(),
             Identity::Omitted {
                 allowed_tools: Some(vec!["Read".into()]),
                 allowed_hosts: None,
@@ -545,7 +694,7 @@ mod tests {
         // A prompt: use it.
         std::fs::write(&target, "You are a parrot.").unwrap();
         assert_eq!(
-            load_at(None, None, &target).unwrap(),
+            load_at(None, None, &[target.as_path()]).unwrap(),
             Identity::Text {
                 text: "You are a parrot.".into(),
                 allowed_tools: None,
@@ -556,7 +705,7 @@ mod tests {
 
         // Broken front matter is reported rather than treated as not-a-prompt.
         std::fs::write(&target, "---\nAllowedTools: Read\nno closing rule\n").unwrap();
-        let err = load_at(None, None, &target).unwrap_err();
+        let err = load_at(None, None, &[target.as_path()]).unwrap_err();
         assert!(err.contains("never closed"), "{err}");
     }
 
@@ -569,7 +718,7 @@ mod tests {
         // A directory where the file is expected: present, unreadable as a file.
         let target = dir.path().join("identity.md");
         std::fs::create_dir(&target).unwrap();
-        let err = load_at(None, None, &target).unwrap_err();
+        let err = load_at(None, None, &[target.as_path()]).unwrap_err();
         assert!(err.contains("cannot read identity file"), "{err}");
     }
 

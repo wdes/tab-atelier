@@ -19,7 +19,7 @@
 #![allow(clippy::module_name_repetitions)]
 
 use std::io::IsTerminal;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use clap::Parser;
@@ -275,9 +275,13 @@ async fn main() {
 /// withheld, so a prompt file cannot grant itself a tool. That is the whole point
 /// of the ceiling — the wrapper answer is the same tool list the operator already
 /// chose, minus what the prompt file removes.
-fn resolve_tools(args: &Args) -> Result<(tools::ToolSet, identity::Identity), Box<dyn std::error::Error>> {
+///
+/// `cwd` is threaded in rather than looked up, because the identity is also found
+/// at `<cwd>/.catbus/identity.md` and the session's directory is `--cwd` when the
+/// launcher named one.
+fn resolve_tools(args: &Args, cwd: &Path) -> Result<(tools::ToolSet, identity::Identity), Box<dyn std::error::Error>> {
     let tool_set = tools::ToolSet::load(args.tools_config.as_deref())?;
-    let identity = identity::load(args.identity.as_deref(), args.identity_file.as_deref())?;
+    let identity = identity::load(args.identity.as_deref(), args.identity_file.as_deref(), cwd)?;
     let Some(allowed) = identity.allowed_tools() else {
         log::info!("offering {} tools", tool_set.specs().len());
         return Ok((tool_set, identity));
@@ -351,14 +355,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     logging::init(args.no_tui);
 
     // Resolved early, because the code below moves fields out of `args` — the cwd
-    // and the provider's own config — and these two need to read it. The logger is
+    // and the provider's own config — and these need to read it. The logger is
     // initialised first so that anything they report is actually seen.
-    let (tool_set, identity) = resolve_tools(&args)?;
-
-    let cwd = match args.cwd {
-        Some(p) => p,
+    let cwd = match &args.cwd {
+        Some(p) => p.clone(),
         None => std::env::current_dir()?,
     };
+    // After the cwd, because a project's `.catbus/identity.md` is found *at* it.
+    let (tool_set, identity) = resolve_tools(&args, &cwd)?;
 
     // The relay must resolve *before* we open the socket — no point
     // accepting prompts we can't service. Relay resolution only reads
