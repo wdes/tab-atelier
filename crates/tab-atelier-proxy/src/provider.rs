@@ -644,27 +644,104 @@ impl Provider {
     ///
     /// A provider configured but unusable must be visibly unusable — routing
     /// to one whose key is missing produces a 401 from somewhere the operator
-    /// was not looking.
+    /// was not looking. For the subscription the credential is this host's
+    /// Claude file rather than a key, so that too is looked for here; it is the
+    /// same question, asked of the only kind whose answer is a path.
     #[must_use]
     pub fn credential_ready(&self) -> bool {
-        self.credential_ready_with(|v| std::env::var(v).ok())
+        self.credential_ready_with(|v| std::env::var(v).ok(), crate::egress::credential_present())
     }
 
     /// The same question with the environment supplied.
     ///
     /// Tests use this rather than setting variables: `set_var` is `unsafe`
     /// (forbidden in this crate) and races every other test in the binary.
+    ///
+    /// `subscription_present` is injected for the same reason: whether the Claude
+    /// credential file exists is host state, and reading it from the real `HOME`
+    /// would make every routing test depend on the machine it happens to run on.
     #[must_use]
-    pub fn credential_ready_with(&self, get: impl Fn(&str) -> Option<String>) -> bool {
+    pub fn credential_ready_with(&self, get: impl Fn(&str) -> Option<String>, subscription_present: bool) -> bool {
         if self.unusable_reason().is_some() {
             return false;
         }
         match &self.auth {
-            Auth::ClaudeOauth => true,
+            // The subscription has no key to look up: its credential is the Claude
+            // file, and a missing one is exactly as unusable as a missing key.
+            Auth::ClaudeOauth => subscription_present,
             Auth::ApiKeyEnv { var } => get(var).is_some_and(|v| !v.trim().is_empty()),
             // A file is checked for existence, not read: this runs on every
             // routing decision and the contents are fetched per request.
             Auth::ApiKeyFile { path } => std::fs::metadata(path).is_ok_and(|m| m.len() > 0),
+        }
+    }
+
+    /// Whether it may serve at all: the operator left it on, and it can
+    /// authenticate.
+    ///
+    /// The one place the two ways of being disabled meet, so that routing and the
+    /// dashboard cannot disagree about whether this provider is in play. A
+    /// switched-off provider and one whose credential is missing are both, in the
+    /// only sense a caller cares about, disabled.
+    #[must_use]
+    pub fn usable(&self) -> bool {
+        self.usable_with(|v| std::env::var(v).ok(), crate::egress::credential_present())
+    }
+
+    /// [`Provider::usable`] with the host state supplied, for the same reason as
+    /// [`Provider::credential_ready_with`].
+    #[must_use]
+    pub fn usable_with(&self, get: impl Fn(&str) -> Option<String>, subscription_present: bool) -> bool {
+        self.enabled && self.credential_ready_with(get, subscription_present)
+    }
+
+    /// Why it may not serve a request right now, or `None` if it may.
+    ///
+    /// The whole "is this provider in play" question with the reason kept, for
+    /// the callers that have to explain themselves rather than quietly pick
+    /// something else. [`Provider::usable`] is this same judgement without the
+    /// words; they are written together so a refusal can never be reported for
+    /// a provider that was a candidate, or the reverse.
+    #[must_use]
+    pub fn refusal(&self) -> Option<String> {
+        self.refusal_with(|v| std::env::var(v).ok(), crate::egress::credential_present())
+    }
+
+    /// [`Provider::refusal`] with the host state supplied, for the same reason as
+    /// [`Provider::credential_ready_with`]: the words a refusal produces are
+    /// user-facing and worth asserting on, and that cannot be done against
+    /// whatever `HOME` the test happens to run under.
+    #[must_use]
+    pub fn refusal_with(&self, get: impl Fn(&str) -> Option<String>, subscription_present: bool) -> Option<String> {
+        if !self.enabled {
+            return Some(format!("provider {} is switched off", self.id));
+        }
+        if let Some(why) = self.unusable_reason() {
+            return Some(why);
+        }
+        (!self.credential_ready_with(get, subscription_present)).then(|| self.missing_credential())
+    }
+
+    /// What a caller needs to fix a provider whose credential is not present.
+    ///
+    /// Names the exact place looked, because "no credential" is not actionable
+    /// on its own — the file it wants is a path the operator set up once and
+    /// has to recognise now. The subscription's is the host's own Claude login,
+    /// which is where the read error a bare `true` used to produce came from.
+    #[must_use]
+    fn missing_credential(&self) -> String {
+        match &self.auth {
+            Auth::ClaudeOauth => format!(
+                "provider {} spends this host's Claude plan, and its credential file is not there: {}",
+                self.id,
+                crate::egress::credentials_file()
+                    .map_or_else(|_| "no home directory".to_owned(), |p| p.display().to_string())
+            ),
+            Auth::ApiKeyEnv { var } => format!("provider {} needs ${var}, which is not set", self.id),
+            Auth::ApiKeyFile { path } => format!(
+                "provider {} needs its key file {path}, which is missing or empty",
+                self.id
+            ),
         }
     }
 
@@ -1159,6 +1236,34 @@ impl Registry {
         None
     }
 
+    /// Whether the shared plan is being spent by this proxy at all.
+    ///
+    /// The question the dashboard asks before it draws a plan at all: with no
+    /// usable subscription there is nothing to report, and a panel of empty
+    /// figures is worse than no panel. Deliberately the same [`Provider::usable`]
+    /// routing uses, so a provider switched off by hand and one left keyless both
+    /// take the graph away — otherwise the two would have to be kept in step by
+    /// hand, and the graph would eventually claim a plan the router was not
+    /// spending.
+    #[must_use]
+    pub fn subscription_usable(&self) -> bool {
+        self.subscription_usable_with(|v| std::env::var(v).ok(), crate::egress::credential_present())
+    }
+
+    /// [`Registry::subscription_usable`] with the host state supplied, so the
+    /// predicate the dashboard keys on can be tested without a credential file
+    /// on the machine running the test.
+    #[must_use]
+    pub fn subscription_usable_with(
+        &self,
+        get: impl Fn(&str) -> Option<String> + Copy,
+        subscription_present: bool,
+    ) -> bool {
+        self.providers
+            .iter()
+            .any(|p| p.uses_the_subscription() && p.usable_with(get, subscription_present))
+    }
+
     /// Every usable `(provider, model)` for a class, best first.
     ///
     /// Ordered by the operator's preference then by cost, so the intended
@@ -1167,7 +1272,12 @@ impl Registry {
     /// than tried and failed.
     #[must_use]
     pub fn candidates(&self, class: Class, now: u64) -> Vec<(&Provider, &Model)> {
-        self.candidates_with(class, |v| std::env::var(v).ok(), now)
+        self.candidates_with(
+            class,
+            |v| std::env::var(v).ok(),
+            crate::egress::credential_present(),
+            now,
+        )
     }
 
     /// [`Registry::candidates`] with the environment supplied, for tests.
@@ -1176,9 +1286,10 @@ impl Registry {
         &self,
         class: Class,
         get: impl Fn(&str) -> Option<String> + Copy,
+        subscription_present: bool,
         now: u64,
     ) -> Vec<(&Provider, &Model)> {
-        self.candidates_pinned(class, get, now, None)
+        self.candidates_pinned(class, get, subscription_present, now, None)
     }
 
     /// Candidates restricted to one provider, when an account is pinned.
@@ -1194,13 +1305,14 @@ impl Registry {
         &self,
         class: Class,
         get: impl Fn(&str) -> Option<String> + Copy,
+        subscription_present: bool,
         now: u64,
         pinned: Option<&str>,
     ) -> Vec<(&Provider, &Model)> {
         let mut out: Vec<(&Provider, &Model)> = self
             .providers
             .iter()
-            .filter(|p| p.enabled && p.credential_ready_with(get))
+            .filter(|p| p.enabled && p.credential_ready_with(get, subscription_present))
             .filter(|p| pinned.is_none_or(|id| p.id == id))
             .filter_map(|p| p.model_for(class, now).map(|m| (p, m)))
             .collect();
@@ -1220,13 +1332,14 @@ impl Registry {
         &self,
         model_id: &str,
         get: impl Fn(&str) -> Option<String> + Copy,
+        subscription_present: bool,
         now: u64,
         pinned: Option<&str>,
     ) -> Vec<(&Provider, &Model)> {
         let mut out: Vec<(&Provider, &Model)> = self
             .providers
             .iter()
-            .filter(|p| p.enabled && p.credential_ready_with(get))
+            .filter(|p| p.enabled && p.credential_ready_with(get, subscription_present))
             .filter(|p| pinned.is_none_or(|id| p.id == id))
             .filter_map(|p| p.serves(model_id).map(|m| (p, m)))
             .collect();
@@ -1434,13 +1547,13 @@ mod tests {
     fn candidates_are_ordered_by_preference_then_cost() {
         let r = two_provider_registry();
 
-        let heavy = r.candidates_with(Class::Heavy, with_key, 0);
+        let heavy = r.candidates_with(Class::Heavy, with_key, true, 0);
         assert_eq!(heavy.len(), 2, "both providers serve heavy work");
         assert_eq!(heavy[0].0.id, "anthropic", "the subscription is preference 0");
         assert_eq!(heavy[1].0.id, "bedrock");
 
         // Nobody serves balanced except anthropic.
-        let balanced = r.candidates_with(Class::Balanced, with_key, 0);
+        let balanced = r.candidates_with(Class::Balanced, with_key, true, 0);
         assert_eq!(balanced.len(), 1);
         assert_eq!(balanced[0].1.id, "claude-sonnet-5");
     }
@@ -1450,9 +1563,91 @@ mod tests {
     #[test]
     fn a_provider_without_its_credential_is_not_a_candidate() {
         let r = two_provider_registry();
-        let heavy = r.candidates_with(Class::Heavy, without_key, 0);
+        let heavy = r.candidates_with(Class::Heavy, without_key, true, 0);
         assert_eq!(heavy.len(), 1, "bedrock has no key, so it is not offered");
         assert_eq!(heavy[0].0.id, "anthropic");
+    }
+
+    /// The subscription's credential is a file on this host rather than a key,
+    /// so it is a second way to have nothing to authenticate with. A bare `true`
+    /// here is what routed requests into an egress that then failed to read
+    /// `.credentials.json`, once per poll.
+    #[test]
+    fn the_subscription_is_not_a_candidate_without_its_credential_file() {
+        let r = Registry::default();
+        assert!(
+            r.candidates_with(Class::Balanced, with_key, false, 0).is_empty(),
+            "a subscription with no credential file has nothing to authenticate with"
+        );
+        assert_eq!(
+            r.candidates_with(Class::Balanced, with_key, true, 0).len(),
+            1,
+            "and is a candidate again the moment the file is there"
+        );
+    }
+
+    /// Both ways of being disabled land in the same place, which is what lets
+    /// the dashboard key the plan panel on this one question.
+    #[test]
+    fn usable_is_false_for_a_switch_off_and_for_a_missing_credential() {
+        let mut on = Registry::default().providers.remove(0);
+        assert!(
+            on.usable_with(without_key, true),
+            "enabled, and its credential file is there"
+        );
+        assert!(
+            !on.usable_with(without_key, false),
+            "the same provider with no credential file has nothing to spend the plan with"
+        );
+        assert_eq!(
+            on.credential_ready_with(with_key, false),
+            on.credential_ready_with(without_key, false),
+            "the subscription reads its file, not the env: a key in it must not stand in"
+        );
+        assert!(
+            on.credential_ready_with(with_key, true),
+            "and a key being present must not be what makes it ready either"
+        );
+        on.enabled = false;
+        assert!(!on.usable_with(without_key, true), "switched off, file and all");
+    }
+
+    /// The dashboard asks this rather than the credential directly, so that a
+    /// provider switched off by hand hides the graph exactly as a missing
+    /// credential file does.
+    #[test]
+    fn the_plan_is_reported_on_only_while_the_subscription_is_usable() {
+        let mut r = Registry::default();
+        assert!(r.subscription_usable_with(without_key, true), "on and ready");
+        assert!(
+            !r.subscription_usable_with(without_key, false),
+            "on, but with no credential file to authenticate with"
+        );
+        r.providers[0].enabled = false;
+        assert!(
+            !r.subscription_usable_with(without_key, true),
+            "switched off by hand takes the graph with it"
+        );
+    }
+
+    /// The refusal a caller is shown must name the thing to fix. "no provider
+    /// available" is true but sends the operator hunting for a routing fault
+    /// when the answer is a file that is not there.
+    #[test]
+    fn a_keyless_subscription_refusal_names_the_file_that_would_fix_it() {
+        let p = Registry::default().providers.remove(0);
+        let why = p
+            .refusal_with(without_key, false)
+            .expect("a subscription with no credential file cannot serve");
+        assert!(why.contains("anthropic"), "the provider is not named: {why}");
+        assert!(
+            why.contains(".credentials.json"),
+            "the file that would fix it is not named: {why}"
+        );
+        assert!(
+            p.refusal_with(without_key, true).is_none(),
+            "and there is nothing to refuse once it is there"
+        );
     }
 
     #[test]
@@ -1463,7 +1658,7 @@ mod tests {
                 p.enabled = false;
             }
         }
-        assert_eq!(r.candidates_with(Class::Heavy, with_key, 0).len(), 1);
+        assert_eq!(r.candidates_with(Class::Heavy, with_key, true, 0).len(), 1);
     }
 
     #[test]
@@ -1474,7 +1669,7 @@ mod tests {
         // Every class is served, or a request could arrive with nowhere to go.
         for class in Class::LADDER {
             assert_eq!(
-                r.candidates_with(class, without_key, 0).len(),
+                r.candidates_with(class, without_key, true, 0).len(),
                 1,
                 "no candidate for {class:?}"
             );
@@ -1862,13 +2057,13 @@ mod tests {
             .expect("a non-Anthropic host with an OAuth credential");
         assert!(why.contains("evil.example"), "the message names the destination: {why}");
         // Not merely reported — excluded, or it would still be chosen.
-        assert!(!p.credential_ready_with(|_| Some("k".to_owned())));
+        assert!(!p.credential_ready_with(|_| Some("k".to_owned()), true));
         let r = Registry {
             providers: vec![p.clone()],
             mappings: vec![],
         };
         assert!(
-            r.candidates_with(Class::Balanced, |_| Some("k".to_owned()), 0)
+            r.candidates_with(Class::Balanced, |_| Some("k".to_owned()), true, 0)
                 .is_empty(),
             "an unusable provider must not be a candidate, whatever else is configured"
         );
@@ -1876,7 +2071,14 @@ mod tests {
         // The same provider pointing at Anthropic is fine.
         p.base_url = "https://api.anthropic.com".to_owned();
         assert!(p.unusable_reason().is_none());
-        assert!(p.credential_ready_with(|_| None), "and needs no key");
+        assert!(
+            p.credential_ready_with(|_| None, true),
+            "and needs no key, but does need its credential file"
+        );
+        assert!(
+            !p.credential_ready_with(|_| None, false),
+            "without which it cannot spend the plan at all"
+        );
 
         // A trailing slash or a different case is the same host, not a
         // different one — a check that refused these would be a bug of its own.
@@ -1969,7 +2171,7 @@ mod tests {
         // keyless file-backed provider: not ready, not a candidate, and the
         // whole proxy with nothing to serve from.
         assert_eq!(merged.auth, Auth::ClaudeOauth, "auth must survive a form save");
-        assert!(merged.credential_ready_with(|_| None), "and it is still ready");
+        assert!(merged.credential_ready_with(|_| None, true), "and it is still ready");
         assert_eq!(merged.preference, 0);
         assert!(merged.enabled);
         // What the form DOES express still takes effect.

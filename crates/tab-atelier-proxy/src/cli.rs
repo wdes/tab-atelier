@@ -188,7 +188,13 @@ fn report_routing(registry: &tab_atelier_proxy::provider::Registry) -> bool {
             // confuse the table.
             tab_atelier_proxy::classifier::Kind::Work,
             &healthy,
-            |v| std::env::var(v).ok(),
+            tab_atelier_proxy::routing::Host {
+                // Annotated because `Host` holds `G: Fn(&str) -> Option<String>`,
+                // a higher-ranked bound: without the type the closure is inferred
+                // at one lifetime and does not satisfy it.
+                get: |v: &str| std::env::var(v).ok(),
+                subscription_present: tab_atelier_proxy::egress::credential_present(),
+            },
             tab_atelier_proxy::usage::now_secs(),
         );
         let Some(route) = chosen else {

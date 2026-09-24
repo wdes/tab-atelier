@@ -100,6 +100,34 @@ pub struct Route {
     pub reason: Option<&'static str>,
 }
 
+/// The host state a routing decision reads.
+///
+/// Both fields are injected rather than looked up, so the decision is a function
+/// of what is true rather than of which machine the caller happens to run on:
+/// `get` is the environment an [`crate::provider::Auth::ApiKeyEnv`] provider
+/// resolves its key in, and `subscription_present` is whether this host holds
+/// the Claude credential file the subscription hop authenticates with — the same
+/// question, asked of the one credential that is a file instead of a variable.
+///
+/// Grouped into one value because they are one idea (can this host
+/// authenticate?) and because seven arguments is already as many as a routing
+/// call should take.
+#[derive(Debug, Clone, Copy)]
+pub struct Host<G> {
+    /// Looks up an environment variable, for `ApiKeyEnv` providers.
+    pub get: G,
+    /// Whether the subscription's credential file exists.
+    pub subscription_present: bool,
+}
+
+impl<G: Fn(&str) -> Option<String>> Host<G> {
+    /// Whether this host can authenticate to `provider` at all.
+    #[must_use]
+    pub fn authenticates(&self, provider: &Provider) -> bool {
+        provider.credential_ready_with(&self.get, self.subscription_present)
+    }
+}
+
 /// Pick a destination for a request that asked for `requested`.
 ///
 /// `health` answers for a provider id. `pinned` is the account's provider, if
@@ -110,13 +138,13 @@ pub struct Route {
 /// configured that could serve the work at all — a caller should treat that as
 /// 503 rather than guessing.
 #[must_use]
-pub fn choose(
+pub fn choose<G: Fn(&str) -> Option<String> + Copy>(
     registry: &Registry,
     requested: &str,
     pinned: Option<&str>,
     kind: crate::classifier::Kind,
     health: &dyn Fn(&str) -> Health,
-    env: impl Fn(&str) -> Option<String> + Copy,
+    host: Host<G>,
     now: u64,
 ) -> Option<Route> {
     // A mapping rewrites the NAME and nothing else. Health, preference and the
@@ -141,7 +169,7 @@ pub fn choose(
     // Tried before the class ladder, because it is the most specific answer
     // available.
     if mapped_from.is_some()
-        && let Some((p, m)) = pick_exact(registry, &target, health, env, now, pinned)
+        && let Some((p, m)) = pick_exact(registry, &target, health, host, now, pinned)
     {
         return Some(Route {
             provider_id: p.id.clone(),
@@ -168,7 +196,7 @@ pub fn choose(
     let mut class = Some(asked_class);
     while let Some(c) = class {
         for allow_strained in [false, true] {
-            if let Some((p, m)) = pick_in(registry, c, health, env, now, pinned, allow_strained) {
+            if let Some((p, m)) = pick_in(registry, c, health, host, now, pinned, allow_strained) {
                 let changed = m.id != target;
                 // Moved, not cloned: the loop returns on the first hit, so
                 // this value is consumed exactly once.
@@ -212,16 +240,16 @@ pub fn choose(
 /// `changed_from` is left for the caller to fill: only it knows the name the
 /// client actually asked for.
 #[must_use]
-pub fn choose_exact(
+pub fn choose_exact<G: Fn(&str) -> Option<String> + Copy>(
     registry: &Registry,
     model_id: &str,
     provider: Option<&str>,
     kind: crate::classifier::Kind,
     health: &dyn Fn(&str) -> Health,
-    env: impl Fn(&str) -> Option<String> + Copy,
+    host: Host<G>,
     now: u64,
 ) -> Option<Route> {
-    pick_exact(registry, model_id, health, env, now, provider).map(|(p, m)| Route {
+    pick_exact(registry, model_id, health, host, now, provider).map(|(p, m)| Route {
         provider_id: p.id.clone(),
         model_id: m.id.clone(),
         class: m.class,
@@ -232,15 +260,15 @@ pub fn choose_exact(
 }
 
 /// A provider that serves this exact model id, healthy first.
-fn pick_exact<'a>(
+fn pick_exact<'a, G: Fn(&str) -> Option<String> + Copy>(
     registry: &'a Registry,
     model_id: &str,
     health: &dyn Fn(&str) -> Health,
-    env: impl Fn(&str) -> Option<String> + Copy,
+    host: Host<G>,
     now: u64,
     pinned: Option<&str>,
 ) -> Option<(&'a Provider, &'a Model)> {
-    let candidates = registry.providers_serving(model_id, env, now, pinned);
+    let candidates = registry.providers_serving(model_id, host.get, host.subscription_present, now, pinned);
     // Blocked is absolute: upstream said stop, and sending anyway is what
     // turns one 429 into a sustained one. So a blocked provider is not a
     // candidate even when a mapping named it — the whole reason a mapping is a
@@ -257,17 +285,17 @@ fn pick_exact<'a>(
         .copied()
 }
 
-fn pick_in<'a>(
+fn pick_in<'a, G: Fn(&str) -> Option<String> + Copy>(
     registry: &'a Registry,
     class: Class,
     health: &dyn Fn(&str) -> Health,
-    env: impl Fn(&str) -> Option<String> + Copy,
+    host: Host<G>,
     now: u64,
     pinned: Option<&str>,
     allow_strained: bool,
 ) -> Option<(&'a Provider, &'a Model)> {
     registry
-        .candidates_pinned(class, env, now, pinned)
+        .candidates_pinned(class, host.get, host.subscription_present, now, pinned)
         .into_iter()
         .find(|(p, _)| {
             let h = health(&p.id);
@@ -292,6 +320,29 @@ mod tests {
     #[allow(clippy::unnecessary_wraps)]
     fn env_with_key(_: &str) -> Option<String> {
         Some("k".to_owned())
+    }
+
+    /// The host state most tests run against: every key present, and the
+    /// subscription's credential file in place.
+    ///
+    /// A `fn` pointer rather than a closure so the value stays `Copy` without
+    /// borrowing anything, and one helper so the subscription's presence is
+    /// stated once here rather than at each call site — a test that means to
+    /// exercise a *missing* credential should say so, not inherit it.
+    fn host() -> Host<fn(&str) -> Option<String>> {
+        Host {
+            get: env_with_key,
+            subscription_present: true,
+        }
+    }
+
+    /// The same host with the subscription's credential file absent — the state
+    /// a proxy is in before anyone has logged in.
+    fn host_without_subscription() -> Host<fn(&str) -> Option<String>> {
+        Host {
+            get: env_with_key,
+            subscription_present: false,
+        }
     }
 
     /// Anthropic plus a second provider serving the same classes from its own
@@ -331,20 +382,55 @@ mod tests {
     #[test]
     fn a_healthy_subscription_serves_what_was_asked_for() {
         let r = two_providers();
+        let route = choose(&r, "claude-opus-5", None, classifier::Kind::Work, &healthy, host(), 0).expect("a route");
+        assert_eq!(route.provider_id, "anthropic");
+        assert_eq!(route.model_id, "claude-opus-5");
+        assert_eq!(route.changed_from, None, "nothing to report when nothing changed");
+        assert_eq!(route.reason, None);
+    }
+
+    /// A subscription with no credential file on this host is not a destination,
+    /// and nothing else is configured — so the answer is `None`, which the caller
+    /// turns into a 503. Before this was checked, the route was chosen and the
+    /// failure surfaced later as a read error from the egress, once per poll.
+    #[test]
+    fn a_subscription_with_no_credential_file_routes_nowhere() {
+        let r = Registry::default(); // subscription only
+        assert_eq!(
+            choose(
+                &r,
+                "claude-opus-5",
+                None,
+                classifier::Kind::Work,
+                &healthy,
+                host_without_subscription(),
+                0
+            ),
+            None,
+            "a provider that cannot authenticate is not a route"
+        );
+    }
+
+    /// The credential check must not be so broad that a *second* provider with a
+    /// key is refused because the subscription's file happens to be absent: the
+    /// work has somewhere else to go and must go there.
+    #[test]
+    fn a_keyed_provider_still_serves_when_the_subscription_has_no_credential() {
+        let r = two_providers();
         let route = choose(
             &r,
             "claude-opus-5",
             None,
             classifier::Kind::Work,
             &healthy,
-            env_with_key,
+            host_without_subscription(),
             0,
         )
-        .expect("a route");
-        assert_eq!(route.provider_id, "anthropic");
-        assert_eq!(route.model_id, "claude-opus-5");
-        assert_eq!(route.changed_from, None, "nothing to report when nothing changed");
-        assert_eq!(route.reason, None);
+        .expect("bedrock can serve this");
+        assert_eq!(
+            route.provider_id, "bedrock",
+            "the usable provider serves, rather than the request failing outright"
+        );
     }
 
     /// The headline behaviour: out of capacity moves the work, it does not
@@ -362,16 +448,7 @@ mod tests {
                 Health::default()
             }
         };
-        let route = choose(
-            &r,
-            "claude-opus-5",
-            None,
-            classifier::Kind::Work,
-            &squeezed,
-            env_with_key,
-            0,
-        )
-        .expect("a route");
+        let route = choose(&r, "claude-opus-5", None, classifier::Kind::Work, &squeezed, host(), 0).expect("a route");
         assert_eq!(route.provider_id, "bedrock", "the work should move, not shrink");
         assert_eq!(route.class, Class::Heavy, "and stay at the same class");
         assert_eq!(route.reason, Some("rerouted"));
@@ -388,15 +465,7 @@ mod tests {
             backoff_secs: 30,
         };
         assert_eq!(
-            choose(
-                &r,
-                "claude-opus-5",
-                None,
-                classifier::Kind::Work,
-                &blocked,
-                env_with_key,
-                0
-            ),
+            choose(&r, "claude-opus-5", None, classifier::Kind::Work, &blocked, host(), 0),
             None,
             "a blocked provider serves nothing, at any class"
         );
@@ -421,7 +490,7 @@ mod tests {
             None,
             classifier::Kind::Work,
             &bedrock_blocked,
-            env_with_key,
+            host(),
             0,
         )
         .expect("a route");
@@ -444,16 +513,7 @@ mod tests {
             utilization: Some(0.93),
             backoff_secs: 0,
         };
-        let route = choose(
-            &r,
-            "claude-opus-5",
-            None,
-            classifier::Kind::Work,
-            &strained,
-            env_with_key,
-            0,
-        )
-        .expect("a route");
+        let route = choose(&r, "claude-opus-5", None, classifier::Kind::Work, &strained, host(), 0).expect("a route");
         assert_eq!(
             route.class,
             Class::Heavy,
@@ -474,7 +534,7 @@ mod tests {
             None,
             classifier::Kind::Work,
             &healthy,
-            env_with_key,
+            host(),
             0,
         )
         .expect("a route");
@@ -491,7 +551,7 @@ mod tests {
             None,
             classifier::Kind::Work,
             &healthy,
-            env_with_key,
+            host(),
             0,
         )
         .expect("a route");
@@ -523,16 +583,7 @@ mod tests {
         let mut r = with_deepseek();
         r.set_mapping("claude-opus-5", "deepseek-flash", None);
 
-        let route = choose(
-            &r,
-            "claude-opus-5",
-            None,
-            classifier::Kind::Work,
-            &healthy,
-            env_with_key,
-            0,
-        )
-        .expect("a route");
+        let route = choose(&r, "claude-opus-5", None, classifier::Kind::Work, &healthy, host(), 0).expect("a route");
         // Not Anthropic, even though it has preference 0 and serves a model of
         // the same class. `deepseek-flash` exists in exactly one place, so the
         // mapping named a destination, not just a rename.
@@ -548,16 +599,7 @@ mod tests {
         let mut r = Registry::default();
         r.set_mapping("claude-opus-5", "claude-sonnet-5", Some("cost control".to_owned()));
 
-        let route = choose(
-            &r,
-            "claude-opus-5",
-            None,
-            classifier::Kind::Work,
-            &healthy,
-            env_with_key,
-            0,
-        )
-        .expect("a route");
+        let route = choose(&r, "claude-opus-5", None, classifier::Kind::Work, &healthy, host(), 0).expect("a route");
         assert_eq!(route.provider_id, "anthropic");
         assert_eq!(route.model_id, "claude-sonnet-5");
         assert_eq!(route.class, Class::Balanced);
@@ -583,7 +625,7 @@ mod tests {
             None,
             classifier::Kind::Work,
             &no_deepseek,
-            env_with_key,
+            host(),
             0,
         )
         .expect("a route");
@@ -609,7 +651,7 @@ mod tests {
             Some("deepseek"),
             classifier::Kind::Work,
             &healthy,
-            env_with_key,
+            host(),
             0,
         ) {
             assert_eq!(rt.provider_id, "deepseek", "the pin filters, it does not hint");
@@ -622,7 +664,7 @@ mod tests {
             Some("anthropic"),
             classifier::Kind::Work,
             &healthy,
-            env_with_key,
+            host(),
             0,
         )
         .expect("a route");
@@ -640,7 +682,7 @@ mod tests {
                 Some("typo-not-a-provider"),
                 classifier::Kind::Work,
                 &healthy,
-                env_with_key,
+                host(),
                 0
             ),
             None,
@@ -671,7 +713,7 @@ mod tests {
             Some("deepseek"),
             classifier::Kind::Work,
             &healthy,
-            env_with_key,
+            host(),
             1_789_016_400,
         );
         assert_eq!(off.map(|rt| rt.provider_id), Some("deepseek".to_owned()));
@@ -685,7 +727,7 @@ mod tests {
             Some("deepseek"),
             classifier::Kind::Work,
             &healthy,
-            env_with_key,
+            host(),
             1_789_005_600,
         );
         assert_eq!(peak.map(|rt| rt.provider_id), Some("deepseek".to_owned()));
@@ -697,7 +739,7 @@ mod tests {
             None,
             classifier::Kind::Work,
             &healthy,
-            env_with_key,
+            host(),
             1_789_005_600,
         )
         .expect("a route");
@@ -720,7 +762,7 @@ mod tests {
                 None,
                 classifier::Kind::Work,
                 &healthy,
-                env_with_key,
+                host(),
                 0
             ),
             None

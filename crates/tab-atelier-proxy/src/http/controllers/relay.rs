@@ -241,7 +241,14 @@ pub(crate) fn pick_route(
     health: &dyn Fn(&str) -> routing::Health,
 ) -> Option<routing::Route> {
     let pin = account.model.as_deref();
-    let env = |v: &str| std::env::var(v).ok();
+    // The host state the decision reads, gathered once: the environment, and
+    // whether the subscription has a credential file. Read here rather than
+    // inside routing, so the decision is a function of what was true at this
+    // moment rather than of what `HOME` happens to hold when a test runs.
+    let host = routing::Host {
+        get: |v: &str| std::env::var(v).ok(),
+        subscription_present: crate::egress::credential_present(),
+    };
     let now = usage::now_secs();
     // Scoped: the registry lock is a std Mutex, and holding one across an
     // await makes this future non-Send — which the compiler reports as a
@@ -255,11 +262,43 @@ pub(crate) fn pick_route(
                 account.provider.as_deref(),
                 kind,
                 health,
-                env,
+                host,
                 now,
             )
         },
-        |pin| routing::choose_exact(&registry, pin, account.provider.as_deref(), kind, health, env, now),
+        |pin| routing::choose_exact(&registry, pin, account.provider.as_deref(), kind, health, host, now),
+    )
+}
+
+/// Why no provider could take a request, in the words of the ones configured to.
+///
+/// The old wording — "all blocked, or none configured" — is true but useless
+/// whenever providers *are* configured: it sends the operator looking for a
+/// routing fault when the real answer is that their key is unset or their
+/// credential file is not there. Each configured provider is asked for its own
+/// refusal instead, so the message names the thing to fix. The original wording
+/// survives for the case it actually describes.
+fn no_route_message(state: &Arc<State>) -> String {
+    // The guard is scoped to the scan and released before the message is built:
+    // this runs on the path that has already given up on the request, and
+    // holding the registry while formatting a string would make every other
+    // reader wait on that formatting.
+    let reasons: Vec<String> = {
+        let registry = state.registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        registry
+            .providers
+            .iter()
+            .filter_map(provider::Provider::refusal)
+            .collect()
+    };
+    if reasons.is_empty() {
+        return "tab-atelier-proxy: no provider available for this request \
+                (all blocked, or none configured)"
+            .to_owned();
+    }
+    format!(
+        "tab-atelier-proxy: no provider available for this request. {}",
+        reasons.join("; ")
     )
 }
 
@@ -329,10 +368,7 @@ pub(crate) async fn shape_and_admit(
     let Some(mut route) = pick_route(state, account, &requested, kind, &health) else {
         // Nothing configured can serve this at any class. A guess would be
         // worse than saying so.
-        return Err(text(
-            503,
-            "tab-atelier-proxy: no provider available for this request (all blocked, or none configured)",
-        ));
+        return Err(text(503, &no_route_message(state)));
     };
     // The pin overrides the name the caller used, so record what it overrode —
     // the client is entitled to know it was answered by a model it did not
@@ -1124,9 +1160,11 @@ pub(crate) fn destination(
     // Belt to the candidate filter's braces. `choose` never returns an
     // unusable provider, but the metadata path names one directly from an
     // account's pin — so the refusal lives here too, where the credential is
-    // actually attached to a URL.
+    // actually attached to a URL. A missing credential is reported the same way
+    // as a broken config: naming the file that would fix it beats a 502 from
+    // halfway through the egress.
     if let Some(p) = chosen
-        && let Some(why) = p.unusable_reason()
+        && let Some(why) = p.refusal()
     {
         return Err(why);
     }

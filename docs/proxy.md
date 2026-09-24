@@ -90,6 +90,17 @@ and the admin dashboard shows the plan monitor as not reporting. Re-run the
 import. Two machines sharing one Claude login is the underlying constraint, not
 something the proxy can paper over.
 
+**If the file is not there at all** — never imported, or the service started with
+a `HOME` that has never held a login — the provider is disabled rather than
+merely broken. It is not a routing candidate, so a request is answered `503`
+naming the file that would fix it, instead of being forwarded into an egress that
+fails to read it; and the plan-pressure panel is not drawn, because a subscription
+that cannot authenticate is not spending the plan and there is nothing to report
+on. It comes back by itself the moment the file exists: nothing was written down,
+so there is no setting to undo and no restart to remember. The same applies to a
+provider switched off by hand — the graph goes with it, on the judgement that in
+both cases the proxy is not spending that plan.
+
 ## Accounts
 
 ```sh

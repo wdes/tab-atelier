@@ -628,3 +628,85 @@ fn a_non_anthropic_request_carries_no_claude_attribution() {
     assert!(!sent.contains("Agent tool"), "a dangling Agent rule was sent:\n{sent}");
     assert!(sent.contains("Kept line."), "real system prose was dropped:\n{sent}");
 }
+
+/// A subscription with no credential file is not a candidate, is not drawn, and
+/// says why.
+///
+/// This is the state a proxy is left in when it runs under a `HOME` that has
+/// never held a Claude login: it is a subscription-only proxy whose one provider
+/// cannot authenticate. It used to route anyway — the readiness check answered a
+/// bare `true` for the subscription — so requests went into an egress that then
+/// failed to read `.credentials.json`, and the plan panel drew figures for a
+/// subscription nothing could be spent on. Both are asserted here, through the
+/// running server rather than the library, because the bug was a disagreement
+/// about host state that only the process can produce.
+#[test]
+fn a_subscription_with_no_credential_file_is_refused_and_not_drawn() {
+    let scratch = Scratch::new("keyless");
+    // The state under test, and the whole of the setup: every other test's
+    // `Scratch` writes this file, so removing it is what a never-logged-in host
+    // looks like.
+    std::fs::remove_file(scratch.path().join("home/.claude/.credentials.json")).expect("remove creds");
+    let port = free_port();
+
+    // An account and a key, so the request gets past authentication and reaches
+    // the routing decision this test is about — a 401 would prove nothing.
+    cli(scratch.path(), &["add", "Keyless", "Host", "keyless@example.org"]);
+    let minted = cli(scratch.path(), &["add-key", "keyless@example.org", "laptop"]);
+    let key = minted
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("key: "))
+        .expect("the CLI prints the key exactly once")
+        .to_owned();
+    let admin = cli(scratch.path(), &["admin-token"]).trim().to_owned();
+
+    let mut child = Command::new(BIN)
+        .args(["serve", "--listen", &format!("127.0.0.1:{port}")])
+        .env("TAB_ATELIER_PROXY_CONFIG", scratch.path().join("config"))
+        .env("TAB_ATELIER_PROXY_STATE", scratch.path().join("state"))
+        .env("HOME", scratch.path().join("home"))
+        .env("RUST_LOG", "warn")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn the proxy");
+    wait_until_listening(port, &mut child);
+    let _serving = Serving(child);
+
+    // 1. The graph is not drawn, because there is no plan being spent. The
+    //    router's own answer, not the dashboard's guess.
+    let pressure = http(
+        port,
+        &format!("GET /api/pressure HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {admin}\r\nConnection: close\r\n\r\n"),
+    );
+    assert!(pressure.starts_with("HTTP/1.1 200"), "pressure failed:\n{pressure}");
+    assert!(
+        pressure.contains("\"available\":false"),
+        "the plan must say there is nothing to report on:\n{pressure}"
+    );
+
+    // 2. The request is refused rather than routed into an egress that cannot
+    //    authenticate, and the refusal names the file that would fix it instead
+    //    of leaving a bare "no provider".
+    let payload = r#"{"model":"claude-sonnet-5","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}"#;
+    let resp = http(
+        port,
+        &format!(
+            "POST /relay/anthropic/v1/messages HTTP/1.1\r\nHost: x\r\nx-api-key: {key}\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+            payload.len()
+        ),
+    );
+    assert!(
+        resp.starts_with("HTTP/1.1 503"),
+        "a keyless subscription must not be routed to:\n{resp}"
+    );
+    assert!(
+        resp.contains(".credentials.json"),
+        "the refusal must name the file that would fix it:\n{resp}"
+    );
+    assert!(
+        resp.contains("provider anthropic"),
+        "and the provider the file belongs to:\n{resp}"
+    );
+}

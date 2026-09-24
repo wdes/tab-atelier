@@ -298,6 +298,13 @@ interface WeeklyDrop {
 }
 
 interface Plan {
+    /**
+     * Whether there is a subscription in play at all — the router's own
+     * judgement, not the dashboard's. False for a provider switched off and for
+     * one whose credential file is missing, and in both cases there is no plan
+     * being spent to report on, so the panel is not drawn.
+     */
+    available: boolean;
     utilization: number | null;
     latest: PlanSample | null;
     health: PlanHealth;

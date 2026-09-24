@@ -318,9 +318,20 @@ pub(crate) fn usage_report(state: &State<Arc<AppState>>, _admin: Admin, window: 
 /// How much of the budget is left, and who is waiting on it.
 #[get("/api/pressure")]
 pub(crate) fn pressure(state: &State<Arc<AppState>>, _admin: Admin) -> Reply {
+    // Whether to report on the plan at all is the router's own judgement, asked
+    // here rather than inferred by the dashboard: a subscription switched off,
+    // or left without a credential file, spends nothing and so has nothing to
+    // draw. The lock is taken and dropped before the resource is built, which
+    // takes it again for the provider summary.
+    let subscription_usable = state
+        .inner()
+        .registry
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .subscription_usable();
     crate::transport::json_of(
         200,
-        &crate::http::resources::PressureResource::of(state.inner(), crate::server::now_ms()),
+        &crate::http::resources::PressureResource::of(state.inner(), crate::server::now_ms(), subscription_usable),
     )
 }
 
