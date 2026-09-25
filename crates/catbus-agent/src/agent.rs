@@ -270,10 +270,91 @@ pub struct Agent {
     /// conversion lives in one place (`statusline::estimate_input_tokens`) and
     /// can change without touching this field.
     pub inflight_input_bytes: std::sync::atomic::AtomicU64,
+    /// What the provider has reported about the request in flight, as it streams past.
+    ///
+    /// Reset as each request is sent and written per chunk by the assembler, so it describes the
+    /// request being answered and never a previous one. Deliberately *not* cleared when the
+    /// request finishes: a turn that is between tool rounds still has a cost worth seeing, and a
+    /// figure that blinked out during every tool call would be harder to read than one that stays
+    /// up until the next request replaces it.
+    live: std::sync::Mutex<LiveReport>,
     /// Cancellation flag for the currently-running turn. Re-built at
     /// the start of every `run_user_prompt` so Ctrl+C only kills the
     /// in-flight request, not future ones.
     cancel: std::sync::Mutex<CancellationToken>,
+}
+
+/// What the provider has said so far about the request in flight.
+///
+/// Two sources with different reliability, kept apart rather than blended: the counts the provider
+/// reported (authoritative, but the output half arrives only at the close) and the bytes of reply
+/// that have arrived (a count of what came over the wire, which is what there is to show until
+/// then). [`live_figures`] decides which of them a figure comes from.
+#[derive(Debug, Clone, Default)]
+struct LiveReport {
+    /// Whether the reply has opened — see [`crate::stream::Assembler::started`]. From that moment
+    /// the input count is the provider's own and never changes.
+    started: bool,
+    /// The counts the provider has reported: the input side at the head, the output side running.
+    usage: Usage,
+    /// Bytes of reply content received, which is the only output figure before the close.
+    output_bytes: u64,
+    /// The model the reply named, which is what the price on the row is computed from.
+    model: Option<String>,
+}
+
+/// Reconcile the provider's report with the local measurement into what the row shows.
+///
+/// Split from the accessor because this is where every judgement lives — when a figure is an
+/// estimate, when it is the provider's, and when there is nothing worth showing at all — and none
+/// of it needs an agent, a session or a network to test.
+///
+/// The two sources are not interchangeable and the difference is visible on screen:
+///
+/// * **Before the reply opens**, the only number is the request's own byte length, and the row
+///   says `~` because that is arithmetic rather than a count. The wording is the one the row has
+///   always used for it.
+/// * **Once it opens**, the input side is the provider's own count and loses the `~`; the output
+///   side stays an estimate until the closing `message_delta`, which is the only frame carrying
+///   the real one. Both are shown, because a generation that has produced 40 tokens of a reply
+///   that will run to 4,000 is a fact about how far along it is.
+/// * **`None`** when nothing has been measured and nothing reported, which is the row's state
+///   between turns. A request whose payload has been serialised but not yet sent still counts as
+///   something to show: the estimate is exactly what the row displayed before this existed.
+fn live_figures(report: LiveReport, inflight_bytes: u64) -> Option<crate::statusline::Live> {
+    if !report.started && report.output_bytes == 0 && inflight_bytes == 0 {
+        // Nothing reported and nothing measured, so the row has nothing to say about cost. That is
+        // the state between turns, and between the payload being serialised and being sent.
+        return None;
+    }
+    let estimate = crate::statusline::estimate_input_tokens(usize::try_from(inflight_bytes).unwrap_or(usize::MAX));
+    // The provider's input count supersedes the estimate the moment it exists; the output count
+    // is the running one until `message_delta` closes the reply, and is estimated from the bytes
+    // received until it does. A provider that reported an output count mid-stream (none does
+    // today) would be taken at its word: the byte estimate is only ever a stand-in for a count.
+    let output = if report.usage.output_tokens > 0 {
+        report.usage.output_tokens
+    } else {
+        crate::statusline::estimate_input_tokens(usize::try_from(report.output_bytes).unwrap_or(usize::MAX))
+    };
+    let mut usage = if report.started {
+        report.usage
+    } else {
+        // A reply that has produced content without opening — a stream that skipped
+        // `message_start`, which providers do send — leaves the input side on the request's own
+        // length. Better a figure marked as an estimate than none at all.
+        Usage {
+            input_tokens: estimate,
+            ..Usage::default()
+        }
+    };
+    usage.output_tokens = output;
+    Some(crate::statusline::Live {
+        usage,
+        reported: report.started,
+        output_estimated: report.usage.output_tokens == 0,
+        model: report.model,
+    })
 }
 
 /// What [`Agent::clear`] replaced, so the REPL can offer a way back.
@@ -374,6 +455,7 @@ impl Agent {
             tokens_in,
             tokens_out,
             inflight_input_bytes: std::sync::atomic::AtomicU64::new(0),
+            live: std::sync::Mutex::new(LiveReport::default()),
             cancel: std::sync::Mutex::new(CancellationToken::new()),
         }
     }
@@ -423,6 +505,22 @@ impl Agent {
     /// time it takes the reply to be formatted and printed.
     fn clear_reasoning(&self) {
         self.reasoning.lock().expect("reasoning mutex").clear();
+    }
+
+    /// Forget everything the previous request reported about itself.
+    ///
+    /// The reasoning and the live cost are cleared together and deliberately, because they are the
+    /// same fact about the same request: one is what it is saying, the other is what it is costing,
+    /// and both describe the call in flight rather than the session. Clearing one and not the other
+    /// is how the row would price a fresh request at the previous one's rates for the round trip —
+    /// a number that is not stale enough to look broken and not fresh enough to be true.
+    ///
+    /// Called as each request is sent, not when a reply lands: the last line stays on screen until
+    /// it is replaced, which is what keeps the row from blinking out between a reply and the tool
+    /// call that follows it.
+    fn clear_live(&self) {
+        self.clear_reasoning();
+        *self.live.lock().expect("live mutex") = LiveReport::default();
     }
 
     /// The question channel. See the field.
@@ -603,22 +701,28 @@ impl Agent {
         self.tokens_out.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Estimated input tokens for the request currently in flight, or `None`
-    /// when nothing is in flight.
+    /// What the request in flight has cost so far, or `None` when there is nothing to show.
     ///
-    /// The estimate exists only because the server withholds `usage` until its
-    /// final response, so during a download there is nothing else to show. It is
-    /// set from the serialised payload's length just before sending and cleared
-    /// as soon as the response arrives, so it never lingers as a stale figure
-    /// once the authoritative total is available.
+    /// This is the figure the status row puts a *price* on while the model works, which is the
+    /// point of it: the totals line under a finished answer is the same arithmetic applied to a
+    /// turn that is already paid for, and by then the decision an operator wanted the number for
+    /// has been made. See [`statusline::Live`] for what each count means and
+    /// [`live_figures`] for how the two sources are reconciled.
     #[must_use]
-    pub fn inflight_input_estimate(&self) -> Option<u64> {
-        match self.inflight_input_bytes.load(std::sync::atomic::Ordering::Relaxed) {
-            0 => None,
-            bytes => Some(crate::statusline::estimate_input_tokens(
-                usize::try_from(bytes).unwrap_or(usize::MAX),
-            )),
-        }
+    pub fn live_cost(&self) -> Option<crate::statusline::Live> {
+        let report = self.live.lock().expect("live mutex").clone();
+        let bytes = self.inflight_input_bytes.load(std::sync::atomic::Ordering::Relaxed);
+        live_figures(report, bytes)
+    }
+
+    /// The prices the catalog holds for a model, if it holds any.
+    ///
+    /// A pass-through rather than a second place that knows how to find a price: the status row
+    /// reaches the catalog through the agent because the agent owns it, not because the lookup is
+    /// the agent's business.
+    #[must_use]
+    pub fn price_of(&self, model: &str) -> Option<crate::cost::ModelPrice> {
+        self.costs.lock().ok().and_then(|c| c.price_of(model))
     }
 
     /// Configure the judge that auto mode consults.
@@ -859,7 +963,7 @@ impl Agent {
         let mut reasoning = String::new();
         // The live view starts each turn empty, so what is on screen is only
         // ever about the turn actually running.
-        self.clear_reasoning();
+        self.clear_live();
         // Cap on tool rounds. 200 is intentionally high — the model
         // self-terminates via end_turn long before this in normal use.
         // The env-var escape hatch exists for unusually long tasks.
@@ -1295,6 +1399,10 @@ impl Agent {
         self.inflight_input_bytes
             .store(payload_bytes, std::sync::atomic::Ordering::Relaxed);
         let _clear = InflightGuard(&self.inflight_input_bytes);
+        // And forget what the *previous* request reported, so the row cannot price this request
+        // with the last one's numbers. The reasoning buffer is cleared in the same place and for
+        // the same reason — see `clear_live`, which says why the two are one call.
+        self.clear_live();
         // Sent through the retry helper rather than straight: a 429 here used
         // to end the turn, and a rate limit is a statement about timing, not
         // about the request. The closure rebuilds the request per attempt
@@ -1327,6 +1435,7 @@ impl Agent {
                 attempt.body(payload.clone())
             },
             &self.reasoning,
+            &self.live,
         )
         .await
     }
@@ -1493,7 +1602,16 @@ fn rebuild_history(project_dir: &std::path::Path, id: &str) -> Vec<ApiMessage> {
 /// only thing on screen while the model works, so it is updated as the words
 /// arrive rather than once at the end. A view that only filled in when the reply
 /// completed would be no better than the spinner it replaces.
-async fn send_streaming<F>(mut build: F, live: &std::sync::Mutex<String>) -> Result<MessagesResp, AgentError>
+///
+/// `report` is the other half of the same idea and is written on the same tick — what the provider
+/// has said about the request's cost. Both are taken here rather than by the caller because this
+/// is the only place that feeds the assembler, and an assembler whose findings were dropped on the
+/// floor would leave the row on the request's own size for the whole generation.
+async fn send_streaming<F>(
+    mut build: F,
+    live: &std::sync::Mutex<String>,
+    report: &std::sync::Mutex<LiveReport>,
+) -> Result<MessagesResp, AgentError>
 where
     F: FnMut() -> reqwest::RequestBuilder,
 {
@@ -1550,11 +1668,26 @@ where
             match resp.chunk().await {
                 Ok(Some(chunk)) => {
                     asm.feed(&chunk).map_err(|e| AgentError::Api(format!("stream: {e}")))?;
-                    // `clone_into` rather than assignment: this runs for every chunk of
-                    // every reply, and reusing the buffer the lock already holds turns a fresh
-                    // allocation per chunk into a copy into memory that is there anyway.
-                    let mut live = live.lock().expect("reasoning mutex");
-                    asm.reasoning().clone_into(&mut live);
+                    // Both published in one scope so the two locks are released before anything
+                    // else in this arm runs: they are read several times a second by the redraw
+                    // tick, and holding either across a branch is contention for nothing.
+                    {
+                        // `clone_into` rather than assignment: this runs for every chunk of
+                        // every reply, and reusing the buffer the lock already holds turns a fresh
+                        // allocation per chunk into a copy into memory that is there anyway.
+                        asm.reasoning().clone_into(&mut live.lock().expect("reasoning mutex"));
+                        // The same tick carries what the chunk said about the request's cost. Read
+                        // from the assembler rather than from the frame directly, so the parsing
+                        // rule lives in one place — and so a provider whose usage arrives in an
+                        // unexpected shape shows up in this display and the totals alike, or in
+                        // neither.
+                        *report.lock().expect("live mutex") = LiveReport {
+                            started: asm.started(),
+                            usage: asm.usage().copied().unwrap_or_default(),
+                            output_bytes: asm.output_bytes(),
+                            model: asm.model().map(ToOwned::to_owned),
+                        };
+                    }
                     // `message_stop` has arrived, so the reply is complete. Stop
                     // reading rather than waiting for the server to close the
                     // connection, which it may hold open for its own reasons and
@@ -1858,7 +1991,7 @@ pub struct MessagesResp {
     pub usage: Usage,
 }
 
-#[derive(Deserialize, Debug, Clone, Default)]
+#[derive(Deserialize, Debug, Clone, Copy, Default)]
 // Every field ends in `_tokens` because they are the names the provider sends: serde matches on
 // them, so they cannot be tidied into something shorter without an alias for each. The lint is
 // about a *domain* type whose fields drift into a shared suffix, which is not this.
@@ -2124,6 +2257,121 @@ mod tests {
             said.contains("retried, and the provider was still failing"),
             "and the fact of the retries is added: {said}"
         );
+    }
+
+    /// The row's state before the provider has said anything: the request's own measured size,
+    /// marked as the estimate it is.
+    ///
+    /// This is the figure the row showed before any of this existed, and it has to survive
+    /// unchanged — a session whose relay never reports usage, or a model that answers with a
+    /// non-streamed body, gets no provider counts at all, and a row that went blank for them would
+    /// be a regression from showing an estimate.
+    #[test]
+    fn before_the_reply_opens_the_only_figure_is_the_requests_own_size() {
+        let live = live_figures(LiveReport::default(), 400_000).expect("something to show");
+        assert!(!live.reported, "it is arithmetic, not a count");
+        assert!(live.output_estimated, "and no output has arrived");
+        assert_eq!(live.usage.input_tokens, 100_000, "400 kB at 4 bytes a token");
+        assert_eq!(live.usage.output_tokens, 0);
+    }
+
+    /// Nothing measured and nothing reported is nothing to show, which is the row between turns.
+    #[test]
+    fn a_request_that_has_not_been_sized_shows_nothing() {
+        assert!(live_figures(LiveReport::default(), 0).is_none());
+    }
+
+    /// Once the reply opens, the input count is the provider's own and the output is counted from
+    /// what has arrived — the asymmetry `Live` carries, and the reason the price on the row is
+    /// still marked as an estimate after the counts stop being one.
+    #[test]
+    fn an_open_reply_takes_the_providers_input_count_and_counts_its_output() {
+        let report = LiveReport {
+            started: true,
+            usage: Usage {
+                input_tokens: 54_321,
+                ..Usage::default()
+            },
+            output_bytes: 8_000,
+            model: Some("claude-sonnet-4-6".to_owned()),
+        };
+        let live = live_figures(report, 900_000).expect("something to show");
+        assert!(live.reported, "the input count is the provider's");
+        assert_eq!(
+            live.usage.input_tokens, 54_321,
+            "the estimate is superseded, not blended with"
+        );
+        assert_eq!(live.usage.output_tokens, 2_000, "8 kB of reply at 4 bytes a token");
+        assert!(live.output_estimated, "the output half is still a guess");
+        assert_eq!(
+            live.model.as_deref(),
+            Some("claude-sonnet-4-6"),
+            "and the model travels through, because the price depends on it"
+        );
+    }
+
+    /// The closing `message_delta` is the only frame with the real output count, and it wins
+    /// outright over the bytes received — the two are not averaged or added.
+    #[test]
+    fn the_providers_output_count_supersedes_the_byte_estimate() {
+        let report = LiveReport {
+            started: true,
+            usage: Usage {
+                input_tokens: 1_000,
+                output_tokens: 640,
+                ..Usage::default()
+            },
+            output_bytes: 8_000,
+            ..LiveReport::default()
+        };
+        let live = live_figures(report, 0).expect("something to show");
+        assert_eq!(
+            live.usage.output_tokens, 640,
+            "the count, not the 2,000 the bytes imply"
+        );
+        assert!(!live.output_estimated);
+        assert!(live.reported);
+    }
+
+    /// A stream that produced content without a `message_start` still shows something: the input
+    /// side falls back to the request's size, and the reply's own bytes are still counted. Better a
+    /// figure marked as an estimate than a blank row on a provider that opened with a frame this
+    /// build did not recognise.
+    #[test]
+    fn content_without_a_message_start_still_reports_output() {
+        let report = LiveReport {
+            started: false,
+            usage: Usage::default(),
+            output_bytes: 4_000,
+            ..LiveReport::default()
+        };
+        let live = live_figures(report, 40_000).expect("something to show");
+        assert!(!live.reported, "nothing was confirmed, so the figures are estimates");
+        assert_eq!(live.usage.input_tokens, 10_000, "the request's own size");
+        assert_eq!(live.usage.output_tokens, 1_000);
+    }
+
+    /// The two counts are the four kinds the pricing applies to, which is what makes the price on
+    /// the row the same arithmetic as the one on the totals line.
+    #[test]
+    fn the_live_counts_are_the_four_kinds_the_catalog_prices() {
+        let report = LiveReport {
+            started: true,
+            usage: Usage {
+                input_tokens: 900,
+                output_tokens: 100,
+                cache_read_input_tokens: 5_000,
+                cache_creation_input_tokens: 400,
+            },
+            output_bytes: 0,
+            ..LiveReport::default()
+        };
+        let live = live_figures(report, 0).expect("something to show");
+        let tokens = live.tokens();
+        assert_eq!(tokens.input, 0, "900 sent of which 900 cached reads");
+        assert_eq!(tokens.cache_read, 5_000);
+        assert_eq!(tokens.cache_write, 400);
+        assert_eq!(tokens.output, 100);
     }
 
     /// A hint only where the retry layer has already given up.

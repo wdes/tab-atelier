@@ -55,6 +55,17 @@ pub struct Assembler {
     /// it belongs to rather than derived from it, so reading it costs nothing
     /// and cannot disturb assembly.
     reasoning: String,
+    /// Bytes of reply content received so far: text, reasoning and tool arguments.
+    ///
+    /// The only output figure that exists while a reply is still coming. The provider
+    /// reports `usage.output_tokens` once, in the closing `message_delta` — and the count is
+    /// cumulative over the whole reply, so a reader who waits for it has nothing to show
+    /// during the wait. This is a count of what has *arrived*, which is what a live view can
+    /// honestly report; [`Self::started`] says whether anything has arrived at all, since a
+    /// reply that has not begun and one that has produced nothing yet are otherwise both zero.
+    output_bytes: u64,
+    /// Whether `message_start` has been seen.
+    started: bool,
     /// Whether `message_stop` has been seen.
     done: bool,
 }
@@ -94,6 +105,40 @@ impl Assembler {
     #[must_use]
     pub fn reasoning(&self) -> &str {
         &self.reasoning
+    }
+
+    /// The counts the provider has reported so far, if it has reported any.
+    ///
+    /// Available as soon as `message_start` lands, which is at the head of the reply: the
+    /// input side is known then and never changes, and the output side is a running total
+    /// that only becomes final at the close. `None` until the reply begins, so a reader can
+    /// tell "no counts yet" from "counts of zero".
+    #[must_use]
+    pub fn usage(&self) -> Option<&Usage> {
+        self.started.then_some(&self.usage)
+    }
+
+    /// The model the reply named, if it named one.
+    ///
+    /// Named by the reply rather than taken from the request, because the relay is free to route a
+    /// request to a different model than the session last used — and a figure priced at the wrong
+    /// model's rates is worse than no figure. The cost ledger only learns the name from a
+    /// *finished* reply, so this is the only source the live row has while the reply is coming.
+    #[must_use]
+    pub fn model(&self) -> Option<&str> {
+        (!self.model.is_empty()).then_some(self.model.as_str())
+    }
+
+    /// Bytes of reply content received so far. See the field for what it counts.
+    #[must_use]
+    pub const fn output_bytes(&self) -> u64 {
+        self.output_bytes
+    }
+
+    /// Whether the reply has begun.
+    #[must_use]
+    pub const fn started(&self) -> bool {
+        self.started
     }
 
     /// Whether the reply has said it is finished.
@@ -174,6 +219,10 @@ impl Assembler {
         let Some(message) = event.get("message") else {
             return;
         };
+        // Set before the fields below, and from the event rather than from their presence: a
+        // `message_start` carrying no usage is still a reply that has begun, and the live view
+        // reads this to tell a request still waiting on the provider from one being answered.
+        self.started = true;
         if let Some(model) = message.get("model").and_then(Value::as_str) {
             model.clone_into(&mut self.model);
         }
@@ -230,12 +279,20 @@ impl Assembler {
         let index = index_of(event);
         match delta.get("type").and_then(Value::as_str) {
             Some("text_delta") => {
+                let piece = field("text");
+                // Counted as it arrives, which is the only reason the live view can say what a
+                // reply has produced before the provider says it. Counted even for a delta whose
+                // block is missing — a reply is producing content whatever this build made of the
+                // frame, and a figure that silently stopped counting would be the kind of number
+                // this display exists to avoid.
+                self.output_bytes = self.output_bytes.saturating_add(piece.len() as u64);
                 if let Some(Partial::Text(text)) = self.at(index) {
-                    text.push_str(&field("text"));
+                    text.push_str(&piece);
                 }
             }
             Some("thinking_delta") => {
                 let piece = field("thinking");
+                self.output_bytes = self.output_bytes.saturating_add(piece.len() as u64);
                 if let Some(Partial::Thinking { text, .. }) = self.at(index) {
                     text.push_str(&piece);
                 }
@@ -250,8 +307,10 @@ impl Assembler {
                 }
             }
             Some("input_json_delta") => {
+                let piece = field("partial_json");
+                self.output_bytes = self.output_bytes.saturating_add(piece.len() as u64);
                 if let Some(Partial::Tool { json, .. }) = self.at(index) {
-                    json.push_str(&field("partial_json"));
+                    json.push_str(&piece);
                 }
             }
             _ => {}
@@ -515,6 +574,77 @@ data: {"type":"message_stop"}
             }
             other => panic!("expected the thinking block, got {other:?}"),
         }
+    }
+
+    /// The counts the live view shows: available from `message_start`, and the output figure it
+    /// carries is the provider's final one rather than a running total.
+    ///
+    /// The asymmetry is the reason the live view needs [`Assembler::output_bytes`] at all. The
+    /// input count is complete the moment the reply opens; the output count arrives once, at the
+    /// close, and reading zero until then is what made the status row sit on the request's own
+    /// size for the whole generation.
+    #[test]
+    fn usage_is_readable_from_the_head_of_the_reply() {
+        let mut asm = Assembler::new();
+        assert!(asm.usage().is_none(), "nothing reported before the reply begins");
+        assert!(asm.model().is_none());
+        assert!(!asm.started());
+
+        asm.feed(START.as_bytes()).expect("start");
+        let usage = asm.usage().expect("reported with message_start");
+        assert_eq!(usage.input_tokens, 11, "the input side is complete at the head");
+        assert_eq!(usage.cache_read_input_tokens, 3);
+        assert_eq!(usage.output_tokens, 0, "the provider has not counted output yet");
+        assert_eq!(asm.model(), Some("deepseek-flash"), "and the model is named here too");
+        assert!(asm.started());
+    }
+
+    /// The count that moves while the model writes: every kind of content delta adds to it.
+    ///
+    /// Text, reasoning and tool arguments all bill as output, so a figure that watched only one
+    /// of them would jump backwards when the model moved from thinking to calling a tool.
+    ///
+    /// The expected figures are taken from the strings fed in rather than written as literals:
+    /// this is a byte count, and a hand-counted third of it is a test that passes for the wrong
+    /// reason the next time a string is retyped.
+    #[test]
+    fn output_bytes_count_reasoning_text_and_tool_arguments() {
+        let reasoning = "weigh it up";
+        let text = "Here.";
+        let arguments = r#"{"file_path":"a.rs"}"#;
+        let mut asm = Assembler::new();
+        assert_eq!(asm.output_bytes(), 0, "a reply that has not begun has produced nothing");
+
+        asm.feed(START.as_bytes()).expect("start");
+        asm.feed(open_block(0, &serde_json::json!({"type": "thinking", "thinking": ""})).as_bytes())
+            .expect("open thinking");
+        asm.feed(thinking_delta(0, reasoning).as_bytes()).expect("delta");
+        assert_eq!(asm.output_bytes(), reasoning.len() as u64);
+
+        asm.feed(close_block(0).as_bytes()).expect("close");
+        asm.feed(open_block(1, &serde_json::json!({"type": "text", "text": ""})).as_bytes())
+            .expect("open text");
+        asm.feed(text_delta(1, text).as_bytes()).expect("delta");
+        assert_eq!(
+            asm.output_bytes(),
+            (reasoning.len() + text.len()) as u64,
+            "the reasoning is not discarded when text starts"
+        );
+
+        asm.feed(close_block(1).as_bytes()).expect("close");
+        asm.feed(
+            open_block(
+                2,
+                &serde_json::json!({"type": "tool_use", "id": "t", "name": "Read", "input": {}}),
+            )
+            .as_bytes(),
+        )
+        .expect("open tool");
+        asm.feed(tool_delta(2, arguments).as_bytes()).expect("delta");
+        assert_eq!(
+            asm.output_bytes(),
+            (reasoning.len() + text.len() + arguments.len()) as u64
+        );
     }
 
     /// `DeepSeek` sends empty deltas, and they must not disturb the view.

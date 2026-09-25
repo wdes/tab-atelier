@@ -209,9 +209,12 @@ Two things that look like faults and are not:
 
 * **A leading `mode open — nothing is checked` line.** That is the banner confirming the
   mode, not a warning.
-* **`~1,200 tokens in` on the status row.** That is the local count of what was sent, marked
-  `~` because it is an estimate; the real figure comes from the provider and appears on the
-  line under a finished answer.
+* **`120,000 in · ~900 out · USD 0.36000 est.` on the status row.** The live cost of the
+  turn being answered, shown while it runs rather than after it. It comes from two sources
+  and says so: `~` marks a figure this machine worked out (the request's own size before the
+  reply opens, the output count while it is still arriving) and is absent on the provider's
+  own counts. `est.` on the price means the money is still moving with the output. The
+  authoritative figures appear on the line under the finished answer.
 
 If the agent is not running at all, the tab's right-click menu entry is dimmed and says an
 agent already runs there — start one agent per tab, not two.

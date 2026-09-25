@@ -214,71 +214,146 @@ fn type_and_expect_env(env: &[(&str, &str)], line: &str, expect: &str) -> (bool,
 /// Split out so a test that *does* send a prompt can aim at a mock relay. The
 /// dead-port default above is what keeps the other tests from needing one.
 fn type_and_expect_at(port: u16, env: &[(&str, &str)], line: &str, expect: &str) -> (bool, String) {
-    let dir = tempfile::tempdir().unwrap();
-    let home = dir.path();
-    let mut pty = Pty::open();
+    let mut repl = AgentRepl::start(port, env);
+    repl.type_and_expect(line, expect)
+}
 
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_catbus-agent"));
-    cmd
-        // Hermetic, for the same reasons as the socket tests: no operator config,
-        // no inherited colour settings.
-        .env("HOME", home)
-        .env("RUST_LOG", "info")
-        .env_remove("NO_COLOR")
-        .env_remove("CLICOLOR")
-        .env_remove("CATBUS_ANSI")
-        .env_remove("CATBUS_TOOLS_CONFIG")
-        // The log path follows XDG_STATE_HOME, so leaving an operator's value in place would
-        // write the tests' logs into their real state directory — and, worse, make the routing
-        // assertions below depend on whatever they happen to have configured.
-        .env_remove("XDG_STATE_HOME")
-        .env_remove("CATBUS_PREFERENCES")
-        .args([
-            "--new-session",
-            "--cwd",
-            home.to_str().unwrap(),
-            "--socket",
-            home.join("agent.sock").to_str().unwrap(),
-            // Minimal tools. Nothing here sends a prompt, so the tool set is
-            // irrelevant to the assertion — but it keeps the agent from reading
-            // the operator's own repository while the test runs.
-            "--tools-config",
-            "minimal",
-            "--relay-url",
-            &format!("http://127.0.0.1:{port}"),
-            "--relay-token",
-            "tap_pty_test",
-        ]);
-    for (key, value) in env {
-        cmd.env(key, value);
+/// A running REPL on a pty, with its own hermetic `HOME`.
+///
+/// Held together in a struct so a test that needs to look at the *middle* of a turn — not just its
+/// end — can drive the same harness. The alternative was copying the spawn block, and a second copy
+/// of the environment scrubbing below is a copy that stops matching the first.
+struct AgentRepl {
+    pty: Pty,
+    /// Kills the child on drop, so a failed assertion cannot leave a process holding a pty open.
+    /// Never read — its whole job is its `Drop` — so the underscore is what keeps the lint quiet.
+    _child: KillOnDrop,
+    /// Kept alive for the process's lifetime: dropping it would delete the `HOME` the child is
+    /// still writing its session and log into.
+    dir: tempfile::TempDir,
+    /// Everything the terminal has emitted so far.
+    seen: String,
+}
+
+impl AgentRepl {
+    /// Spawn the binary against a relay on `port` and wait until its prompt is drawn.
+    fn start(port: u16, env: &[(&str, &str)]) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let pty = Pty::open();
+
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_catbus-agent"));
+        cmd
+            // Hermetic, for the same reasons as the socket tests: no operator config,
+            // no inherited colour settings.
+            .env("HOME", home)
+            .env("RUST_LOG", "info")
+            .env_remove("NO_COLOR")
+            .env_remove("CLICOLOR")
+            .env_remove("CATBUS_ANSI")
+            .env_remove("CATBUS_TOOLS_CONFIG")
+            // The log path follows XDG_STATE_HOME, so leaving an operator's value in place would
+            // write the tests' logs into their real state directory — and, worse, make the routing
+            // assertions below depend on whatever they happen to have configured.
+            .env_remove("XDG_STATE_HOME")
+            .env_remove("CATBUS_PREFERENCES")
+            .args([
+                "--new-session",
+                "--cwd",
+                home.to_str().unwrap(),
+                "--socket",
+                home.join("agent.sock").to_str().unwrap(),
+                // Minimal tools. Nothing here sends a prompt, so the tool set is
+                // irrelevant to the assertion — but it keeps the agent from reading
+                // the operator's own repository while the test runs.
+                "--tools-config",
+                "minimal",
+                "--relay-url",
+                &format!("http://127.0.0.1:{port}"),
+                "--relay-token",
+                "tap_pty_test",
+            ]);
+        for (key, value) in env {
+            cmd.env(key, value);
+        }
+        let child = cmd
+            // All three streams on the pty: reedline writes the prompt to stdout and
+            // reads keys from the controlling terminal, so anything left as a pipe
+            // would either hide the output or fail the open.
+            .stdin(pty.stdio())
+            .stdout(pty.stdio())
+            .stderr(pty.stdio())
+            .spawn()
+            .expect("spawn catbus-agent");
+
+        let mut repl = Self {
+            pty,
+            _child: KillOnDrop(child),
+            dir,
+            seen: String::new(),
+        };
+        // The banner and the first prompt are what say the REPL is live, so nothing is typed into a
+        // process that is still resolving its relay.
+        let ready = repl.pty.drain_until(&mut repl.seen, "/help", Duration::from_secs(20));
+        assert!(ready, "the REPL never drew its prompt; output so far:\n{}", repl.seen);
+        repl
     }
-    let child = cmd
-        // All three streams on the pty: reedline writes the prompt to stdout and
-        // reads keys from the controlling terminal, so anything left as a pipe
-        // would either hide the output or fail the open.
-        .stdin(pty.stdio())
-        .stdout(pty.stdio())
-        .stderr(pty.stdio())
-        .spawn()
-        .expect("spawn catbus-agent");
-    let _child = KillOnDrop(child);
 
-    let mut seen = String::new();
-    // The banner and the first prompt are what say the REPL is live, so the
-    // command is not typed into a process that is still resolving its relay.
-    let ready = pty.drain_until(&mut seen, "/help", Duration::from_secs(20));
-    assert!(ready, "the REPL never drew its prompt; output so far:\n{seen}");
+    /// The state directory the child was pointed at, for reading its log.
+    fn home(&self) -> &std::path::Path {
+        self.dir.path()
+    }
 
-    pty.send(&format!("{line}\n"));
-    let on_screen = pty.drain_until(&mut seen, expect, Duration::from_secs(20));
+    /// Send a line and wait until `expect` appears on the terminal *or* in the log.
+    fn type_and_expect(&mut self, line: &str, expect: &str) -> (bool, String) {
+        let mut seen = self.seen.clone();
+        self.pty.send(&format!("{line}\n"));
+        let on_screen = self.pty.drain_until(&mut seen, expect, Duration::from_secs(20));
+        (on_screen, self.report(&seen))
+    }
 
-    // The colour and gate verdicts are *log* lines — this helper's caller says so — and the log
-    // now goes to a file rather than the terminal, because a line on the terminal lands
-    // mid-viewport and the TUI will not repaint it. So the file is part of what this reports, or a
-    // test observing a verdict through its log would fail for a reason unrelated to the verdict.
-    let log = std::fs::read_to_string(home.join(".local/state/tab-atelier/catbus-agent.log")).unwrap_or_default();
-    let matched = on_screen || log.contains(expect);
-    (matched, format!("{seen}\n--- log ---\n{log}"))
+    /// Send a line, then wait until the *rendered screen* satisfies `pred`, up to `within`.
+    ///
+    /// The screen rather than the raw stream, because this is for reading a status row: the row is
+    /// repainted in place several times a second, so the raw output holds every frame jumbled
+    /// together with the carriage returns between them, and a predicate over it could be satisfied
+    /// by a frame that was on screen for one tick and then replaced.
+    ///
+    /// Returns whether the predicate held, and leaves everything the terminal emitted in
+    /// [`Self::seen`] so the caller can render the screen with [`Self::screen`]. The rendered screen
+    /// is deliberately *not* returned directly: it has to be read without the log appended (see
+    /// [`Self::report`]) or the log's text lands in the middle of the row being asserted on.
+    fn type_and_watch(&mut self, line: &str, rows: u16, pred: impl Fn(&str) -> bool, within: Duration) -> bool {
+        let mut seen = self.seen.clone();
+        self.pty.send(&format!("{line}\n"));
+        let matched = self.pty.drain_until_screen(&mut seen, rows, &pred, within);
+        self.seen = seen;
+        matched
+    }
+
+    /// The last `cols`-wide `rows` lines of what the terminal drew, as text.
+    fn screen(&self, rows: u16, cols: u16) -> String {
+        screen_of(&self.seen, rows, cols).join("\n")
+    }
+
+    /// The child's log file, if it has been written.
+    fn log(&self) -> String {
+        std::fs::read_to_string(self.home().join(".local/state/tab-atelier/catbus-agent.log")).unwrap_or_default()
+    }
+
+    /// What was seen, with the child's log appended.
+    ///
+    /// The colour and gate verdicts are *log* lines, and the log goes to a file rather than the
+    /// terminal — a line on the terminal lands mid-viewport and the TUI will not repaint it. So the
+    /// file is part of what a caller is told, or a test observing a verdict through its log would
+    /// fail for a reason unrelated to the verdict.
+    ///
+    /// Only for a *diagnostic* message. A caller asserting on the screen must render through
+    /// [`Self::screen`] instead: this concatenation interleaves the log into the last rows, which
+    /// silently truncates whatever was on them.
+    fn report(&self, seen: &str) -> String {
+        format!("{seen}\n--- log ---\n{}", self.log())
+    }
 }
 
 /// The colour verdict the binary reaches from its environment.
@@ -473,7 +548,90 @@ fn spawn_delayed_relay(body: &'static str, delay: Duration) -> u16 {
     port
 }
 
-/// The price list the mock serves for `GET /v1/models`.
+/// Serve a *streamed* reply, holding it open between frames, and return the port.
+///
+/// The buffered mock above cannot exercise the live cost row: it answers with one JSON body, so no
+/// frame ever names a model or reports usage, and the row has nothing to price. This one writes the
+/// frames an SSE reply is made of and pauses between them, which is what makes the mid-turn state
+/// observable rather than instantaneous.
+///
+/// The pauses are the whole design: `message_start` lands, then the terminal is left alone long
+/// enough for the status row to be painted with the provider's own counts and the model from the
+/// reply, and only then does the reply continue. Without a pause the turn would complete before the
+/// test could look, and the assertion would be about the totals line again.
+fn spawn_streaming_relay(hold: Duration) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let events = [
+            // The model and the input count, which is all the provider says at the head.
+            r#"event: message_start
+data: {"type":"message_start","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":120000,"output_tokens":0}}}
+
+"#,
+            r#"event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+"#,
+        ];
+        let mut served = false;
+        while !served {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let raw = read_request(&mut stream);
+            if raw.starts_with("GET ") {
+                let prices = MOCK_PRICES;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
+                     connection: close\r\n\r\n{prices}",
+                    prices.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+                continue;
+            }
+            // A streamed reply is not `content-length`-delimited: it is closed when the frames end.
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncache-control: no-cache\r\n\
+                  connection: close\r\n\r\n",
+            );
+            let _ = stream.flush();
+            for event in events {
+                let _ = stream.write_all(event.as_bytes());
+                let _ = stream.flush();
+            }
+            // The hold: the row now has the model and the provider's input count, and the reply has
+            // not finished. This is the state the test reads.
+            std::thread::sleep(hold);
+            let rest = [
+                r#"event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello there."}}
+
+"#,
+                r#"event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+"#,
+                r#"event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":6789}}
+
+"#,
+                r#"event: message_stop
+data: {"type":"message_stop"}
+
+"#,
+            ];
+            for event in rest {
+                let _ = stream.write_all(event.as_bytes());
+                let _ = stream.flush();
+            }
+            served = true;
+        }
+    });
+    port
+}
+
 ///
 /// Two models in two currencies, so the totals a session accumulates can be shown to group rather
 /// than to add: a session that used one reply from each has spent dollars and euros, and no single
@@ -551,20 +709,86 @@ fn a_turn_paints_the_spinner_and_then_the_totals_line() {
     let totals_at = flat.find("12,345 in - 6,789 out").unwrap();
     assert!(reply_at < totals_at, "the totals line should follow the reply:\n{flat}");
 
-    // The in-flight spinner painted at least one frame, with a token count.
+    // The in-flight spinner painted at least one frame, carrying the request's own *estimated* size.
+    // This relay answers with a plain JSON body rather than an SSE stream, so no `message_start`
+    // names a model and there is nothing to price — which makes this exactly the state the row
+    // displayed before it could price anything, and that state has to survive.
+    let spinner = flat
+        .lines()
+        .find(|row| row.contains("Thinking") && row.contains('~'))
+        .unwrap_or_else(|| panic!("no spinner frame carried an estimated token count:\n{flat}"));
     assert!(
-        flat.contains("tokens in"),
-        "no spinner frame carried a token count:\n{flat}"
+        spinner.contains(" in"),
+        "the frame's figure is an input count: {spinner}"
+    );
+    // Scoped to *this* frame, and asserted rather than glossed over: nothing has named a model yet,
+    // so pricing here would be pricing at a model nobody confirmed. A later frame may carry a price
+    // once the reply has been recorded — that is the ledger working, not this — which is why the
+    // check is on the frame rather than on the whole stream.
+    assert!(
+        !spinner.contains("USD"),
+        "no model was reported yet, so this frame cannot be priced: {spinner}"
+    );
+}
+
+/// While a reply is being streamed, the row says what the turn has cost so far.
+///
+/// This is the request the change was made for. The row used to show only the request's own size and
+/// wait for the totals line — which arrives *after* the turn, so the price came too late to inform
+/// the decision to keep going. Here the reply is held open mid-flight and the screen is read then.
+#[test]
+fn the_spinner_row_prices_a_streaming_turn_while_it_runs() {
+    let port = spawn_streaming_relay(Duration::from_secs(5));
+    // A generous screen: the app draws an inline viewport and pushes what is above it into
+    // scrollback, so emulating exactly 24 rows would leave the assertion reading blank space.
+    let rows = 40;
+    let mut repl = AgentRepl::start(port, &[("TERM", "xterm-256color")]);
+    // Waiting for the price rather than for the model name, because the model name is the weaker
+    // property: the row could carry it from a previous turn. A price needs the catalog *and* the
+    // counts that only exist once the reply has reported them.
+    let matched = repl.type_and_watch(
+        "hello",
+        rows,
+        |screen| screen.contains("USD") && screen.contains(" in"),
+        Duration::from_secs(20),
+    );
+    let screen = repl.screen(rows, 80);
+    assert!(
+        matched,
+        "the live price never appeared while the turn ran:\n{}",
+        repl.report(&screen)
+    );
+
+    // The counts are the provider's own here, taken from `message_start`, so no `~` marks the input.
+    assert!(
+        screen.contains("120,000 in"),
+        "the reported input count is missing:\n{screen}"
     );
     assert!(
-        flat.contains("Thinking"),
-        "the spinner never showed the activity label:\n{flat}"
+        !screen.contains("~120,000"),
+        "a count the provider reported is not an estimate:\n{screen}"
     );
-    // And the count is marked as the local estimate, not the server's figure —
-    // the distinction the `~` exists to make.
+    // 120,000 input at $3/M is $0.36, computed from the catalog the relay served.
     assert!(
-        flat.contains('~'),
-        "the in-flight count must be marked as an estimate:\n{flat}"
+        screen.contains("USD 0.36000"),
+        "the price on the running turn is wrong:\n{screen}"
+    );
+    // And it is marked as an estimate, because the output half is still being counted from the bytes
+    // that have arrived — which is the half the price will move on.
+    assert!(
+        screen.contains("est."),
+        "the price does not say it is still an estimate:\n{screen}"
+    );
+    // The model `message_start` named, which is what the price was looked up by.
+    assert!(
+        screen.contains("claude-sonnet-4-6"),
+        "the running model is not named:\n{screen}"
+    );
+    // And the turn really was still running: the reply has not been written yet, so this is the
+    // mid-turn state and not the totals line read a moment too late.
+    assert!(
+        !screen.contains("Hello there."),
+        "the reply had already finished, so this proves nothing about the live row:\n{screen}"
     );
 }
 

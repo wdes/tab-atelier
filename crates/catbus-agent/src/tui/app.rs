@@ -1413,38 +1413,62 @@ impl Repl<'_> {
             &self.agent.status().unwrap_or_else(|| "thinking".to_owned()),
             std::time::Instant::now(),
         );
-        // The input estimate is the local count of what was sent, marked `~` so it is
-        // never mistaken for the server's. Omitted rather than shown as zero before a
-        // request has been measured.
-        let estimate = self.agent.inflight_input_estimate().map_or(String::new(), |n| {
-            format!("  ~{} tokens in", crate::statusline::thousands(n))
-        });
-        // What is waiting, so a queued prompt is visibly waiting rather than apparently
-        // swallowed. Nothing is echoed when it is queued: it is echoed when it *starts*,
-        // because a prompt printed before the previous answer arrives would put the
-        // transcript out of order.
-        // The model, on the busy line, because it is the one fact about a turn that the operator
-        // cannot get from the answer: two turns in one session can be served by different models,
-        // and which one answered changes what the reply means.
-        let model = self
+        // What the turn is costing, live, and the model it is being served by. The two are read
+        // together because the price depends on the model: the reply names the one answering it, and
+        // falls back to the last reply's — which is the only name there is on the first turn of a
+        // session, and what the row has always shown. A catalog that has not arrived yet leaves the
+        // counts without money rather than showing a price of zero, the same rule the totals line
+        // follows.
+        let live = self.agent.live_cost();
+        let ledger = self
             .agent
             .costs()
             .lock()
             .ok()
             .and_then(|c| c.model().map(ToOwned::to_owned));
-        let model = model.map_or(String::new(), |m| format!("  {m}"));
+        let model_name = live.as_ref().and_then(|l| l.model.clone()).or_else(|| ledger.clone());
+        // The model, on the busy line, because it is the one fact about a turn that the operator
+        // cannot get from the answer: two turns in one session can be served by different models,
+        // and which one answered changes what the reply means.
+        let model = model_name.clone().map_or(String::new(), |m| format!("  {m}"));
+        // What is waiting, so a queued prompt is visibly waiting rather than apparently
+        // swallowed. Nothing is echoed when it is queued: it is echoed when it *starts*,
+        // because a prompt printed before the previous answer arrives would put the
+        // transcript out of order.
         let waiting = match self.queued.len() {
             0 => String::new(),
             1 => "  · 1 queued".to_owned(),
             n => format!("  · {n} queued"),
         };
+        // The cost is fitted to what is *left* of the row, not to the whole terminal: the row
+        // already carries a spinner, the activity and the model, and may be followed by a queued
+        // count and a job summary — all of which sit on the same line. ratatui clips a line wider
+        // than its area, so a price sized against the terminal would push that tail off the edge,
+        // and a clipped line and a line that exactly fills the row look the same to a reader. The
+        // two characters of margin are why a `room` of six or less drops the money: there is no
+        // width left to say what the money was for.
+        let cost = live.map_or(String::new(), |live| {
+            let spent = spinner.label().chars().count()
+                + 2
+                + activity.chars().count()
+                + model.chars().count()
+                + waiting.chars().count()
+                // "  ·  " — the separator the job summary is joined with, four of them plus the
+                // leading space of the summary itself.
+                + jobs.as_ref().map_or(0, |jobs| jobs.chars().count() + 5);
+            let room = crate::statusline::terminal_width().saturating_sub(spent + 2);
+            // `price_of` hands back an owned entry, so the lock is released before the line is
+            // formatted — see its own note for why that matters on a row repainted per frame.
+            let price = model_name.as_deref().and_then(|m| self.agent.price_of(m));
+            crate::statusline::live_line(&live, price.as_ref(), room)
+        });
         let base = if self.question.is_some() {
             // A question replaces the spinner, because the turn is not progressing — it is
             // waiting on the operator, and saying "Thinking" while it waits on a person would be
             // a lie.
             format!("waiting for an answer to the question above{waiting}")
         } else {
-            format!("{}  {activity}{model}{estimate}{waiting}", spinner.label())
+            format!("{}  {activity}{model}{cost}{waiting}", spinner.label())
         };
         // A command running behind a turn is shown beside it rather than in place of it: both
         // are true at once, and dropping either would hide something the operator started.
