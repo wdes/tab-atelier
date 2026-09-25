@@ -244,16 +244,12 @@ fn push_capped(collected: &mut String, line: &str) {
     collected.push_str(line);
     collected.push('\n');
     if collected.len() > MAX_COLLECTED {
-        // The cut has to be moved onto a character boundary before anything is sliced, because a
-        // byte count lands wherever it likes and a slice inside a multi-byte character panics.
-        // Accented output is the ordinary case here, not the exotic one.
-        let mut cut = collected.len() - MAX_COLLECTED;
-        while cut < collected.len() && !collected.is_char_boundary(cut) {
-            cut += 1;
-        }
-        // And then onto a line boundary: cutting mid-line would make the notice look like the
-        // command printed something strange.
-        let cut = collected[cut..].find('\n').map_or(cut, |at| cut + at + 1);
+        // The offset comes from `text::tail_start` rather than being `len - MAX_COLLECTED`, because
+        // that is a byte count where the string is characters and a cut inside a multi-byte
+        // character panics. It also lands the cut on a line start, so the notice never opens with
+        // half a line. The `Bash` tool has the same problem and the same helper — it panicked there
+        // first.
+        let cut = crate::text::tail_start(collected, MAX_COLLECTED);
         collected.drain(..cut);
         if !collected.starts_with("[...earlier output dropped...]") {
             collected.insert_str(0, "[...earlier output dropped...]\n");

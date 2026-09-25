@@ -42,6 +42,7 @@ mod slash;
 mod socket;
 mod statusline;
 mod stream;
+mod text;
 mod tools;
 mod tui;
 
