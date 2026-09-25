@@ -370,6 +370,33 @@ pub struct Cleared {
     pub name: String,
 }
 
+/// A turn's status bookkeeping, undone however the turn ends — including by being *dropped*.
+///
+/// The marker and the app's last word used to be written on the lines after the turn's `.await`, which
+/// is the one place that is not safe: a turn is not always finished, it is sometimes *abandoned*,
+/// whenever its future is dropped. Both cancellation paths do exactly that. Ctrl-C in the TUI aborts
+/// the task, and a socket client that hangs up mid-turn makes `run_watching_for_questions` return
+/// `Ok(None)` while the turn is still pinned inside it (`socket`). Neither runs a line after that
+/// await, so the status line went on saying `thinking` and the tab's indicator stayed green — the app
+/// reading "working" — until its own staleness sweep dropped the state 120 s later. An agent sitting
+/// still is the one thing the indicator must never claim about it, which is what this guard is for.
+///
+/// Holds `self` rather than a copy of the session id: `/resume` can swap the session mid-turn, and the
+/// end of a turn belongs to whichever session is current when it ends. No `unsafe`, so the guard is not
+/// `Send`; that is fine, as it lives entirely inside the turn's own future.
+struct TurnStatus<'a> {
+    agent: &'a Agent,
+}
+
+impl Drop for TurnStatus<'_> {
+    fn drop(&mut self) {
+        *self.agent.status.lock().expect("status mutex") = None;
+        // And the app hears that the turn is over: the operator is the one being waited on now, which
+        // is what `waiting` means for a Claude Code tab too.
+        self.agent.report_status(crate::applink::State::Waiting, None);
+    }
+}
+
 impl Agent {
     #[must_use]
     pub fn new(provider: Provider, session: Session) -> Self {
@@ -542,7 +569,16 @@ impl Agent {
         if session.is_empty() {
             return;
         }
-        tokio::spawn(async move {
+        // `try_current` where `spawn` would do, because this is now also reached from a `Drop` — and a
+        // `Drop` can run on a thread that has no runtime at all: a turn future that is dropped rather
+        // than polled never enters one, so abandoning a turn (see `TurnStatus`) is exactly the case
+        // where there may be no runtime. `spawn` panics there, which would take the process down over
+        // a status report. Losing the report is the ordinary case anyway, so it is logged and dropped.
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            log::debug!("no runtime to report {state:?} from; the app keeps its last word");
+            return;
+        };
+        handle.spawn(async move {
             crate::applink::report(&endpoint, state, label.as_deref(), &session).await;
         });
     }
@@ -914,11 +950,15 @@ impl Agent {
         *self.status.lock().expect("status mutex") = Some(crate::statusline::THINKING_MARKER.to_owned());
         // What the tab's indicator shows for the whole of a turn.
         self.report_status(crate::applink::State::Thinking, None);
+        // Taken before the turn runs and held across it, so that taking it back cannot be skipped by a
+        // turn that never returns — a Ctrl-C or a socket client hanging up drops this future instead of
+        // finishing it, and the lines that used to undo this would never be reached. See `TurnStatus`.
+        let turn_status = TurnStatus { agent: self };
         let result = self.run_user_prompt_inner(text, &token).await;
-        *self.status.lock().expect("status mutex") = None;
-        // And when it is over: the operator is the one being waited on now, which is what the app's
-        // `waiting` means for a Claude Code tab too.
-        self.report_status(crate::applink::State::Waiting, None);
+        // The turn is over, so the marker comes off and the app hears about it. Deliberately explicit
+        // rather than left to the end of the function, so the order against `save_totals` below is the
+        // one the reader sees.
+        drop(turn_status);
         // The totals are persisted here rather than by whichever UI happens to be attached, so
         // every path that runs a turn records them: the REPL, a socket client, and the app's own
         // CLI. It was in the REPL's render path before, which meant a session driven over the
