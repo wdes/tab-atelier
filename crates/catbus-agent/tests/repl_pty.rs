@@ -135,6 +135,24 @@ impl Pty {
         seen.contains(needle)
     }
 
+    /// Collect whatever arrives for `within`, then stop.
+    ///
+    /// Cannot wait for the pty to close, which would be the natural end-of-stream signal: this
+    /// harness holds its own slave fd open for the child's standard streams, so the master never
+    /// sees the disconnect that a closed pty would produce. The bound is therefore time, and the
+    /// caller has to have established some other way that nothing more is coming — by seeing the
+    /// process exit, say — before reading the tail as final.
+    fn drain_for(&self, seen: &mut String, within: Duration) {
+        let deadline = Instant::now() + within;
+        while Instant::now() < deadline {
+            match self.chunks.recv_timeout(Duration::from_millis(50)) {
+                Ok(chunk) => seen.push_str(&String::from_utf8_lossy(&chunk)),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+    }
+
     /// Drain output until the rendered screen satisfies `pred`, or time out.
     ///
     /// Needed in place of [`Pty::drain_until`] for the question panel, because ratatui diffs its
@@ -1477,5 +1495,49 @@ fn a_streamed_reply_arrives_whole_and_the_turn_ends() {
         pty.drain_until(&mut seen, "5 out", Duration::from_secs(30)),
         "the turn never completed, or its output tokens were lost:\n{}",
         strip_ansi(&seen)
+    );
+}
+
+/// Leaving the REPL hands the terminal back on a fresh line.
+///
+/// The cursor is restored where the viewport left it, which is mid-line, so without an explicit
+/// line break the shell's next prompt is drawn against the end of the last thing on screen and the
+/// command typed into it reads as part of that line. The break is the last thing written, so the
+/// output has to end with it.
+#[test]
+fn leaving_the_repl_ends_the_output_with_a_newline() {
+    let (port, _captured) = spawn_capturing_relay();
+    let (mut pty, mut child, _home) = repl_against(port);
+
+    let mut seen = String::new();
+    assert!(
+        pty.drain_until(&mut seen, "/help", Duration::from_secs(20)),
+        "the REPL never drew its prompt:\n{seen}"
+    );
+    pty.send("/exit\n");
+
+    // The process exiting is the signal that nothing more is coming. The pty cannot say so: the
+    // harness holds its own slave fd, so the master never sees a disconnect however long it waits.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut exited = false;
+    while Instant::now() < deadline {
+        if child.0.try_wait().expect("ask after the child").is_some() {
+            exited = true;
+            break;
+        }
+    }
+    assert!(exited, "the REPL did not exit after /exit:\n{}", strip_ansi(&seen));
+
+    // Now collect what it wrote on the way out — the closing bytes are flushed as it hands the
+    // terminal back, so some of them land after the process has been reaped.
+    pty.drain_for(&mut seen, Duration::from_millis(1500));
+    // A carriage return may precede it — `\r\n` is what the app writes, because which of the two
+    // returns the carriage depends on the terminal having been put back into cooked mode — so the
+    // assertion is on the line ending rather than on the exact pair. Asserted on the tail, which is
+    // the whole point: a newline anywhere earlier would be the prompt's own.
+    assert!(
+        seen.ends_with('\n'),
+        "the shell would have continued the app's last line. Output ended with: {:?}",
+        &seen[seen.len().saturating_sub(60)..]
     );
 }

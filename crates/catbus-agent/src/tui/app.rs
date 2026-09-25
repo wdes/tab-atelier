@@ -475,6 +475,12 @@ impl Ui {
         }
         execute!(out, DisableBracketedPaste)?;
         disable_raw_mode()?;
+        // A line break before handing the terminal back. Without it the shell's prompt is drawn at
+        // whatever column the viewport left the cursor on, so it appears to continue the last line
+        // of app output — and the command typed into it reads as part of that line. `\r\n` rather
+        // than `\n` because which of the two returns the carriage depends on the terminal having
+        // been put back into cooked mode, and this has to be right either way.
+        out.write_all(b"\r\n")?;
         out.flush()
     }
 
