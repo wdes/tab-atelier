@@ -1587,14 +1587,44 @@ impl Registry {
                 .filter(|p| p.enabled && p.models.iter().any(|m| !m.deprecated && m.price.is_some()))
                 .min_by_key(|p| p.preference)?,
         };
-        let model = match model_pin {
-            Some(id) => provider.models.iter().find(|m| m.id == id && !m.deprecated)?,
-            None => provider
+        // A model pin names a rate only when it names a model this provider
+        // both serves and prices. It is not the caller's choice of model here:
+        // the pin at the one call site that matters is the name the upstream
+        // echoed about itself, and a vendor may answer with a legacy name it
+        // still accepts for a model newer than it — DeepSeek serves and bills
+        // `deepseek-v4-flash` at Flash's price while the catalogue holds only
+        // `deepseek-flash`. Failing on that mismatch threw the whole hour away
+        // — no rate, so no stored cost and no `cost_model`, and the dashboard
+        // then drew no money at all.
+        //
+        // The provider pin above has already settled *who* served the tokens,
+        // so only the model is in doubt, and the fallback below settles it the
+        // same way the unpinned case does: the provider's cheapest billable
+        // model. That can be the wrong one of several, so it says so rather
+        // than passing quietly — but a name we cannot price is no better
+        // evidence than no name at all, which already takes this path.
+        if let Some(id) = model_pin {
+            if let Some(model) = provider
                 .models
                 .iter()
-                .filter(|m| !m.deprecated && m.price.is_some())
-                .min_by_key(|m| m.relative_cost)?,
-        };
+                .find(|m| m.id == id && !m.deprecated && m.price.is_some())
+            {
+                return Some(Rate {
+                    price: model.price?,
+                    peak: provider.peak.clone(),
+                    model: model.id.clone(),
+                });
+            }
+            log::warn!(
+                "provider {} answered as model {id}, which is not one of its priced models; billing the hour at the provider's default rate",
+                provider.id
+            );
+        }
+        let model = provider
+            .models
+            .iter()
+            .filter(|m| !m.deprecated && m.price.is_some())
+            .min_by_key(|m| m.relative_cost)?;
         Some(Rate {
             price: model.price?,
             peak: provider.peak.clone(),
@@ -2134,6 +2164,47 @@ mod tests {
             serde_json::to_string(&bare).expect("serialize"),
             r#"{"multiplier_percent":100,"windows":[]}"#
         );
+    }
+
+    /// An echoed model name that is not in the catalogue still has to be billed.
+    ///
+    /// The model pin at the call site is the name the upstream echoed about
+    /// itself, not the caller's choice: `DeepSeek` keeps accepting the legacy
+    /// name `deepseek-v4-flash` and answers under it, while the catalogue holds
+    /// only `deepseek-flash`. Treating that as "no rate" threw the hour away —
+    /// no stored cost, no `cost_model`, and a dashboard that drew no money at
+    /// all. The rate it falls back to is the right one here, because `DeepSeek`
+    /// bills that legacy name at Flash's price.
+    #[test]
+    fn an_unrecognised_model_name_is_billed_at_the_providers_rate() {
+        let registry = Registry {
+            providers: vec![Preset::Deepseek.provider(Path::new("/tmp"))],
+            ..Registry::default()
+        };
+
+        let known = registry
+            .billing_price(Some("deepseek"), Some("deepseek-flash"))
+            .expect("a catalogued model is priced");
+        assert_eq!(known.model, "deepseek-flash");
+
+        let echoed = registry
+            .billing_price(Some("deepseek"), Some("deepseek-v4-flash"))
+            .expect("an accepted legacy name is still the provider's tokens, and still costs money");
+        assert_eq!(
+            echoed.model, "deepseek-flash",
+            "the legacy name is billed at Flash's price, which is what the vendor does"
+        );
+
+        // A provider with no prices still has no rate: the fallback settles
+        // which model, never whether there is one.
+        let mut unpaid = Registry {
+            providers: vec![Preset::Deepseek.provider(Path::new("/tmp"))],
+            ..Registry::default()
+        };
+        for model in &mut unpaid.providers[0].models {
+            model.price = None;
+        }
+        assert!(unpaid.billing_price(Some("deepseek"), Some("deepseek-flash")).is_none());
     }
 
     /// "Peak now" without an end is a warning nobody can plan around. The end

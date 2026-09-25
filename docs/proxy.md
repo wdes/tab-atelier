@@ -355,6 +355,28 @@ alone. A provider that ends up with no rate at all is named in the log at load:
 nothing errors and no token is lost, which is exactly why the one symptom — a
 money figure that never appears — has to be said out loud.
 
+**A chart and a total are not the same query.** The window's own cost is summed
+straight off the stored hours, and the per-hour series the chart is drawn from
+is built by a second path that copies each hour field by field. The two agreed
+on everything except the charge, so every figure printed above the chart stayed
+right while every bar in it was blank — the money graph read as "the API does
+not return the billed prices" when in fact it returned them, correctly, two
+fields higher up. When a chart disagrees with its own totals, suspect the series
+builder before the totals.
+
+**A name we cannot price is not the same as no tokens.** The rate is looked up
+from the model name *the upstream echoed back about itself*, not from anything
+the caller sent, and a vendor may answer under a legacy name it still accepts
+for a model newer than it — DeepSeek serves and bills `deepseek-v4-flash` at
+Flash's price while the catalogue holds only `deepseek-flash`. Treating that as
+"no rate" threw the hour away completely: no stored cost, no `cost_model`, and a
+dashboard that drew no money at all. So the echoed name settles *which model*
+only while it names one the provider actually serves and prices; otherwise the
+hour is billed at the provider's default rate, and the log says the name was not
+recognised. The default is the pit a caller with no pin already falls into — the
+cheapest billable model of the hop that has one — so it can be the wrong one of
+several, which is why it is logged rather than passed off quietly.
+
 ### Peak pricing
 
 A provider can charge more for the same tokens at certain hours — DeepSeek

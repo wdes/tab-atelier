@@ -133,6 +133,15 @@ fn mock_upstream() -> u16 {
 /// The other mock answers; this one also records, because the question here is
 /// what the proxy *wrote* upstream, not what came back.
 fn capturing_upstream(capture: PathBuf) -> u16 {
+    capturing_upstream_reporting("deepseek-flash", capture)
+}
+
+/// The same, but answering under a chosen model name.
+///
+/// The name in the response is not decoration: it is what the proxy bills the
+/// hour at, so what a vendor echoes about itself is the whole question.
+fn capturing_upstream_reporting(model: &str, capture: PathBuf) -> u16 {
+    let model = model.to_owned();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock");
     let port = listener.local_addr().expect("addr").port();
     std::thread::spawn(move || {
@@ -169,7 +178,9 @@ fn capturing_upstream(capture: PathBuf) -> u16 {
             if let Some(start) = head {
                 let _ = std::fs::write(&capture, &req[start..]);
             }
-            let body = r#"{"model":"deepseek-flash","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":11,"output_tokens":7}}"#;
+            let body = format!(
+                r#"{{"model":"{model}","content":[{{"type":"text","text":"ok"}}],"usage":{{"input_tokens":11,"output_tokens":7}}}}"#
+            );
             let _ = write!(
                 sock,
                 "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
@@ -540,6 +551,133 @@ fn a_provider_that_lost_its_rate_still_records_a_cost() {
         recorded.contains(r#""cost":{"in_micro":1,"out_micro":4}"#),
         "the hour must record what it cost, priced where it was served \
          rather than left empty for want of a rate: {recorded}"
+    );
+}
+
+/// An hour the vendor answered under a legacy name is still billed.
+///
+/// This is the money graph's other loose end, and the one that survives every
+/// other repair: the rate is looked up from the model name the *upstream echoed
+/// about itself*, and a vendor may answer under a name it still accepts for a
+/// model newer than it — `DeepSeek` serves and bills `deepseek-v4-flash` at
+/// Flash's price while the catalogue holds only `deepseek-flash`. Requiring an
+/// exact match threw the hour away entirely: no stored cost, no `cost_model`,
+/// and a dashboard that drew no money even though the tokens were spent.
+///
+/// So this proves the two halves at once — the hour keeps its cost, and it
+/// names the model the price came from rather than the string that arrived.
+#[test]
+fn an_hour_answered_under_a_legacy_model_name_is_still_priced() {
+    let scratch = Scratch::new("legacy-model-name");
+    let upstream = capturing_upstream_reporting("deepseek-v4-flash", scratch.path().join("captured.json"));
+    let port = free_port();
+
+    cli(scratch.path(), &["add", "Ada", "Lovelace", "ada@example.org"]);
+    let minted = cli(scratch.path(), &["add-key", "ada@example.org", "laptop"]);
+    let key = minted
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("key: "))
+        .expect("the CLI prints the key exactly once")
+        .to_owned();
+
+    let config = scratch.path().join("config");
+    std::fs::create_dir_all(&config).expect("config dir");
+    let key_file = config.join("deepseek.key");
+    std::fs::write(&key_file, "sk-mock\n").expect("key file");
+    let providers = format!(
+        concat!(
+            r#"{{"providers":[{{"id":"deepseek","label":"DeepSeek (mock)","wire":"anthropic","#,
+            r#""base_url":"http://127.0.0.1:{upstream}","auth":{{"kind":"api_key_file","path":"{key}"}},"#,
+            r#""models":[{{"id":"deepseek-flash","class":"balanced","relative_cost":15}}],"#,
+            r#""preference":0,"enabled":true}}],"#,
+            r#""mappings":[{{"from":"claude-sonnet-5","to":"deepseek-flash"}}]}}"#,
+        ),
+        upstream = upstream,
+        key = key_file.display(),
+    );
+    std::fs::write(config.join("providers.json"), providers).expect("providers.json");
+
+    let mut child = Command::new(BIN)
+        .args(["serve", "--listen", &format!("127.0.0.1:{port}")])
+        .env("TAB_ATELIER_PROXY_CONFIG", &config)
+        .env("TAB_ATELIER_PROXY_STATE", scratch.path().join("state"))
+        .env("HOME", scratch.path().join("home"))
+        .env("RUST_LOG", "warn")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn the proxy");
+    wait_until_listening(port, &mut child);
+    let _serving = Serving(child);
+
+    let payload = concat!(
+        r#"{"model":"claude-sonnet-5","max_tokens":16,"#,
+        r#""messages":[{"role":"user","content":"hi"}]}"#,
+    );
+    let resp = http(
+        port,
+        &format!(
+            "POST /relay/anthropic/v1/messages HTTP/1.1\r\nHost: x\r\nx-api-key: {key}\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+            payload.len()
+        ),
+    );
+    assert!(resp.starts_with("HTTP/1.1 200"), "proxied call failed:\n{resp}");
+
+    let usage_root = scratch.path().join("state/usage");
+    let mut found = None;
+    for _ in 0..50 {
+        if let Some(f) = first_usage_file(&usage_root) {
+            found = Some(f);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let file = found.unwrap_or_else(|| panic!("no usage file appeared under {}", usage_root.display()));
+    let recorded = std::fs::read_to_string(&file).expect("read usage");
+
+    assert!(
+        recorded.contains(r#""cost":{"in_micro":1,"out_micro":4}"#),
+        "an hour the vendor answered under a legacy name still cost money, and \
+         saying otherwise is the empty graph: {recorded}"
+    );
+
+    // And it survives to the wire the dashboard actually reads. `cost_model` is
+    // the rate's model, not the name the vendor echoed: the figures come from
+    // `deepseek-flash`'s price even though the response said `deepseek-v4-flash`,
+    // so the panel can say which rate it billed at instead of implying the
+    // catalogue holds a model it does not.
+    let admin = cli(scratch.path(), &["admin-token"]).trim().to_owned();
+    let usage = http(
+        port,
+        &format!(
+            "GET /api/usage HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {admin}\r\n\
+             Connection: close\r\n\r\n"
+        ),
+    );
+    assert!(usage.starts_with("HTTP/1.1 200"), "usage failed:\n{usage}");
+    // `series_hourly` is what the money chart is drawn from, and the billed
+    // hour in it must carry the charge. Asserting on the whole body would pass
+    // on the totals alone: they are summed straight off the account and stayed
+    // right while the series — the only thing the graph reads — was blank, which
+    // is exactly why this looked like "the API does not return the billed
+    // prices" rather than like a wrong figure anywhere.
+    let series = usage
+        .split(r#""series_hourly":"#)
+        .nth(1)
+        .and_then(|rest| rest.split(']').next())
+        .expect("the response carries the hourly series the chart plots");
+    assert!(
+        series.contains(r#""cost_in_micro":1"#),
+        "the hour the chart draws must carry its billed price, not null: {series}"
+    );
+    assert!(
+        series.contains(r#""cost_out_micro":4"#),
+        "both halves of the charge reach the series: {series}"
+    );
+    assert!(
+        usage.contains(r#""cost_model":"deepseek-flash""#),
+        "and it names the rate that was used, not the name the vendor echoed: {usage}"
     );
 }
 
