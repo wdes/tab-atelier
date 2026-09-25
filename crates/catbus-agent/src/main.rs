@@ -53,7 +53,11 @@ mod tui;
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Parser, Debug)]
 #[command(
-    version,
+    // The commit, not just the crate version, and in the app's own shape
+    // (`v0.1.0-dev (07c49210abcd)`) so the two binaries of one build read the
+    // same. A `catbus-agent` in a tab can be older than the checkout that
+    // started it, and this is the first thing anyone asks.
+    version = concat!("v", env!("CARGO_PKG_VERSION"), " (", env!("BUILD_HASH"), ")"),
     about = "Claude agent for tab-atelier. Many tabs, many windows.",
     long_about = None,
 )]
