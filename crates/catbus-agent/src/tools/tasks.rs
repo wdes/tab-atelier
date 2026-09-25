@@ -261,16 +261,70 @@ fn render(list: &TaskList) -> String {
         }
         out.push('\n');
     }
-    let _ = write!(out, "{} task(s): ", list.tasks.len());
-    let summary: Vec<String> = Status::ALL
+    let _ = write!(out, "{}", summary(list));
+    out
+}
+
+/// How many tasks there are, by status, in the order the list reads: `3 task(s): 1
+/// doing, 2 todo`.
+fn summary(list: &TaskList) -> String {
+    let counts: Vec<String> = Status::ALL
         .iter()
         .filter_map(|status| {
             let count = list.tasks.iter().filter(|t| t.status == *status).count();
             (count > 0).then(|| format!("{count} {}", status.as_str()))
         })
         .collect();
-    out.push_str(&summary.join(", "));
-    out
+    format!("{} task(s): {}", list.tasks.len(), counts.join(", "))
+}
+
+/// The one line the REPL shows above its prompt: what the agent is working on, and how
+/// much is left.
+///
+/// A door beside [`run`] rather than another action, because this is not something the
+/// model asks for — it is the operator glancing at the list the agent keeps for itself
+/// while it works. Written here rather than in the TUI so the wording sits beside the
+/// list it describes, and so it can be tested without a terminal.
+///
+/// `None` when there is nothing worth saying: no list for this directory, an empty one,
+/// or a file that could not be read. A line above a prompt is not the place to report a
+/// corrupt file — the tool already tells the model, who is the reader that can act on
+/// it — so the reason is logged and the line is simply not drawn.
+pub fn band_line(cwd: &Path) -> Option<String> {
+    band_line_in(&state_base().ok()?, cwd)
+}
+
+/// [`band_line`] with the state directory passed in, so the tests touch no environment.
+fn band_line_in(base: &Path, cwd: &Path) -> Option<String> {
+    let list = match load(&list_path_in(base, cwd)) {
+        Ok(list) => list,
+        Err(e) => {
+            log::warn!("no task line above the prompt: {e}");
+            return None;
+        }
+    };
+    if list.tasks.is_empty() {
+        return None;
+    }
+    // The head of the list in the order it reads everywhere else: what is being worked
+    // on, then what is waiting, then what is stuck. `Status::ALL` is that order, so this
+    // cannot drift from the order the tool's own rendering uses.
+    let head = Status::ALL
+        .iter()
+        .filter(|status| !status.is_finished())
+        .find_map(|status| list.tasks.iter().find(|task| task.status == *status));
+    let Some(head) = head else {
+        // Everything is finished. Still worth a line: it is how the operator can tell the
+        // agent's plan ran out rather than the list never having been used.
+        return Some(format!("{} {}", crate::statusline::DONE, summary(&list)));
+    };
+    let open = list.tasks.iter().filter(|t| !t.status.is_finished()).count();
+    Some(format!(
+        "{} #{} {} · {open} open",
+        head.status.as_str(),
+        head.id,
+        head.title
+    ))
 }
 
 /// A short age, for the open tasks.
@@ -619,5 +673,66 @@ mod tests {
         assert_eq!(ago(172_800), "2d");
         // A clock that went backwards must not print a negative age.
         assert_eq!(ago(-5), "just now");
+    }
+
+    /// The line above the prompt names the head of the list and how much is left.
+    #[test]
+    fn the_band_line_names_the_head_of_the_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = Path::new("/work/example");
+        assert_eq!(band_line_in(dir.path(), cwd), None, "no list is no line");
+
+        for title in ["first", "second", "third"] {
+            added(dir.path(), title);
+        }
+        // Nothing started yet: the head is the oldest task still to do, and a list of
+        // nothing but todo is three open.
+        assert_eq!(band_line_in(dir.path(), cwd).as_deref(), Some("todo #1 first · 3 open"));
+
+        // Work in progress leads, whatever its id.
+        act(dir.path(), &serde_json::json!({"action":"block","id":1})).unwrap();
+        act(dir.path(), &serde_json::json!({"action":"start","id":3})).unwrap();
+        assert_eq!(
+            band_line_in(dir.path(), cwd).as_deref(),
+            Some("doing #3 third · 3 open")
+        );
+
+        // With nothing being worked on, what is waiting comes before what is stuck.
+        act(dir.path(), &serde_json::json!({"action":"done","id":3})).unwrap();
+        assert_eq!(
+            band_line_in(dir.path(), cwd).as_deref(),
+            Some("todo #2 second · 2 open")
+        );
+        act(dir.path(), &serde_json::json!({"action":"done","id":2})).unwrap();
+        assert_eq!(
+            band_line_in(dir.path(), cwd).as_deref(),
+            Some("blocked #1 first · 1 open"),
+            "a stuck task is still the thing to name when it is all that is left"
+        );
+    }
+
+    /// A finished list still draws: it is how the operator can tell the plan ran out
+    /// rather than never having existed.
+    #[test]
+    fn a_finished_list_says_so_rather_than_showing_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = Path::new("/work/example");
+        added(dir.path(), "one");
+        act(dir.path(), &serde_json::json!({"action":"done","id":1})).unwrap();
+        let line = band_line_in(dir.path(), cwd).unwrap();
+        assert!(line.starts_with(crate::statusline::DONE), "{line}");
+        assert!(line.contains("1 task(s): 1 done"), "{line}");
+    }
+
+    /// A corrupt file cannot be reported above a prompt, so it draws nothing. The tool
+    /// is where the model is told, and the model is the reader who can act on it.
+    #[test]
+    fn a_corrupt_list_draws_no_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = Path::new("/work/example");
+        let path = list_path_in(dir.path(), cwd);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{ this is not json").unwrap();
+        assert_eq!(band_line_in(dir.path(), cwd), None);
     }
 }

@@ -26,7 +26,10 @@ mod plouf;
 mod read;
 mod spawn;
 pub mod ssh;
-mod tasks;
+// Visible past this module for the same reason `bash` is: the REPL shows the head of
+// the list above its prompt, and reading it the way the tool does beats a second
+// reader that could disagree about where the file is.
+pub mod tasks;
 mod write;
 
 // Only the resolved set is re-exported. `CustomTool` and `ToolConfig` describe

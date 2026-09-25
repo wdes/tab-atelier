@@ -50,6 +50,29 @@ use crate::tui::spinner::Spinner;
 /// feels immediate, slow enough to cost nothing.
 const TICK: Duration = Duration::from_millis(60);
 
+/// Marking a prompt typed while the model is thinking.
+///
+/// A mark rather than a word, because the row it sits on is the operator's own line and
+/// the alternative — printing it into scrollback the moment it is given — would put it
+/// above the answer to the prompt *before* it.
+const QUEUED_MARK: &str = "↳";
+
+/// The most rows the waiting prompts may take from the band.
+///
+/// Two of the band's five on an ordinary terminal, and one row is held back for the reasoning
+/// before they are placed — so the model is never both busy and invisible, whatever is queued.
+/// The status row counts the rest; past the cap, printing every one would say less than the
+/// count already does.
+const MAX_QUEUED_ROWS: usize = 2;
+
+/// How many redraws apart the task line is re-read.
+///
+/// The list is a file the agent writes, and nothing tells this loop when it changes. Reading
+/// it on every frame would be a syscall sixteen times a second for a line that changes every
+/// few seconds at most; this is about a second, which is invisible next to a turn that takes
+/// minutes.
+const TASK_LINE_TICKS: u64 = 16;
+
 /// A tick-box list for one question, and the cursor inside it.
 #[derive(Debug)]
 struct Ticks {
@@ -630,12 +653,21 @@ impl Ui {
     /// as many rows as it needs, up to the band, and scrolls inside it past that. The rows that
     /// are used come first and the remainder stay blank, so the empty space is at the bottom of
     /// the screen rather than between the conversation and the prompt.
+    ///
+    /// Stacked above the prompt are the things the operator is waiting on rather than typing:
+    /// the agent's own list (`task`), what the model is thinking (`reasoning`), and the prompts
+    /// given while it works (`queued`). They take rows off the top of the band rather than being
+    /// printed, so they are looked at while they are true and are gone afterwards — and nothing
+    /// lands in scrollback above an answer it does not belong to. How the band's few rows are
+    /// shared between them is [`above_lines`]'s decision, not this one's.
     pub fn draw(
         &mut self,
         prompt: &str,
         editor: &Editor,
         status: Option<&str>,
         reasoning: Option<&str>,
+        task: Option<&str>,
+        queued: &[String],
     ) -> std::io::Result<()> {
         let prompt = prompt.to_owned();
         let (before, after) = editor.line_at_cursor();
@@ -646,13 +678,13 @@ impl Ui {
         // The live view of what the model is thinking, above the prompt. It takes rows off the top
         // of the band rather than being printed above it: printed rows become scrollback, and this
         // is meant to be looked at while it is happening and then be gone, not to pile up behind
-        // the answer the way a printed line would.
+        // the answer the way a printed line would. The same is true of the rows under it — see
+        // [`above_lines`], which decides which of the three gets the rows there are.
         //
         // The prompt keeps a row of its own whatever else is on screen — the operator is still
         // typing — and the status row is never given up, because it is where the spinner lives.
-        let band_for_text = usize::from(self.rows.saturating_sub(1));
-        let reasoning_lines = live_lines(reasoning, width, band_for_text.saturating_sub(1));
-        let live_rows = reasoning_lines.len();
+        let above = above_lines(task, reasoning, queued, width, self.rows);
+        let live_rows = above.len();
         // The band's last row is the status row whenever the buffer needs all of the others.
         let text_rows = usize::from(self.rows.saturating_sub(1)).max(1) - live_rows;
         let shown = wrapped.rows.len().min(text_rows);
@@ -675,7 +707,7 @@ impl Ui {
             // The reasoning reads as secondary: it is the model's working, not something to reply
             // to, and italic grey keeps it from being mistaken for the answer.
             let live_style = Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC);
-            for (offset, row) in reasoning_lines.iter().enumerate() {
+            for (offset, row) in above.iter().enumerate() {
                 let y = top.saturating_add(u16::try_from(offset).unwrap_or(0));
                 frame.render_widget(
                     Paragraph::new(Line::from(Span::styled(row.clone(), live_style))),
@@ -805,6 +837,75 @@ fn prompt_rows(height: u16) -> u16 {
     const WANTED: u16 = 5;
     let half = (height / 2).max(1);
     WANTED.min(half).max(2).min(height.max(1))
+}
+
+/// The rows stacked above the prompt, top to bottom: the agent's list, the model's reasoning, the
+/// prompts waiting to be asked.
+///
+/// Three things want the band's spare rows, and there are only three of them on an ordinary
+/// terminal, so the shares are decided here rather than left to whatever happens to be drawn.
+///
+/// The reasoning is served first, and served as one guaranteed row: a model that went quiet
+/// mid-turn is indistinguishable from one that died, so something of its thinking is always on
+/// screen while a turn runs. Then the waiting prompts, which are what the operator just did — a
+/// prompt that looks like it went nowhere is the failure this exists to prevent — capped so a
+/// long queue cannot be the whole band. Then the list, which is the context for everything else
+/// and the same line a second later, so it is the one that gives way. Whatever is left goes back
+/// to the reasoning, which is the only one of the three read a line at a time.
+///
+/// The waiting prompts are drawn nearest the prompt, because the thing just typed belongs beside
+/// the line it was typed on.
+fn above_lines(task: Option<&str>, reasoning: Option<&str>, queued: &[String], width: usize, band: u16) -> Vec<String> {
+    // Two of the band's rows are not the stack's to give: the status row, where the spinner
+    // lives, and the prompt's own row, where the operator is typing.
+    let spare = usize::from(band.saturating_sub(2));
+    if spare == 0 || width == 0 {
+        return Vec::new();
+    }
+    // A row of reasoning is held back before anything else is placed, so the model is never both
+    // busy and invisible. Only a turn that has actually thought something out loud counts — an
+    // empty stream must not reserve the row, or the prompt would sit a line lower for no reason.
+    let thinking = reasoning.is_some_and(|text| text.lines().any(|line| !line.trim().is_empty()));
+    let mut left = spare;
+    let held = usize::from(thinking && left > 0);
+    left -= held;
+    // Then the prompts, up to the cap: past that the status row is doing the counting, and one
+    // long queue must not be the whole band.
+    let waiting = queued_rows(queued, width, left.min(MAX_QUEUED_ROWS));
+    left -= waiting.len();
+    // Then the list, which yields to everything above it. One spare row means there is no room
+    // left for it at all, which is the right answer: it is the same line next second.
+    let task_row = if task.is_some() && left > 0 {
+        left -= 1;
+        task.map(|line| clip_line(line, width))
+    } else {
+        None
+    };
+    // Whatever survived goes to the reasoning, on top of the row held back for it.
+    let reasoning_rows = live_lines(reasoning, width, held + left);
+    let mut above: Vec<String> = task_row.into_iter().collect();
+    above.extend(reasoning_rows);
+    above.extend(waiting);
+    above
+}
+
+/// The prompts waiting to be asked, one row each.
+///
+/// The newest are the ones kept: the one just typed is the one the operator is looking for, and
+/// the status row still accounts for the rest. One row each, so a pasted block cannot swallow the
+/// band — the marker and its space take two columns and the rest of the text is flattened onto
+/// the single row there is room for.
+fn queued_rows(queued: &[String], width: usize, cap: usize) -> Vec<String> {
+    if cap == 0 || width == 0 {
+        return Vec::new();
+    }
+    queued[queued.len().saturating_sub(cap)..]
+        .iter()
+        .map(|text| {
+            let flat = text.replace('\n', " ");
+            format!("{QUEUED_MARK} {}", clip_line(&flat, width.saturating_sub(2)))
+        })
+        .collect()
 }
 
 /// The tail of the model's reasoning, one entry per row it will occupy.
@@ -1381,6 +1482,12 @@ struct Repl<'a> {
     /// printed from its own task would interleave with the redraw. A foreground
     /// job is one whose output the operator is waiting on.
     jobs: Vec<crate::shell::Job>,
+    /// The agent's task list, as the line above the prompt.
+    ///
+    /// Cached rather than read while drawing, because the draw happens on every tick and the
+    /// list is a file: it is re-read on [`TASK_LINE_TICKS`] instead. `None` when there is
+    /// nothing to say — no list, or nothing left on it.
+    task_line: Option<String>,
 }
 
 /// What the loop should do after handling something.
@@ -1431,10 +1538,8 @@ impl Repl<'_> {
         // cannot get from the answer: two turns in one session can be served by different models,
         // and which one answered changes what the reply means.
         let model = model_name.clone().map_or(String::new(), |m| format!("  {m}"));
-        // What is waiting, so a queued prompt is visibly waiting rather than apparently
-        // swallowed. Nothing is echoed when it is queued: it is echoed when it *starts*,
-        // because a prompt printed before the previous answer arrives would put the
-        // transcript out of order.
+        // The text of the waiting prompts is on rows of their own above the input; this counts
+        // them, so the number is still right when the band has room for fewer rows than there are.
         let waiting = match self.queued.len() {
             0 => String::new(),
             1 => "  · 1 queued".to_owned(),
@@ -1513,6 +1618,28 @@ impl Repl<'_> {
         self.turn.as_ref()?;
         let reasoning = self.agent.reasoning_so_far();
         (!reasoning.trim().is_empty()).then_some(reasoning)
+    }
+
+    /// The prompts waiting behind the turn, for the rows above the prompt: the oldest first, as
+    /// they will be run.
+    ///
+    /// Copied rather than lent out, because the caller is about to borrow `self.ui` mutably to
+    /// draw them and a `&[String]` out of `self` would still be holding it. The queue is bounded
+    /// at [`QUEUE_LIMIT`] short lines, so the copy is nothing next to the frame that follows it —
+    /// and the two halves of the deque are chained, because a queue that has been popped from
+    /// wraps and its tail would otherwise be dropped, which is the newest prompt of all.
+    fn queued_prompts(&self) -> Vec<String> {
+        let (head, tail) = self.queued.as_slices();
+        head.iter().chain(tail).cloned().collect()
+    }
+
+    /// Re-read the agent's task list for the line above the prompt.
+    ///
+    /// Called on a slow tick rather than per frame: the list is a file nothing notifies this
+    /// loop about, so it has to be polled, but a poll sixteen times a second to catch a change
+    /// that happens every few seconds is a syscall for nothing.
+    fn refresh_task_line(&mut self) {
+        self.task_line = crate::tools::tasks::band_line(self.cwd);
     }
 
     /// Start a `!` command, or say why it could not be started.
@@ -1949,13 +2076,19 @@ async fn run_inner(ui: &mut Ui, agent: Arc<Agent>, cwd: &Path) -> std::io::Resul
         question: None,
         panel: None,
         jobs: Vec::new(),
+        task_line: None,
     };
+
+    // Read once before the first frame, so the line is there from the start rather than a
+    // second after it.
+    repl.refresh_task_line();
 
     // The banner, once, before the first prompt: what version is running, which session,
     // which mode. It goes above the viewport into scrollback, so it stays readable rather
     // than being repainted.
     print_banner(repl.ui, &repl.agent).await?;
 
+    let mut ticks: u64 = 0;
     loop {
         // A question asked from inside the running turn, before drawing: this loop is the only
         // place it can be shown, and showing it is what lets the operator answer.
@@ -1963,6 +2096,12 @@ async fn run_inner(ui: &mut Ui, agent: Arc<Agent>, cwd: &Path) -> std::io::Resul
         // Commands the operator started, drained before drawing: this loop is the only place
         // that may write to the screen, and a command finishing is what unblocks the prompt.
         repl.pump_jobs()?;
+        // The agent's list is a file nothing pushes to this loop, so it is read on a slow tick
+        // rather than every frame — see `TASK_LINE_TICKS`.
+        ticks += 1;
+        if ticks.is_multiple_of(TASK_LINE_TICKS) {
+            repl.refresh_task_line();
+        }
         let status = repl.status();
         let reasoning = repl.live_reasoning();
         // An open question is drawn where the prompt would be, because that is where the
@@ -1973,8 +2112,16 @@ async fn run_inner(ui: &mut Ui, agent: Arc<Agent>, cwd: &Path) -> std::io::Resul
             repl.ui.draw_panel(panel, questions, status.as_deref())?;
         } else {
             let prompt = prompt_for(&repl.agent).await;
-            repl.ui
-                .draw(&prompt, &repl.editor, status.as_deref(), reasoning.as_deref())?;
+            let task = repl.task_line.clone();
+            let queued = repl.queued_prompts();
+            repl.ui.draw(
+                &prompt,
+                &repl.editor,
+                status.as_deref(),
+                reasoning.as_deref(),
+                task.as_deref(),
+                &queued,
+            )?;
         }
 
         tokio::select! {
@@ -2567,5 +2714,82 @@ mod tests {
         assert_eq!(clip_line("abc", 1), "…");
         // And a line that fits is left exactly as it was, not ellipsised.
         assert_eq!(clip_line("short", 10), "short");
+    }
+
+    /// A prompt given mid-turn appears above the input, marked, and flattened to one row.
+    #[test]
+    fn a_waiting_prompt_is_shown_above_the_input() {
+        let queued = vec!["fix the parser".to_owned(), "then the tests".to_owned()];
+        assert_eq!(
+            queued_rows(&queued, 40, 3),
+            vec!["↳ fix the parser", "↳ then the tests"]
+        );
+        // A pasted block is one row: the band is fixed height and a row that wrapped would push
+        // the status row off the bottom.
+        assert_eq!(queued_rows(&["one\ntwo".to_owned()], 40, 3), vec!["↳ one two"]);
+        // Wider than the terminal is clipped, with room kept for the marker.
+        for width in 3..12 {
+            let row = &queued_rows(&["a line far too long to fit".to_owned()], width, 3)[0];
+            assert!(row.chars().count() <= width, "width {width} gave {row:?}");
+        }
+    }
+
+    /// Showing the text never costs the prompt its own row, or the status row its place.
+    #[test]
+    fn the_stack_keeps_a_row_for_the_prompt_and_the_status() {
+        let queued: Vec<String> = (0..5).map(|i| format!("prompt {i}")).collect();
+        for band in 1..=8u16 {
+            let rows = above_lines(Some("doing #1 fix"), Some("thinking"), &queued, 40, band);
+            assert!(
+                rows.len() <= usize::from(band.saturating_sub(2)),
+                "band {band} left {} rows for a prompt and a status",
+                rows.len()
+            );
+        }
+    }
+
+    /// Three things want the band's rows and they are taken in order: a row held back for the
+    /// reasoning, then the waiting prompts (capped), then the list, then the reasoning again.
+    #[test]
+    fn the_band_shares_its_rows_in_order() {
+        let queued = vec!["first".to_owned(), "second".to_owned(), "third".to_owned()];
+        // Five rows — the ordinary terminal — leaves three to share. Two go to the prompts, one
+        // is held back for the reasoning, and the list has nothing left: it is the same line next
+        // second, and the two that are moving are not.
+        assert_eq!(
+            above_lines(Some("doing #1 fix"), Some("thinking hard"), &queued, 40, 5),
+            vec!["thinking hard", "↳ second", "↳ third"]
+        );
+        // One prompt waiting leaves room for the list as well.
+        assert_eq!(
+            above_lines(Some("doing #1 fix"), Some("thinking hard"), &queued[..1], 40, 5),
+            vec!["doing #1 fix", "thinking hard", "↳ first"]
+        );
+        // A taller band reaches the reasoning, which can use more than the row held back for it.
+        assert_eq!(
+            above_lines(Some("doing #1 fix"), Some("one\ntwo\nthree"), &[], 40, 7),
+            vec!["doing #1 fix", "one", "two", "three"]
+        );
+        // No list and nothing waiting: the reasoning is all that is left and takes what there is.
+        assert_eq!(
+            above_lines(None, Some("one\ntwo\nthree"), &[], 40, 5),
+            vec!["one", "two", "three"]
+        );
+        // Nothing worth a row at all.
+        assert!(above_lines(None, None, &[], 40, 5).is_empty());
+    }
+
+    /// A model that is thinking is never pushed off the band by the operator's own queue: the row
+    /// is held back before the prompts are placed, whatever else has to give.
+    #[test]
+    fn the_reasoning_keeps_a_row_whatever_is_queued() {
+        let queued: Vec<String> = (0..5).map(|i| format!("prompt {i}")).collect();
+        for band in 3..=8u16 {
+            let rows = above_lines(None, Some("thinking hard"), &queued, 40, band);
+            assert!(
+                rows.iter().any(|row| row == "thinking hard"),
+                "band {band} buried the reasoning: {rows:?}"
+            );
+        }
     }
 }
