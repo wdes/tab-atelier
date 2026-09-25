@@ -246,6 +246,21 @@ pub struct Agent {
     /// Current activity description shown in the REPL spinner.
     /// `None` = idle, `Some(s)` = description of what's happening.
     pub status: std::sync::Mutex<Option<String>>,
+    /// The reasoning from the model call being streamed right now.
+    ///
+    /// Written as the deltas arrive and read by the REPL on its redraw tick,
+    /// which is why it is shared state and not a channel: the agent runs inside
+    /// an `Arc` shared with the UI, there is no event loop to push into, and the
+    /// one existing "show me what it is doing" channel — [`Self::status`] — works
+    /// exactly this way.
+    ///
+    /// It is what to look at *while* the model works, not a record, and it is
+    /// deliberately the current call rather than the whole turn: a turn runs one
+    /// call per tool round, and what is worth watching is what the model is
+    /// working out now. The turn's accumulated reasoning reaches the transcript
+    /// through [`Turn::reasoning`] as it always did, and this is cleared as a
+    /// turn starts so it is never a stale copy left on screen.
+    reasoning: std::sync::Mutex<String>,
     /// Cumulative tokens consumed across all turns in this process.
     /// Both counters accumulate monotonically and are never reset.
     pub tokens_in: std::sync::atomic::AtomicU64,
@@ -355,6 +370,7 @@ impl Agent {
             model: std::sync::Mutex::new(model),
             served_model: std::sync::Mutex::new(from_transcript),
             status: std::sync::Mutex::new(None),
+            reasoning: std::sync::Mutex::new(String::new()),
             tokens_in,
             tokens_out,
             inflight_input_bytes: std::sync::atomic::AtomicU64::new(0),
@@ -387,6 +403,26 @@ impl Agent {
     #[must_use]
     pub fn status(&self) -> Option<String> {
         self.status.lock().expect("status mutex").clone()
+    }
+
+    /// The reasoning from the model call currently being streamed.
+    ///
+    /// Empty when nothing has been said yet, and when nothing is running. Read by
+    /// the REPL on its redraw tick to put something on screen to watch; it is not
+    /// a record of anything, and the turn's accumulated reasoning reaches the
+    /// transcript through [`Turn::reasoning`] as before.
+    #[must_use]
+    pub fn reasoning_so_far(&self) -> String {
+        self.reasoning.lock().expect("reasoning mutex").clone()
+    }
+
+    /// Forget the last turn's reasoning, at the start of a new one.
+    ///
+    /// Cleared here rather than when the turn ends so the screen keeps its last
+    /// line until the answer actually arrives, instead of going blank for the
+    /// time it takes the reply to be formatted and printed.
+    fn clear_reasoning(&self) {
+        self.reasoning.lock().expect("reasoning mutex").clear();
     }
 
     /// The question channel. See the field.
@@ -821,6 +857,9 @@ impl Agent {
         // Separate from `final_text` so the answer keeps exactly the shape it had
         // before reasoning was carried: see `Turn`.
         let mut reasoning = String::new();
+        // The live view starts each turn empty, so what is on screen is only
+        // ever about the turn actually running.
+        self.clear_reasoning();
         // Cap on tool rounds. 200 is intentionally high — the model
         // self-terminates via end_turn long before this in normal use.
         // The env-var escape hatch exists for unusually long tasks.
@@ -1151,6 +1190,7 @@ impl Agent {
             system,
             tools: &tool_specs,
             messages: &active.history,
+            stream: true,
         };
         // Serialised here rather than handed to `.json()` so the cache
         // breakpoints can be written into it first — and so the state turn can
@@ -1212,35 +1252,35 @@ impl Agent {
         // about the request. The closure rebuilds the request per attempt
         // because a `RequestBuilder` is consumed by `send`, and resending the
         // identical body is exactly what a retry means.
-        let (status, text) = send_retrying(|| {
-            let mut attempt = self
-                .http
-                .post(relay.messages_url())
-                .header("x-api-key", relay.token())
-                // `.body()` rather than `.json()` because the bytes are already
-                // serialised; the header matches what `.json()` would set, and is
-                // what the proxy forwards upstream.
-                .header("content-type", "application/json")
-                .header("anthropic-version", claude_api::ANTHROPIC_VERSION);
-            if let Some((client_id, client_secret)) = relay.cloudflare_access() {
-                attempt = attempt
-                    .header("CF-Access-Client-Id", client_id)
-                    .header("CF-Access-Client-Secret", client_secret);
-            }
-            // A `Vec` clone is a memcpy, and only happens on a retry — cheaper
-            // than re-serialising, and reqwest needs owned bytes per attempt.
-            attempt.body(payload.clone())
-        })
-        .await?;
-        if !status.is_success() {
-            return Err(AgentError::Api(api_error(status, &text)));
-        }
-        serde_json::from_str::<MessagesResp>(&text).map_err(|e| {
-            AgentError::Api(format!(
-                "the reply from the relay did not decode: {e}\n  first bytes: {}",
-                truncate(&text, 400)
-            ))
-        })
+        //
+        // Streamed, so the model's reasoning is on screen while it is being
+        // written rather than arriving all at once at the end. The reply is put
+        // back together into the same `MessagesResp` the buffered call returned,
+        // so everything after this line is unchanged.
+        send_streaming(
+            || {
+                let mut attempt = self
+                    .http
+                    .post(relay.messages_url())
+                    .header("x-api-key", relay.token())
+                    // `.body()` rather than `.json()` because the bytes are already
+                    // serialised; the header matches what `.json()` would set, and is
+                    // what the proxy forwards upstream.
+                    .header("content-type", "application/json")
+                    .header("accept", "text/event-stream")
+                    .header("anthropic-version", claude_api::ANTHROPIC_VERSION);
+                if let Some((client_id, client_secret)) = relay.cloudflare_access() {
+                    attempt = attempt
+                        .header("CF-Access-Client-Id", client_id)
+                        .header("CF-Access-Client-Secret", client_secret);
+                }
+                // A `Vec` clone is a memcpy, and only happens on a retry — cheaper
+                // than re-serialising, and reqwest needs owned bytes per attempt.
+                attempt.body(payload.clone())
+            },
+            &self.reasoning,
+        )
+        .await
     }
 
     /// Same turn, different wire: translate our Anthropic-shaped
@@ -1391,13 +1431,27 @@ fn rebuild_history(project_dir: &std::path::Path, id: &str) -> Vec<ApiMessage> {
 /// this fixes is throttling, and retrying a connection error needs a sense of
 /// whether the request was received — which `reqwest` does not give and
 /// guessing at would risk double-charging a turn.
-async fn send_retrying<F>(mut build: F) -> Result<(reqwest::StatusCode, String), AgentError>
+/// Send a request and put its streamed reply back together.
+///
+/// This is the Messages wire's only sender, and it retries on the same terms the
+/// old buffered path did — with one difference that streaming forces: **a retry
+/// is only possible until the first event arrives.** After that the model has
+/// begun answering, the caller has been shown part of it, and asking again would
+/// restart a reply that is already half drawn. So a failure past that point is
+/// final, which is why the retry lives around the response rather than inside
+/// the read.
+///
+/// `live` is the agent's reasoning buffer, written after every chunk: it is the
+/// only thing on screen while the model works, so it is updated as the words
+/// arrive rather than once at the end. A view that only filled in when the reply
+/// completed would be no better than the spinner it replaces.
+async fn send_streaming<F>(mut build: F, live: &std::sync::Mutex<String>) -> Result<MessagesResp, AgentError>
 where
     F: FnMut() -> reqwest::RequestBuilder,
 {
     let mut attempt = 1;
     loop {
-        let resp = build().send().await.map_err(|e| AgentError::Http(e.to_string()))?;
+        let mut resp = build().send().await.map_err(|e| AgentError::Http(e.to_string()))?;
         let status = resp.status();
         // Read the hint before consuming the body.
         let retry_after = resp
@@ -1405,19 +1459,73 @@ where
             .get("retry-after")
             .and_then(|v| v.to_str().ok())
             .and_then(retry::parse_retry_after);
-        let text = resp.text().await.map_err(|e| AgentError::Http(e.to_string()))?;
 
-        if status.is_success() || !retry::is_retryable(status.as_u16()) || attempt >= retry::MAX_ATTEMPTS {
-            return Ok((status, text));
+        // An unsuccessful reply is not a stream: it is a JSON error body, and it
+        // is safe to retry because nothing has been shown to anyone yet.
+        if !status.is_success() {
+            let text = resp.text().await.map_err(|e| AgentError::Http(e.to_string()))?;
+            if retry::is_retryable(status.as_u16()) && attempt < retry::MAX_ATTEMPTS {
+                let wait = retry::delay_for(attempt + 1, retry_after);
+                log::warn!(
+                    "provider returned {status}; waiting {wait:?} before attempt {} of {}",
+                    attempt + 1,
+                    retry::MAX_ATTEMPTS
+                );
+                tokio::time::sleep(wait).await;
+                attempt += 1;
+                continue;
+            }
+            return Err(AgentError::Api(api_error(status, &text)));
         }
-        let wait = retry::delay_for(attempt + 1, retry_after);
-        log::warn!(
-            "provider returned {status}; waiting {wait:?} before attempt {} of {}",
-            attempt + 1,
-            retry::MAX_ATTEMPTS
-        );
-        tokio::time::sleep(wait).await;
-        attempt += 1;
+
+        // A provider that does not stream answers a `stream: true` request with
+        // the ordinary whole body. Reading it as events would fail on the first
+        // line, so the content type decides — the same test the proxy makes
+        // before it pumps a reply through its translator.
+        let streaming = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|ctype| ctype.contains("event-stream"));
+        if !streaming {
+            let text = resp.text().await.map_err(|e| AgentError::Http(e.to_string()))?;
+            return serde_json::from_str::<MessagesResp>(&text).map_err(|e| {
+                AgentError::Api(format!(
+                    "the reply from the relay did not decode: {e}\n  first bytes: {}",
+                    truncate(&text, 400)
+                ))
+            });
+        }
+
+        let mut asm = crate::stream::Assembler::new();
+        loop {
+            match resp.chunk().await {
+                Ok(Some(chunk)) => {
+                    asm.feed(&chunk).map_err(|e| AgentError::Api(format!("stream: {e}")))?;
+                    // `clone_into` rather than assignment: this runs for every chunk of
+                    // every reply, and reusing the buffer the lock already holds turns a fresh
+                    // allocation per chunk into a copy into memory that is there anyway.
+                    let mut live = live.lock().expect("reasoning mutex");
+                    asm.reasoning().clone_into(&mut live);
+                    // `message_stop` has arrived, so the reply is complete. Stop
+                    // reading rather than waiting for the server to close the
+                    // connection, which it may hold open for its own reasons and
+                    // which would otherwise delay the answer on screen.
+                    if asm.is_done() {
+                        break;
+                    }
+                }
+                // The body ended. Whether that is the whole reply is
+                // `finish`'s question, not this loop's.
+                Ok(None) => break,
+                // Mid-reply, a dropped connection is not retried: part of the
+                // answer has been seen, and re-asking would restart it. A
+                // transport error was never retried on this wire even when the
+                // reply was buffered, so nothing here is a regression.
+                Err(e) => return Err(AgentError::Http(e.to_string())),
+            }
+        }
+        return asm.finish().map_err(AgentError::Api);
     }
 }
 
@@ -1675,6 +1783,14 @@ struct MessagesReq<'a> {
     system: Vec<SystemBlock<'a>>,
     tools: &'a [serde_json::Value],
     messages: &'a [ApiMessage],
+    /// Ask for the reply as server-sent events.
+    ///
+    /// Always true. The unstreamed shape is not kept as an alternative: a
+    /// streamed reply that has been reassembled is the same
+    /// [`MessagesResp`] either way (see [`crate::stream`]), so the only
+    /// difference is that this way the reasoning can be watched as it arrives
+    /// instead of all at once at the end.
+    stream: bool,
 }
 
 #[derive(Serialize)]

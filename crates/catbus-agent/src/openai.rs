@@ -64,6 +64,13 @@ pub fn infomaniak_chat_url(product_id: &str) -> String {
 /// everything behind them. This wire has no `cache_control`, but the ordering
 /// costs nothing and keeps the two backends consistent, so a reader does not
 /// have to remember which one is which.
+///
+/// No `stream`, deliberately. The Messages wire streams so the model's reasoning
+/// can be watched while it arrives, and this one cannot: [`ChatResp`] has no
+/// reasoning field at all, so a compatible provider's thinking is discarded
+/// during deserialisation whether it arrives streamed or whole. Streaming here
+/// would buy the ordering and cost a second parser for no visible difference.
+/// See `crate::stream` for the side that does stream.
 #[must_use]
 pub fn build_request(model: &str, system: &str, state: &str, tool_specs: &[Value], history: &[ApiMessage]) -> Value {
     let mut messages = Vec::with_capacity(history.len() + 2);

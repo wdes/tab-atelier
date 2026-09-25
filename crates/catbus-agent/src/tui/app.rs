@@ -624,15 +624,31 @@ impl Ui {
     /// as many rows as it needs, up to the band, and scrolls inside it past that. The rows that
     /// are used come first and the remainder stay blank, so the empty space is at the bottom of
     /// the screen rather than between the conversation and the prompt.
-    pub fn draw(&mut self, prompt: &str, editor: &Editor, status: Option<&str>) -> std::io::Result<()> {
+    pub fn draw(
+        &mut self,
+        prompt: &str,
+        editor: &Editor,
+        status: Option<&str>,
+        reasoning: Option<&str>,
+    ) -> std::io::Result<()> {
         let prompt = prompt.to_owned();
         let (before, after) = editor.line_at_cursor();
         let status = status.map(ToOwned::to_owned);
         let size = self.terminal.size()?;
         let width = usize::from(size.width).max(1);
         let wrapped = wrap_prompt(&prompt, &before, &after, width);
+        // The live view of what the model is thinking, above the prompt. It takes rows off the top
+        // of the band rather than being printed above it: printed rows become scrollback, and this
+        // is meant to be looked at while it is happening and then be gone, not to pile up behind
+        // the answer the way a printed line would.
+        //
+        // The prompt keeps a row of its own whatever else is on screen — the operator is still
+        // typing — and the status row is never given up, because it is where the spinner lives.
+        let band_for_text = usize::from(self.rows.saturating_sub(1));
+        let reasoning_lines = live_lines(reasoning, width, band_for_text.saturating_sub(1));
+        let live_rows = reasoning_lines.len();
         // The band's last row is the status row whenever the buffer needs all of the others.
-        let text_rows = usize::from(self.rows.saturating_sub(1)).max(1);
+        let text_rows = usize::from(self.rows.saturating_sub(1)).max(1) - live_rows;
         let shown = wrapped.rows.len().min(text_rows);
         // Keep the cursor's row on screen when the buffer is taller than the band. The window
         // ends at the cursor rather than centring on it, because the line being typed is the one
@@ -642,7 +658,7 @@ impl Ui {
         } else {
             0
         };
-        let cursor_row = wrapped.cursor_row.saturating_sub(scroll);
+        let cursor_row = live_rows + wrapped.cursor_row.saturating_sub(scroll);
         let cursor_col = wrapped.cursor_col;
         let rows = wrapped.rows;
         let prefixes = wrapped.prompt_prefix;
@@ -650,9 +666,19 @@ impl Ui {
         self.terminal.draw(move |frame| {
             let area = frame.area();
             let top = area.top();
+            // The reasoning reads as secondary: it is the model's working, not something to reply
+            // to, and italic grey keeps it from being mistaken for the answer.
+            let live_style = Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC);
+            for (offset, row) in reasoning_lines.iter().enumerate() {
+                let y = top.saturating_add(u16::try_from(offset).unwrap_or(0));
+                frame.render_widget(
+                    Paragraph::new(Line::from(Span::styled(row.clone(), live_style))),
+                    Rect::new(area.left(), y, area.width, 1),
+                );
+            }
             let prompt_style = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
             for (offset, row) in rows.iter().skip(scroll).take(shown).enumerate() {
-                let y = top.saturating_add(u16::try_from(offset).unwrap_or(0));
+                let y = top.saturating_add(u16::try_from(live_rows + offset).unwrap_or(0));
                 let prefix = prefixes.get(scroll + offset).copied().unwrap_or(0);
                 let (head, tail) = split_at_chars(row, prefix);
                 let line = if head.is_empty() {
@@ -669,7 +695,7 @@ impl Ui {
             // describes the turn the prompt belongs to, and three blank rows between them would
             // read as a gap. The rows below stay blank, which is the bottom of the screen and so
             // looks like nothing at all.
-            let status_offset = u16::try_from(shown).unwrap_or(0);
+            let status_offset = u16::try_from(live_rows + shown).unwrap_or(0);
             let status_y = top
                 .saturating_add(status_offset)
                 .min(top.saturating_add(band).saturating_sub(1));
@@ -773,6 +799,47 @@ fn prompt_rows(height: u16) -> u16 {
     const WANTED: u16 = 5;
     let half = (height / 2).max(1);
     WANTED.min(half).max(2).min(height.max(1))
+}
+
+/// The tail of the model's reasoning, one entry per row it will occupy.
+///
+/// The end of the text is what is shown, not the start: reasoning arrives a word at a time, and
+/// what matters is what the model is thinking *now*, not how it opened. Blank lines are dropped
+/// — a stream that has only just crossed a line break would otherwise put an empty row on screen
+/// for a frame — and each line is clipped, so one long line cannot push the rest away.
+///
+/// `cap` is how many rows the band can spare. Zero returns nothing, which is what happens on a
+/// terminal too short to show the reasoning and the prompt at the same time.
+fn live_lines(reasoning: Option<&str>, width: usize, cap: usize) -> Vec<String> {
+    let Some(text) = reasoning else {
+        return Vec::new();
+    };
+    if cap == 0 || width == 0 {
+        return Vec::new();
+    }
+    let mut lines: Vec<String> = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| clip_line(line, width))
+        .collect();
+    // The newest lines are the ones to keep.
+    if lines.len() > cap {
+        lines.drain(..lines.len() - cap);
+    }
+    lines
+}
+
+/// A line shortened to `width`, with an ellipsis when it had to be.
+fn clip_line(line: &str, width: usize) -> String {
+    let trimmed = line.trim();
+    if trimmed.chars().count() <= width {
+        return trimmed.to_owned();
+    }
+    // `width - 1` characters and the ellipsis, so the result is exactly the width asked for. At
+    // a width of one that is the ellipsis alone rather than a character and an overflow.
+    let mut clipped: String = trimmed.chars().take(width.saturating_sub(1)).collect();
+    clipped.push('…');
+    clipped
 }
 
 /// The prompt and the buffer, broken into the rows the terminal will actually show.
@@ -1301,6 +1368,13 @@ struct Repl<'a> {
     /// question is a choice, and a choice is easier to make by moving a cursor than by
     /// transcribing a label exactly.
     panel: Option<Panel>,
+    /// Commands the operator started with `!`, running or finished.
+    ///
+    /// Held here rather than in a task, and drained on the redraw tick, because
+    /// this loop is the only thing that may write to the screen — a command that
+    /// printed from its own task would interleave with the redraw. A foreground
+    /// job is one whose output the operator is waiting on.
+    jobs: Vec<crate::shell::Job>,
 }
 
 /// What the loop should do after handling something.
@@ -1315,7 +1389,14 @@ impl Repl<'_> {
     /// The status row: the spinner, what the agent is doing, the input estimate, and how
     /// much is waiting.
     fn status(&mut self) -> Option<String> {
-        self.turn.as_ref()?;
+        // A command reports itself whether or not a turn is running: it is the thing the
+        // operator started, and a foreground one is *why* the prompt is not taking input. Checked
+        // first so a command's line is shown alone when the model is idle, rather than a status
+        // row being invented for a turn that is not happening.
+        let jobs = self.jobs_summary();
+        if self.turn.is_none() {
+            return jobs;
+        }
         let spinner = self.spinner.get_or_insert_with(Spinner::new);
         // The agent reports `thinking` while it waits on the model and a tool name while
         // it runs one. `Activity` decides which of those the row is allowed to name: it holds a
@@ -1351,12 +1432,155 @@ impl Repl<'_> {
             1 => "  · 1 queued".to_owned(),
             n => format!("  · {n} queued"),
         };
-        // A question replaces the spinner, because the turn is not progressing — it is waiting
-        // on the operator, and saying "Thinking" while it waits on a person would be a lie.
-        if self.question.is_some() {
-            return Some(format!("waiting for an answer to the question above{waiting}"));
+        let base = if self.question.is_some() {
+            // A question replaces the spinner, because the turn is not progressing — it is
+            // waiting on the operator, and saying "Thinking" while it waits on a person would be
+            // a lie.
+            format!("waiting for an answer to the question above{waiting}")
+        } else {
+            format!("{}  {activity}{model}{estimate}{waiting}", spinner.label())
+        };
+        // A command running behind a turn is shown beside it rather than in place of it: both
+        // are true at once, and dropping either would hide something the operator started.
+        Some(match jobs {
+            Some(jobs) => format!("{base}  ·  {jobs}"),
+            None => base,
+        })
+    }
+
+    /// A line for the commands in flight, or `None` when there are none.
+    fn jobs_summary(&self) -> Option<String> {
+        let foreground = self.jobs.iter().find(|job| job.foreground);
+        if let Some(job) = foreground {
+            // The escape is named because this is the one state where ordinary typing does
+            // nothing, and an operator who does not know the key is stuck.
+            return Some(format!(
+                "$ {} ({:.0}s)  Ctrl-B to background, Ctrl-C to stop",
+                job.command,
+                job.elapsed().as_secs_f64()
+            ));
         }
-        Some(format!("{}  {activity}{model}{estimate}{waiting}", spinner.label()))
+        let background: Vec<_> = self.jobs.iter().filter(|job| !job.foreground).collect();
+        let first = background.first()?;
+        let more = match background.len() {
+            1 => String::new(),
+            n => format!("  (+{} more)", n - 1),
+        };
+        Some(format!(
+            "$ {} ({:.0}s){more}",
+            first.command,
+            first.elapsed().as_secs_f64()
+        ))
+    }
+
+    /// What the model has reasoned so far, for the rows above the prompt.
+    ///
+    /// `None` when no turn is running, and when the model has not thought anything out loud yet —
+    /// a model that answers without visible reasoning, or one whose provider does not send any,
+    /// shows nothing rather than an empty frame. Emptiness is checked on the trimmed text so a
+    /// stream that has so far produced only whitespace does not reserve rows for nothing.
+    fn live_reasoning(&self) -> Option<String> {
+        self.turn.as_ref()?;
+        let reasoning = self.agent.reasoning_so_far();
+        (!reasoning.trim().is_empty()).then_some(reasoning)
+    }
+
+    /// Start a `!` command, or say why it could not be started.
+    ///
+    /// The command line is echoed before anything else so the transcript reads
+    /// like a shell session — the output that follows belongs to something
+    /// visible, not to nothing.
+    fn run_shell(&mut self, line: &slash::ShellLine) -> std::io::Result<Flow> {
+        match crate::shell::Job::start(&line.command, self.cwd, line.tell_model, !line.background) {
+            Ok(job) => {
+                self.ui.print_above(&format!("$ {}", line.command))?;
+                self.jobs.push(job);
+            }
+            Err(e) => self.ui.print_above(&format!("could not start that: {e}"))?,
+        }
+        Ok(Flow::Continue)
+    }
+
+    /// Show what the running commands have said, and act on the ones that finished.
+    ///
+    /// Called from the loop before it draws, because that loop is the only thing
+    /// allowed to write to the screen: a command printing from its own task would
+    /// interleave with the redraw and corrupt it.
+    fn pump_jobs(&mut self) -> std::io::Result<()> {
+        // Gathered first: printing needs `self.ui`, and the jobs are borrowed from `self`.
+        let mut printing = Vec::new();
+        for job in &mut self.jobs {
+            printing.extend(job.drain());
+        }
+        for line in printing {
+            self.ui.print_above(&line)?;
+        }
+        // Then the finished ones, oldest first, so several completing between two ticks report in
+        // the order they were started rather than the order the loop noticed.
+        let mut done = Vec::new();
+        for (index, job) in self.jobs.iter_mut().enumerate() {
+            if let Some(code) = job.finished() {
+                done.push((index, code));
+            }
+        }
+        for (index, code) in done.into_iter().rev() {
+            let mut job = self.jobs.remove(index);
+            let how = match code {
+                crate::shell::Exit::Code(code) => format!("exit {code}"),
+                crate::shell::Exit::Signal => "stopped by a signal".to_owned(),
+            };
+            self.ui
+                .print_above(&format!("[{how}, {:.1}s] {}", job.elapsed().as_secs_f64(), job.command))?;
+            // `notice` is already `None` for a `!!` command, so the silence is decided where it
+            // was asked for rather than here.
+            if let Some(notice) = job.notice() {
+                self.notify_model(notice)?;
+            }
+            job.kill();
+        }
+        Ok(())
+    }
+
+    /// Tell the model what a command did, starting a turn for it.
+    ///
+    /// Reuses the prompt path — the same `start` a typed line takes — so the
+    /// notice is displayed, priced and recorded like anything else the model is
+    /// asked, instead of arriving by a route of its own that nothing else would
+    /// know about. If a turn is already running the notice queues behind it,
+    /// which is right: the model is mid-thought, and cutting it off to report a
+    /// command would lose work to gain nothing.
+    fn notify_model(&mut self, notice: String) -> std::io::Result<()> {
+        match submit_action(self.turn.is_some(), self.queued.len(), &notice) {
+            Submit::Now => self.start(notice)?,
+            Submit::Queue => self.queued.push_back(notice),
+            Submit::Refuse => self
+                .ui
+                .print_above("a command finished, but the queue is full so the model was not told")?,
+        }
+        Ok(())
+    }
+
+    /// Stop the command the prompt is waiting on.
+    ///
+    /// No `Result`: killing is best effort, and a command that had already gone
+    /// is the ordinary case rather than something the caller could do anything
+    /// about.
+    fn kill_foreground_job(&mut self) {
+        if let Some(job) = self.jobs.iter_mut().find(|job| job.foreground) {
+            job.kill();
+        }
+    }
+
+    /// Stop waiting for the command, and let it finish in the background.
+    fn detach_foreground_job(&mut self) {
+        if let Some(job) = self.jobs.iter_mut().find(|job| job.foreground) {
+            job.foreground = false;
+        }
+    }
+
+    /// Whether a command is holding the prompt.
+    fn is_waiting_on_a_job(&self) -> bool {
+        self.jobs.iter().any(|job| job.foreground)
     }
 
     /// Echo a prompt, copy it, and start its turn.
@@ -1516,6 +1740,13 @@ impl Repl<'_> {
         if trimmed.is_empty() {
             return Ok(Flow::Continue);
         }
+        // A `!` line is the operator's own shell — never a prompt, never a slash command, and
+        // never queued behind the model. It runs here, now, even mid-turn: being able to run one
+        // whenever you like is the point of having it. Checked before the queue because the
+        // queue is for the model's turns and this is not one.
+        if let Some(shell_line) = slash::shell(&trimmed) {
+            return self.run_shell(&shell_line);
+        }
         match submit_action(self.turn.is_some(), self.queued.len(), &trimmed) {
             Submit::Refuse => {
                 self.ui.print_above(&format!(
@@ -1567,6 +1798,25 @@ impl Repl<'_> {
             }
             return Ok(Flow::Continue);
         }
+        // A foreground command owns the prompt while it runs: that is what makes `&` mean
+        // something, because a command you wait for and one you do not would otherwise behave
+        // identically and there would be no reason to ask for either. Only the *sending* is held:
+        // the line stays editable, so the next message can be composed while the command runs and
+        // nothing typed is thrown away. Ctrl-C stops the command and Ctrl-B stops waiting for it,
+        // so the prompt is never a trap — the same escape the open question and the running turn
+        // already have.
+        let waiting_on_a_job = self.is_waiting_on_a_job();
+        if waiting_on_a_job {
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            if ctrl && key.code == KeyCode::Char('c') {
+                self.kill_foreground_job();
+                return Ok(Flow::Continue);
+            }
+            if ctrl && key.code == KeyCode::Char('b') {
+                self.detach_foreground_job();
+                return Ok(Flow::Continue);
+            }
+        }
         // While a turn runs the line stays editable — a turn can take minutes, and a
         // locked editor is what makes a session feel stuck. Ctrl-C is the exception: it
         // is the abort key, and there is nothing else to do with it mid-flight.
@@ -1593,6 +1843,17 @@ impl Repl<'_> {
             }
             Action::Exit => Ok(Flow::Exit),
             Action::Submit(text) => {
+                if waiting_on_a_job {
+                    // Not sent, and deliberately not cleared: the line stays exactly as typed, so
+                    // the message is delivered the moment the command is done or backgrounded.
+                    // Throwing away what someone composed while they waited would be the worst
+                    // thing a gate like this could do.
+                    self.ui.print_above(
+                        "that command is still running — Ctrl-B to send this now and let it finish \
+                         in the background, or Ctrl-C to stop it",
+                    )?;
+                    return Ok(Flow::Continue);
+                }
                 self.editor.clear();
                 self.submitted(text).await
             }
@@ -1657,6 +1918,7 @@ async fn run_inner(ui: &mut Ui, agent: Arc<Agent>, cwd: &Path) -> std::io::Resul
         queued: std::collections::VecDeque::new(),
         question: None,
         panel: None,
+        jobs: Vec::new(),
     };
 
     // The banner, once, before the first prompt: what version is running, which session,
@@ -1668,15 +1930,21 @@ async fn run_inner(ui: &mut Ui, agent: Arc<Agent>, cwd: &Path) -> std::io::Resul
         // A question asked from inside the running turn, before drawing: this loop is the only
         // place it can be shown, and showing it is what lets the operator answer.
         repl.show_pending_question()?;
+        // Commands the operator started, drained before drawing: this loop is the only place
+        // that may write to the screen, and a command finishing is what unblocks the prompt.
+        repl.pump_jobs()?;
         let status = repl.status();
+        let reasoning = repl.live_reasoning();
         // An open question is drawn where the prompt would be, because that is where the
         // operator is looking and a panel below a live-looking prompt invites typing into
-        // the wrong thing.
+        // the wrong thing. Its own panel is not the place for the reasoning: a question is a
+        // request for a decision, and the model's working behind it is not what is being asked.
         if let (Some(panel), Some((_, questions))) = (repl.panel.as_ref(), repl.question.as_ref()) {
             repl.ui.draw_panel(panel, questions, status.as_deref())?;
         } else {
             let prompt = prompt_for(&repl.agent).await;
-            repl.ui.draw(&prompt, &repl.editor, status.as_deref())?;
+            repl.ui
+                .draw(&prompt, &repl.editor, status.as_deref(), reasoning.as_deref())?;
         }
 
         tokio::select! {
@@ -2223,5 +2491,51 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The live reasoning shows its end, which is what the model is thinking now.
+    #[test]
+    fn the_live_view_shows_the_newest_reasoning_lines() {
+        // The start of a thought is not what matters while it is being written; the end is.
+        let long = "one\ntwo\nthree\nfour\nfive";
+        assert_eq!(live_lines(Some(long), 40, 2), vec!["four", "five"]);
+        // A line wider than the terminal is clipped rather than allowed to push the others away.
+        let wide = "aaaaaaaaaa\nbb";
+        assert_eq!(live_lines(Some(wide), 5, 4)[0], "aaaa…");
+        assert_eq!(live_lines(Some(wide), 5, 4)[1], "bb");
+    }
+
+    /// Nothing to show means no rows taken from the prompt.
+    #[test]
+    fn the_live_view_reserves_nothing_when_there_is_nothing_to_show() {
+        // A model that answers without reasoning, and one whose provider sends none.
+        assert!(live_lines(Some(""), 40, 3).is_empty());
+        // A stream that has so far produced only whitespace, which would otherwise put a blank
+        // row above the prompt for a frame and push the prompt down by one.
+        assert!(live_lines(Some("   \n\n  "), 40, 3).is_empty());
+        // No turn at all.
+        assert!(live_lines(None, 40, 3).is_empty());
+        // A terminal with no rows to spare, and one with no columns.
+        assert!(live_lines(Some("thinking"), 40, 0).is_empty());
+        assert!(live_lines(Some("thinking"), 0, 3).is_empty());
+    }
+
+    /// A clipped line is exactly the width it was given, so it cannot wrap.
+    #[test]
+    fn a_clipped_line_never_wraps() {
+        // A row that wrapped would put the next line on the row after it and shift the status
+        // row off by one, so this is the property that keeps the band aligned.
+        for width in 1..12 {
+            let clipped = clip_line("a fairly long line of text", width);
+            assert!(
+                clipped.chars().count() <= width,
+                "width {width} produced {} chars: {clipped:?}",
+                clipped.chars().count()
+            );
+        }
+        // At a width of one there is room for the ellipsis and nothing else.
+        assert_eq!(clip_line("abc", 1), "…");
+        // And a line that fits is left exactly as it was, not ellipsised.
+        assert_eq!(clip_line("short", 10), "short");
     }
 }

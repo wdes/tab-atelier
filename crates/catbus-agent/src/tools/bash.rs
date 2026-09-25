@@ -24,23 +24,7 @@ pub async fn run(input: &serde_json::Value, cwd: &Path) -> Result<String, String
         .map(Duration::from_secs)
         .map_or(DEFAULT_TIMEOUT, |d| d.min(MAX_TIMEOUT));
 
-    // `bash -lc` so we inherit the user's PATH / aliases. Stderr is
-    // merged with stdout to give the model one chunk of context.
-    //
-    // `kill_on_drop` matters on the timeout arm below: the future returned by
-    // `wait_with_output` is dropped there, and `Child` does not kill on drop, so
-    // without this a command that outlives its timeout keeps running — together
-    // with anything it started — with nothing left to reap it or report on it.
-    let mut cmd = Command::new("bash");
-    cmd.arg("-lc")
-        .arg(command)
-        .current_dir(cwd)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
-
-    let child = cmd.spawn().map_err(|e| format!("spawn bash: {e}"))?;
+    let child = spawn(command, cwd)?;
     let out = match tokio::time::timeout(timeout, child.wait_with_output()).await {
         Ok(Ok(out)) => out,
         Ok(Err(e)) => return Err(format!("wait: {e}")),
@@ -64,6 +48,33 @@ pub async fn run(input: &serde_json::Value, cwd: &Path) -> Result<String, String
         let _ = write!(combined, "\n[exit {}]", out.status.code().unwrap_or(-1));
     }
     Ok(combined)
+}
+
+/// Start `command` with this crate's conventions, without waiting for it.
+///
+/// Split out of [`run`] so the REPL can run a command the same way the tool does
+/// and still watch the output as it arrives: [`run`] has to wait for the whole
+/// thing because the model wants one finished chunk, whereas the operator wants
+/// to see it happening. The conventions themselves are not two decisions, so
+/// they live in one place.
+///
+/// `bash -lc` so we inherit the user's PATH and aliases. `kill_on_drop` matters
+/// to whoever holds the returned child: a `Child` does not kill on drop, so
+/// without it a command the operator abandoned keeps running — together with
+/// anything it started — with nothing left to reap it or report on it.
+///
+/// # Errors
+/// Returns a description when the shell cannot be started at all.
+pub fn spawn(command: &str, cwd: &Path) -> Result<tokio::process::Child, String> {
+    let mut cmd = Command::new("bash");
+    cmd.arg("-lc")
+        .arg(command)
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    cmd.spawn().map_err(|e| format!("spawn bash: {e}"))
 }
 
 /// Move-friendly bytes → String conversion: for valid UTF-8 (the common

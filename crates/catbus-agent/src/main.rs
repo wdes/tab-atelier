@@ -36,9 +36,11 @@ mod openai;
 mod relay;
 mod retry;
 mod session;
+mod shell;
 mod slash;
 mod socket;
 mod statusline;
+mod stream;
 mod tools;
 mod tui;
 

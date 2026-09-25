@@ -123,6 +123,21 @@ the actual binary with a config file, has the (mocked) model call the tools, and
 asserts the results are the real output of real `git` and `cargo` subprocesses.
 Only the model is simulated.
 
+### The operator's shell is not one of these
+
+Typing `!cmd` at the prompt runs `cmd` on the operator's own shell. It is
+deliberately not a tool, and the difference is not cosmetic: a tool call is the
+*model's* request, so it passes through the tool set, the identity's
+`AllowedTools`, and the proxy's shaping — while `!cmd` is the *operator's*, and
+none of that applies to it. Nothing in this file's `disable`/`allow` config can
+turn it off, because it was never in the set they filter.
+
+What the model receives is a message saying the operator ran a command, quoting
+it, with the output and the exit status. It cannot mistake that for something it
+asked for, and it cannot invoke the shell itself by any route this opens. A
+`!!cmd` runs the same way and the model is told nothing at all; a trailing `&`
+runs it in the background. See `docs/agent-guide.md` for the user-facing list.
+
 - **`disable`** / **`allow`** filter the built-in set. `"disable": ["Bash"]`
   removes shell access entirely; `allow` keeps only what it lists.
 - **`add`** contributes a tool the agent runs itself.

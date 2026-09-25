@@ -189,21 +189,147 @@ const COLUMN_GAP: usize = 5;
 /// written down, so a new command — or a longer argument — widens the column
 /// instead of knocking the block out of true.
 #[must_use]
-pub fn help_text() -> String {
-    let column = COMMANDS
+/// The width every description starts at.
+///
+/// Measured across both tables, not one: `/help` is read as a single list, and
+/// two columns that happen to differ would look like a mistake in whichever
+/// section came second.
+fn help_column() -> usize {
+    COMMANDS
         .iter()
         .map(|command| command.help_name().len())
+        .chain(SHELL_HELP.iter().map(|(name, _)| name.len()))
         .max()
         .unwrap_or_default()
-        + COLUMN_GAP;
-    let mut lines = vec![String::from("slash commands:")];
-    for command in COMMANDS {
-        let name = command.help_name();
-        lines.push(format!("  {name:<column$}{}", command.description));
+        + COLUMN_GAP
+}
+
+/// `/help`: the heading and entries of each section, in the order they are shown.
+///
+/// Two tables because a `!` line is not a slash command — it has no action to
+/// take, it is handed to the shell — so it is not in [`COMMANDS`] and would not
+/// otherwise appear at all. A feature nobody can find is a feature nobody uses.
+#[must_use]
+fn help_sections() -> [(&'static str, Vec<(String, &'static str)>); 2] {
+    [
+        (
+            "slash commands:",
+            COMMANDS
+                .iter()
+                .map(|command| (command.help_name(), command.description))
+                .collect(),
+        ),
+        (
+            "your own shell:",
+            SHELL_HELP
+                .iter()
+                .map(|(name, description)| ((*name).to_owned(), *description))
+                .collect(),
+        ),
+    ]
+}
+
+/// The help text, ready to print.
+#[must_use]
+pub fn help_text() -> String {
+    let column = help_column();
+    let mut lines = Vec::new();
+    for (heading, entries) in help_sections() {
+        lines.push(heading.to_owned());
+        for (name, description) in entries {
+            lines.push(format!("  {name:<column$}{description}"));
+        }
+        lines.push(String::new());
     }
+    // Said once, under both tables, because it applies to the shell lines and is the one
+    // thing about them that cannot be guessed from the list.
+    lines.push(String::from(
+        "  Ctrl-B and Ctrl-C stop waiting for a `!` command, and stop it.",
+    ));
     let mut text = lines.join("\n");
     text.push_str("\n\n");
     text
+}
+
+/// The `!` lines, in the same shape as [`COMMANDS`] so `/help` reads as one list.
+///
+/// The recommendation is on the entry it applies to rather than in a sentence
+/// after the table, because that is where someone reading for "how do I run this
+/// in the background" is already looking.
+const SHELL_HELP: &[(&str, &str)] = &[
+    ("!<cmd>", "Run it, show the output, then tell the model what it printed"),
+    ("!!<cmd>", "Run it and show the output, and tell the model nothing"),
+    (
+        "!<cmd> &",
+        "The same, in the background — recommended: the prompt stays free",
+    ),
+    ("!!<cmd> &", "In the background, and silent"),
+];
+
+/// A line the operator typed to run on their own shell.
+///
+/// Two sigils, and the second `!` is the whole point: it says the model is not
+/// to hear about this one. Checked here, beside the slash table and before the
+/// fall-through that makes a line a prompt, because a `!` line must never reach
+/// the model as text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shell {
+    /// `!cmd` — run it, show the output, and tell the model what it printed.
+    Tell,
+    /// `!!cmd` — run it and show the output, and tell the model nothing.
+    Silent,
+}
+
+/// What a `!` line asks for: what to run, and how.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShellLine {
+    /// The command, with the `!`, the `!!` and any background marker taken off.
+    pub command: String,
+    /// Whether the model is told when it finishes.
+    pub tell_model: bool,
+    /// Whether it is to run in the background — a trailing `&`.
+    pub background: bool,
+}
+
+/// The shell line `input` names, or `None` if it is not one.
+///
+/// `None` for anything that does not open with `!`, which is what leaves the
+/// line to be a prompt or a slash command; and `None` for a bare `!` with no
+/// command after it, which is a mistake to report rather than an empty command
+/// to run.
+///
+/// The background marker is a trailing `&` that is a word of its own — `cmd &`
+/// rather than `cmd && something`, and rather than `cmd 2>&1`, where the `&` is
+/// part of the redirection. Requiring whitespace (or the whole command to be
+/// just `&`) is what tells those apart, since a bare trailing `&` in shell is
+/// exactly the background operator.
+#[must_use]
+pub fn shell(input: &str) -> Option<ShellLine> {
+    let input = input.trim();
+    let (kind, rest) = match input.strip_prefix("!!") {
+        Some(rest) => (Shell::Silent, rest),
+        None => (Shell::Tell, input.strip_prefix('!')?),
+    };
+    let rest = rest.trim();
+    let (command, background) = match rest.strip_suffix('&') {
+        // `&` alone was never a command, and `&&` is not a background marker.
+        Some(head) if head.ends_with(char::is_whitespace) => (head.trim(), true),
+        _ => (rest, false),
+    };
+    // A sigil with nothing after it, and `&` with nothing before it, are both
+    // mistakes to report rather than commands to attempt: `&` on its own is a
+    // syntax error to the shell, so running it would produce an error rather
+    // than an answer. `make &&` is left alone — its ampersands are part of the
+    // command, and only a trailing one with whitespace in front of it is the
+    // background operator.
+    if command.is_empty() || command.trim_matches('&').trim().is_empty() {
+        return None;
+    }
+    Some(ShellLine {
+        command: command.to_owned(),
+        tell_model: kind == Shell::Tell,
+        background,
+    })
 }
 
 /// The command `input` names, with the argument typed after it — trimmed, and
@@ -292,6 +418,91 @@ mod tests {
     }
 
     #[test]
+    fn a_bang_line_is_a_shell_command_and_says_who_hears_about_it() {
+        // One `!` tells the model, two do not. The distinction is the operator's
+        // to make, so both spellings have to keep meaning what they say.
+        let told = shell("!make test").expect("a shell line");
+        assert_eq!(told.command, "make test");
+        assert!(told.tell_model);
+        assert!(!told.background);
+
+        let quiet = shell("!!make test").expect("a shell line");
+        assert_eq!(quiet.command, "make test");
+        assert!(!quiet.tell_model);
+        assert!(!quiet.background);
+
+        // The command is taken verbatim, so its own quoting and flags survive.
+        let quoted = shell("!git commit -m 'a message'").expect("a shell line");
+        assert_eq!(quoted.command, "git commit -m 'a message'");
+    }
+
+    #[test]
+    fn a_trailing_ampersand_asks_for_the_background() {
+        let background = shell("!npm test &").expect("a shell line");
+        assert_eq!(background.command, "npm test");
+        assert!(background.background);
+        assert!(background.tell_model, "the sigil still decides who is told");
+
+        let quiet = shell("!!npm test &").expect("a shell line");
+        assert!(quiet.background);
+        assert!(!quiet.tell_model);
+
+        // And whitespace before the `&` is not required to be a single space.
+        assert_eq!(shell("!ls\t&").expect("a shell line").command, "ls");
+    }
+
+    #[test]
+    fn an_ampersand_that_is_not_a_background_marker_is_left_alone() {
+        // These all contain an `&` that a shell would read as part of the
+        // command, so splitting it off would change what runs.
+        for line in [
+            "!make && echo done",
+            "!echo a & b",
+            "!cmd > out 2>&1",
+            "!f() { echo hi; }; f",
+        ] {
+            let parsed = shell(line).expect("a shell line");
+            assert!(!parsed.background, "{line:?} is not a background request");
+            assert_eq!(
+                parsed.command,
+                line.trim_start_matches('!'),
+                "{line:?} keeps its ampersand"
+            );
+        }
+    }
+
+    #[test]
+    fn what_is_not_a_shell_line_stays_a_prompt() {
+        for not_a_shell_line in [
+            "",       // nothing at all
+            "!",      // a sigil and no command
+            "!!",     // both sigils and no command
+            "!   ",   // a sigil and only spaces
+            "!! &",   // nothing to run, in the background
+            "ls -la", // an ordinary prompt
+            "/help",  // a slash command, which is checked separately
+            // A `!` that is not the first character is an ordinary sentence.
+            "wow! that worked",
+        ] {
+            assert_eq!(
+                shell(not_a_shell_line),
+                None,
+                "{not_a_shell_line:?} is not a shell line"
+            );
+        }
+    }
+
+    #[test]
+    fn a_shell_line_is_never_also_a_slash_command() {
+        // The two parsers are consulted in order, so a line that both accepted
+        // would depend on which ran first. They must not overlap at all.
+        for line in ["!make test", "!!make test", "!npm test &", "!plan"] {
+            assert!(shell(line).is_some(), "{line:?} is a shell line");
+            assert_eq!(lookup(line), None, "{line:?} is not a slash command");
+        }
+    }
+
+    #[test]
     fn an_argument_is_the_text_after_the_first_space_trimmed() {
         // The REPL hands the argument on as-is, so the splitting belongs here:
         // `/rename  spaced  out ` names `spaced  out`.
@@ -337,28 +548,42 @@ mod tests {
 
     #[test]
     fn help_lists_one_line_per_command_at_one_column() {
-        // The shape the hand-written block had, kept: two spaces of indent, and
-        // every description starting at the same column.
+        // Checked against the text as printed, not against a line rebuilt the same
+        // way `help_text` builds it — a test that reconstructs the output agrees
+        // with itself whatever the output says.
         let help = help_text();
-        let lines: Vec<&str> = help.lines().skip(1).filter(|line| !line.is_empty()).collect();
-        assert_eq!(lines.len(), COMMANDS.len(), "one line per command:\n{help}");
-        let columns: Vec<usize> = COMMANDS
-            .iter()
-            .zip(&lines)
-            .map(|(command, line)| {
+        let lines: Vec<&str> = help.lines().collect();
+        let mut columns = Vec::new();
+        let mut index = 0;
+        for (heading, entries) in help_sections() {
+            assert_eq!(lines.get(index).copied(), Some(heading), "{heading:?} is not a heading");
+            index += 1;
+            for (name, description) in &entries {
+                let line = lines
+                    .get(index)
+                    .copied()
+                    .unwrap_or_else(|| panic!("{name:?} has no line in the help text:\n{help}"));
                 assert!(line.starts_with("  "), "{line:?} is not indented");
-                let column = line.len() - command.description.len();
-                assert!(
-                    line.ends_with(command.description),
-                    "{line:?} does not end in its description"
-                );
+                assert!(line.ends_with(description), "{line:?} does not end in {description:?}");
+                let column = line.len() - description.len();
                 assert!(column > 2, "{line:?} has no gap between the name and the description");
-                column
-            })
-            .collect();
+                // The name is what sits between the indent and the description.
+                assert_eq!(
+                    line[2..column].trim_end(),
+                    *name,
+                    "{line:?} does not begin with {name:?}"
+                );
+                columns.push(column);
+                index += 1;
+            }
+            // A blank line ends each section, so the two tables read as two lists.
+            assert_eq!(lines.get(index).copied(), Some(""), "{heading:?} is not ended");
+            index += 1;
+        }
         assert!(
             columns.windows(2).all(|pair| pair[0] == pair[1]),
-            "descriptions start at different columns: {columns:?}\n{help}"
+            "descriptions start at different columns, across the sections as well as within \
+             them: {columns:?}\n{help}"
         );
     }
 

@@ -9,7 +9,9 @@
 use std::path::Path;
 
 pub mod ask;
-mod bash;
+// Visible past this module so the REPL can start a command the same way the tool
+// does rather than growing a second way to run one.
+pub mod bash;
 mod config;
 mod delegate;
 mod edit;
