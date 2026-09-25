@@ -498,11 +498,26 @@ interface PeakWindow {
     end_hour: number;
 }
 
+/** One day a hop charges off-peak for, whatever its windows say. */
+interface PeakHoliday {
+    /** What the day is called, for the operator reading the panel. */
+    name: string;
+    /** The days themselves, as civil dates in the provider's own calendar. */
+    dates: string[];
+}
+
 /** A hop's peak-pricing multiplier, and when it applies. */
 interface PeakConfig {
     /** Percent of the base price — 150 means half again as expensive. */
     multiplier_percent: number;
     windows: PeakWindow[];
+    /**
+     * Whole days charged off-peak regardless of `windows`, which is how
+     * DeepSeek excludes Chinese public holidays. Absent when the provider
+     * publishes no such exclusion; a holiday is off-peak in full, so no hour
+     * of one is ever charged the multiplier.
+     */
+    holidays?: PeakHoliday[];
 }
 
 interface ProviderView {

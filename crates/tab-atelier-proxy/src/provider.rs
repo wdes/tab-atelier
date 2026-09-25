@@ -401,6 +401,32 @@ pub struct Peak {
     /// 200 = double.
     pub multiplier_percent: u32,
     pub windows: Vec<PeakWindow>,
+    /// Whole days the provider charges off-peak for, whatever `windows` say.
+    ///
+    /// `DeepSeek`'s schedule reads "peak hours are 01:00-04:00 and 06:00-10:00
+    /// UTC, Monday to Friday, *excluding Chinese public holidays*", and a
+    /// holiday is off-peak "in full" — the entire date, not the peak window
+    /// inside it. So this is the one thing the windows cannot express, and
+    /// leaving it out is not neutral: it bills a weekday holiday at double.
+    ///
+    /// Empty for a provider that publishes no such exclusion, and skipped on
+    /// the wire so the ordinary case is unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub holidays: Vec<Holiday>,
+}
+
+/// A named stretch of civil days a provider treats as off-peak.
+///
+/// Days rather than instants because that is the unit the vendor publishes and
+/// the unit a gazette declares. `dates` is a list because a festival that is
+/// observed across a moving bridge (Spring Festival, National Day) is one
+/// holiday with several days off, and naming it once is how the operator reads
+/// it back on the panel.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Holiday {
+    pub name: String,
+    /// The days themselves, as dates in the provider's own civil calendar.
+    pub dates: Vec<jiff::civil::Date>,
 }
 
 /// When peak applies, in UTC.
@@ -417,10 +443,44 @@ pub struct PeakWindow {
     pub end_hour: u8,
 }
 
+/// The zone a Chinese public holiday is a date in.
+///
+/// Fixed at UTC+8 because the mainland has kept one offset with no daylight
+/// saving since 1991, and because a fixed offset needs no tzdb — this crate
+/// ships none, and pulling one in to place a holiday would be a large
+/// dependency for a rule that has not moved in thirty years.
+#[must_use]
+const fn beijing() -> jiff::tz::TimeZone {
+    jiff::tz::TimeZone::fixed(jiff::tz::Offset::constant(8))
+}
+
 impl Peak {
+    /// The holiday that makes this instant off-peak, if a calendar says so.
+    ///
+    /// Matched on the date read in the provider's own zone, never on a time of
+    /// day: a holiday cancels the windows for the whole date, so the question
+    /// is only which date the instant is.
+    #[must_use]
+    pub fn holiday_at(&self, unix_secs: u64) -> Option<&str> {
+        let second = i64::try_from(unix_secs).ok()?;
+        let ts = jiff::Timestamp::from_second(second).ok()?;
+        let date = ts.to_zoned(beijing()).date();
+        self.holidays
+            .iter()
+            .find(|h| h.dates.contains(&date))
+            .map(|h| h.name.as_str())
+    }
+
     /// Whether peak pricing is in force at this instant.
     #[must_use]
     pub fn active_at(&self, unix_secs: u64) -> bool {
+        // Before the windows, because the exclusion is the stronger statement:
+        // a holiday is off-peak "in full", so no hour of it is charged at the
+        // multiplier even where a window covers that hour. Guarded on the
+        // calendar being non-empty so a provider without one pays nothing.
+        if !self.holidays.is_empty() && self.holiday_at(unix_secs).is_some() {
+            return false;
+        }
         let Ok(ts) = i64::try_from(unix_secs).map(jiff::Timestamp::from_second) else {
             return false;
         };
@@ -456,6 +516,26 @@ impl Peak {
             at += 3_600;
         }
         None
+    }
+
+    /// The year an instant falls in, when the calendar says nothing about it.
+    ///
+    /// A gazette declares one year at a time, so the list is only true for the
+    /// year it was published for and nothing here can know the next one. Say so
+    /// rather than let every holiday of an uncovered year bill at peak in
+    /// silence — the same class of failure the rates already refuse to make
+    /// quietly. `None` when the year is covered, and when there is no calendar
+    /// at all: a provider that published no exclusion has no gap to report.
+    #[must_use]
+    pub fn uncovered_year_at(&self, unix_secs: u64) -> Option<i16> {
+        if self.holidays.is_empty() {
+            return None;
+        }
+        let second = i64::try_from(unix_secs).ok()?;
+        let ts = jiff::Timestamp::from_second(second).ok()?;
+        let year = ts.to_zoned(beijing()).year();
+        let covered = self.holidays.iter().any(|h| h.dates.iter().any(|d| d.year() == year));
+        (!covered).then_some(year)
     }
 }
 
@@ -769,6 +849,32 @@ impl Provider {
         }
     }
 
+    /// Put back the billing calendar the catalogue publishes for this hop.
+    ///
+    /// The same loss as a rate, from the same cause: the dashboard form has no
+    /// field for a calendar, so a save writes the row back without one, and a
+    /// row written before the field existed deserialises with none. Unlike a
+    /// rate, the loss is not visible as a missing figure — the provider still
+    /// prices every hour — so it has to be repaired here or not at all. A
+    /// calendar left out is not "no peak": the windows still stand, and every
+    /// Chinese public holiday that falls on a weekday is billed at double.
+    ///
+    /// Only ever fills an empty list, so a calendar typed by hand is kept.
+    pub fn adopt_published_peak(&mut self) {
+        let Some(peak) = &mut self.peak else {
+            return;
+        };
+        // Only an empty list is filled, so a calendar typed by hand is kept: an
+        // operator who wrote one meant it, and the catalogue cannot know that
+        // their year or their vendor differs from the shipped one.
+        if !peak.holidays.is_empty() {
+            return;
+        }
+        if let Some(published) = published_peak(&self.base_url) {
+            peak.holidays = published.holidays;
+        }
+    }
+
     /// Whether not one model it serves carries a rate.
     ///
     /// Not a fault on its own: the subscription hop is unpriced by design, since
@@ -885,6 +991,11 @@ impl Preset {
                             end_hour: 10,
                         },
                     ],
+                    // The exclusion the windows cannot state: a weekday holiday
+                    // is off-peak "in full", so without these seven entries the
+                    // schedule doubles the price on roughly nineteen weekdays a
+                    // year.
+                    holidays: holidays_2026(),
                 }),
                 models: vec![
                     // 1M context, thinking and non-thinking, tool calls,
@@ -1005,6 +1116,79 @@ pub fn published_price(model_id: &str) -> Option<Price> {
         .flat_map(|preset| preset.models())
         .find(|model| model.id == model_id && !model.deprecated)
         .and_then(|model| model.price)
+}
+
+/// The billing calendar the shipped catalogue records for a provider.
+///
+/// The peak counterpart of [`published_price`], drawn from the same place. It
+/// is how a provider that lost its calendar gets it back — see
+/// [`Provider::adopt_published_peak`]. Matched on `base_url` rather than `id`,
+/// because an operator may rename the row and a calendar is a property of who
+/// serves the tokens, not of what the row is called; the key path
+/// `provider_named` builds on the way is discarded, and no directory is read.
+#[must_use]
+pub fn published_peak(base_url: &str) -> Option<Peak> {
+    Preset::ALL
+        .iter()
+        .map(|preset| preset.provider_named(Path::new(""), "catalogue"))
+        .find(|provider| provider.base_url == base_url)
+        .and_then(|provider| provider.peak)
+}
+
+/// A civil date, falling over only on an impossible one.
+///
+/// The calendar below is a literal typed by hand, so an impossible date is a
+/// mistake in this file rather than an input: failing where it is written beats
+/// a typo that silently drops a holiday and starts billing peak again.
+fn day(year: i16, month: i8, day: i8) -> jiff::civil::Date {
+    jiff::civil::Date::new(year, month, day).expect("holiday calendar holds a real date")
+}
+
+/// One holiday and the days it covers.
+fn holiday(name: &str, dates: &[(i8, i8)]) -> Holiday {
+    Holiday {
+        name: name.to_owned(),
+        dates: dates.iter().map(|&(m, d)| day(2026, m, d)).collect(),
+    }
+}
+
+/// The Chinese public holidays `DeepSeek` charges off-peak for, in 2026.
+///
+/// Transcribed from the State Council's arrangement for 2026, which is the
+/// declaration the provider's schedule defers to. These are the days the
+/// exchange is *closed* — the ones that make an otherwise-peak weekday
+/// off-peak. The adjusted working weekends around them (the "make-up" days) are
+/// deliberately absent: they are working days, and where one lands inside a
+/// peak window the provider still charges the multiplier.
+///
+/// A gazette covers one year. [`Peak::uncovered_year_at`] reports the years
+/// past this list so the gap is visible rather than billed blind.
+fn holidays_2026() -> Vec<Holiday> {
+    vec![
+        holiday("New Year's Day", &[(1, 1), (1, 2), (1, 3)]),
+        holiday(
+            "Spring Festival",
+            &[
+                (2, 15),
+                (2, 16),
+                (2, 17),
+                (2, 18),
+                (2, 19),
+                (2, 20),
+                (2, 21),
+                (2, 22),
+                (2, 23),
+            ],
+        ),
+        holiday("Qingming Festival", &[(4, 4), (4, 5), (4, 6)]),
+        holiday("Labour Day", &[(5, 1), (5, 2), (5, 3), (5, 4), (5, 5)]),
+        holiday("Dragon Boat Festival", &[(6, 19), (6, 20), (6, 21)]),
+        holiday("Mid-Autumn Festival", &[(9, 25), (9, 26), (9, 27)]),
+        holiday(
+            "National Day",
+            &[(10, 1), (10, 2), (10, 3), (10, 4), (10, 5), (10, 6), (10, 7)],
+        ),
+    ]
 }
 
 /// Where a provider's key file lives: beside `providers.json`, `0600`.
@@ -1155,6 +1339,11 @@ impl Registry {
                 // does not cost nothing for ever.
                 for p in &mut r.providers {
                     p.adopt_published_rates();
+                    // And the billing calendar, for the same reason: a save
+                    // through the form drops it, and a missing calendar is not
+                    // "no peak" — the windows survive, so every holiday that
+                    // falls on a weekday bills at double until it is put back.
+                    p.adopt_published_peak();
                 }
                 // Loud at LOAD, not only at the first request that would have
                 // used it. A provider that can never be used still sits in the
@@ -1174,6 +1363,21 @@ impl Registry {
                     if p.enabled && p.has_no_recorded_rate() {
                         log::warn!(
                             "provider {} serves models with no recorded rate, so its hours show no cost",
+                            p.id
+                        );
+                    }
+                    // And a calendar that has run out of year. The gazette it
+                    // was drawn from declares one year, so past that date the
+                    // schedule silently bills every weekday holiday at peak.
+                    // Nothing errors; the only symptom is a price that is too
+                    // high, which is exactly the kind of thing nobody notices.
+                    if let Some(year) = p
+                        .peak
+                        .as_ref()
+                        .and_then(|peak| peak.uncovered_year_at(crate::server::now_ms() / 1000))
+                    {
+                        log::warn!(
+                            "provider {} bills at peak with no holiday calendar for {year}, so a holiday in it will be charged at the peak rate",
                             p.id
                         );
                     }
@@ -1771,6 +1975,154 @@ mod tests {
         // the schedule at all rather than a number in a comment.
         assert_eq!(ds.cost_at(flash, 1_789_005_600), off_peak * 2);
         assert_eq!(ds.cost_at(flash, 1_789_016_400), off_peak);
+    }
+
+    /// The exclusion the windows cannot state, on the day it was billing wrong.
+    ///
+    /// `DeepSeek`'s table ends "excluding Chinese public holidays" and calls a
+    /// holiday off-peak "in full", so a holiday cancels both windows for the
+    /// whole date. Without the calendar every such weekday was charged double.
+    #[test]
+    fn a_weekday_holiday_is_off_peak_all_day() {
+        let ds = Preset::Deepseek.provider(Path::new("/tmp"));
+        let flash = ds.models.iter().find(|m| m.id == "deepseek-flash").expect("flash");
+        let off_peak = flash.relative_cost;
+
+        // Friday 25 September 2026, Mid-Autumn Festival — a gazetted rest day.
+        // 02:00 sits inside the first window and 09:00 inside the second, so
+        // both would be peak on any other Friday.
+        assert!(!ds.peak_now(1_790_301_600), "Mid-Autumn 02:00 UTC is off-peak");
+        assert!(!ds.peak_now(1_790_326_800), "Mid-Autumn 09:00 UTC is off-peak");
+        assert_eq!(ds.cost_at(flash, 1_790_301_600), off_peak);
+        assert_eq!(ds.cost_at(flash, 1_790_326_800), off_peak);
+
+        // Each holiday, at 02:00 UTC — an hour that is peak on a plain weekday.
+        // The dates are the *ranges* the arrangement declares, not the loose
+        // days: New Year is Jan 1-3 and National Day Oct 1-7, and both ends
+        // matter. Getting a boundary wrong by one day is invisible here and
+        // bills a working day at off-peak, or a rest day at peak, for a whole
+        // year — which is how this list first went in.
+        for (name, ts) in [
+            ("New Year's Day", 1_767_232_800),
+            ("Spring Festival", 1_771_293_600),
+            ("Qingming", 1_775_440_800),
+            ("Labour Day", 1_777_860_000),
+            ("Dragon Boat", 1_781_834_400),
+            ("National Day", 1_790_906_400),
+        ] {
+            assert!(!ds.peak_now(ts), "{name} is off-peak in full");
+        }
+
+        // The two boundaries the ranges decide, asserted on the days either
+        // side: the second of January is inside the New Year break and is a
+        // Friday, the eighth of October is after National Day and is a Thursday.
+        assert!(!ds.peak_now(1_767_319_200), "Jan 2 is a Friday, and a rest day");
+        assert!(ds.peak_now(1_791_424_800), "Oct 8 is a Thursday, and a working day");
+
+        // The control: the Friday a week before Mid-Autumn is an ordinary
+        // weekday, and its 02:00 is peak at double. Without this the test
+        // would also pass if the calendar had cancelled peak altogether.
+        assert!(ds.peak_now(1_789_696_800), "the Friday before is peak");
+        assert_eq!(ds.cost_at(flash, 1_789_696_800), off_peak * 2);
+    }
+
+    /// A gazette declares one year, and the calendar must say when it ends.
+    ///
+    /// Past the last declared holiday nothing errors and nothing is missing —
+    /// the price is merely too high, on the handful of weekdays a year that
+    /// are holidays. That is the failure mode worth a warning.
+    #[test]
+    fn a_year_the_calendar_does_not_reach_is_reported() {
+        let ds = Preset::Deepseek.provider(Path::new("/tmp"));
+        let peak = ds.peak.as_ref().expect("deepseek has a schedule");
+
+        assert_eq!(peak.uncovered_year_at(1_790_301_600), None, "2026 is covered");
+        assert_eq!(
+            peak.uncovered_year_at(1_799_287_200),
+            Some(2027),
+            "2027 is not in the gazette this was drawn from"
+        );
+
+        // A provider that published no exclusion has no gap to report: there
+        // is nothing it is failing to honour.
+        let no_calendar = Peak {
+            multiplier_percent: 100,
+            windows: Vec::new(),
+            holidays: Vec::new(),
+        };
+        assert_eq!(no_calendar.uncovered_year_at(1_799_287_200), None);
+    }
+
+    /// The calendar has to survive the round-trip the dashboard puts it through.
+    ///
+    /// A save writes the provider row back from a form that has no field for a
+    /// calendar, and a row stored before the field existed has no key at all.
+    /// Both arrive here as a `peak` with no holidays, so `adopt_published_peak`
+    /// is what stands between that and a year of doubled holidays.
+    #[test]
+    fn a_calendar_lost_to_a_save_is_put_back() {
+        let mut ds = Preset::Deepseek.provider(Path::new("/tmp"));
+        let published = ds.peak.as_ref().expect("schedule").holidays.len();
+        assert_eq!(published, 7, "the gazetted holidays of 2026");
+
+        // What a round-trip through the form leaves: the schedule, no calendar.
+        ds.peak.as_mut().expect("schedule").holidays.clear();
+        assert!(
+            ds.peak_now(1_790_301_600),
+            "without the calendar the holiday's 02:00 is billed as peak, which is the bug"
+        );
+        ds.adopt_published_peak();
+        assert_eq!(
+            ds.peak.as_ref().expect("schedule").holidays.len(),
+            published,
+            "the catalogue's calendar is put back"
+        );
+        assert!(!ds.peak_now(1_790_301_600), "and Mid-Autumn is off-peak again");
+
+        // A calendar an operator wrote by hand is theirs and is left alone.
+        ds.peak.as_mut().expect("schedule").holidays = vec![Holiday {
+            name: "Company shutdown".to_owned(),
+            dates: vec![day(2026, 12, 24)],
+        }];
+        ds.adopt_published_peak();
+        let kept = &ds.peak.as_ref().expect("schedule").holidays;
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].name, "Company shutdown");
+
+        // And a provider with no schedule at all stays without one.
+        let mut openai = Preset::Openai.provider(Path::new("/tmp"));
+        openai.adopt_published_peak();
+        assert!(openai.peak.is_none());
+    }
+
+    #[test]
+    fn a_calendar_and_a_row_without_one_both_deserialise() {
+        let ds = Preset::Deepseek.provider(Path::new("/tmp"));
+        let peak = ds.peak.as_ref().expect("schedule");
+
+        // The dates are written the way a person would check them, so a
+        // mistyped literal in the table above shows up here.
+        let json = serde_json::to_string(peak).expect("serialize");
+        assert!(json.contains("2026-09-25"), "a holiday reads as a plain date: {json}");
+        assert_eq!(&serde_json::from_str::<Peak>(&json).expect("round-trip"), peak);
+
+        // A schedule stored before the field existed has no `holidays` key, and
+        // must still load — that row is what every existing install has.
+        let older = r#"{"multiplier_percent":200,"windows":[{"weekdays":[1,2,3,4,5],"start_hour":1,"end_hour":4}]}"#;
+        let parsed: Peak = serde_json::from_str(older).expect("an older row loads");
+        assert!(parsed.holidays.is_empty(), "and reports no calendar, as it had none");
+
+        // Nothing extra is written for a provider without a calendar, so the
+        // ordinary case is byte-for-byte what it was.
+        let bare = Peak {
+            multiplier_percent: 100,
+            windows: Vec::new(),
+            holidays: Vec::new(),
+        };
+        assert_eq!(
+            serde_json::to_string(&bare).expect("serialize"),
+            r#"{"multiplier_percent":100,"windows":[]}"#
+        );
     }
 
     /// "Peak now" without an end is a warning nobody can plan around. The end

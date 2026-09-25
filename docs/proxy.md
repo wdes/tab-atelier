@@ -296,7 +296,10 @@ paste this shape in by hand:
          "note": "withdrawn 2026-09-14; requests are served by deepseek-flash at Flash prices"}
       ],
       "peak": {"multiplier_percent": 200,
-               "windows": [{"weekdays": [1,2,3,4,5], "start_hour": 1, "end_hour": 4}]} }
+               "windows": [{"weekdays": [1,2,3,4,5], "start_hour": 1, "end_hour": 4},
+                           {"weekdays": [1,2,3,4,5], "start_hour": 6, "end_hour": 10}],
+               "holidays": [{"name": "Mid-Autumn Festival",
+                             "dates": ["2026-09-25", "2026-09-26", "2026-09-27"]}]} }
   ]
 }
 ```
@@ -360,6 +363,27 @@ difference in a comparison whose whole job is ordering providers by cost, so it
 is modelled rather than written in a comment: `relative_cost` stays one true
 number and the schedule explains itself. `ping` and the UI both say when a
 provider is in peak right now.
+
+**The weekday test is not the whole rule.** DeepSeek's footnote reads "excluding
+Chinese public holidays", and calls a holiday off-peak *in full* — the whole
+date, both windows, not the peak hours inside it. `holidays` is that exclusion:
+a list of named civil days, matched against the date in the provider's own
+calendar (UTC+8, fixed, because the mainland has kept one offset since 1991).
+Without it every Chinese public holiday that falls on a weekday is charged
+double — roughly nineteen days a year. Two neighbouring things look similar and
+are not: the adjusted working weekends ("make-up days") are *absent* on purpose,
+because they are working days and the provider still charges peak on them.
+
+A gazette declares one year. Past the last declared holiday the calendar is
+silently out of date and nothing errors — the price is merely too high on the
+handful of weekdays a year that are holidays, which is the kind of thing nobody
+notices. So a peak schedule with no holiday in the current year is named in the
+log at load, the same way an unpriced provider is.
+
+Like a rate, a calendar survives a save only because it is put back: the
+provider form has no field for one, so a save writes the row without it, and the
+row takes the catalogue's calendar back as it loads. Only an empty list is
+filled, so a calendar set by hand is left alone.
 
 ### Pinning someone to a provider
 

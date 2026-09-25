@@ -719,6 +719,7 @@ mod tests {
                         end_hour: 10,
                     },
                 ],
+                holidays: Vec::new(),
             }),
             ..flat_rate(3_000, 150_000, 600_000)
         }
