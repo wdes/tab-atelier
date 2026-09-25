@@ -370,9 +370,11 @@ date, both windows, not the peak hours inside it. `holidays` is that exclusion:
 a list of named civil days, matched against the date in the provider's own
 calendar (UTC+8, fixed, because the mainland has kept one offset since 1991).
 Without it every Chinese public holiday that falls on a weekday is charged
-double — roughly nineteen days a year. Two neighbouring things look similar and
-are not: the adjusted working weekends ("make-up days") are *absent* on purpose,
-because they are working days and the provider still charges peak on them.
+double — roughly nineteen days a year. The adjusted working weekends around a
+holiday (the "make-up days") need no entry of their own and have none: every one
+of them falls on a Saturday or Sunday, so it is already outside the
+Monday-to-Friday windows. Weekends and holidays alike are off-peak, make-up
+weekends included.
 
 A gazette declares one year. Past the last declared holiday the calendar is
 silently out of date and nothing errors — the price is merely too high on the

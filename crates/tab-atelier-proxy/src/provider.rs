@@ -1158,8 +1158,10 @@ fn holiday(name: &str, dates: &[(i8, i8)]) -> Holiday {
 /// declaration the provider's schedule defers to. These are the days the
 /// exchange is *closed* — the ones that make an otherwise-peak weekday
 /// off-peak. The adjusted working weekends around them (the "make-up" days) are
-/// deliberately absent: they are working days, and where one lands inside a
-/// peak window the provider still charges the multiplier.
+/// deliberately absent, and need no entry: every one of them falls on a
+/// Saturday or Sunday, so it is already outside the Monday-to-Friday windows.
+/// The vendor's own notice says as much — weekends and holidays alike are
+/// billed off-peak, make-up weekends included.
 ///
 /// A gazette covers one year. [`Peak::uncovered_year_at`] reports the years
 /// past this list so the gap is visible rather than billed blind.
@@ -2024,6 +2026,15 @@ mod tests {
         // would also pass if the calendar had cancelled peak altogether.
         assert!(ds.peak_now(1_789_696_800), "the Friday before is peak");
         assert_eq!(ds.cost_at(flash, 1_789_696_800), off_peak * 2);
+
+        // And the make-up working weekends need no entry in the calendar: the
+        // vendor bills weekends off-peak, so a "working" Saturday is already
+        // outside the Monday-to-Friday windows. 10 October 2026 is one of the
+        // days the arrangement makes people work to pay for National Day.
+        assert!(
+            !ds.peak_now(1_791_597_600),
+            "a make-up Saturday is off-peak by the weekday rule"
+        );
     }
 
     /// A gazette declares one year, and the calendar must say when it ends.
