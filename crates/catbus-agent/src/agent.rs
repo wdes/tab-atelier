@@ -30,7 +30,7 @@ use std::fmt::Write as _;
 use crate::relay::Relay;
 use crate::session::{self, Block, Session};
 use crate::tools;
-use crate::{ansi, cache, guard, retry};
+use crate::{ansi, cache, guard, progress, retry};
 
 /// The model to ask for when neither the session nor the provider names one.
 ///
@@ -867,6 +867,10 @@ impl Agent {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(200);
+        // Survives across rounds on purpose: the two ways a loop shows itself —
+        // the same call again, or the same result again — are only visible as a
+        // run. See `progress` for the case that made this necessary.
+        let mut loop_guard = progress::Progress::from_env();
         for _ in 0..max_rounds {
             if cancel.is_cancelled() {
                 return Err(AgentError::Cancelled);
@@ -1013,10 +1017,28 @@ impl Agent {
             // in the same order the model produced the tool_use
             // blocks).
             let gate = self.gate();
+            // Asked before anything is dispatched, because that is the whole
+            // point of catching this shape: the call has nothing new to tell the
+            // model, so making it costs the round and changes nothing. It is
+            // refused — never dispatched — and answered with a `tool_result` that
+            // says so; see `progress` for why the previous rounds' output has to
+            // have stalled too before a repeat counts as a loop.
+            let stop = loop_guard.before(tool_uses.iter().map(|(_, name, input)| (*name, *input)));
             let mut results: Vec<Block> = Vec::with_capacity(tool_uses.len());
             for (id, name, input) in &tool_uses {
                 if cancel.is_cancelled() {
                     return Err(AgentError::Cancelled);
+                }
+                // A refused call still gets a `tool_result`: the API requires one
+                // for every `tool_use`, and the model reads the refusal as the
+                // outcome of the call it made.
+                if let Some(stop) = &stop {
+                    results.push(Block::ToolResult {
+                        tool_use_id: (*id).to_string(),
+                        content: stop.refusal(),
+                        is_error: true,
+                    });
+                    continue;
                 }
                 // Show the tool name (and a short input summary for Bash)
                 // in the status so the spinner reflects what's running.
@@ -1084,6 +1106,19 @@ impl Agent {
                     is_error,
                 });
             }
+            // The other half of the guard, on the signal this side can actually
+            // see: if this round's results matched the round before, the model
+            // learned nothing, whatever its calls looked like. This is what
+            // catches a model varying its reads and getting the same answer —
+            // the shape the 2026-09-25 loop took. Skipped when the calls were
+            // already refused above: those results are the refusal text, and
+            // feeding it to the result check would count a refusal as staleness.
+            let stop = stop.or_else(|| {
+                loop_guard.after(results.iter().filter_map(|block| match block {
+                    Block::ToolResult { content, .. } => Some(content.as_str()),
+                    _ => None,
+                }))
+            });
             // Done with the borrows — move resp.content into history now.
             let _ = tool_uses;
             {
@@ -1100,6 +1135,19 @@ impl Agent {
                 active.history.push(ApiMessage {
                     role: "user".into(),
                     content: ApiContent::Blocks(results),
+                });
+            }
+            // Cut here, not at the round cap, and only after the round is
+            // recorded: the history above is what keeps the turn valid — an
+            // assistant message whose `tool_use` blocks have no answering
+            // `tool_result` is a 400 on the next request, so the results go in
+            // even when the loop stops. `final_text` carries whatever the model
+            // said on the way, and the notice explains the stop to the reader.
+            if let Some(stop) = stop {
+                final_text.push_str(&stop.notice());
+                return Ok(Turn {
+                    answer: for_sink(final_text),
+                    reasoning: for_sink(reasoning),
                 });
             }
         }

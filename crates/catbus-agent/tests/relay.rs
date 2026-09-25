@@ -1655,12 +1655,21 @@ fn the_round_cap_warning_names_the_real_limit() {
     std::fs::write(dir.path().join("notes.txt"), "some notes").unwrap();
 
     let (_agent, mut reader, mut stream) = spawn_agent(dir.path(), &socket, |cmd| {
-        cmd.env("CATBUS_MAX_ROUNDS", "3").args([
-            "--relay-url",
-            &format!("http://127.0.0.1:{port}"),
-            "--relay-token",
-            RELAY_TOKEN,
-        ]);
+        // The repeat guard is switched off so this stays a test of the *cap*. Its
+        // fixture asks for the same read every round and gets the same bytes back,
+        // which is now that guard's business — it would stop the turn at round
+        // three with a loop notice, the cap would never be reached, and the
+        // assertion below could not tell a correct limit string from a missing
+        // one. The cap is the backstop for a loop that keeps changing; a test for
+        // it needs a loop that does, or needs the other guard out of the way.
+        cmd.env("CATBUS_MAX_ROUNDS", "3")
+            .env("CATBUS_REPEAT_ROUNDS", "0")
+            .args([
+                "--relay-url",
+                &format!("http://127.0.0.1:{port}"),
+                "--relay-token",
+                RELAY_TOKEN,
+            ]);
     });
 
     let reply = send_prompt(&mut stream, &mut reader, "keep reading");
@@ -1792,12 +1801,17 @@ fn a_tool_only_loop_that_hits_the_cap_reports_an_error() {
     std::fs::write(dir.path().join("notes.txt"), "some notes").unwrap();
 
     let (_agent, mut reader, mut stream) = spawn_agent(dir.path(), &socket, |cmd| {
-        cmd.env("CATBUS_MAX_ROUNDS", "3").args([
-            "--relay-url",
-            &format!("http://127.0.0.1:{port}"),
-            "--relay-token",
-            RELAY_TOKEN,
-        ]);
+        // See the note in `the_round_cap_warning_names_the_real_limit` — this
+        // fixture is a repeat loop too, so the repeat guard has to be off for the
+        // cap to be the thing that stops it.
+        cmd.env("CATBUS_MAX_ROUNDS", "3")
+            .env("CATBUS_REPEAT_ROUNDS", "0")
+            .args([
+                "--relay-url",
+                &format!("http://127.0.0.1:{port}"),
+                "--relay-token",
+                RELAY_TOKEN,
+            ]);
     });
 
     let reply = send_prompt(&mut stream, &mut reader, "keep reading");
@@ -1811,6 +1825,212 @@ fn a_tool_only_loop_that_hits_the_cap_reports_an_error() {
     assert!(
         message.contains("CATBUS_MAX_ROUNDS"),
         "the error should name the knob to turn:\n{message}"
+    );
+}
+
+/// The loop from 2026-09-25, end to end.
+///
+/// A tab spent 200 rounds and 2.55M input tokens re-reading the same files. The
+/// relay had replaced old `tool_result` bodies with `[elided: …]` stubs to fit
+/// the request in the model's context window, so the model could not tell a
+/// result it had already read from one it had never seen — and reading again was
+/// the only way to find out. Its own account, from that transcript:
+///
+/// > *I kept re-reading the same architectural files and getting `[elided: …]`
+/// > back. Instead of narrowing, I issued more broad reads.*
+///
+/// The relay side is fixed at the source (`tab-atelier-proxy::compact` no longer
+/// elides a body it has no reason to elide, and its stub names the call it
+/// replaced). This is the client's own guard, and the point of it is that the
+/// client had the means to notice all along: an identical call made three rounds
+/// running returns exactly what the second one did.
+///
+/// Caught *before* dispatch, which the transcript proves — the file is read
+/// twice, and the third call is refused rather than run.
+#[test]
+fn a_call_repeated_three_rounds_running_is_refused_before_it_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    // Far more rounds than the guard should ever need, so that a guard which
+    // fails to fire runs all the way to the cap and the notice says `200`.
+    let responses: Vec<(&'static str, String)> = (0..12)
+        .map(|i| {
+            (
+                "HTTP/1.1 200 OK",
+                tool_round(&format!("c{i}"), "Read", r#"{"path": "notes.txt"}"#),
+            )
+        })
+        .collect();
+    let (port, rx) = spawn_mock_relay_owned(responses);
+    let socket = dir.path().join("agent.sock");
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(dir.path().join("notes.txt"), "some notes").unwrap();
+
+    let (_agent, mut reader, mut stream) = spawn_agent_in(&home, dir.path(), &socket, |cmd| {
+        cmd.env("CATBUS_MAX_ROUNDS", "200").args([
+            "--relay-url",
+            &format!("http://127.0.0.1:{port}"),
+            "--relay-token",
+            RELAY_TOKEN,
+        ]);
+    });
+
+    let reply = send_prompt(&mut stream, &mut reader, "keep reading");
+    assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+    let text = reply["text"].as_str().unwrap();
+    assert!(
+        text.contains("3 identical rounds"),
+        "the notice should say how many rounds it took:\n{text}"
+    );
+    assert!(
+        text.contains("Read notes.txt"),
+        "and name the call, so the reader can see what was being repeated:\n{text}"
+    );
+    assert!(
+        !text.contains("200-round"),
+        "the round cap must not be what stopped this:\n{text}"
+    );
+
+    // Three requests: one per round, the third answered from the refusal rather
+    // than the relay. The cap this run was given is 200, so anything near it
+    // means the guard never fired.
+    let seen = rx.try_iter().count();
+    assert!(
+        seen <= 4,
+        "the guard stopped it at 3 rounds, not 200: {seen} requests seen"
+    );
+
+    // The evidence that the third call was not made: the file was read exactly
+    // twice, and the refusal sits in the transcript in place of a third result.
+    let transcript = transcript_text(&home);
+    assert_eq!(
+        transcript.matches("some notes").count(),
+        2,
+        "the file was read exactly twice, not three times:\n{transcript}"
+    );
+    assert!(
+        transcript.contains("Error: not run"),
+        "the refusal is recorded as the third result, so the turn stays valid:\n{transcript}"
+    );
+}
+
+/// The harder shape, and the one the 2026-09-25 tab actually took.
+///
+/// The model did not repeat a call — it *widened* its reads: a page, a wider
+/// page, then the whole file. Every call was different, so call identity says
+/// nothing about this loop. What never changed was the content, because all three
+/// reads were the same file. Asking for it a fourth way cannot return anything
+/// the third way did not.
+///
+/// This is why the guard compares results as well as calls. In the incident the
+/// results were stubs, and a client cannot see those — the relay rewrites the
+/// request after it has left. Result identity is visible from here, needs no
+/// knowledge of the relay, and is the honest question to ask: did this round tell
+/// the model anything it did not already have?
+#[test]
+fn a_loop_that_varies_its_reads_but_gets_the_same_content_is_stopped() {
+    let dir = tempfile::tempdir().unwrap();
+    // Three genuinely different reads of one small file. The last argument names
+    // the file with no range at all, so every read returns its full contents.
+    let reads = [
+        r#"{"path": "notes.txt", "limit": 100}"#,
+        r#"{"path": "notes.txt", "limit": 200}"#,
+        r#"{"path": "notes.txt"}"#,
+    ];
+    let responses: Vec<(&'static str, String)> = (0..12)
+        .map(|i| {
+            let input = reads[i % reads.len()];
+            ("HTTP/1.1 200 OK", tool_round(&format!("c{i}"), "Read", input))
+        })
+        .collect();
+    let (port, _rx) = spawn_mock_relay_owned(responses);
+    let socket = dir.path().join("agent.sock");
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(dir.path().join("notes.txt"), "some notes").unwrap();
+
+    let (_agent, mut reader, mut stream) = spawn_agent_in(&home, dir.path(), &socket, |cmd| {
+        cmd.env("CATBUS_MAX_ROUNDS", "200").args([
+            "--relay-url",
+            &format!("http://127.0.0.1:{port}"),
+            "--relay-token",
+            RELAY_TOKEN,
+        ]);
+    });
+
+    let reply = send_prompt(&mut stream, &mut reader, "keep reading");
+    assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+    let text = reply["text"].as_str().unwrap();
+    assert!(
+        text.contains("changed nothing"),
+        "the notice should describe the stall, not claim a repeat:\n{text}"
+    );
+    assert!(
+        text.contains("3 rounds"),
+        "it took three rounds of the same content to be sure:\n{text}"
+    );
+    assert!(
+        text.contains("byte-identical"),
+        "the notice must say what was seen, not why:\n{text}"
+    );
+
+    // All three rounds ran — none of them was a repeated call — and then it
+    // stopped, rather than running to the 200-round cap.
+    let transcript = transcript_text(&home);
+    assert_eq!(
+        transcript.matches("some notes").count(),
+        3,
+        "three real reads happened before the stall was certain:\n{transcript}"
+    );
+}
+
+/// The threshold is a knob, and it has to be the one that is honoured.
+///
+/// A run that genuinely needs to ask the same thing more times than the default
+/// must not have to patch the binary: `CATBUS_REPEAT_ROUNDS` raises the limit,
+/// and the notice quotes whatever it was set to — so an operator reading the tab
+/// can tell a stop at the default from a stop at their own setting.
+#[test]
+fn the_repeat_limit_is_configurable() {
+    let dir = tempfile::tempdir().unwrap();
+    let responses: Vec<(&'static str, String)> = (0..12)
+        .map(|i| {
+            (
+                "HTTP/1.1 200 OK",
+                tool_round(&format!("c{i}"), "Read", r#"{"path": "notes.txt"}"#),
+            )
+        })
+        .collect();
+    let (port, _rx) = spawn_mock_relay_owned(responses);
+    let socket = dir.path().join("agent.sock");
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(dir.path().join("notes.txt"), "some notes").unwrap();
+
+    let (_agent, mut reader, mut stream) = spawn_agent_in(&home, dir.path(), &socket, |cmd| {
+        cmd.env("CATBUS_MAX_ROUNDS", "50")
+            .env("CATBUS_REPEAT_ROUNDS", "5")
+            .args([
+                "--relay-url",
+                &format!("http://127.0.0.1:{port}"),
+                "--relay-token",
+                RELAY_TOKEN,
+            ]);
+    });
+
+    let reply = send_prompt(&mut stream, &mut reader, "keep reading");
+    assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+    let text = reply["text"].as_str().unwrap();
+    assert!(
+        text.contains("5 identical rounds"),
+        "the notice must quote the configured limit, not the default:\n{text}"
+    );
+
+    let transcript = transcript_text(&home);
+    assert_eq!(
+        transcript.matches("some notes").count(),
+        4,
+        "five rounds means the first four ran and the fifth was refused:\n{transcript}"
     );
 }
 

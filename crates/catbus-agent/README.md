@@ -199,6 +199,36 @@ Two things follow from that, and both are easy to get wrong:
 | `--judge-model` | `CATBUS_JUDGE_MODEL` | what auto mode grades with |
 | `--monitor-prompt` | `CATBUS_MONITOR_PROMPT` | a file to use instead of the built-in prompt |
 | `--tools-config` | `CATBUS_TOOLS_CONFIG` | the tool set file above |
+| — | `CATBUS_MAX_ROUNDS` | hard cap on tool rounds in one turn (default 200) |
+| — | `CATBUS_REPEAT_ROUNDS` | rounds of no new information before the loop guard stops the turn (default 3; `0` disables) |
+
+## The loop guard
+
+A turn stops early when the tools have told the model nothing new for
+`CATBUS_REPEAT_ROUNDS` rounds. Two shapes count, and both are needed:
+
+- **The same call.** Identical tool, identical arguments, with a completed round
+  in between — *and* the round before it returned what the one before that did.
+  Both halves matter: a poll loop sends one identical call every round by nature,
+  so the call alone cannot decide anything. What separates `make` until it goes
+  green from a stall is whether the output changed.
+- **The same result.** Different calls, identical results. This is the shape that
+  matters most, because it is the one a call-identity check cannot see — read a
+  page, a wider page, then the whole file, and every call differs while the
+  content does not.
+
+The call check runs before dispatch, so a repeated call is refused rather than
+run: no time, no side effect, no tokens. The result check can only run once the
+tools have returned, so it stops the *next* round — the results in hand are real
+and are recorded first, which keeps the turn valid for the following request.
+
+On 2026-09-25 a tab spent 200 rounds and 2.55M input tokens on the second shape.
+`tab-atelier-proxy` had replaced old `tool_result` bodies with `[elided:N B]`
+stubs to fit the request in the model's context window; a stub is
+indistinguishable from a real result the model has never read, so it read again —
+and, widening each time, never got anything new. The proxy no longer elides a body
+it has no reason to elide and its stub names the call it replaced; this guard is
+the client's own half, and it catches the shape whatever the relay does.
 
 ## Rate limits
 
