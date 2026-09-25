@@ -80,6 +80,8 @@
 //! `tool_use` unanswered, which is a 400.** Nothing here removes
 //! `tool_result` blocks; it replaces their contents.
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 /// How many trailing turns each layer leaves alone.
@@ -199,6 +201,13 @@ pub struct Stats {
     /// Tool results left alone because a stub would have been longer than the
     /// result it replaced — see [`MIN_TOOL_RESULT_BYTES`].
     pub tool_results_kept_small: usize,
+    /// Tool results left alone because the stale region they sit in was under
+    /// [`ELIDE_ABOVE_BYTES`] — see the note there. Nonzero means the pass found
+    /// work and declined it, which is a different answer from "nothing to do"
+    /// and the one an operator debugging an un-shrunk transcript is asking for.
+    ///
+    /// Deliberately not part of [`Stats::changed`]: declining is not a change.
+    pub tool_results_kept_under_budget: usize,
     pub thinking_dropped: usize,
     pub notices_dropped: usize,
 }
@@ -221,21 +230,31 @@ fn bytes_of(value: &serde_json::Value) -> u64 {
     u64::try_from(serde_json::to_vec(value).map_or(0, |v| v.len())).unwrap_or(u64::MAX)
 }
 
-/// The marker every stub begins with, and the floor below which nothing is
-/// stubbed at all.
+/// The marker every stub begins with, followed by the byte count of the content
+/// it replaced, a `; `, and the call that produced it — `[elided:90002B; Read …]`.
 ///
-/// Kept to the shortest form that still tells the model two things: something
-/// was here, and how much of it. The byte count is not decoration — it is what
-/// the model judges "is re-reading this worth a turn" on, and dropping it would
-/// invite exactly the re-reads this pass exists to avoid.
+/// Kept as short as it can be while still telling the model two things at the
+/// point it reads the stub, which are the two things it needs to decide whether
+/// to look at the result again:
+///
+/// 1. *something was here, and how much* — so a stub is never read as an empty
+///    result, which a model answers by calling the tool again.
+/// 2. *which call this was* — so it can tell a result it has already reasoned
+///    over from one it has never seen. Without this the stub carries no more
+///    information than a fresh call would, and re-reading is the only way to
+///    find out, which is the loop the pass was meant to prevent.
+///
+/// The `tool_use_id` is deliberately *not* in the text: it is 49 bytes, and it is
+/// already the sibling field of the block being annotated — in one captured body
+/// 803 of 804 stubs repeated a value sitting right next to them. The prose went
+/// the same way. What replaced it is the call's *target*, which is the part the
+/// model actually matches against its own history; the id could not serve there,
+/// because the model never saw the id when it made the call.
 ///
 /// The previous text was
 /// `[tool result elided by tab-atelier-proxy: N bytes; tool_use_id=…]` — 102
-/// bytes where this is 14, and the id was 49 of them. It was also pure
-/// duplication: in one captured body 803 of 804 stubs repeated a value already
-/// sitting in the `tool_use_id` field of the very block they annotated. The
-/// prose went for the same reason — nothing reads it but the model, and the
-/// model needs the number, not the sentence.
+/// bytes, where the body of this one is typically 25-30. See [`stub`] for the
+/// text and [`ELIDE_ABOVE_BYTES`] for when it is used at all.
 const ELIDED_PREFIX: &str = "[elided:";
 
 /// The marker this replaced.
@@ -265,14 +284,167 @@ const ELIDED_PREFIX_LEGACY: &str = "[tool result elided by tab-atelier-proxy: ";
 /// nothing in the design would have said that was wrong.
 const MIN_TOOL_RESULT_BYTES: u64 = 200;
 
+/// How much stale `tool_result` content a request must carry before layer A
+/// does anything at all.
+///
+/// Elision exists to keep a request inside the model's context window, and that
+/// is a problem only above a certain size: most of the bytes in a long session
+/// are machine payload, so on a transcript that has grown into the megabytes the
+/// pass pays for itself many times over. On a request that already fits it pays
+/// for nothing the provider was charging for, and costs the model the contents
+/// of calls it is still working with — plus, on any hop with a prompt cache, an
+/// invalidated prefix (see the module docs).
+///
+/// That cost is not theoretical, and it is why this floor exists. On 2026-09-25 a
+/// `catbus-agent` tab spent 200 rounds and 2.55M input tokens re-reading files
+/// whose results this pass had replaced with stubs. The request was never over
+/// any budget, so the elision bought no context — while the stub left nothing to
+/// reason about, and the model had no way to tell a fresh read from a recycled
+/// one. It could only read again, so it did, until the round cap stopped it.
+///
+/// Measured on the stale region only — the bytes this pass would actually
+/// remove — because that is the tightest available criterion: "is there enough
+/// old tool output here to be worth trimming?" A body with less is returned
+/// untouched, which is also the cheapest possible answer.
+pub const ELIDE_ABOVE_BYTES: u64 = 256 * 1024;
+
+/// The keys a tool call names its target with, most specific first.
+const TARGET_KEYS: [&str; 6] = ["file_path", "path", "pattern", "command", "query", "name"];
+
+/// How many characters of a call's target survive into the stub.
+const TARGET_KEEP: usize = 48;
+
 /// The stub that replaces an elided `tool_result`'s content.
 ///
 /// The block, its id and its position all stay. That is the point: the model is
 /// told *something was there*, rather than being shown an empty result and
 /// concluding the tool returned nothing. The id is not repeated in the text
 /// because it is already the sibling field of the block this replaces.
-fn stub(byte_count: u64) -> String {
-    format!("{ELIDED_PREFIX}{byte_count}B]")
+///
+/// What is repeated is *what was called*. The byte count alone says something
+/// was here and how big it was, which leaves the model to work out whether the
+/// thing it needs is inside it — and the safe answer to that question, when the
+/// task depends on it, is to read it again. Naming the call answers a different
+/// question, the one the model actually has: "have I already read this file this
+/// conversation?" With the name in the stub it can see that it has, and use the
+/// reasoning it did the first time. Without it, re-reading is the only way to
+/// find out, which is the loop this pass was supposed to prevent.
+///
+/// The target, not the `tool_use_id`: the id is 49 bytes and already the sibling
+/// field of the block being annotated, while the target is the string the model
+/// wrote in the call and can match against its own history. It stays a pure
+/// function of the body — see the module docs on determinism — because it is read
+/// out of the `tool_use` the stub answers.
+///
+/// What the stub deliberately does *not* do is tell the model what to do about it
+/// — no "re-read a narrower range", no "this content is still in your context".
+/// Both would be claims about behaviour this side cannot promise, and the second
+/// is actually false: a re-read's result is the newest in the body, so it sits
+/// inside the keep window and comes back in full. The stub's job is to report what
+/// happened. Guidance belongs where it can be checked against real outcomes — the
+/// client's loop guard, which sees the calls and the results both.
+fn stub(byte_count: u64, provenance: Option<&str>) -> String {
+    provenance.map_or_else(
+        || format!("{ELIDED_PREFIX}{byte_count}B]"),
+        |what| format!("{ELIDED_PREFIX}{byte_count}B; {what}]"),
+    )
+}
+
+/// Map every `tool_use` in `messages` from its id to a short "what was called".
+///
+/// Built from the same slice the stubs are written into: a `tool_result` can only
+/// be answered by a `tool_use` that came before it, so a call whose result is in
+/// the stale region is itself in there.
+fn call_targets(messages: &[serde_json::Value]) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for message in messages {
+        let Some(list) = blocks(message) else { continue };
+        for block in list {
+            if block_type(block) != Some("tool_use") {
+                continue;
+            }
+            let Some(id) = block.get("id").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let name = block.get("name").and_then(serde_json::Value::as_str).unwrap_or("tool");
+            out.insert(id.to_owned(), describe_call(name, block.get("input")));
+        }
+    }
+    out
+}
+
+/// "`Read /src/lib.rs`", or just "`Read`" when the call names no target.
+fn describe_call(name: &str, input: Option<&serde_json::Value>) -> String {
+    let target = input.and_then(|input| {
+        TARGET_KEYS
+            .iter()
+            .find_map(|key| input.get(key).and_then(serde_json::Value::as_str))
+    });
+    match target.map(first_line_clipped) {
+        Some(target) if !target.is_empty() => format!("{name} {target}"),
+        _ => name.to_owned(),
+    }
+}
+
+/// The first line of a target, clipped so a stub cannot inherit a whole prompt.
+fn first_line_clipped(text: &str) -> String {
+    let line = text.lines().next().unwrap_or("").trim();
+    if line.chars().count() <= TARGET_KEEP {
+        return line.to_owned();
+    }
+    let clipped: String = line.chars().take(TARGET_KEEP).collect();
+    format!("{clipped}…")
+}
+
+/// Why a `tool_result` is left alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Keep {
+    /// It carries an error, and the error text is what makes it useful.
+    Error,
+    /// No `tool_use_id`, so a stub would point at nothing.
+    Unbound,
+    /// Already a stub from an earlier pass.
+    Stubbed,
+    /// Shorter than [`MIN_TOOL_RESULT_BYTES`], or with no content at all.
+    Small,
+}
+
+/// Whether this `tool_result` should be stubbed, and how much it would save.
+///
+/// The caller has already checked the block is a `tool_result`; every other
+/// reason to leave it alone is here, so the counting pass and the stub text can
+/// never disagree about what is eligible.
+///
+/// An elided error is the one elision class where the loss is semantic rather
+/// than bulk — "use the Grep tool instead" is not something the model can
+/// re-derive from a byte count. A few KB is a cheap price for never doing that.
+fn elidable(block: &serde_json::Value) -> Result<u64, Keep> {
+    if block
+        .get("is_error")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Err(Keep::Error);
+    }
+    // A result with no id is not bound to a call, so a stub would leave content
+    // pointing at nothing. Not the shape Claude Code sends, and cheap to refuse.
+    if block.get("tool_use_id").and_then(serde_json::Value::as_str).is_none() {
+        return Err(Keep::Unbound);
+    }
+    let Some(content) = block.get("content") else {
+        return Err(Keep::Small);
+    };
+    // Already a stub from a previous pass: leaving it alone keeps the original
+    // byte count in the message and makes the pass idempotent.
+    if already_elided(content) {
+        return Err(Keep::Stubbed);
+    }
+    // The floor decides, not the stub length. See `MIN_TOOL_RESULT_BYTES`.
+    let bytes = bytes_of(content);
+    if bytes < MIN_TOOL_RESULT_BYTES {
+        return Err(Keep::Small);
+    }
+    Ok(bytes)
 }
 
 /// Whether this content is already a stub from an earlier pass.
@@ -338,60 +510,51 @@ fn blocks_mut(message: &mut serde_json::Value) -> Option<&mut Vec<serde_json::Va
 }
 
 /// Layer A — stub the content of old `tool_result` blocks.
+///
+/// Nothing happens at all unless the stale region holds more than
+/// [`ELIDE_ABOVE_BYTES`] of elidable content; see that constant for why the
+/// floor is there.
 fn elide_tool_results(messages: &mut [serde_json::Value], stats: &mut Stats) {
     let start = window_start(messages, KEEP_TURNS, |m| has_block(m, "tool_result"));
-    for message in &mut messages[..start] {
-        let Some(list) = blocks_mut(message) else { continue };
-        for block in list.iter_mut() {
+    // Classify the region first, decide, then rewrite. Rewriting as we walked
+    // would mean the budget could not be consulted before the first stub was
+    // written — it is a property of the whole region, so it cannot be known
+    // from inside it.
+    let mut candidates: Vec<(usize, usize, u64)> = Vec::new();
+    for (index, message) in messages[..start].iter().enumerate() {
+        let Some(list) = blocks(message) else { continue };
+        for (slot, block) in list.iter().enumerate() {
             if block_type(block) != Some("tool_result") {
                 continue;
             }
-            // An elided error is the one elision class where the loss is
-            // semantic rather than bulk — "use the Grep tool instead" is not
-            // something the model can re-derive from a byte count. A few KB
-            // is a cheap price for never doing that.
-            let is_error = block
-                .get("is_error")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false);
-            if is_error {
-                stats.tool_results_kept_for_error += 1;
-                continue;
+            match elidable(block) {
+                Ok(bytes) => candidates.push((index, slot, bytes)),
+                Err(Keep::Error) => stats.tool_results_kept_for_error += 1,
+                Err(Keep::Small) => stats.tool_results_kept_small += 1,
+                // Nothing was saved, so nothing needs saying: `Unbound` is not
+                // the shape Claude Code sends, and `Stubbed` is this pass having
+                // already run on this body.
+                Err(Keep::Unbound | Keep::Stubbed) => {}
             }
-            // A result with no id is not bound to a call, so a stub would leave
-            // content pointing at nothing. Not the shape Claude Code sends, and
-            // cheap to refuse.
-            if block.get("tool_use_id").and_then(serde_json::Value::as_str).is_none() {
-                continue;
-            }
-            let Some(content) = block.get("content") else { continue };
-            // Already a stub from a previous pass: leaving it alone keeps the
-            // original byte count in the message and makes the pass idempotent.
-            if already_elided(content) {
-                continue;
-            }
-            // The floor decides, not the stub length. A tool result is evidence:
-            // "The file /src/lib.rs has been updated." is the only record in the
-            // conversation that the call succeeded, and it is short. Replacing it
-            // saves a handful of bytes and costs the model the ability to tell
-            // "it worked" from "that call never happened".
-            //
-            // This floor used to be implicit, and the accident is worth naming.
-            // The rule was "only when the stub is strictly shorter than the
-            // result", which with a 102-byte stub happened to mean "over 102
-            // bytes". Shrinking the stub to 14 would have quietly moved that
-            // floor to 14 and started eating acknowledgements — caught by
-            // `a_short_acknowledgement_is_never_elided`, which failed the moment
-            // the marker changed.
-            let content_len = bytes_of(content);
-            if content_len < MIN_TOOL_RESULT_BYTES {
-                stats.tool_results_kept_small += 1;
-                continue;
-            }
-            let replacement = stub(content_len);
-            block["content"] = serde_json::Value::String(replacement);
-            stats.tool_results_elided += 1;
         }
+    }
+    let stale_bytes: u64 = candidates.iter().map(|(_, _, bytes)| bytes).sum();
+    if stale_bytes < ELIDE_ABOVE_BYTES {
+        stats.tool_results_kept_under_budget = candidates.len();
+        return;
+    }
+    let targets = call_targets(&messages[..start]);
+    for (index, slot, bytes) in candidates {
+        let Some(block) = blocks_mut(&mut messages[index]).and_then(|list| list.get_mut(slot)) else {
+            continue;
+        };
+        let provenance = block
+            .get("tool_use_id")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|id| targets.get(id))
+            .map(String::as_str);
+        block["content"] = serde_json::Value::String(stub(bytes, provenance));
+        stats.tool_results_elided += 1;
     }
 }
 
@@ -512,6 +675,16 @@ mod tests {
     /// How many turns the fixtures below build.
     const TURNS: usize = 10;
 
+    /// How big each `tool_result` payload is in the fixture.
+    ///
+    /// Chosen to clear [`ELIDE_ABOVE_BYTES`] even after a test replaces one of the
+    /// stale results with a short acknowledgement: the remaining candidates are
+    /// 270 KB between them, over the 256 KiB floor. A fixture that did not clear
+    /// the floor would make every layer-A assertion below vacuous — the pass would
+    /// decline the body and `tool_results_elided` would be 0 for a reason the test
+    /// never meant to assert.
+    const PAYLOAD: usize = 90_000;
+
     /// A body in the shape Claude Code sends: a system prompt, tool schemas,
     /// and alternating turns — a user turn carrying a `tool_result`, an
     /// assistant turn carrying `thinking` and the `tool_use` it answers.
@@ -520,6 +693,15 @@ mod tests {
     /// change it" is only worth asserting when there was something there to
     /// change.
     fn body() -> serde_json::Value {
+        body_sized(PAYLOAD)
+    }
+
+    /// The same body, too small for layer A to touch. See [`ELIDE_ABOVE_BYTES`].
+    fn small_body() -> serde_json::Value {
+        body_sized(1000)
+    }
+
+    fn body_sized(payload: usize) -> serde_json::Value {
         let mut messages = Vec::new();
         for i in 0..TURNS {
             messages.push(json!({
@@ -528,7 +710,7 @@ mod tests {
                     "type": "tool_result",
                     "tool_use_id": format!("call_{i:02}"),
                     // Distinct sizes, so the stub's byte count is checkable.
-                    "content": "r".repeat(1000 + i),
+                    "content": "r".repeat(payload + i),
                 }],
             }));
             messages.push(json!({
@@ -550,6 +732,12 @@ mod tests {
             "tools": [{"name": "Bash", "description": "run", "input_schema": {"type": "object"}}],
             "messages": messages,
         })
+    }
+
+    /// The byte count a stub should carry for turn `i` of [`body`]: the payload
+    /// plus the two quotes `serde_json` wraps it in.
+    fn stubbed_bytes(i: usize) -> u64 {
+        (PAYLOAD + i + 2) as u64
     }
 
     fn messages(body: &serde_json::Value) -> &Vec<serde_json::Value> {
@@ -636,14 +824,7 @@ mod tests {
         let first = results[0];
         assert_eq!(first["tool_use_id"], "call_00");
         let text = first["content"].as_str().expect("content became a string");
-        assert_eq!(
-            text,
-            format!(
-                "[elided:{}B]",
-                // The serialized length of the 1000-byte payload plus quotes.
-                1002
-            )
-        );
+        assert_eq!(text, format!("[elided:{}B; Bash ls]", stubbed_bytes(0)));
         assert!(first.get("is_error").is_none(), "the block is otherwise untouched");
 
         // …and the kept ones are untouched, byte for byte.
@@ -726,7 +907,7 @@ mod tests {
             "content": [{
                 "type": "tool_result",
                 "tool_use_id": format!("call_{i:02}"),
-                "content": "r".repeat(1000 + i),
+                "content": "r".repeat(PAYLOAD + i),
             }],
         }));
         list.push(json!({
@@ -736,6 +917,109 @@ mod tests {
                 {"type": "tool_use", "id": format!("call_{i:02}"), "name": "Bash", "input": {"command": "ls"}},
             ],
         }));
+    }
+
+    /// A body with too little stale tool output is forwarded untouched, whole.
+    ///
+    /// Layer A is a context-window measure, and that is only a problem above a
+    /// certain size. Below [`ELIDE_ABOVE_BYTES`] the pass would buy back no
+    /// context the provider was charging for, while still taking away the model's
+    /// sight of results it is mid-way through using. So it declines the body —
+    /// and declines it byte for byte, rather than partially, so the request the
+    /// provider sees is the one the client sent.
+    ///
+    /// The regression this guards: on 2026-09-25 a `catbus-agent` tab spent 200
+    /// rounds and 2.55M input tokens with every tool result stubbed, on a request
+    /// that was never over any budget.
+    #[test]
+    fn a_small_stale_region_is_left_completely_alone() {
+        let mut b = small_body();
+        let before = serialized(&b);
+        let stats = apply(&mut b, Compact::Tools);
+
+        assert_eq!(serialized(&b), before, "the body must come back byte-identical");
+        assert_eq!(stats.tool_results_elided, 0);
+        assert_eq!(
+            stats.tool_results_kept_under_budget,
+            TURNS - KEEP_TURNS,
+            "declining is reported, so it is distinguishable from nothing to do"
+        );
+        assert!(!stats.changed(), "declining is not a change");
+    }
+
+    /// The floor gates layer A and nothing else. A small body still loses its
+    /// stale thinking: that is a different trade, and one with no such risk —
+    /// nothing in the conversation is the model's own reasoning to re-read.
+    #[test]
+    fn the_floor_does_not_gate_thinking() {
+        let mut b = small_body();
+        let stats = apply(&mut b, Compact::ToolsThinking);
+        assert_eq!(stats.tool_results_elided, 0);
+        assert_eq!(stats.thinking_dropped, TURNS - KEEP_TURNS);
+        assert!(stats.changed());
+    }
+
+    /// The stub names the call that produced it.
+    ///
+    /// This is the fix for the 2026-09-25 loop. A stub carrying only a byte count
+    /// leaves the model unable to tell a result it has already seen from one it
+    /// has not, and the cheap way to find out is to call the tool again — which it
+    /// did, 200 times, on the same files. The target is what makes the stub
+    /// answerable: it is the string the model wrote in the call, so it can match
+    /// it against its own history at a glance.
+    #[test]
+    fn the_stub_names_the_call_that_produced_it() {
+        let long_path = format!("/src/{}/unique_tail.rs", "segment/".repeat(8));
+        let mut b = body();
+        b["messages"][1]["content"][1] = json!({
+            "type": "tool_use",
+            "id": "call_00",
+            "name": "Read",
+            "input": {"file_path": long_path},
+        });
+        let stats = apply(&mut b, Compact::Tools);
+        let text = tool_results(&b)[0]["content"].as_str().expect("a stub").to_owned();
+
+        assert_eq!(stats.tool_results_elided, TURNS - KEEP_TURNS);
+        assert!(
+            text.starts_with(&format!("[elided:{}B; ", stubbed_bytes(0))),
+            "the byte count survives the change: {text}"
+        );
+        assert!(text.contains("Read /src/"), "the call is named: {text}");
+        assert!(
+            text.ends_with("…]"),
+            "a long target is clipped, not carried whole: {text}"
+        );
+        assert!(
+            !text.contains("unique_tail"),
+            "the tail of a long target must not be in the stub: {text}"
+        );
+    }
+
+    /// A call the model made *is* named even when it carries no target string —
+    /// the tool is still something to recognise. Only a result whose call cannot
+    /// be found at all falls back to the bare count.
+    #[test]
+    fn a_stub_falls_back_to_the_bare_count_only_when_the_call_is_missing() {
+        let mut b = body();
+        b["messages"][1]["content"][1] = json!({
+            "type": "tool_use",
+            "id": "call_00",
+            "name": "TodoWrite",
+            "input": {"todos": []},
+        });
+        let _ = apply(&mut b, Compact::Tools);
+        let named = tool_results(&b)[0]["content"].as_str().expect("a stub").to_owned();
+        assert_eq!(named, format!("[elided:{}B; TodoWrite]", stubbed_bytes(0)));
+
+        // The same result, but the call it belongs to is not in the body — an id
+        // no `tool_use` answers. It is still stubbed, because the alternative is
+        // forwarding megabytes to save a naming we cannot do.
+        let mut b = body();
+        b["messages"][1]["content"][1]["id"] = json!("call_99");
+        let _ = apply(&mut b, Compact::Tools);
+        let bare = tool_results(&b)[0]["content"].as_str().expect("a stub").to_owned();
+        assert_eq!(bare, format!("[elided:{}B]", stubbed_bytes(0)));
     }
 
     /// The one elision class where the loss is semantic rather than bulk.
@@ -752,7 +1036,7 @@ mod tests {
         let first = tool_results(&b)[0];
         assert_eq!(
             serialized(&first["content"]).len(),
-            1002,
+            PAYLOAD + 2,
             "the error's content is intact, not stubbed"
         );
     }
@@ -779,10 +1063,11 @@ mod tests {
         let stats = apply(&mut b, Compact::Tools);
 
         assert_eq!(stats.tool_results_elided, TURNS - KEEP_TURNS - 1);
+        assert_eq!(stats.tool_results_kept_small, 1);
         assert_eq!(
             tool_results(&b)[0]["content"],
             ack,
-            "a 34-byte acknowledgement must survive a 14-byte stub"
+            "a 34-byte acknowledgement is under `MIN_TOOL_RESULT_BYTES` and must survive"
         );
     }
 
@@ -989,9 +1274,9 @@ mod tests {
             .filter(|c| c.starts_with(ELIDED_PREFIX))
             .collect();
         assert_eq!(stubs.len(), TURNS - KEEP_TURNS);
-        assert!(stubs[0].contains("1002B"), "{}", stubs[0]);
+        assert!(stubs[0].contains(&format!("{}B", stubbed_bytes(0))), "{}", stubs[0]);
         assert!(
-            !stubs[0].contains("14B"),
+            !stubs[0].contains(&format!("{}B", stubs[0].len())),
             "the stub's own length leaked in: {}",
             stubs[0]
         );

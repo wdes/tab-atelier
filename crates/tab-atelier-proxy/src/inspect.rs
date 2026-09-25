@@ -191,6 +191,23 @@ pub struct Compaction {
     pub tool_results_kept_for_error: usize,
     /// Tool results a stub would have lengthened — kept verbatim.
     pub tool_results_kept_small: usize,
+    /// Tool results the pass found and *declined* to elide, because the stale
+    /// region was under [`crate::compact`]'s `ELIDE_ABOVE_BYTES` floor.
+    ///
+    /// The same reason as the field above it, for a failure that is harder to
+    /// see. A transcript the panel shows as repeatedly compacted with nothing
+    /// saved is `0` here when there was genuinely nothing to do, and nonzero
+    /// when elision was available and refused — and those want opposite
+    /// investigations. On 2026-09-25 the refused case was the live one: a client
+    /// looped on stubs the pass had written into a body it had no contextual
+    /// reason to touch, and nothing in the record said so.
+    ///
+    /// Deserialization defaulted, unlike its neighbours: captures are written to
+    /// disk, so a record from a proxy that predates this field has to keep
+    /// loading. `0` is also the truthful answer for those — the pass that wrote
+    /// them had no floor and so declined nothing.
+    #[serde(default)]
+    pub tool_results_kept_under_budget: usize,
     pub thinking_dropped: usize,
     pub notices_dropped: usize,
 }

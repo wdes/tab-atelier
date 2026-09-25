@@ -573,6 +573,21 @@ pub fn shape_body(
             elided.thinking_dropped,
             elided.notices_dropped
         );
+    } else if elided.tool_results_kept_under_budget > 0 {
+        // Elision had work in front of it and declined it. Logged at debug rather
+        // than info because it is the quiet case, but logged at all because it is
+        // the one an operator debugging an un-shrunk transcript is asking about —
+        // and on 2026-09-25 it was the live one. The inspect record carries the
+        // same number to the panel; this is so a plain log tail shows it too.
+        log::debug!(
+            "proxy: compacted {}/{} {before} → {} bytes: no change — the stale region's \
+             {} tool results are under the {} byte floor, so they were forwarded whole",
+            route.provider_id,
+            route.model_id,
+            encoded.len(),
+            elided.tool_results_kept_under_budget,
+            crate::compact::ELIDE_ABOVE_BYTES
+        );
     }
     // Recorded whenever a level was in force, even if it changed nothing:
     // "compaction is on and elided nothing" and "compaction is off" are
@@ -593,6 +608,7 @@ pub fn shape_body(
             tool_results_elided: elided.tool_results_elided,
             tool_results_kept_for_error: elided.tool_results_kept_for_error,
             tool_results_kept_small: elided.tool_results_kept_small,
+            tool_results_kept_under_budget: elided.tool_results_kept_under_budget,
             thinking_dropped: elided.thinking_dropped,
             notices_dropped: elided.notices_dropped,
         })
@@ -1367,11 +1383,17 @@ mod tests {
             reason: None,
         };
         // Ten tool-result turns, of which the keep window leaves six.
+        //
+        // The payload is sized to clear `compact::ELIDE_ABOVE_BYTES`: four stale
+        // results at 100 KB each is 400 KB against a 256 KiB floor. A smaller
+        // fixture would exercise the decline path instead and this test would
+        // pass with zero elisions — which is what it did, once, before the floor
+        // landed and made the assumption visible.
         let turns: Vec<String> = (0..10)
             .map(|i| {
                 format!(
                     r#"{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"call_{i:02}","content":"{}"}}]}}"#,
-                    "r".repeat(500)
+                    "r".repeat(100_000)
                 )
             })
             .collect();
@@ -1390,10 +1412,61 @@ mod tests {
         let record = record.expect("a level was in force, so a record comes back");
         assert_eq!(record.level, "tools");
         assert_eq!(record.tool_results_elided, 4, "six of ten are inside the keep window");
+        assert_eq!(record.tool_results_kept_under_budget, 0, "the floor was cleared");
         assert_eq!(record.bytes_before, u64::try_from(before).expect("fits"));
         assert_eq!(record.bytes_after, u64::try_from(after.len()).expect("fits"));
         assert!(record.saved() > 0, "the body did shrink");
         assert!(after.len() < before);
+
+        // The same ten turns, small enough that the pass declines them. The
+        // operator-facing distinction this buys: "compaction is on and there was
+        // nothing worth doing" must not look like "compaction is on and it is
+        // quietly refusing to work".
+        let small: Vec<String> = (0..10)
+            .map(|i| {
+                format!(
+                    r#"{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"call_{i:02}","content":"{}"}}]}}"#,
+                    "r".repeat(500)
+                )
+            })
+            .collect();
+        let body = Bytes::from(format!(r#"{{"model":"m","messages":[{}]}}"#, small.join(",")));
+        let (after, declined, _) = shape_body(
+            &body,
+            &route,
+            "m",
+            crate::compact::Compact::Tools,
+            &crate::tools::Policy::default(),
+            true,
+            crate::identity::Vendor::Anthropic,
+        );
+        let declined = declined.expect("still a record");
+        assert_eq!(declined.tool_results_elided, 0);
+        assert_eq!(
+            declined.tool_results_kept_under_budget, 4,
+            "the four stale results are reported as declined, not as absent"
+        );
+        assert_eq!(declined.saved(), 0, "declining saves nothing");
+        // Not byte-identical: `shape_body` parses and re-serialises, so the
+        // output differs from the input in key order and whitespace whatever the
+        // pass does. What must hold is that no *content* was touched — the four
+        // stale results are the ones the client sent, in full.
+        assert_eq!(
+            declined.bytes_after, declined.bytes_before,
+            "declining must not change the measured size"
+        );
+        let parsed: serde_json::Value = serde_json::from_slice(&after).expect("still JSON");
+        let results: Vec<&str> = parsed["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .map(|m| m["content"][0]["content"].as_str().expect("a string"))
+            .collect();
+        assert_eq!(results.len(), 10);
+        assert!(
+            results.iter().all(|c| c.len() == 500 && !c.starts_with("[elided:")),
+            "every result is intact, none stubbed"
+        );
 
         let plain = Bytes::from(r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#);
         let (_, quiet, _) = shape_body(

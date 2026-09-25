@@ -512,11 +512,18 @@ fn compaction_reaches_upstream_and_only_where_it_is_configured() {
 
     // Ten tool-result turns, so six survive the window and four are elided —
     // the same shape the unit fixture uses.
+    //
+    // The payloads clear `compact::ELIDE_ABOVE_BYTES` on purpose: the four stale
+    // results are 320 KB against a 256 KiB floor, so elision engages. At the
+    // 1,000 bytes this used to send, the pass now declines the body and every
+    // assertion below fails on a request that was deliberately never over any
+    // budget — which is the behaviour the floor exists to produce, just not what
+    // this test is for.
     let mut messages = Vec::new();
     for i in 0..10 {
         messages.push(format!(
             r#"{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"call_{i:02}","content":"{}"}}]}}"#,
-            "r".repeat(1000)
+            "r".repeat(80_000)
         ));
         messages.push(format!(
             r#"{{"role":"assistant","content":[{{"type":"thinking","thinking":"{}","signature":"s{i:02}"}},{{"type":"tool_use","id":"call_{i:02}","name":"Bash","input":{{}}}}]}}"#,

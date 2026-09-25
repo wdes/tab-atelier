@@ -83,7 +83,7 @@ missing forever. That rules out anything time-based or random.
 
 | # | layer | what it does | kept verbatim |
 |---|-------|--------------|---------------|
-| A | `tools` | replaces old `tool_result` **content** with a stub naming the byte count and `tool_use_id` | last **6** tool-result turns |
+| A | `tools` | replaces old `tool_result` **content** with a stub naming the byte count and the call that produced it | last **6** tool-result turns |
 | B | `+thinking` | drops `thinking` blocks on older assistant turns | last **6** assistant turns |
 | C | `+notices` | drops stale injected system notices — the `<total_tokens>` banner, `[SYSTEM NOTIFICATION …]`, PostToolUse notes, "user sent a new message" | the newest banner, plus the last **6** notices |
 
@@ -107,12 +107,26 @@ The saving was real but small: over the captures sampled it removed **12.9 MB
 against layer A's 107 MB** — 11% of everything this pass removes — and bodies
 came out about 5% smaller because of it.
 
-The stubs are the point of layer A: `"[elided: 9073B]"` keeps the block and its
-position, and tells the model *that something was there* rather than pretending
-it was always empty. It deliberately does not repeat the `tool_use_id`, which is
-already a sibling field on the same block — 803 of 804 stubs were duplicating it
-at 44 bytes each. The byte count stays: it is what tells the model whether
-re-reading is worth the round trip.
+The stubs are the point of layer A: `"[elided:9073B; Read /src/lib.rs]"` keeps the
+block and its position, and tells the model *that something was there* rather
+than pretending it was always empty. It deliberately does not repeat the
+`tool_use_id`, which is already a sibling field on the same block — 803 of 804
+stubs were duplicating it at 44 bytes each.
+
+It **does** name the call, and that is a fix, not a flourish. The byte count alone
+tells the model *whether* something was there and how big it was, which leaves it
+to work out whether the content it needs is inside — and the safe answer to that
+question, when the task depends on it, is to read it again. Naming the call
+answers the question the model actually has: *have I already read this file this
+conversation?* With the name in the stub it can see that it has. Without it,
+re-reading is the only way to find out.
+
+That is not hypothetical. On 2026-09-25 a `catbus-agent` tab hit exactly that
+wall: 200 rounds, 2.55M input tokens, re-reading the same files because the stubs
+were indistinguishable from results it had never seen. The name is what the model
+writes in the call, so it is the string it can match against its own history — the
+`tool_use_id` cannot serve there, because the model never saw the id when it made
+the call.
 
 The marker is matched in both forms. Conversations already in flight when it
 shrank still carry the long one, and recognising only the short form would make
@@ -132,6 +146,34 @@ That floor used to be implicit, and the accident is worth recording. The rule wa
 stub to 14 would have quietly moved the floor to 14 and started eating
 acknowledgements; `a_short_acknowledgement_is_never_elided` failed the moment the
 marker changed, which is how it was caught.
+
+## Layer A only runs above a size floor
+
+**`ELIDE_ABOVE_BYTES` (256 KiB) gates the whole of layer A.** The pass counts the
+elidable bytes in the stale region first; below the floor it returns the body
+untouched and reports the count as `tool_results_kept_under_budget`.
+
+The reasoning is the same as the 200-byte floor, one scale up. Elision exists to
+keep a request inside the model's context window, and that is a problem only above
+a certain size — most bytes in a long session are machine payload, so on a
+transcript measured in megabytes the pass pays for itself many times over. On a
+request that already fits, it pays for nothing the provider was charging for,
+while costing the model the contents of calls it is still working with. On any hop
+with a prompt cache it is worse than that: rewriting old `tool_result` bodies
+invalidates the cached prefix outright, which is why `ELIDE_BATCH` exists to make
+the rewrite all-or-nothing.
+
+And it is what let the loop happen. The 2026-09-25 tab was never over any budget —
+its requests fit. The pass ran anyway, stubbed what it was not entitled to stub,
+and left the model with nothing to reason over and no way to tell. The floor is
+the fix at the source; the call-name in the stub is the fix at the point of
+contact; `catbus-agent`'s own loop guard is the client-side half that does not
+depend on the relay at all.
+
+The count is reported rather than silently swallowed: a transcript the panel shows
+as repeatedly compacted with nothing saved is `0` here when there was genuinely
+nothing to do, and nonzero when elision was available and declined. Those want
+opposite investigations.
 
 Layer C is the biggest of the last two wins on a measured body: 51.7 KB of a
 353 KB request was injected system notices — harness notifications, PostToolUse

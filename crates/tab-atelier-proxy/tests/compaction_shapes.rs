@@ -17,7 +17,7 @@
 //! and the assertions read the body back the way a client would.
 
 use serde_json::{Value, json};
-use tab_atelier_proxy::compact::{Compact, KEEP_TURNS, apply};
+use tab_atelier_proxy::compact::{Compact, ELIDE_ABOVE_BYTES, KEEP_TURNS, apply};
 
 /// The marker production puts in place of a stubbed tool result.
 /// The stub layer A writes, and the legacy one it must still recognise.
@@ -25,6 +25,30 @@ const TOOL_STUB: &str = "[elided:";
 const TOOL_STUB_LEGACY: &str = "[tool result elided by tab-atelier-proxy: ";
 /// The marker it puts in place of an old write payload.
 const WRITE_STUB: &str = "[file content elided by tab-atelier-proxy: ";
+
+/// How big an old `tool_result` is in these fixtures.
+///
+/// Sized to clear layer A's `ELIDE_ABOVE_BYTES` floor, and that is not
+/// decoration — it is the difference between a fixture that exercises the layer
+/// and one that silently does not. The floor was added after a client looped on
+/// stubs the pass had written into a body it had no reason to touch; below it, a
+/// body comes back exactly as it went in.
+///
+/// The old size here was 1,600 bytes, and four turns of it spent every assertion
+/// in this file: `tool_results_elided > 0` failed, `TOOL_STUB` was absent, and
+/// the tests that assert the *keep window survived* passed for the wrong reason —
+/// nothing had been touched anywhere. A fixture under the floor tests the
+/// decline path whichever test uses it, so the number has to be above it.
+///
+/// Four turns at 80 KB is 320 KB against a 256 KiB floor, which leaves margin
+/// wide enough that a threshold change fails loudly here rather than quietly
+/// hollowing these tests out again. `fixtures_clear_the_elision_floor` below is
+/// what holds that — by running the fixture, not by re-deriving the arithmetic.
+///
+/// Note this is for `tool_result` payloads only. The `Write`-payload tests build
+/// their own `filler(1_600)` on purpose: layer C has its own floor and its own
+/// reasons, and borrowing this constant there would couple two unrelated rules.
+const OLD_RESULT_BYTES: usize = 80_000;
 
 /// A payload of `len` bytes, built from a short repeated pattern.
 ///
@@ -113,10 +137,39 @@ fn all_strings(value: &Value) -> Vec<String> {
 }
 
 #[test]
+fn fixtures_clear_the_elision_floor() {
+    // The guard on the *other* assumption this file rests on, and the one that was
+    // false when the floor landed. Every fixture here means to exercise layer A;
+    // below `ELIDE_ABOVE_BYTES` the pass declines the body whole instead, and the
+    // tests that assert the keep window survived then pass for the wrong reason —
+    // nothing anywhere was touched, so "the tail is intact" is true trivially
+    // while "the old results were elided" is false.
+    //
+    // Asserted by *running the real fixture*, not by multiplying constants
+    // together. An earlier version of this test did the arithmetic itself and got
+    // it wrong — 256 KiB is 262,144 bytes, not 256,000, and it counted one stale
+    // turn fewer than the builder makes — which would have hidden the very
+    // assumption it exists to check. The fixture is the thing that has to clear
+    // the floor, so the fixture is what gets measured.
+    let mut body = long_session(4, OLD_RESULT_BYTES);
+    let stats = apply(&mut body, Compact::Tools);
+    assert_eq!(
+        stats.tool_results_kept_under_budget, 0,
+        "layer A declined the fixture whole: its stale results are under the \
+         {ELIDE_ABOVE_BYTES} byte floor, so every layer-A assertion in this file is vacuous"
+    );
+    assert!(
+        stats.tool_results_elided > 0,
+        "the fixture cleared the floor but nothing was elided, which means the fixture no \
+         longer exercises layer A at all"
+    );
+}
+
+#[test]
 fn fixtures_are_generated_not_stored() {
     // The guard on this file: a payload must be a repeated pattern, so a real
     // capture can never be pasted in. If this fails, a fixture became data.
-    let body = long_session(4, 1_600);
+    let body = long_session(4, OLD_RESULT_BYTES);
     for s in all_strings(&body) {
         if s.len() < 64 {
             continue;
@@ -132,7 +185,7 @@ fn fixtures_are_generated_not_stored() {
 
 #[test]
 fn old_tool_results_are_replaced_by_a_stub() {
-    let mut body = long_session(4, 1_600);
+    let mut body = long_session(4, OLD_RESULT_BYTES);
     let stats = apply(&mut body, Compact::Tools);
 
     assert!(stats.tool_results_elided > 0, "nothing was elided");
@@ -153,7 +206,7 @@ fn a_legacy_stub_survives_the_pass_unchanged() {
     // one planted here is padded past 200 bytes. Without the padding this test
     // passed even with the legacy prefix removed, because the floor had already
     // kept the stub — it asserted nothing.
-    let mut body = long_session(4, 1_600);
+    let mut body = long_session(4, OLD_RESULT_BYTES);
     let legacy = format!("{TOOL_STUB_LEGACY}1002 bytes; tool_use_id=call_00{}]", "x".repeat(200));
 
     let mut planted = false;
@@ -183,7 +236,7 @@ fn the_trailing_keep_window_is_left_alone() {
     // payload appears twice per turn — the Write argument and the tool result
     // that answered it — and pinning that arithmetic instead of the property
     // would make the test fail on a fixture change that broke nothing.
-    let mut body = long_session(4, 1_600);
+    let mut body = long_session(4, OLD_RESULT_BYTES);
     let recent = filler(400);
     let before = all_strings(&body).iter().filter(|s| **s == recent).count();
     assert!(before > 0, "the fixture has no recent payload to protect");
@@ -198,7 +251,7 @@ fn the_trailing_keep_window_is_left_alone() {
 fn tool_use_and_tool_result_stay_paired() {
     // The one invariant the compaction module documents as sacred: dropping a
     // `tool_result` leaves its `tool_use` unanswered, which is a 400.
-    let mut body = long_session(4, 1_600);
+    let mut body = long_session(4, OLD_RESULT_BYTES);
     let _ = apply(&mut body, Compact::All);
 
     let mut calls: Vec<String> = Vec::new();
@@ -261,7 +314,7 @@ fn no_write_payload_is_ever_replaced_by_a_marker() {
     // and nothing is elided — a fixture on which the assertions below could not
     // fail. This promotes the oldest turn's write to a payload the old layer
     // would have stubbed and puts it where that layer applied.
-    let mut body = long_session(9, 1_600);
+    let mut body = long_session(9, OLD_RESULT_BYTES);
     let authored = filler(4_000);
     body["messages"][0]["content"][0]["input"]["content"] = Value::String(authored.clone());
 
