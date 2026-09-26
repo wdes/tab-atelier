@@ -47,7 +47,25 @@ const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
 /// a message comes to promise a limit the request does not use, which is exactly
 /// what happened to the round-cap warning that claimed "32" while the default
 /// was 200.
-const MAX_OUTPUT_TOKENS: u32 = 16_384;
+///
+/// 65536 because the ceiling is free and the *retry* is not. A reply is billed on
+/// the output tokens it actually produces, so a ceiling above that costs the same
+/// as one below it — the model still stops when it is done. What costs is being
+/// cut: the answer so far is re-sent as input on the next round, and it is always
+/// a cache miss, since that text has never been seen as input before. Measured
+/// against the endpoint, a reply that needed 31405 tokens took four rounds at a
+/// 8192 ceiling and about 40% more than finishing in one.
+///
+/// The number is also about reasoning, which shares this budget rather than
+/// having one of its own — `budget_tokens` is ignored there. A turn whose thinking
+/// runs long can spend the whole ceiling and return no text at all; that was
+/// observed at 8192, and it is a better account of a truncated reply than length
+/// is. So the ceiling has to cover thinking *plus* answer, not the answer alone.
+///
+/// Not the 384K the provider allows: a reply that goes wrong should be cut off
+/// somewhere, and 65536 bounds that at a few cents while leaving the measured
+/// worst case a clear margin.
+const MAX_OUTPUT_TOKENS: u32 = 65_536;
 
 /// What the model is told when its previous reply stopped at the output limit.
 ///

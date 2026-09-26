@@ -62,6 +62,36 @@ const CONTINUATION_ROUND: &str = r#"{
     "usage": { "input_tokens": 9, "output_tokens": 3 }
 }"#;
 
+/// The ceiling reached with nothing to show for it.
+///
+/// Measured, not invented: on this endpoint thinking is drawn from the same output budget as the
+/// answer, so a hard-thinking turn can spend the entire ceiling on thinking and return empty
+/// content with `stop_reason: "max_tokens"`. Observed at 8192 — 8192 output tokens, zero
+/// characters of text. See `docs/output-limit.md`.
+const SILENT_CUT_ROUND: &str = r#"{
+    "id": "msg_silent",
+    "type": "message",
+    "role": "assistant",
+    "model": "claude-sonnet-4-6",
+    "content": [],
+    "stop_reason": "max_tokens",
+    "usage": { "input_tokens": 51, "output_tokens": 8192 }
+}"#;
+
+/// A round that hit the ceiling *and* asked for a tool, which is not a truncated answer.
+const CUT_OFF_TOOL_ROUND: &str = r#"{
+    "id": "msg_tool_cut",
+    "type": "message",
+    "role": "assistant",
+    "model": "claude-sonnet-4-6",
+    "content": [
+        { "type": "text", "text": "Let me look." },
+        { "type": "tool_use", "id": "c1", "name": "Read", "input": { "path": "note.txt" } }
+    ],
+    "stop_reason": "max_tokens",
+    "usage": { "input_tokens": 5, "output_tokens": 65536 }
+}"#;
+
 const RELAY_TOKEN: &str = "tap_integration_test_token";
 
 /// Serve one canned `(status line, JSON body)` per connection, in order.
@@ -1697,11 +1727,97 @@ fn a_reply_that_never_finishes_reports_the_limit() {
     let text = reply["text"].as_str().unwrap();
     assert!(text.contains("still cut off"), "the limit must be reported:\n{text}");
     // The ceiling we ask for, tracked here because this test cannot see the constant.
-    assert!(text.contains("16384"), "and named:\n{text}");
+    assert!(text.contains("65536"), "and named:\n{text}");
     assert!(text.contains("continuations"), "and the attempt counted:\n{text}");
     assert!(
         !text.contains("ask for the rest"),
         "the operator is not the retry mechanism any more:\n{text}"
+    );
+}
+
+/// The request asks for the ceiling the truncation message quotes.
+///
+/// Two places hold this number — the request and the note — and a note that promises a limit the
+/// request does not use is a recorded failure in this file already: the round-cap warning used to
+/// claim "32" while the default was 200. Pinned so the two cannot drift apart again.
+#[test]
+fn the_request_asks_for_the_configured_output_ceiling() {
+    let dir = tempfile::tempdir().unwrap();
+    let (port, rx) = spawn_mock_relay(vec![("HTTP/1.1 200 OK", FINAL_ROUND)]);
+    let socket = dir.path().join("agent.sock");
+    let (_agent, mut reader, mut stream) = spawn_agent_at(dir.path(), &socket, port);
+    let _ = send_prompt(&mut stream, &mut reader, "hi");
+
+    let body = body_of(&rx.recv_timeout(Duration::from_secs(5)).unwrap());
+    assert_eq!(
+        body["max_tokens"], 65536,
+        "the ceiling is free (a reply is billed for what it produces) and a retry is not, so \
+         this is set high enough that a normal reply is never cut. See docs/output-limit.md."
+    );
+}
+
+/// A round cut off at the ceiling that produced *no text at all* is still continued.
+///
+/// This is the shape the measurement found, not a hypothetical one: reasoning and the answer
+/// share the output budget on this endpoint, so a hard-thinking turn can spend the whole ceiling
+/// on thinking and return empty content with `stop_reason: "max_tokens"`. That round looks
+/// exactly like a finished reply that chose to say nothing — the failure the old code shipped,
+/// where the operator saw a yellow note and nothing else.
+#[test]
+fn a_cut_round_that_produced_no_text_still_continues() {
+    let dir = tempfile::tempdir().unwrap();
+    let (port, rx) = spawn_mock_relay(vec![
+        ("HTTP/1.1 200 OK", SILENT_CUT_ROUND),
+        ("HTTP/1.1 200 OK", FINAL_ROUND),
+    ]);
+    let socket = dir.path().join("agent.sock");
+    let (_agent, mut reader, mut stream) = spawn_agent_at(dir.path(), &socket, port);
+
+    let reply = send_prompt(&mut stream, &mut reader, "think hard");
+    assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+    assert_eq!(
+        reply["text"], "hi from the relay",
+        "the empty round contributes nothing and the answer is what came next"
+    );
+
+    // And a continuation really was sent, rather than the empty round being taken for an answer.
+    let _first = body_of(&rx.recv_timeout(Duration::from_secs(5)).unwrap());
+    let second = body_of(&rx.recv_timeout(Duration::from_secs(5)).unwrap());
+    assert!(
+        second.to_string().contains("output-token limit"),
+        "an empty round at the ceiling must be continued:\n{second}"
+    );
+}
+
+/// A round that hit the ceiling *and* asked for a tool runs the tool.
+///
+/// `stop_reason: "max_tokens"` with tool calls is not a truncated answer — the call that arrived
+/// is complete, and the loop's job is to run it. The continuation belongs to the other branch,
+/// the one with no tool work to do, and this pins it there: a model cut off after asking for a
+/// tool must not be sent a cue asking it to finish a sentence it already finished.
+#[test]
+fn a_tool_call_that_also_hit_the_limit_runs_the_tool() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("note.txt"), "from the file\n").unwrap();
+    let (port, rx) = spawn_mock_relay(vec![
+        ("HTTP/1.1 200 OK", CUT_OFF_TOOL_ROUND),
+        ("HTTP/1.1 200 OK", FINAL_ROUND),
+    ]);
+    let socket = dir.path().join("agent.sock");
+    let (_agent, mut reader, mut stream) = spawn_agent_at(dir.path(), &socket, port);
+
+    let reply = send_prompt(&mut stream, &mut reader, "look at note.txt");
+    assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+
+    let _first = body_of(&rx.recv_timeout(Duration::from_secs(5)).unwrap());
+    let second = body_of(&rx.recv_timeout(Duration::from_secs(5)).unwrap());
+    assert!(
+        tool_result_of(&second, "c1").contains("from the file"),
+        "the complete call in a cut-off round must still run:\n{second}"
+    );
+    assert!(
+        !second.to_string().contains("output-token limit"),
+        "a round with tool work is not a truncated answer:\n{second}"
     );
 }
 
