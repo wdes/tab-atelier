@@ -17,6 +17,11 @@ pub mod bench_lag;
 pub mod brain;
 /// `tab-atelier brief` — what a Claude session starting here would be told.
 pub mod brief;
+/// `tab-atelier catalog list` / `spawn --from-skill` — the PROFIL catalogue.
+///
+/// A reusable agent profile (prompt, tools, measured efficiency) and the loop that
+/// improves it. See the module docs for what was (and wasn't) ported.
+pub mod catalog;
 /// `tab-atelier --check` — preflight the GUI's runtime libraries.
 pub mod check;
 pub mod claude_hook;
