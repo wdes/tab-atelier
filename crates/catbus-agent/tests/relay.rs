@@ -37,6 +37,31 @@ const FINAL_ROUND: &str = r#"{
     "usage": { "input_tokens": 5, "output_tokens": 4 }
 }"#;
 
+/// A reply the server stopped mid-sentence at the output ceiling.
+///
+/// The text deliberately ends on the word `to` and the continuation below begins with a space,
+/// so the two only read as one sentence if they are joined without anything between them.
+const CUT_OFF_ROUND: &str = r#"{
+    "id": "msg_cut",
+    "type": "message",
+    "role": "assistant",
+    "model": "claude-sonnet-4-6",
+    "content": [{ "type": "text", "text": "Here is the analysis you asked for. The first thing to" }],
+    "stop_reason": "max_tokens",
+    "usage": { "input_tokens": 5, "output_tokens": 8192 }
+}"#;
+
+/// What the model writes when asked to finish [`CUT_OFF_ROUND`].
+const CONTINUATION_ROUND: &str = r#"{
+    "id": "msg_more",
+    "type": "message",
+    "role": "assistant",
+    "model": "claude-sonnet-4-6",
+    "content": [{ "type": "text", "text": " hand back." }],
+    "stop_reason": "end_turn",
+    "usage": { "input_tokens": 9, "output_tokens": 3 }
+}"#;
+
 const RELAY_TOKEN: &str = "tap_integration_test_token";
 
 /// Serve one canned `(status line, JSON body)` per connection, in order.
@@ -1566,27 +1591,21 @@ fn auto_mode_consults_the_judge_and_honours_a_block() {
     assert_ne!(first["model"], "deepseek-flash");
 }
 
-/// A reply the server cut off at the output limit is reported as incomplete.
+/// A reply the server cut off at the output limit is continued, not reported.
 ///
-/// `stop_reason: "max_tokens"` with no tool calls lands in the same branch as a
-/// clean `end_turn` — the model simply stopped, so there is no error to raise
-/// and nothing to continue with. Reporting `done` over half a sentence is the
-/// failure this guards; an operator reading a fragment as a whole answer is
-/// worse than an error, because nothing looks wrong.
+/// `stop_reason: "max_tokens"` with no tool calls used to land in the same branch as a clean
+/// `end_turn` — the model simply stopped — and the answer was handed over with a warning telling
+/// the operator to ask for the rest. That reads as a working feature and is not one: the
+/// operator asks, and the model has to pick up a sentence whose beginning is no longer in its
+/// view. The limit is a property of one request, so the honest repair is to make the next one
+/// and let the model finish its own thought.
 #[test]
-fn a_reply_cut_off_at_the_output_limit_says_so() {
+fn a_reply_cut_off_at_the_output_limit_is_continued() {
     let dir = tempfile::tempdir().unwrap();
-    let truncated = serde_json::json!({
-        "id": "msg_cut",
-        "type": "message",
-        "role": "assistant",
-        "model": "claude-sonnet-4-6",
-        "content": [{ "type": "text", "text": "Here is the analysis you asked for. The first thing to" }],
-        "stop_reason": "max_tokens",
-        "usage": { "input_tokens": 5, "output_tokens": 8192 }
-    })
-    .to_string();
-    let (port, _rx) = spawn_mock_relay_owned(vec![("HTTP/1.1 200 OK", truncated)]);
+    let (port, rx) = spawn_mock_relay(vec![
+        ("HTTP/1.1 200 OK", CUT_OFF_ROUND),
+        ("HTTP/1.1 200 OK", CONTINUATION_ROUND),
+    ]);
     let socket = dir.path().join("agent.sock");
     let (_agent, mut reader, mut stream) = spawn_agent_at(dir.path(), &socket, port);
 
@@ -1594,14 +1613,95 @@ fn a_reply_cut_off_at_the_output_limit_says_so() {
     assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
     let text = reply["text"].as_str().unwrap();
 
-    // The fragment is still shown — it is not withheld — but flagged.
-    assert!(
-        text.contains("Here is the analysis"),
-        "the text should survive:\n{text}"
+    // The two halves are one answer. The cut fell mid-sentence, so they are joined with
+    // *nothing*: a newline here would put a paragraph break inside a sentence, which is what
+    // the old code did on every tool-loop round and is wrong for exactly this case.
+    assert_eq!(
+        text, "Here is the analysis you asked for. The first thing to hand back.",
+        "the continuation must read as one paragraph:\n{text}"
     );
-    assert!(text.contains("cut off"), "a truncated reply must be flagged:\n{text}");
-    // And the flag names the limit that was hit, so the fix is discoverable.
-    assert!(text.contains("8192"), "the limit should be named:\n{text}");
+    // And no warning: nothing was lost, so there is nothing to report.
+    assert!(
+        !text.contains("cut off"),
+        "a continued reply is not a truncated one:\n{text}"
+    );
+
+    // The model was told why it was being asked again, and that the text so far is fine —
+    // otherwise it restates the beginning and the operator reads it twice. Not the last message:
+    // the harness appends its own environment block to each request, so the cue is found by
+    // looking for it rather than by assuming where it sits. Matched on the rendered message
+    // because the history builder turns the plain text into a content block and adds a cache
+    // breakpoint to it on the way out.
+    let _first = body_of(&rx.recv_timeout(Duration::from_secs(5)).unwrap());
+    let second = body_of(&rx.recv_timeout(Duration::from_secs(5)).unwrap());
+    let messages = second["messages"].as_array().unwrap();
+    let cue = messages
+        .iter()
+        .find(|m| m.to_string().contains("output-token limit"))
+        .unwrap_or_else(|| panic!("no continuation cue in: {messages:?}"));
+    let cue_text = cue.to_string();
+    assert_eq!(cue["role"], "user", "the protocol has no other role for this");
+    assert!(
+        cue_text.contains("Continue from exactly where it stopped"),
+        "and what is wanted of it:\n{cue_text}"
+    );
+    assert!(
+        cue_text.contains("do not apologise"),
+        "and what it should not spend the budget on:\n{cue_text}"
+    );
+}
+
+/// The cue is sent to the model and kept out of the transcript.
+///
+/// It has to be a `user` message on the wire, because that is the only role this side speaks
+/// in — but it is not the operator's words, and a resumed session that showed it as such would
+/// be showing a message nobody sent.
+#[test]
+fn the_continuation_cue_never_reaches_the_transcript() {
+    let dir = tempfile::tempdir().unwrap();
+    let (port, _rx) = spawn_mock_relay(vec![
+        ("HTTP/1.1 200 OK", CUT_OFF_ROUND),
+        ("HTTP/1.1 200 OK", CONTINUATION_ROUND),
+    ]);
+    let socket = dir.path().join("agent.sock");
+    let (_agent, mut reader, mut stream) = spawn_agent_at(dir.path(), &socket, port);
+    let _ = send_prompt(&mut stream, &mut reader, "explain");
+
+    let history = transcript_text(dir.path());
+    assert!(
+        !history.contains("output-token limit"),
+        "the cue is ours, not the model's, and belongs on no disk:\n{history}"
+    );
+    assert!(history.contains("explain"), "the operator's own words are kept");
+}
+
+/// A reply that stops at the limit again and again is eventually reported.
+///
+/// The automatic continuation is bounded because the ceiling is a property of the request, not
+/// of the answer: a model that reasons its way to 8192 tokens will do it again next round, and
+/// an unbounded loop would spend the turn doing nothing else. When the budget runs out the
+/// operator is told what was already tried — which is the difference between the old message
+/// ("ask for the rest") and this one.
+#[test]
+fn a_reply_that_never_finishes_reports_the_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    // The default is eight continuations, so nine stops in a row exhausts it: each of the first
+    // eight asks again, and the ninth is the one that reports.
+    let replies: Vec<(&'static str, &'static str)> = (0..9).map(|_| ("HTTP/1.1 200 OK", CUT_OFF_ROUND)).collect();
+    let (port, _rx) = spawn_mock_relay(replies);
+    let socket = dir.path().join("agent.sock");
+    let (_agent, mut reader, mut stream) = spawn_agent_at(dir.path(), &socket, port);
+
+    let reply = send_prompt(&mut stream, &mut reader, "explain");
+    assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+    let text = reply["text"].as_str().unwrap();
+    assert!(text.contains("still cut off"), "the limit must be reported:\n{text}");
+    assert!(text.contains("8192"), "and named:\n{text}");
+    assert!(text.contains("continuations"), "and the attempt counted:\n{text}");
+    assert!(
+        !text.contains("ask for the rest"),
+        "the operator is not the retry mechanism any more:\n{text}"
+    );
 }
 
 /// A clean `end_turn` carries no such warning, so the flag means something.

@@ -49,6 +49,22 @@ const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
 /// was 200.
 const MAX_OUTPUT_TOKENS: u32 = 8192;
 
+/// What the model is told when its previous reply stopped at the output limit.
+///
+/// Sent as a `user` message because that is the only role the API lets this side speak in, but
+/// it is not from the operator and is never written to the transcript — see where it is pushed.
+/// It says the reply was cut off, that the text so far is complete *as text*, and that what is
+/// wanted is the remainder and nothing else: a model asked to continue will otherwise helpfully
+/// restate the part that already arrived, and the operator would read it twice.
+///
+/// "Do not apologise" is in there for the same reason it is in most of these: an apology costs
+/// a paragraph of the budget that is already too small.
+const CONTINUATION_CUE: &str = "\
+Your previous message was cut off at the output-token limit, not by you finishing. Continue \
+from exactly where it stopped, mid-sentence if that is where the cut fell — repeat nothing you \
+already wrote, do not restate the question, do not start over, and do not apologise. \
+If a tool call was cut in half, make that call again from the start with the full arguments.";
+
 /// What the model is asked to write, and why it changed.
 ///
 /// Nothing session-specific may be added to this text: the working directory and
@@ -1015,6 +1031,20 @@ impl Agent {
         // the same call again, or the same result again — are only visible as a
         // run. See `progress` for the case that made this necessary.
         let mut loop_guard = progress::Progress::from_env();
+        // Set when a round stopped at the output limit, so the next round is understood as the
+        // second half of the same sentence rather than a new paragraph — see the text arm below
+        // and `CONTINUATION_CUE`.
+        let mut mid_sentence = false;
+        // How many times one answer may be continued before the limit is reported instead.
+        // Bounded because the limit is a property of the request, not of this answer: a model
+        // that reasons its way to the ceiling will do it again next round, and an unbounded
+        // loop would spend the whole turn doing that. Eight is several ordinary replies' worth
+        // of text past the first stop, which is far more than a cut-off sentence needs.
+        let max_continuations: u32 = std::env::var("CATBUS_MAX_CONTINUATIONS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(8);
+        let mut continuations: u32 = 0;
         for _ in 0..max_rounds {
             if cancel.is_cancelled() {
                 return Err(AgentError::Cancelled);
@@ -1089,7 +1119,11 @@ impl Agent {
             for block in &resp.content {
                 match block {
                     Block::Text { text } => {
-                        if !final_text.is_empty() {
+                        // A newline separates turns of a tool loop, which are separate
+                        // statements. It does not separate the two halves of one sentence, and
+                        // a continuation is exactly that — see `mid_sentence` — so that case
+                        // joins with nothing, which is what the model was told to do.
+                        if !final_text.is_empty() && !mid_sentence {
                             final_text.push('\n');
                         }
                         final_text.push_str(text);
@@ -1132,22 +1166,49 @@ impl Agent {
                         content: ApiContent::Blocks(resp.content),
                     });
                 }
-                // A reply cut off by the output limit is not a finished answer,
-                // yet the branch above treats it as one: the model stopped
-                // mid-sentence, so there is no tool to continue with and no
-                // error to raise. Saying so is the difference between a client
-                // that knows it has a fragment and one that reports `done` over
-                // half a sentence — which is what happened before this check
-                // existed.
+                // A reply cut off by the output limit is not a finished answer, yet this
+                // branch is where the turn would end: the model stopped mid-sentence, so
+                // there is no tool to continue with and no error to raise.
+                //
+                // Warning about it is not enough, and a warning is what this used to do:
+                // the operator reads "ask for the rest", asks, and gets a *second* answer
+                // that has to pick up a sentence it can no longer see the start of — when
+                // the request is re-sent, the cut-off reply is in history, but what arrived
+                // after it was the operator's words rather than the model's own train of
+                // thought. The limit is a property of one request, so the honest fix is to
+                // make the next request and let the model finish the thought.
                 if stop_reason.as_deref() == Some("max_tokens") {
-                    // `write!` rather than `push_str(&format!(..))`: the same
-                    // output, without building and dropping a throwaway `String`.
-                    // `write!` to a `String` is infallible, so the result is
-                    // discarded rather than unwrapped.
+                    if continuations < max_continuations {
+                        continuations += 1;
+                        // The next round joins this text without a paragraph break, because
+                        // the model is being asked to finish the sentence, not to start one.
+                        mid_sentence = true;
+                        // In memory only. The transcript keeps the model's words and nothing
+                        // else, so a cue from us must not be written there: it would read, on
+                        // resume, as a thing the operator had said. History is what the next
+                        // request is built from, and that is all this needs to reach the model.
+                        // Scoped so the guard is released before the log and the next round.
+                        {
+                            let mut active = self.active.write().await;
+                            active.history.push(ApiMessage {
+                                role: "user".into(),
+                                content: ApiContent::Plain(CONTINUATION_CUE.to_owned()),
+                            });
+                        }
+                        log::info!(
+                            "response hit the {MAX_OUTPUT_TOKENS}-token output limit; asking the \
+                             model to continue ({continuations}/{max_continuations})"
+                        );
+                        continue;
+                    }
+                    // Out of continuations, so the limit is real and worth reporting — but
+                    // honestly: by now the model was asked to continue and stopped again, so
+                    // the operator is told what was tried rather than told to try it.
                     let _ = write!(
                         final_text,
-                        "\n\n\x1b[33m[reply cut off at the {MAX_OUTPUT_TOKENS}-token output limit — \
-                         it may end mid-sentence; ask for the rest to continue]\x1b[0m"
+                        "\n\n\x1b[33m[reply still cut off at the {MAX_OUTPUT_TOKENS}-token output \
+                         limit after {max_continuations} automatic continuations — it may end \
+                         mid-sentence]\x1b[0m"
                     );
                 }
                 return Ok(Turn {
@@ -1265,6 +1326,11 @@ impl Agent {
             });
             // Done with the borrows — move resp.content into history now.
             let _ = tool_uses;
+            // Whatever the next round says follows tool results, so it is a new statement rather
+            // than the second half of the previous one: the no-separator rule in the text arm
+            // applies to a continuation and to nothing else, and a continuation is over as soon
+            // as the model has been given something to react to.
+            mid_sentence = false;
             {
                 let mut active = self.active.write().await;
                 active.history.push(ApiMessage {
