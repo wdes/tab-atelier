@@ -1,0 +1,848 @@
+Package: tab-atelier-dbgsym
+Architecture: amd64
+Version: 0.5.0~nightly20260926123438.dc00be2-1
+Auto-Built-Package: debug-symbols
+Priority: extra
+Section: debug
+Maintainer: William Desportes <williamdes@wdes.fr>
+Installed-Size: 35310
+Recommends: tab-atelier (= 0.5.0~nightly20260926123438.dc00be2-1)
+Filename: pool/nightly/main/t/tab-atelier/tab-atelier-dbgsym_0.5.0~nightly20260926123438.dc00be2-1_amd64.ddeb
+Size: 31373848
+MD5sum: cf74251da38e1ee69265ff7d813bb695
+SHA1: 79ba13fec623244241f3d18ad5669df36a43a4ce
+SHA256: a067abe6d5cacfc93be107d3a5613def4e46acfc5465bc39131a9948a0cfe224
+SHA512: 57a01db19002156c84df8d5b27c82ba339f24c96ee38206f80c049b691d13c0fb6b60ddad061af533d2b77d8d4bb10c38cb3c6cdfa90588a5414c689a2e99d26
+Homepage: https://github.com/wdes/tab-atelier#readme
+Description: Debug symbols for tab-atelier v0.5.0~nightly20260926123438.dc00be2-1 (amd64)
+
+Package: tab-atelier-dbgsym
+Architecture: amd64
+Version: 0.5.0~nightly20260926124620.cd206f6-1
+Auto-Built-Package: debug-symbols
+Priority: extra
+Section: debug
+Maintainer: William Desportes <williamdes@wdes.fr>
+Installed-Size: 35310
+Recommends: tab-atelier (= 0.5.0~nightly20260926124620.cd206f6-1)
+Filename: pool/nightly/main/t/tab-atelier/tab-atelier-dbgsym_0.5.0~nightly20260926124620.cd206f6-1_amd64.ddeb
+Size: 31385876
+MD5sum: 6b8ebd6e5b4d7c013f1a635b21d243a6
+SHA1: e3824fd0a60912b7c8517f7ee071ec72eb52693d
+SHA256: e6091e6dc808b0e52c95578c7c3f16ff5423c9d14a4e32b03eaddb7d81578ea1
+SHA512: 420644b0a3c443b04e7f5f9fe29f79de8de8867208e2364579a5501c5578de84dc930976dba1dec6f165ad88edc54bf5bde17c31b0303952fde631579df34d88
+Homepage: https://github.com/wdes/tab-atelier#readme
+Description: Debug symbols for tab-atelier v0.5.0~nightly20260926124620.cd206f6-1 (amd64)
+
+Package: tab-atelier-dbgsym
+Architecture: amd64
+Version: 0.5.0~nightly20260926130355.a52b6c6-1
+Auto-Built-Package: debug-symbols
+Priority: extra
+Section: debug
+Maintainer: William Desportes <williamdes@wdes.fr>
+Installed-Size: 35310
+Recommends: tab-atelier (= 0.5.0~nightly20260926130355.a52b6c6-1)
+Filename: pool/nightly/main/t/tab-atelier/tab-atelier-dbgsym_0.5.0~nightly20260926130355.a52b6c6-1_amd64.ddeb
+Size: 31373936
+MD5sum: 2f18952f921d7c08cff9f8b3cbe9058c
+SHA1: 719ad18de6eee8d2eae47effb67c761bca93213e
+SHA256: 66734dc9a5aea2e8762cf37902e2cb69c625d3de81a88d77f9f1828b861415c1
+SHA512: 0c50fba2e812c0f2ec49d331f05cd9043ef9e4cdcca185482f4096cc79b2de79a791b337ec35dca6b7bf07a1dca79e67cb5bc8dc8227e89c5503614ed25a912a
+Homepage: https://github.com/wdes/tab-atelier#readme
+Description: Debug symbols for tab-atelier v0.5.0~nightly20260926130355.a52b6c6-1 (amd64)
+
+Package: tab-atelier-headless-dbgsym
+Architecture: amd64
+Version: 0.5.0~nightly20260926123438.dc00be2-1
+Auto-Built-Package: debug-symbols
+Priority: extra
+Section: debug
+Maintainer: William Desportes <williamdes@wdes.fr>
+Installed-Size: 20116
+Recommends: tab-atelier-headless (= 0.5.0~nightly20260926123438.dc00be2-1)
+Filename: pool/nightly/main/t/tab-atelier/tab-atelier-headless-dbgsym_0.5.0~nightly20260926123438.dc00be2-1_amd64.ddeb
+Size: 17934056
+MD5sum: 28afdf254eb4193b0cee7ffba29cb00d
+SHA1: b161016bc63352837a4d9e2b02e265b2cad33abd
+SHA256: 7c701a876f694c64def36ac7f53f65e84377e014969da361a45f0bef0b916346
+SHA512: dde83e7f7f1d20d209bf03576e5eb1ab598e048f35f95f48b0077b76411015cc5b3616bbfff5a980888ca646bdb53ed79e59414eb0219f8d14d0bad8048f535f
+Homepage: https://github.com/wdes/tab-atelier#readme
+Description: Debug symbols for tab-atelier-headless v0.5.0~nightly20260926123438.dc00be2-1
+ (amd64)
+
+Package: tab-atelier-headless-dbgsym
+Architecture: amd64
+Version: 0.5.0~nightly20260926124620.cd206f6-1
+Auto-Built-Package: debug-symbols
+Priority: extra
+Section: debug
+Maintainer: William Desportes <williamdes@wdes.fr>
+Installed-Size: 20116
+Recommends: tab-atelier-headless (= 0.5.0~nightly20260926124620.cd206f6-1)
+Filename: pool/nightly/main/t/tab-atelier/tab-atelier-headless-dbgsym_0.5.0~nightly20260926124620.cd206f6-1_amd64.ddeb
+Size: 17929632
+MD5sum: 3515cf7dc38f3725a5424a9e4ac3a46c
+SHA1: 0350a061da16f47998f118fd33a736530a3923fa
+SHA256: 90e1baf6a568d5137c7c5191e4af4d27bb836f1b5fb7cdf4b792c14daa7bd64c
+SHA512: 6875bac7320586ffb5c951617453c233cfae2842621b6ba3667ec4baf82ad5cec3e36653ca96c514b245c0c242b76bcf1b17ae00d54234be13b5feb3442cfd8e
+Homepage: https://github.com/wdes/tab-atelier#readme
+Description: Debug symbols for tab-atelier-headless v0.5.0~nightly20260926124620.cd206f6-1
+ (amd64)
+
+Package: tab-atelier-headless-dbgsym
+Architecture: amd64
+Version: 0.5.0~nightly20260926130355.a52b6c6-1
+Auto-Built-Package: debug-symbols
+Priority: extra
+Section: debug
+Maintainer: William Desportes <williamdes@wdes.fr>
+Installed-Size: 20116
+Recommends: tab-atelier-headless (= 0.5.0~nightly20260926130355.a52b6c6-1)
+Filename: pool/nightly/main/t/tab-atelier/tab-atelier-headless-dbgsym_0.5.0~nightly20260926130355.a52b6c6-1_amd64.ddeb
+Size: 17929284
+MD5sum: c7111e8b09b517767753fcb39729ba53
+SHA1: 2498ee88164a8c50068549495b37ea6c85b207ed
+SHA256: ad097ad7c13a9e42d1727b23600ec48fc81cf8dcf4cb79e63142324cacf83273
+SHA512: 94495bd5f53a4020b21976b3be3f5789ed47a09d96246e6f63797a4a09a5fb7d13355f20586a9a232de55301d90c39fc01c58eb6fcbd4b239e6c4115e211d22d
+Homepage: https://github.com/wdes/tab-atelier#readme
+Description: Debug symbols for tab-atelier-headless v0.5.0~nightly20260926130355.a52b6c6-1
+ (amd64)
+
+Package: tab-atelier-headless
+Architecture: amd64
+Version: 0.5.0~nightly20260924231829.90fca11-1
+Priority: optional
+Section: x11
+Maintainer: William Desportes <williamdes@wdes.fr>
+Installed-Size: 21318
+Depends: adduser, bubblewrap, init-system-helpers, libc6 (>= 2.39), libgcc-s1, nftables
+Recommends: openssh-client
+Conflicts: tab-atelier
+Replaces: tab-atelier
+Filename: pool/nightly/main/t/tab-atelier/tab-atelier-headless_0.5.0~nightly20260924231829.90fca11-1_amd64.deb
+Size: 6149112
+MD5sum: 82e0c651f373b4b64cf5c31eabdeee0a
+SHA1: a1874406abc0cde41bf3c63120d99706ccb2e0dd
+SHA256: bb0521110c978cefb35b3eab22a07d4499f2f1604d39e6c03aaf339107599418
+SHA512: c35dd37d92b3ea858d075b6e4f104ced10c2132286a7ff48249674c5b16c9382d1f08943f82b832b580ebcb8e5c379d64a114ca96e5cf04209603027b0cdcf37
+Homepage: https://github.com/wdes/tab-atelier#readme
+Description: Guake-style drop-down terminal emulator for Linux (X11)
+ Display-less companion to tab-atelier. Restores tabs from tabs.json, spawns
+ their PTYs, and runs the same local HTTP/TLS API as the desktop GUI — without
+ any X11 / gpui dependency. Designed for servers, CI runners, and remote shells
+ where the web viewer should still see the same set of named tabs.
+
+Package: tab-atelier-headless
+Architecture: amd64
+Version: 0.5.0~nightly20260925111239.e3ac3aa-1
+Priority: optional
+Section: x11
+Maintainer: William Desportes <williamdes@wdes.fr>
+Installed-Size: 21318
+Depends: adduser, bubblewrap, init-system-helpers, libc6 (>= 2.39), libgcc-s1, nftables
+Recommends: openssh-client
+Conflicts: tab-atelier
+Replaces: tab-atelier
+Filename: pool/nightly/main/t/tab-atelier/tab-atelier-headless_0.5.0~nightly20260925111239.e3ac3aa-1_amd64.deb
+Size: 6146896
+MD5sum: 0ac76df3342934f452e1b8d9681d50e5
+SHA1: 7bee54b3ac27132808b64026d387e76eed43beb8
+SHA256: fb3a213e37d542a6cd685d7a495944c9408216ac67ad8c3668537883d77e6e81
+SHA512: 821557024f69108f0029d1a51d3eab28548eca2f5703a1ab38adcfc7b7f6de22afa410e65d64a0803c0d7df2e5663c6fc088621f004135190e1c3a1ccb353e1a
+Homepage: https://github.com/wdes/tab-atelier#readme
+Description: Guake-style drop-down terminal emulator for Linux (X11)
+ Display-less companion to tab-atelier. Restores tabs from tabs.json, spawns
+ their PTYs, and runs the same local HTTP/TLS API as the desktop GUI — without
+ any X11 / gpui dependency. Designed for servers, CI runners, and remote shells
+ where the web viewer should still see the same set of named tabs.
+
+Package: tab-atelier-headless
+Architecture: amd64
+Version: 0.5.0~nightly20260925120732.a081d49-1
+Priority: optional
+Section: x11
+Maintainer: William Desportes <williamdes@wdes.fr>
+Installed-Size: 21390
+Depends: adduser, bubblewrap, init-system-helpers, libc6 (>= 2.39), libgcc-s1, nftables
+Recommends: openssh-client
+Conflicts: tab-atelier
+Replaces: tab-atelier
+Filename: pool/nightly/main/t/tab-atelier/tab-atelier-headless_0.5.0~nightly20260925120732.a081d49-1_amd64.deb
+Size: 6171776
+MD5sum: 83ab932aa46983f90e9aaa38b109fe9f
+SHA1: 52baffb85f99bb44658d61ed5a9887eee5a22528
+SHA256: f02b7659d63c5f8fc3dd95e85714687666e842e457abf1849e6141543c18692c
+SHA512: 15081ae3612d4962fe2274e4e268c4d6387097b151bb92ace8b679d3851f92fef29743c89f216e937b2fa7e1f39731fa054a43fc223c9b6caf935c3d5a90fc83
+Homepage: https://github.com/wdes/tab-atelier#readme
+Description: Guake-style drop-down terminal emulator for Linux (X11)
+ Display-less companion to tab-atelier. Restores tabs from tabs.json, spawns
+ their PTYs, and runs the same local HTTP/TLS API as the desktop GUI — without
+ any X11 / gpui dependency. Designed for servers, CI runners, and remote shells
+ where the web viewer should still see the same set of named tabs.
+
+Package: tab-atelier-headless
+Architecture: amd64
+Version: 0.5.0~nightly20260925124220.b64311e-1
+Priority: optional
+Section: x11
+Maintainer: William Desportes <williamdes@wdes.fr>
+Installed-Size: 21412
+Depends: adduser, bubblewrap, init-system-helpers, libc6 (>= 2.39), libgcc-s1, nftables
+Recommends: openssh-client
+Conflicts: tab-atelier
+Replaces: tab-atelier
+Filename: pool/nightly/main/t/tab-atelier/tab-atelier-headless_0.5.0~nightly20260925124220.b64311e-1_amd64.deb
+Size: 6178844
+MD5sum: 51f76d7232b1b6c01509a417bc4d3784
+SHA1: 6011e85eedefc7f1cd3187670dd33f18930b0eed
+SHA256: a5ce9759c937f3078fbed01618a5067abecaf35608f123a0ba41a02cee09db31
+SHA512: 50f9ccf52e9e920983e6138e4cafed92254b8c1a01fe86a3560a70fa88c6c15e30e57163df7a52d019b471fea0ddb2dc64f44cdf4eba8035d6dad38956e0b37a
+Homepage: https://github.com/wdes/tab-atelier#readme
+Description: Guake-style drop-down terminal emulator for Linux (X11)
+ Display-less companion to tab-atelier. Restores tabs from tabs.json, spawns
+ their PTYs, and runs the same local HTTP/TLS API as the desktop GUI — without
+ any X11 / gpui dependency. Designed for servers, CI runners, and remote shells
+ where the web viewer should still see the same set of named tabs.
+
+Package: tab-atelier-headless
+Architecture: amd64
+Version: 0.5.0~nightly20260925124342.93ef16d-1
+Priority: optional
+Section: x11
+Maintainer: William Desportes <williamdes@wdes.fr>
+Installed-Size: 21413
+Depends: adduser, bubblewrap, init-system-helpers, libc6 (>= 2.39), libgcc-s1, nftables
+Recommends: openssh-client
+Conflicts: tab-atelier
+Replaces: tab-atelier
+Filename: pool/nightly/main/t/tab-atelier/tab-atelier-headless_0.5.0~nightly20260925124342.93ef16d-1_amd64.deb
+Size: 6178524
+MD5sum: 7758da3876692d653e8b0c0c61744ff6
+SHA1: d72359b3015a43cde03636e004db5b0eed947f3d
+SHA256: 7af0db01a58e3d6e8aee25f500257169d498bc2311a752c3f35de48d1913df05
+SHA512: 129792dc9ec6e97ab9433b5f833af4df427db3c6183dc357d012ccc3dbc367de831a9667c4bb0c88096481272ca3b013e2efa134123a82f0823e310983828c71
+Homepage: https://github.com/wdes/tab-atelier#readme
+Description: Guake-style drop-down terminal emulator for Linux (X11)
+ Display-less companion to tab-atelier. Restores tabs from tabs.json, spawns
+ their PTYs, and runs the same local HTTP/TLS API as the desktop GUI — without
+ any X11 / gpui dependency. Designed for servers, CI runners, and remote shells
+ where the web viewer should still see the same set of named tabs.
+
+Package: tab-atelier-headless
+Architecture: amd64
+Version: 0.5.0~nightly20260925152239.8d5b133-1
+Priority: optional
+Section: x11
+Maintainer: William Desportes <williamdes@wdes.fr>
+Installed-Size: 21432
+Depends: adduser, bubblewrap, init-system-helpers, libc6 (>= 2.39), libgcc-s1, nftables
+Recommends: openssh-client
+Conflicts: tab-atelier
+Replaces: tab-atelier
+Filename: pool/nightly/main/t/tab-atelier/tab-atelier-headless_0.5.0~nightly20260925152239.8d5b133-1_amd64.deb
+Size: 6186828
+MD5sum: 2d11dcf5957786ef483a6937872e6136
+SHA1: 287e1617ca22c870ee285a5718f941a0619d325c
+SHA256: b5365e1bd4e21c29c7b6d4f161312e786b1b24e7db0f7f7c8b343c27331366fc
+SHA512: 3c11f9fb315174e7ab078c298e4fea3c14bdc6f2438119dd9b19d85e4aed49e841c50fc61c1f975f0be2306922e53616d5d1cb1e52c21710da38881a04c59278
+Homepage: https://github.com/wdes/tab-atelier#readme
+Description: Guake-style drop-down terminal emulator for Linux (X11)
+ Display-less companion to tab-atelier. Restores tabs from tabs.json, spawns
+ their PTYs, and runs the same local HTTP/TLS API as the desktop GUI — without
+ any X11 / gpui dependency. Designed for servers, CI runners, and remote shells
+ where the web viewer should still see the same set of named tabs.
+
+Package: tab-atelier-headless
+Architecture: amd64
+Version: 0.5.0~nightly20260926090059.fdf6135-1
+Priority: optional
+Section: x11
+Maintainer: William Desportes <williamdes@wdes.fr>
+Installed-Size: 21671
+Depends: adduser, bubblewrap, init-system-helpers, libc6 (>= 2.39), libgcc-s1, nftables
+Recommends: openssh-client
+Conflicts: tab-atelier
+Replaces: tab-atelier
+Filename: pool/nightly/main/t/tab-atelier/tab-atelier-headless_0.5.0~nightly20260926090059.fdf6135-1_amd64.deb
+Size: 6391796
+MD5sum: 9befc980ef08ad98785d8d18a0619194
+SHA1: aafbd1b09956f3d8d9c6edb446b25dd7ebaef056
+SHA256: ef93969b52f52307c0baa324a35765b3d683dc181e94bd2f2eb5588494cdbe89
+SHA512: 16c4bde434ecb23e4a98f11d9d465253f75fb98b79e571cfca36eae9eb7247badfd6c37c118b6b27ff955ceb8a30c127bb2b8e9c1b1246d2d27ef1fc3327906d
+Homepage: https://github.com/wdes/tab-atelier#readme
+Description: Guake-style drop-down terminal emulator for Linux (X11)
+ Display-less companion to tab-atelier. Restores tabs from tabs.json, spawns
+ their PTYs, and runs the same local HTTP/TLS API as the desktop GUI — without
+ any X11 / gpui dependency. Designed for servers, CI runners, and remote shells
+ where the web viewer should still see the same set of named tabs.
+
+Package: tab-atelier-headless
+Architecture: amd64
+Version: 0.5.0~nightly20260926123438.dc00be2-1
+Priority: optional
+Section: x11
+Maintainer: William Desportes <williamdes@wdes.fr>
+Installed-Size: 21671
+Depends: adduser, bubblewrap, init-system-helpers, libc6 (>= 2.39), libgcc-s1, nftables
+Recommends: openssh-client
+Conflicts: tab-atelier
+Replaces: tab-atelier
+Filename: pool/nightly/main/t/tab-atelier/tab-atelier-headless_0.5.0~nightly20260926123438.dc00be2-1_amd64.deb
+Size: 6394600
+MD5sum: 76a6650ab4a8414fedbccda00d16c8e3
+SHA1: 5b3a0bab1245550a7339a95bf48f9b8ca7b0aefa
+SHA256: c41192e7ea95a6ffd02eb19b08039b634f0f3db6fd26636ad8b2c68821845378
+SHA512: ccf8e2bb4544bd7af2dca74a2d21fd7c4073e0dc6373e72ddbfe9d41593e625af10bf846847b2dd299878daff252462ae972b0674880feff05b69c96e5ba570e
+Homepage: https://github.com/wdes/tab-atelier#readme
+Description: Guake-style drop-down terminal emulator for Linux (X11)
+ Display-less companion to tab-atelier. Restores tabs from tabs.json, spawns
+ their PTYs, and runs the same local HTTP/TLS API as the desktop GUI — without
+ any X11 / gpui dependency. Designed for servers, CI runners, and remote shells
+ where the web viewer should still see the same set of named tabs.
+
+Package: tab-atelier-headless
+Architecture: amd64
+Version: 0.5.0~nightly20260926124620.cd206f6-1
+Priority: optional
+Section: x11
+Maintainer: William Desportes <williamdes@wdes.fr>
+Installed-Size: 21671
+Depends: adduser, bubblewrap, init-system-helpers, libc6 (>= 2.39), libgcc-s1, nftables
+Recommends: openssh-client
+Conflicts: tab-atelier
+Replaces: tab-atelier
+Filename: pool/nightly/main/t/tab-atelier/tab-atelier-headless_0.5.0~nightly20260926124620.cd206f6-1_amd64.deb
+Size: 6392776
+MD5sum: bb5ebd38329e6d8c0e106cf5d1f25720
+SHA1: e05ac0143664b63b100269ec7bf6222576f0d517
+SHA256: dcb6a05f34bb587d5fa96dcedcd636e684e300fafa6eeaa81ce80d2c0d3319b6
+SHA512: 4276f41666c1b58cfd2d9b26b9fc93f81b66ed561a2f71d3ea2d5c876cd49dd657705ea3af3a3956055420703c4e05f05a6dc149381956e41286b2d286f93466
+Homepage: https://github.com/wdes/tab-atelier#readme
+Description: Guake-style drop-down terminal emulator for Linux (X11)
+ Display-less companion to tab-atelier. Restores tabs from tabs.json, spawns
+ their PTYs, and runs the same local HTTP/TLS API as the desktop GUI — without
+ any X11 / gpui dependency. Designed for servers, CI runners, and remote shells
+ where the web viewer should still see the same set of named tabs.
+
+Package: tab-atelier-headless
+Architecture: amd64
+Version: 0.5.0~nightly20260926130355.a52b6c6-1
+Priority: optional
+Section: x11
+Maintainer: William Desportes <williamdes@wdes.fr>
+Installed-Size: 21671
+Depends: adduser, bubblewrap, init-system-helpers, libc6 (>= 2.39), libgcc-s1, nftables
+Recommends: openssh-client
+Conflicts: tab-atelier
+Replaces: tab-atelier
+Filename: pool/nightly/main/t/tab-atelier/tab-atelier-headless_0.5.0~nightly20260926130355.a52b6c6-1_amd64.deb
+Size: 6390216
+MD5sum: 3ae01158188120c06f2bcd57d7209386
+SHA1: 08dabbe640a8ebfca6609be129c6f4b7d752bc50
+SHA256: e26df9f22caaf6f2cd3aa7199ffe7ad571221e6ae2213c7e6278515cfa8348a0
+SHA512: 8a48f0b7d3a945d62d19e1b8694fadf825ce302557ff56a038201c753edf303f696f77dd4e54549ea974069dd06c4ed79780f12e701a08997430093ad51ac1a5
+Homepage: https://github.com/wdes/tab-atelier#readme
+Description: Guake-style drop-down terminal emulator for Linux (X11)
+ Display-less companion to tab-atelier. Restores tabs from tabs.json, spawns
+ their PTYs, and runs the same local HTTP/TLS API as the desktop GUI — without
+ any X11 / gpui dependency. Designed for servers, CI runners, and remote shells
+ where the web viewer should still see the same set of named tabs.
+
+Package: tab-atelier-proxy-dbgsym
+Architecture: amd64
+Version: 0.5.0~nightly20260926123438.dc00be2-1
+Auto-Built-Package: debug-symbols
+Priority: extra
+Section: debug
+Maintainer: William Desportes <williamdes@wdes.fr>
+Installed-Size: 9008
+Recommends: tab-atelier-proxy (= 0.5.0~nightly20260926123438.dc00be2-1)
+Filename: pool/nightly/main/t/tab-atelier/tab-atelier-proxy-dbgsym_0.5.0~nightly20260926123438.dc00be2-1_amd64.ddeb
+Size: 7912204
+MD5sum: 3d4fd6d8cb96e4ed2b0bca7c5a790c05
+SHA1: ada6ad04f4fae3ee57704b6c6ffe3afe9cd288f3
+SHA256: affb6e58e502da0702a7d6b37104033d5c156eea335be046d9f76608d13e9c94
+SHA512: 9c8c11a8595f9d7fdc0923a3dfb10809fe9a550f7a844e62ca3df0ed53011a05191f6829aec4da890272f513c8d2d65da3085ad1fcf811572b93aa06405df62a
+Homepage: https://github.com/wdes/tab-atelier
+Description: Debug symbols for tab-atelier-proxy v0.5.0~nightly20260926123438.dc00be2-1
+ (amd64)
+
+Package: tab-atelier-proxy-dbgsym
+Architecture: amd64
+Version: 0.5.0~nightly20260926124620.cd206f6-1
+Auto-Built-Package: debug-symbols
+Priority: extra
+Section: debug
+Maintainer: William Desportes <williamdes@wdes.fr>
+Installed-Size: 9008
+Recommends: tab-atelier-proxy (= 0.5.0~nightly20260926124620.cd206f6-1)
+Filename: pool/nightly/main/t/tab-atelier/tab-atelier-proxy-dbgsym_0.5.0~nightly20260926124620.cd206f6-1_amd64.ddeb
+Size: 7912204
+MD5sum: 2a16c4283c6a955bb66fa172094f8344
+SHA1: 899012275fd35b0f003b0ce1c50aefe59a7a4659
+SHA256: 0c014604ce270a4800b89edbaf8a16445ee438e21d5152719cb6cb227647fb27
+SHA512: 46bb1e33469daf8d96cd223c00ea2fb6ae59a9972aeadbe1acee1941b6fb5107e4b614d468ee05e6d7505c1a65cc06736e94a4eded8af89ef3c7b9f175b5ac23
+Homepage: https://github.com/wdes/tab-atelier
+Description: Debug symbols for tab-atelier-proxy v0.5.0~nightly20260926124620.cd206f6-1
+ (amd64)
+
+Package: tab-atelier-proxy-dbgsym
+Architecture: amd64
+Version: 0.5.0~nightly20260926130355.a52b6c6-1
+Auto-Built-Package: debug-symbols
+Priority: extra
+Section: debug
+Maintainer: William Desportes <williamdes@wdes.fr>
+Installed-Size: 9008
+Recommends: tab-atelier-proxy (= 0.5.0~nightly20260926130355.a52b6c6-1)
+Filename: pool/nightly/main/t/tab-atelier/tab-atelier-proxy-dbgsym_0.5.0~nightly20260926130355.a52b6c6-1_amd64.ddeb
+Size: 7912204
+MD5sum: 65385ee7e2189992e6354fbfebee2518
+SHA1: cb04883cad68e0447279af74ade5df7d141951a8
+SHA256: 1f839c1afcb66fed55d742f567c9ab65d0e24d77e74e56fa79576a7ace7a69d7
+SHA512: 82df405f20637fed015aaf21b90f8938dee6b9d3dddc86af404e42f05454afb1d72cc081ad95a6e6858bb8713f38a72d65264db1783b2f0cc7b576fa741bef4c
+Homepage: https://github.com/wdes/tab-atelier
+Description: Debug symbols for tab-atelier-proxy v0.5.0~nightly20260926130355.a52b6c6-1
+ (amd64)
+
+Package: tab-atelier-proxy
+Architecture: amd64
+Version: 0.5.0~nightly20260924231829.90fca11-1
+Priority: optional
+Section: utils
+Maintainer: William Desportes <williamdes@wdes.fr>
+Installed-Size: 8746
+Depends: adduser, init-system-helpers, libc6 (>= 2.34), libjs-bootstrap5
+Filename: pool/nightly/main/t/tab-atelier/tab-atelier-proxy_0.5.0~nightly20260924231829.90fca11-1_amd64.deb
+Size: 2826152
+MD5sum: b20011e49cf222213d5d4cb19723042d
+SHA1: 53a63d409a77f9c4fc687f579a630ac5b866d207
+SHA256: 899bd9551d522d9651adaad3a3e6a9432fbc59d99bdd41e5dc1cd3c043a916fa
+SHA512: 413e8d9368865c92e1a81eef89d499731f0b42d61fabe2bfbb43e6f57db03452c4ca1b787469a30cf7508fb712ae75be8106e05d1fae10903d1c236c40387547
+Homepage: https://github.com/wdes/tab-atelier
+Description: Multi-user Anthropic API proxy for tab-atelier fleets
+ A multi-user Anthropic API proxy for tab-atelier. Each account has its own key,
+ so a fleet's machines authenticate as people rather than sharing one secret,
+ and revoking one does not disturb the others. Serves a small web UI for account
+ management.
+
+Package: tab-atelier-proxy
+Architecture: amd64
+Version: 0.5.0~nightly20260925111239.e3ac3aa-1
+Priority: optional
+Section: utils
+Maintainer: William Desportes <williamdes@wdes.fr>
+Installed-Size: 8802
+Depends: adduser, init-system-helpers, libc6 (>= 2.34), libjs-bootstrap5
+Filename: pool/nightly/main/t/tab-atelier/tab-atelier-proxy_0.5.0~nightly20260925111239.e3ac3aa-1_amd64.deb
+Size: 2839728
+MD5sum: 3255f34300645cceb3c761a31293f4f3
+SHA1: 82107db8f4bd4ad0079e1b3dd59d0e4c9bac73bf
+SHA256: 71747aa76cc807623ae774a84092916900eee677985e3fbb1336f7f74d9b4ede
+SHA512: 4989bd05e52a9683ee4cc98d6accf092c404cf686f9fa65c0a7be6b09c10f9f46ee80d51c2ea77aa2fd1d96d500710e37029b1cb817bd486ef43d4af4b397257
+Homepage: https://github.com/wdes/tab-atelier
+Description: Multi-user Anthropic API proxy for tab-atelier fleets
+ A multi-user Anthropic API proxy for tab-atelier. Each account has its own key,
+ so a fleet's machines authenticate as people rather than sharing one secret,
+ and revoking one does not disturb the others. Serves a small web UI for account
+ management.
+
+Package: tab-atelier-proxy
+Architecture: amd64
+Version: 0.5.0~nightly20260925120732.a081d49-1
+Priority: optional
+Section: utils
+Maintainer: William Desportes <williamdes@wdes.fr>
+Installed-Size: 8802
+Depends: adduser, init-system-helpers, libc6 (>= 2.34), libjs-bootstrap5
+Filename: pool/nightly/main/t/tab-atelier/tab-atelier-proxy_0.5.0~nightly20260925120732.a081d49-1_amd64.deb
+Size: 2839728
+MD5sum: 7764ab1c4d2e1c185407d3857c3e08a0
+SHA1: 60df9750e900d54cf9d6689286b8a7db3b81337c
+SHA256: 01bbc5d5f31da43a5e599fbd81d33ef0863d9d43f1e2d1565bc76aebb9e300b0
+SHA512: 105a0ac83f09ca0722b1cb570fb35c139f16ee067d00fb83542ac9320a8a1a6786c031d56e37bf0259d5a876659ca3666b767ec61d93334cba8bdd737092c31e
+Homepage: https://github.com/wdes/tab-atelier
+Description: Multi-user Anthropic API proxy for tab-atelier fleets
+ A multi-user Anthropic API proxy for tab-atelier. Each account has its own key,
+ so a fleet's machines authenticate as people rather than sharing one secret,
+ and revoking one does not disturb the others. Serves a small web UI for account
+ management.
+
+Package: tab-atelier-proxy
+Architecture: amd64
+Version: 0.5.0~nightly20260925124220.b64311e-1
+Priority: optional
+Section: utils
+Maintainer: William Desportes <williamdes@wdes.fr>
+Installed-Size: 8810
+Depends: adduser, init-system-helpers, libc6 (>= 2.34), libjs-bootstrap5
+Filename: pool/nightly/main/t/tab-atelier/tab-atelier-proxy_0.5.0~nightly20260925124220.b64311e-1_amd64.deb
+Size: 2842684
+MD5sum: 8f190e859c47845edad076205caf76a9
+SHA1: e0f36cf3862584b040a2e312cd31977f293e4e57
+SHA256: a4bc2e86b314c2d4d3f1cc317b609523c2ebfe3204f7edc7ed02815d072eeae2
+SHA512: a9f5a8574ee2d6f5ef9d1ab407112d4b1a30fbde10ad58f72db2cf7246fbb6861de7032412af63e1057b0ff82b99b6c848a34345363ad82204844e6905c9f445
+Homepage: https://github.com/wdes/tab-atelier
+Description: Multi-user Anthropic API proxy for tab-atelier fleets
+ A multi-user Anthropic API proxy for tab-atelier. Each account has its own key,
+ so a fleet's machines authenticate as people rather than sharing one secret,
+ and revoking one does not disturb the others. Serves a small web UI for account
+ management.
+
+Package: tab-atelier-proxy
+Architecture: amd64
+Version: 0.5.0~nightly20260925124342.93ef16d-1
+Priority: optional
+Section: utils
+Maintainer: William Desportes <williamdes@wdes.fr>
+Installed-Size: 8810
+Depends: adduser, init-system-helpers, libc6 (>= 2.34), libjs-bootstrap5
+Filename: pool/nightly/main/t/tab-atelier/tab-atelier-proxy_0.5.0~nightly20260925124342.93ef16d-1_amd64.deb
+Size: 2842684
+MD5sum: fd3f6250680dfba46c353de597eee4e3
+SHA1: 5959304a427c4089a7ba967d7169115df30eb149
+SHA256: 1c9e3785441a38fe7d5c9d8efbc1661690fd2e070da4474d66864a1d0408e39b
+SHA512: 40d61fc523b52900e5f00cbc012c7f2cda735dc90186bb934acabef0b5b98ffb9390268473c4375c650198f88c8f097b40d8a97f50d9880e72a8a6a85351a3c4
+Homepage: https://github.com/wdes/tab-atelier
+Description: Multi-user Anthropic API proxy for tab-atelier fleets
+ A multi-user Anthropic API proxy for tab-atelier. Each account has its own key,
+ so a fleet's machines authenticate as people rather than sharing one secret,
+ and revoking one does not disturb the others. Serves a small web UI for account
+ management.
+
+Package: tab-atelier-proxy
+Architecture: amd64
+Version: 0.5.0~nightly20260925152239.8d5b133-1
+Priority: optional
+Section: utils
+Maintainer: William Desportes <williamdes@wdes.fr>
+Installed-Size: 8810
+Depends: adduser, init-system-helpers, libc6 (>= 2.34), libjs-bootstrap5
+Filename: pool/nightly/main/t/tab-atelier/tab-atelier-proxy_0.5.0~nightly20260925152239.8d5b133-1_amd64.deb
+Size: 2842684
+MD5sum: 0eb401aec7dfab62a16f43ba10d2ea13
+SHA1: 6d4bc82ec1c0144337068dc295fb2d3d54127d38
+SHA256: 2de13a96cabae11213081a5a81a5396e9e0cf9ff7c5b6cf32011d92c33dc012e
+SHA512: db78c8062e6cd0a330a8dff327d370ac13cf1c1f922d2d24e5e030bfea90e06f34823b7e712b31a77c6ca2a83edbdf4301515a495384e4488c4249a03c900d39
+Homepage: https://github.com/wdes/tab-atelier
+Description: Multi-user Anthropic API proxy for tab-atelier fleets
+ A multi-user Anthropic API proxy for tab-atelier. Each account has its own key,
+ so a fleet's machines authenticate as people rather than sharing one secret,
+ and revoking one does not disturb the others. Serves a small web UI for account
+ management.
+
+Package: tab-atelier-proxy
+Architecture: amd64
+Version: 0.5.0~nightly20260926090059.fdf6135-1
+Priority: optional
+Section: utils
+Maintainer: William Desportes <williamdes@wdes.fr>
+Installed-Size: 8810
+Depends: adduser, init-system-helpers, libc6 (>= 2.34), libjs-bootstrap5
+Filename: pool/nightly/main/t/tab-atelier/tab-atelier-proxy_0.5.0~nightly20260926090059.fdf6135-1_amd64.deb
+Size: 2842696
+MD5sum: 04293f3afbde3a07f46c9886a8af7d0f
+SHA1: 3c63723c640f1848f410f6fa95c1f55a91a7bef7
+SHA256: 5cf85b5d135eff136ba442ca285b428b72c836430c4f1e139e17407848ee5d43
+SHA512: c15499e91474b0a150b685e0782483b59c67b61b7ca50d59b4370b0bfe4a3eaa9d35bfdcacffb7fd9b9a23cf06b74fceae2c0a26817f1fa9af55f9b3fbf648d8
+Homepage: https://github.com/wdes/tab-atelier
+Description: Multi-user Anthropic API proxy for tab-atelier fleets
+ A multi-user Anthropic API proxy for tab-atelier. Each account has its own key,
+ so a fleet's machines authenticate as people rather than sharing one secret,
+ and revoking one does not disturb the others. Serves a small web UI for account
+ management.
+
+Package: tab-atelier-proxy
+Architecture: amd64
+Version: 0.5.0~nightly20260926123438.dc00be2-1
+Priority: optional
+Section: utils
+Maintainer: William Desportes <williamdes@wdes.fr>
+Installed-Size: 8810
+Depends: adduser, init-system-helpers, libc6 (>= 2.34), libjs-bootstrap5
+Filename: pool/nightly/main/t/tab-atelier/tab-atelier-proxy_0.5.0~nightly20260926123438.dc00be2-1_amd64.deb
+Size: 2842700
+MD5sum: 5bccdabb6154791d85167cbdbce23c36
+SHA1: 5033800dcecc88154414a32289e475918c973f1b
+SHA256: 5a0dc794768aeaf81257a9663a436d6874b5bfba5ca2c9008a44f3872a5193c6
+SHA512: 679b98d3adc0b98ebd2d693e8e77b4669a832ff4a19d3b095e1f678d78a3354992be9c998951b564ae4698c7fa7df0adc32bbaf3ce8e01e0aa688a3773e9cf17
+Homepage: https://github.com/wdes/tab-atelier
+Description: Multi-user Anthropic API proxy for tab-atelier fleets
+ A multi-user Anthropic API proxy for tab-atelier. Each account has its own key,
+ so a fleet's machines authenticate as people rather than sharing one secret,
+ and revoking one does not disturb the others. Serves a small web UI for account
+ management.
+
+Package: tab-atelier-proxy
+Architecture: amd64
+Version: 0.5.0~nightly20260926124620.cd206f6-1
+Priority: optional
+Section: utils
+Maintainer: William Desportes <williamdes@wdes.fr>
+Installed-Size: 8810
+Depends: adduser, init-system-helpers, libc6 (>= 2.34), libjs-bootstrap5
+Filename: pool/nightly/main/t/tab-atelier/tab-atelier-proxy_0.5.0~nightly20260926124620.cd206f6-1_amd64.deb
+Size: 2842700
+MD5sum: 2cf806139195796e08ecf091fec5c71c
+SHA1: 32729e8183cd3a400350c23962a79188ac77916c
+SHA256: 246277081f638510a987000fa2d45d25b951bb1eb99622110941a8a5954f5f65
+SHA512: 36f776a2cb3db7716c800d2ce2c92d0c553d975b051d40d95f32d4d7e20f1a2d163be4edb844a745ebbe4fa40c0f8ea66406165ce6688c49183236fa899e2ed8
+Homepage: https://github.com/wdes/tab-atelier
+Description: Multi-user Anthropic API proxy for tab-atelier fleets
+ A multi-user Anthropic API proxy for tab-atelier. Each account has its own key,
+ so a fleet's machines authenticate as people rather than sharing one secret,
+ and revoking one does not disturb the others. Serves a small web UI for account
+ management.
+
+Package: tab-atelier-proxy
+Architecture: amd64
+Version: 0.5.0~nightly20260926130355.a52b6c6-1
+Priority: optional
+Section: utils
+Maintainer: William Desportes <williamdes@wdes.fr>
+Installed-Size: 8810
+Depends: adduser, init-system-helpers, libc6 (>= 2.34), libjs-bootstrap5
+Filename: pool/nightly/main/t/tab-atelier/tab-atelier-proxy_0.5.0~nightly20260926130355.a52b6c6-1_amd64.deb
+Size: 2842700
+MD5sum: 885d0348eb1c5659fc46a5dcc7ecb3d5
+SHA1: fcc341bec588a2e66624bc43bf6a85cbe6b739ac
+SHA256: 289f1f4e06d9a130e97397f3c550480c4ff59a98a767d6a7c2a8a80e3b09f5b6
+SHA512: d517cced6ae006337e3bd62872ced362c7621f5a852955ecc2a32605f14526ce88cadd544082fc2cf9e4b21487714c373acfd192c57f4fb32355d14f5e7a422f
+Homepage: https://github.com/wdes/tab-atelier
+Description: Multi-user Anthropic API proxy for tab-atelier fleets
+ A multi-user Anthropic API proxy for tab-atelier. Each account has its own key,
+ so a fleet's machines authenticate as people rather than sharing one secret,
+ and revoking one does not disturb the others. Serves a small web UI for account
+ management.
+
+Package: tab-atelier
+Architecture: amd64
+Version: 0.5.0~nightly20260924231829.90fca11-1
+Priority: optional
+Section: x11
+Maintainer: William Desportes <williamdes@wdes.fr>
+Installed-Size: 38670
+Depends: fonts-dejavu-core, libc6 (>= 2.39), libfreetype6, libgcc-s1, libxcb1 (>= 1.12), libxkbcommon-x11-0 (>= 0.5.0), libxkbcommon0 (>= 0.5.0)
+Recommends: fonts-noto-color-emoji
+Conflicts: tab-atelier-headless
+Replaces: tab-atelier-headless
+Filename: pool/nightly/main/t/tab-atelier/tab-atelier_0.5.0~nightly20260924231829.90fca11-1_amd64.deb
+Size: 11691568
+MD5sum: fd7c21e1b1e5640667984eaf0cdcf09b
+SHA1: 23a29b6b2a9241b8b8ec55a620d6f772b89fef15
+SHA256: bf74c1b0cc0b60ce315d910fd3854a5654c51b6ebb0cf839e9a034872ebe9036
+SHA512: aeabe5a0209f5caad0be8e8fab5af7a56a194433649b922cda51a0c00f0fd7405d835ee49af0dc56109768e779a1877d7cbbf4933af9f53cc4c2660206329d71
+Homepage: https://github.com/wdes/tab-atelier#readme
+Description: Guake-style drop-down terminal emulator for Linux (X11)
+ A Guake-style drop-down terminal emulator built with alacritty_terminal and
+ gpui. Features tabbed terminals, i18n (English/French), power monitoring,
+ screenshots, remote control via QR code, and Wakatime integration.
+
+Package: tab-atelier
+Architecture: amd64
+Version: 0.5.0~nightly20260925111239.e3ac3aa-1
+Priority: optional
+Section: x11
+Maintainer: William Desportes <williamdes@wdes.fr>
+Installed-Size: 38670
+Depends: fonts-dejavu-core, libc6 (>= 2.39), libfreetype6, libgcc-s1, libxcb1 (>= 1.12), libxkbcommon-x11-0 (>= 0.5.0), libxkbcommon0 (>= 0.5.0)
+Recommends: fonts-noto-color-emoji
+Conflicts: tab-atelier-headless
+Replaces: tab-atelier-headless
+Filename: pool/nightly/main/t/tab-atelier/tab-atelier_0.5.0~nightly20260925111239.e3ac3aa-1_amd64.deb
+Size: 11688788
+MD5sum: f3314e7fdaaf8caa030238eaea1accb3
+SHA1: 75c00a7976e6e1e7af432ddbea39244273acbe71
+SHA256: f90ff1bf957f1b6a251eac02ea23192f4f3ccb1043925683d026aab8fa56df0a
+SHA512: b4a9962f5c64c87e14789e6d58b4cf459ab9e7b53cdf071cea9d66b177d09d3f4dad851a768e960b2306c0e29e52920f23e0f1f958420cc7400de0e6331f4190
+Homepage: https://github.com/wdes/tab-atelier#readme
+Description: Guake-style drop-down terminal emulator for Linux (X11)
+ A Guake-style drop-down terminal emulator built with alacritty_terminal and
+ gpui. Features tabbed terminals, i18n (English/French), power monitoring,
+ screenshots, remote control via QR code, and Wakatime integration.
+
+Package: tab-atelier
+Architecture: amd64
+Version: 0.5.0~nightly20260925120732.a081d49-1
+Priority: optional
+Section: x11
+Maintainer: William Desportes <williamdes@wdes.fr>
+Installed-Size: 38732
+Depends: fonts-dejavu-core, libc6 (>= 2.39), libfreetype6, libgcc-s1, libxcb1 (>= 1.12), libxkbcommon-x11-0 (>= 0.5.0), libxkbcommon0 (>= 0.5.0)
+Recommends: fonts-noto-color-emoji
+Conflicts: tab-atelier-headless
+Replaces: tab-atelier-headless
+Filename: pool/nightly/main/t/tab-atelier/tab-atelier_0.5.0~nightly20260925120732.a081d49-1_amd64.deb
+Size: 11708584
+MD5sum: 41ab6342847b15155bd45ac5eb090a37
+SHA1: a4d27b8053dece86c789ce34e2749b6c2a23c291
+SHA256: 542c673f2ac5bbf0ab7ac76cee19f64de60bdbf25b768ff1a262b82efd63ded9
+SHA512: 293a64773604be7a6407b55b9915858fe8d5ed37ee0da4b8bb7085f18f0b96c45c4e9431c9a96254fe9a65d862a377717455e6aadc0c03c91901aaaec5e03d86
+Homepage: https://github.com/wdes/tab-atelier#readme
+Description: Guake-style drop-down terminal emulator for Linux (X11)
+ A Guake-style drop-down terminal emulator built with alacritty_terminal and
+ gpui. Features tabbed terminals, i18n (English/French), power monitoring,
+ screenshots, remote control via QR code, and Wakatime integration.
+
+Package: tab-atelier
+Architecture: amd64
+Version: 0.5.0~nightly20260925124220.b64311e-1
+Priority: optional
+Section: x11
+Maintainer: William Desportes <williamdes@wdes.fr>
+Installed-Size: 38757
+Depends: fonts-dejavu-core, libc6 (>= 2.39), libfreetype6, libgcc-s1, libxcb1 (>= 1.12), libxkbcommon-x11-0 (>= 0.5.0), libxkbcommon0 (>= 0.5.0)
+Recommends: fonts-noto-color-emoji
+Conflicts: tab-atelier-headless
+Replaces: tab-atelier-headless
+Filename: pool/nightly/main/t/tab-atelier/tab-atelier_0.5.0~nightly20260925124220.b64311e-1_amd64.deb
+Size: 11719492
+MD5sum: 8157f3ed9a6846b4214283f676d81b0b
+SHA1: cd2c4a970f2247cea3d074983b47129a5dedbc3a
+SHA256: aa101b03aa2ab448393758a1a6bea7caa7c9521616e820bae2ffe29caa1b2f90
+SHA512: 8958981f626510f7f0e83d5ab40bd73a4139ddd197197edae000d6a6f91e93a31d1ea4b533c4c945e4beee838599e730365d50434f7f97c9f629fd473fc08225
+Homepage: https://github.com/wdes/tab-atelier#readme
+Description: Guake-style drop-down terminal emulator for Linux (X11)
+ A Guake-style drop-down terminal emulator built with alacritty_terminal and
+ gpui. Features tabbed terminals, i18n (English/French), power monitoring,
+ screenshots, remote control via QR code, and Wakatime integration.
+
+Package: tab-atelier
+Architecture: amd64
+Version: 0.5.0~nightly20260925124342.93ef16d-1
+Priority: optional
+Section: x11
+Maintainer: William Desportes <williamdes@wdes.fr>
+Installed-Size: 38757
+Depends: fonts-dejavu-core, libc6 (>= 2.39), libfreetype6, libgcc-s1, libxcb1 (>= 1.12), libxkbcommon-x11-0 (>= 0.5.0), libxkbcommon0 (>= 0.5.0)
+Recommends: fonts-noto-color-emoji
+Conflicts: tab-atelier-headless
+Replaces: tab-atelier-headless
+Filename: pool/nightly/main/t/tab-atelier/tab-atelier_0.5.0~nightly20260925124342.93ef16d-1_amd64.deb
+Size: 11722624
+MD5sum: 83b548ba95ee06ffe15abb874ed9f8a4
+SHA1: 83978f25ef9145f3611e5be39c614033e96af888
+SHA256: b64c24cc28f39c8807201007c6efa057b8f52347ba6a45dc6945997bdd734138
+SHA512: 5e3551d20c8955d92fb440095a8215db34cf4b4dc8b1193d310534cd20f61f07c85d53b842cf96729ffefb21682ca004bbb39eaab17606e28f74e37c0e32eeba
+Homepage: https://github.com/wdes/tab-atelier#readme
+Description: Guake-style drop-down terminal emulator for Linux (X11)
+ A Guake-style drop-down terminal emulator built with alacritty_terminal and
+ gpui. Features tabbed terminals, i18n (English/French), power monitoring,
+ screenshots, remote control via QR code, and Wakatime integration.
+
+Package: tab-atelier
+Architecture: amd64
+Version: 0.5.0~nightly20260925152239.8d5b133-1
+Priority: optional
+Section: x11
+Maintainer: William Desportes <williamdes@wdes.fr>
+Installed-Size: 38777
+Depends: fonts-dejavu-core, libc6 (>= 2.39), libfreetype6, libgcc-s1, libxcb1 (>= 1.12), libxkbcommon-x11-0 (>= 0.5.0), libxkbcommon0 (>= 0.5.0)
+Recommends: fonts-noto-color-emoji
+Conflicts: tab-atelier-headless
+Replaces: tab-atelier-headless
+Filename: pool/nightly/main/t/tab-atelier/tab-atelier_0.5.0~nightly20260925152239.8d5b133-1_amd64.deb
+Size: 11723252
+MD5sum: 9dd05d3889f8f27d7c5208353eafe68a
+SHA1: 25e2e8127244eae4d7379fea2e9920af1190f2b5
+SHA256: 782a35a0fae7a98e596888c7170dcf57c2ee74609e92f2d4931fe9280e6541dd
+SHA512: 0769b9baf34f86fe2f9afb9feb813299f9e8258d81c5d86c2b287486feba233a6dd23200620e2022affad79959e56195ec5c56e2cc85d8c786f25a931a3b88a0
+Homepage: https://github.com/wdes/tab-atelier#readme
+Description: Guake-style drop-down terminal emulator for Linux (X11)
+ A Guake-style drop-down terminal emulator built with alacritty_terminal and
+ gpui. Features tabbed terminals, i18n (English/French), power monitoring,
+ screenshots, remote control via QR code, and Wakatime integration.
+
+Package: tab-atelier
+Architecture: amd64
+Version: 0.5.0~nightly20260926090059.fdf6135-1
+Priority: optional
+Section: x11
+Maintainer: William Desportes <williamdes@wdes.fr>
+Installed-Size: 39028
+Depends: fonts-dejavu-core, libc6 (>= 2.39), libfreetype6, libgcc-s1, libxcb1 (>= 1.12), libxkbcommon-x11-0 (>= 0.5.0), libxkbcommon0 (>= 0.5.0)
+Recommends: fonts-noto-color-emoji
+Conflicts: tab-atelier-headless
+Replaces: tab-atelier-headless
+Filename: pool/nightly/main/t/tab-atelier/tab-atelier_0.5.0~nightly20260926090059.fdf6135-1_amd64.deb
+Size: 11801880
+MD5sum: 402033da7d0b8fbcf6457ed98683b6e4
+SHA1: f8d825d1e8e1fb242404e93d74a6f41f3c24ed40
+SHA256: 437e070f907bb910a9e0dc496328bc29e5fa569f42619f6eac28952f5f3dd43d
+SHA512: 2335d1683652abbc05b5eaa39ed12a08168be87860526975d7489b7e258bafaf8a22e7e87659a06b52083d23d0bc04f6f7f81956b4ef0567f1556e42a259c3ab
+Homepage: https://github.com/wdes/tab-atelier#readme
+Description: Guake-style drop-down terminal emulator for Linux (X11)
+ A Guake-style drop-down terminal emulator built with alacritty_terminal and
+ gpui. Features tabbed terminals, i18n (English/French), power monitoring,
+ screenshots, remote control via QR code, and Wakatime integration.
+
+Package: tab-atelier
+Architecture: amd64
+Version: 0.5.0~nightly20260926123438.dc00be2-1
+Priority: optional
+Section: x11
+Maintainer: William Desportes <williamdes@wdes.fr>
+Installed-Size: 39028
+Depends: fonts-dejavu-core, libc6 (>= 2.39), libfreetype6, libgcc-s1, libxcb1 (>= 1.12), libxkbcommon-x11-0 (>= 0.5.0), libxkbcommon0 (>= 0.5.0)
+Recommends: fonts-noto-color-emoji
+Conflicts: tab-atelier-headless
+Replaces: tab-atelier-headless
+Filename: pool/nightly/main/t/tab-atelier/tab-atelier_0.5.0~nightly20260926123438.dc00be2-1_amd64.deb
+Size: 11802516
+MD5sum: b7d3d31464ac640232535734ba45a62f
+SHA1: de32d58fe6c3b91b64a42c3db49b1254ecba5b19
+SHA256: 455381ab075822e8ec0b54c59df58fc24ea426269ecb2ff2c26085723ebf9bcf
+SHA512: 416eabdb5cc41efcc75a8645d08e1233bcfa015b3b27356d0dc7a52c233e65eb31b727f90301ecc48ab7cbe0041bac4dbd1e64641e43ba75abc02f47385e3a9f
+Homepage: https://github.com/wdes/tab-atelier#readme
+Description: Guake-style drop-down terminal emulator for Linux (X11)
+ A Guake-style drop-down terminal emulator built with alacritty_terminal and
+ gpui. Features tabbed terminals, i18n (English/French), power monitoring,
+ screenshots, remote control via QR code, and Wakatime integration.
+
+Package: tab-atelier
+Architecture: amd64
+Version: 0.5.0~nightly20260926124620.cd206f6-1
+Priority: optional
+Section: x11
+Maintainer: William Desportes <williamdes@wdes.fr>
+Installed-Size: 39028
+Depends: fonts-dejavu-core, libc6 (>= 2.39), libfreetype6, libgcc-s1, libxcb1 (>= 1.12), libxkbcommon-x11-0 (>= 0.5.0), libxkbcommon0 (>= 0.5.0)
+Recommends: fonts-noto-color-emoji
+Conflicts: tab-atelier-headless
+Replaces: tab-atelier-headless
+Filename: pool/nightly/main/t/tab-atelier/tab-atelier_0.5.0~nightly20260926124620.cd206f6-1_amd64.deb
+Size: 11807912
+MD5sum: 9baebfbeb279b2f3f5da25bdd46d98b4
+SHA1: 4a722dd9e963215f0bdf3538dfc120b168991e5c
+SHA256: c5358f863622c5eab2e05870532069c1342d781ffbcb12b99425e2e89a7260dc
+SHA512: 9e0fbd44dc769da5b14f69acd905a4993a2b9c513d17fbaf337397251470e0857260223cd45638431fa343309c1b5a5a24ef2968c10587b1d6310496dbf1b3e5
+Homepage: https://github.com/wdes/tab-atelier#readme
+Description: Guake-style drop-down terminal emulator for Linux (X11)
+ A Guake-style drop-down terminal emulator built with alacritty_terminal and
+ gpui. Features tabbed terminals, i18n (English/French), power monitoring,
+ screenshots, remote control via QR code, and Wakatime integration.
+
+Package: tab-atelier
+Architecture: amd64
+Version: 0.5.0~nightly20260926130355.a52b6c6-1
+Priority: optional
+Section: x11
+Maintainer: William Desportes <williamdes@wdes.fr>
+Installed-Size: 39028
+Depends: fonts-dejavu-core, libc6 (>= 2.39), libfreetype6, libgcc-s1, libxcb1 (>= 1.12), libxkbcommon-x11-0 (>= 0.5.0), libxkbcommon0 (>= 0.5.0)
+Recommends: fonts-noto-color-emoji
+Conflicts: tab-atelier-headless
+Replaces: tab-atelier-headless
+Filename: pool/nightly/main/t/tab-atelier/tab-atelier_0.5.0~nightly20260926130355.a52b6c6-1_amd64.deb
+Size: 11804996
+MD5sum: 1c1639b0c5c84c48db172aae5ce84a97
+SHA1: 18ec76b16b138d9ea6691bec592e2e219c3a4ea2
+SHA256: a22d52137efa030c13e97aaa7a6c1aa11fe276e8241be2f7f900ce4dcdf3b4cc
+SHA512: 2e0ba9979d66c9afecbdec38a219b5757d2f9369c927e372ad70c6a3e8edc308d91e8e7bcb482660cf025076b124a9e66c9e179cdf7adf07596ffe873d8f91be
+Homepage: https://github.com/wdes/tab-atelier#readme
+Description: Guake-style drop-down terminal emulator for Linux (X11)
+ A Guake-style drop-down terminal emulator built with alacritty_terminal and
+ gpui. Features tabbed terminals, i18n (English/French), power monitoring,
+ screenshots, remote control via QR code, and Wakatime integration.
+
