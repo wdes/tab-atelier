@@ -210,6 +210,14 @@ pub struct RetireRequest {
     /// ⇒ nothing is recorded (the profile stands, telemetry-only retire).
     #[serde(default)]
     pub bilan: Option<Bilan>,
+    /// The éval-à-3 votes (agent / orchestrator / Olympe). Absent ⇒ the conservative
+    /// all-abstain default (silence never improves).
+    #[serde(default)]
+    pub votes: EvalVotes,
+    /// The PRECISE run's concrete values that must NOT leak into the derived prompt —
+    /// the anti-over-fit ban's input. Absent ⇒ nothing is banned.
+    #[serde(default)]
+    pub task_literals: Vec<String>,
     #[serde(flatten)]
     pub stamp: V2Stamp,
 }
@@ -218,18 +226,53 @@ impl RetireRequest {
     /// The record to archive: a v2 PROFILE (the stamp) carrying the bilan, keyed by the
     /// retired tab's `id`.
     ///
+    /// This is where the éval-à-3 is WIRED into the retire path: when a non-empty bilan
+    /// is present and the operator did NOT hand an explicit `--prompt`, [`evaluate`] runs
+    /// against `base` (the skill's current folded profile) and its decision is APPLIED —
+    /// `Improved` ⇒ the derived prompt + a bumped `prompt_version`, `StatuQuo` ⇒ the base
+    /// prompt kept — and its report is ARCHIVED on the record. Without `base` (a skill's
+    /// first record) the eval starts from the empty prompt, so it can only ADD.
+    ///
+    /// An explicit `--prompt` stays the manual escape hatch: it short-circuits the eval,
+    /// so a hand-written prompt is never overwritten by a derivation.
+    ///
     /// A request with no `skill` produces a record that FAILS the v2 completeness gate
     /// (and so stays out of the read-model) — [`perform_retire`] then keeps the tab
     /// rather than closing a profile-less retire. A retire that names no skill has no
     /// place in the v2 model, so it is quarantined rather than half-recorded.
     #[must_use]
-    fn into_record(self, id: &str, retired_at: u64) -> CatalogRecord {
+    fn into_record(mut self, id: &str, retired_at: u64, base: Option<&SkillProfile>) -> CatalogRecord {
         let mut record = CatalogRecord {
             id: id.to_string(),
             retired_at,
             ..CatalogRecord::default()
         };
-        if let Some(bilan) = self.bilan {
+        let base_prompt = base.and_then(|p| p.prompt.clone()).unwrap_or_default();
+        let base_version = base.and_then(|p| p.prompt_version);
+        // An explicit prompt is the manual escape hatch: no derivation.
+        let explicit = self.stamp.prompt.as_deref().is_some_and(|p| !p.trim().is_empty());
+        if let Some(bilan) = self.bilan.take().filter(|b| !b.is_empty()) {
+            if !explicit {
+                let result = evaluate(&EvalInput {
+                    base_prompt: base_prompt.clone(),
+                    bilan: bilan.clone(),
+                    task_literals: std::mem::take(&mut self.task_literals),
+                    votes: self.votes,
+                });
+                match result.report.decision {
+                    EvalDecision::Improved => {
+                        self.stamp.prompt = Some(result.resulting_prompt);
+                        // The PROFILE's next version — previous + 1, min 1 on a first record.
+                        self.stamp.prompt_version = Some(base_version.unwrap_or(0) + 1);
+                    }
+                    EvalDecision::StatuQuo => {
+                        // The original prompt stands (and its version is preserved).
+                        self.stamp.prompt = Some(base_prompt);
+                        self.stamp.prompt_version = base_version.or(self.stamp.prompt_version);
+                    }
+                }
+                record.eval = Some(result.report);
+            }
             record = record.with_bilan(bilan);
         }
         record.with_v2(self.stamp)
@@ -558,6 +601,11 @@ pub struct CatalogRecord {
     /// the close.
     #[serde(default)]
     bilan: Option<Bilan>,
+    /// The éval-à-3 [`EvalReport`] — the trace of "we improved / we kept", so the
+    /// decision that shaped `prompt` is AUDITABLE after the fact. `None` on a
+    /// telemetry-only retire (no bilan) or a manual `--prompt` override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    eval: Option<EvalReport>,
     retired_at: u64,
 }
 
@@ -1352,7 +1400,17 @@ pub fn run_retire(args: &[String]) -> i32 {
             return 2;
         }
     };
-    let record = req.into_record(id, crate::unix_millis());
+    // The skill's CURRENT folded profile is the eval's base prompt. Read BEFORE the
+    // archive (the new line isn't in the file yet), so re-retiring a skill improves the
+    // prompt the last record distilled.
+    let profiles = read_skill_profiles();
+    let base = req
+        .stamp
+        .skill
+        .as_deref()
+        .and_then(|s| resolve_skill_profile(&profiles, s))
+        .cloned();
+    let record = req.into_record(id, crate::unix_millis(), base.as_ref());
     let cat = catalog_path();
     // `had_session`: v2 completeness ignores it (the baseline is A/B-isolated), and this
     // verb archives no session id, so the v1 session branch is unreachable from here.
@@ -1838,8 +1896,9 @@ mod tests {
         let record = RetireRequest {
             bilan: Some(bilan.clone()),
             stamp,
+            ..RetireRequest::default()
         }
-        .into_record("tab-max", RETIRED_AT);
+        .into_record("tab-max", RETIRED_AT, None);
 
         let path = temp_catalog("");
         append_catalog_line(&path, &record).expect("archive");
@@ -1867,7 +1926,7 @@ mod tests {
     // closed. The assertion that counts is that the `shutdown` seam never ran.
     #[test]
     fn retire_gate_keeps_the_tab_on_empty_or_incomplete_read_back() {
-        let record = v2_request("olympe", "You are Olympe.").into_record("t1", RETIRED_AT);
+        let record = v2_request("olympe", "You are Olympe.").into_record("t1", RETIRED_AT, None);
 
         // (i) the write "succeeded" but nothing landed → empty read-back.
         let (out, log) = retire_with(&record, true, || None);
@@ -1899,7 +1958,7 @@ mod tests {
     // (d) the ORDER of effects: shutdown (the only real-tab-touching seam) runs LAST.
     #[test]
     fn retire_orders_write_readback_deregister_then_close() {
-        let record = v2_request("olympe", "p").into_record("t1", RETIRED_AT);
+        let record = v2_request("olympe", "p").into_record("t1", RETIRED_AT, None);
         let archived = record.clone();
         let (out, log) = retire_with(&record, true, move || Some(archived));
         assert_eq!(out, RetireOutcome::Retired);
@@ -1913,7 +1972,7 @@ mod tests {
     // GATE 3a: no safe-to-close ACK → NO close, and nothing is even written.
     #[test]
     fn retire_without_the_safe_to_close_ack_touches_nothing() {
-        let record = v2_request("olympe", "p").into_record("t1", RETIRED_AT);
+        let record = v2_request("olympe", "p").into_record("t1", RETIRED_AT, None);
         let archived = record.clone();
         let (out, log) = retire_with(&record, false, move || Some(archived));
         assert!(matches!(out, RetireOutcome::Incomplete(_)));
@@ -1925,7 +1984,7 @@ mod tests {
     #[test]
     fn a_v2_retire_lands_in_the_skill_read_model() {
         let path = temp_catalog("");
-        let record = v2_request("olympe", "You are Olympe.").into_record("tab-1", RETIRED_AT);
+        let record = v2_request("olympe", "You are Olympe.").into_record("tab-1", RETIRED_AT, None);
         append_catalog_line(&path, &record).expect("archive");
         let back = read_back(&path, "tab-1").expect("read-back");
         assert!(back.is_complete(false), "skill + prompt ⇒ a complete v2 profile");
@@ -1945,7 +2004,7 @@ mod tests {
     // and the record is quarantined from the read-model (no half-built profile).
     #[test]
     fn a_skill_less_retire_is_quarantined() {
-        let record = RetireRequest::default().into_record("t1", RETIRED_AT);
+        let record = RetireRequest::default().into_record("t1", RETIRED_AT, None);
         assert_eq!(record.schema_version, Some(2));
         assert!(
             !record.is_complete(false),
@@ -1970,8 +2029,9 @@ mod tests {
         let record = RetireRequest {
             bilan: Some(Bilan::default()),
             stamp: v2_request("olympe", "p").stamp,
+            ..RetireRequest::default()
         }
-        .into_record("t1", RETIRED_AT);
+        .into_record("t1", RETIRED_AT, None);
         assert!(record.bilan.is_none());
     }
 
@@ -2000,5 +2060,161 @@ mod tests {
             .collect();
         assert!(!args.iter().any(|a| a == "--ack-safe-to-close"));
         assert_eq!(run_retire(&args), 1, "no ACK ⇒ refusal, exit 1");
+    }
+
+    // -----------------------------------------------------------------------
+    // The éval-à-3 WIRED INTO the retire path — the loop actually IMPROVES the prompt
+    // it archives, instead of merely recording telemetry + a hand-written --prompt.
+    // -----------------------------------------------------------------------
+
+    /// The base profile the eval starts from: a skill's previously-archived prompt.
+    fn base_profile(prompt: &str, version: Option<u32>) -> SkillProfile {
+        SkillProfile {
+            skill: "olympe".into(),
+            prompt: Some(prompt.into()),
+            prompt_version: version,
+            ..SkillProfile::default()
+        }
+    }
+
+    /// Three unanimous approving votes — the consensus the eval needs to improve.
+    fn unanimous() -> EvalVotes {
+        let yes = EvalVote {
+            approve_prompt: true,
+            run_ok: true,
+        };
+        EvalVotes {
+            agent: yes,
+            orchestrator: yes,
+            olympe: yes,
+        }
+    }
+
+    /// A v2 request carrying a bilan + the éval inputs (votes, task literals).
+    fn eval_request(bilan: Bilan, votes: EvalVotes, task_literals: Vec<String>) -> RetireRequest {
+        RetireRequest {
+            bilan: Some(bilan),
+            votes,
+            task_literals,
+            stamp: V2Stamp {
+                skill: Some("olympe".into()),
+                ..V2Stamp::default()
+            },
+        }
+    }
+
+    // (a) THE LOOP: a clean, generalisable bilan + a unanimous éval-à-3 ⇒ the archived
+    // record carries the DERIVED prompt (`apply_directives` ran), a bumped
+    // `prompt_version`, and the archived eval report.
+    #[test]
+    fn a_clean_bilan_derives_the_improved_prompt() {
+        let req = eval_request(
+            Bilan {
+                add_directives: vec!["Always run the linter.".into()],
+                ..Bilan::default()
+            },
+            unanimous(),
+            vec!["catalog.jsonl".into()],
+        );
+        let base = base_profile("You are Olympe.", Some(4));
+        let record = req.into_record("t1", RETIRED_AT, Some(&base));
+
+        let prompt = record.prompt.as_deref().expect("a derived prompt");
+        assert!(prompt.contains("You are Olympe."), "the base is kept, then extended");
+        assert!(prompt.contains("Always run the linter."), "apply_directives ran");
+        assert_eq!(record.prompt_version, Some(5), "previous profile version + 1");
+        assert_eq!(record.bilan.as_ref().map(|b| b.add_directives.len()), Some(1));
+        assert!(record.is_complete(false), "a derived prompt passes the v2 gate");
+        let eval = record.eval.expect("the eval report is archived");
+        assert_eq!(eval.decision, EvalDecision::Improved);
+        assert_eq!(eval.outcome, Outcome::Success);
+    }
+
+    // (b) THE VETO (anti-over-fit): a directive that leaks a task literal ⇒ statu quo,
+    // and the ORIGINAL prompt is archived — the over-fitted directive never pollutes the
+    // profile.
+    #[test]
+    fn a_leaky_directive_is_vetoed_and_the_original_prompt_stands() {
+        let req = eval_request(
+            Bilan {
+                add_directives: vec!["Fix the bug in catalog.jsonl.".into()],
+                ..Bilan::default()
+            },
+            unanimous(),
+            vec!["catalog.jsonl".into()],
+        );
+        let base = base_profile("You are Olympe.", Some(4));
+        let record = req.into_record("t1", RETIRED_AT, Some(&base));
+
+        assert_eq!(
+            record.prompt.as_deref(),
+            Some("You are Olympe."),
+            "the original prompt stands"
+        );
+        assert!(
+            !record.prompt.as_deref().unwrap().contains("catalog.jsonl"),
+            "the leaked literal never reaches the profile"
+        );
+        assert_eq!(record.prompt_version, Some(4), "no bump on a statu quo");
+        let eval = record.eval.expect("the veto is traced");
+        assert_eq!(eval.decision, EvalDecision::StatuQuo);
+        assert_eq!(eval.leaked_literals, vec!["catalog.jsonl".to_string()]);
+    }
+
+    // (c) DISSENT: 2/3 approvals ⇒ statu quo, the original prompt kept.
+    #[test]
+    fn a_dissent_keeps_the_original_prompt() {
+        let mut votes = unanimous();
+        votes.olympe.approve_prompt = false;
+        let req = eval_request(
+            Bilan {
+                add_directives: vec!["Always run the linter.".into()],
+                ..Bilan::default()
+            },
+            votes,
+            Vec::new(),
+        );
+        let base = base_profile("You are Olympe.", Some(2));
+        let record = req.into_record("t1", RETIRED_AT, Some(&base));
+
+        assert_eq!(record.prompt.as_deref(), Some("You are Olympe."));
+        assert_eq!(record.eval.map(|e| e.decision), Some(EvalDecision::StatuQuo));
+    }
+
+    // (d) THE MANUAL OVERRIDE WINS: an explicit --prompt is never overwritten by the
+    // derivation, even with a clean bilan + a unanimous éval.
+    #[test]
+    fn an_explicit_prompt_is_never_overwritten() {
+        let req = RetireRequest {
+            stamp: V2Stamp {
+                skill: Some("olympe".into()),
+                prompt: Some("Hand-written.".into()),
+                ..V2Stamp::default()
+            },
+            ..eval_request(
+                Bilan {
+                    add_directives: vec!["Always run the linter.".into()],
+                    ..Bilan::default()
+                },
+                unanimous(),
+                Vec::new(),
+            )
+        };
+        let base = base_profile("You are Olympe.", Some(4));
+        let record = req.into_record("t1", RETIRED_AT, Some(&base));
+
+        assert_eq!(record.prompt.as_deref(), Some("Hand-written."));
+        assert!(record.eval.is_none(), "no eval ran under a manual prompt");
+    }
+
+    // (e) DEGRADED: a retire with no bilan is telemetry-only — no eval runs, the stamp's
+    // prompt stands, and the current behaviour is preserved.
+    #[test]
+    fn a_retire_without_a_bilan_runs_no_eval() {
+        let record = v2_request("olympe", "You are Olympe.").into_record("t1", RETIRED_AT, None);
+        assert!(record.eval.is_none(), "no bilan ⇒ no eval");
+        assert_eq!(record.prompt.as_deref(), Some("You are Olympe."));
+        assert!(record.bilan.is_none());
+        assert!(record.is_complete(false));
     }
 }
