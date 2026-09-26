@@ -27,6 +27,27 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+/// The reply this harness gives to a cursor-position (DSR) query.
+const DSR_REPLY: &str = "\x1b[1;1R";
+
+/// The same reply as the line discipline echoes it back.
+///
+/// Restoring the terminal on the way out turns ECHO back on, and with ECHOCTL the
+/// kernel echoes an ESC as the two printable characters `^[` — so what lands in the
+/// captured output *after* the app's own last line is caret notation, not the raw
+/// bytes above. A test asserting on that tail must ignore this form; it must also
+/// still ignore the raw form, in case ECHOCTL is off.
+const DSR_ECHO: &str = "^[[1;1R";
+
+/// Drop the harness's own cursor-position reply from the tail of a capture.
+///
+/// Both forms: caret notation (what ECHOCTL gives, the default) and the raw bytes
+/// (in case it is off). A no-op when the reply did not come back at all, which is
+/// the usual case locally — the assertion stays honest either way.
+fn strip_dsr_echo(seen: &str) -> &str {
+    seen.trim_end_matches(DSR_ECHO).trim_end_matches(DSR_REPLY)
+}
+
 /// A pty pair, with the master split into a writer and a reading thread.
 ///
 /// Split because the reading side has to run on its own thread: a blocking read
@@ -84,7 +105,7 @@ impl Pty {
                 for _ in 0..queries {
                     // Row 1, column 1: any position is accepted, it is only
                     // used to place the cursor for redraws.
-                    let _ = responder.write_all(b"\x1b[1;1R");
+                    let _ = responder.write_all(DSR_REPLY.as_bytes());
                 }
                 let _ = responder.flush();
                 carry = window[window.len().saturating_sub(4)..].to_vec();
@@ -1759,9 +1780,44 @@ fn leaving_the_repl_ends_the_output_with_a_newline() {
     // returns the carriage depends on the terminal having been put back into cooked mode — so the
     // assertion is on the line ending rather than on the exact pair. Asserted on the tail, which is
     // the whole point: a newline anywhere earlier would be the prompt's own.
+    //
+    // The tail is read past our own DSR reply first: restoring the terminal turns ECHO back on, so
+    // the reply this harness injected comes back as input echo and lands after the app's last line
+    // (see the responder thread). That echo is the harness's, not the app's, so it must not decide
+    // whether the app ended on a newline. It arrives in caret notation (`DSR_ECHO`) under ECHOCTL,
+    // which is the default; the raw form is stripped too, in case it is not.
+    let tail = strip_dsr_echo(&seen);
     assert!(
-        seen.ends_with('\n'),
+        tail.ends_with('\n'),
         "the shell would have continued the app's last line. Output ended with: {:?}",
-        &seen[seen.len().saturating_sub(60)..]
+        &tail[tail.len().saturating_sub(60)..]
     );
+}
+
+/// The strip handles the exact tail CI produced.
+///
+/// Kept as a test of its own because the pty test cannot reproduce the race on
+/// demand: locally the echo does not land there, so the strip is a no-op and the
+/// pty test would pass with the bug still in. This one pins the bytes instead.
+#[test]
+fn the_dsr_echo_is_stripped_in_both_forms() {
+    // What CI saw: the app restores the terminal and ends its line, then the
+    // kernel echoes our reply back in caret notation (ECHOCTL).
+    let seen = "\u{1b}[?2004l\r\r\n^[[1;1R";
+    assert!(
+        strip_dsr_echo(seen).ends_with('\n'),
+        "caret-notation echo must not decide the tail"
+    );
+
+    // The raw form, should ECHOCTL ever be off.
+    let seen = "\u{1b}[?2004l\r\r\n\u{1b}[1;1R";
+    assert!(strip_dsr_echo(seen).ends_with('\n'));
+
+    // No reply echoed: the capture is returned untouched, so the assertion stays
+    // as strict as it was.
+    assert_eq!(strip_dsr_echo("done\r\n"), "done\r\n");
+
+    // And it still catches a genuine failure: an app that did NOT end its line.
+    let seen = "\u{1b}[?2004l\r\r\n^[[1;1R";
+    assert!(!strip_dsr_echo(&seen[..seen.len() - 2]).ends_with('\n'));
 }
