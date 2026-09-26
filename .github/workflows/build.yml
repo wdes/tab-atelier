@@ -108,6 +108,16 @@ jobs:
             # whole crate graph once more just for this step.
             - name: Run headless tests
               run: cargo test --workspace --locked --no-default-features --features headless,energy --no-fail-fast
+            # The dashboard's assets are plain ES modules with no toolchain of
+            # their own: node runs them directly, so there is nothing to install
+            # and no npm in this repository. They read `dashboard.js` from the
+            # source tree and do not need the crate built — which matters, since
+            # it is not a default member.
+            #
+            # The `*.accept.mjs` beside them are NOT run: they drive a real
+            # browser and need playwright, which this repository does not carry.
+            - name: Run dashboard asset tests
+              run: crates/tab-atelier-dashboard/assets/run-tests.sh
             - name: Check formatting
               run: cargo fmt --all -- --check
             - name: Clippy (GUI)
