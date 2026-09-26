@@ -28,7 +28,7 @@ use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::{Config, Term};
 use alacritty_terminal::tty;
-use log::{debug, info, warn};
+use log::{debug, error, info, warn};
 
 use crate::api;
 use crate::platform;
@@ -76,6 +76,13 @@ struct HeadlessTab {
     #[allow(dead_code)]
     event_proxy: EventProxy,
     pid: u32,
+    /// A dup of the PTY master fd, kept open for a hot-swap handoff. `None`
+    /// when the platform has no fd to dup (Windows/ConPTY — hot swap is
+    /// Unix-only anyway) or the dup failed; the tab then simply can't be
+    /// carried across an exec. [`crate::hotswap`] collects these into the
+    /// handoff manifest.
+    #[cfg(unix)]
+    master_copy: Option<std::fs::File>,
     /// Wall-clock at which this tab's PTY was spawned in *this*
     /// process run. `prior_uptime` folds in time accumulated in
     /// previous runs so a restart doesn't reset the counter.
@@ -449,6 +456,27 @@ impl HeadlessTab {
     }
 }
 
+/// Wire a PTY (fresh fork or hot-swap-adopted) into a running event loop.
+///
+/// Tap → event loop → notifier on the proxy; returns the notifier so the
+/// caller can push `Msg`s. Shared by both spawn paths of [`spawn_pty_tab`]
+/// so the adopted path can't drift from the fresh one.
+fn start_tab_event_loop<
+    P: alacritty_terminal::tty::EventedPty + alacritty_terminal::event::OnResize + Send + 'static,
+>(
+    term: &Arc<FairMutex<Term<EventProxy>>>,
+    proxy: &EventProxy,
+    pty_ring: &Arc<Mutex<crate::pty_ring::PtyRing>>,
+    pty: P,
+) -> Option<EventLoopSender> {
+    let pty = crate::pty_ring::PtyTap::new(pty, pty_ring.clone());
+    let el = EventLoop::new(term.clone(), proxy.clone(), pty, false, false).ok()?;
+    let notifier = el.channel();
+    proxy.set_notifier(notifier.clone());
+    el.spawn();
+    Some(notifier)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_pty_tab(
     id: String,
@@ -490,6 +518,30 @@ fn spawn_pty_tab(
         cell_width: 9,
         cell_height: 18,
     };
+    // Created up front (no PTY dependency): the hot-swap adoption below
+    // seeds it with the carried pre-swap bytes, and the tap threads it
+    // into whichever PTY this tab ends up with.
+    let pty_ring = Arc::new(Mutex::new(crate::pty_ring::PtyRing::default()));
+    // Hot-swap handoff: if the previous binary handed us this tab's live
+    // PTY, reattach to it instead of forking a fresh shell. The ring is
+    // seeded either way — if the shell died mid-swap, the fresh fork's
+    // output just appends below the pre-swap history.
+    #[cfg(unix)]
+    let adopted_pty: Option<(crate::hotswap::AdoptedPty, u32)> = crate::hotswap::take_adopted(&id).and_then(|a| {
+        if !a.ring.is_empty()
+            && let Ok(mut r) = pty_ring.lock()
+        {
+            r.push(&a.ring);
+        }
+        let pid = a.pid;
+        let pty = crate::hotswap::AdoptedPty::adopt(a.master, pid, ws);
+        if pty.is_none() {
+            info!("hot swap: tab '{name}' shell (pid {pid}) exited during handoff — forking fresh");
+        }
+        pty.map(|p| (p, pid))
+    });
+    #[cfg(target_os = "linux")]
+    let adopting = adopted_pty.is_some();
     // Pick the shell explicitly. Alacritty defaults to the user's
     // login shell from /etc/passwd. The headless deb creates
     // `tab-atelier` as a system user with `nologin` as its login
@@ -573,7 +625,12 @@ fn spawn_pty_tab(
     // The returned cgroup path is unused now — every tab is put in its cgroup
     // unconditionally below (`ensure_tab`) for teardown, not just net ones.
     #[cfg(target_os = "linux")]
-    let _net_setup: Option<String> = {
+    let _net_setup: Option<String> = if adopting {
+        // Adopted shell: its nft rules, resolver and cgroup survived the
+        // exec untouched — leaving them alone IS the point of the handoff.
+        // Re-running teardown/apply would strip a live tab's egress rules.
+        None
+    } else {
         crate::net_nft::teardown(&id);
         crate::cgroup::prepare_tab_cgroup(&id).and_then(|rel| {
             let ok = if net_disabled {
@@ -637,27 +694,6 @@ fn spawn_pty_tab(
         env: env_map,
         ..Default::default()
     };
-    let pty = match tty::new(&opts, ws, 0) {
-        Ok(p) => p,
-        Err(e) => {
-            warn!("headless: pty spawn failed for '{name}': {e}");
-            return None;
-        }
-    };
-    #[cfg(unix)]
-    let pid = pty.child().id();
-    // ConPTY's Pty doesn't expose the child the way the Unix one does.
-    // Every PID consumer (catbus, energy, /proc cwd) is disabled on
-    // Windows, so a sentinel keeps the build going until a real ConPTY
-    // child-PID lookup is wired up.
-    #[cfg(windows)]
-    let pid = 0u32;
-    // Put every tab in its OWN cgroup immediately: nft egress enforcement
-    // (when opted in) keys on it AND it makes the tab's whole process tree
-    // reliably killable/reapable (cgroup.kill) so a `claude --resume` can't
-    // orphan across restarts. Idempotent; also covers limit-less/plain tabs.
-    #[cfg(target_os = "linux")]
-    crate::cgroup::ensure_tab(&id, pid);
     let config = Config {
         scrolling_history: 10_000,
         ..Config::default()
@@ -672,29 +708,88 @@ fn spawn_pty_tab(
         proxy.clone(),
     );
     let term = Arc::new(FairMutex::new(term));
-    // Tap the PTY before alacritty sees it. Every byte goes into the
-    // ring first; only then is it forwarded to the parser. The ring
-    // survives `\x1b[3J` (alacritty would otherwise wipe its history)
-    // and captures Claude / htop / `less` in-place redraws that never
-    // reach alacritty's scrollback.
-    let pty_ring = Arc::new(Mutex::new(crate::pty_ring::PtyRing::default()));
-    let pty = crate::pty_ring::PtyTap::new(pty, pty_ring.clone());
-    let el = EventLoop::new(term.clone(), proxy.clone(), pty, false, false).ok()?;
-    let notifier = el.channel();
-    proxy.set_notifier(notifier.clone());
-    el.spawn();
+    // Reattach (hot swap) or fork fresh. Either way the PTY is tapped
+    // before alacritty sees it — every byte goes into the ring first
+    // (survives `\x1b[3J`, captures in-place TUI redraws), then reaches
+    // the parser. The ring was created (and may have been seeded) above.
+    #[cfg(unix)]
+    let adopted_start: Option<(EventLoopSender, u32, Option<std::fs::File>)> =
+        if let Some((pty, adopted_pid)) = adopted_pty {
+            let master_copy = pty.master_copy();
+            let notifier = start_tab_event_loop(&term, &proxy, &pty_ring, pty)?;
+            Some((notifier, adopted_pid, master_copy))
+        } else {
+            None
+        };
+    #[cfg(unix)]
+    let was_adopted = adopted_start.is_some();
+    #[cfg(not(unix))]
+    let was_adopted = false;
+
+    #[cfg(unix)]
+    let fresh = adopted_start.is_none();
+    #[cfg(not(unix))]
+    let fresh = true;
+    let (notifier, pid, master_copy) = if fresh {
+        let pty = match tty::new(&opts, ws, 0) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!("headless: pty spawn failed for '{name}': {e}");
+                return None;
+            }
+        };
+        #[cfg(unix)]
+        let pid = pty.child().id();
+        // ConPTY's Pty doesn't expose the child the way the Unix one does.
+        // Every PID consumer (catbus, energy, /proc cwd) is disabled on
+        // Windows, so a sentinel keeps the build going until a real ConPTY
+        // child-PID lookup is wired up.
+        #[cfg(windows)]
+        let pid = 0u32;
+        // A dup of the master fd, kept for the *next* hot-swap handoff.
+        #[cfg(unix)]
+        let master_copy = pty.file().try_clone().ok();
+        // ConPTY has no fd to dup; hot swap is Unix-only anyway.
+        #[cfg(not(unix))]
+        let master_copy: Option<std::fs::File> = None;
+        let notifier = start_tab_event_loop(&term, &proxy, &pty_ring, pty)?;
+        (notifier, pid, master_copy)
+    } else {
+        #[cfg(unix)]
+        {
+            let Some(t) = adopted_start else {
+                return None; // unreachable: `fresh` is `adopted_start.is_none()`
+            };
+            t
+        }
+        #[cfg(not(unix))]
+        {
+            return None; // unreachable: `fresh` is constant `true`
+        }
+    };
+    // Put every tab in its OWN cgroup immediately: nft egress enforcement
+    // (when opted in) keys on it AND it makes the tab's whole process tree
+    // reliably killable/reapable (cgroup.kill) so a `claude --resume` can't
+    // orphan across restarts. Idempotent; also covers limit-less/plain tabs
+    // and re-asserts membership for adopted shells (already in there).
+    #[cfg(target_os = "linux")]
+    crate::cgroup::ensure_tab(&id, pid);
 
     // Only queue a type-in resume when we did NOT launch the agent directly
     // above (agent_direct) — otherwise the exec'd agent + a typed `--resume`
-    // would double-launch.
-    let pending_agent_resume = match (&agent_kind, &agent_session_id) {
-        _ if agent_direct.is_some() || crate::read_only() => None,
-        // A session-less daemon has nothing to resume — just relaunch it. The
-        // GUI already did this for brain; headless didn't, so a restarted
-        // daemon tab came back as a bare shell.
-        (Some(kind), None) => build_agent_resume_command(kind, "", agent_plan_mode),
-        (Some(kind), Some(sid)) => build_agent_resume_command(kind, sid, agent_plan_mode),
-        _ => None,
+    // would double-launch. Never into a hot-swap-adopted shell either: its
+    // agent is still running.
+    let pending_agent_resume = if agent_direct.is_some() || crate::read_only() || was_adopted {
+        None
+    } else {
+        match (&agent_kind, &agent_session_id) {
+            // A session-less daemon has nothing to resume — just relaunch it. The
+            // GUI already did this for brain; headless didn't, so a restarted
+            // daemon tab came back as a bare shell.
+            (Some(kind), None) => build_agent_resume_command(kind, "", agent_plan_mode),
+            (Some(kind), Some(sid)) => build_agent_resume_command(kind, sid, agent_plan_mode),
+            _ => None,
+        }
     };
 
     let last_known_cwd_string = cwd.as_ref().map(|p| p.to_string_lossy().into());
@@ -712,6 +807,8 @@ fn spawn_pty_tab(
         notifier,
         event_proxy: proxy,
         pid,
+        #[cfg(unix)]
+        master_copy,
         created_at: Instant::now(),
         prior_uptime: Duration::from_secs_f64(prior_uptime_secs),
         active_duration: Duration::ZERO,
@@ -879,6 +976,16 @@ pub fn run() -> std::io::Result<()> {
 
     let read_only = crate::read_only();
 
+    // Hot-swap handoff: when the previous binary exec'd into us it left
+    // `--handoff <manifest>` on argv, naming the live PTY master fds it
+    // kept open across the exec. Adopt them BEFORE the cgroup reap and
+    // the tab restore below, so restored tabs reattach to their running
+    // shells instead of forking fresh ones ([`crate::hotswap`]).
+    let adopted = crate::hotswap::adopt_from_args();
+    if adopted > 0 {
+        info!("hot swap: inherited {adopted} live tab(s) from the previous binary");
+    }
+
     // --- Restore tabs (or seed one fresh tab) ---
     let mut tabs: Vec<HeadlessTab> = Vec::new();
     let mut active: usize = 0;
@@ -893,10 +1000,12 @@ pub fn run() -> std::io::Result<()> {
     // `Delegate=yes` only; a clean no-op otherwise. Then reap any tab cgroups
     // a prior (crashed / unclean) run left behind, BEFORE respawning tabs, so
     // a fresh resume can't run beside a still-live copy of the same session.
+    // Hot-swap-adopted tabs are NOT stale: their cgroups hold exactly the
+    // live shells the handoff carried across the exec, so they're kept.
     #[cfg(target_os = "linux")]
     {
         crate::cgroup::init(true);
-        crate::cgroup::reap_stale_tabs();
+        crate::cgroup::reap_stale_tabs(&crate::hotswap::adopted_ids());
     }
     if let Some(saved) = saved_state {
         info!("restoring {} tab(s) from saved state", saved.tabs.len());
@@ -1026,6 +1135,12 @@ pub fn run() -> std::io::Result<()> {
     if tabs.is_empty() {
         return Err(std::io::Error::other("headless: failed to spawn initial pty"));
     }
+
+    // Every restored tab has claimed its hot-swap handoff by now. A
+    // handoff fd still unclaimed belongs to a tab that no longer exists —
+    // close it so its orphaned shell gets its HUP instead of wedging on a
+    // full PTY buffer nobody drains.
+    crate::hotswap::close_unclaimed();
 
     // --- API servers ---
     let api_state = Arc::new(Mutex::new(api::TabSnapshot {
@@ -1217,6 +1332,55 @@ pub fn run() -> std::io::Result<()> {
                 }
             }
             return Ok(());
+        }
+
+        // A hot-swap upgrade came in (`POST /upgrade`): flush all state,
+        // then replace this process with the binary now installed at our
+        // own path, handing every tab's live PTY across the exec — the
+        // shells (and the agents in them) never notice. Falls through and
+        // keeps running only if the exec failed.
+        #[cfg(unix)]
+        if crate::hotswap::upgrade_requested() && !crate::read_only() {
+            crate::hotswap::clear_upgrade_request();
+            info!("hot swap: flushing state and exec'ing the new binary");
+            persist(
+                &mut tabs,
+                active,
+                &state_writer,
+                &api_state,
+                #[cfg(feature = "energy")]
+                &power_pids,
+                #[cfg(feature = "energy")]
+                &power_watts,
+                #[cfg(feature = "energy")]
+                &battery_percent,
+                &mut last_uptime_save,
+                &mut last_state_hash,
+                true,
+            );
+            // Freeze *before* snapshotting the rings: bytes read into the
+            // live ring after the snapshot would be missing from the dump.
+            crate::hotswap::freeze_and_settle();
+            let sources: Vec<crate::hotswap::HandoffSource> = tabs
+                .iter()
+                .filter_map(|tab| {
+                    let master = tab.master_copy.as_ref().and_then(|f| f.try_clone().ok())?;
+                    let ring = tab
+                        .pty_ring
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .since(0);
+                    Some(crate::hotswap::HandoffSource {
+                        id: tab.id.to_string(),
+                        master,
+                        pid: tab.pid,
+                        ring,
+                    })
+                })
+                .collect();
+            info!("hot swap: handing off {} live tab(s)", sources.len());
+            let err = crate::hotswap::exec_swap(&sources);
+            error!("hot swap failed, continuing on the old binary: {err}");
         }
 
         // Drain pending actions EVERY tick (~16 ms) — this is the

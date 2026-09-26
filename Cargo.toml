@@ -266,6 +266,16 @@ tempfile = "3"
 [target.'cfg(target_os = "linux")'.dependencies]
 gpui = { version = "0.2", default-features = false, features = ["x11"], optional = true }
 
+# Hot swap (src/hotswap.rs) is Unix-only: it hands live PTY masters
+# across an `exec` and re-derives the child-exit watch the replaced
+# `alacritty_terminal::Pty` owned. rustix covers the fd/termios/process
+# calls without `unsafe` libc boilerplate; signal-hook's self-pipe gives
+# the adopter its SIGCHLD wakeup. Both are already in the tree
+# transitively (alacritty_terminal), so this adds no new download.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs", "process", "termios"] }
+signal-hook = "0.3"
+
 [target.'cfg(windows)'.dependencies]
 # getrandom 0.4 renamed `getrandom()` → `fill()` and dropped the
 # alloc feature gate. Tracked under src/platform/windows.rs which

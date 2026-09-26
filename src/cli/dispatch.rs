@@ -71,6 +71,13 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub relay: bool,
 
+    /// (internal) Hot-swap handoff manifest, left on argv by the previous
+    /// binary exec'ing into us. Consumed at boot by
+    /// [`crate::hotswap::adopt_from_args`], which re-scans argv itself — this
+    /// field exists only so clap doesn't reject the flag.
+    #[arg(long, hide = true, value_name = "PATH")]
+    pub handoff: Option<PathBuf>,
+
     #[command(subcommand)]
     pub command: Option<Commands>,
 }
@@ -594,6 +601,11 @@ pub enum Commands {
     /// token 401s; the new token is written to `api.token`.
     ResetMasterToken,
 
+    /// Hot-swap the running daemon onto the binary now installed at its
+    /// path — every tab (and whatever runs inside) stays live across the
+    /// switch. Install the new binary first, then run this.
+    Upgrade,
+
     /// Bridge a Claude Code hook event to set-status. Reads JSON from stdin.
     ClaudeHook {
         /// Event name (`session-start`, `pre-tool`, …).
@@ -989,6 +1001,7 @@ fn command_exit_code(cli: Cli) -> Option<i32> {
         Commands::Token => crate::cli::client::run("token", &[]),
         Commands::RotateTokens => crate::cli::client::run("rotate-tokens", &[]),
         Commands::ResetMasterToken => crate::cli::client::run("reset-master-token", &[]),
+        Commands::Upgrade => crate::cli::client::run("upgrade", &[]),
         Commands::ClaudeHook { event } => crate::cli::client::run("claude-hook", &[event]),
         Commands::Remote { args } => crate::cli::client::run("remote", &args),
         Commands::Dispatch { args } => crate::cli::client::run("dispatch", &args),
