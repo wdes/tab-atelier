@@ -1,0 +1,341 @@
+/* Harness control panel. Slice S3. See docs/dashboard.md. */
+:root {
+  color-scheme: light dark;
+  --bg: #f7f7f8;
+  --fg: #1f2328;
+  --panel: #ffffff;
+  --border: #d0d7de;
+  --muted: #57606a;
+  /* Neutral (empty node): faint, dashed. Led colours below work on both themes. */
+  --neutral-fill: #eaeef2;
+  --neutral-stroke: #c0c7cf;
+  /* Led palette as variables so a node fill and its legend swatch (S1) paint the
+     EXACT same colour — the acceptance matches swatch bg against node fill. */
+  --led-idle-fill: #ddf4ff;       --led-idle-stroke: #54aeff;
+  --led-unreviewed-fill: #fff8c5; --led-unreviewed-stroke: #d4a72c;
+  --led-working-fill: #dafbe1;    --led-working-stroke: #2da44e;
+  --led-error-fill: #ffebe9;      --led-error-stroke: #cf222e;
+  --led-dead-fill: #d0d7de;       --led-dead-stroke: #6e7781;
+  --orchestrator-accent: #8250df;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14171c;
+    --fg: #e6edf3;
+    --panel: #1e232b;
+    --border: #30363d;
+    --muted: #9198a1;
+    --neutral-fill: #232a33;
+    --neutral-stroke: #3a424c;
+    --led-idle-fill: #0c2d4a;       --led-idle-stroke: #3b82f6;
+    --led-unreviewed-fill: #3b2e00; --led-unreviewed-stroke: #d4a72c;
+    --led-working-fill: #0f3d22;    --led-working-stroke: #2da44e;
+    --led-error-fill: #4a1512;      --led-error-stroke: #f85149;
+    --led-dead-fill: #2b3138;       --led-dead-stroke: #6e7781;
+    --orchestrator-accent: #d2a8ff;
+  }
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font: 14px/1.4 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  background: var(--bg);
+  color: var(--fg);
+}
+
+.topbar {
+  display: flex;
+  align-items: baseline;
+  gap: 1rem;
+  padding: 0.6rem 1rem;
+  border-bottom: 1px solid var(--border);
+}
+.topbar h1 { font-size: 1rem; margin: 0; font-weight: 600; }
+.status { font-size: 0.8rem; color: var(--muted); }
+.status.ok { color: #2da44e; }
+.status.err { color: #cf222e; }
+
+#dashboard { padding: 1rem; }
+
+/* --- clipped-field 'voir plus' toggle (catalogue prompt, kiosk bodies) --- */
+.ac-more {
+  color: var(--led-working-stroke); cursor: pointer; text-decoration: underline;
+  margin-left: 0.25rem; font-size: 0.9em; white-space: nowrap;
+}
+.ac-more:hover { opacity: 0.8; }
+
+/* --- Catalogue #39 SC2: topbar button + cold-source overlay (distinct from live cards) --- */
+.catalog-toggle {
+  margin-left: auto;
+  padding: 0.25rem 0.7rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--fg);
+  font: inherit; font-size: 0.82rem; cursor: pointer;
+}
+.catalog-toggle:hover { background: color-mix(in srgb, var(--fg) 6%, transparent); }
+
+.catalog-panel {
+  position: fixed;
+  top: 50%; left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 60;
+  width: min(760px, 94vw);
+  max-height: 86vh;
+  overflow: auto;
+  background: var(--panel);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.4);
+}
+.catalog-panel .cat-header {
+  position: sticky; top: 0;
+  display: flex; align-items: center; gap: 0.6rem;
+  padding: 0.7rem 1rem;
+  background: var(--panel);
+  border-bottom: 2px solid var(--border);
+}
+.cat-title { font-weight: 700; font-size: 1rem; }
+.cat-count { color: var(--muted); font-size: 0.78rem; }
+.cat-refresh, .cat-close { margin-left: auto; border: none; background: transparent; color: var(--muted); font-size: 1rem; cursor: pointer; }
+.cat-refresh { margin-left: auto; } .cat-close { margin-left: 0.3rem; font-size: 1.2rem; }
+.cat-list { padding: 0.4rem 0.6rem 0.8rem; }
+.cat-loading, .cat-error, .cat-empty { padding: 1rem; color: var(--muted); }
+/* category-sort (Option A): the header sort selector + collapsible group headers. */
+.cat-sort-wrap { font-size: 0.72rem; color: var(--muted); display: inline-flex; align-items: center; gap: 0.3rem; margin-left: 0.4rem; }
+.cat-sort { font: inherit; font-size: 0.72rem; background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 4px; padding: 0.05rem 0.3rem; cursor: pointer; }
+.cat-group + .cat-group { margin-top: 0.3rem; }
+.cat-group-head { display: flex; align-items: center; gap: 0.35rem; width: 100%; border: none; background: transparent; color: var(--muted); font: inherit; font-weight: 700; text-align: left; cursor: pointer; padding: 0.35rem 0.2rem; border-bottom: 1px solid var(--border); }
+.cat-group-head:hover { color: var(--fg); background: color-mix(in srgb, var(--fg) 6%, transparent); }
+.cat-group-caret { display: inline-block; width: 1em; }
+.cat-group-count { color: var(--muted); font-weight: 400; }
+.cat-group-body[hidden] { display: none; }
+/* distilled agent cards surfaced in the "catégorie" mode: read-only, origin tag. */
+.cat-origin { color: var(--muted); font-size: 0.72rem; font-weight: 400; }
+.cat-skill.cat-readonly .cat-name { font-weight: 500; }
+
+.cat-skill { border-bottom: 1px solid var(--border); }
+.cat-skill-head {
+  width: 100%; text-align: left; border: none; background: transparent;
+  color: var(--fg); font: inherit; padding: 0.55rem 0.4rem; cursor: pointer;
+  display: flex; align-items: center; gap: 0.4rem;
+}
+.cat-skill-head:hover { background: color-mix(in srgb, var(--fg) 5%, transparent); }
+.cat-caret { color: var(--muted); font-size: 0.75rem; width: 0.9rem; }
+.cat-name { font-weight: 600; }
+.cat-ver { color: var(--muted); font-size: 0.72rem; }
+.cat-skill-body { padding: 0.2rem 0.4rem 0.7rem 1.3rem; font-size: 0.84rem; }
+.cat-field { margin: 0.25rem 0; }
+.cat-key { color: var(--muted); font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.03em; margin-right: 0.3rem; }
+.cat-tag { font-size: 0.72rem; padding: 0.02rem 0.35rem; border: 1px solid var(--border); border-radius: 999px; color: var(--muted); white-space: nowrap; }
+.cat-prompt { white-space: pre-wrap; }
+
+.cat-metrics { margin-top: 0.5rem; }
+.metrics-table { border-collapse: collapse; font-size: 0.76rem; width: 100%; max-width: 460px; }
+.metrics-table th, .metrics-table td { border: 1px solid var(--border); padding: 0.15rem 0.4rem; text-align: right; }
+.metrics-table th[scope="row"], .metrics-table thead th:first-child { text-align: left; color: var(--muted); }
+.fvr-line { margin-top: 0.35rem; font-size: 0.78rem; color: var(--muted); }
+/* Verdict = DIRECTION only (never pass/fail): fresh=blue, resume=purple, else muted. */
+.fvr-verdict { font-size: 0.72rem; padding: 0.05rem 0.4rem; border-radius: 999px; border: 1px solid var(--border); }
+.fvr-verdict.fvr-fresh { color: var(--led-idle-stroke); border-color: var(--led-idle-stroke); background: color-mix(in srgb, var(--led-idle-stroke) 12%, transparent); }
+.fvr-verdict.fvr-resume { color: var(--orchestrator-accent); border-color: var(--orchestrator-accent); background: color-mix(in srgb, var(--orchestrator-accent) 12%, transparent); }
+.fvr-verdict.fvr-inconclusive { color: var(--muted); }
+.fvr-verdict.fvr-insufficient { color: var(--muted); border-style: dashed; }
+.catalog-panel[hidden] { display: none; }
+
+/* --- Catalogue #39 SC3: edit form + delete/restore --- */
+.cat-edit { margin-top: 0.7rem; padding-top: 0.6rem; border-top: 1px dashed var(--border); }
+.cat-edit-row { display: flex; gap: 0.6rem; align-items: flex-start; margin-bottom: 0.4rem; }
+.cat-edit-row > label { flex: 0 0 6.5rem; font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.03em; color: var(--muted); padding-top: 0.25rem; }
+.cat-edit-row > label small { text-transform: none; letter-spacing: 0; }
+.cat-edit input, .cat-edit textarea {
+  flex: 1 1 auto; font: inherit; font-size: 0.82rem;
+  padding: 0.3rem 0.4rem; border: 1px solid var(--border); border-radius: 6px;
+  background: var(--bg); color: var(--fg); resize: vertical;
+}
+.cat-edit-actions { display: flex; align-items: center; gap: 0.5rem; margin-top: 0.2rem; }
+.cat-save, .cat-delete, .cat-restore {
+  font: inherit; font-size: 0.78rem; padding: 0.25rem 0.7rem; border-radius: 6px;
+  border: 1px solid var(--border); background: var(--panel); color: var(--fg); cursor: pointer;
+}
+.cat-save { border-color: var(--led-working-stroke); color: var(--led-working-stroke); }
+.cat-delete { border-color: var(--led-error-stroke); color: var(--led-error-stroke); }
+.cat-restore { border-color: var(--led-idle-stroke); color: var(--led-idle-stroke); }
+.cat-edit-msg { font-size: 0.74rem; color: var(--muted); }
+.cat-edit-msg.err { color: var(--led-error-stroke); }
+.cat-tombstone { font-size: 0.62rem; text-transform: uppercase; color: var(--muted); border: 1px dashed var(--border); border-radius: 999px; padding: 0 0.35rem; }
+.cat-skill.cat-deleted .cat-name { color: var(--muted); text-decoration: line-through; }
+
+/* --- Catalogue #39 SC3-toggle: show-deleted control --- */
+.cat-deleted-toggle { font-size: 0.72rem; color: var(--muted); display: inline-flex; align-items: center; gap: 0.3rem; margin-left: 0.4rem; cursor: pointer; }
+.cat-deleted-toggle input { margin: 0; }
+
+/* --- KIOSK #kiosk (PD2): cross-project pending-decisions panel --- */
+.kiosk-toggle {
+  margin-left: 0.4rem;
+  padding: 0.25rem 0.7rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--fg);
+  font: inherit; font-size: 0.82rem; cursor: pointer;
+  display: inline-flex; align-items: center; gap: 0.35rem;
+}
+.kiosk-toggle:hover { background: color-mix(in srgb, var(--fg) 6%, transparent); }
+/* Badge = nb open decisions (hidden at zero via [hidden]). */
+.kiosk-badge {
+  min-width: 1.1rem; padding: 0 0.3rem; border-radius: 999px;
+  background: var(--led-error-stroke); color: var(--bg);
+  font-size: 0.7rem; font-weight: 700; text-align: center; line-height: 1.3;
+}
+.kiosk-badge[hidden] { display: none; }
+
+.kiosk-panel {
+  position: fixed;
+  top: 50%; left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 60;
+  width: min(760px, 94vw);
+  max-height: 86vh;
+  overflow: auto;
+  background: var(--panel);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.4);
+}
+.kiosk-panel[hidden] { display: none; }
+.kiosk-panel .kk-header {
+  position: sticky; top: 0;
+  display: flex; align-items: center; gap: 0.6rem;
+  padding: 0.7rem 1rem;
+  background: var(--panel);
+  border-bottom: 2px solid var(--border);
+}
+.kk-panel-title { font-weight: 700; font-size: 1rem; }
+.kk-count { color: var(--muted); font-size: 0.78rem; }
+.kk-archived-toggle { font-size: 0.72rem; color: var(--muted); display: inline-flex; align-items: center; gap: 0.3rem; margin-left: 0.4rem; cursor: pointer; }
+.kk-archived-toggle input { margin: 0; }
+.kk-refresh, .kk-close { border: none; background: transparent; color: var(--muted); font-size: 1rem; cursor: pointer; }
+.kk-refresh { margin-left: auto; } .kk-close { margin-left: auto; font-size: 1.2rem; }
+.kk-list { padding: 0.4rem 0.8rem 0.9rem; }
+.kk-loading, .kk-error, .kk-empty { padding: 1rem; color: var(--muted); }
+
+/* Volet-2 (#kiosk 3 onglets): tab bar + panels. */
+.kk-tabs { display: flex; gap: 0.2rem; padding: 0.4rem 0.8rem 0; border-bottom: 1px solid var(--border); position: sticky; top: 3rem; background: var(--panel); z-index: 1; }
+.kk-tab { border: none; background: transparent; color: var(--muted); font: inherit; font-size: 0.82rem; padding: 0.45rem 0.7rem; cursor: pointer; border-bottom: 2px solid transparent; }
+.kk-tab:hover { color: var(--fg); }
+.kk-tab[aria-selected="true"] { color: var(--fg); border-bottom-color: var(--led-working-stroke); font-weight: 600; }
+.kk-tabpanel[hidden] { display: none; }
+.kk-subhead { display: flex; align-items: center; gap: 0.4rem; padding: 0.55rem 0.8rem 0; }
+
+/* Onglet (b) Rapports. */
+.kk-report-list { padding: 0.4rem 0.8rem 0.9rem; display: flex; flex-direction: column; gap: 0.3rem; }
+.kk-report { padding: 0.35rem 0.5rem; border: 1px solid var(--border); border-radius: 6px; display: flex; align-items: baseline; justify-content: space-between; gap: 0.5rem; }
+/* volet (b): "à la une" (5 most recent, distinct) + the ranging selector (calqué catalogue). */
+.kk-featured { padding: 0.2rem 0.2rem 0.4rem; }
+.kk-featured-head { font-weight: 700; color: var(--muted); padding: 0.35rem 0.9rem 0.1rem; font-size: 0.82rem; }
+.kk-reports-sub { display: flex; align-items: center; gap: 0.4rem; padding: 0.2rem 0.9rem 0.3rem; border-top: 1px solid var(--border); }
+.kk-report-groups .cat-group-body.kk-report-list { padding-top: 0.25rem; padding-bottom: 0.5rem; }
+/* volet-3: the "Ouvrir en distant" share link sits beside the local viewer link. */
+.kk-remote-link { flex: none; font-size: 0.72rem; color: var(--led-working-stroke); border: 1px solid var(--border); border-radius: 6px; padding: 0.15rem 0.45rem; text-decoration: none; white-space: nowrap; }
+.kk-remote-link:hover, .kk-remote-link:focus { color: var(--fg, #cdd); outline: none; }
+
+/* Onglet (c) Grille d'intention. */
+.kk-intent { padding: 0.6rem 0.8rem 1rem; display: flex; flex-direction: column; gap: 0.55rem; }
+.kk-intent-hint { color: var(--muted); font-size: 0.76rem; margin: 0; }
+.kk-intent-label { display: flex; flex-direction: column; gap: 0.25rem; font-size: 0.78rem; color: var(--muted); }
+.kk-intent textarea, .kk-gwt-row textarea { font: inherit; font-size: 0.82rem; width: 100%; box-sizing: border-box; resize: none; overflow: hidden; background: var(--bg, #1b1b1b); color: var(--fg); border: 1px solid var(--border); border-radius: 6px; padding: 0.4rem 0.5rem; min-height: 2rem; }
+.kk-gwt-row { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 0.35rem; margin-bottom: 0.35rem; }
+.kk-gwt-add { align-self: flex-start; font: inherit; font-size: 0.76rem; background: transparent; color: var(--led-working-stroke); border: 1px dashed var(--border); border-radius: 6px; padding: 0.3rem 0.6rem; cursor: pointer; }
+.kk-intent-actions { display: flex; align-items: center; gap: 0.6rem; }
+.kk-intent-post { font: inherit; font-size: 0.82rem; padding: 0.35rem 0.9rem; border-radius: 6px; border: 1px solid var(--led-working-stroke); background: var(--panel); color: var(--led-working-stroke); cursor: pointer; }
+.kk-intent-msg { font-size: 0.78rem; color: var(--muted); }
+.kk-intent-msg.ok { color: var(--led-ok-stroke, #6c6); }
+.kk-intent-msg.err { color: var(--led-error-stroke, #e66); }
+
+.kk-group { margin-top: 0.5rem; }
+.kk-project { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); margin: 0.6rem 0 0.3rem; }
+.kk-card { border: 1px solid var(--border); border-radius: 8px; padding: 0.5rem 0.7rem; margin-bottom: 0.5rem; }
+.kk-card.kk-state-archived { opacity: 0.6; }
+.kk-head { display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap; }
+.kk-check { font-size: 0.76rem; color: var(--fg); display: inline-flex; align-items: center; gap: 0.25rem; cursor: pointer; }
+.kk-check input { margin: 0; }
+.kk-title { font-weight: 600; font-size: 0.9rem; }
+/* Item 2 (#kiosk): the 2-3 line summary under the bold title, above the toggle/detail. */
+.kk-summary { margin: 0.2rem 0 0.35rem; font-size: 0.84rem; line-height: 1.4; color: var(--fg); }
+.kk-state-tag { margin-left: auto; font-size: 0.66rem; text-transform: uppercase; letter-spacing: 0.03em; color: var(--muted); border: 1px solid var(--border); border-radius: 999px; padding: 0 0.4rem; }
+.kk-field { margin: 0.25rem 0; font-size: 0.82rem; }
+.kk-key { color: var(--muted); font-size: 0.66rem; text-transform: uppercase; letter-spacing: 0.03em; margin-right: 0.3rem; }
+.kk-detail-toggle { font: inherit; font-size: 0.78rem; line-height: 1; cursor: pointer; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); color: var(--muted); padding: 0.05rem 0.35rem; }
+.kk-detail-toggle:hover { color: var(--fg); }
+.kk-detail { margin: 0.3rem 0; padding: 0.4rem 0.5rem; font-size: 0.82rem; line-height: 1.45; border-left: 2px solid var(--border); color: var(--fg); white-space: normal; overflow-wrap: anywhere; }
+/* Volet (a): a fenced code block in the detail body — the 📋 button floats top-right; the
+   code is monospace, scrollable, and never wraps into the button. */
+.kk-codeblock { position: relative; margin: 0.4rem 0; }
+.kk-code { margin: 0; padding: 0.45rem 0.55rem; padding-right: 2rem; font-family: var(--mono, monospace); font-size: 0.78rem; line-height: 1.4; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; overflow-x: auto; white-space: pre; color: var(--fg); }
+.kk-copy-code { position: absolute; top: 0.25rem; right: 0.25rem; font-size: 0.8rem; line-height: 1; cursor: copy; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); padding: 0.1rem 0.3rem; opacity: 0.6; }
+.kk-copy-code:hover, .kk-copy-code:focus { opacity: 1; outline: none; }
+/* Copy confirmation toast — visible feedback on every copy path (secure OR http-LAN legacy). */
+.kk-toast {
+  position: fixed; bottom: 1.5rem; left: 50%;
+  transform: translateX(-50%) translateY(1rem);
+  z-index: 70;
+  background: var(--panel); color: var(--fg);
+  border: 1px solid var(--border); border-radius: 8px;
+  padding: 0.5rem 1rem; font-size: 0.85rem; font-weight: 600;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+  opacity: 0; pointer-events: none;
+  transition: opacity 0.15s ease, transform 0.15s ease;
+}
+.kk-toast-show { opacity: 1; transform: translateX(-50%) translateY(0); }
+@media (prefers-reduced-motion: reduce) { .kk-toast { transition: opacity 0.15s ease; } }
+.kk-files { margin: 0.3rem 0; display: flex; flex-direction: column; gap: 0.15rem; }
+.kk-file { font-size: 0.78rem; color: var(--led-idle-stroke); word-break: break-all; }
+/* FU2: a code-source ref is copyable TEXT (not a link) — monospace, subtly boxed,
+   a copy cursor. Distinct from .kk-file (a real doc link). */
+.kk-file-ref { font-size: 0.78rem; font-family: var(--mono, monospace); color: var(--fg-dim, #9aa); word-break: break-all; cursor: copy; border-bottom: 1px dotted currentColor; }
+.kk-file-ref:hover, .kk-file-ref:focus { color: var(--fg, #cdd); outline: none; }
+.kk-rule { display: flex; align-items: center; gap: 0.5rem; margin-top: 0.4rem; flex-wrap: wrap; }
+.kk-verdict-input { flex: 1 1 12rem; font: inherit; font-size: 0.8rem; padding: 0.25rem 0.4rem; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); color: var(--fg); }
+.kk-verdict-input:disabled { opacity: 0.5; }
+/* Bug3: the explicit ruling action — makes verdict submission evident. */
+.kk-send { font: inherit; font-size: 0.78rem; padding: 0.25rem 0.7rem; border-radius: 6px; border: 1px solid var(--led-working-stroke); background: var(--panel); color: var(--led-working-stroke); cursor: pointer; }
+.kk-send:disabled { opacity: 0.5; cursor: not-allowed; }
+.kk-verdict { font-size: 0.76rem; color: var(--muted); }
+.kk-hint { font-size: 0.72rem; color: var(--muted); font-style: italic; }
+.kk-msg { font-size: 0.74rem; color: var(--muted); }
+.kk-msg.err { color: var(--led-error-stroke); }
+
+/* --- Mesh view: fleet force-directed graph (additive lens) --- */
+/* The topbar toggle mirrors the catalogue/kiosk buttons; .active marks the lens on. */
+.mesh-toggle { cursor: pointer; }
+.mesh-toggle.active { background: var(--led-working-stroke); color: #fff; }
+.mesh { position: relative; }
+.mesh-filters { display: flex; gap: 12px; align-items: center; padding: 8px 4px; flex-wrap: wrap; color: var(--muted); font-size: 0.8rem; }
+.mesh-filters select { font: inherit; }
+.mesh-svg { width: 100%; height: 72vh; display: block; touch-action: none; cursor: grab; }
+.mesh-svg.mesh-panning { cursor: grabbing; }
+.mesh-node circle { stroke-width: 1.5; cursor: pointer; }
+.mesh-node text {
+  fill: var(--fg); font-size: 10px; pointer-events: none;
+  paint-order: stroke; stroke: var(--bg); stroke-width: 3px; stroke-linejoin: round;
+}
+/* Node fill/stroke reuse the SAME led-* variables as the phase nodes + legend swatches,
+   so a mesh node matches its led everywhere (single source of colour). */
+.mesh-node.led-neutral circle    { fill: var(--neutral-fill);       stroke: var(--neutral-stroke); }
+.mesh-node.led-idle circle       { fill: var(--led-idle-fill);      stroke: var(--led-idle-stroke); }
+.mesh-node.led-unreviewed circle { fill: var(--led-unreviewed-fill); stroke: var(--led-unreviewed-stroke); }
+.mesh-node.led-working circle    { fill: var(--led-working-fill);   stroke: var(--led-working-stroke); }
+.mesh-node.led-error circle      { fill: var(--led-error-fill);     stroke: var(--led-error-stroke); }
+.mesh-node.led-dead circle       { fill: var(--led-dead-fill);      stroke: var(--led-dead-stroke); }
+.mesh-node.mesh-dim, .mesh-svg .lineage-edge.mesh-dim { opacity: 0.12; }
+.mesh-tip {
+  position: absolute; pointer-events: none; z-index: 10; max-width: 320px;
+  background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+  padding: 8px 10px; font-size: 0.78rem; display: none; box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+}
+.mesh-tip .k { color: var(--muted); }
