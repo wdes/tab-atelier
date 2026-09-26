@@ -54,6 +54,37 @@ dispatches on — so a command cannot exist without being documented.
 | `/resume <id>` | Switch to one, in place. |
 | `/exit` (alias `/quit`) | Leave. Works even while a turn is running. |
 
+## Your own shell
+
+A line starting with `!` runs in your shell, here, and you watch it as it happens. It is not a
+prompt and never reaches the model as text.
+
+| Line | What it does |
+|---|---|
+| `!<cmd>` | Run it, show the output, then tell the model what it printed. |
+| `!!<cmd>` | Run it and show the output. The model is told nothing. |
+| `!<cmd> &` | The same, in the background. |
+| `!!<cmd> &` | In the background, and silent. |
+
+**Prefer the background.** A command run this way keeps the prompt free, so you can keep reading
+the output, run something else, or carry on talking to the model while it runs — and a slow one
+cannot hold the session still. The model is told how it ended whether or not it was backgrounded,
+so `!make test &` is almost always what you want over `!make test`. The only cost is that you have
+to be looking when the notice arrives.
+
+A foreground command owns the prompt until it finishes, and the status row says so. Press
+**Ctrl-B** to stop waiting for it — it carries on in the background — or **Ctrl-C** to stop the
+command itself. Nothing is lost either way; a background command still reports when it ends.
+
+Two things to know about the model's side of it. The first: what the model is told is that *you*
+ran the command, quoting it, with the exit status and the output — so it takes the result into
+account without ever believing one of its own tools produced it. The second: if the model is
+already mid-turn, the notice waits for its turn rather than interrupting it, and if a turn is not
+running, the notice starts one.
+
+While the model works, its reasoning streams above the prompt in grey. It is there to be watched
+and clears when the answer arrives — the transcript stays the answer.
+
 ## Permission modes
 
 Three modes, and the banner says which you are in when the session starts, because a write
@@ -178,9 +209,12 @@ Two things that look like faults and are not:
 
 * **A leading `mode open — nothing is checked` line.** That is the banner confirming the
   mode, not a warning.
-* **`~1,200 tokens in` on the status row.** That is the local count of what was sent, marked
-  `~` because it is an estimate; the real figure comes from the provider and appears on the
-  line under a finished answer.
+* **`120,000 in · ~900 out · USD 0.36000 est.` on the status row.** The live cost of the
+  turn being answered, shown while it runs rather than after it. It comes from two sources
+  and says so: `~` marks a figure this machine worked out (the request's own size before the
+  reply opens, the output count while it is still arriving) and is absent on the provider's
+  own counts. `est.` on the price means the money is still moving with the output. The
+  authoritative figures appear on the line under the finished answer.
 
 If the agent is not running at all, the tab's right-click menu entry is dimmed and says an
 agent already runs there — start one agent per tab, not two.

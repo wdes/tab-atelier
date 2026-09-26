@@ -82,7 +82,13 @@ pub async fn run(input: &serde_json::Value, cwd: &Path) -> Result<String, String
     }
     // Reject a bad tool set here rather than watching the child die of it: the
     // message names the set, where the child would only report an exit code.
-    if let Err(why) = super::ToolSet::load(Some(Path::new(tools))) {
+    //
+    // Resolved the way the child will resolve it — over `work_dir`, which is what the child
+    // gets as its own cwd — so a working directory whose `.catbus/tools.toml` is broken is
+    // caught here rather than by a child that starts and immediately exits. The default
+    // (`minimal`) short-circuits before discovery, which is the right answer for a sub-agent:
+    // it should be smaller than its parent, not larger.
+    if let Err(why) = super::ToolSet::load_layered(Some(Path::new(tools)), work_dir.as_path()) {
         return Err(format!("spawn refused: tools_config `{tools}`: {why}"));
     }
     let _slot = LiveSlot::claim()?;

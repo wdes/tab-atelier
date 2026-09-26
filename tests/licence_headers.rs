@@ -57,6 +57,13 @@ fn skipped(path: &Path) -> bool {
         // Scratch space for inter-tab handoffs, not shipped source.
         || s.contains("/inbox/")
         || s.contains("/outbox/")
+        // Agent worktrees under `.claude/`, which git excludes itself
+        // (`.git/info/exclude`). They are whole checkouts of this repository, so
+        // walking into one scans a second copy of the tree — and fails the suite
+        // over a file that is not on any branch, is not shipped, and is not the
+        // author's to label. A test whose result depends on whether someone has a
+        // worktree open is testing the wrong thing.
+        || s.contains("/.claude/worktrees/")
 }
 
 fn source_files(root: &Path) -> Vec<PathBuf> {

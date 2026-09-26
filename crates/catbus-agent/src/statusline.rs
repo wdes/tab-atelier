@@ -3,15 +3,19 @@
 //! The two lines the REPL shows about a turn.
 //!
 //! While the agent works, one line is repainted in place: a spinner, the current
-//! activity, and an estimate of the input tokens this request will cost. When
-//! the reply lands, a totals line is printed below it — cumulative tokens on the
-//! left, the gate mode on the right.
+//! activity, the model serving the turn, and what that turn has cost so far — its
+//! token count and, when a price is known, its money. When the reply lands, a totals
+//! line is printed below it — cumulative tokens on the left, the gate mode on the right.
 //!
-//! The visible count during a download is necessarily an *estimate*, marked with
-//! `~`: the Messages API reports `usage` only in its final response, so until
-//! then the only figure available is local arithmetic on the payload size. The
-//! authoritative numbers appear on the totals line, which is fed from the
-//! server's own `usage`. [`estimate_input_tokens`] carries the reasoning.
+//! The counts on the running line come from two sources and the difference is visible.
+//! Until the reply opens there is nothing but the request's own payload size, so the
+//! figure is local arithmetic and carries `~`. Once the reply opens, its `message_start`
+//! reports the input count — the provider's own, and exact — and the output side is
+//! counted from what has streamed in so far, which is the only running figure there is:
+//! the real output total arrives once, in the closing `message_delta`. So the two halves
+//! are marked separately, and the price built on them is marked `est.` while either is
+//! still being guessed. [`Live`] carries which is which; [`estimate_input_tokens`]
+//! carries the arithmetic.
 //!
 //! Both lines are *pure formatting* on purpose. The REPL itself is only
 //! reachable through a real terminal, so anything that can be a function taking
@@ -23,6 +27,7 @@
 //! showing; it takes the clock as an argument rather than reading it, so its timing
 //! rules are testable too.
 
+use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 
 /// `1,234 in - 567 out` — the left-hand field of the totals line.
@@ -180,27 +185,165 @@ pub fn totals_line(tokens_in: u64, tokens_out: u64, gate: crate::tools::Gate, wi
 
 /// Rough bytes per token for English text under a BPE tokenizer.
 ///
-/// An approximation, and named as one: the real count comes from the server's
-/// `usage.input_tokens` and is shown on the totals line once the reply lands.
+/// An approximation, and named as one: the real count comes from the server's own `usage` and
+/// replaces this on the display as soon as it arrives — see [`estimate_input_tokens`] for which
+/// half of a reply it arrives for, and when.
 pub const BYTES_PER_TOKEN: usize = 4;
 
 /// Estimate the input tokens a request of `bytes` will cost.
 ///
-/// Needed because the Messages API reports `usage` only in its *final* response,
-/// so while a request is in flight there is no authoritative figure to show. The
-/// spinner would otherwise read `0 tokens in` for the whole download — which is
-/// what it did before this existed — and a number that never moves is worse than
-/// no number, since it looks like the request is stuck.
+/// Needed for the gap before the provider has said anything. Its `message_start` carries the input
+/// count, so that gap is only the round trip — but it is the round trip of a request that may be
+/// hundreds of kilobytes, on a relay that has to accept it first, and the spinner would otherwise
+/// read `0 tokens in` for the whole of it. A number that never moves is worse than no number, since
+/// it looks like the request is stuck.
+///
+/// The output side needs the same arithmetic for longer: the real output count arrives once, in the
+/// closing `message_delta`, so until then a reply's output is estimated from the bytes that have
+/// streamed in. That estimate is what [`live_line`] shows with a `~` on the output figure alone,
+/// once the input figure beside it has become the provider's own.
 ///
 /// Deliberately crude. A byte-length ratio is wrong by a wide margin on
 /// non-English text, code, and JSON scaffolding, and it is still the right
 /// choice here: the alternative is either a tokenizer dependency (large, and
 /// wrong for whatever model the relay actually routes to) or a spinner that
-/// shows nothing. `~/` in the display marks it as an estimate so it cannot be
+/// shows nothing. `~` in the display marks it as an estimate so it cannot be
 /// mistaken for the server's own count.
 #[must_use]
 pub const fn estimate_input_tokens(bytes: usize) -> u64 {
     (bytes / BYTES_PER_TOKEN) as u64
+}
+
+/// What the request in flight has used and what the provider has confirmed about it.
+///
+/// The two are separate fields because they are separate claims. `usage` is what has been counted,
+/// from whichever source was available — the provider's own figures once it has reported any, the
+/// request's measured size before that. `reported` and `output_estimated` are what the reader is
+/// owed about *how* those counts were obtained, and they are carried rather than derived because
+/// only the agent knows which source each figure came from.
+///
+/// The direction of the uncertainty is deliberately not symmetrical. The input count becomes the
+/// provider's own the instant the reply opens, and is exact from then on. The output count stays an
+/// estimate until the close, because that is the only frame that carries the real one — so the
+/// display marks the *output* as estimated even when the input beside it is not. Marking the pair
+/// with one flag would either understate a known input count or overstate a guessed output one, and
+/// both are worse than saying which is which.
+#[derive(Debug, Clone, Default)]
+pub struct Live {
+    /// The counts to display: the provider's when it has reported any, otherwise the local
+    /// estimate for what was sent.
+    pub usage: crate::agent::Usage,
+    /// Whether `usage` came from the provider rather than from local arithmetic.
+    pub reported: bool,
+    /// Whether the *output* count is still a local estimate of what has arrived.
+    pub output_estimated: bool,
+    /// The model this request is being served by, when something has named it.
+    ///
+    /// Carried because the price depends on it and the ledger cannot always supply it: the cost
+    /// ledger only learns a model from a *finished* reply, so on the first turn of a session — and
+    /// on every turn a relay routes to a different model — it is either empty or one turn behind.
+    /// The reply names itself in `message_start`, which is the first thing that arrives, so the
+    /// price on the row is built on the model actually answering rather than on the last one that
+    /// did.
+    pub model: Option<String>,
+}
+
+impl Live {
+    /// The four kinds as one value, for the cost arithmetic.
+    #[must_use]
+    pub const fn tokens(&self) -> crate::cost::Tokens {
+        self.usage.tokens()
+    }
+
+    /// Whether there is anything to show. A request that has been sized but not yet answered has an
+    /// input estimate and nothing else, which is still worth showing.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.tokens().is_empty()
+    }
+}
+
+/// The cost of the request in flight, for the row that is repainted while it runs.
+///
+/// This is deliberately *not* [`cost_line`]. That line is printed once, under a finished answer,
+/// where there is room for the model, the currency codes and a note about unpriced tokens; this one
+/// is appended to a busy row that already carries a spinner, an activity, the model and possibly a
+/// queue count, and it is repainted several times a second. So it is short, and it gives up the
+/// money before it gives up the counts.
+///
+/// The order of that last decision matters. A narrow terminal should lose the price and keep the
+/// tokens, not the other way round: the counts are the fact the price is computed from, they are
+/// what the totals line under the answer will agree with, and a price with no counts above it
+/// invites the reader to wonder what it was charged for.
+///
+/// `~` marks one figure, not the line: it sits on exactly the number that is local arithmetic rather
+/// than the provider's own count. Before the reply opens that is both of them; after it opens the
+/// input side is exact and the output side is still being counted from the bytes received, so the
+/// row reads `12,345 in · ~900 out` — which is the whole point of carrying the two flags separately.
+/// A single mark over the pair would either understate a count the provider gave or overstate one it
+/// has not.
+///
+/// `price` is the catalog entry for the model the session is running as, or `None` when no catalog
+/// has arrived or the model is not in it. Money is grouped by currency for the same reason
+/// [`cost_line`] is: a session spanning two providers is billed in two currencies, and adding them
+/// would be a lie about which. A price built even partly on an estimate is marked `est.`, since it
+/// is the figure most likely to move — a reply of 40 tokens so far may become 400.
+///
+/// `width` is the room *left on the row*, not the terminal's width: the caller has already spent
+/// the spinner, the activity and the model, and knows what is queued behind this. Getting that
+/// wrong is invisible — the terminal clips the overflow — and it costs the reader whichever figure
+/// happened to be last.
+#[must_use]
+pub fn live_line(live: &Live, price: Option<&crate::cost::ModelPrice>, width: usize) -> String {
+    if live.is_empty() {
+        return String::new();
+    }
+    let tokens = live.tokens();
+    // The provider's raw input count, in and out of cache together — the same quantity the totals
+    // line's "in" figure is, so a reader can compare the two. Pricing splits it by kind; this does
+    // not, because the row is about how much was sent, not how it was charged.
+    let mut counts = format!(
+        "  {}{} in",
+        if live.reported { "" } else { "~" },
+        crate::statusline::thousands(live.usage.input_tokens)
+    );
+    // Shown only once there is something of a reply to count, because `0 out` on a request that has
+    // not been answered yet is not a fact — it is the absence of one.
+    if live.usage.output_tokens > 0 {
+        let _ = write!(
+            counts,
+            " · {}{} out",
+            if live.output_estimated { "~" } else { "" },
+            crate::statusline::thousands(live.usage.output_tokens)
+        );
+    }
+    // Money is a bonus on this row: it appears when a price is known and there is width for it, and
+    // its absence is not worth a word here — the totals line below the answer is where a missing
+    // price is explained, and saying `no price` on a row repainted every frame would be noise.
+    let mut money = String::new();
+    if let Some(price) = price {
+        let amounts = price.cost(tokens);
+        if !amounts.is_empty() {
+            let rendered = amounts
+                .iter()
+                .map(|(currency, amount)| format!("{currency} {amount:.5}"))
+                .collect::<Vec<_>>()
+                .join("  ");
+            money = format!(
+                " · {rendered}{}",
+                if live.reported && !live.output_estimated {
+                    ""
+                } else {
+                    " est."
+                }
+            );
+        }
+    }
+    if counts.chars().count() + money.chars().count() <= width {
+        counts + &money
+    } else {
+        counts
+    }
 }
 
 /// The label shown while the model is thinking and has not called a tool.
@@ -674,5 +817,159 @@ mod tests {
         assert_eq!(tokens(1, 1, 0, 0).cached(), 0);
         // And the total is everything, cache included.
         assert_eq!(tokens(1, 1, 10, 5).total(), 17);
+    }
+
+    /// A catalog entry for one model, in one currency, priced per million of each kind.
+    fn price() -> crate::cost::ModelPrice {
+        crate::cost::Catalog::parse(
+            r#"{"models":[{"id":"m","name":"M","amounts":[
+                {"currency":"USD","unit_tokens":1000000,"kind":"input","price":3.0},
+                {"currency":"USD","unit_tokens":1000000,"kind":"output","price":15.0},
+                {"currency":"USD","unit_tokens":1000000,"kind":"cache_read","price":0.3},
+                {"currency":"USD","unit_tokens":1000000,"kind":"cache_write","price":3.75}]}]}"#,
+        )
+        .expect("parses")
+        .model("m")
+        .expect("priced")
+        .clone()
+    }
+
+    fn live(input: u64, output: u64, reported: bool, output_estimated: bool) -> Live {
+        Live {
+            usage: crate::agent::Usage {
+                input_tokens: input,
+                output_tokens: output,
+                ..crate::agent::Usage::default()
+            },
+            reported,
+            output_estimated,
+            model: None,
+        }
+    }
+
+    /// The problem this whole display exists for: before the reply lands there is no price on
+    /// screen, and the operator is deciding whether to keep going while it is being spent.
+    #[test]
+    fn a_live_turn_shows_its_count_and_its_price() {
+        let line = live_line(&live(120_000, 0, false, true), Some(&price()), 200);
+        // 120,000 input at $3/M is $0.36.
+        assert!(line.contains("USD 0.36000"), "{line}");
+        assert!(line.contains("~120,000 in"), "the counts are shown too: {line}");
+        // The whole figure is an estimate, so the price built on it is marked as one.
+        assert!(line.contains("est."), "an estimated price says so: {line}");
+    }
+
+    /// The `~` moves off the input when the provider's own count arrives and stays on the output —
+    /// which is the whole reason the two flags are carried separately rather than as one.
+    #[test]
+    fn each_figure_is_marked_estimated_on_its_own() {
+        let line = live_line(&live(120_000, 300, true, true), Some(&price()), 200);
+        assert!(line.contains("120,000 in"), "the input count is the provider's: {line}");
+        assert!(!line.contains("~120,000"), "{line}");
+        assert!(
+            line.contains("~300 out"),
+            "the output side is still counted from bytes: {line}"
+        );
+        assert!(line.contains("est."), "so the price built on it is marked: {line}");
+    }
+
+    /// Nothing of a reply yet means no output figure at all, rather than a `0 out` that reads as a
+    /// fact about a request the provider has not answered.
+    #[test]
+    fn an_unanswered_request_has_no_output_figure() {
+        let line = live_line(&live(120_000, 0, true, true), Some(&price()), 200);
+        assert!(line.contains("120,000 in"), "{line}");
+        assert!(!line.contains("out"), "no reply, so nothing to count out: {line}");
+    }
+
+    /// Once the reply closes, the counts and the price are both final and nothing is marked.
+    #[test]
+    fn a_finished_count_carries_no_caveat() {
+        let line = live_line(&live(120_000, 900, true, false), Some(&price()), 200);
+        assert!(!line.contains('~'), "{line}");
+        assert!(!line.contains("est."), "{line}");
+        // And the row's `in` reads the same field the totals line sums, so the two agree.
+        assert!(line.contains("120,000 in · 900 out"), "{line}");
+        // 120,000 input at 3/M + 900 output at 15/M = 0.36 + 0.0135.
+        assert!(line.contains("0.37350"), "{line}");
+    }
+
+    /// No catalog, no price — and no word about it. The counts are the fact; a missing rate is
+    /// explained on the totals line under the finished answer, not on a row repainted every frame.
+    #[test]
+    fn without_a_price_the_counts_stand_alone_and_in_silence() {
+        let line = live_line(&live(120_000, 300, true, false), None, 200);
+        assert!(line.contains("120,000 in · 300 out"), "{line}");
+        assert!(!line.contains("USD"), "{line}");
+        assert!(!line.contains("no price"), "no complaint on the busy row: {line}");
+    }
+
+    /// A narrow terminal loses the money before the counts: the counts are what a price is computed
+    /// from, and a price with no counts above it invites the reader to ask what was charged for.
+    #[test]
+    fn a_narrow_row_drops_the_money_and_keeps_the_counts() {
+        let priced = live_line(&live(120_000, 900, true, false), Some(&price()), 200);
+        assert!(priced.contains("USD"), "{priced}");
+
+        let narrow = live_line(&live(120_000, 900, true, false), Some(&price()), 10);
+        assert!(narrow.contains("120,000 in"), "{narrow}");
+        assert!(!narrow.contains("USD"), "the price is what gives way: {narrow}");
+    }
+
+    /// A session that has just sent a request has an input estimate and nothing else, and that is
+    /// still worth showing — it is exactly what the row displayed before it could price anything.
+    #[test]
+    fn an_input_estimate_with_no_output_yet_is_still_shown() {
+        let line = live_line(&live(30_000, 0, false, true), Some(&price()), 200);
+        assert!(line.contains("~30,000 in"), "{line}");
+        // 30,000 input at 3/M = 0.09.
+        assert!(line.contains("0.09000"), "{line}");
+    }
+
+    /// Nothing counted produces nothing, rather than `0 in` — which would look like a failure on a
+    /// row that is merely between requests.
+    #[test]
+    fn nothing_counted_puts_nothing_on_the_row() {
+        let empty = Live::default();
+        assert!(empty.is_empty());
+        assert_eq!(live_line(&empty, Some(&price()), 200), "");
+    }
+
+    /// A request whose tokens are all cache is not an empty row: the input count the provider
+    /// reports includes the cached reads, and they are charged at the cache rate rather than the
+    /// input one — which is what stops the price on this row disagreeing with the totals line.
+    #[test]
+    fn a_cache_only_request_is_not_an_empty_row() {
+        let cached = Live {
+            usage: crate::agent::Usage {
+                input_tokens: 50_000,
+                cache_read_input_tokens: 50_000,
+                ..crate::agent::Usage::default()
+            },
+            reported: true,
+            output_estimated: false,
+            model: None,
+        };
+        assert!(!cached.is_empty());
+        let line = live_line(&cached, Some(&price()), 200);
+        assert!(line.contains("50,000 in"), "{line}");
+        // 50,000 at the cache-read rate of 0.3/M, not the 3/M input rate.
+        assert!(line.contains("0.01500"), "{line}");
+    }
+
+    /// Two currencies are two figures. A session that used two providers is billed twice, and one
+    /// number would be a lie about which.
+    #[test]
+    fn a_two_currency_catalog_shows_both_amounts() {
+        let catalog = crate::cost::Catalog::parse(
+            r#"{"models":[{"id":"m","name":"M","amounts":[
+                {"currency":"USD","unit_tokens":1000000,"kind":"input","price":3.0},
+                {"currency":"EUR","unit_tokens":1000000,"kind":"input","price":2.5}]}]}"#,
+        )
+        .expect("parses");
+        let price = catalog.model("m").expect("priced");
+        let line = live_line(&live(1_000_000, 0, true, false), Some(price), 200);
+        assert!(line.contains("USD 3.00000"), "{line}");
+        assert!(line.contains("EUR 2.50000"), "{line}");
     }
 }

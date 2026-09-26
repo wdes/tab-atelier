@@ -133,6 +133,15 @@ fn mock_upstream() -> u16 {
 /// The other mock answers; this one also records, because the question here is
 /// what the proxy *wrote* upstream, not what came back.
 fn capturing_upstream(capture: PathBuf) -> u16 {
+    capturing_upstream_reporting("deepseek-flash", capture)
+}
+
+/// The same, but answering under a chosen model name.
+///
+/// The name in the response is not decoration: it is what the proxy bills the
+/// hour at, so what a vendor echoes about itself is the whole question.
+fn capturing_upstream_reporting(model: &str, capture: PathBuf) -> u16 {
+    let model = model.to_owned();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock");
     let port = listener.local_addr().expect("addr").port();
     std::thread::spawn(move || {
@@ -169,7 +178,9 @@ fn capturing_upstream(capture: PathBuf) -> u16 {
             if let Some(start) = head {
                 let _ = std::fs::write(&capture, &req[start..]);
             }
-            let body = r#"{"model":"deepseek-flash","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":11,"output_tokens":7}}"#;
+            let body = format!(
+                r#"{{"model":"{model}","content":[{{"type":"text","text":"ok"}}],"usage":{{"input_tokens":11,"output_tokens":7}}}}"#
+            );
             let _ = write!(
                 sock,
                 "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
@@ -448,6 +459,228 @@ fn the_cli_and_the_server_agree_on_where_the_files_are() {
     );
 }
 
+/// An hour a saved-without-its-rate provider served records what it cost.
+///
+/// The config is the shape the provider form writes: `id:class:relative_cost`
+/// and no rate, because the form has no field for one. That is what every
+/// provider in production looks like after a single save, and it is the whole
+/// reason the money unit was empty — the hop kept serving, kept counting tokens,
+/// and had no rate to charge them at. `relative_cost` is a ranking number the
+/// router orders providers by, not a price, so it cannot stand in for one.
+///
+/// The amount asserted is worked out by hand from the rates the catalogue
+/// publishes, so this fails if the arithmetic drifts: the mock reports 11
+/// uncached input tokens and 7 generated ones, and at $0.15/1M in and $0.60/1M
+/// out that is 1.65 and 4.2 micro-dollars, floored to whole micro-dollars —
+/// which is what an hour stores.
+#[test]
+fn a_provider_that_lost_its_rate_still_records_a_cost() {
+    let scratch = Scratch::new("rate-repair");
+    let upstream = capturing_upstream(scratch.path().join("captured.json"));
+    let port = free_port();
+
+    cli(scratch.path(), &["add", "Ada", "Lovelace", "ada@example.org"]);
+    let minted = cli(scratch.path(), &["add-key", "ada@example.org", "laptop"]);
+    let key = minted
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("key: "))
+        .expect("the CLI prints the key exactly once")
+        .to_owned();
+
+    let config = scratch.path().join("config");
+    std::fs::create_dir_all(&config).expect("config dir");
+    let key_file = config.join("deepseek.key");
+    std::fs::write(&key_file, "sk-mock\n").expect("key file");
+    let providers = format!(
+        concat!(
+            r#"{{"providers":[{{"id":"deepseek","label":"DeepSeek (mock)","wire":"anthropic","#,
+            r#""base_url":"http://127.0.0.1:{upstream}","auth":{{"kind":"api_key_file","path":"{key}"}},"#,
+            r#""models":[{{"id":"deepseek-flash","class":"balanced","relative_cost":15}}],"#,
+            r#""preference":0,"enabled":true}}],"#,
+            r#""mappings":[{{"from":"claude-sonnet-5","to":"deepseek-flash"}}]}}"#,
+        ),
+        upstream = upstream,
+        key = key_file.display(),
+    );
+    std::fs::write(config.join("providers.json"), providers).expect("providers.json");
+
+    let mut child = Command::new(BIN)
+        .args(["serve", "--listen", &format!("127.0.0.1:{port}")])
+        .env("TAB_ATELIER_PROXY_CONFIG", &config)
+        .env("TAB_ATELIER_PROXY_STATE", scratch.path().join("state"))
+        .env("HOME", scratch.path().join("home"))
+        .env("RUST_LOG", "warn")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn the proxy");
+    wait_until_listening(port, &mut child);
+    let _serving = Serving(child);
+
+    let payload = concat!(
+        r#"{"model":"claude-sonnet-5","max_tokens":16,"#,
+        r#""messages":[{"role":"user","content":"hi"}]}"#,
+    );
+    let resp = http(
+        port,
+        &format!(
+            "POST /relay/anthropic/v1/messages HTTP/1.1\r\nHost: x\r\nx-api-key: {key}\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+            payload.len()
+        ),
+    );
+    assert!(resp.starts_with("HTTP/1.1 200"), "proxied call failed:\n{resp}");
+
+    let usage_root = scratch.path().join("state/usage");
+    let mut found = None;
+    for _ in 0..50 {
+        if let Some(f) = first_usage_file(&usage_root) {
+            found = Some(f);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let file = found.unwrap_or_else(|| panic!("no usage file appeared under {}", usage_root.display()));
+    let recorded = std::fs::read_to_string(&file).expect("read usage");
+
+    assert!(
+        recorded.contains("deepseek-flash"),
+        "the hour must record the model the vendor billed: {recorded}"
+    );
+    assert!(
+        recorded.contains(r#""cost":{"in_micro":1,"out_micro":4}"#),
+        "the hour must record what it cost, priced where it was served \
+         rather than left empty for want of a rate: {recorded}"
+    );
+}
+
+/// An hour the vendor answered under a legacy name is still billed.
+///
+/// This is the money graph's other loose end, and the one that survives every
+/// other repair: the rate is looked up from the model name the *upstream echoed
+/// about itself*, and a vendor may answer under a name it still accepts for a
+/// model newer than it — `DeepSeek` serves and bills `deepseek-v4-flash` at
+/// Flash's price while the catalogue holds only `deepseek-flash`. Requiring an
+/// exact match threw the hour away entirely: no stored cost, no `cost_model`,
+/// and a dashboard that drew no money even though the tokens were spent.
+///
+/// So this proves the two halves at once — the hour keeps its cost, and it
+/// names the model the price came from rather than the string that arrived.
+#[test]
+fn an_hour_answered_under_a_legacy_model_name_is_still_priced() {
+    let scratch = Scratch::new("legacy-model-name");
+    let upstream = capturing_upstream_reporting("deepseek-v4-flash", scratch.path().join("captured.json"));
+    let port = free_port();
+
+    cli(scratch.path(), &["add", "Ada", "Lovelace", "ada@example.org"]);
+    let minted = cli(scratch.path(), &["add-key", "ada@example.org", "laptop"]);
+    let key = minted
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("key: "))
+        .expect("the CLI prints the key exactly once")
+        .to_owned();
+
+    let config = scratch.path().join("config");
+    std::fs::create_dir_all(&config).expect("config dir");
+    let key_file = config.join("deepseek.key");
+    std::fs::write(&key_file, "sk-mock\n").expect("key file");
+    let providers = format!(
+        concat!(
+            r#"{{"providers":[{{"id":"deepseek","label":"DeepSeek (mock)","wire":"anthropic","#,
+            r#""base_url":"http://127.0.0.1:{upstream}","auth":{{"kind":"api_key_file","path":"{key}"}},"#,
+            r#""models":[{{"id":"deepseek-flash","class":"balanced","relative_cost":15}}],"#,
+            r#""preference":0,"enabled":true}}],"#,
+            r#""mappings":[{{"from":"claude-sonnet-5","to":"deepseek-flash"}}]}}"#,
+        ),
+        upstream = upstream,
+        key = key_file.display(),
+    );
+    std::fs::write(config.join("providers.json"), providers).expect("providers.json");
+
+    let mut child = Command::new(BIN)
+        .args(["serve", "--listen", &format!("127.0.0.1:{port}")])
+        .env("TAB_ATELIER_PROXY_CONFIG", &config)
+        .env("TAB_ATELIER_PROXY_STATE", scratch.path().join("state"))
+        .env("HOME", scratch.path().join("home"))
+        .env("RUST_LOG", "warn")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn the proxy");
+    wait_until_listening(port, &mut child);
+    let _serving = Serving(child);
+
+    let payload = concat!(
+        r#"{"model":"claude-sonnet-5","max_tokens":16,"#,
+        r#""messages":[{"role":"user","content":"hi"}]}"#,
+    );
+    let resp = http(
+        port,
+        &format!(
+            "POST /relay/anthropic/v1/messages HTTP/1.1\r\nHost: x\r\nx-api-key: {key}\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+            payload.len()
+        ),
+    );
+    assert!(resp.starts_with("HTTP/1.1 200"), "proxied call failed:\n{resp}");
+
+    let usage_root = scratch.path().join("state/usage");
+    let mut found = None;
+    for _ in 0..50 {
+        if let Some(f) = first_usage_file(&usage_root) {
+            found = Some(f);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let file = found.unwrap_or_else(|| panic!("no usage file appeared under {}", usage_root.display()));
+    let recorded = std::fs::read_to_string(&file).expect("read usage");
+
+    assert!(
+        recorded.contains(r#""cost":{"in_micro":1,"out_micro":4}"#),
+        "an hour the vendor answered under a legacy name still cost money, and \
+         saying otherwise is the empty graph: {recorded}"
+    );
+
+    // And it survives to the wire the dashboard actually reads. `cost_model` is
+    // the rate's model, not the name the vendor echoed: the figures come from
+    // `deepseek-flash`'s price even though the response said `deepseek-v4-flash`,
+    // so the panel can say which rate it billed at instead of implying the
+    // catalogue holds a model it does not.
+    let admin = cli(scratch.path(), &["admin-token"]).trim().to_owned();
+    let usage = http(
+        port,
+        &format!(
+            "GET /api/usage HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {admin}\r\n\
+             Connection: close\r\n\r\n"
+        ),
+    );
+    assert!(usage.starts_with("HTTP/1.1 200"), "usage failed:\n{usage}");
+    // `series_hourly` is what the money chart is drawn from, and the billed
+    // hour in it must carry the charge. Asserting on the whole body would pass
+    // on the totals alone: they are summed straight off the account and stayed
+    // right while the series — the only thing the graph reads — was blank, which
+    // is exactly why this looked like "the API does not return the billed
+    // prices" rather than like a wrong figure anywhere.
+    let series = usage
+        .split(r#""series_hourly":"#)
+        .nth(1)
+        .and_then(|rest| rest.split(']').next())
+        .expect("the response carries the hourly series the chart plots");
+    assert!(
+        series.contains(r#""cost_in_micro":1"#),
+        "the hour the chart draws must carry its billed price, not null: {series}"
+    );
+    assert!(
+        series.contains(r#""cost_out_micro":4"#),
+        "both halves of the charge reach the series: {series}"
+    );
+    assert!(
+        usage.contains(r#""cost_model":"deepseek-flash""#),
+        "and it names the rate that was used, not the name the vendor echoed: {usage}"
+    );
+}
+
 /// The identity rewrite reaches tool descriptions, proven on the wire.
 ///
 /// This is the regression it was written for and missed. Claude Code puts its
@@ -532,4 +765,86 @@ fn a_non_anthropic_request_carries_no_claude_attribution() {
     // The rule goes only because the tool policy left no tool for it to govern.
     assert!(!sent.contains("Agent tool"), "a dangling Agent rule was sent:\n{sent}");
     assert!(sent.contains("Kept line."), "real system prose was dropped:\n{sent}");
+}
+
+/// A subscription with no credential file is not a candidate, is not drawn, and
+/// says why.
+///
+/// This is the state a proxy is left in when it runs under a `HOME` that has
+/// never held a Claude login: it is a subscription-only proxy whose one provider
+/// cannot authenticate. It used to route anyway — the readiness check answered a
+/// bare `true` for the subscription — so requests went into an egress that then
+/// failed to read `.credentials.json`, and the plan panel drew figures for a
+/// subscription nothing could be spent on. Both are asserted here, through the
+/// running server rather than the library, because the bug was a disagreement
+/// about host state that only the process can produce.
+#[test]
+fn a_subscription_with_no_credential_file_is_refused_and_not_drawn() {
+    let scratch = Scratch::new("keyless");
+    // The state under test, and the whole of the setup: every other test's
+    // `Scratch` writes this file, so removing it is what a never-logged-in host
+    // looks like.
+    std::fs::remove_file(scratch.path().join("home/.claude/.credentials.json")).expect("remove creds");
+    let port = free_port();
+
+    // An account and a key, so the request gets past authentication and reaches
+    // the routing decision this test is about — a 401 would prove nothing.
+    cli(scratch.path(), &["add", "Keyless", "Host", "keyless@example.org"]);
+    let minted = cli(scratch.path(), &["add-key", "keyless@example.org", "laptop"]);
+    let key = minted
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("key: "))
+        .expect("the CLI prints the key exactly once")
+        .to_owned();
+    let admin = cli(scratch.path(), &["admin-token"]).trim().to_owned();
+
+    let mut child = Command::new(BIN)
+        .args(["serve", "--listen", &format!("127.0.0.1:{port}")])
+        .env("TAB_ATELIER_PROXY_CONFIG", scratch.path().join("config"))
+        .env("TAB_ATELIER_PROXY_STATE", scratch.path().join("state"))
+        .env("HOME", scratch.path().join("home"))
+        .env("RUST_LOG", "warn")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn the proxy");
+    wait_until_listening(port, &mut child);
+    let _serving = Serving(child);
+
+    // 1. The graph is not drawn, because there is no plan being spent. The
+    //    router's own answer, not the dashboard's guess.
+    let pressure = http(
+        port,
+        &format!("GET /api/pressure HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {admin}\r\nConnection: close\r\n\r\n"),
+    );
+    assert!(pressure.starts_with("HTTP/1.1 200"), "pressure failed:\n{pressure}");
+    assert!(
+        pressure.contains("\"available\":false"),
+        "the plan must say there is nothing to report on:\n{pressure}"
+    );
+
+    // 2. The request is refused rather than routed into an egress that cannot
+    //    authenticate, and the refusal names the file that would fix it instead
+    //    of leaving a bare "no provider".
+    let payload = r#"{"model":"claude-sonnet-5","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}"#;
+    let resp = http(
+        port,
+        &format!(
+            "POST /relay/anthropic/v1/messages HTTP/1.1\r\nHost: x\r\nx-api-key: {key}\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+            payload.len()
+        ),
+    );
+    assert!(
+        resp.starts_with("HTTP/1.1 503"),
+        "a keyless subscription must not be routed to:\n{resp}"
+    );
+    assert!(
+        resp.contains(".credentials.json"),
+        "the refusal must name the file that would fix it:\n{resp}"
+    );
+    assert!(
+        resp.contains("provider anthropic"),
+        "and the provider the file belongs to:\n{resp}"
+    );
 }

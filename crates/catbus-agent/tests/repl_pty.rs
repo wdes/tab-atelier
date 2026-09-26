@@ -135,6 +135,24 @@ impl Pty {
         seen.contains(needle)
     }
 
+    /// Collect whatever arrives for `within`, then stop.
+    ///
+    /// Cannot wait for the pty to close, which would be the natural end-of-stream signal: this
+    /// harness holds its own slave fd open for the child's standard streams, so the master never
+    /// sees the disconnect that a closed pty would produce. The bound is therefore time, and the
+    /// caller has to have established some other way that nothing more is coming — by seeing the
+    /// process exit, say — before reading the tail as final.
+    fn drain_for(&self, seen: &mut String, within: Duration) {
+        let deadline = Instant::now() + within;
+        while Instant::now() < deadline {
+            match self.chunks.recv_timeout(Duration::from_millis(50)) {
+                Ok(chunk) => seen.push_str(&String::from_utf8_lossy(&chunk)),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+    }
+
     /// Drain output until the rendered screen satisfies `pred`, or time out.
     ///
     /// Needed in place of [`Pty::drain_until`] for the question panel, because ratatui diffs its
@@ -196,71 +214,146 @@ fn type_and_expect_env(env: &[(&str, &str)], line: &str, expect: &str) -> (bool,
 /// Split out so a test that *does* send a prompt can aim at a mock relay. The
 /// dead-port default above is what keeps the other tests from needing one.
 fn type_and_expect_at(port: u16, env: &[(&str, &str)], line: &str, expect: &str) -> (bool, String) {
-    let dir = tempfile::tempdir().unwrap();
-    let home = dir.path();
-    let mut pty = Pty::open();
+    let mut repl = AgentRepl::start(port, env);
+    repl.type_and_expect(line, expect)
+}
 
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_catbus-agent"));
-    cmd
-        // Hermetic, for the same reasons as the socket tests: no operator config,
-        // no inherited colour settings.
-        .env("HOME", home)
-        .env("RUST_LOG", "info")
-        .env_remove("NO_COLOR")
-        .env_remove("CLICOLOR")
-        .env_remove("CATBUS_ANSI")
-        .env_remove("CATBUS_TOOLS_CONFIG")
-        // The log path follows XDG_STATE_HOME, so leaving an operator's value in place would
-        // write the tests' logs into their real state directory — and, worse, make the routing
-        // assertions below depend on whatever they happen to have configured.
-        .env_remove("XDG_STATE_HOME")
-        .env_remove("CATBUS_PREFERENCES")
-        .args([
-            "--new-session",
-            "--cwd",
-            home.to_str().unwrap(),
-            "--socket",
-            home.join("agent.sock").to_str().unwrap(),
-            // Minimal tools. Nothing here sends a prompt, so the tool set is
-            // irrelevant to the assertion — but it keeps the agent from reading
-            // the operator's own repository while the test runs.
-            "--tools-config",
-            "minimal",
-            "--relay-url",
-            &format!("http://127.0.0.1:{port}"),
-            "--relay-token",
-            "tap_pty_test",
-        ]);
-    for (key, value) in env {
-        cmd.env(key, value);
+/// A running REPL on a pty, with its own hermetic `HOME`.
+///
+/// Held together in a struct so a test that needs to look at the *middle* of a turn — not just its
+/// end — can drive the same harness. The alternative was copying the spawn block, and a second copy
+/// of the environment scrubbing below is a copy that stops matching the first.
+struct AgentRepl {
+    pty: Pty,
+    /// Kills the child on drop, so a failed assertion cannot leave a process holding a pty open.
+    /// Never read — its whole job is its `Drop` — so the underscore is what keeps the lint quiet.
+    _child: KillOnDrop,
+    /// Kept alive for the process's lifetime: dropping it would delete the `HOME` the child is
+    /// still writing its session and log into.
+    dir: tempfile::TempDir,
+    /// Everything the terminal has emitted so far.
+    seen: String,
+}
+
+impl AgentRepl {
+    /// Spawn the binary against a relay on `port` and wait until its prompt is drawn.
+    fn start(port: u16, env: &[(&str, &str)]) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let pty = Pty::open();
+
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_catbus-agent"));
+        cmd
+            // Hermetic, for the same reasons as the socket tests: no operator config,
+            // no inherited colour settings.
+            .env("HOME", home)
+            .env("RUST_LOG", "info")
+            .env_remove("NO_COLOR")
+            .env_remove("CLICOLOR")
+            .env_remove("CATBUS_ANSI")
+            .env_remove("CATBUS_TOOLS_CONFIG")
+            // The log path follows XDG_STATE_HOME, so leaving an operator's value in place would
+            // write the tests' logs into their real state directory — and, worse, make the routing
+            // assertions below depend on whatever they happen to have configured.
+            .env_remove("XDG_STATE_HOME")
+            .env_remove("CATBUS_PREFERENCES")
+            .args([
+                "--new-session",
+                "--cwd",
+                home.to_str().unwrap(),
+                "--socket",
+                home.join("agent.sock").to_str().unwrap(),
+                // Minimal tools. Nothing here sends a prompt, so the tool set is
+                // irrelevant to the assertion — but it keeps the agent from reading
+                // the operator's own repository while the test runs.
+                "--tools-config",
+                "minimal",
+                "--relay-url",
+                &format!("http://127.0.0.1:{port}"),
+                "--relay-token",
+                "tap_pty_test",
+            ]);
+        for (key, value) in env {
+            cmd.env(key, value);
+        }
+        let child = cmd
+            // All three streams on the pty: reedline writes the prompt to stdout and
+            // reads keys from the controlling terminal, so anything left as a pipe
+            // would either hide the output or fail the open.
+            .stdin(pty.stdio())
+            .stdout(pty.stdio())
+            .stderr(pty.stdio())
+            .spawn()
+            .expect("spawn catbus-agent");
+
+        let mut repl = Self {
+            pty,
+            _child: KillOnDrop(child),
+            dir,
+            seen: String::new(),
+        };
+        // The banner and the first prompt are what say the REPL is live, so nothing is typed into a
+        // process that is still resolving its relay.
+        let ready = repl.pty.drain_until(&mut repl.seen, "/help", Duration::from_secs(20));
+        assert!(ready, "the REPL never drew its prompt; output so far:\n{}", repl.seen);
+        repl
     }
-    let child = cmd
-        // All three streams on the pty: reedline writes the prompt to stdout and
-        // reads keys from the controlling terminal, so anything left as a pipe
-        // would either hide the output or fail the open.
-        .stdin(pty.stdio())
-        .stdout(pty.stdio())
-        .stderr(pty.stdio())
-        .spawn()
-        .expect("spawn catbus-agent");
-    let _child = KillOnDrop(child);
 
-    let mut seen = String::new();
-    // The banner and the first prompt are what say the REPL is live, so the
-    // command is not typed into a process that is still resolving its relay.
-    let ready = pty.drain_until(&mut seen, "/help", Duration::from_secs(20));
-    assert!(ready, "the REPL never drew its prompt; output so far:\n{seen}");
+    /// The state directory the child was pointed at, for reading its log.
+    fn home(&self) -> &std::path::Path {
+        self.dir.path()
+    }
 
-    pty.send(&format!("{line}\n"));
-    let on_screen = pty.drain_until(&mut seen, expect, Duration::from_secs(20));
+    /// Send a line and wait until `expect` appears on the terminal *or* in the log.
+    fn type_and_expect(&mut self, line: &str, expect: &str) -> (bool, String) {
+        let mut seen = self.seen.clone();
+        self.pty.send(&format!("{line}\n"));
+        let on_screen = self.pty.drain_until(&mut seen, expect, Duration::from_secs(20));
+        (on_screen, self.report(&seen))
+    }
 
-    // The colour and gate verdicts are *log* lines — this helper's caller says so — and the log
-    // now goes to a file rather than the terminal, because a line on the terminal lands
-    // mid-viewport and the TUI will not repaint it. So the file is part of what this reports, or a
-    // test observing a verdict through its log would fail for a reason unrelated to the verdict.
-    let log = std::fs::read_to_string(home.join(".local/state/tab-atelier/catbus-agent.log")).unwrap_or_default();
-    let matched = on_screen || log.contains(expect);
-    (matched, format!("{seen}\n--- log ---\n{log}"))
+    /// Send a line, then wait until the *rendered screen* satisfies `pred`, up to `within`.
+    ///
+    /// The screen rather than the raw stream, because this is for reading a status row: the row is
+    /// repainted in place several times a second, so the raw output holds every frame jumbled
+    /// together with the carriage returns between them, and a predicate over it could be satisfied
+    /// by a frame that was on screen for one tick and then replaced.
+    ///
+    /// Returns whether the predicate held, and leaves everything the terminal emitted in
+    /// [`Self::seen`] so the caller can render the screen with [`Self::screen`]. The rendered screen
+    /// is deliberately *not* returned directly: it has to be read without the log appended (see
+    /// [`Self::report`]) or the log's text lands in the middle of the row being asserted on.
+    fn type_and_watch(&mut self, line: &str, rows: u16, pred: impl Fn(&str) -> bool, within: Duration) -> bool {
+        let mut seen = self.seen.clone();
+        self.pty.send(&format!("{line}\n"));
+        let matched = self.pty.drain_until_screen(&mut seen, rows, &pred, within);
+        self.seen = seen;
+        matched
+    }
+
+    /// The last `cols`-wide `rows` lines of what the terminal drew, as text.
+    fn screen(&self, rows: u16, cols: u16) -> String {
+        screen_of(&self.seen, rows, cols).join("\n")
+    }
+
+    /// The child's log file, if it has been written.
+    fn log(&self) -> String {
+        std::fs::read_to_string(self.home().join(".local/state/tab-atelier/catbus-agent.log")).unwrap_or_default()
+    }
+
+    /// What was seen, with the child's log appended.
+    ///
+    /// The colour and gate verdicts are *log* lines, and the log goes to a file rather than the
+    /// terminal — a line on the terminal lands mid-viewport and the TUI will not repaint it. So the
+    /// file is part of what a caller is told, or a test observing a verdict through its log would
+    /// fail for a reason unrelated to the verdict.
+    ///
+    /// Only for a *diagnostic* message. A caller asserting on the screen must render through
+    /// [`Self::screen`] instead: this concatenation interleaves the log into the last rows, which
+    /// silently truncates whatever was on them.
+    fn report(&self, seen: &str) -> String {
+        format!("{seen}\n--- log ---\n{}", self.log())
+    }
 }
 
 /// The colour verdict the binary reaches from its environment.
@@ -455,7 +548,90 @@ fn spawn_delayed_relay(body: &'static str, delay: Duration) -> u16 {
     port
 }
 
-/// The price list the mock serves for `GET /v1/models`.
+/// Serve a *streamed* reply, holding it open between frames, and return the port.
+///
+/// The buffered mock above cannot exercise the live cost row: it answers with one JSON body, so no
+/// frame ever names a model or reports usage, and the row has nothing to price. This one writes the
+/// frames an SSE reply is made of and pauses between them, which is what makes the mid-turn state
+/// observable rather than instantaneous.
+///
+/// The pauses are the whole design: `message_start` lands, then the terminal is left alone long
+/// enough for the status row to be painted with the provider's own counts and the model from the
+/// reply, and only then does the reply continue. Without a pause the turn would complete before the
+/// test could look, and the assertion would be about the totals line again.
+fn spawn_streaming_relay(hold: Duration) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let events = [
+            // The model and the input count, which is all the provider says at the head.
+            r#"event: message_start
+data: {"type":"message_start","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":120000,"output_tokens":0}}}
+
+"#,
+            r#"event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+"#,
+        ];
+        let mut served = false;
+        while !served {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let raw = read_request(&mut stream);
+            if raw.starts_with("GET ") {
+                let prices = MOCK_PRICES;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
+                     connection: close\r\n\r\n{prices}",
+                    prices.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+                continue;
+            }
+            // A streamed reply is not `content-length`-delimited: it is closed when the frames end.
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncache-control: no-cache\r\n\
+                  connection: close\r\n\r\n",
+            );
+            let _ = stream.flush();
+            for event in events {
+                let _ = stream.write_all(event.as_bytes());
+                let _ = stream.flush();
+            }
+            // The hold: the row now has the model and the provider's input count, and the reply has
+            // not finished. This is the state the test reads.
+            std::thread::sleep(hold);
+            let rest = [
+                r#"event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello there."}}
+
+"#,
+                r#"event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+"#,
+                r#"event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":6789}}
+
+"#,
+                r#"event: message_stop
+data: {"type":"message_stop"}
+
+"#,
+            ];
+            for event in rest {
+                let _ = stream.write_all(event.as_bytes());
+                let _ = stream.flush();
+            }
+            served = true;
+        }
+    });
+    port
+}
+
 ///
 /// Two models in two currencies, so the totals a session accumulates can be shown to group rather
 /// than to add: a session that used one reply from each has spent dollars and euros, and no single
@@ -533,20 +709,86 @@ fn a_turn_paints_the_spinner_and_then_the_totals_line() {
     let totals_at = flat.find("12,345 in - 6,789 out").unwrap();
     assert!(reply_at < totals_at, "the totals line should follow the reply:\n{flat}");
 
-    // The in-flight spinner painted at least one frame, with a token count.
+    // The in-flight spinner painted at least one frame, carrying the request's own *estimated* size.
+    // This relay answers with a plain JSON body rather than an SSE stream, so no `message_start`
+    // names a model and there is nothing to price — which makes this exactly the state the row
+    // displayed before it could price anything, and that state has to survive.
+    let spinner = flat
+        .lines()
+        .find(|row| row.contains("Thinking") && row.contains('~'))
+        .unwrap_or_else(|| panic!("no spinner frame carried an estimated token count:\n{flat}"));
     assert!(
-        flat.contains("tokens in"),
-        "no spinner frame carried a token count:\n{flat}"
+        spinner.contains(" in"),
+        "the frame's figure is an input count: {spinner}"
+    );
+    // Scoped to *this* frame, and asserted rather than glossed over: nothing has named a model yet,
+    // so pricing here would be pricing at a model nobody confirmed. A later frame may carry a price
+    // once the reply has been recorded — that is the ledger working, not this — which is why the
+    // check is on the frame rather than on the whole stream.
+    assert!(
+        !spinner.contains("USD"),
+        "no model was reported yet, so this frame cannot be priced: {spinner}"
+    );
+}
+
+/// While a reply is being streamed, the row says what the turn has cost so far.
+///
+/// This is the request the change was made for. The row used to show only the request's own size and
+/// wait for the totals line — which arrives *after* the turn, so the price came too late to inform
+/// the decision to keep going. Here the reply is held open mid-flight and the screen is read then.
+#[test]
+fn the_spinner_row_prices_a_streaming_turn_while_it_runs() {
+    let port = spawn_streaming_relay(Duration::from_secs(5));
+    // A generous screen: the app draws an inline viewport and pushes what is above it into
+    // scrollback, so emulating exactly 24 rows would leave the assertion reading blank space.
+    let rows = 40;
+    let mut repl = AgentRepl::start(port, &[("TERM", "xterm-256color")]);
+    // Waiting for the price rather than for the model name, because the model name is the weaker
+    // property: the row could carry it from a previous turn. A price needs the catalog *and* the
+    // counts that only exist once the reply has reported them.
+    let matched = repl.type_and_watch(
+        "hello",
+        rows,
+        |screen| screen.contains("USD") && screen.contains(" in"),
+        Duration::from_secs(20),
+    );
+    let screen = repl.screen(rows, 80);
+    assert!(
+        matched,
+        "the live price never appeared while the turn ran:\n{}",
+        repl.report(&screen)
+    );
+
+    // The counts are the provider's own here, taken from `message_start`, so no `~` marks the input.
+    assert!(
+        screen.contains("120,000 in"),
+        "the reported input count is missing:\n{screen}"
     );
     assert!(
-        flat.contains("Thinking"),
-        "the spinner never showed the activity label:\n{flat}"
+        !screen.contains("~120,000"),
+        "a count the provider reported is not an estimate:\n{screen}"
     );
-    // And the count is marked as the local estimate, not the server's figure —
-    // the distinction the `~` exists to make.
+    // 120,000 input at $3/M is $0.36, computed from the catalog the relay served.
     assert!(
-        flat.contains('~'),
-        "the in-flight count must be marked as an estimate:\n{flat}"
+        screen.contains("USD 0.36000"),
+        "the price on the running turn is wrong:\n{screen}"
+    );
+    // And it is marked as an estimate, because the output half is still being counted from the bytes
+    // that have arrived — which is the half the price will move on.
+    assert!(
+        screen.contains("est."),
+        "the price does not say it is still an estimate:\n{screen}"
+    );
+    // The model `message_start` named, which is what the price was looked up by.
+    assert!(
+        screen.contains("claude-sonnet-4-6"),
+        "the running model is not named:\n{screen}"
+    );
+    // And the turn really was still running: the reply has not been written yet, so this is the
+    // mid-turn state and not the totals line read a moment too late.
+    assert!(
+        !screen.contains("Hello there."),
+        "the reply had already finished, so this proves nothing about the live row:\n{screen}"
     );
 }
 
@@ -1202,5 +1444,324 @@ fn the_tui_writes_its_log_to_a_file_and_not_the_screen() {
     assert!(
         !raw.contains("catbus_agent]") && !raw.contains("catbus_agent::") && !raw.contains("INFO"),
         "a log line reached the screen, where ratatui will not repaint over it:\n{raw}"
+    );
+}
+
+/// A `!` command runs in the operator's shell, shows its output, and tells the model.
+///
+/// The command does not exist anywhere in the agent's tool set, so the model could not have run
+/// it: the output on screen can only have come from the operator's own shell. What is captured
+/// downstream is the *next request*, which is the only place "the model was told" is observable.
+#[test]
+fn a_bang_command_runs_in_the_shell_and_tells_the_model_what_it_printed() {
+    let (port, captured) = spawn_capturing_relay();
+    let (mut pty, _child, _home) = repl_against(port);
+
+    let mut seen = String::new();
+    assert!(
+        pty.drain_until(&mut seen, "/help", Duration::from_secs(20)),
+        "the REPL never drew its prompt:\n{seen}"
+    );
+    pty.send("!echo a-marker-from-my-shell\n");
+    assert!(
+        pty.drain_until(&mut seen, "a-marker-from-my-shell", Duration::from_secs(30)),
+        "the command's output never appeared:\n{seen}"
+    );
+
+    // And the model heard about it. The request is the evidence: nothing else in the flow
+    // carries the marker to the model.
+    let body = captured
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the model should have been told the command finished");
+    assert!(
+        body.contains("a-marker-from-my-shell"),
+        "the command and its output should be in the request:\n{body}"
+    );
+    assert!(
+        body.contains("I ran this in my own shell"),
+        "the model must be told the operator ran it, not one of its own tools:\n{body}"
+    );
+}
+
+/// `!!` runs the command and says nothing to the model.
+///
+/// The silence is the feature, so the assertion has to be on an absence — and a channel that
+/// stays empty is the only honest way to see one. A short timeout is enough: the notification,
+/// if it were coming, is sent by the same tick that printed the output above.
+#[test]
+fn a_double_bang_command_tells_the_model_nothing() {
+    let (port, captured) = spawn_capturing_relay();
+    let (mut pty, _child, _home) = repl_against(port);
+
+    let mut seen = String::new();
+    assert!(
+        pty.drain_until(&mut seen, "/help", Duration::from_secs(20)),
+        "the REPL never drew its prompt:\n{seen}"
+    );
+    pty.send("!!echo a-silent-marker\n");
+    assert!(
+        pty.drain_until(&mut seen, "a-silent-marker", Duration::from_secs(30)),
+        "the command's output never appeared:\n{seen}"
+    );
+    match captured.recv_timeout(Duration::from_secs(5)) {
+        Err(mpsc::RecvTimeoutError::Timeout) => {}
+        other => panic!("a `!!` command must reach no model call, but one arrived: {other:?}"),
+    }
+}
+
+/// A backgrounded command leaves the prompt free while it runs, and still reports.
+///
+/// The prompt being free is what makes backgrounding worth asking for, so it is the thing to
+/// prove: a second line typed while a *foreground* command runs is swallowed by the input gate
+/// and produces nothing, whereas here it is answered normally.
+#[test]
+fn a_backgrounded_command_leaves_the_prompt_free_and_still_reports() {
+    let (port, captured) = spawn_capturing_relay();
+    let (mut pty, _child, _home) = repl_against(port);
+
+    let mut seen = String::new();
+    assert!(
+        pty.drain_until(&mut seen, "/help", Duration::from_secs(20)),
+        "the REPL never drew its prompt:\n{seen}"
+    );
+    // Long enough that the line below certainly arrives while it is still running.
+    pty.send("!sleep 6 && echo background-command-finished &\n");
+    // Typed straight away, so the command is still going. A foreground one would swallow this.
+    pty.send("/help\n");
+    assert!(
+        pty.drain_until(&mut seen, "slash commands:", Duration::from_secs(15)),
+        "the prompt was not free while a background command ran:\n{seen}"
+    );
+
+    // The command still reports when it finishes, and the model is told.
+    assert!(
+        pty.drain_until(&mut seen, "background-command-finished", Duration::from_secs(40)),
+        "a background command must still show its output when it ends:\n{seen}"
+    );
+    let body = captured
+        .recv_timeout(Duration::from_secs(40))
+        .expect("a background `!` command should still tell the model");
+    assert!(
+        body.contains("background-command-finished"),
+        "the background command's output should reach the model:\n{body}"
+    );
+}
+
+/// An upstream that answers a turn as server-sent events.
+///
+/// The real relay streams — `pump` forwards the upstream as it arrives — so the streaming path is
+/// the one a real deployment takes, and a mock that answers with a whole body only ever exercises
+/// the fallback. This writes the frames the relay writes: a thinking block, then a text block, with
+/// `message_stop` at the end.
+///
+/// The pause is why this mock exists rather than a simpler one. It holds the reasoning and the
+/// answer apart, so the reasoning is on screen for long enough to be seen. A reader that only
+/// showed the reasoning once the reply had completed would find the answer here and the reasoning
+/// never, which is exactly what this test is for.
+fn spawn_sse_relay(thinking: &'static str, answer: &'static str, pause: Duration) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let mut served = false;
+        while !served {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let raw = read_request(&mut stream);
+            // The startup price fetch shares the port; answered without consuming the turn.
+            if raw.starts_with("GET ") {
+                let prices = MOCK_PRICES;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
+                     connection: close\r\n\r\n{prices}",
+                    prices.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+                continue;
+            }
+            // No content-length: an event stream is delimited by the connection closing, and that
+            // is what makes it a stream rather than a body.
+            let _ =
+                stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n");
+            let frame = |kind: &str, data: &str| format!("event: {kind}\ndata: {data}\n\n");
+            let send = |stream: &mut TcpStream, text: String| {
+                let _ = stream.write_all(text.as_bytes());
+                let _ = stream.flush();
+            };
+            send(
+                &mut stream,
+                frame(
+                    "message_start",
+                    r#"{"type":"message_start","message":{"model":"test-model","usage":{"input_tokens":10}}}"#,
+                ),
+            );
+            send(
+                &mut stream,
+                frame(
+                    "content_block_start",
+                    r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+                ),
+            );
+            send(
+                &mut stream,
+                frame(
+                    "content_block_delta",
+                    &format!(
+                        r#"{{"type":"content_block_delta","index":0,"delta":{{"type":"thinking_delta","thinking":"{thinking}"}}}}"#
+                    ),
+                ),
+            );
+            send(
+                &mut stream,
+                frame("content_block_stop", r#"{"type":"content_block_stop","index":0}"#),
+            );
+            // The reply is now half-written and the model has said nothing final: this is the
+            // state the live view exists for.
+            std::thread::sleep(pause);
+            send(
+                &mut stream,
+                frame(
+                    "content_block_start",
+                    r#"{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}"#,
+                ),
+            );
+            send(
+                &mut stream,
+                frame(
+                    "content_block_delta",
+                    &format!(
+                        r#"{{"type":"content_block_delta","index":1,"delta":{{"type":"text_delta","text":"{answer}"}}}}"#
+                    ),
+                ),
+            );
+            send(
+                &mut stream,
+                frame("content_block_stop", r#"{"type":"content_block_stop","index":1}"#),
+            );
+            send(
+                &mut stream,
+                frame(
+                    "message_delta",
+                    r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}"#,
+                ),
+            );
+            send(&mut stream, frame("message_stop", r#"{"type":"message_stop"}"#));
+            served = true;
+        }
+    });
+    port
+}
+
+/// The reasoning is on screen while the turn is still running.
+///
+/// This is the whole feature, and a screen mid-turn is the only place it exists: the reasoning is
+/// deliberately not printed into the transcript, so if it is not drawn live it is nowhere. The
+/// upstream holds the answer back, so a reader that showed the reasoning only at the end would find
+/// the answer below and the reasoning never.
+#[test]
+fn the_models_reasoning_is_shown_while_the_turn_is_still_running() {
+    let port = spawn_sse_relay("weighing-what-was-asked", "the-answer-itself", Duration::from_secs(8));
+    let (mut pty, _child, _home) = repl_against(port);
+
+    let mut seen = String::new();
+    assert!(
+        pty.drain_until(&mut seen, "/help", Duration::from_secs(20)),
+        "the REPL never drew its prompt:\n{seen}"
+    );
+    pty.send("hello\n");
+    // Seen while the answer is still held back, which is the only time it proves anything.
+    assert!(
+        pty.drain_until(&mut seen, "weighing-what-was-asked", Duration::from_secs(30)),
+        "the reasoning was never drawn while the turn ran:\n{}",
+        strip_ansi(&seen)
+    );
+    assert!(
+        !strip_ansi(&seen).contains("the-answer-itself"),
+        "the answer had already arrived, so the reasoning was not shown *while* the model worked"
+    );
+    // And the reply still lands whole once the stream completes, which is what proves the frames
+    // were reassembled rather than merely displayed.
+    assert!(
+        pty.drain_until(&mut seen, "the-answer-itself", Duration::from_secs(30)),
+        "the streamed answer never arrived:\n{}",
+        strip_ansi(&seen)
+    );
+}
+
+/// A streamed reply is one reply, however many frames it arrived in.
+///
+/// The reasoning is not printed into the transcript by design, so what is checked here is the part
+/// that has to survive: the text, the totals from the usage that arrived in a *later* frame than the
+/// text did, and the fact that the turn ended at all. A reassembly that dropped `message_stop`, or
+/// kept only the input side of the usage, would fail on a stream where a whole-body reply would not.
+#[test]
+fn a_streamed_reply_arrives_whole_and_the_turn_ends() {
+    let port = spawn_sse_relay("a-thought", "the-streamed-answer", Duration::from_millis(50));
+    let (mut pty, _child, _home) = repl_against(port);
+
+    let mut seen = String::new();
+    assert!(
+        pty.drain_until(&mut seen, "/help", Duration::from_secs(20)),
+        "the REPL never drew its prompt:\n{seen}"
+    );
+    pty.send("hello\n");
+    assert!(
+        pty.drain_until(&mut seen, "the-streamed-answer", Duration::from_secs(30)),
+        "the answer never arrived:\n{}",
+        strip_ansi(&seen)
+    );
+    // The totals line is printed when the turn completes, so seeing it proves the stream was read
+    // to its end rather than the answer being shown from a truncated one. The output count matters:
+    // it arrives in a frame *after* the text, and a reply assembled from `message_start` alone would
+    // report zero.
+    assert!(
+        pty.drain_until(&mut seen, "5 out", Duration::from_secs(30)),
+        "the turn never completed, or its output tokens were lost:\n{}",
+        strip_ansi(&seen)
+    );
+}
+
+/// Leaving the REPL hands the terminal back on a fresh line.
+///
+/// The cursor is restored where the viewport left it, which is mid-line, so without an explicit
+/// line break the shell's next prompt is drawn against the end of the last thing on screen and the
+/// command typed into it reads as part of that line. The break is the last thing written, so the
+/// output has to end with it.
+#[test]
+fn leaving_the_repl_ends_the_output_with_a_newline() {
+    let (port, _captured) = spawn_capturing_relay();
+    let (mut pty, mut child, _home) = repl_against(port);
+
+    let mut seen = String::new();
+    assert!(
+        pty.drain_until(&mut seen, "/help", Duration::from_secs(20)),
+        "the REPL never drew its prompt:\n{seen}"
+    );
+    pty.send("/exit\n");
+
+    // The process exiting is the signal that nothing more is coming. The pty cannot say so: the
+    // harness holds its own slave fd, so the master never sees a disconnect however long it waits.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut exited = false;
+    while Instant::now() < deadline {
+        if child.0.try_wait().expect("ask after the child").is_some() {
+            exited = true;
+            break;
+        }
+    }
+    assert!(exited, "the REPL did not exit after /exit:\n{}", strip_ansi(&seen));
+
+    // Now collect what it wrote on the way out — the closing bytes are flushed as it hands the
+    // terminal back, so some of them land after the process has been reaped.
+    pty.drain_for(&mut seen, Duration::from_millis(1500));
+    // A carriage return may precede it — `\r\n` is what the app writes, because which of the two
+    // returns the carriage depends on the terminal having been put back into cooked mode — so the
+    // assertion is on the line ending rather than on the exact pair. Asserted on the tail, which is
+    // the whole point: a newline anywhere earlier would be the prompt's own.
+    assert!(
+        seen.ends_with('\n'),
+        "the shell would have continued the app's last line. Output ended with: {:?}",
+        &seen[seen.len().saturating_sub(60)..]
     );
 }

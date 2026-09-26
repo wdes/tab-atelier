@@ -291,6 +291,7 @@ mod tests {
         reg.providers[0].peak = Some(Peak {
             multiplier_percent: 200,
             windows: Vec::new(),
+            holidays: Vec::new(),
         });
         let catalog = providers_json(&state_with(reg));
         let m = catalog.providers[0]

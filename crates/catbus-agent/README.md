@@ -118,10 +118,63 @@ catbus-agent --tools-config ./tools.json
 A working set is committed at `examples/tools.json` — `git status`, `git log`,
 `cargo test` and `cargo check`, with `Bash` removed.
 
+The same body in TOML is read too — `.toml` by name, `.json` by name, and a path with no
+extension tried as JSON and then TOML — so a tool set can be written with comments:
+
+```toml
+disable = ["Bash"]
+
+[[add]]
+name = "GitBlameLine"
+description = "Who last touched a line."
+argv = ["git", "blame", "-L", "{line},{line}", "--", "{path}"]
+timeout_secs = 10
+judged = false
+schema = { type = "object", properties = { path = { type = "string" }, line = { type = "integer" } }, required = ["path", "line"] }
+```
+
+A working directory also gets a say: `<cwd>/.catbus/tools.toml` is **discovered** rather than
+named, beside the identity file, and layered over whatever `--tools-config` set. It can add
+tools and withhold built-ins, but not widen — `allow` is refused there, and `minimal` is not
+read at all, since a directory's file must not defeat a deliberate lockdown. `AllowedTools`
+still narrows last, so a tool the directory adds must also be named there when the identity
+has a list. See `docs/config-guide.md`.
+
+### `PHPUnit` cannot spawn a process
+
+`PHPUnit` runs project code, and project code can otherwise run anything. Every run goes
+through `php -d disable_functions=shell_exec,exec,system,passthru,proc_open,popen,pcntl_exec`,
+so a test that tries to shell out fails as a test error rather than succeeding as a command —
+including a *throwaway* test written to shell out, which is how a tool set with no shell gets
+worked around otherwise. The entry point is named as an argument rather than executed by its
+own shebang, because a shebang would start an interpreter the options never reached.
+
+A project whose own suite legitimately spawns — one whose validator shells out to `node`, say —
+sets its own list, or `[]` to remove the block:
+
+```toml
+phpunit_disable_functions = ["shell_exec", "exec"]
+```
+
 `tests/relay.rs::configured_tools_execute_for_real` runs this for real: it starts
 the actual binary with a config file, has the (mocked) model call the tools, and
 asserts the results are the real output of real `git` and `cargo` subprocesses.
 Only the model is simulated.
+
+### The operator's shell is not one of these
+
+Typing `!cmd` at the prompt runs `cmd` on the operator's own shell. It is
+deliberately not a tool, and the difference is not cosmetic: a tool call is the
+*model's* request, so it passes through the tool set, the identity's
+`AllowedTools`, and the proxy's shaping — while `!cmd` is the *operator's*, and
+none of that applies to it. Nothing in this file's `disable`/`allow` config can
+turn it off, because it was never in the set they filter.
+
+What the model receives is a message saying the operator ran a command, quoting
+it, with the output and the exit status. It cannot mistake that for something it
+asked for, and it cannot invoke the shell itself by any route this opens. A
+`!!cmd` runs the same way and the model is told nothing at all; a trailing `&`
+runs it in the background. See `docs/agent-guide.md` for the user-facing list.
 
 - **`disable`** / **`allow`** filter the built-in set. `"disable": ["Bash"]`
   removes shell access entirely; `allow` keeps only what it lists.
@@ -184,6 +237,36 @@ Two things follow from that, and both are easy to get wrong:
 | `--judge-model` | `CATBUS_JUDGE_MODEL` | what auto mode grades with |
 | `--monitor-prompt` | `CATBUS_MONITOR_PROMPT` | a file to use instead of the built-in prompt |
 | `--tools-config` | `CATBUS_TOOLS_CONFIG` | the tool set file above |
+| — | `CATBUS_MAX_ROUNDS` | hard cap on tool rounds in one turn (default 200) |
+| — | `CATBUS_REPEAT_ROUNDS` | rounds of no new information before the loop guard stops the turn (default 3; `0` disables) |
+
+## The loop guard
+
+A turn stops early when the tools have told the model nothing new for
+`CATBUS_REPEAT_ROUNDS` rounds. Two shapes count, and both are needed:
+
+- **The same call.** Identical tool, identical arguments, with a completed round
+  in between — *and* the round before it returned what the one before that did.
+  Both halves matter: a poll loop sends one identical call every round by nature,
+  so the call alone cannot decide anything. What separates `make` until it goes
+  green from a stall is whether the output changed.
+- **The same result.** Different calls, identical results. This is the shape that
+  matters most, because it is the one a call-identity check cannot see — read a
+  page, a wider page, then the whole file, and every call differs while the
+  content does not.
+
+The call check runs before dispatch, so a repeated call is refused rather than
+run: no time, no side effect, no tokens. The result check can only run once the
+tools have returned, so it stops the *next* round — the results in hand are real
+and are recorded first, which keeps the turn valid for the following request.
+
+On 2026-09-25 a tab spent 200 rounds and 2.55M input tokens on the second shape.
+`tab-atelier-proxy` had replaced old `tool_result` bodies with `[elided:N B]`
+stubs to fit the request in the model's context window; a stub is
+indistinguishable from a real result the model has never read, so it read again —
+and, widening each time, never got anything new. The proxy no longer elides a body
+it has no reason to elide and its stub names the call it replaced; this guard is
+the client's own half, and it catches the shape whatever the relay does.
 
 ## Rate limits
 

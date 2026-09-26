@@ -30,7 +30,7 @@ use std::fmt::Write as _;
 use crate::relay::Relay;
 use crate::session::{self, Block, Session};
 use crate::tools;
-use crate::{ansi, cache, guard, retry};
+use crate::{ansi, cache, guard, progress, retry};
 
 /// The model to ask for when neither the session nor the provider names one.
 ///
@@ -48,6 +48,22 @@ const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
 /// what happened to the round-cap warning that claimed "32" while the default
 /// was 200.
 const MAX_OUTPUT_TOKENS: u32 = 8192;
+
+/// What the model is told when its previous reply stopped at the output limit.
+///
+/// Sent as a `user` message because that is the only role the API lets this side speak in, but
+/// it is not from the operator and is never written to the transcript — see where it is pushed.
+/// It says the reply was cut off, that the text so far is complete *as text*, and that what is
+/// wanted is the remainder and nothing else: a model asked to continue will otherwise helpfully
+/// restate the part that already arrived, and the operator would read it twice.
+///
+/// "Do not apologise" is in there for the same reason it is in most of these: an apology costs
+/// a paragraph of the budget that is already too small.
+const CONTINUATION_CUE: &str = "\
+Your previous message was cut off at the output-token limit, not by you finishing. Continue \
+from exactly where it stopped, mid-sentence if that is where the cut fell — repeat nothing you \
+already wrote, do not restate the question, do not start over, and do not apologise. \
+If a tool call was cut in half, make that call again from the start with the full arguments.";
 
 /// What the model is asked to write, and why it changed.
 ///
@@ -246,6 +262,21 @@ pub struct Agent {
     /// Current activity description shown in the REPL spinner.
     /// `None` = idle, `Some(s)` = description of what's happening.
     pub status: std::sync::Mutex<Option<String>>,
+    /// The reasoning from the model call being streamed right now.
+    ///
+    /// Written as the deltas arrive and read by the REPL on its redraw tick,
+    /// which is why it is shared state and not a channel: the agent runs inside
+    /// an `Arc` shared with the UI, there is no event loop to push into, and the
+    /// one existing "show me what it is doing" channel — [`Self::status`] — works
+    /// exactly this way.
+    ///
+    /// It is what to look at *while* the model works, not a record, and it is
+    /// deliberately the current call rather than the whole turn: a turn runs one
+    /// call per tool round, and what is worth watching is what the model is
+    /// working out now. The turn's accumulated reasoning reaches the transcript
+    /// through [`Turn::reasoning`] as it always did, and this is cleared as a
+    /// turn starts so it is never a stale copy left on screen.
+    reasoning: std::sync::Mutex<String>,
     /// Cumulative tokens consumed across all turns in this process.
     /// Both counters accumulate monotonically and are never reset.
     pub tokens_in: std::sync::atomic::AtomicU64,
@@ -255,10 +286,91 @@ pub struct Agent {
     /// conversion lives in one place (`statusline::estimate_input_tokens`) and
     /// can change without touching this field.
     pub inflight_input_bytes: std::sync::atomic::AtomicU64,
+    /// What the provider has reported about the request in flight, as it streams past.
+    ///
+    /// Reset as each request is sent and written per chunk by the assembler, so it describes the
+    /// request being answered and never a previous one. Deliberately *not* cleared when the
+    /// request finishes: a turn that is between tool rounds still has a cost worth seeing, and a
+    /// figure that blinked out during every tool call would be harder to read than one that stays
+    /// up until the next request replaces it.
+    live: std::sync::Mutex<LiveReport>,
     /// Cancellation flag for the currently-running turn. Re-built at
     /// the start of every `run_user_prompt` so Ctrl+C only kills the
     /// in-flight request, not future ones.
     cancel: std::sync::Mutex<CancellationToken>,
+}
+
+/// What the provider has said so far about the request in flight.
+///
+/// Two sources with different reliability, kept apart rather than blended: the counts the provider
+/// reported (authoritative, but the output half arrives only at the close) and the bytes of reply
+/// that have arrived (a count of what came over the wire, which is what there is to show until
+/// then). [`live_figures`] decides which of them a figure comes from.
+#[derive(Debug, Clone, Default)]
+struct LiveReport {
+    /// Whether the reply has opened — see [`crate::stream::Assembler::started`]. From that moment
+    /// the input count is the provider's own and never changes.
+    started: bool,
+    /// The counts the provider has reported: the input side at the head, the output side running.
+    usage: Usage,
+    /// Bytes of reply content received, which is the only output figure before the close.
+    output_bytes: u64,
+    /// The model the reply named, which is what the price on the row is computed from.
+    model: Option<String>,
+}
+
+/// Reconcile the provider's report with the local measurement into what the row shows.
+///
+/// Split from the accessor because this is where every judgement lives — when a figure is an
+/// estimate, when it is the provider's, and when there is nothing worth showing at all — and none
+/// of it needs an agent, a session or a network to test.
+///
+/// The two sources are not interchangeable and the difference is visible on screen:
+///
+/// * **Before the reply opens**, the only number is the request's own byte length, and the row
+///   says `~` because that is arithmetic rather than a count. The wording is the one the row has
+///   always used for it.
+/// * **Once it opens**, the input side is the provider's own count and loses the `~`; the output
+///   side stays an estimate until the closing `message_delta`, which is the only frame carrying
+///   the real one. Both are shown, because a generation that has produced 40 tokens of a reply
+///   that will run to 4,000 is a fact about how far along it is.
+/// * **`None`** when nothing has been measured and nothing reported, which is the row's state
+///   between turns. A request whose payload has been serialised but not yet sent still counts as
+///   something to show: the estimate is exactly what the row displayed before this existed.
+fn live_figures(report: LiveReport, inflight_bytes: u64) -> Option<crate::statusline::Live> {
+    if !report.started && report.output_bytes == 0 && inflight_bytes == 0 {
+        // Nothing reported and nothing measured, so the row has nothing to say about cost. That is
+        // the state between turns, and between the payload being serialised and being sent.
+        return None;
+    }
+    let estimate = crate::statusline::estimate_input_tokens(usize::try_from(inflight_bytes).unwrap_or(usize::MAX));
+    // The provider's input count supersedes the estimate the moment it exists; the output count
+    // is the running one until `message_delta` closes the reply, and is estimated from the bytes
+    // received until it does. A provider that reported an output count mid-stream (none does
+    // today) would be taken at its word: the byte estimate is only ever a stand-in for a count.
+    let output = if report.usage.output_tokens > 0 {
+        report.usage.output_tokens
+    } else {
+        crate::statusline::estimate_input_tokens(usize::try_from(report.output_bytes).unwrap_or(usize::MAX))
+    };
+    let mut usage = if report.started {
+        report.usage
+    } else {
+        // A reply that has produced content without opening — a stream that skipped
+        // `message_start`, which providers do send — leaves the input side on the request's own
+        // length. Better a figure marked as an estimate than none at all.
+        Usage {
+            input_tokens: estimate,
+            ..Usage::default()
+        }
+    };
+    usage.output_tokens = output;
+    Some(crate::statusline::Live {
+        usage,
+        reported: report.started,
+        output_estimated: report.usage.output_tokens == 0,
+        model: report.model,
+    })
 }
 
 /// What [`Agent::clear`] replaced, so the REPL can offer a way back.
@@ -272,6 +384,33 @@ pub struct Cleared {
     pub id: String,
     /// Human-readable label, for saying *which* conversation was left behind.
     pub name: String,
+}
+
+/// A turn's status bookkeeping, undone however the turn ends — including by being *dropped*.
+///
+/// The marker and the app's last word used to be written on the lines after the turn's `.await`, which
+/// is the one place that is not safe: a turn is not always finished, it is sometimes *abandoned*,
+/// whenever its future is dropped. Both cancellation paths do exactly that. Ctrl-C in the TUI aborts
+/// the task, and a socket client that hangs up mid-turn makes `run_watching_for_questions` return
+/// `Ok(None)` while the turn is still pinned inside it (`socket`). Neither runs a line after that
+/// await, so the status line went on saying `thinking` and the tab's indicator stayed green — the app
+/// reading "working" — until its own staleness sweep dropped the state 120 s later. An agent sitting
+/// still is the one thing the indicator must never claim about it, which is what this guard is for.
+///
+/// Holds `self` rather than a copy of the session id: `/resume` can swap the session mid-turn, and the
+/// end of a turn belongs to whichever session is current when it ends. No `unsafe`, so the guard is not
+/// `Send`; that is fine, as it lives entirely inside the turn's own future.
+struct TurnStatus<'a> {
+    agent: &'a Agent,
+}
+
+impl Drop for TurnStatus<'_> {
+    fn drop(&mut self) {
+        *self.agent.status.lock().expect("status mutex") = None;
+        // And the app hears that the turn is over: the operator is the one being waited on now, which
+        // is what `waiting` means for a Claude Code tab too.
+        self.agent.report_status(crate::applink::State::Waiting, None);
+    }
 }
 
 impl Agent {
@@ -355,9 +494,11 @@ impl Agent {
             model: std::sync::Mutex::new(model),
             served_model: std::sync::Mutex::new(from_transcript),
             status: std::sync::Mutex::new(None),
+            reasoning: std::sync::Mutex::new(String::new()),
             tokens_in,
             tokens_out,
             inflight_input_bytes: std::sync::atomic::AtomicU64::new(0),
+            live: std::sync::Mutex::new(LiveReport::default()),
             cancel: std::sync::Mutex::new(CancellationToken::new()),
         }
     }
@@ -389,6 +530,42 @@ impl Agent {
         self.status.lock().expect("status mutex").clone()
     }
 
+    /// The reasoning from the model call currently being streamed.
+    ///
+    /// Empty when nothing has been said yet, and when nothing is running. Read by
+    /// the REPL on its redraw tick to put something on screen to watch; it is not
+    /// a record of anything, and the turn's accumulated reasoning reaches the
+    /// transcript through [`Turn::reasoning`] as before.
+    #[must_use]
+    pub fn reasoning_so_far(&self) -> String {
+        self.reasoning.lock().expect("reasoning mutex").clone()
+    }
+
+    /// Forget the last turn's reasoning, at the start of a new one.
+    ///
+    /// Cleared here rather than when the turn ends so the screen keeps its last
+    /// line until the answer actually arrives, instead of going blank for the
+    /// time it takes the reply to be formatted and printed.
+    fn clear_reasoning(&self) {
+        self.reasoning.lock().expect("reasoning mutex").clear();
+    }
+
+    /// Forget everything the previous request reported about itself.
+    ///
+    /// The reasoning and the live cost are cleared together and deliberately, because they are the
+    /// same fact about the same request: one is what it is saying, the other is what it is costing,
+    /// and both describe the call in flight rather than the session. Clearing one and not the other
+    /// is how the row would price a fresh request at the previous one's rates for the round trip —
+    /// a number that is not stale enough to look broken and not fresh enough to be true.
+    ///
+    /// Called as each request is sent, not when a reply lands: the last line stays on screen until
+    /// it is replaced, which is what keeps the row from blinking out between a reply and the tool
+    /// call that follows it.
+    fn clear_live(&self) {
+        self.clear_reasoning();
+        *self.live.lock().expect("live mutex") = LiveReport::default();
+    }
+
     /// The question channel. See the field.
     #[must_use]
     pub const fn asker(&self) -> &std::sync::Arc<crate::tools::ask::Asker> {
@@ -408,7 +585,16 @@ impl Agent {
         if session.is_empty() {
             return;
         }
-        tokio::spawn(async move {
+        // `try_current` where `spawn` would do, because this is now also reached from a `Drop` — and a
+        // `Drop` can run on a thread that has no runtime at all: a turn future that is dropped rather
+        // than polled never enters one, so abandoning a turn (see `TurnStatus`) is exactly the case
+        // where there may be no runtime. `spawn` panics there, which would take the process down over
+        // a status report. Losing the report is the ordinary case anyway, so it is logged and dropped.
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            log::debug!("no runtime to report {state:?} from; the app keeps its last word");
+            return;
+        };
+        handle.spawn(async move {
             crate::applink::report(&endpoint, state, label.as_deref(), &session).await;
         });
     }
@@ -567,22 +753,28 @@ impl Agent {
         self.tokens_out.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Estimated input tokens for the request currently in flight, or `None`
-    /// when nothing is in flight.
+    /// What the request in flight has cost so far, or `None` when there is nothing to show.
     ///
-    /// The estimate exists only because the server withholds `usage` until its
-    /// final response, so during a download there is nothing else to show. It is
-    /// set from the serialised payload's length just before sending and cleared
-    /// as soon as the response arrives, so it never lingers as a stale figure
-    /// once the authoritative total is available.
+    /// This is the figure the status row puts a *price* on while the model works, which is the
+    /// point of it: the totals line under a finished answer is the same arithmetic applied to a
+    /// turn that is already paid for, and by then the decision an operator wanted the number for
+    /// has been made. See [`statusline::Live`] for what each count means and
+    /// [`live_figures`] for how the two sources are reconciled.
     #[must_use]
-    pub fn inflight_input_estimate(&self) -> Option<u64> {
-        match self.inflight_input_bytes.load(std::sync::atomic::Ordering::Relaxed) {
-            0 => None,
-            bytes => Some(crate::statusline::estimate_input_tokens(
-                usize::try_from(bytes).unwrap_or(usize::MAX),
-            )),
-        }
+    pub fn live_cost(&self) -> Option<crate::statusline::Live> {
+        let report = self.live.lock().expect("live mutex").clone();
+        let bytes = self.inflight_input_bytes.load(std::sync::atomic::Ordering::Relaxed);
+        live_figures(report, bytes)
+    }
+
+    /// The prices the catalog holds for a model, if it holds any.
+    ///
+    /// A pass-through rather than a second place that knows how to find a price: the status row
+    /// reaches the catalog through the agent because the agent owns it, not because the lookup is
+    /// the agent's business.
+    #[must_use]
+    pub fn price_of(&self, model: &str) -> Option<crate::cost::ModelPrice> {
+        self.costs.lock().ok().and_then(|c| c.price_of(model))
     }
 
     /// Configure the judge that auto mode consults.
@@ -774,11 +966,15 @@ impl Agent {
         *self.status.lock().expect("status mutex") = Some(crate::statusline::THINKING_MARKER.to_owned());
         // What the tab's indicator shows for the whole of a turn.
         self.report_status(crate::applink::State::Thinking, None);
+        // Taken before the turn runs and held across it, so that taking it back cannot be skipped by a
+        // turn that never returns — a Ctrl-C or a socket client hanging up drops this future instead of
+        // finishing it, and the lines that used to undo this would never be reached. See `TurnStatus`.
+        let turn_status = TurnStatus { agent: self };
         let result = self.run_user_prompt_inner(text, &token).await;
-        *self.status.lock().expect("status mutex") = None;
-        // And when it is over: the operator is the one being waited on now, which is what the app's
-        // `waiting` means for a Claude Code tab too.
-        self.report_status(crate::applink::State::Waiting, None);
+        // The turn is over, so the marker comes off and the app hears about it. Deliberately explicit
+        // rather than left to the end of the function, so the order against `save_totals` below is the
+        // one the reader sees.
+        drop(turn_status);
         // The totals are persisted here rather than by whichever UI happens to be attached, so
         // every path that runs a turn records them: the REPL, a socket client, and the app's own
         // CLI. It was in the REPL's render path before, which meant a session driven over the
@@ -821,6 +1017,9 @@ impl Agent {
         // Separate from `final_text` so the answer keeps exactly the shape it had
         // before reasoning was carried: see `Turn`.
         let mut reasoning = String::new();
+        // The live view starts each turn empty, so what is on screen is only
+        // ever about the turn actually running.
+        self.clear_live();
         // Cap on tool rounds. 200 is intentionally high — the model
         // self-terminates via end_turn long before this in normal use.
         // The env-var escape hatch exists for unusually long tasks.
@@ -828,6 +1027,24 @@ impl Agent {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(200);
+        // Survives across rounds on purpose: the two ways a loop shows itself —
+        // the same call again, or the same result again — are only visible as a
+        // run. See `progress` for the case that made this necessary.
+        let mut loop_guard = progress::Progress::from_env();
+        // Set when a round stopped at the output limit, so the next round is understood as the
+        // second half of the same sentence rather than a new paragraph — see the text arm below
+        // and `CONTINUATION_CUE`.
+        let mut mid_sentence = false;
+        // How many times one answer may be continued before the limit is reported instead.
+        // Bounded because the limit is a property of the request, not of this answer: a model
+        // that reasons its way to the ceiling will do it again next round, and an unbounded
+        // loop would spend the whole turn doing that. Eight is several ordinary replies' worth
+        // of text past the first stop, which is far more than a cut-off sentence needs.
+        let max_continuations: u32 = std::env::var("CATBUS_MAX_CONTINUATIONS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(8);
+        let mut continuations: u32 = 0;
         for _ in 0..max_rounds {
             if cancel.is_cancelled() {
                 return Err(AgentError::Cancelled);
@@ -902,7 +1119,11 @@ impl Agent {
             for block in &resp.content {
                 match block {
                     Block::Text { text } => {
-                        if !final_text.is_empty() {
+                        // A newline separates turns of a tool loop, which are separate
+                        // statements. It does not separate the two halves of one sentence, and
+                        // a continuation is exactly that — see `mid_sentence` — so that case
+                        // joins with nothing, which is what the model was told to do.
+                        if !final_text.is_empty() && !mid_sentence {
                             final_text.push('\n');
                         }
                         final_text.push_str(text);
@@ -945,22 +1166,49 @@ impl Agent {
                         content: ApiContent::Blocks(resp.content),
                     });
                 }
-                // A reply cut off by the output limit is not a finished answer,
-                // yet the branch above treats it as one: the model stopped
-                // mid-sentence, so there is no tool to continue with and no
-                // error to raise. Saying so is the difference between a client
-                // that knows it has a fragment and one that reports `done` over
-                // half a sentence — which is what happened before this check
-                // existed.
+                // A reply cut off by the output limit is not a finished answer, yet this
+                // branch is where the turn would end: the model stopped mid-sentence, so
+                // there is no tool to continue with and no error to raise.
+                //
+                // Warning about it is not enough, and a warning is what this used to do:
+                // the operator reads "ask for the rest", asks, and gets a *second* answer
+                // that has to pick up a sentence it can no longer see the start of — when
+                // the request is re-sent, the cut-off reply is in history, but what arrived
+                // after it was the operator's words rather than the model's own train of
+                // thought. The limit is a property of one request, so the honest fix is to
+                // make the next request and let the model finish the thought.
                 if stop_reason.as_deref() == Some("max_tokens") {
-                    // `write!` rather than `push_str(&format!(..))`: the same
-                    // output, without building and dropping a throwaway `String`.
-                    // `write!` to a `String` is infallible, so the result is
-                    // discarded rather than unwrapped.
+                    if continuations < max_continuations {
+                        continuations += 1;
+                        // The next round joins this text without a paragraph break, because
+                        // the model is being asked to finish the sentence, not to start one.
+                        mid_sentence = true;
+                        // In memory only. The transcript keeps the model's words and nothing
+                        // else, so a cue from us must not be written there: it would read, on
+                        // resume, as a thing the operator had said. History is what the next
+                        // request is built from, and that is all this needs to reach the model.
+                        // Scoped so the guard is released before the log and the next round.
+                        {
+                            let mut active = self.active.write().await;
+                            active.history.push(ApiMessage {
+                                role: "user".into(),
+                                content: ApiContent::Plain(CONTINUATION_CUE.to_owned()),
+                            });
+                        }
+                        log::info!(
+                            "response hit the {MAX_OUTPUT_TOKENS}-token output limit; asking the \
+                             model to continue ({continuations}/{max_continuations})"
+                        );
+                        continue;
+                    }
+                    // Out of continuations, so the limit is real and worth reporting — but
+                    // honestly: by now the model was asked to continue and stopped again, so
+                    // the operator is told what was tried rather than told to try it.
                     let _ = write!(
                         final_text,
-                        "\n\n\x1b[33m[reply cut off at the {MAX_OUTPUT_TOKENS}-token output limit — \
-                         it may end mid-sentence; ask for the rest to continue]\x1b[0m"
+                        "\n\n\x1b[33m[reply still cut off at the {MAX_OUTPUT_TOKENS}-token output \
+                         limit after {max_continuations} automatic continuations — it may end \
+                         mid-sentence]\x1b[0m"
                     );
                 }
                 return Ok(Turn {
@@ -974,10 +1222,28 @@ impl Agent {
             // in the same order the model produced the tool_use
             // blocks).
             let gate = self.gate();
+            // Asked before anything is dispatched, because that is the whole
+            // point of catching this shape: the call has nothing new to tell the
+            // model, so making it costs the round and changes nothing. It is
+            // refused — never dispatched — and answered with a `tool_result` that
+            // says so; see `progress` for why the previous rounds' output has to
+            // have stalled too before a repeat counts as a loop.
+            let stop = loop_guard.before(tool_uses.iter().map(|(_, name, input)| (*name, *input)));
             let mut results: Vec<Block> = Vec::with_capacity(tool_uses.len());
             for (id, name, input) in &tool_uses {
                 if cancel.is_cancelled() {
                     return Err(AgentError::Cancelled);
+                }
+                // A refused call still gets a `tool_result`: the API requires one
+                // for every `tool_use`, and the model reads the refusal as the
+                // outcome of the call it made.
+                if let Some(stop) = &stop {
+                    results.push(Block::ToolResult {
+                        tool_use_id: (*id).to_string(),
+                        content: stop.refusal(),
+                        is_error: true,
+                    });
+                    continue;
                 }
                 // Show the tool name (and a short input summary for Bash)
                 // in the status so the spinner reflects what's running.
@@ -1045,8 +1311,26 @@ impl Agent {
                     is_error,
                 });
             }
+            // The other half of the guard, on the signal this side can actually
+            // see: if this round's results matched the round before, the model
+            // learned nothing, whatever its calls looked like. This is what
+            // catches a model varying its reads and getting the same answer —
+            // the shape the 2026-09-25 loop took. Skipped when the calls were
+            // already refused above: those results are the refusal text, and
+            // feeding it to the result check would count a refusal as staleness.
+            let stop = stop.or_else(|| {
+                loop_guard.after(results.iter().filter_map(|block| match block {
+                    Block::ToolResult { content, .. } => Some(content.as_str()),
+                    _ => None,
+                }))
+            });
             // Done with the borrows — move resp.content into history now.
             let _ = tool_uses;
+            // Whatever the next round says follows tool results, so it is a new statement rather
+            // than the second half of the previous one: the no-separator rule in the text arm
+            // applies to a continuation and to nothing else, and a continuation is over as soon
+            // as the model has been given something to react to.
+            mid_sentence = false;
             {
                 let mut active = self.active.write().await;
                 active.history.push(ApiMessage {
@@ -1061,6 +1345,19 @@ impl Agent {
                 active.history.push(ApiMessage {
                     role: "user".into(),
                     content: ApiContent::Blocks(results),
+                });
+            }
+            // Cut here, not at the round cap, and only after the round is
+            // recorded: the history above is what keeps the turn valid — an
+            // assistant message whose `tool_use` blocks have no answering
+            // `tool_result` is a 400 on the next request, so the results go in
+            // even when the loop stops. `final_text` carries whatever the model
+            // said on the way, and the notice explains the stop to the reader.
+            if let Some(stop) = stop {
+                final_text.push_str(&stop.notice());
+                return Ok(Turn {
+                    answer: for_sink(final_text),
+                    reasoning: for_sink(reasoning),
                 });
             }
         }
@@ -1151,6 +1448,7 @@ impl Agent {
             system,
             tools: &tool_specs,
             messages: &active.history,
+            stream: true,
         };
         // Serialised here rather than handed to `.json()` so the cache
         // breakpoints can be written into it first — and so the state turn can
@@ -1207,40 +1505,45 @@ impl Agent {
         self.inflight_input_bytes
             .store(payload_bytes, std::sync::atomic::Ordering::Relaxed);
         let _clear = InflightGuard(&self.inflight_input_bytes);
+        // And forget what the *previous* request reported, so the row cannot price this request
+        // with the last one's numbers. The reasoning buffer is cleared in the same place and for
+        // the same reason — see `clear_live`, which says why the two are one call.
+        self.clear_live();
         // Sent through the retry helper rather than straight: a 429 here used
         // to end the turn, and a rate limit is a statement about timing, not
         // about the request. The closure rebuilds the request per attempt
         // because a `RequestBuilder` is consumed by `send`, and resending the
         // identical body is exactly what a retry means.
-        let (status, text) = send_retrying(|| {
-            let mut attempt = self
-                .http
-                .post(relay.messages_url())
-                .header("x-api-key", relay.token())
-                // `.body()` rather than `.json()` because the bytes are already
-                // serialised; the header matches what `.json()` would set, and is
-                // what the proxy forwards upstream.
-                .header("content-type", "application/json")
-                .header("anthropic-version", claude_api::ANTHROPIC_VERSION);
-            if let Some((client_id, client_secret)) = relay.cloudflare_access() {
-                attempt = attempt
-                    .header("CF-Access-Client-Id", client_id)
-                    .header("CF-Access-Client-Secret", client_secret);
-            }
-            // A `Vec` clone is a memcpy, and only happens on a retry — cheaper
-            // than re-serialising, and reqwest needs owned bytes per attempt.
-            attempt.body(payload.clone())
-        })
-        .await?;
-        if !status.is_success() {
-            return Err(AgentError::Api(api_error(status, &text)));
-        }
-        serde_json::from_str::<MessagesResp>(&text).map_err(|e| {
-            AgentError::Api(format!(
-                "the reply from the relay did not decode: {e}\n  first bytes: {}",
-                truncate(&text, 400)
-            ))
-        })
+        //
+        // Streamed, so the model's reasoning is on screen while it is being
+        // written rather than arriving all at once at the end. The reply is put
+        // back together into the same `MessagesResp` the buffered call returned,
+        // so everything after this line is unchanged.
+        send_streaming(
+            || {
+                let mut attempt = self
+                    .http
+                    .post(relay.messages_url())
+                    .header("x-api-key", relay.token())
+                    // `.body()` rather than `.json()` because the bytes are already
+                    // serialised; the header matches what `.json()` would set, and is
+                    // what the proxy forwards upstream.
+                    .header("content-type", "application/json")
+                    .header("accept", "text/event-stream")
+                    .header("anthropic-version", claude_api::ANTHROPIC_VERSION);
+                if let Some((client_id, client_secret)) = relay.cloudflare_access() {
+                    attempt = attempt
+                        .header("CF-Access-Client-Id", client_id)
+                        .header("CF-Access-Client-Secret", client_secret);
+                }
+                // A `Vec` clone is a memcpy, and only happens on a retry — cheaper
+                // than re-serialising, and reqwest needs owned bytes per attempt.
+                attempt.body(payload.clone())
+            },
+            &self.reasoning,
+            &self.live,
+        )
+        .await
     }
 
     /// Same turn, different wire: translate our Anthropic-shaped
@@ -1391,13 +1694,36 @@ fn rebuild_history(project_dir: &std::path::Path, id: &str) -> Vec<ApiMessage> {
 /// this fixes is throttling, and retrying a connection error needs a sense of
 /// whether the request was received — which `reqwest` does not give and
 /// guessing at would risk double-charging a turn.
-async fn send_retrying<F>(mut build: F) -> Result<(reqwest::StatusCode, String), AgentError>
+/// Send a request and put its streamed reply back together.
+///
+/// This is the Messages wire's only sender, and it retries on the same terms the
+/// old buffered path did — with one difference that streaming forces: **a retry
+/// is only possible until the first event arrives.** After that the model has
+/// begun answering, the caller has been shown part of it, and asking again would
+/// restart a reply that is already half drawn. So a failure past that point is
+/// final, which is why the retry lives around the response rather than inside
+/// the read.
+///
+/// `live` is the agent's reasoning buffer, written after every chunk: it is the
+/// only thing on screen while the model works, so it is updated as the words
+/// arrive rather than once at the end. A view that only filled in when the reply
+/// completed would be no better than the spinner it replaces.
+///
+/// `report` is the other half of the same idea and is written on the same tick — what the provider
+/// has said about the request's cost. Both are taken here rather than by the caller because this
+/// is the only place that feeds the assembler, and an assembler whose findings were dropped on the
+/// floor would leave the row on the request's own size for the whole generation.
+async fn send_streaming<F>(
+    mut build: F,
+    live: &std::sync::Mutex<String>,
+    report: &std::sync::Mutex<LiveReport>,
+) -> Result<MessagesResp, AgentError>
 where
     F: FnMut() -> reqwest::RequestBuilder,
 {
     let mut attempt = 1;
     loop {
-        let resp = build().send().await.map_err(|e| AgentError::Http(e.to_string()))?;
+        let mut resp = build().send().await.map_err(|e| AgentError::Http(e.to_string()))?;
         let status = resp.status();
         // Read the hint before consuming the body.
         let retry_after = resp
@@ -1405,19 +1731,88 @@ where
             .get("retry-after")
             .and_then(|v| v.to_str().ok())
             .and_then(retry::parse_retry_after);
-        let text = resp.text().await.map_err(|e| AgentError::Http(e.to_string()))?;
 
-        if status.is_success() || !retry::is_retryable(status.as_u16()) || attempt >= retry::MAX_ATTEMPTS {
-            return Ok((status, text));
+        // An unsuccessful reply is not a stream: it is a JSON error body, and it
+        // is safe to retry because nothing has been shown to anyone yet.
+        if !status.is_success() {
+            let text = resp.text().await.map_err(|e| AgentError::Http(e.to_string()))?;
+            if retry::is_retryable(status.as_u16()) && attempt < retry::MAX_ATTEMPTS {
+                let wait = retry::delay_for(attempt + 1, retry_after);
+                log::warn!(
+                    "provider returned {status}; waiting {wait:?} before attempt {} of {}",
+                    attempt + 1,
+                    retry::MAX_ATTEMPTS
+                );
+                tokio::time::sleep(wait).await;
+                attempt += 1;
+                continue;
+            }
+            return Err(AgentError::Api(api_error(status, &text)));
         }
-        let wait = retry::delay_for(attempt + 1, retry_after);
-        log::warn!(
-            "provider returned {status}; waiting {wait:?} before attempt {} of {}",
-            attempt + 1,
-            retry::MAX_ATTEMPTS
-        );
-        tokio::time::sleep(wait).await;
-        attempt += 1;
+
+        // A provider that does not stream answers a `stream: true` request with
+        // the ordinary whole body. Reading it as events would fail on the first
+        // line, so the content type decides — the same test the proxy makes
+        // before it pumps a reply through its translator.
+        let streaming = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|ctype| ctype.contains("event-stream"));
+        if !streaming {
+            let text = resp.text().await.map_err(|e| AgentError::Http(e.to_string()))?;
+            return serde_json::from_str::<MessagesResp>(&text).map_err(|e| {
+                AgentError::Api(format!(
+                    "the reply from the relay did not decode: {e}\n  first bytes: {}",
+                    truncate(&text, 400)
+                ))
+            });
+        }
+
+        let mut asm = crate::stream::Assembler::new();
+        loop {
+            match resp.chunk().await {
+                Ok(Some(chunk)) => {
+                    asm.feed(&chunk).map_err(|e| AgentError::Api(format!("stream: {e}")))?;
+                    // Both published in one scope so the two locks are released before anything
+                    // else in this arm runs: they are read several times a second by the redraw
+                    // tick, and holding either across a branch is contention for nothing.
+                    {
+                        // `clone_into` rather than assignment: this runs for every chunk of
+                        // every reply, and reusing the buffer the lock already holds turns a fresh
+                        // allocation per chunk into a copy into memory that is there anyway.
+                        asm.reasoning().clone_into(&mut live.lock().expect("reasoning mutex"));
+                        // The same tick carries what the chunk said about the request's cost. Read
+                        // from the assembler rather than from the frame directly, so the parsing
+                        // rule lives in one place — and so a provider whose usage arrives in an
+                        // unexpected shape shows up in this display and the totals alike, or in
+                        // neither.
+                        *report.lock().expect("live mutex") = LiveReport {
+                            started: asm.started(),
+                            usage: asm.usage().copied().unwrap_or_default(),
+                            output_bytes: asm.output_bytes(),
+                            model: asm.model().map(ToOwned::to_owned),
+                        };
+                    }
+                    // `message_stop` has arrived, so the reply is complete. Stop
+                    // reading rather than waiting for the server to close the
+                    // connection, which it may hold open for its own reasons and
+                    // which would otherwise delay the answer on screen.
+                    if asm.is_done() {
+                        break;
+                    }
+                }
+                // The body ended. Whether that is the whole reply is
+                // `finish`'s question, not this loop's.
+                Ok(None) => break,
+                // Mid-reply, a dropped connection is not retried: part of the
+                // answer has been seen, and re-asking would restart it. A
+                // transport error was never retried on this wire even when the
+                // reply was buffered, so nothing here is a regression.
+                Err(e) => return Err(AgentError::Http(e.to_string())),
+            }
+        }
+        return asm.finish().map_err(AgentError::Api);
     }
 }
 
@@ -1675,6 +2070,14 @@ struct MessagesReq<'a> {
     system: Vec<SystemBlock<'a>>,
     tools: &'a [serde_json::Value],
     messages: &'a [ApiMessage],
+    /// Ask for the reply as server-sent events.
+    ///
+    /// Always true. The unstreamed shape is not kept as an alternative: a
+    /// streamed reply that has been reassembled is the same
+    /// [`MessagesResp`] either way (see [`crate::stream`]), so the only
+    /// difference is that this way the reasoning can be watched as it arrives
+    /// instead of all at once at the end.
+    stream: bool,
 }
 
 #[derive(Serialize)]
@@ -1694,7 +2097,7 @@ pub struct MessagesResp {
     pub usage: Usage,
 }
 
-#[derive(Deserialize, Debug, Clone, Default)]
+#[derive(Deserialize, Debug, Clone, Copy, Default)]
 // Every field ends in `_tokens` because they are the names the provider sends: serde matches on
 // them, so they cannot be tidied into something shorter without an alias for each. The lint is
 // about a *domain* type whose fields drift into a shared suffix, which is not this.
@@ -1960,6 +2363,121 @@ mod tests {
             said.contains("retried, and the provider was still failing"),
             "and the fact of the retries is added: {said}"
         );
+    }
+
+    /// The row's state before the provider has said anything: the request's own measured size,
+    /// marked as the estimate it is.
+    ///
+    /// This is the figure the row showed before any of this existed, and it has to survive
+    /// unchanged — a session whose relay never reports usage, or a model that answers with a
+    /// non-streamed body, gets no provider counts at all, and a row that went blank for them would
+    /// be a regression from showing an estimate.
+    #[test]
+    fn before_the_reply_opens_the_only_figure_is_the_requests_own_size() {
+        let live = live_figures(LiveReport::default(), 400_000).expect("something to show");
+        assert!(!live.reported, "it is arithmetic, not a count");
+        assert!(live.output_estimated, "and no output has arrived");
+        assert_eq!(live.usage.input_tokens, 100_000, "400 kB at 4 bytes a token");
+        assert_eq!(live.usage.output_tokens, 0);
+    }
+
+    /// Nothing measured and nothing reported is nothing to show, which is the row between turns.
+    #[test]
+    fn a_request_that_has_not_been_sized_shows_nothing() {
+        assert!(live_figures(LiveReport::default(), 0).is_none());
+    }
+
+    /// Once the reply opens, the input count is the provider's own and the output is counted from
+    /// what has arrived — the asymmetry `Live` carries, and the reason the price on the row is
+    /// still marked as an estimate after the counts stop being one.
+    #[test]
+    fn an_open_reply_takes_the_providers_input_count_and_counts_its_output() {
+        let report = LiveReport {
+            started: true,
+            usage: Usage {
+                input_tokens: 54_321,
+                ..Usage::default()
+            },
+            output_bytes: 8_000,
+            model: Some("claude-sonnet-4-6".to_owned()),
+        };
+        let live = live_figures(report, 900_000).expect("something to show");
+        assert!(live.reported, "the input count is the provider's");
+        assert_eq!(
+            live.usage.input_tokens, 54_321,
+            "the estimate is superseded, not blended with"
+        );
+        assert_eq!(live.usage.output_tokens, 2_000, "8 kB of reply at 4 bytes a token");
+        assert!(live.output_estimated, "the output half is still a guess");
+        assert_eq!(
+            live.model.as_deref(),
+            Some("claude-sonnet-4-6"),
+            "and the model travels through, because the price depends on it"
+        );
+    }
+
+    /// The closing `message_delta` is the only frame with the real output count, and it wins
+    /// outright over the bytes received — the two are not averaged or added.
+    #[test]
+    fn the_providers_output_count_supersedes_the_byte_estimate() {
+        let report = LiveReport {
+            started: true,
+            usage: Usage {
+                input_tokens: 1_000,
+                output_tokens: 640,
+                ..Usage::default()
+            },
+            output_bytes: 8_000,
+            ..LiveReport::default()
+        };
+        let live = live_figures(report, 0).expect("something to show");
+        assert_eq!(
+            live.usage.output_tokens, 640,
+            "the count, not the 2,000 the bytes imply"
+        );
+        assert!(!live.output_estimated);
+        assert!(live.reported);
+    }
+
+    /// A stream that produced content without a `message_start` still shows something: the input
+    /// side falls back to the request's size, and the reply's own bytes are still counted. Better a
+    /// figure marked as an estimate than a blank row on a provider that opened with a frame this
+    /// build did not recognise.
+    #[test]
+    fn content_without_a_message_start_still_reports_output() {
+        let report = LiveReport {
+            started: false,
+            usage: Usage::default(),
+            output_bytes: 4_000,
+            ..LiveReport::default()
+        };
+        let live = live_figures(report, 40_000).expect("something to show");
+        assert!(!live.reported, "nothing was confirmed, so the figures are estimates");
+        assert_eq!(live.usage.input_tokens, 10_000, "the request's own size");
+        assert_eq!(live.usage.output_tokens, 1_000);
+    }
+
+    /// The two counts are the four kinds the pricing applies to, which is what makes the price on
+    /// the row the same arithmetic as the one on the totals line.
+    #[test]
+    fn the_live_counts_are_the_four_kinds_the_catalog_prices() {
+        let report = LiveReport {
+            started: true,
+            usage: Usage {
+                input_tokens: 900,
+                output_tokens: 100,
+                cache_read_input_tokens: 5_000,
+                cache_creation_input_tokens: 400,
+            },
+            output_bytes: 0,
+            ..LiveReport::default()
+        };
+        let live = live_figures(report, 0).expect("something to show");
+        let tokens = live.tokens();
+        assert_eq!(tokens.input, 0, "900 sent of which 900 cached reads");
+        assert_eq!(tokens.cache_read, 5_000);
+        assert_eq!(tokens.cache_write, 400);
+        assert_eq!(tokens.output, 100);
     }
 
     /// A hint only where the retry layer has already given up.

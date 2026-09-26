@@ -665,6 +665,14 @@ impl Store {
                         slot.errors = b.errors;
                         slot.tokens = b.tokens;
                         slot.by_model.clone_from(&b.by_model);
+                        // The charge travels with the hour, or the money graph
+                        // reads every bucket as unpriced however much was
+                        // actually spent. The totals below sum `b.cost`
+                        // straight off the account, so leaving this out is
+                        // invisible to them and every figure they show stays
+                        // right — which is exactly why it went unnoticed: only
+                        // the per-hour series the chart draws was blank.
+                        slot.cost = b.cost;
                     }
                 }
             }
@@ -1347,6 +1355,53 @@ mod tests {
         );
         // Ascending, so a chart can plot it without sorting.
         assert!(series.windows(2).all(|w| w[0].hour < w[1].hour));
+    }
+
+    /// The charge has to reach the series, because that is what the chart plots.
+    ///
+    /// `cost_total` reads every bucket off the account directly and was always
+    /// right, which is what hid this: the dense series copied calls, tokens and
+    /// models but never the charge, so the per-hour rows the panel draws carried
+    /// no cost and the money graph stayed empty however much had been spent.
+    /// Nothing else failed — no error, no missing hour — which is why it read as
+    /// "the API does not return the billed prices".
+    #[test]
+    fn the_series_carries_the_charge_the_chart_plots() {
+        let mut s = Store::load(tmp("series-cost"));
+        s.record(
+            "ada",
+            Some("m"),
+            Tokens {
+                input: 10,
+                output: 5,
+                ..Tokens::default()
+            },
+            true,
+            Some(Cost {
+                in_micro: 1,
+                out_micro: 4,
+            }),
+        );
+
+        let series = s.series("ada", hours(24));
+        assert_eq!(
+            series.last().and_then(|b| b.cost),
+            Some(Cost {
+                in_micro: 1,
+                out_micro: 4
+            }),
+            "the hour's charge must reach the series, or the money graph is blank"
+        );
+        // The two readings agree, where before only the series had lost it.
+        assert_eq!(
+            s.cost_total("ada", hours(24)),
+            Some(Cost {
+                in_micro: 1,
+                out_micro: 4
+            })
+        );
+        // And an idle hour stays unpriced rather than becoming free.
+        assert!(series[..23].iter().all(|b| b.cost.is_none()));
     }
 
     #[test]

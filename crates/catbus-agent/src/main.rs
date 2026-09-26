@@ -19,7 +19,7 @@
 #![allow(clippy::module_name_repetitions)]
 
 use std::io::IsTerminal;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use clap::Parser;
@@ -33,12 +33,16 @@ mod guard;
 mod identity;
 mod logging;
 mod openai;
+mod progress;
 mod relay;
 mod retry;
 mod session;
+mod shell;
 mod slash;
 mod socket;
 mod statusline;
+mod stream;
+mod text;
 mod tools;
 mod tui;
 
@@ -50,7 +54,11 @@ mod tui;
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Parser, Debug)]
 #[command(
-    version,
+    // The commit, not just the crate version, and in the app's own shape
+    // (`v0.1.0-dev (07c49210abcd)`) so the two binaries of one build read the
+    // same. A `catbus-agent` in a tab can be older than the checkout that
+    // started it, and this is the first thing anyone asks.
+    version = concat!("v", env!("CARGO_PKG_VERSION"), " (", env!("BUILD_HASH"), ")"),
     about = "Claude agent for tab-atelier. Many tabs, many windows.",
     long_about = None,
 )]
@@ -275,9 +283,17 @@ async fn main() {
 /// withheld, so a prompt file cannot grant itself a tool. That is the whole point
 /// of the ceiling — the wrapper answer is the same tool list the operator already
 /// chose, minus what the prompt file removes.
-fn resolve_tools(args: &Args) -> Result<(tools::ToolSet, identity::Identity), Box<dyn std::error::Error>> {
-    let tool_set = tools::ToolSet::load(args.tools_config.as_deref())?;
-    let identity = identity::load(args.identity.as_deref(), args.identity_file.as_deref())?;
+///
+/// `cwd` is threaded in rather than looked up, because the identity is also found
+/// at `<cwd>/.catbus/identity.md` and the session's directory is `--cwd` when the
+/// launcher named one.
+fn resolve_tools(args: &Args, cwd: &Path) -> Result<(tools::ToolSet, identity::Identity), Box<dyn std::error::Error>> {
+    // Both of the sources that are *named or absent* — the launcher's flag, and the working
+    // directory's own `.catbus/tools.toml` — are resolved here; the third source, the identity
+    // file's `AllowedTools`, narrows the result below. A project tool therefore also has to be
+    // named in `AllowedTools` when the identity has one, because narrowing is the last word.
+    let tool_set = tools::ToolSet::load_layered(args.tools_config.as_deref(), cwd)?;
+    let identity = identity::load(args.identity.as_deref(), args.identity_file.as_deref(), cwd)?;
     let Some(allowed) = identity.allowed_tools() else {
         log::info!("offering {} tools", tool_set.specs().len());
         return Ok((tool_set, identity));
@@ -351,14 +367,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     logging::init(args.no_tui);
 
     // Resolved early, because the code below moves fields out of `args` — the cwd
-    // and the provider's own config — and these two need to read it. The logger is
+    // and the provider's own config — and these need to read it. The logger is
     // initialised first so that anything they report is actually seen.
-    let (tool_set, identity) = resolve_tools(&args)?;
-
-    let cwd = match args.cwd {
-        Some(p) => p,
+    let cwd = match &args.cwd {
+        Some(p) => p.clone(),
         None => std::env::current_dir()?,
     };
+    // After the cwd, because a project's `.catbus/identity.md` is found *at* it.
+    let (tool_set, identity) = resolve_tools(&args, &cwd)?;
 
     // The relay must resolve *before* we open the socket — no point
     // accepting prompts we can't service. Relay resolution only reads

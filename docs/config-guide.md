@@ -9,7 +9,9 @@ has. Written for someone with the package installed and no checkout.
 |---|---|---|
 | `~/.config/tab-atelier/preferences.json` | The relay endpoint. The agent reads this for its URL and token, so a tab needs no flags. | `tab-atelier` writes it; `/etc/tab-atelier/preferences.json` is the fallback for a fresh install. |
 | `~/.config/tab-atelier/catbus-agent/identity.md` | The system prompt. See below. | You. |
+| `<cwd>/.catbus/identity.md` | The system prompt for one directory. See below. | You. Ignored by git, not committed. |
 | `~/.config/tab-atelier/catbus-agent/tools.json` | Which tools the agent has. See below. | You, passed with `--tools-config`. |
+| `<cwd>/.catbus/tools.toml` | Tools for one directory, found without being named. See below. | You. Ignored by git, not committed. |
 | `~/.claude/projects/<escaped-cwd>/<id>.jsonl` | The transcript, one file per session. | The agent. |
 | `~/.claude/projects/<escaped-cwd>/<id>.name` | A session's `/rename`d name. | The agent. |
 | `~/.claude/projects/<escaped-cwd>/<id>.gate` | The permission mode the session was last left in. | The agent. |
@@ -53,6 +55,20 @@ permission list with a typo in it should say so.
 
 A file whose body is blank but whose front matter names tools still limits them; that is how
 you say "no identity, but only these tools".
+
+### Per-directory identities
+
+A working directory can carry its own identity at `<cwd>/.catbus/identity.md`. It is the more
+specific statement, so it wins over the one above, and it is how a project says who its agent
+is without that answer depending on which machine the tab runs on. `.catbus/` is worth
+ignoring rather than committing: the front matter is where `AllowedHosts` and
+`AllowedJumpHosts` live, and a host limit describes where the work runs rather than the work.
+
+The search is `--identity`, then `--identity-file`, then `<cwd>/.catbus/identity.md`, then the
+one above. The first two are *named*, so a name that does not resolve is an error; the last two
+are *found*, so one that is absent is not a statement and the search carries on. A found file
+that exists but has a blank body is a statement — it silences the identity, and being nearer
+it silences the ones behind it too, which is how a directory turns off a prompt it inherits.
 
 ### Limiting which hosts SSH may reach
 
@@ -110,8 +126,49 @@ that renders it needs to know that whoever it thinks it is.
 | Value | Tools |
 |---|---|
 | `minimal` | `Read`, `Write`, `FileTree` — no shell. The default for a `Spawn`ed sub-agent. |
-| *(omitted)* | Everything the build has. |
-| a path | A JSON file, below. |
+| *(omitted)* | Everything the build has, plus the working directory's own file if it has one. |
+| a path | A config file, below. `.toml` is read as TOML and `.json` as JSON; a path with no extension is tried as JSON and then TOML. |
+
+A config file's shape, in TOML:
+
+```toml
+disable = ["Bash"]
+
+[[add]]
+name = "GitBisect"
+description = "List the commits between a good and a bad revision."
+argv = ["git", "log", "--oneline", "--ancestry-path", "{good}..{bad}"]
+judged = false
+timeout_secs = 30
+schema = { type = "object", properties = { good = { type = "string" }, bad = { type = "string" } }, required = ["good", "bad"] }
+```
+
+The same body in JSON is documented below; the fields are identical, and either format is
+read by the same parser once it has been deserialised.
+
+### Per-directory tools
+
+A working directory can carry its own tools at `<cwd>/.catbus/tools.toml`, beside the identity
+file. Like the identity it is **found rather than named**: a project describes what its own work
+needs, and a tab started in it should not need a second flag. The file you pass with
+`--tools-config` still applies, and the two are layered:
+
+- **`add`** from both, the launcher's first. A name both files define is a refusal that names
+  both, not a silent override — and a project tool may not take a built-in's name.
+- **`disable`** is the union. Either file can withhold a built-in; neither can un-withhold.
+- **`allow`** may appear only in the launcher's file. A project that sets one is refused, because
+  two whitelists would make the live set an intersection the operator cannot see in one place.
+  `AllowedTools` in the identity file is the instrument for narrowing, and it applies to custom
+  tools too — so a project tool must *also* be named in `AllowedTools` when the identity has one.
+- **`phpunit_disable_functions`** is the project's when it sets one, since the project is the one
+  whose tests are being run.
+
+`minimal` is exempt: it is a deliberate lockdown, so a directory's file is not read at all.
+
+`.catbus/` is worth ignoring rather than committing — like the identity, the file is a statement
+about the machine and the operator rather than about the work.
+
+### The example in JSON
 
 ```json
 {
@@ -136,14 +193,13 @@ that renders it needs to know that whoever it thinks it is.
 }
 ```
 
-The command is **`argv`**, one array — there is no `command` plus `args`. Each element becomes
-exactly one argument, so nothing is shell-parsed: a `good` of `v1.0; rm -rf /` is passed as a
-single argument, not run. That is also why an unknown key is a mistake worth catching: an
-extra `"command"` is ignored, and the config then fails on the missing `argv` rather than
-doing what it looks like it does.
-
 `disable` removes built-ins; `allow` keeps only what it lists. `disable` wins where they
 overlap, so a tool in both is off.
+
+Write the top-level keys (`disable`, `allow`, `phpunit_disable_functions`) **before** the first
+`[[add]]` table. In TOML a key written after a table belongs to that table, so a top-level
+setting placed at the bottom of the file is absorbed by the last tool and ignored — silently,
+since an unknown field on a tool is not an error. The JSON form has no such rule.
 
 `add` contributes a tool the agent runs itself, from `argv` with `{name}` placeholders filled
 from the arguments the model passes. An *optional* placeholder must be a whole argument —

@@ -57,7 +57,7 @@ uuid = { version = "1", features = ["v4"] }
 # `humantime` feature — zero extra compile units. `default-features = false` is
 # load-bearing: the defaults drag in a proc-macro and a bundled tz database,
 # and nothing here needs a timezone, only UTC instants.
-jiff = { version = "0.2", default-features = false, features = ["std"] }
+jiff = { version = "0.2", default-features = false, features = ["std", "serde"] }
 
 [lints.clippy]
 all = { level = "deny", priority = -1 }

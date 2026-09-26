@@ -73,9 +73,35 @@ pub(crate) fn save(request: &SaveProvider, state: &Arc<State>) -> Reply {
         new.enabled = request.enabled.unwrap_or(old.enabled);
         new.auth = old.auth.clone();
         new.peak.clone_from(&old.peak);
+        // The model list is rebuilt from text, so every field the text cannot
+        // express is carried over by id — the same rule as the four lines above,
+        // one level down. `price` is the one that shows: without it the row has
+        // no recorded rate, and every hour it serves draws no money. It is also
+        // the one the catalogue cannot always give back, because a rate set by
+        // hand belongs to a model the catalogue has never heard of.
+        //
+        // `deprecated` and `note` ride along for the same reason the text has no
+        // room for them. Only for a model the text still lists, though: one the
+        // caller leaves out is dropped from the row, which the panel means to do
+        // — it filters withdrawn models out of the list it sends.
+        for model in &mut new.models {
+            let Some(before) = old.models.iter().find(|m| m.id == model.id) else {
+                continue;
+            };
+            if model.price.is_none() {
+                model.price = before.price;
+            }
+            model.deprecated = before.deprecated;
+            model.note.clone_from(&before.note);
+        }
     } else if let Some(wanted) = request.enabled {
         new.enabled = wanted;
     }
+
+    // Neither branch can supply a rate the form never had a field for. Take back
+    // the one the catalogue publishes, which for a preset provider is where it
+    // came from before the first save dropped it.
+    new.adopt_published_rates();
 
     let id = new.id.clone();
     let key = request.key.trim();
@@ -174,7 +200,7 @@ pub(crate) fn remove(id: &str, state: &Arc<State>) -> Reply {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::{Auth, Preset};
+    use crate::provider::{Auth, Class, Model, Preset};
 
     /// A state whose registry and key files live where this test can write.
     ///
@@ -387,6 +413,90 @@ mod tests {
             .expect("still there")
             .preference;
         assert_eq!(weight, 42, "the weight survived a save that cannot mention it");
+    }
+
+    /// The rate is not on the form either, and a save used to drop it.
+    ///
+    /// The model list round-trips as `id:class:cost` text — the shape the panel
+    /// builds at `web/src/app.ts` and this crate parses back — and a rate has no
+    /// place in it. So the one field that decides whether an hour can draw a
+    /// money figure was deleted by any save at all, including the ones that have
+    /// nothing to do with models: `setCompact`, the dropdown that changes how
+    /// much history a provider is sent, sends the whole list back as text.
+    ///
+    /// The symptom is silence, which is why it needs a test rather than a look:
+    /// the hop keeps serving, keeps counting tokens, and the money unit stays
+    /// empty for ever.
+    ///
+    /// Priced by hand on a model the catalogue does not know, on purpose. The
+    /// catalogue can only hand back what it publishes, so this is the one case
+    /// where carrying the old value across is the only thing standing between an
+    /// operator's own figure and the repair that cannot replace it.
+    #[test]
+    fn a_save_keeps_the_price_the_form_cannot_express() {
+        let state = state_for("preserve-price");
+        let mut mine = host_login(&state, "mine", 10);
+        mine.models = vec![Model::new("bespoke-model", Class::Balanced, 7).priced(1, 2, 3)];
+        let by_hand = mine.models[0].price;
+        assert!(by_hand.is_some(), "the fixture has a rate to lose");
+        assert!(
+            provider::published_price("bespoke-model").is_none(),
+            "the model must be one the catalogue cannot re-supply"
+        );
+        seed(&state, mine);
+
+        // A save exactly as the panel sends one: every model it lists, in text.
+        let mut req = custom("mine");
+        req.models = "bespoke-model:balanced:7".to_owned();
+        assert_eq!(save(&req, &state).status, 200);
+
+        let price = state
+            .registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get("mine")
+            .and_then(|p| p.models.iter().find(|m| m.id == "bespoke-model"))
+            .expect("the model is still there")
+            .price;
+        assert_eq!(
+            price, by_hand,
+            "the rate was overwritten by a form that has no field for it, \
+             and the catalogue has none to give back"
+        );
+    }
+
+    /// A row that has already lost its rates gets them back on the next save.
+    ///
+    /// Carrying the old ones over only helps a row that still has them. A file
+    /// written before the field existed deserialises without them, and so does a
+    /// row every earlier save stripped — for those the catalogue has to be the
+    /// source, or they are unpriced for ever.
+    #[test]
+    fn a_save_returns_the_rate_the_catalogue_publishes() {
+        let state = state_for("restore-price");
+        let mut bare = Preset::Deepseek.provider(&registry_dir(&state));
+        for model in &mut bare.models {
+            model.price = None;
+        }
+        seed(&state, bare);
+
+        let mut req = custom("deepseek");
+        req.base_url = "https://api.deepseek.com/anthropic".to_owned();
+        req.models = "deepseek-flash:balanced:15".to_owned();
+        assert_eq!(save(&req, &state).status, 200);
+
+        let price = state
+            .registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get("deepseek")
+            .and_then(|p| p.models.iter().find(|m| m.id == "deepseek-flash"))
+            .expect("the model is still there")
+            .price;
+        assert!(
+            price.is_some(),
+            "a row that lost its rate must take the published one back"
+        );
     }
 
     #[test]

@@ -90,6 +90,17 @@ and the admin dashboard shows the plan monitor as not reporting. Re-run the
 import. Two machines sharing one Claude login is the underlying constraint, not
 something the proxy can paper over.
 
+**If the file is not there at all** — never imported, or the service started with
+a `HOME` that has never held a login — the provider is disabled rather than
+merely broken. It is not a routing candidate, so a request is answered `503`
+naming the file that would fix it, instead of being forwarded into an egress that
+fails to read it; and the plan-pressure panel is not drawn, because a subscription
+that cannot authenticate is not spending the plan and there is nothing to report
+on. It comes back by itself the moment the file exists: nothing was written down,
+so there is no setting to undo and no restart to remember. The same applies to a
+provider switched off by hand — the graph goes with it, on the judgement that in
+both cases the proxy is not spending that plan.
+
 ## Accounts
 
 ```sh
@@ -278,13 +289,17 @@ paste this shape in by hand:
       "auth": {"kind": "api_key_file", "path": "/var/lib/tab-atelier-proxy/provider-deepseek.key"},
       "preference": 10, "enabled": true,
       "models": [
-        {"id": "deepseek-flash", "class": "balanced", "relative_cost": 15},
+        {"id": "deepseek-flash", "class": "balanced", "relative_cost": 15,
+         "price": {"cache_hit": 3000, "input": 150000, "output": 600000}},
         {"id": "deepseek-v4-pro", "class": "heavy", "relative_cost": 66,
          "deprecated": true,
          "note": "withdrawn 2026-09-14; requests are served by deepseek-flash at Flash prices"}
       ],
       "peak": {"multiplier_percent": 200,
-               "windows": [{"weekdays": [1,2,3,4,5], "start_hour": 1, "end_hour": 4}]} }
+               "windows": [{"weekdays": [1,2,3,4,5], "start_hour": 1, "end_hour": 4},
+                           {"weekdays": [1,2,3,4,5], "start_hour": 6, "end_hour": 10}],
+               "holidays": [{"name": "Mid-Autumn Festival",
+                             "dates": ["2026-09-25", "2026-09-26", "2026-09-27"]}]} }
   ]
 }
 ```
@@ -308,6 +323,60 @@ environment.
 capability that are both about to stop being true, so deprecated models are
 listed, never routed to, and never probed.
 
+### What an hour cost
+
+`price` is the model's published rate per 1M tokens — cached input, uncached
+input, generated output. When a request is served, the amount is **computed once
+from that triple and stored beside the tokens it paid for**, in the hour bucket
+it belongs to, with the peak multiplier of the hour it was served in. The
+dashboard then draws the stored figure. It never prices anything at draw time,
+because a rate read from *today's* table and applied to a *month-old* token
+count is a number nobody was ever billed — and for a vendor that moved a price
+in between, it is wrong by exactly the amount that moved.
+
+**A model with no `price` records no money.** Not zero: nothing. `$0.00` is a
+claim that the tokens were free, and absence is the truth — the hop counts its
+tokens and its hours draw a gap. The subscription hop does this because a flat
+plan has no per-token cost to state, and the metered models the presets list
+without a rate do it too. `relative_cost` cannot stand in: it is one scalar the
+router orders providers by, and a real triple is needed to bill — `deepseek-v4-pro`'s
+shape across hit:miss:out is 1:30:90 against Flash's 1:50:200, so scaling one
+model's rates by another's ratio is wrong on two of the three.
+
+The rates in `providers.json` are the copy that bills, so they have to survive
+a save. The provider form rebuilds every model from `id:class:relative_cost`
+text, which has no room for a triple, and a provider written before the field
+existed deserialises without one — either way the row keeps serving and stops
+pricing. A save carries an existing rate over by model id, and a row that has
+none takes back the rate the shipped catalogue publishes for that model id, as
+it is loaded. That lookup can only return rates this repository actually records,
+so a deliberately unpriced model stays unpriced and a rate set by hand is left
+alone. A provider that ends up with no rate at all is named in the log at load:
+nothing errors and no token is lost, which is exactly why the one symptom — a
+money figure that never appears — has to be said out loud.
+
+**A chart and a total are not the same query.** The window's own cost is summed
+straight off the stored hours, and the per-hour series the chart is drawn from
+is built by a second path that copies each hour field by field. The two agreed
+on everything except the charge, so every figure printed above the chart stayed
+right while every bar in it was blank — the money graph read as "the API does
+not return the billed prices" when in fact it returned them, correctly, two
+fields higher up. When a chart disagrees with its own totals, suspect the series
+builder before the totals.
+
+**A name we cannot price is not the same as no tokens.** The rate is looked up
+from the model name *the upstream echoed back about itself*, not from anything
+the caller sent, and a vendor may answer under a legacy name it still accepts
+for a model newer than it — DeepSeek serves and bills `deepseek-v4-flash` at
+Flash's price while the catalogue holds only `deepseek-flash`. Treating that as
+"no rate" threw the hour away completely: no stored cost, no `cost_model`, and a
+dashboard that drew no money at all. So the echoed name settles *which model*
+only while it names one the provider actually serves and prices; otherwise the
+hour is billed at the provider's default rate, and the log says the name was not
+recognised. The default is the pit a caller with no pin already falls into — the
+cheapest billable model of the hop that has one — so it can be the wrong one of
+several, which is why it is logged rather than passed off quietly.
+
 ### Peak pricing
 
 A provider can charge more for the same tokens at certain hours — DeepSeek
@@ -316,6 +385,29 @@ difference in a comparison whose whole job is ordering providers by cost, so it
 is modelled rather than written in a comment: `relative_cost` stays one true
 number and the schedule explains itself. `ping` and the UI both say when a
 provider is in peak right now.
+
+**The weekday test is not the whole rule.** DeepSeek's footnote reads "excluding
+Chinese public holidays", and calls a holiday off-peak *in full* — the whole
+date, both windows, not the peak hours inside it. `holidays` is that exclusion:
+a list of named civil days, matched against the date in the provider's own
+calendar (UTC+8, fixed, because the mainland has kept one offset since 1991).
+Without it every Chinese public holiday that falls on a weekday is charged
+double — roughly nineteen days a year. The adjusted working weekends around a
+holiday (the "make-up days") need no entry of their own and have none: every one
+of them falls on a Saturday or Sunday, so it is already outside the
+Monday-to-Friday windows. Weekends and holidays alike are off-peak, make-up
+weekends included.
+
+A gazette declares one year. Past the last declared holiday the calendar is
+silently out of date and nothing errors — the price is merely too high on the
+handful of weekdays a year that are holidays, which is the kind of thing nobody
+notices. So a peak schedule with no holiday in the current year is named in the
+log at load, the same way an unpriced provider is.
+
+Like a rate, a calendar survives a save only because it is put back: the
+provider form has no field for one, so a save writes the row without it, and the
+row takes the catalogue's calendar back as it loads. Only an empty list is
+filled, so a calendar set by hand is left alone.
 
 ### Pinning someone to a provider
 

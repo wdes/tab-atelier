@@ -343,6 +343,17 @@ impl Costs {
         self.model.as_deref()
     }
 
+    /// The catalog's prices for a model, if it describes one.
+    ///
+    /// Handed back by value rather than by reference because the caller is a status row that has to
+    /// let go of the lock before it formats: it runs on a redraw tick several times a second, and
+    /// formatting a line while holding the mutex the turn's own accounting needs is a stall waiting
+    /// for a busy session to find.
+    #[must_use]
+    pub fn price_of(&self, model: &str) -> Option<ModelPrice> {
+        self.catalog.as_ref()?.model(model).cloned()
+    }
+
     /// Add one turn.
     ///
     /// The model is recorded whatever happens — it is what the relay *said*, and that is true

@@ -225,8 +225,16 @@
 
         <div v-if="error" class="alert alert-danger py-2 small">{{ error }}</div>
 
-        <!-- Plan pressure: the shared subscription, reported by Anthropic -->
-        <div class="ta-viz mb-4">
+        <!--
+          Plan pressure: the shared subscription, reported by Anthropic.
+
+          The whole block is gated on the same "is the subscription usable"
+          answer the router uses, so a provider switched off — by hand, or for
+          want of its credential file — takes the panel with it. Reporting on a
+          plan the proxy has decided not to spend would be a figure with no
+          referent.
+        -->
+        <div class="ta-viz mb-4" v-if="planAvailable">
           <div class="card shadow-sm mb-3" v-if="pressure">
             <div class="card-body">
               <div class="d-flex align-items-start mb-2">

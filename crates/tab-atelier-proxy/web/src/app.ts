@@ -275,6 +275,15 @@ const AdminApp = Vue.defineComponent({
     planUtil(): number | null {
       return this.plan.utilization ?? null;
     },
+    // Whether to draw the plan panel at all. Deliberately the API's own answer
+    // rather than a check for a missing credential here: the proxy has already
+    // decided whether it is spending the plan, and the two must not be able to
+    // disagree — a graph drawn for a subscription the router is not using
+    // reports on nothing. Requires the fetch to have landed, so the panel does
+    // not flash on before the first response says otherwise.
+    planAvailable(): boolean {
+      return this.pressure !== null && this.plan.available === true;
+    },
     planHealth(): PlanHealth | Record<string, never> {
       return this.plan.health || {};
     },

@@ -76,6 +76,16 @@ pub struct ToolConfig {
     /// Tools added on top.
     #[serde(default)]
     pub add: Vec<CustomTool>,
+    /// Which PHP functions a `PHPUnit` run may not call.
+    ///
+    /// Absent means the tool's own default, which stops a test from spawning a process at all.
+    /// It is here rather than hard-coded because a project whose own suite legitimately shells
+    /// out (a PDF converter driving `node`, a hook guard testing `proc_open`) would otherwise be
+    /// unable to run its tests through the agent. Setting it pins the list for that project;
+    /// setting it empty removes the block, which is the operator saying they accept a test
+    /// running arbitrary commands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phpunit_disable_functions: Option<Vec<String>>,
 }
 
 const fn default_timeout() -> u64 {
@@ -123,7 +133,20 @@ pub struct ToolSet {
     /// is the only piece of policy a tool itself has to consult mid-call. See `ssh::Policy` for why
     /// the two lists' absences mean different things.
     policy: crate::tools::ssh::Policy,
+    /// PHP functions a `PHPUnit` run may not call, from the config.
+    ///
+    /// `None` means the tool's own default. Held on the set for the same reason the SSH
+    /// policy is: the dispatcher is a method here, and this is a limit a tool has to be
+    /// handed rather than one it can look up.
+    phpunit_functions: Option<Vec<String>>,
 }
+
+/// The name of the project-local tool config, under `<cwd>/.catbus/`.
+///
+/// Discovered rather than named by the launcher, which is the whole point: a project
+/// describes its own tools, and the operator running a session in it should not have to
+/// know that, any more than they have to pass the identity.
+pub const PROJECT_TOOL_FILE: &str = "tools.toml";
 
 impl ToolSet {
     /// Every built-in tool, with nothing disabled.
@@ -133,6 +156,7 @@ impl ToolSet {
             specs: crate::tools::builtin_specs(),
             custom: BTreeMap::new(),
             policy: crate::tools::ssh::Policy::default(),
+            phpunit_functions: None,
         }
     }
 
@@ -156,11 +180,208 @@ impl ToolSet {
         if path.as_os_str() == MINIMAL_KEYWORD {
             return Self::from_config(minimal_config());
         }
+        Self::from_config(Self::read(path)?)
+    }
+
+    /// Resolve the tool set from the launcher's config and the project's, layered.
+    ///
+    /// `launcher` is what `--tools-config` named — a path, the `minimal` keyword, or
+    /// nothing; `cwd` is the directory the session runs in. Three things can contribute:
+    /// the built-ins, the launcher's config, and `<cwd>/.catbus/tools.toml`.
+    ///
+    /// The project's file is *discovered* rather than named, for the reason the identity
+    /// file is: a project describes the tools its own work needs, and the operator
+    /// starting a session in it should not have to know to pass a second flag. It may
+    /// **take away** a built-in (`disable`) and **add** tools of its own (`add`).
+    ///
+    /// It cannot widen. A project's `allow` is **refused** rather than ignored, because a
+    /// second whitelist would make "which tools exist" the intersection of two lists the
+    /// operator cannot see at once — and the identity file's `AllowedTools` is the
+    /// instrument for narrowing the whole set, custom tools included.
+    ///
+    /// It *can* exempt a tool of its own from the auto-mode judge, since the file is the
+    /// operator's; that is logged, not silently allowed. The controls that hold whatever this
+    /// file says are `AllowedTools` — narrow-only, so a tool still has to be named to exist at
+    /// all — and the session's gate mode.
+    ///
+    /// `minimal` is exempt: it is a deliberate lockdown (`Spawn`'s default, and how an
+    /// operator says "no shell"), so a project file does not get to add to it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::load`], plus a project file that cannot be read, parses as neither
+    /// format its name promises, or collides with the launcher's own tools.
+    pub fn load_layered(launcher: Option<&Path>, cwd: &Path) -> Result<Self, String> {
+        if launcher.is_some_and(|p| p.as_os_str() == MINIMAL_KEYWORD) {
+            log::info!(
+                "tools: the minimal set (--tools-config minimal); a working directory's own \
+                 tools config is not read"
+            );
+            return Self::load(launcher);
+        }
+        let launcher_name = launcher.map_or_else(|| "--tools-config".to_owned(), |p| p.display().to_string());
+        let launcher_config = launcher.map(Self::read).transpose()?;
+        let project_path = crate::identity::project_dir(cwd).join(PROJECT_TOOL_FILE);
+        let project_config = Self::read_if_present(&project_path)?;
+        if project_config.is_some() {
+            log::info!("tools taken from {}", project_path.display());
+        }
+        let config = match (launcher_config, project_config) {
+            (Some(base), Some(over)) => Self::merge(base, &launcher_name, over, &project_path.display().to_string())?,
+            (Some(only), None) | (None, Some(only)) => only,
+            // Neither file: the built-ins as such, unsorted, exactly as `load(None)` gives.
+            (None, None) => return Ok(Self::builtin()),
+        };
+        Self::from_config(config)
+    }
+
+    /// Read and parse a config file, choosing the format by its extension.
+    ///
+    /// See [`Self::parse`] for the rule and why a file whose extension says nothing is tried
+    /// both ways rather than sniffed.
+    fn read(path: &Path) -> Result<ToolConfig, String> {
         let raw = std::fs::read_to_string(path)
             .map_err(|e| format!("tools config {} could not be read: {e}", path.display()))?;
-        let config: ToolConfig = serde_json::from_str(&raw)
-            .map_err(|e| format!("tools config {} is not valid JSON: {e}", path.display()))?;
-        Self::from_config(config)
+        Self::parse(&raw, path)
+    }
+
+    /// As [`Self::read`], but a missing file is `None` rather than an error.
+    ///
+    /// For the discovered project file only: not having one is the ordinary case, while a
+    /// file that is present but unreadable is not — the same distinction the identity
+    /// search draws.
+    fn read_if_present(path: &Path) -> Result<Option<ToolConfig>, String> {
+        match std::fs::read_to_string(path) {
+            Ok(raw) => Self::parse(&raw, path).map(Some),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(format!("tools config {} could not be read: {e}", path.display())),
+        }
+    }
+
+    /// Parse a config body, the format decided by the extension.
+    ///
+    /// `.toml` is read as TOML and `.json` as JSON, so a file that parses as neither complains
+    /// about the one format its name promised — a JSON body in a `.toml` file would otherwise
+    /// load as something the operator did not write.
+    ///
+    /// A path with no extension to go on is tried as JSON first, because every config that
+    /// existed before TOML was supported was JSON and an old path is exactly that, then as
+    /// TOML. Both failures are reported together, so the message does not send the operator to
+    /// the wrong format.
+    fn parse(raw: &str, path: &Path) -> Result<ToolConfig, String> {
+        match path.extension().and_then(std::ffi::OsStr::to_str) {
+            Some("toml") => {
+                toml::from_str(raw).map_err(|e| format!("tools config {} is not valid TOML: {e}", path.display()))
+            }
+            Some("json") => Self::from_json(raw, path),
+            _ => match Self::from_json(raw, path) {
+                Ok(config) => Ok(config),
+                Err(json_error) => toml::from_str(raw)
+                    .map_err(|toml_error| format!("{json_error}, and not valid TOML either: {toml_error}")),
+            },
+        }
+    }
+
+    /// The JSON arm, split out so its message is written once.
+    fn from_json(raw: &str, path: &Path) -> Result<ToolConfig, String> {
+        serde_json::from_str(raw).map_err(|e| format!("tools config {} is not valid JSON: {e}", path.display()))
+    }
+
+    /// Layer a project's config over the launcher's, into the one config that is built.
+    ///
+    /// Each field has a direction, and the direction is the point:
+    ///
+    /// - `disable` is the **union**. Either side withholds a built-in; neither can un-withhold.
+    /// - `allow` is the **launcher's alone**. A project that carries one is refused — see
+    ///   [`Self::load_layered`].
+    /// - `add` is the launcher's tools followed by the project's, with a name either both
+    ///   define or that a built-in already holds refused rather than resolved.
+    /// - the PHP function list is the project's when it sets one, since the project is the
+    ///   one whose tests are being run.
+    ///
+    /// The two names are for the refusals: a collision the operator cannot locate is one they
+    /// cannot fix.
+    fn merge(base: ToolConfig, base_name: &str, over: ToolConfig, over_name: &str) -> Result<ToolConfig, String> {
+        let ToolConfig {
+            mut disable,
+            allow,
+            mut add,
+            phpunit_disable_functions,
+        } = base;
+        let ToolConfig {
+            disable: more_disable,
+            allow: over_allow,
+            add: more_add,
+            phpunit_disable_functions: over_functions,
+        } = over;
+
+        if over_allow.is_some() {
+            return Err(format!(
+                "{over_name} sets `allow`, which only the launcher's --tools-config may set — \
+                 withhold a built-in here with `disable`, and narrow the whole set with \
+                 AllowedTools in the identity file"
+            ));
+        }
+
+        let builtins = crate::tools::builtin_specs();
+        let is_builtin = |name: &str| {
+            builtins
+                .iter()
+                .any(|s| s.get("name").and_then(Value::as_str) == Some(name))
+        };
+
+        for tool in &more_add {
+            // Refused rather than resolved: whichever file lost would silently run argv the
+            // other wrote, under a name the operator wrote for something else.
+            if add.iter().any(|t| t.name == tool.name) {
+                return Err(format!(
+                    "custom tool {:?} is defined in both {base_name} and {over_name} — rename one",
+                    tool.name
+                ));
+            }
+            // A project may not take a built-in's name, least of all one the launcher just
+            // withheld: the model's idea of `Bash` would then be wrong, which is the confusion
+            // the same check inside one file already refuses.
+            if is_builtin(&tool.name) {
+                return Err(format!(
+                    "{over_name} defines a tool named {:?}, which is a built-in; pick another name",
+                    tool.name
+                ));
+            }
+            // Exempting a capability from the judge is the operator's to give — this file is
+            // theirs, and a project file is the natural place for it — but it is *announced*,
+            // because the file sits in a directory the agent can write and an exemption that
+            // appeared there without the operator noticing would be one they never granted.
+            // The controls that do not depend on this file are `AllowedTools` (narrow-only, so
+            // a tool still has to be named to exist) and the session's gate mode.
+            if !tool.judged {
+                log::warn!(
+                    "{over_name} adds {:?} with `judged: false`: it will run ungraded in auto mode",
+                    tool.name
+                );
+            }
+        }
+
+        // `disable` filters built-ins, so naming a custom tool does nothing at all. Say so,
+        // rather than accept an entry that has no effect and looks like it did.
+        for name in &more_disable {
+            if add.iter().any(|t| t.name == *name) {
+                return Err(format!(
+                    "{over_name} disables {name:?}, which {base_name} adds as a custom tool — \
+                     `disable` withholds built-ins; withhold a custom tool with AllowedTools in \
+                     the identity file"
+                ));
+            }
+        }
+
+        disable.extend(more_disable);
+        add.extend(more_add);
+        Ok(ToolConfig {
+            disable,
+            allow,
+            add,
+            phpunit_disable_functions: over_functions.or(phpunit_disable_functions),
+        })
     }
 
     /// Build from an already-parsed config.
@@ -173,7 +394,12 @@ impl ToolSet {
         // means by "passed by value but not consumed": taking ownership and
         // then only borrowing reads as a mistake, and destructuring makes the
         // three pieces this actually works from explicit.
-        let ToolConfig { disable, allow, add } = config;
+        let ToolConfig {
+            disable,
+            allow,
+            add,
+            phpunit_disable_functions,
+        } = config;
         let mut custom = BTreeMap::new();
         for tool in add {
             if tool.name.trim().is_empty() {
@@ -255,7 +481,16 @@ impl ToolSet {
             // A set built from a config file has no host policy of its own: the identity
             // file supplies one, through `with_allowed_hosts`.
             policy: crate::tools::ssh::Policy::default(),
+            phpunit_functions: phpunit_disable_functions,
         })
+    }
+
+    /// The PHP functions a `PHPUnit` run may not call, if the config set any.
+    ///
+    /// `None` leaves it to the tool's own default. See the field.
+    #[must_use]
+    pub fn phpunit_disable_functions(&self) -> Option<&[String]> {
+        self.phpunit_functions.as_deref()
     }
 
     /// Apply the operator's SSH limits.
@@ -364,6 +599,9 @@ impl ToolSet {
             // Carried through narrowing, so restricting the tools cannot silently drop the host
             // limit — the two are set independently and neither implies the other.
             policy: self.policy.clone(),
+            // And the PHP function list for the same reason: `AllowedTools` is about which tools
+            // exist, not about what a surviving one may do.
+            phpunit_functions: self.phpunit_functions.clone(),
         })
     }
 
@@ -1001,5 +1239,246 @@ mod tests {
         assert!(set.changes_the_world("Default"), "safe by default");
         assert!(!set.changes_the_world("Exempt"), "and explicit when not");
         assert!(!set.changes_the_world("Never"), "an unknown tool is not judged");
+    }
+
+    /// A file named `.toml` is read as TOML, and the `add` entries come through with the same
+    /// shape JSON gives — the point of supporting the format at all.
+    #[test]
+    fn a_toml_config_loads_the_same_as_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let toml_path = dir.path().join("tools.toml");
+        std::fs::write(
+            &toml_path,
+            r#"
+disable = ["Bash"]
+
+[[add]]
+name = "GiteaPr"
+description = "Read a pull request."
+judged = false
+timeout_secs = 120
+schema = { type = "object", properties = { pr = { type = "string" } }, required = ["pr"] }
+argv = ["scripts/claude-gitea-pr.sh", "--get", "{pr}"]
+"#,
+        )
+        .unwrap();
+        let set = ToolSet::load(Some(&toml_path)).expect("valid TOML");
+        assert!(!names(&set).iter().any(|n| n == "Bash"), "disable honoured");
+        assert!(names(&set).iter().any(|n| n == "GiteaPr"), "custom tool added");
+        assert!(!set.changes_the_world("GiteaPr"), "judged: false carried through");
+    }
+
+    /// A JSON body in a `.toml` file is refused, and the message says which format the name
+    /// promised — a file that loads as the format it did not claim would be a surprise.
+    #[test]
+    fn the_extension_decides_the_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tools.toml");
+        std::fs::write(&path, r#"{"disable": ["Bash"]}"#).unwrap();
+        let err = ToolSet::load(Some(&path)).expect_err("JSON in a .toml file");
+        assert!(err.contains("TOML"), "{err}");
+
+        // A `.json` file holding TOML gets the JSON complaint.
+        let json_path = dir.path().join("tools.json");
+        std::fs::write(&json_path, "disable = [\"Bash\"]\n").unwrap();
+        let err = ToolSet::load(Some(&json_path)).expect_err("TOML in a .json file");
+        assert!(err.contains("JSON"), "{err}");
+    }
+
+    /// An extension-less path — the shape every config had before TOML existed — still reads as
+    /// JSON, and also as TOML, so neither old path nor a new nameless one is stranded.
+    #[test]
+    fn a_path_with_no_extension_is_tried_both_ways() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tools");
+        std::fs::write(&path, r#"{"disable": ["Bash"]}"#).unwrap();
+        assert!(
+            !names(&ToolSet::load(Some(&path)).expect("JSON"))
+                .iter()
+                .any(|n| n == "Bash")
+        );
+
+        std::fs::write(&path, "disable = [\"Bash\"]\n").unwrap();
+        assert!(
+            !names(&ToolSet::load(Some(&path)).expect("TOML"))
+                .iter()
+                .any(|n| n == "Bash")
+        );
+
+        // And something that is neither names both, so the operator is not sent to the wrong one.
+        std::fs::write(&path, "this is not a config").unwrap();
+        let err = ToolSet::load(Some(&path)).expect_err("garbage");
+        assert!(err.contains("JSON") && err.contains("TOML"), "{err}");
+    }
+
+    /// The project file is found without being named, its tools are added, and its `disable` is
+    /// honoured — the feature the whole change exists for.
+    #[test]
+    fn the_project_file_is_discovered_and_adds_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let catbus = dir.path().join(".catbus");
+        std::fs::create_dir_all(&catbus).unwrap();
+        std::fs::write(
+            catbus.join(PROJECT_TOOL_FILE),
+            r#"
+disable = ["Bash"]
+
+[[add]]
+name = "GiteaPr"
+description = "Read a pull request."
+schema = { type = "object", properties = {} }
+argv = ["scripts/claude-gitea-pr.sh", "--get", "1"]
+"#,
+        )
+        .unwrap();
+        let set = ToolSet::load_layered(None, dir.path()).expect("valid");
+        assert!(names(&set).iter().any(|n| n == "GiteaPr"), "project tool added");
+        assert!(!names(&set).iter().any(|n| n == "Bash"), "project disable honoured");
+    }
+
+    /// `minimal` is a deliberate lockdown, so a project file does not get to add to it: the
+    /// keyword is taken at its word and the directory is not read.
+    #[test]
+    fn minimal_is_not_widened_by_a_project_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let catbus = dir.path().join(".catbus");
+        std::fs::create_dir_all(&catbus).unwrap();
+        std::fs::write(
+            catbus.join(PROJECT_TOOL_FILE),
+            "[[add]]\nname = \"Sneak\"\ndescription = \"d\"\nschema = { type = \"object\" }\nargv = [\"true\"]\n",
+        )
+        .unwrap();
+        let set = ToolSet::load_layered(Some(Path::new(MINIMAL_KEYWORD)), dir.path()).expect("valid");
+        assert!(!names(&set).iter().any(|n| n == "Sneak"), "minimal stayed minimal");
+    }
+
+    /// A project file may withhold a built-in and add tools, but may not set `allow`: a second
+    /// whitelist would make the live set the intersection of two lists, and `AllowedTools` is the
+    /// instrument for narrowing.
+    #[test]
+    fn a_project_file_cannot_widen_or_whitelist() {
+        let dir = tempfile::tempdir().unwrap();
+        let catbus = dir.path().join(".catbus");
+        std::fs::create_dir_all(&catbus).unwrap();
+        let base = dir.path().join("launcher.toml");
+        std::fs::write(&base, r#"disable = ["Bash"]"#).unwrap();
+
+        std::fs::write(catbus.join(PROJECT_TOOL_FILE), r#"allow = ["Read"]"#).unwrap();
+        let err = ToolSet::load_layered(Some(&base), dir.path()).expect_err("allow is refused");
+        assert!(err.contains("allow"), "{err}");
+
+        // No `allow`: the launcher's disable survives and the project's is added to it.
+        std::fs::write(catbus.join(PROJECT_TOOL_FILE), r#"disable = ["Bun"]"#).unwrap();
+        let set = ToolSet::load_layered(Some(&base), dir.path()).expect("valid");
+        let names = names(&set);
+        assert!(!names.iter().any(|n| n == "Bash"), "launcher withheld");
+        assert!(!names.iter().any(|n| n == "Bun"), "and the project withheld another");
+    }
+
+    /// A name defined by both files is refused, and the message names both — a collision the
+    /// operator cannot locate is one they cannot fix. So is a project tool named after a built-in.
+    #[test]
+    fn a_collision_between_the_two_files_is_refused_with_both_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let catbus = dir.path().join(".catbus");
+        std::fs::create_dir_all(&catbus).unwrap();
+        let base = dir.path().join("launcher.toml");
+        let entry = |name: &str| {
+            format!(
+                "[[add]]\nname = \"{name}\"\ndescription = \"d\"\nschema = {{ type = \"object\" }}\nargv = [\"true\"]\n"
+            )
+        };
+        std::fs::write(&base, entry("Clash")).unwrap();
+
+        std::fs::write(catbus.join(PROJECT_TOOL_FILE), entry("Clash")).unwrap();
+        let err = ToolSet::load_layered(Some(&base), dir.path()).expect_err("collision");
+        assert!(err.contains("Clash") && err.contains("launcher.toml"), "{err}");
+
+        // A project tool named for a built-in is refused too: the model's idea of `Bash` would
+        // otherwise be a script someone else wrote.
+        std::fs::write(catbus.join(PROJECT_TOOL_FILE), entry("Bash")).unwrap();
+        let err = ToolSet::load_layered(Some(&base), dir.path()).expect_err("shadows a built-in");
+        assert!(err.contains("Bash") && err.contains("built-in"), "{err}");
+    }
+
+    /// A `disable` naming a custom tool does nothing — it filters built-ins — so it is refused
+    /// rather than accepted as an entry that looks like it had an effect.
+    #[test]
+    fn disabling_a_custom_tool_is_refused_as_a_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let catbus = dir.path().join(".catbus");
+        std::fs::create_dir_all(&catbus).unwrap();
+        let base = dir.path().join("launcher.toml");
+        std::fs::write(
+            &base,
+            "[[add]]\nname = \"Mine\"\ndescription = \"d\"\nschema = { type = \"object\" }\nargv = [\"true\"]\n",
+        )
+        .unwrap();
+        std::fs::write(catbus.join(PROJECT_TOOL_FILE), r#"disable = ["Mine"]"#).unwrap();
+        let err = ToolSet::load_layered(Some(&base), dir.path()).expect_err("no-op disable");
+        assert!(err.contains("Mine"), "{err}");
+    }
+
+    /// The PHP function list rides on the set and survives narrowing, like the host policy: which
+    /// tools exist and what a surviving one may do are independent.
+    #[test]
+    fn the_php_function_list_is_carried_and_is_the_projects() {
+        let dir = tempfile::tempdir().unwrap();
+        let catbus = dir.path().join(".catbus");
+        std::fs::create_dir_all(&catbus).unwrap();
+        let base = dir.path().join("launcher.toml");
+        std::fs::write(&base, r#"phpunit_disable_functions = ["exec"]"#).unwrap();
+        std::fs::write(
+            catbus.join(PROJECT_TOOL_FILE),
+            r#"phpunit_disable_functions = ["shell_exec", "proc_open"]"#,
+        )
+        .unwrap();
+
+        let set = ToolSet::load_layered(Some(&base), dir.path()).expect("valid");
+        assert_eq!(
+            set.phpunit_disable_functions(),
+            Some(["shell_exec".to_owned(), "proc_open".to_owned()].as_slice()),
+            "the project's tests are the ones being run, so its list wins"
+        );
+
+        // `narrowed_to` is for `AllowedTools`, not for this, and must not drop it.
+        let narrowed = set.narrowed_to(&["Read".to_owned()]).expect("Read survives");
+        assert!(narrowed.phpunit_disable_functions().is_some(), "survives narrowing");
+
+        // Nothing set: the tool's own default applies, which the getter reports as `None`.
+        assert_eq!(ToolSet::builtin().phpunit_disable_functions(), None);
+    }
+
+    /// The project file is read only when it is there; a broken one is an error, not a silence.
+    #[test]
+    fn a_missing_project_file_is_fine_and_a_broken_one_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            ToolSet::load_layered(None, dir.path()).is_ok(),
+            "no .catbus, no problem"
+        );
+
+        let catbus = dir.path().join(".catbus");
+        std::fs::create_dir_all(&catbus).unwrap();
+        std::fs::write(catbus.join(PROJECT_TOOL_FILE), "not a config at all").unwrap();
+        let err = ToolSet::load_layered(None, dir.path()).expect_err("broken");
+        assert!(err.contains(PROJECT_TOOL_FILE), "names the file: {err}");
+    }
+
+    /// A top-level key written *after* an `[[add]]` table silently becomes a field of that
+    /// tool in TOML, so a mistyped layout loses the setting rather than erroring. This pins the
+    /// shape the documents prescribe — top-level keys first — so a config that looks right but
+    /// is laid out wrong is caught by the round trip it is meant to survive.
+    #[test]
+    fn a_top_level_key_after_a_table_is_the_trap_it_looks_like() {
+        let good = "disable = [\"Bash\"]\n\n[[add]]\nname = \"T\"\ndescription = \"d\"\nschema = { type = \"object\" }\nargv = [\"true\"]\n";
+        let config: ToolConfig = toml::from_str(good).unwrap();
+        assert_eq!(config.disable, ["Bash"], "top-level key before the table");
+
+        // The same key at the end is absorbed by the last tool and the top level stays empty —
+        // which is why the documents show the keys first, and why this test exists at all.
+        let bad = "[[add]]\nname = \"T\"\ndescription = \"d\"\nschema = { type = \"object\" }\nargv = [\"true\"]\ndisable = [\"Bash\"]\n";
+        let config: ToolConfig = toml::from_str(bad).unwrap();
+        assert!(config.disable.is_empty(), "absorbed by the table above it");
     }
 }

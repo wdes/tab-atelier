@@ -401,6 +401,32 @@ pub struct Peak {
     /// 200 = double.
     pub multiplier_percent: u32,
     pub windows: Vec<PeakWindow>,
+    /// Whole days the provider charges off-peak for, whatever `windows` say.
+    ///
+    /// `DeepSeek`'s schedule reads "peak hours are 01:00-04:00 and 06:00-10:00
+    /// UTC, Monday to Friday, *excluding Chinese public holidays*", and a
+    /// holiday is off-peak "in full" — the entire date, not the peak window
+    /// inside it. So this is the one thing the windows cannot express, and
+    /// leaving it out is not neutral: it bills a weekday holiday at double.
+    ///
+    /// Empty for a provider that publishes no such exclusion, and skipped on
+    /// the wire so the ordinary case is unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub holidays: Vec<Holiday>,
+}
+
+/// A named stretch of civil days a provider treats as off-peak.
+///
+/// Days rather than instants because that is the unit the vendor publishes and
+/// the unit a gazette declares. `dates` is a list because a festival that is
+/// observed across a moving bridge (Spring Festival, National Day) is one
+/// holiday with several days off, and naming it once is how the operator reads
+/// it back on the panel.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Holiday {
+    pub name: String,
+    /// The days themselves, as dates in the provider's own civil calendar.
+    pub dates: Vec<jiff::civil::Date>,
 }
 
 /// When peak applies, in UTC.
@@ -417,10 +443,44 @@ pub struct PeakWindow {
     pub end_hour: u8,
 }
 
+/// The zone a Chinese public holiday is a date in.
+///
+/// Fixed at UTC+8 because the mainland has kept one offset with no daylight
+/// saving since 1991, and because a fixed offset needs no tzdb — this crate
+/// ships none, and pulling one in to place a holiday would be a large
+/// dependency for a rule that has not moved in thirty years.
+#[must_use]
+const fn beijing() -> jiff::tz::TimeZone {
+    jiff::tz::TimeZone::fixed(jiff::tz::Offset::constant(8))
+}
+
 impl Peak {
+    /// The holiday that makes this instant off-peak, if a calendar says so.
+    ///
+    /// Matched on the date read in the provider's own zone, never on a time of
+    /// day: a holiday cancels the windows for the whole date, so the question
+    /// is only which date the instant is.
+    #[must_use]
+    pub fn holiday_at(&self, unix_secs: u64) -> Option<&str> {
+        let second = i64::try_from(unix_secs).ok()?;
+        let ts = jiff::Timestamp::from_second(second).ok()?;
+        let date = ts.to_zoned(beijing()).date();
+        self.holidays
+            .iter()
+            .find(|h| h.dates.contains(&date))
+            .map(|h| h.name.as_str())
+    }
+
     /// Whether peak pricing is in force at this instant.
     #[must_use]
     pub fn active_at(&self, unix_secs: u64) -> bool {
+        // Before the windows, because the exclusion is the stronger statement:
+        // a holiday is off-peak "in full", so no hour of it is charged at the
+        // multiplier even where a window covers that hour. Guarded on the
+        // calendar being non-empty so a provider without one pays nothing.
+        if !self.holidays.is_empty() && self.holiday_at(unix_secs).is_some() {
+            return false;
+        }
         let Ok(ts) = i64::try_from(unix_secs).map(jiff::Timestamp::from_second) else {
             return false;
         };
@@ -456,6 +516,26 @@ impl Peak {
             at += 3_600;
         }
         None
+    }
+
+    /// The year an instant falls in, when the calendar says nothing about it.
+    ///
+    /// A gazette declares one year at a time, so the list is only true for the
+    /// year it was published for and nothing here can know the next one. Say so
+    /// rather than let every holiday of an uncovered year bill at peak in
+    /// silence — the same class of failure the rates already refuse to make
+    /// quietly. `None` when the year is covered, and when there is no calendar
+    /// at all: a provider that published no exclusion has no gap to report.
+    #[must_use]
+    pub fn uncovered_year_at(&self, unix_secs: u64) -> Option<i16> {
+        if self.holidays.is_empty() {
+            return None;
+        }
+        let second = i64::try_from(unix_secs).ok()?;
+        let ts = jiff::Timestamp::from_second(second).ok()?;
+        let year = ts.to_zoned(beijing()).year();
+        let covered = self.holidays.iter().any(|h| h.dates.iter().any(|d| d.year() == year));
+        (!covered).then_some(year)
     }
 }
 
@@ -644,28 +724,166 @@ impl Provider {
     ///
     /// A provider configured but unusable must be visibly unusable — routing
     /// to one whose key is missing produces a 401 from somewhere the operator
-    /// was not looking.
+    /// was not looking. For the subscription the credential is this host's
+    /// Claude file rather than a key, so that too is looked for here; it is the
+    /// same question, asked of the only kind whose answer is a path.
     #[must_use]
     pub fn credential_ready(&self) -> bool {
-        self.credential_ready_with(|v| std::env::var(v).ok())
+        self.credential_ready_with(|v| std::env::var(v).ok(), crate::egress::credential_present())
     }
 
     /// The same question with the environment supplied.
     ///
     /// Tests use this rather than setting variables: `set_var` is `unsafe`
     /// (forbidden in this crate) and races every other test in the binary.
+    ///
+    /// `subscription_present` is injected for the same reason: whether the Claude
+    /// credential file exists is host state, and reading it from the real `HOME`
+    /// would make every routing test depend on the machine it happens to run on.
     #[must_use]
-    pub fn credential_ready_with(&self, get: impl Fn(&str) -> Option<String>) -> bool {
+    pub fn credential_ready_with(&self, get: impl Fn(&str) -> Option<String>, subscription_present: bool) -> bool {
         if self.unusable_reason().is_some() {
             return false;
         }
         match &self.auth {
-            Auth::ClaudeOauth => true,
+            // The subscription has no key to look up: its credential is the Claude
+            // file, and a missing one is exactly as unusable as a missing key.
+            Auth::ClaudeOauth => subscription_present,
             Auth::ApiKeyEnv { var } => get(var).is_some_and(|v| !v.trim().is_empty()),
             // A file is checked for existence, not read: this runs on every
             // routing decision and the contents are fetched per request.
             Auth::ApiKeyFile { path } => std::fs::metadata(path).is_ok_and(|m| m.len() > 0),
         }
+    }
+
+    /// Whether it may serve at all: the operator left it on, and it can
+    /// authenticate.
+    ///
+    /// The one place the two ways of being disabled meet, so that routing and the
+    /// dashboard cannot disagree about whether this provider is in play. A
+    /// switched-off provider and one whose credential is missing are both, in the
+    /// only sense a caller cares about, disabled.
+    #[must_use]
+    pub fn usable(&self) -> bool {
+        self.usable_with(|v| std::env::var(v).ok(), crate::egress::credential_present())
+    }
+
+    /// [`Provider::usable`] with the host state supplied, for the same reason as
+    /// [`Provider::credential_ready_with`].
+    #[must_use]
+    pub fn usable_with(&self, get: impl Fn(&str) -> Option<String>, subscription_present: bool) -> bool {
+        self.enabled && self.credential_ready_with(get, subscription_present)
+    }
+
+    /// Why it may not serve a request right now, or `None` if it may.
+    ///
+    /// The whole "is this provider in play" question with the reason kept, for
+    /// the callers that have to explain themselves rather than quietly pick
+    /// something else. [`Provider::usable`] is this same judgement without the
+    /// words; they are written together so a refusal can never be reported for
+    /// a provider that was a candidate, or the reverse.
+    #[must_use]
+    pub fn refusal(&self) -> Option<String> {
+        self.refusal_with(|v| std::env::var(v).ok(), crate::egress::credential_present())
+    }
+
+    /// [`Provider::refusal`] with the host state supplied, for the same reason as
+    /// [`Provider::credential_ready_with`]: the words a refusal produces are
+    /// user-facing and worth asserting on, and that cannot be done against
+    /// whatever `HOME` the test happens to run under.
+    #[must_use]
+    pub fn refusal_with(&self, get: impl Fn(&str) -> Option<String>, subscription_present: bool) -> Option<String> {
+        if !self.enabled {
+            return Some(format!("provider {} is switched off", self.id));
+        }
+        if let Some(why) = self.unusable_reason() {
+            return Some(why);
+        }
+        (!self.credential_ready_with(get, subscription_present)).then(|| self.missing_credential())
+    }
+
+    /// What a caller needs to fix a provider whose credential is not present.
+    ///
+    /// Names the exact place looked, because "no credential" is not actionable
+    /// on its own — the file it wants is a path the operator set up once and
+    /// has to recognise now. The subscription's is the host's own Claude login,
+    /// which is where the read error a bare `true` used to produce came from.
+    #[must_use]
+    fn missing_credential(&self) -> String {
+        match &self.auth {
+            Auth::ClaudeOauth => format!(
+                "provider {} spends this host's Claude plan, and its credential file is not there: {}",
+                self.id,
+                crate::egress::credentials_file()
+                    .map_or_else(|_| "no home directory".to_owned(), |p| p.display().to_string())
+            ),
+            Auth::ApiKeyEnv { var } => format!("provider {} needs ${var}, which is not set", self.id),
+            Auth::ApiKeyFile { path } => format!(
+                "provider {} needs its key file {path}, which is missing or empty",
+                self.id
+            ),
+        }
+    }
+
+    /// Put back the rates the catalogue publishes for models this row leaves
+    /// unpriced.
+    ///
+    /// A price is a property of the vendor's list, not of an operator's edit,
+    /// and nothing outside this file can set one: the provider form rebuilds
+    /// every model from `id:class:relative_cost` text and [`parse_models`] has
+    /// no field for a rate, so a single save drops the triple from the row. The
+    /// same happens to a file written before the rates existed at all, because
+    /// `price` is `#[serde(default)]` and simply deserialises to `None`. Either
+    /// way the provider keeps working and keeps counting tokens, while every
+    /// hour it serves draws no money — an empty money unit that looks like a
+    /// broken chart rather than a missing figure.
+    ///
+    /// Filling from the catalogue turns that loss into a recoverable one. It can
+    /// only restore what the catalogue itself declares, so a model deliberately
+    /// left unpriced stays unpriced, and a rate set by hand is left alone.
+    pub fn adopt_published_rates(&mut self) {
+        for model in &mut self.models {
+            if model.price.is_none() && !model.deprecated {
+                model.price = published_price(&model.id);
+            }
+        }
+    }
+
+    /// Put back the billing calendar the catalogue publishes for this hop.
+    ///
+    /// The same loss as a rate, from the same cause: the dashboard form has no
+    /// field for a calendar, so a save writes the row back without one, and a
+    /// row written before the field existed deserialises with none. Unlike a
+    /// rate, the loss is not visible as a missing figure — the provider still
+    /// prices every hour — so it has to be repaired here or not at all. A
+    /// calendar left out is not "no peak": the windows still stand, and every
+    /// Chinese public holiday that falls on a weekday is billed at double.
+    ///
+    /// Only ever fills an empty list, so a calendar typed by hand is kept.
+    pub fn adopt_published_peak(&mut self) {
+        let Some(peak) = &mut self.peak else {
+            return;
+        };
+        // Only an empty list is filled, so a calendar typed by hand is kept: an
+        // operator who wrote one meant it, and the catalogue cannot know that
+        // their year or their vendor differs from the shipped one.
+        if !peak.holidays.is_empty() {
+            return;
+        }
+        if let Some(published) = published_peak(&self.base_url) {
+            peak.holidays = published.holidays;
+        }
+    }
+
+    /// Whether not one model it serves carries a rate.
+    ///
+    /// Not a fault on its own: the subscription hop is unpriced by design, since
+    /// a flat plan has no per-token cost to state. It is worth saying out loud
+    /// all the same, because the only visible symptom is a money figure that
+    /// never appears.
+    #[must_use]
+    pub fn has_no_recorded_rate(&self) -> bool {
+        !self.models.iter().any(|m| !m.deprecated && m.price.is_some())
     }
 }
 
@@ -773,6 +991,11 @@ impl Preset {
                             end_hour: 10,
                         },
                     ],
+                    // The exclusion the windows cannot state: a weekday holiday
+                    // is off-peak "in full", so without these seven entries the
+                    // schedule doubles the price on roughly nineteen weekdays a
+                    // year.
+                    holidays: holidays_2026(),
                 }),
                 models: vec![
                     // 1M context, thinking and non-thinking, tool calls,
@@ -865,6 +1088,109 @@ impl Preset {
             },
         }
     }
+
+    /// The models a preset ships, without configuring a whole provider.
+    ///
+    /// Delegates to [`Preset::provider_named`] so the rates written beside the
+    /// model list stay the only copy of them: a second table here would be one
+    /// more thing to leave behind when a vendor moves a price. The key path it
+    /// builds on the way is discarded, and no directory is read or written.
+    #[must_use]
+    pub fn models(self) -> Vec<Model> {
+        self.provider_named(Path::new(""), "catalogue").models
+    }
+}
+
+/// The rate the shipped catalogue records for a model id.
+///
+/// This is how a row that lost its price gets it back — see
+/// [`Provider::adopt_published_rates`]. It answers only for models whose rates
+/// this repository actually records, and that limit is the point: the
+/// subscription hop has no per-token price at all, and the metered models the
+/// presets list without one stay that way. A lookup that can only return what
+/// the presets say cannot invent a figure for either.
+#[must_use]
+pub fn published_price(model_id: &str) -> Option<Price> {
+    Preset::ALL
+        .iter()
+        .flat_map(|preset| preset.models())
+        .find(|model| model.id == model_id && !model.deprecated)
+        .and_then(|model| model.price)
+}
+
+/// The billing calendar the shipped catalogue records for a provider.
+///
+/// The peak counterpart of [`published_price`], drawn from the same place. It
+/// is how a provider that lost its calendar gets it back — see
+/// [`Provider::adopt_published_peak`]. Matched on `base_url` rather than `id`,
+/// because an operator may rename the row and a calendar is a property of who
+/// serves the tokens, not of what the row is called; the key path
+/// `provider_named` builds on the way is discarded, and no directory is read.
+#[must_use]
+pub fn published_peak(base_url: &str) -> Option<Peak> {
+    Preset::ALL
+        .iter()
+        .map(|preset| preset.provider_named(Path::new(""), "catalogue"))
+        .find(|provider| provider.base_url == base_url)
+        .and_then(|provider| provider.peak)
+}
+
+/// A civil date, falling over only on an impossible one.
+///
+/// The calendar below is a literal typed by hand, so an impossible date is a
+/// mistake in this file rather than an input: failing where it is written beats
+/// a typo that silently drops a holiday and starts billing peak again.
+fn day(year: i16, month: i8, day: i8) -> jiff::civil::Date {
+    jiff::civil::Date::new(year, month, day).expect("holiday calendar holds a real date")
+}
+
+/// One holiday and the days it covers.
+fn holiday(name: &str, dates: &[(i8, i8)]) -> Holiday {
+    Holiday {
+        name: name.to_owned(),
+        dates: dates.iter().map(|&(m, d)| day(2026, m, d)).collect(),
+    }
+}
+
+/// The Chinese public holidays `DeepSeek` charges off-peak for, in 2026.
+///
+/// Transcribed from the State Council's arrangement for 2026, which is the
+/// declaration the provider's schedule defers to. These are the days the
+/// exchange is *closed* — the ones that make an otherwise-peak weekday
+/// off-peak. The adjusted working weekends around them (the "make-up" days) are
+/// deliberately absent, and need no entry: every one of them falls on a
+/// Saturday or Sunday, so it is already outside the Monday-to-Friday windows.
+/// The vendor's own notice says as much — weekends and holidays alike are
+/// billed off-peak, make-up weekends included.
+///
+/// A gazette covers one year. [`Peak::uncovered_year_at`] reports the years
+/// past this list so the gap is visible rather than billed blind.
+fn holidays_2026() -> Vec<Holiday> {
+    vec![
+        holiday("New Year's Day", &[(1, 1), (1, 2), (1, 3)]),
+        holiday(
+            "Spring Festival",
+            &[
+                (2, 15),
+                (2, 16),
+                (2, 17),
+                (2, 18),
+                (2, 19),
+                (2, 20),
+                (2, 21),
+                (2, 22),
+                (2, 23),
+            ],
+        ),
+        holiday("Qingming Festival", &[(4, 4), (4, 5), (4, 6)]),
+        holiday("Labour Day", &[(5, 1), (5, 2), (5, 3), (5, 4), (5, 5)]),
+        holiday("Dragon Boat Festival", &[(6, 19), (6, 20), (6, 21)]),
+        holiday("Mid-Autumn Festival", &[(9, 25), (9, 26), (9, 27)]),
+        holiday(
+            "National Day",
+            &[(10, 1), (10, 2), (10, 3), (10, 4), (10, 5), (10, 6), (10, 7)],
+        ),
+    ]
 }
 
 /// Where a provider's key file lives: beside `providers.json`, `0600`.
@@ -1007,7 +1333,20 @@ impl Registry {
             return Self::default();
         };
         match serde_json::from_str::<Self>(&raw) {
-            Ok(r) if !r.providers.is_empty() => {
+            Ok(mut r) if !r.providers.is_empty() => {
+                // A row can be missing rates it ought to have: the form cannot
+                // express one, and a file older than the field deserialises
+                // without them. Put back what the catalogue publishes before
+                // anything reads them, so that a provider which was saved once
+                // does not cost nothing for ever.
+                for p in &mut r.providers {
+                    p.adopt_published_rates();
+                    // And the billing calendar, for the same reason: a save
+                    // through the form drops it, and a missing calendar is not
+                    // "no peak" — the windows survive, so every holiday that
+                    // falls on a weekday bills at double until it is put back.
+                    p.adopt_published_peak();
+                }
                 // Loud at LOAD, not only at the first request that would have
                 // used it. A provider that can never be used still sits in the
                 // file looking configured, and the operator's next question is
@@ -1016,6 +1355,33 @@ impl Registry {
                 for p in &r.providers {
                     if let Some(why) = p.unusable_reason() {
                         log::error!("provider {} is UNUSABLE: {why}", p.id);
+                    }
+                    // And one step quieter: usable, but with no rate recorded
+                    // for anything it serves, so its hours will draw no money.
+                    // Nothing errors and no token is lost — which is why it has
+                    // to be said here. The only symptom is a figure that never
+                    // appears, and an operator cannot tell a missing price from
+                    // a broken chart.
+                    if p.enabled && p.has_no_recorded_rate() {
+                        log::warn!(
+                            "provider {} serves models with no recorded rate, so its hours show no cost",
+                            p.id
+                        );
+                    }
+                    // And a calendar that has run out of year. The gazette it
+                    // was drawn from declares one year, so past that date the
+                    // schedule silently bills every weekday holiday at peak.
+                    // Nothing errors; the only symptom is a price that is too
+                    // high, which is exactly the kind of thing nobody notices.
+                    if let Some(year) = p
+                        .peak
+                        .as_ref()
+                        .and_then(|peak| peak.uncovered_year_at(crate::server::now_ms() / 1000))
+                    {
+                        log::warn!(
+                            "provider {} bills at peak with no holiday calendar for {year}, so a holiday in it will be charged at the peak rate",
+                            p.id
+                        );
                     }
                 }
                 r
@@ -1076,6 +1442,34 @@ impl Registry {
         None
     }
 
+    /// Whether the shared plan is being spent by this proxy at all.
+    ///
+    /// The question the dashboard asks before it draws a plan at all: with no
+    /// usable subscription there is nothing to report, and a panel of empty
+    /// figures is worse than no panel. Deliberately the same [`Provider::usable`]
+    /// routing uses, so a provider switched off by hand and one left keyless both
+    /// take the graph away — otherwise the two would have to be kept in step by
+    /// hand, and the graph would eventually claim a plan the router was not
+    /// spending.
+    #[must_use]
+    pub fn subscription_usable(&self) -> bool {
+        self.subscription_usable_with(|v| std::env::var(v).ok(), crate::egress::credential_present())
+    }
+
+    /// [`Registry::subscription_usable`] with the host state supplied, so the
+    /// predicate the dashboard keys on can be tested without a credential file
+    /// on the machine running the test.
+    #[must_use]
+    pub fn subscription_usable_with(
+        &self,
+        get: impl Fn(&str) -> Option<String> + Copy,
+        subscription_present: bool,
+    ) -> bool {
+        self.providers
+            .iter()
+            .any(|p| p.uses_the_subscription() && p.usable_with(get, subscription_present))
+    }
+
     /// Every usable `(provider, model)` for a class, best first.
     ///
     /// Ordered by the operator's preference then by cost, so the intended
@@ -1084,7 +1478,12 @@ impl Registry {
     /// than tried and failed.
     #[must_use]
     pub fn candidates(&self, class: Class, now: u64) -> Vec<(&Provider, &Model)> {
-        self.candidates_with(class, |v| std::env::var(v).ok(), now)
+        self.candidates_with(
+            class,
+            |v| std::env::var(v).ok(),
+            crate::egress::credential_present(),
+            now,
+        )
     }
 
     /// [`Registry::candidates`] with the environment supplied, for tests.
@@ -1093,9 +1492,10 @@ impl Registry {
         &self,
         class: Class,
         get: impl Fn(&str) -> Option<String> + Copy,
+        subscription_present: bool,
         now: u64,
     ) -> Vec<(&Provider, &Model)> {
-        self.candidates_pinned(class, get, now, None)
+        self.candidates_pinned(class, get, subscription_present, now, None)
     }
 
     /// Candidates restricted to one provider, when an account is pinned.
@@ -1111,13 +1511,14 @@ impl Registry {
         &self,
         class: Class,
         get: impl Fn(&str) -> Option<String> + Copy,
+        subscription_present: bool,
         now: u64,
         pinned: Option<&str>,
     ) -> Vec<(&Provider, &Model)> {
         let mut out: Vec<(&Provider, &Model)> = self
             .providers
             .iter()
-            .filter(|p| p.enabled && p.credential_ready_with(get))
+            .filter(|p| p.enabled && p.credential_ready_with(get, subscription_present))
             .filter(|p| pinned.is_none_or(|id| p.id == id))
             .filter_map(|p| p.model_for(class, now).map(|m| (p, m)))
             .collect();
@@ -1137,13 +1538,14 @@ impl Registry {
         &self,
         model_id: &str,
         get: impl Fn(&str) -> Option<String> + Copy,
+        subscription_present: bool,
         now: u64,
         pinned: Option<&str>,
     ) -> Vec<(&Provider, &Model)> {
         let mut out: Vec<(&Provider, &Model)> = self
             .providers
             .iter()
-            .filter(|p| p.enabled && p.credential_ready_with(get))
+            .filter(|p| p.enabled && p.credential_ready_with(get, subscription_present))
             .filter(|p| pinned.is_none_or(|id| p.id == id))
             .filter_map(|p| p.serves(model_id).map(|m| (p, m)))
             .collect();
@@ -1185,14 +1587,44 @@ impl Registry {
                 .filter(|p| p.enabled && p.models.iter().any(|m| !m.deprecated && m.price.is_some()))
                 .min_by_key(|p| p.preference)?,
         };
-        let model = match model_pin {
-            Some(id) => provider.models.iter().find(|m| m.id == id && !m.deprecated)?,
-            None => provider
+        // A model pin names a rate only when it names a model this provider
+        // both serves and prices. It is not the caller's choice of model here:
+        // the pin at the one call site that matters is the name the upstream
+        // echoed about itself, and a vendor may answer with a legacy name it
+        // still accepts for a model newer than it — DeepSeek serves and bills
+        // `deepseek-v4-flash` at Flash's price while the catalogue holds only
+        // `deepseek-flash`. Failing on that mismatch threw the whole hour away
+        // — no rate, so no stored cost and no `cost_model`, and the dashboard
+        // then drew no money at all.
+        //
+        // The provider pin above has already settled *who* served the tokens,
+        // so only the model is in doubt, and the fallback below settles it the
+        // same way the unpinned case does: the provider's cheapest billable
+        // model. That can be the wrong one of several, so it says so rather
+        // than passing quietly — but a name we cannot price is no better
+        // evidence than no name at all, which already takes this path.
+        if let Some(id) = model_pin {
+            if let Some(model) = provider
                 .models
                 .iter()
-                .filter(|m| !m.deprecated && m.price.is_some())
-                .min_by_key(|m| m.relative_cost)?,
-        };
+                .find(|m| m.id == id && !m.deprecated && m.price.is_some())
+            {
+                return Some(Rate {
+                    price: model.price?,
+                    peak: provider.peak.clone(),
+                    model: model.id.clone(),
+                });
+            }
+            log::warn!(
+                "provider {} answered as model {id}, which is not one of its priced models; billing the hour at the provider's default rate",
+                provider.id
+            );
+        }
+        let model = provider
+            .models
+            .iter()
+            .filter(|m| !m.deprecated && m.price.is_some())
+            .min_by_key(|m| m.relative_cost)?;
         Some(Rate {
             price: model.price?,
             peak: provider.peak.clone(),
@@ -1351,13 +1783,13 @@ mod tests {
     fn candidates_are_ordered_by_preference_then_cost() {
         let r = two_provider_registry();
 
-        let heavy = r.candidates_with(Class::Heavy, with_key, 0);
+        let heavy = r.candidates_with(Class::Heavy, with_key, true, 0);
         assert_eq!(heavy.len(), 2, "both providers serve heavy work");
         assert_eq!(heavy[0].0.id, "anthropic", "the subscription is preference 0");
         assert_eq!(heavy[1].0.id, "bedrock");
 
         // Nobody serves balanced except anthropic.
-        let balanced = r.candidates_with(Class::Balanced, with_key, 0);
+        let balanced = r.candidates_with(Class::Balanced, with_key, true, 0);
         assert_eq!(balanced.len(), 1);
         assert_eq!(balanced[0].1.id, "claude-sonnet-5");
     }
@@ -1367,9 +1799,91 @@ mod tests {
     #[test]
     fn a_provider_without_its_credential_is_not_a_candidate() {
         let r = two_provider_registry();
-        let heavy = r.candidates_with(Class::Heavy, without_key, 0);
+        let heavy = r.candidates_with(Class::Heavy, without_key, true, 0);
         assert_eq!(heavy.len(), 1, "bedrock has no key, so it is not offered");
         assert_eq!(heavy[0].0.id, "anthropic");
+    }
+
+    /// The subscription's credential is a file on this host rather than a key,
+    /// so it is a second way to have nothing to authenticate with. A bare `true`
+    /// here is what routed requests into an egress that then failed to read
+    /// `.credentials.json`, once per poll.
+    #[test]
+    fn the_subscription_is_not_a_candidate_without_its_credential_file() {
+        let r = Registry::default();
+        assert!(
+            r.candidates_with(Class::Balanced, with_key, false, 0).is_empty(),
+            "a subscription with no credential file has nothing to authenticate with"
+        );
+        assert_eq!(
+            r.candidates_with(Class::Balanced, with_key, true, 0).len(),
+            1,
+            "and is a candidate again the moment the file is there"
+        );
+    }
+
+    /// Both ways of being disabled land in the same place, which is what lets
+    /// the dashboard key the plan panel on this one question.
+    #[test]
+    fn usable_is_false_for_a_switch_off_and_for_a_missing_credential() {
+        let mut on = Registry::default().providers.remove(0);
+        assert!(
+            on.usable_with(without_key, true),
+            "enabled, and its credential file is there"
+        );
+        assert!(
+            !on.usable_with(without_key, false),
+            "the same provider with no credential file has nothing to spend the plan with"
+        );
+        assert_eq!(
+            on.credential_ready_with(with_key, false),
+            on.credential_ready_with(without_key, false),
+            "the subscription reads its file, not the env: a key in it must not stand in"
+        );
+        assert!(
+            on.credential_ready_with(with_key, true),
+            "and a key being present must not be what makes it ready either"
+        );
+        on.enabled = false;
+        assert!(!on.usable_with(without_key, true), "switched off, file and all");
+    }
+
+    /// The dashboard asks this rather than the credential directly, so that a
+    /// provider switched off by hand hides the graph exactly as a missing
+    /// credential file does.
+    #[test]
+    fn the_plan_is_reported_on_only_while_the_subscription_is_usable() {
+        let mut r = Registry::default();
+        assert!(r.subscription_usable_with(without_key, true), "on and ready");
+        assert!(
+            !r.subscription_usable_with(without_key, false),
+            "on, but with no credential file to authenticate with"
+        );
+        r.providers[0].enabled = false;
+        assert!(
+            !r.subscription_usable_with(without_key, true),
+            "switched off by hand takes the graph with it"
+        );
+    }
+
+    /// The refusal a caller is shown must name the thing to fix. "no provider
+    /// available" is true but sends the operator hunting for a routing fault
+    /// when the answer is a file that is not there.
+    #[test]
+    fn a_keyless_subscription_refusal_names_the_file_that_would_fix_it() {
+        let p = Registry::default().providers.remove(0);
+        let why = p
+            .refusal_with(without_key, false)
+            .expect("a subscription with no credential file cannot serve");
+        assert!(why.contains("anthropic"), "the provider is not named: {why}");
+        assert!(
+            why.contains(".credentials.json"),
+            "the file that would fix it is not named: {why}"
+        );
+        assert!(
+            p.refusal_with(without_key, true).is_none(),
+            "and there is nothing to refuse once it is there"
+        );
     }
 
     #[test]
@@ -1380,7 +1894,7 @@ mod tests {
                 p.enabled = false;
             }
         }
-        assert_eq!(r.candidates_with(Class::Heavy, with_key, 0).len(), 1);
+        assert_eq!(r.candidates_with(Class::Heavy, with_key, true, 0).len(), 1);
     }
 
     #[test]
@@ -1391,7 +1905,7 @@ mod tests {
         // Every class is served, or a request could arrive with nowhere to go.
         for class in Class::LADDER {
             assert_eq!(
-                r.candidates_with(class, without_key, 0).len(),
+                r.candidates_with(class, without_key, true, 0).len(),
                 1,
                 "no candidate for {class:?}"
             );
@@ -1493,6 +2007,204 @@ mod tests {
         // the schedule at all rather than a number in a comment.
         assert_eq!(ds.cost_at(flash, 1_789_005_600), off_peak * 2);
         assert_eq!(ds.cost_at(flash, 1_789_016_400), off_peak);
+    }
+
+    /// The exclusion the windows cannot state, on the day it was billing wrong.
+    ///
+    /// `DeepSeek`'s table ends "excluding Chinese public holidays" and calls a
+    /// holiday off-peak "in full", so a holiday cancels both windows for the
+    /// whole date. Without the calendar every such weekday was charged double.
+    #[test]
+    fn a_weekday_holiday_is_off_peak_all_day() {
+        let ds = Preset::Deepseek.provider(Path::new("/tmp"));
+        let flash = ds.models.iter().find(|m| m.id == "deepseek-flash").expect("flash");
+        let off_peak = flash.relative_cost;
+
+        // Friday 25 September 2026, Mid-Autumn Festival — a gazetted rest day.
+        // 02:00 sits inside the first window and 09:00 inside the second, so
+        // both would be peak on any other Friday.
+        assert!(!ds.peak_now(1_790_301_600), "Mid-Autumn 02:00 UTC is off-peak");
+        assert!(!ds.peak_now(1_790_326_800), "Mid-Autumn 09:00 UTC is off-peak");
+        assert_eq!(ds.cost_at(flash, 1_790_301_600), off_peak);
+        assert_eq!(ds.cost_at(flash, 1_790_326_800), off_peak);
+
+        // Each holiday, at 02:00 UTC — an hour that is peak on a plain weekday.
+        // The dates are the *ranges* the arrangement declares, not the loose
+        // days: New Year is Jan 1-3 and National Day Oct 1-7, and both ends
+        // matter. Getting a boundary wrong by one day is invisible here and
+        // bills a working day at off-peak, or a rest day at peak, for a whole
+        // year — which is how this list first went in.
+        for (name, ts) in [
+            ("New Year's Day", 1_767_232_800),
+            ("Spring Festival", 1_771_293_600),
+            ("Qingming", 1_775_440_800),
+            ("Labour Day", 1_777_860_000),
+            ("Dragon Boat", 1_781_834_400),
+            ("National Day", 1_790_906_400),
+        ] {
+            assert!(!ds.peak_now(ts), "{name} is off-peak in full");
+        }
+
+        // The two boundaries the ranges decide, asserted on the days either
+        // side: the second of January is inside the New Year break and is a
+        // Friday, the eighth of October is after National Day and is a Thursday.
+        assert!(!ds.peak_now(1_767_319_200), "Jan 2 is a Friday, and a rest day");
+        assert!(ds.peak_now(1_791_424_800), "Oct 8 is a Thursday, and a working day");
+
+        // The control: the Friday a week before Mid-Autumn is an ordinary
+        // weekday, and its 02:00 is peak at double. Without this the test
+        // would also pass if the calendar had cancelled peak altogether.
+        assert!(ds.peak_now(1_789_696_800), "the Friday before is peak");
+        assert_eq!(ds.cost_at(flash, 1_789_696_800), off_peak * 2);
+
+        // And the make-up working weekends need no entry in the calendar: the
+        // vendor bills weekends off-peak, so a "working" Saturday is already
+        // outside the Monday-to-Friday windows. 10 October 2026 is one of the
+        // days the arrangement makes people work to pay for National Day.
+        assert!(
+            !ds.peak_now(1_791_597_600),
+            "a make-up Saturday is off-peak by the weekday rule"
+        );
+    }
+
+    /// A gazette declares one year, and the calendar must say when it ends.
+    ///
+    /// Past the last declared holiday nothing errors and nothing is missing —
+    /// the price is merely too high, on the handful of weekdays a year that
+    /// are holidays. That is the failure mode worth a warning.
+    #[test]
+    fn a_year_the_calendar_does_not_reach_is_reported() {
+        let ds = Preset::Deepseek.provider(Path::new("/tmp"));
+        let peak = ds.peak.as_ref().expect("deepseek has a schedule");
+
+        assert_eq!(peak.uncovered_year_at(1_790_301_600), None, "2026 is covered");
+        assert_eq!(
+            peak.uncovered_year_at(1_799_287_200),
+            Some(2027),
+            "2027 is not in the gazette this was drawn from"
+        );
+
+        // A provider that published no exclusion has no gap to report: there
+        // is nothing it is failing to honour.
+        let no_calendar = Peak {
+            multiplier_percent: 100,
+            windows: Vec::new(),
+            holidays: Vec::new(),
+        };
+        assert_eq!(no_calendar.uncovered_year_at(1_799_287_200), None);
+    }
+
+    /// The calendar has to survive the round-trip the dashboard puts it through.
+    ///
+    /// A save writes the provider row back from a form that has no field for a
+    /// calendar, and a row stored before the field existed has no key at all.
+    /// Both arrive here as a `peak` with no holidays, so `adopt_published_peak`
+    /// is what stands between that and a year of doubled holidays.
+    #[test]
+    fn a_calendar_lost_to_a_save_is_put_back() {
+        let mut ds = Preset::Deepseek.provider(Path::new("/tmp"));
+        let published = ds.peak.as_ref().expect("schedule").holidays.len();
+        assert_eq!(published, 7, "the gazetted holidays of 2026");
+
+        // What a round-trip through the form leaves: the schedule, no calendar.
+        ds.peak.as_mut().expect("schedule").holidays.clear();
+        assert!(
+            ds.peak_now(1_790_301_600),
+            "without the calendar the holiday's 02:00 is billed as peak, which is the bug"
+        );
+        ds.adopt_published_peak();
+        assert_eq!(
+            ds.peak.as_ref().expect("schedule").holidays.len(),
+            published,
+            "the catalogue's calendar is put back"
+        );
+        assert!(!ds.peak_now(1_790_301_600), "and Mid-Autumn is off-peak again");
+
+        // A calendar an operator wrote by hand is theirs and is left alone.
+        ds.peak.as_mut().expect("schedule").holidays = vec![Holiday {
+            name: "Company shutdown".to_owned(),
+            dates: vec![day(2026, 12, 24)],
+        }];
+        ds.adopt_published_peak();
+        let kept = &ds.peak.as_ref().expect("schedule").holidays;
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].name, "Company shutdown");
+
+        // And a provider with no schedule at all stays without one.
+        let mut openai = Preset::Openai.provider(Path::new("/tmp"));
+        openai.adopt_published_peak();
+        assert!(openai.peak.is_none());
+    }
+
+    #[test]
+    fn a_calendar_and_a_row_without_one_both_deserialise() {
+        let ds = Preset::Deepseek.provider(Path::new("/tmp"));
+        let peak = ds.peak.as_ref().expect("schedule");
+
+        // The dates are written the way a person would check them, so a
+        // mistyped literal in the table above shows up here.
+        let json = serde_json::to_string(peak).expect("serialize");
+        assert!(json.contains("2026-09-25"), "a holiday reads as a plain date: {json}");
+        assert_eq!(&serde_json::from_str::<Peak>(&json).expect("round-trip"), peak);
+
+        // A schedule stored before the field existed has no `holidays` key, and
+        // must still load — that row is what every existing install has.
+        let older = r#"{"multiplier_percent":200,"windows":[{"weekdays":[1,2,3,4,5],"start_hour":1,"end_hour":4}]}"#;
+        let parsed: Peak = serde_json::from_str(older).expect("an older row loads");
+        assert!(parsed.holidays.is_empty(), "and reports no calendar, as it had none");
+
+        // Nothing extra is written for a provider without a calendar, so the
+        // ordinary case is byte-for-byte what it was.
+        let bare = Peak {
+            multiplier_percent: 100,
+            windows: Vec::new(),
+            holidays: Vec::new(),
+        };
+        assert_eq!(
+            serde_json::to_string(&bare).expect("serialize"),
+            r#"{"multiplier_percent":100,"windows":[]}"#
+        );
+    }
+
+    /// An echoed model name that is not in the catalogue still has to be billed.
+    ///
+    /// The model pin at the call site is the name the upstream echoed about
+    /// itself, not the caller's choice: `DeepSeek` keeps accepting the legacy
+    /// name `deepseek-v4-flash` and answers under it, while the catalogue holds
+    /// only `deepseek-flash`. Treating that as "no rate" threw the hour away —
+    /// no stored cost, no `cost_model`, and a dashboard that drew no money at
+    /// all. The rate it falls back to is the right one here, because `DeepSeek`
+    /// bills that legacy name at Flash's price.
+    #[test]
+    fn an_unrecognised_model_name_is_billed_at_the_providers_rate() {
+        let registry = Registry {
+            providers: vec![Preset::Deepseek.provider(Path::new("/tmp"))],
+            ..Registry::default()
+        };
+
+        let known = registry
+            .billing_price(Some("deepseek"), Some("deepseek-flash"))
+            .expect("a catalogued model is priced");
+        assert_eq!(known.model, "deepseek-flash");
+
+        let echoed = registry
+            .billing_price(Some("deepseek"), Some("deepseek-v4-flash"))
+            .expect("an accepted legacy name is still the provider's tokens, and still costs money");
+        assert_eq!(
+            echoed.model, "deepseek-flash",
+            "the legacy name is billed at Flash's price, which is what the vendor does"
+        );
+
+        // A provider with no prices still has no rate: the fallback settles
+        // which model, never whether there is one.
+        let mut unpaid = Registry {
+            providers: vec![Preset::Deepseek.provider(Path::new("/tmp"))],
+            ..Registry::default()
+        };
+        for model in &mut unpaid.providers[0].models {
+            model.price = None;
+        }
+        assert!(unpaid.billing_price(Some("deepseek"), Some("deepseek-flash")).is_none());
     }
 
     /// "Peak now" without an end is a warning nobody can plan around. The end
@@ -1779,13 +2491,13 @@ mod tests {
             .expect("a non-Anthropic host with an OAuth credential");
         assert!(why.contains("evil.example"), "the message names the destination: {why}");
         // Not merely reported — excluded, or it would still be chosen.
-        assert!(!p.credential_ready_with(|_| Some("k".to_owned())));
+        assert!(!p.credential_ready_with(|_| Some("k".to_owned()), true));
         let r = Registry {
             providers: vec![p.clone()],
             mappings: vec![],
         };
         assert!(
-            r.candidates_with(Class::Balanced, |_| Some("k".to_owned()), 0)
+            r.candidates_with(Class::Balanced, |_| Some("k".to_owned()), true, 0)
                 .is_empty(),
             "an unusable provider must not be a candidate, whatever else is configured"
         );
@@ -1793,7 +2505,14 @@ mod tests {
         // The same provider pointing at Anthropic is fine.
         p.base_url = "https://api.anthropic.com".to_owned();
         assert!(p.unusable_reason().is_none());
-        assert!(p.credential_ready_with(|_| None), "and needs no key");
+        assert!(
+            p.credential_ready_with(|_| None, true),
+            "and needs no key, but does need its credential file"
+        );
+        assert!(
+            !p.credential_ready_with(|_| None, false),
+            "without which it cannot spend the plan at all"
+        );
 
         // A trailing slash or a different case is the same host, not a
         // different one — a check that refused these would be a bug of its own.
@@ -1886,7 +2605,7 @@ mod tests {
         // keyless file-backed provider: not ready, not a candidate, and the
         // whole proxy with nothing to serve from.
         assert_eq!(merged.auth, Auth::ClaudeOauth, "auth must survive a form save");
-        assert!(merged.credential_ready_with(|_| None), "and it is still ready");
+        assert!(merged.credential_ready_with(|_| None, true), "and it is still ready");
         assert_eq!(merged.preference, 0);
         assert!(merged.enabled);
         // What the form DOES express still takes effect.
@@ -2056,5 +2775,128 @@ mod tests {
         std::fs::write(&path, "{ not json").expect("write");
         assert_eq!(Registry::load(&path).providers.len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The repair can only hand back what this repository actually records.
+    ///
+    /// That limit is the whole safety argument for it: a model left unpriced on
+    /// purpose must stay unpriced, or the dashboard starts stating costs nobody
+    /// published. Each of the four answers here is a claim about the catalogue,
+    /// so a preset that gains or drops a rate will fail this test rather than
+    /// silently widen what the repair is willing to invent.
+    #[test]
+    fn only_the_rate_the_catalogue_publishes_is_handed_back() {
+        assert!(
+            published_price("deepseek-flash").is_some(),
+            "the one priced model in the tree must answer, or the repair does nothing"
+        );
+        for unpriced in [
+            // No triple to hand back, for two different reasons. The preset
+            // records this one's published rates in a comment and deliberately
+            // leaves `price` unset, because `billing_price` skips deprecated
+            // models and a price there could never be selected for billing.
+            "deepseek-v4-pro",
+            // And this one is listed with no rate anywhere at all.
+            "gpt-5.6-sol",
+            // The subscription hop has no per-token cost at all.
+            "claude-opus-5",
+            // And nothing that was never heard of.
+            "no-such-model",
+        ] {
+            assert!(
+                published_price(unpriced).is_none(),
+                "{unpriced} has no rate recorded in the catalogue; \
+                 a repair must not manufacture one"
+            );
+        }
+    }
+
+    /// A file whose rows lost their rates gets them back as it is read.
+    ///
+    /// This is the case that makes the money unit work again for a provider
+    /// already in use: it was saved through the form, so its `price` is gone
+    /// from disk, and no later save can bring it back on its own.
+    #[test]
+    fn loading_a_row_that_lost_its_rate_takes_the_catalogue_back() {
+        let dir = std::env::temp_dir().join(format!("ta-proxy-rate-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("providers.json");
+
+        let mut r = Registry::default();
+        let mut deepseek = Preset::Deepseek.provider(&dir);
+        let published = deepseek
+            .models
+            .iter()
+            .find(|m| m.id == "deepseek-flash")
+            .and_then(|m| m.price)
+            .expect("the preset ships a rate");
+        for model in &mut deepseek.models {
+            model.price = None;
+        }
+        r.providers.push(deepseek);
+        r.save(&path).expect("save");
+
+        let back = Registry::load(&path);
+        let restored = back
+            .providers
+            .iter()
+            .find(|p| p.id == "deepseek")
+            .and_then(|p| p.models.iter().find(|m| m.id == "deepseek-flash"))
+            .and_then(|m| m.price);
+        assert_eq!(
+            restored,
+            Some(published),
+            "a row saved without a rate must come back with the published one"
+        );
+
+        // And the row that was never priced stays that way, so the repair
+        // cannot be mistaken for a general "price everything" pass.
+        let anthropic = back
+            .providers
+            .iter()
+            .find(|p| p.id == "anthropic")
+            .expect("the default row is still there");
+        assert!(
+            anthropic.has_no_recorded_rate(),
+            "the subscription hop records no rate, and none is invented for it"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A rate set by hand is not the repair's to change.
+    ///
+    /// Only an absent one is filled, so an operator who priced a model the
+    /// catalogue does not know keeps their figure — and gets to keep it through
+    /// every later save, since the repair and the save-preserve agree on it.
+    #[test]
+    fn a_recorded_rate_is_left_alone_by_the_repair() {
+        let mine = Price {
+            cache_hit: 1,
+            input: 3,
+            output: 4,
+        };
+        let mut p = Provider {
+            id: "by-hand".to_owned(),
+            wire: Wire::Anthropic,
+            base_url: "https://api.deepseek.com/anthropic".to_owned(),
+            auth: Auth::ApiKeyEnv { var: "K".to_owned() },
+            models: vec![Model::new("deepseek-flash", Class::Balanced, 15).priced(1, 3, 4)],
+            preference: 10,
+            enabled: true,
+            peak: None,
+        };
+        p.adopt_published_rates();
+        assert_eq!(
+            p.models[0].price,
+            Some(mine),
+            "the catalogue overwrote a rate that was already recorded"
+        );
+
+        // The same row with the rate missing does take the published one, which
+        // is what separates this from a no-op.
+        p.models[0].price = None;
+        p.adopt_published_rates();
+        assert_eq!(p.models[0].price, published_price("deepseek-flash"));
+        assert!(p.models[0].price.is_some(), "and there was one to take");
     }
 }

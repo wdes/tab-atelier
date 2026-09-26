@@ -34,6 +34,17 @@ use tab_atelier_proxy::tools;
 /// this guards against only appears once the window starts moving.
 const TURNS: usize = 24;
 
+/// Bytes per `tool_result` payload.
+///
+/// Sized so the *stale* region — `TURNS - compact::KEEP_TURNS` = 18 turns —
+/// clears layer A's `ELIDE_ABOVE_BYTES` floor: 18 × 20 KB = 360 KB against
+/// 256 KiB. It has to, because `the_compaction_levels_remove_something` asserts
+/// each level removes something, and below the floor the `Tools` level correctly
+/// removes nothing at all. At the 2 KB this used to carry the stale region was
+/// 36 KB, the pass declined the body whole, and that test failed — which is the
+/// floor doing its job, not a regression in the levels.
+const RESULT_BYTES: usize = 20_000;
+
 fn route() -> routing::Route {
     routing::Route {
         provider_id: "deepseek".to_owned(),
@@ -89,7 +100,7 @@ fn push_turn(body: &mut Value, turn: usize) {
         "content": [{
             "type": "tool_result",
             "tool_use_id": format!("call_{turn:02}"),
-            "content": "r".repeat(2_000),
+            "content": "r".repeat(RESULT_BYTES),
         }],
     }));
     list.push(json!({

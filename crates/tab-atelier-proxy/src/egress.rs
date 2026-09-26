@@ -76,6 +76,18 @@ fn credentials_path() -> Result<PathBuf, String> {
     claude_api::default_credentials_path()
 }
 
+/// Whether the subscription's credential file is actually there.
+///
+/// A `metadata` check rather than a read, because it is asked on every routing
+/// decision and the token itself is read per request. A missing file is the
+/// ordinary state of a proxy that does not use the subscription at all, so an
+/// absent one is simply `false` here; only the request that actually needed the
+/// token should hear about the read error.
+#[must_use]
+pub fn credential_present() -> bool {
+    credentials_file().is_ok_and(|p| std::fs::metadata(p).is_ok_and(|m| m.len() > 0))
+}
+
 /// Test/ops override for the egress upstream. Set via [`set_upstream`], else the
 /// `TAB_ATELIER_PROXY_UPSTREAM` env var, else [`ANTHROPIC_BASE`].
 static UPSTREAM_OVERRIDE: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
