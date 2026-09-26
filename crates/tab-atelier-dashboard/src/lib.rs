@@ -21,15 +21,10 @@
 //!
 //! - `/`, `/dashboard` — the dashboard page (embedded asset).
 //! - `/assets/*` — the embedded UI assets (HTML/CSS/JS).
-//! - `/dashboard/state`, `/dashboard/activity`, `/dashboard/share-token` —
-//!   harness routes owned by this crate. They are STUBS today: the real
-//!   payloads are derived read-models built from daemon internals that are
-//!   not on the HTTP API yet, so they answer `501` with a JSON body naming the
-//!   route rather than pretending. TODO: back them with daemon endpoints.
-//! - `/reports` — NOT ours: the daemon serves it (it lists the outbox markdown
-//!   bundles), so it is proxied like any other daemon route.
 //! - anything else — reverse-proxied to the upstream daemon, method, headers,
-//!   query, body and response stream included.
+//!   query, body and response stream included. That covers the harness routes
+//!   the UI reads (`/decisions`, `/reports`, `/intent`, `/tabs/usage`, …):
+//!   they are served by the daemon, not by this crate.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -88,8 +83,6 @@ fn json_response(status: StatusCode, value: &serde_json::Value) -> Response<BoxB
 enum Route {
     /// Serve an embedded asset: `(body, content-type)`.
     Asset(&'static str, &'static str),
-    /// A harness route this crate owns but does not implement yet.
-    Stub,
     /// Everything else: hand it to the upstream daemon.
     Proxy,
 }
@@ -102,7 +95,6 @@ fn route(req: &Request<()>) -> Route {
     }
     match req.uri().path() {
         "/" | "/dashboard" | "/assets/dashboard.html" => Route::Asset(DASHBOARD_HTML, "text/html; charset=utf-8"),
-        "/dashboard/state" | "/dashboard/activity" | "/dashboard/share-token" => Route::Stub,
         "/assets/dashboard.css" => Route::Asset(DASHBOARD_CSS, "text/css; charset=utf-8"),
         "/assets/dashboard.js" => Route::Asset(DASHBOARD_JS, "text/javascript; charset=utf-8"),
         _ => Route::Proxy,
@@ -260,7 +252,6 @@ async fn serve_with(listener: tokio::net::TcpListener, upstream: String, timeout
 
 async fn handle(req: Request<Incoming>, upstream: &Upstream) -> Response<BoxBody> {
     let (parts, body) = req.into_parts();
-    let path = parts.uri.path().to_string();
     match route(&Request::from_parts(parts.clone(), ())) {
         Route::Asset(asset, content_type) => Response::builder()
             .status(StatusCode::OK)
@@ -271,14 +262,6 @@ async fn handle(req: Request<Incoming>, upstream: &Upstream) -> Response<BoxBody
             .header(header::CACHE_CONTROL, "no-cache")
             .body(full(asset))
             .expect("static response builder"),
-        Route::Stub => json_response(
-            StatusCode::NOT_IMPLEMENTED,
-            &serde_json::json!({
-                "error": "not_implemented",
-                "route": path,
-                "detail": "harness route owned by tab-atelier-dashboard; not backed by the daemon API yet",
-            }),
-        ),
         Route::Proxy => proxy(Request::from_parts(parts, body), upstream).await,
     }
 }
@@ -614,7 +597,6 @@ mod tests {
         assert!(matches!(r(Method::GET, "/"), Route::Asset(..)));
         assert!(matches!(r(Method::GET, "/dashboard"), Route::Asset(..)));
         assert!(matches!(r(Method::GET, "/assets/dashboard.css"), Route::Asset(..)));
-        assert_eq!(r(Method::GET, "/dashboard/state"), Route::Stub);
         // /reports is the daemon's (it lists the outbox markdown bundles).
         assert_eq!(r(Method::GET, "/reports"), Route::Proxy);
         // The daemon's own API is never ours, whatever the method.
@@ -625,7 +607,7 @@ mod tests {
     }
 
     #[test]
-    fn serves_embedded_assets_and_stubs_locally() {
+    fn serves_the_embedded_assets_locally() {
         let upstream = spawn_upstream();
         let port = spawn_dashboard(upstream);
 
@@ -642,18 +624,6 @@ mod tests {
         let (status, ctype, body) = get(port, "/assets/dashboard.js");
         assert_eq!((status, ctype.as_str()), (200, "text/javascript; charset=utf-8"));
         assert!(body.contains("export"), "the module must be the real script");
-
-        let (status, ctype, body) = get(port, "/dashboard/state");
-        assert_eq!(status, 501);
-        assert_eq!(ctype, "application/json");
-        assert!(
-            body.contains("/dashboard/state"),
-            "the stub must name its route: {body}"
-        );
-        // Well-formed JSON, not string-spliced.
-        let parsed: serde_json::Value = serde_json::from_str(&body).expect("the stub body must parse");
-        assert_eq!(parsed["error"], "not_implemented");
-        assert_eq!(parsed["route"], "/dashboard/state");
     }
 
     #[test]
