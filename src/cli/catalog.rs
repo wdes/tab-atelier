@@ -641,10 +641,14 @@ impl CatalogRecord {
 
     /// The WRITE gate: is this archived record complete enough to close behind?
     ///
-    /// - **v2** (CF1): a NON-EMPTY `skill` AND a NON-EMPTY `prompt`. `session_id` is
-    ///   NOT required — the v2 baseline is A/B-isolated and optional. This is the bar
-    ///   [`perform_retire`] refuses to close under, so a half-built profile can never
-    ///   die at close.
+    /// - **v2** (CF1): a NON-EMPTY `skill`. The prompt is deliberately NOT required:
+    ///   the eval can legitimately fail to produce one (every directive vetoed on a
+    ///   skill's first retire, no `--prompt`), and there is then nothing to distill
+    ///   rather than something missing. Refusing the close would hold a tab forever
+    ///   over a profile that cannot exist. Such a record is archived — it keeps its
+    ///   telemetry — but the read-model quarantines it (see [`read_skill_profiles_at`]),
+    ///   so it never becomes a profile and can never blank one.
+    ///   `session_id` is NOT required — the v2 baseline is A/B-isolated and optional.
     /// - **v1**: WHEN the tab carried a live session (`had_session`), the archive must
     ///   carry the `session_id` — a lost existing session is an incomplete archive.
     #[must_use]
@@ -653,7 +657,7 @@ impl CatalogRecord {
             return false;
         }
         if self.is_v2() {
-            return self.has_skill() && self.has_prompt();
+            return self.has_skill();
         }
         !had_session || self.session_id.is_some()
     }
@@ -1025,7 +1029,16 @@ pub fn read_skill_profiles_at(path: &Path) -> Vec<SkillProfile> {
     let mut by_skill: BTreeMap<String, Vec<CatalogRecord>> = BTreeMap::new();
     for c in read_catalog_records_at(path)
         .into_iter()
-        .filter(|c| c.is_v2() && c.has_skill())
+        // A v2 record with no prompt is not a profile: the eval had nothing to
+        // distill. It is archived (its telemetry is worth keeping) but QUARANTINED
+        // from the read-model here — and this filter matters, because `fold` copies
+        // the prompt of the last content record: admitting a promptless one would
+        // blank an existing profile's prompt.
+        //
+        // Visibility records are exempt: a tombstone is not a profile and carries no
+        // prompt by nature, so requiring one would drop the tombstone and resurrect
+        // the skill it hides.
+        .filter(|c| c.is_v2() && c.has_skill() && (c.kind.is_visibility() || c.has_prompt()))
     {
         by_skill.entry(c.fold_key()).or_default().push(c);
     }
@@ -1065,7 +1078,16 @@ pub fn read_skill_profiles_all_at(path: &Path) -> Vec<SkillProfile> {
     let mut by_skill: BTreeMap<String, Vec<CatalogRecord>> = BTreeMap::new();
     for c in read_catalog_records_at(path)
         .into_iter()
-        .filter(|c| c.is_v2() && c.has_skill())
+        // A v2 record with no prompt is not a profile: the eval had nothing to
+        // distill. It is archived (its telemetry is worth keeping) but QUARANTINED
+        // from the read-model here — and this filter matters, because `fold` copies
+        // the prompt of the last content record: admitting a promptless one would
+        // blank an existing profile's prompt.
+        //
+        // Visibility records are exempt: a tombstone is not a profile and carries no
+        // prompt by nature, so requiring one would drop the tombstone and resurrect
+        // the skill it hides.
+        .filter(|c| c.is_v2() && c.has_skill() && (c.kind.is_visibility() || c.has_prompt()))
     {
         by_skill.entry(c.fold_key()).or_default().push(c);
     }
@@ -1484,10 +1506,16 @@ mod tests {
     use super::*;
 
     /// A v2 record for `skill`, hand-built so a test is readable.
+    ///
+    /// It carries a prompt: a v2 record with a skill but no prompt is not a profile
+    /// (the eval had nothing to distill), and the read-model quarantines it — so a
+    /// fixture meaning "a profile" must have one. Tests about the quarantine build
+    /// their record by hand.
     fn rec(skill: &str, mode: SpawnMode, outcome: Outcome, tokens: u64) -> CatalogRecord {
         CatalogRecord {
             skill: Some(skill.to_string()),
             schema_version: Some(2),
+            prompt: Some(format!("the {skill} prompt")),
             spawn_mode: Some(mode),
             outcome: Some(outcome),
             tokens: Some(tokens),
@@ -1940,9 +1968,10 @@ mod tests {
             "no de-register, NO close — the tab is KEPT"
         );
 
-        // (ii) the archive landed but WITHOUT the prompt the v2 gate requires.
+        // (ii) the archive landed but WITHOUT the skill — it is not a v2 profile at
+        // all, so the v1 bar applies and the record is incomplete.
         let mut truncated = record.clone();
-        truncated.prompt = None;
+        truncated.skill = None;
         let (out, log) = retire_with(&record, true, move || Some(truncated));
         assert!(
             matches!(out, RetireOutcome::Incomplete(_)),
@@ -1953,6 +1982,38 @@ mod tests {
             "shutdown is NEVER called on an incomplete read-back"
         );
         assert_eq!(log, vec!["write", "read-back"], "the tab is KEPT");
+    }
+
+    /// A v2 record that landed WITHOUT a prompt is CLOSABLE, not incomplete.
+    ///
+    /// The eval can legitimately produce no prompt — every directive vetoed on a
+    /// skill's first retire, with no `--prompt` given — and there is then nothing to
+    /// distill rather than something missing. Refusing the close would hold a tab
+    /// forever over a profile that cannot exist. The record is archived (its telemetry
+    /// is kept) and the read-model quarantines it instead.
+    #[test]
+    fn a_promptless_v2_retire_closes_and_is_quarantined_not_kept() {
+        let record = v2_request("olympe", "You are Olympe.").into_record("t1", RETIRED_AT, None);
+        let mut promptless = record.clone();
+        promptless.prompt = None;
+
+        let (out, log) = retire_with(&record, true, move || Some(promptless));
+        assert_eq!(
+            out,
+            RetireOutcome::Retired,
+            "a promptless archive is complete enough to close behind"
+        );
+        assert_eq!(log, vec!["write", "read-back", "deregister", "shutdown"]);
+
+        // …and it does NOT become a profile: quarantined by the read-model, so it
+        // cannot surface as one, nor blank the prompt of an existing profile.
+        let mut promptless = record.clone();
+        promptless.prompt = None;
+        let path = temp_catalog(&format!("{}\n", line(&promptless)));
+        assert!(
+            read_skill_profiles_at(&path).is_empty(),
+            "a v2 record without a prompt must not fold into a profile"
+        );
     }
 
     // (d) the ORDER of effects: shutdown (the only real-tab-touching seam) runs LAST.
