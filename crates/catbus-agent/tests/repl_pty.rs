@@ -53,6 +53,27 @@ impl Pty {
         let master = pair.master;
         let slave = pair.slave;
 
+        // The pty must not echo, and it is worth saying why, because the default is the reason a
+        // test in this file used to fail about one run in three.
+        //
+        // The app is a full-screen TUI: it draws its own input, so the terminal's echo adds nothing
+        // the assertions want — and one thing they cannot ignore. When the app restores cooked mode
+        // on its way out, the terminal echoes whatever input is still queued, and `ECHOCTL` renders
+        // control bytes as caret text. A reply to the app's cursor query (`ESC [ 6 n`) is therefore
+        // echoed *after* the app's final newline, as the literal characters `^[[1;1R` — which no
+        // escape stripper can remove, because by then it is not an escape at all. Whether the reply
+        // was still queued at that moment is a race, hence the intermittency.
+        //
+        // Set here, before the child starts, on purpose: the app saves the terminal's settings when
+        // it enters raw mode and restores *those* on the way out, so a flag cleared after it starts
+        // would only be cleared until the app put it back.
+        let mut flags = nix::sys::termios::tcgetattr(&slave).expect("read pty termios");
+        flags.local_flags.remove(nix::sys::termios::LocalFlags::ECHO);
+        flags.local_flags.remove(nix::sys::termios::LocalFlags::ECHONL);
+        flags.local_flags.remove(nix::sys::termios::LocalFlags::ECHOCTL);
+        nix::sys::termios::tcsetattr(&slave, nix::sys::termios::SetArg::TCSANOW, &flags)
+            .expect("stop the pty echoing input");
+
         let writer = File::from(master.try_clone().expect("dup master"));
         let responder = File::from(master.try_clone().expect("dup master for DSR"));
         let mut reader = File::from(master);
@@ -687,22 +708,38 @@ fn strip_ansi(text: &str) -> String {
     out
 }
 
-/// A terminal's reply to a cursor query is not output, and must not be read as any.
+/// The harness's pty does not echo what is typed into it.
 ///
-/// The harness answers the app's `ESC [ 6 n` with `ESC [ 1 ; 1 R`, and that reply is echoed back
-/// to the master once the app restores cooked mode on its way out — so it can land *after* the
-/// final newline. That is the exact byte tail that failed in CI on 2026-09-26, where the app had
-/// written its newline correctly and the assertion was reading the echo instead. Pinned here, on
-/// the strings themselves, so the rule the exit test depends on is checked somewhere that cannot
-/// flake on timing.
+/// The exit test depends on this, and the failure it caused was intermittent, so the property is
+/// pinned rather than assumed. A full-screen TUI draws its own input, so the terminal's echo adds
+/// nothing the assertions want — and on the way out it adds something they cannot ignore: the
+/// terminal echoes whatever input is still queued when the app restores cooked mode, and control
+/// bytes come back as caret text, so a reply to the app's cursor query lands *after* the app's
+/// final newline as the literal `^[[1;1R`. No escape stripper can remove that, because by then it
+/// is not an escape — it is six ordinary characters that read as part of the last line.
+///
+/// A pty with no process on the far end is enough to test it: whatever is written to the master
+/// comes back only if the terminal echoes.
 #[test]
-fn a_cursor_report_is_not_taken_for_output() {
+fn the_harness_pty_does_not_echo_typed_input() {
+    let mut pty = Pty::open();
+    pty.send("hello");
+    let mut seen = String::new();
+    pty.drain_for(&mut seen, Duration::from_millis(400));
     assert!(
-        strip_ansi("done\r\r\n\u{1b}[1;1R").ends_with('\n'),
-        "the reply is stripped and the newline it followed is not"
+        !seen.contains("hello"),
+        "the pty echoed typed input, which would pollute what the app wrote:\n{seen:?}"
     );
-    // A carriage return alone is not a line ending, and stripping must not invent one: this is an
-    // app that left the terminal mid-line, which is the failure the exit test exists to catch.
+}
+
+/// Stripping escapes must not invent a line ending.
+///
+/// The exit test asks whether the app's output ends in a newline, so the stripper has to be
+/// neutral about it. A carriage return is not a line ending — an app that left the terminal
+/// mid-line ended in `\r` and no `\n`, which is exactly the failure that test exists to catch —
+/// and empty output has no newline either.
+#[test]
+fn stripping_does_not_invent_a_line_ending() {
     assert!(!strip_ansi("working\u{1b}[?2004l\r").ends_with('\n'));
     assert!(!strip_ansi("").ends_with('\n'));
 }
@@ -1775,18 +1812,14 @@ fn leaving_the_repl_ends_the_output_with_a_newline() {
     // Now collect what it wrote on the way out — the closing bytes are flushed as it hands the
     // terminal back, so some of them land after the process has been reaped.
     pty.drain_for(&mut seen, Duration::from_millis(1500));
-    // A carriage return may precede it — `\r\n` is what the app writes, because which of the two
-    // returns the carriage depends on the terminal having been put back into cooked mode — so the
-    // assertion is on the line ending rather than on the exact pair. Asserted on the tail, which is
-    // the whole point: a newline anywhere earlier would be the prompt's own.
+    // Asserted on the tail, which is the whole point: a newline anywhere earlier would be the
+    // prompt's own.
     //
-    // Read from the stripped output, because a terminal's *reply* to a query is not output the app
-    // wrote. The harness answers the app's `ESC [ 6 n` cursor query with `ESC [ 1 ; 1 R` (see the
-    // responder above), and that reply is echoed back to the master once the app has restored
-    // cooked mode on its way out — so it can land after the final newline, which is what made this
-    // test fail in CI on a race while passing locally. Stripping escapes and carriage returns
-    // leaves what the terminal would have shown, whose last character is the newline under test;
-    // an app that wrote no newline at all still fails, since nothing else puts one at the end.
+    // Stripped first, and carriage returns with the escapes: the app writes SGR and cursor
+    // sequences on its way out, and `\r\n` for the line ending, so stripping is what leaves the
+    // text a terminal would have shown. What is left is the app's own output and nothing else —
+    // the harness's pty does not echo, and `Pty::open` records what it cost to have it echo. An app
+    // that wrote no newline at all still fails, because nothing else puts one at the end.
     let shown = strip_ansi(&seen);
     assert!(
         shown.ends_with('\n'),

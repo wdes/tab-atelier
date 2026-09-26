@@ -487,24 +487,39 @@ impl Ui {
     }
 
     /// Give the terminal back. Called on every exit path, including the error one.
+    ///
+    /// Every step runs even when an earlier one fails, and the first failure is what comes back.
+    /// Returning at the first `?` — which this used to do — means a failure in `show_cursor`
+    /// skips `disable_raw_mode`, leaving the shell in raw mode with no echo. That is precisely
+    /// what this function exists to prevent, which is why no step may depend on the last one
+    /// having worked.
     pub fn leave(&mut self) -> std::io::Result<()> {
+        let mut out = std::io::stdout();
+        // The line break first, and unconditionally. It is the one effect here the operator can
+        // see: without it the shell's prompt is drawn at whatever column the viewport left the
+        // cursor on, so it reads as a continuation of the app's last line and the command typed
+        // into it reads as part of that line. Written before raw mode goes back on, so it is
+        // exactly `\r\n` — under cooked mode the terminal's own newline translation adds a second
+        // carriage return, which is where the `\r\r\n` observed in CI came from.
+        let mut failure = out.write_all(b"\r\n").and_then(|()| out.flush()).err();
         // The cursor is left just under the last row so the shell's next prompt does
         // not overwrite app output.
-        self.terminal.show_cursor()?;
-        let mut out = std::io::stdout();
+        if let Err(e) = self.terminal.show_cursor() {
+            failure.get_or_insert(e);
+        }
         if self.enhanced {
-            execute!(out, PopKeyboardEnhancementFlags)?;
+            if let Err(e) = execute!(out, PopKeyboardEnhancementFlags) {
+                failure.get_or_insert(e);
+            }
             self.enhanced = false;
         }
-        execute!(out, DisableBracketedPaste)?;
-        disable_raw_mode()?;
-        // A line break before handing the terminal back. Without it the shell's prompt is drawn at
-        // whatever column the viewport left the cursor on, so it appears to continue the last line
-        // of app output — and the command typed into it reads as part of that line. `\r\n` rather
-        // than `\n` because which of the two returns the carriage depends on the terminal having
-        // been put back into cooked mode, and this has to be right either way.
-        out.write_all(b"\r\n")?;
-        out.flush()
+        if let Err(e) = execute!(out, DisableBracketedPaste) {
+            failure.get_or_insert(e);
+        }
+        if let Err(e) = disable_raw_mode() {
+            failure.get_or_insert(e);
+        }
+        failure.map_or(Ok(()), Err)
     }
 
     /// Print finished output above the viewport, so it lands in scrollback.
