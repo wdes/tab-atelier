@@ -21,11 +21,13 @@
 //!
 //! - `/`, `/dashboard` — the dashboard page (embedded asset).
 //! - `/assets/*` — the embedded UI assets (HTML/CSS/JS).
-//! - `/dashboard/state`, `/dashboard/activity`, `/dashboard/share-token`,
-//!   `/reports` — harness routes owned by this crate. They are STUBS today: the
-//!   real payloads are derived read-models built from daemon internals that are
+//! - `/dashboard/state`, `/dashboard/activity`, `/dashboard/share-token` —
+//!   harness routes owned by this crate. They are STUBS today: the real
+//!   payloads are derived read-models built from daemon internals that are
 //!   not on the HTTP API yet, so they answer `501` with a JSON body naming the
 //!   route rather than pretending. TODO: back them with daemon endpoints.
+//! - `/reports` — NOT ours: the daemon serves it (it lists the outbox markdown
+//!   bundles), so it is proxied like any other daemon route.
 //! - anything else — reverse-proxied to the upstream daemon, method, headers,
 //!   query, body and response stream included.
 
@@ -100,7 +102,7 @@ fn route(req: &Request<()>) -> Route {
     }
     match req.uri().path() {
         "/" | "/dashboard" | "/assets/dashboard.html" => Route::Asset(DASHBOARD_HTML, "text/html; charset=utf-8"),
-        "/dashboard/state" | "/dashboard/activity" | "/dashboard/share-token" | "/reports" => Route::Stub,
+        "/dashboard/state" | "/dashboard/activity" | "/dashboard/share-token" => Route::Stub,
         "/assets/dashboard.css" => Route::Asset(DASHBOARD_CSS, "text/css; charset=utf-8"),
         "/assets/dashboard.js" => Route::Asset(DASHBOARD_JS, "text/javascript; charset=utf-8"),
         _ => Route::Proxy,
@@ -613,7 +615,8 @@ mod tests {
         assert!(matches!(r(Method::GET, "/dashboard"), Route::Asset(..)));
         assert!(matches!(r(Method::GET, "/assets/dashboard.css"), Route::Asset(..)));
         assert_eq!(r(Method::GET, "/dashboard/state"), Route::Stub);
-        assert_eq!(r(Method::GET, "/reports"), Route::Stub);
+        // /reports is the daemon's (it lists the outbox markdown bundles).
+        assert_eq!(r(Method::GET, "/reports"), Route::Proxy);
         // The daemon's own API is never ours, whatever the method.
         assert_eq!(r(Method::GET, "/api/tabs"), Route::Proxy);
         assert_eq!(r(Method::POST, "/api/tabs"), Route::Proxy);
