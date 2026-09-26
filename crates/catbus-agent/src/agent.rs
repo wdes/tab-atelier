@@ -47,7 +47,7 @@ const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
 /// a message comes to promise a limit the request does not use, which is exactly
 /// what happened to the round-cap warning that claimed "32" while the default
 /// was 200.
-const MAX_OUTPUT_TOKENS: u32 = 8192;
+const MAX_OUTPUT_TOKENS: u32 = 16_384;
 
 /// What the model is told when its previous reply stopped at the output limit.
 ///

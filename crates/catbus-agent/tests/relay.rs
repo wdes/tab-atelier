@@ -1696,7 +1696,8 @@ fn a_reply_that_never_finishes_reports_the_limit() {
     assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
     let text = reply["text"].as_str().unwrap();
     assert!(text.contains("still cut off"), "the limit must be reported:\n{text}");
-    assert!(text.contains("8192"), "and named:\n{text}");
+    // The ceiling we ask for, tracked here because this test cannot see the constant.
+    assert!(text.contains("16384"), "and named:\n{text}");
     assert!(text.contains("continuations"), "and the attempt counted:\n{text}");
     assert!(
         !text.contains("ask for the rest"),
