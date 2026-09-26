@@ -118,6 +118,44 @@ catbus-agent --tools-config ./tools.json
 A working set is committed at `examples/tools.json` — `git status`, `git log`,
 `cargo test` and `cargo check`, with `Bash` removed.
 
+The same body in TOML is read too — `.toml` by name, `.json` by name, and a path with no
+extension tried as JSON and then TOML — so a tool set can be written with comments:
+
+```toml
+disable = ["Bash"]
+
+[[add]]
+name = "GitBlameLine"
+description = "Who last touched a line."
+argv = ["git", "blame", "-L", "{line},{line}", "--", "{path}"]
+timeout_secs = 10
+judged = false
+schema = { type = "object", properties = { path = { type = "string" }, line = { type = "integer" } }, required = ["path", "line"] }
+```
+
+A working directory also gets a say: `<cwd>/.catbus/tools.toml` is **discovered** rather than
+named, beside the identity file, and layered over whatever `--tools-config` set. It can add
+tools and withhold built-ins, but not widen — `allow` is refused there, and `minimal` is not
+read at all, since a directory's file must not defeat a deliberate lockdown. `AllowedTools`
+still narrows last, so a tool the directory adds must also be named there when the identity
+has a list. See `docs/config-guide.md`.
+
+### `PHPUnit` cannot spawn a process
+
+`PHPUnit` runs project code, and project code can otherwise run anything. Every run goes
+through `php -d disable_functions=shell_exec,exec,system,passthru,proc_open,popen,pcntl_exec`,
+so a test that tries to shell out fails as a test error rather than succeeding as a command —
+including a *throwaway* test written to shell out, which is how a tool set with no shell gets
+worked around otherwise. The entry point is named as an argument rather than executed by its
+own shebang, because a shebang would start an interpreter the options never reached.
+
+A project whose own suite legitimately spawns — one whose validator shells out to `node`, say —
+sets its own list, or `[]` to remove the block:
+
+```toml
+phpunit_disable_functions = ["shell_exec", "exec"]
+```
+
 `tests/relay.rs::configured_tools_execute_for_real` runs this for real: it starts
 the actual binary with a config file, has the (mocked) model call the tools, and
 asserts the results are the real output of real `git` and `cargo` subprocesses.

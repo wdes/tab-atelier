@@ -132,14 +132,24 @@ fn path_from(xdg_config: Option<String>, home: Option<String>) -> PathBuf {
     base.join("tab-atelier").join("catbus-agent").join("identity.md")
 }
 
+/// The directory a working directory keeps its own agent state in.
+///
+/// `<cwd>/.catbus`. Meant to be ignored by version control rather than committed:
+/// what lives here is a statement about the machine and the operator — tool and
+/// host limits — rather than about the work. Named once so the two files that
+/// share it (the identity and the tool set) cannot disagree about where it is.
+#[must_use]
+pub fn project_dir(cwd: &Path) -> PathBuf {
+    cwd.join(".catbus")
+}
+
 /// Path of the identity file a working directory keeps for itself.
 ///
-/// `<cwd>/.catbus/identity.md`. The directory is meant to be ignored by version
-/// control rather than committed: the file can carry tool and host limits, and a
-/// limit is a statement about the machine it runs on rather than about the work.
+/// `<cwd>/.catbus/identity.md`. See [`project_dir`] for why the directory is not
+/// committed.
 #[must_use]
 pub fn project_path(cwd: &Path) -> PathBuf {
-    cwd.join(".catbus").join("identity.md")
+    project_dir(cwd).join("identity.md")
 }
 
 /// Resolve the identity from an inline string and/or an explicit file path.

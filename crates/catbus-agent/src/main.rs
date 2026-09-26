@@ -288,7 +288,11 @@ async fn main() {
 /// at `<cwd>/.catbus/identity.md` and the session's directory is `--cwd` when the
 /// launcher named one.
 fn resolve_tools(args: &Args, cwd: &Path) -> Result<(tools::ToolSet, identity::Identity), Box<dyn std::error::Error>> {
-    let tool_set = tools::ToolSet::load(args.tools_config.as_deref())?;
+    // Both of the sources that are *named or absent* — the launcher's flag, and the working
+    // directory's own `.catbus/tools.toml` — are resolved here; the third source, the identity
+    // file's `AllowedTools`, narrows the result below. A project tool therefore also has to be
+    // named in `AllowedTools` when the identity has one, because narrowing is the last word.
+    let tool_set = tools::ToolSet::load_layered(args.tools_config.as_deref(), cwd)?;
     let identity = identity::load(args.identity.as_deref(), args.identity_file.as_deref(), cwd)?;
     let Some(allowed) = identity.allowed_tools() else {
         log::info!("offering {} tools", tool_set.specs().len());

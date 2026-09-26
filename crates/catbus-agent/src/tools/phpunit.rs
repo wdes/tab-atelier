@@ -39,8 +39,13 @@ const MAX_DIFF: usize = 2_000;
 /// Bound on the console output kept for context.
 const MAX_OUTPUT: usize = 2_000;
 
-pub async fn run(input: &serde_json::Value, cwd: &Path) -> Result<String, String> {
-    let phpunit = find_phpunit(cwd)?;
+/// Run the project's suite.
+///
+/// `configured` is the session's own list of PHP functions to disarm, or `None` for
+/// [`DISABLED_FUNCTIONS`]. It is passed in rather than read here because the tool set owns the
+/// config, and a tool that looked its own limit up could as easily not.
+pub async fn run(input: &serde_json::Value, cwd: &Path, configured: Option<&[String]>) -> Result<String, String> {
+    let phpunit = find_phpunit(cwd, &disabled_list(configured))?;
     let timeout = input
         .get("timeout_secs")
         .and_then(serde_json::Value::as_u64)
@@ -151,49 +156,118 @@ pub async fn run(input: &serde_json::Value, cwd: &Path) -> Result<String, String
 }
 
 /// Where `PHPUnit` is, and how to invoke it.
+#[derive(Debug)]
 struct PhpUnit {
     program: PathBuf,
-    /// Arguments that must precede the tool's own — `["the/script.php"]` when the binary
-    /// is a PHP file rather than an executable.
+    /// Arguments that must precede the tool's own: the `-d` options that disarm the
+    /// interpreter, then the `PHPUnit` entry point. Always at least these two — `program` is
+    /// always `php`, so that the options cannot be skipped by an executable bit.
     prefix: Vec<String>,
+}
+
+/// PHP functions a `PHPUnit` run may not call.
+///
+/// Every arm of [`find_phpunit`] runs `php -d disable_functions=…`, so a test that reaches for
+/// one of these gets `Call to undefined function …` — a test *error*, in the `JUnit` log and so in
+/// the result the model reads — rather than a process.
+///
+/// This exists because the tool runs project code, and project code can otherwise run anything:
+/// a throwaway test with a `shell_exec()` in it is a shell, which is what the tool set exists to
+/// avoid giving the model. The first four are the shell wrappers, `popen` and `proc_open` are the
+/// two that take a command line directly, and `pcntl_exec` is the remaining way out — `pcntl_fork`
+/// alone only copies this interpreter. `Symfony\Component\Process\Process`, which `PHPUnit` itself
+/// uses for `@runInSeparateProcess`, is built on `proc_open` and so is covered by that entry.
+///
+/// Deliberately absent: `assert`, because PHP 8 removed its string form and it is no longer a way
+/// to run code; and `mail`, which does reach a binary but is a project's own business rather than
+/// a command channel.
+///
+/// A project whose own suite legitimately spawns a process can pin its own list with
+/// `phpunit_disable_functions` in its tools config, or disable this tool and run the suite with
+/// `Bash` — which auto mode judges and plan mode refuses.
+const DISABLED_FUNCTIONS: &[&str] = &[
+    "shell_exec",
+    "exec",
+    "system",
+    "passthru",
+    "proc_open",
+    "popen",
+    "pcntl_exec",
+];
+
+/// The functions to disarm for this run: the config's list, or the default.
+///
+/// Empty means the operator removed the block, which is their call to make in their own project.
+fn disabled_list(configured: Option<&[String]>) -> String {
+    configured.map_or_else(|| DISABLED_FUNCTIONS.join(","), |functions| functions.join(","))
+}
+
+/// The arguments that must precede `PHPUnit`'s own: the hardening, then the entry point.
+///
+/// The entry point is named here rather than being the program, because letting its
+/// `#!/usr/bin/env php` shebang start the interpreter would run it *without* the `-d` above.
+fn prefix_for(entry: &Path, disabled: &str) -> Vec<String> {
+    vec![
+        "-d".to_owned(),
+        format!("disable_functions={disabled}"),
+        entry.display().to_string(),
+    ]
 }
 
 /// Find the project's `PHPUnit`, preferring the one the project pinned.
 ///
 /// `vendor/bin/phpunit` first, because a project's own pinned version is the one its
 /// tests are written against; a global `phpunit` may be a major version off and would
-/// produce failures that are about the version. The project's copy is often a PHP script
-/// without the executable bit, in which case it is run through `php`.
-fn find_phpunit(cwd: &Path) -> Result<PhpUnit, String> {
+/// produce failures that are about the version.
+///
+/// Whatever it finds is run through `php`, with the executable bit deciding nothing: the
+/// process-function block in [`DISABLED_FUNCTIONS`] is the point of this tool, and an entry
+/// point exec'd directly by its shebang would escape it.
+fn find_phpunit(cwd: &Path, disabled: &str) -> Result<PhpUnit, String> {
+    find_phpunit_at(
+        super::packages::find_on_path("php"),
+        super::packages::find_on_path("phpunit"),
+        cwd,
+        disabled,
+    )
+}
+
+/// [`find_phpunit`] with the two PATH lookups passed in.
+///
+/// Split out because a test cannot set `PATH` — edition 2024 makes `set_var` unsafe, and this
+/// crate denies `unsafe` — so the environment enters here, once.
+fn find_phpunit_at(
+    php: Option<PathBuf>,
+    phpunit: Option<PathBuf>,
+    cwd: &Path,
+    disabled: &str,
+) -> Result<PhpUnit, String> {
+    let Some(php) = php else {
+        return Err(
+            "no `php` on PATH: PHPUnit is a PHP program, and it is run through php so that a \
+             test cannot spawn a process. Install php, or remove this tool with \
+             \"disable\": [\"PHPUnit\"] and run the suite with Bash."
+                .to_owned(),
+        );
+    };
     let vendored = cwd.join("vendor").join("bin").join("phpunit");
     if vendored.is_file() {
-        let executable = std::fs::metadata(&vendored).is_ok_and(|m| {
-            use std::os::unix::fs::PermissionsExt as _;
-            m.permissions().mode() & 0o111 != 0
-        });
-        return Ok(if executable {
-            PhpUnit {
-                program: vendored,
-                prefix: Vec::new(),
-            }
-        } else {
-            PhpUnit {
-                program: PathBuf::from("php"),
-                prefix: vec![vendored.display().to_string()],
-            }
+        return Ok(PhpUnit {
+            program: php,
+            prefix: prefix_for(&vendored, disabled),
         });
     }
     // A `phpunit.xml` with no vendor copy is worth naming: the project means to have one.
     if cwd.join("vendor").is_dir() || cwd.join("phpunit.xml").exists() || cwd.join("phpunit.xml.dist").exists() {
-        if which("phpunit") {
+        if let Some(global) = phpunit {
             return Ok(PhpUnit {
-                program: PathBuf::from("phpunit"),
-                prefix: Vec::new(),
+                program: php,
+                prefix: prefix_for(&global, disabled),
             });
         }
         return Err(format!(
-            "no PHPUnit found: {} does not exist or is not executable, and no `phpunit` is on \
-             PATH. Run `composer install` in {} first.",
+            "no PHPUnit found: {} does not exist, and no `phpunit` is on PATH. Run `composer \
+             install` in {} first.",
             vendored.display(),
             cwd.display()
         ));
@@ -204,16 +278,6 @@ fn find_phpunit(cwd: &Path) -> Result<PhpUnit, String> {
          version is the one its tests are written against.",
         cwd.display()
     ))
-}
-
-/// Whether a program is on PATH.
-fn which(program: &str) -> bool {
-    std::env::var_os("PATH").is_some_and(|path| {
-        std::env::split_paths(&path).any(|dir| {
-            let candidate = dir.join(program);
-            candidate.is_file()
-        })
-    })
 }
 
 /// The `PHPUnit` arguments for this call.
@@ -432,7 +496,11 @@ pub fn spec() -> serde_json::Value {
                         already separated. Prefer this over running phpunit through Bash — \
                         the parsing is done for you and the output is bounded. Returns JSON. \
                         It runs project code, so it is judged in auto mode and refused in \
-                        plan-mode.",
+                        plan-mode. A test cannot spawn a process: the run disarms shell_exec, \
+                        exec, system, passthru, proc_open, popen and pcntl_exec, so a test that \
+                        reaches for one fails as a test error. Write a test that exercises the \
+                        code, not one that runs a command — the latter is a shell, and this tool \
+                        set exists to not give you one.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -674,30 +742,103 @@ Expected &lt;1&gt;</failure></testcase>
         );
     }
 
-    /// A project's own `PHPUnit` is preferred over a global one, and a non-executable copy is
-    /// run through `php` rather than failing.
+    /// Everything is run through `php` with the process functions disarmed, and the executable
+    /// bit decides nothing — an entry point exec'd by its own shebang would escape the block.
     #[test]
-    fn the_project_copy_is_preferred_and_run_through_php_when_needed() {
+    fn the_entry_point_is_always_run_through_php() {
         use std::os::unix::fs::PermissionsExt as _;
         let dir = tempfile::tempdir().unwrap();
         // Not a PHP project yet.
-        assert!(find_phpunit(dir.path()).is_err());
+        assert!(find_phpunit(dir.path(), "shell_exec").is_err());
 
         let bin = dir.path().join("vendor").join("bin");
         std::fs::create_dir_all(&bin).unwrap();
         let phpunit = bin.join("phpunit");
         std::fs::write(&phpunit, "#!/usr/bin/env php\n").unwrap();
 
-        // Present but not executable: run it through php.
-        let found = find_phpunit(dir.path()).expect("found");
-        assert_eq!(found.program, PathBuf::from("php"));
-        assert_eq!(found.prefix, vec![phpunit.display().to_string()]);
+        let php = PathBuf::from("/usr/bin/php");
+        let expected = vec![
+            "-d".to_owned(),
+            "disable_functions=shell_exec,proc_open".to_owned(),
+            phpunit.display().to_string(),
+        ];
 
-        // Executable: run it directly.
-        std::fs::set_permissions(&phpunit, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let found = find_phpunit(dir.path()).expect("found");
-        assert_eq!(found.program, phpunit);
-        assert!(found.prefix.is_empty());
+        // Not executable, executable, and after a global one appears: the same shape every time,
+        // because the shebang is never what starts the interpreter.
+        for mode in [0o644, 0o755] {
+            std::fs::set_permissions(&phpunit, std::fs::Permissions::from_mode(mode)).unwrap();
+            let found = find_phpunit_at(Some(php.clone()), None, dir.path(), "shell_exec,proc_open").expect("found");
+            assert_eq!(found.program, php, "mode {mode:o}");
+            assert_eq!(found.prefix, expected, "mode {mode:o}");
+        }
+    }
+
+    /// A global `phpunit` is run through `php` too, so the block is not evaded by having no
+    /// vendored copy.
+    #[test]
+    fn a_global_phpunit_is_run_through_php_as_well() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("phpunit.xml"), "<phpunit/>").unwrap();
+        let php = PathBuf::from("/usr/bin/php");
+        let global = PathBuf::from("/usr/local/bin/phpunit");
+        let found = find_phpunit_at(Some(php.clone()), Some(global.clone()), dir.path(), "exec").expect("found");
+        assert_eq!(found.program, php);
+        assert_eq!(
+            found.prefix,
+            vec![
+                "-d".to_owned(),
+                "disable_functions=exec".to_owned(),
+                global.display().to_string()
+            ]
+        );
+    }
+
+    /// Without `php` there is no hardened way to run the suite, so the tool says how to proceed
+    /// rather than running the entry point unhardened.
+    #[test]
+    fn without_php_the_tool_says_how_to_proceed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("vendor").join("bin")).unwrap();
+        std::fs::write(dir.path().join("vendor").join("bin").join("phpunit"), "x").unwrap();
+        let err = find_phpunit_at(None, Some(PathBuf::from("/usr/local/bin/phpunit")), dir.path(), "exec")
+            .expect_err("no php");
+        assert!(err.contains("php"), "{err}");
+        assert!(err.contains("disable"), "and says how to turn it off: {err}");
+        assert!(err.contains("Bash"), "and what to use instead: {err}");
+    }
+
+    /// The default list covers every way out, and is well formed: a name with a space in it
+    /// would make `disable_functions` silently disable nothing.
+    #[test]
+    fn the_default_block_names_every_way_out() {
+        for wanted in [
+            "shell_exec",
+            "exec",
+            "system",
+            "passthru",
+            "proc_open",
+            "popen",
+            "pcntl_exec",
+        ] {
+            assert!(DISABLED_FUNCTIONS.contains(&wanted), "{wanted} is not blocked");
+        }
+        for name in DISABLED_FUNCTIONS {
+            assert!(!name.contains(char::is_whitespace), "{name:?} has whitespace");
+        }
+        let mut sorted = DISABLED_FUNCTIONS.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), DISABLED_FUNCTIONS.len(), "a name is repeated");
+    }
+
+    /// The configured list replaces the default, and an empty one removes the block — the
+    /// operator's escape for a suite that legitimately spawns.
+    #[test]
+    fn the_configured_list_replaces_the_default() {
+        assert_eq!(disabled_list(None), DISABLED_FUNCTIONS.join(","));
+        let mine = vec!["shell_exec".to_owned(), "exec".to_owned()];
+        assert_eq!(disabled_list(Some(&mine)), "shell_exec,exec");
+        assert_eq!(disabled_list(Some(&[])), "", "an empty list blocks nothing");
     }
 
     /// Truncation respects character boundaries, so a multi-byte message cannot panic.

@@ -274,7 +274,11 @@ fn find_composer(cwd: &Path) -> Result<PathBuf, String> {
 }
 
 /// Whether a program is on PATH, and where.
-fn find_on_path(program: &str) -> Option<PathBuf> {
+///
+/// `pub(super)` because `phpunit` needs it too: it has to find `php` — the interpreter it now
+/// runs every suite through — by absolute path, and a second copy of this lookup would be a
+/// second thing to keep right.
+pub(super) fn find_on_path(program: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
         .map(|dir| dir.join(program))
