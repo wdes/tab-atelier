@@ -615,6 +615,22 @@ pub enum Commands {
         args: Vec<String>,
     },
 
+    /// The PROFIL catalogue (v2): `catalog list` reads the reusable agent
+    /// profiles — each with its distilled prompt, tools, and measured
+    /// fresh-vs-resume efficiency.
+    Catalog {
+        /// Passed straight through to `cli::catalog::run`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// Create a tab from a PROFIL: `spawn --from-skill <name> [--task <ctx>] [--resume]`.
+    Spawn {
+        /// Passed straight through to `cli::catalog::spawn_run`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
     /// Launch `claude` cleanly: clear the grid, then `exec claude ARGS…`.
     ///
     /// A no-fuss agent launcher — every argument passes through, so
@@ -992,6 +1008,8 @@ fn command_exit_code(cli: Cli) -> Option<i32> {
         Commands::ClaudeHook { event } => crate::cli::client::run("claude-hook", &[event]),
         Commands::Remote { args } => crate::cli::client::run("remote", &args),
         Commands::Dispatch { args } => crate::cli::client::run("dispatch", &args),
+        Commands::Catalog { args } => crate::cli::client::run("catalog", &args),
+        Commands::Spawn { args } => crate::cli::client::run("spawn", &args),
         Commands::Peers { all } => {
             let args: Vec<String> = if all { vec!["--all".into()] } else { vec![] };
             crate::cli::client::run("peers", &args)
@@ -1537,6 +1555,10 @@ mod tests {
                 // rejection path is the one worth routing here.
                 vec!["remote", "add"],
                 vec!["dispatch"],
+                // The catalogue verbs, in their usage-error form: the working
+                // forms would spawn a real tab / read the live catalogue.
+                vec!["catalog"],
+                vec!["spawn"],
             ];
             for argv in cases {
                 let mut full = vec!["tab-atelier"];

@@ -221,6 +221,9 @@ pub fn dispatch(name: &str, rest: &[String]) -> Option<i32> {
         "claude-hook" => claude_hook::run(rest),
         // Orchestration / teamwork.
         "dispatch" => delegate::run(rest),
+        // The PROFIL catalogue: the read-model, then spawn-from-profile.
+        "catalog" => super::catalog::run(rest),
+        "spawn" => super::catalog::spawn_run(rest),
         "remote" => remote::run(rest),
         "brain" => brain::run(rest),
         "schedule" => share_link::schedule(rest),

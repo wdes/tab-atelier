@@ -10,6 +10,7 @@ use log::{debug, error, info};
 
 mod assets;
 mod blackboard_route;
+mod catalog;
 #[cfg(feature = "catbus")]
 mod catbus;
 mod claims_route;
@@ -1645,7 +1646,7 @@ fn handle_connection<S: Read + Write>(
     };
     let raw_path = parts[1].to_string();
 
-    let (path, query_token, query_lines, query_since, query_crc, query_name, query_path) =
+    let (path, query_token, query_lines, query_since, query_crc, query_name, query_path, query_include_deleted) =
         if let Some((p, q)) = raw_path.split_once('?') {
             let qt = q
                 .split('&')
@@ -1665,9 +1666,11 @@ fn handle_connection<S: Read + Write>(
                 .and_then(|s| u32::from_str_radix(s, 16).ok());
             let qn = q.split('&').find_map(|pair| pair.strip_prefix("name=")).map(url_decode);
             let qp = q.split('&').find_map(|pair| pair.strip_prefix("path=")).map(url_decode);
-            (p.to_string(), qt, ql, qs, qc, qn, qp)
+            // A presence flag (no `=`): `?includeDeleted` surfaces tombstoned skills.
+            let qid = q.split('&').any(|pair| pair == "includeDeleted");
+            (p.to_string(), qt, ql, qs, qc, qn, qp, qid)
         } else {
-            (raw_path, None, None, None, None, None, None)
+            (raw_path, None, None, None, None, None, None, false)
         };
     // Strip a trailing slash so a path like `/tabs/.../view/` (added
     // by some reverse proxies / Cloudflare Tunnel normalisation)
@@ -1944,6 +1947,11 @@ fn handle_connection<S: Read + Write>(
         ("POST", "/claims/release") => claims_route::release(stream, &body_bytes),
         ("GET", "/fleet") => fleet_route::get(stream, state, from_loopback),
         ("GET", "/blackboard") => blackboard_route::list(stream, query_since),
+        // The PROFIL (v2) catalogue read-model: `{skills:[…]}`, tombstoned skills
+        // included only with `?includeDeleted`. MASTER-only: the path is not
+        // `/tabs/by-id/…`, so the share-token whitelist never matches it — the
+        // upstream auth gate 401s any other token (fail-closed by construction).
+        ("GET", "/catalog/list") => catalog::list(stream, query_include_deleted),
         ("POST", "/blackboard") => blackboard_route::merge(stream, &body_bytes),
         ("GET", "/env") => env::list_global(stream),
         ("GET", p) if p.starts_with("/tabs/") && p.ends_with("/env") => env::list_tab(stream, state, p),
@@ -6627,5 +6635,60 @@ mod tests {
         assert_eq!(session_id, None);
         assert_eq!(kind, None);
         assert_eq!(state_now, None, "and the indicator comes down");
+    }
+    /// The `/catalog/list` route is LIVE (built≠wired): the real HTTP server folds
+    /// a catalogue file and serves it, `?includeDeleted` surfaces a tombstone, and a
+    /// non-master token is refused by the upstream gate.
+    #[test]
+    fn catalog_list_serves_the_skill_read_model_and_is_master_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let cat = dir.path().join("catalog.jsonl");
+        // A v2 profile, then a tombstone on it (so the default hides it).
+        let records = [
+            r#"{"slug":"build","skill":"build","prompt":"You are a builder.","schemaVersion":2,"spawnMode":"fresh","outcome":"success","tokens":100,"retiredAt":1}"#,
+            r#"{"slug":"build","skill":"build","schemaVersion":2,"kind":"delete","retiredAt":2}"#,
+        ];
+        std::fs::write(&cat, format!("{}\n{}\n", records[0], records[1])).unwrap();
+
+        // The catalogue module's test seam (not an env var: `unsafe_code` is denied,
+        // so `set_var` is off the table).
+        crate::cli::catalog::set_catalog_path(Some(cat));
+
+        let state = std::sync::Arc::new(std::sync::Mutex::new(test_snapshot(vec![])));
+        state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .master_token = "test-secret-token".into();
+        let port = spawn_test_server(&state, false);
+
+        let master = request(
+            port,
+            "GET /catalog/list HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer test-secret-token\r\n\r\n",
+        );
+        assert_eq!(status_code(&master), 200, "{master}");
+        assert!(
+            master.contains("\"skills\":[]"),
+            "the tombstone hides 'build' by default: {master}"
+        );
+
+        let with_deleted = request(
+            port,
+            "GET /catalog/list?includeDeleted HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer test-secret-token\r\n\r\n",
+        );
+        assert_eq!(status_code(&with_deleted), 200, "{with_deleted}");
+        assert!(
+            with_deleted.contains("\"deleted\":true"),
+            "includeDeleted surfaces it: {with_deleted}"
+        );
+        assert!(with_deleted.contains("You are a builder."), "{with_deleted}");
+
+        // A wrong token on the same route: master-only by construction.
+        let denied = request(
+            port,
+            "GET /catalog/list HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer nope\r\n\r\n",
+        );
+        assert_eq!(status_code(&denied), 401, "{denied}");
+
+        crate::cli::catalog::set_catalog_path(None);
     }
 }
