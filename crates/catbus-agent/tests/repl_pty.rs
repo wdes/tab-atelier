@@ -687,6 +687,26 @@ fn strip_ansi(text: &str) -> String {
     out
 }
 
+/// A terminal's reply to a cursor query is not output, and must not be read as any.
+///
+/// The harness answers the app's `ESC [ 6 n` with `ESC [ 1 ; 1 R`, and that reply is echoed back
+/// to the master once the app restores cooked mode on its way out — so it can land *after* the
+/// final newline. That is the exact byte tail that failed in CI on 2026-09-26, where the app had
+/// written its newline correctly and the assertion was reading the echo instead. Pinned here, on
+/// the strings themselves, so the rule the exit test depends on is checked somewhere that cannot
+/// flake on timing.
+#[test]
+fn a_cursor_report_is_not_taken_for_output() {
+    assert!(
+        strip_ansi("done\r\r\n\u{1b}[1;1R").ends_with('\n'),
+        "the reply is stripped and the newline it followed is not"
+    );
+    // A carriage return alone is not a line ending, and stripping must not invent one: this is an
+    // app that left the terminal mid-line, which is the failure the exit test exists to catch.
+    assert!(!strip_ansi("working\u{1b}[?2004l\r").ends_with('\n'));
+    assert!(!strip_ansi("").ends_with('\n'));
+}
+
 #[test]
 fn a_turn_paints_the_spinner_and_then_the_totals_line() {
     // A colour-capable tab, because the spinner line carries SGR and the
@@ -1759,9 +1779,18 @@ fn leaving_the_repl_ends_the_output_with_a_newline() {
     // returns the carriage depends on the terminal having been put back into cooked mode — so the
     // assertion is on the line ending rather than on the exact pair. Asserted on the tail, which is
     // the whole point: a newline anywhere earlier would be the prompt's own.
+    //
+    // Read from the stripped output, because a terminal's *reply* to a query is not output the app
+    // wrote. The harness answers the app's `ESC [ 6 n` cursor query with `ESC [ 1 ; 1 R` (see the
+    // responder above), and that reply is echoed back to the master once the app has restored
+    // cooked mode on its way out — so it can land after the final newline, which is what made this
+    // test fail in CI on a race while passing locally. Stripping escapes and carriage returns
+    // leaves what the terminal would have shown, whose last character is the newline under test;
+    // an app that wrote no newline at all still fails, since nothing else puts one at the end.
+    let shown = strip_ansi(&seen);
     assert!(
-        seen.ends_with('\n'),
+        shown.ends_with('\n'),
         "the shell would have continued the app's last line. Output ended with: {:?}",
-        &seen[seen.len().saturating_sub(60)..]
+        &shown[shown.len().saturating_sub(60)..]
     );
 }
