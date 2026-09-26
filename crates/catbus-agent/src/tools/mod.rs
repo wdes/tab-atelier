@@ -374,12 +374,14 @@ impl ToolSet {
                 git::run(input, cwd).await
             }
             // Runs project code, so it is judged like the shell is — see
-            // `changes_the_world` — and refused in plan-mode.
+            // `changes_the_world` — and refused in plan-mode. The run is handed the configured
+            // list of PHP functions to disarm, so that what a test may not do is a setting of
+            // the session rather than something the tool decides on its own.
             "PHPUnit" => {
                 if let Some(why) = gate.refusal("PHPUnit") {
                     return Err(why.to_string());
                 }
-                phpunit::run(input, cwd).await
+                phpunit::run(input, cwd, self.phpunit_disable_functions()).await
             }
             // Same treatment as `Git`: one tool with actions, and only `index` writes, so the gate is
             // asked about the action. Asking questions of the code graph is reading, and refusing it
