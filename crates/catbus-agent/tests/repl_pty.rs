@@ -27,6 +27,14 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+/// The reply this harness gives to a cursor-position (DSR) query.
+///
+/// Named because it does not only travel one way: once the app restores the
+/// terminal on its way out, the line discipline echoes it back, and it lands in
+/// the captured output *after* the app's own last line. A test asserting on that
+/// tail has to know the sequence to ignore (`strip_dsr_echo`).
+const DSR_REPLY: &str = "\x1b[1;1R";
+
 /// A pty pair, with the master split into a writer and a reading thread.
 ///
 /// Split because the reading side has to run on its own thread: a blocking read
@@ -84,7 +92,7 @@ impl Pty {
                 for _ in 0..queries {
                     // Row 1, column 1: any position is accepted, it is only
                     // used to place the cursor for redraws.
-                    let _ = responder.write_all(b"\x1b[1;1R");
+                    let _ = responder.write_all(DSR_REPLY.as_bytes());
                 }
                 let _ = responder.flush();
                 carry = window[window.len().saturating_sub(4)..].to_vec();
@@ -1759,9 +1767,15 @@ fn leaving_the_repl_ends_the_output_with_a_newline() {
     // returns the carriage depends on the terminal having been put back into cooked mode — so the
     // assertion is on the line ending rather than on the exact pair. Asserted on the tail, which is
     // the whole point: a newline anywhere earlier would be the prompt's own.
+    //
+    // The tail is read past our own DSR reply first: restoring the terminal turns ECHO back on, so
+    // the reply this harness injected comes back as input echo and lands after the app's last line
+    // (see the responder thread). That echo is the harness's, not the app's, so it must not decide
+    // whether the app ended on a newline.
+    let tail = seen.trim_end_matches(DSR_REPLY);
     assert!(
-        seen.ends_with('\n'),
+        tail.ends_with('\n'),
         "the shell would have continued the app's last line. Output ended with: {:?}",
-        &seen[seen.len().saturating_sub(60)..]
+        &tail[tail.len().saturating_sub(60)..]
     );
 }
