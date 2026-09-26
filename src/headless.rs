@@ -28,7 +28,7 @@ use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::{Config, Term};
 use alacritty_terminal::tty;
-use log::{debug, info, warn};
+use log::{debug, error, info, warn};
 
 use crate::api;
 use crate::platform;
@@ -461,7 +461,9 @@ impl HeadlessTab {
 /// Tap → event loop → notifier on the proxy; returns the notifier so the
 /// caller can push `Msg`s. Shared by both spawn paths of [`spawn_pty_tab`]
 /// so the adopted path can't drift from the fresh one.
-fn start_tab_event_loop<P: alacritty_terminal::event::OnResize + alacritty_terminal::event::EventedPty + 'static>(
+fn start_tab_event_loop<
+    P: alacritty_terminal::tty::EventedPty + alacritty_terminal::event::OnResize + Send + 'static,
+>(
     term: &Arc<FairMutex<Term<EventProxy>>>,
     proxy: &EventProxy,
     pty_ring: &Arc<Mutex<crate::pty_ring::PtyRing>>,
