@@ -21,9 +21,16 @@
 //!
 //! serde IGNORES unknown JSON keys, so a `catalog.jsonl` written by the v1/v2 MX
 //! build still parses into this narrower struct — the organisation fields are read
-//! and dropped. Nothing here WRITES a record (the retire write-path is out of this
-//! port's scope), so the serialisation surface is read-only, and declaring v1 fields
-//! nobody reads would be untested write surface for no reader.
+//! and dropped. The only WRITER is [`run_retire`] (`catalog retire`), and that path
+//! stamps a v2 profile (`skill` + `prompt`) — so declaring v1 fields nobody reads
+//! would be write surface with no reader.
+//!
+//! # The write-path (the loop that improves the prompt)
+//!
+//! `catalog retire` takes a [`V2Stamp`] (the distilled profile + this instance's
+//! telemetry) plus the agent's [`Bilan`] and runs [`perform_retire`]: append the
+//! record, RE-READ it, and gate the close on that read-back. The read-back is the
+//! PROOF — not "I wrote it" — so a profile that didn't land keeps its tab.
 //!
 //! # The read-model
 //!
@@ -188,6 +195,44 @@ impl Bilan {
         .flatten()
         .collect::<Vec<_>>()
         .join(" · ")
+    }
+}
+
+/// The `catalog retire` input.
+///
+/// The orchestrator's [`V2Stamp`] (flattened at the top level) plus the agent's
+/// [`Bilan`] — the ONE definition of the retire body, shared by [`run_retire`] and the
+/// eventual daemon route.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RetireRequest {
+    /// The agent's structured bilan — the retrospective on its PROMPT. Absent or empty
+    /// ⇒ nothing is recorded (the profile stands, telemetry-only retire).
+    #[serde(default)]
+    pub bilan: Option<Bilan>,
+    #[serde(flatten)]
+    pub stamp: V2Stamp,
+}
+
+impl RetireRequest {
+    /// The record to archive: a v2 PROFILE (the stamp) carrying the bilan, keyed by the
+    /// retired tab's `id`.
+    ///
+    /// A request with no `skill` produces a record that FAILS the v2 completeness gate
+    /// (and so stays out of the read-model) — [`perform_retire`] then keeps the tab
+    /// rather than closing a profile-less retire. A retire that names no skill has no
+    /// place in the v2 model, so it is quarantined rather than half-recorded.
+    #[must_use]
+    fn into_record(self, id: &str, retired_at: u64) -> CatalogRecord {
+        let mut record = CatalogRecord {
+            id: id.to_string(),
+            retired_at,
+            ..CatalogRecord::default()
+        };
+        if let Some(bilan) = self.bilan {
+            record = record.with_bilan(bilan);
+        }
+        record.with_v2(self.stamp)
     }
 }
 
@@ -451,13 +496,16 @@ fn apply_directives(base: &str, bilan: &Bilan) -> String {
 /// so an existing catalogue still parses and those fields are simply dropped. Nothing
 /// in this port writes a record, so declaring them would be write surface with no
 /// reader (see the module docs).
-// `Serialize` is test-only: the record shape is a READ contract here (nothing in this
-// port writes a catalogue), so production never needs to encode one — only the tests
-// build fixture lines.
-#[cfg_attr(test, derive(Serialize))]
-#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+// `Serialize` is production, not test-only: `catalog retire` WRITES a record through
+// [`encode_catalog_line`], so the on-disk shape has ONE definition shared by the
+// read-model and the write-path.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct CatalogRecord {
+pub struct CatalogRecord {
+    /// The archived tab's id — the key [`read_back`] looks up (append-only ⇒ the LAST
+    /// line wins). Required: [`perform_retire`]'s gate refuses an id-less archive.
+    #[serde(default)]
+    id: String,
     #[serde(default)]
     specialty: Option<String>,
     #[serde(default)]
@@ -492,6 +540,11 @@ struct CatalogRecord {
     tokens: Option<u64>,
     #[serde(default)]
     cost: Option<f64>,
+    /// How hard this instance judged its task — telemetry, stamp-only (there is no
+    /// per-tab difficulty to inherit). Declared so the [`V2Stamp`] write shape has
+    /// exactly one definition.
+    #[serde(default)]
+    difficulty: Option<u8>,
     /// `Some(2)` = a v2 record (in the skill read-model); `None`/`Some(1)` = a v1
     /// legacy record, QUARANTINED from the v2 read-model.
     #[serde(default)]
@@ -500,6 +553,11 @@ struct CatalogRecord {
     /// as a retire.
     #[serde(default)]
     kind: RecordKind,
+    /// The agent's structured [`Bilan`] — the retrospective on its PROMPT that feeds
+    /// the improved prompt (the raw material of the loop). Captured at retire, before
+    /// the close.
+    #[serde(default)]
+    bilan: Option<Bilan>,
     retired_at: u64,
 }
 
@@ -524,6 +582,72 @@ impl CatalogRecord {
     #[must_use]
     fn fold_key(&self) -> String {
         self.skill.as_deref().unwrap_or_default().trim().to_string()
+    }
+
+    /// Does this record carry a NON-EMPTY `prompt`? The other half of the v2
+    /// completeness bar — a profile with no distilled prompt can't be re-seeded.
+    #[must_use]
+    fn has_prompt(&self) -> bool {
+        self.prompt.as_deref().is_some_and(|p| !p.trim().is_empty())
+    }
+
+    /// The WRITE gate: is this archived record complete enough to close behind?
+    ///
+    /// - **v2** (CF1): a NON-EMPTY `skill` AND a NON-EMPTY `prompt`. `session_id` is
+    ///   NOT required — the v2 baseline is A/B-isolated and optional. This is the bar
+    ///   [`perform_retire`] refuses to close under, so a half-built profile can never
+    ///   die at close.
+    /// - **v1**: WHEN the tab carried a live session (`had_session`), the archive must
+    ///   carry the `session_id` — a lost existing session is an incomplete archive.
+    #[must_use]
+    fn is_complete(&self, had_session: bool) -> bool {
+        if self.id.is_empty() {
+            return false;
+        }
+        if self.is_v2() {
+            return self.has_skill() && self.has_prompt();
+        }
+        !had_session || self.session_id.is_some()
+    }
+
+    /// Promote this record to a v2 PROFILE by stamping the orchestrator's [`V2Stamp`]
+    /// — the distilled profile plus this instance's per-mode telemetry. Sets
+    /// `schema_version` to 2 (the read-model's opt-in). The baseline
+    /// (`session_id`/`agent_kind`) is untouched: it stays A/B-isolated.
+    #[must_use]
+    fn with_v2(mut self, stamp: V2Stamp) -> Self {
+        self.skill = stamp.skill.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        self.prompt_version = stamp.prompt_version;
+        self.prompt = stamp.prompt;
+        self.tools = stamp.tools;
+        self.patterns = stamp.patterns;
+        // Keep a spawn-time mode (seeded on the tab) unless the stamp overrides it.
+        if stamp.spawn_mode.is_some() {
+            self.spawn_mode = stamp.spawn_mode;
+        }
+        self.outcome = stamp.outcome;
+        // Telemetry sourced elsewhere (the tab) is kept unless the stamp is explicit.
+        if stamp.tokens.is_some() {
+            self.tokens = stamp.tokens;
+        }
+        if stamp.cost.is_some() {
+            self.cost = stamp.cost;
+        }
+        if stamp.difficulty.is_some() {
+            self.difficulty = stamp.difficulty;
+        }
+        self.schema_version = Some(2);
+        self
+    }
+
+    /// Attach the agent's structured [`Bilan`] — captured at retire, BEFORE the close.
+    /// An empty bilan is a no-op: nothing to record, so the record is untouched.
+    #[must_use]
+    fn with_bilan(mut self, bilan: Bilan) -> Self {
+        if !bilan.is_empty() {
+            self.bilan = Some(bilan);
+        }
+        self
     }
 }
 
@@ -578,6 +702,42 @@ fn read_catalog_records_at(path: &Path) -> Vec<CatalogRecord> {
 #[must_use]
 fn read_catalog_records() -> Vec<CatalogRecord> {
     read_catalog_records_at(&catalog_path())
+}
+
+/// One catalog record as a JSONL line (trailing newline included).
+///
+/// A serialisation failure can only mean a non-serialisable field was added; falling
+/// back to `{}` writes an unparseable line the reader DROPS, which the retire gate
+/// then catches as an incomplete read-back (the tab is kept, never closed blind).
+#[must_use]
+pub fn encode_catalog_line(record: &CatalogRecord) -> String {
+    serde_json::to_string(record).unwrap_or_else(|_| "{}".to_string()) + "\n"
+}
+
+/// Append one record to the catalogue (create + append, line-atomic like the swamp /
+/// task producer). Path-injectable so it's testable against a temp file.
+///
+/// # Errors
+/// Propagates any create / open / write I/O error.
+pub fn append_catalog_line(path: &Path, record: &CatalogRecord) -> std::io::Result<()> {
+    use std::io::Write as _;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+    f.write_all(encode_catalog_line(record).as_bytes())
+}
+
+/// RE-READ the catalogue for the LATEST archived record of `id`.
+///
+/// Append-only ⇒ last write wins; `None` when the id was never archived. This is the
+/// read-back [`perform_retire`] gates on — proof the write LANDED, not "I wrote it".
+#[must_use]
+pub fn read_back(path: &Path, id: &str) -> Option<CatalogRecord> {
+    parse_catalog(&std::fs::read_to_string(path).ok()?)
+        .into_iter()
+        .rev()
+        .find(|c| c.id == id)
 }
 
 // ---------------------------------------------------------------------------
@@ -990,17 +1150,93 @@ pub fn plan_from_skill(
 }
 
 // ---------------------------------------------------------------------------
+// The retire write-path: archive → RE-READ → gate → de-register → close.
+// ---------------------------------------------------------------------------
+
+/// The verdict of a retire attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetireOutcome {
+    /// Archived (read-back OK + complete), de-registered, and closed. Terminal.
+    Retired,
+    /// The archive write or its read-back was empty / incomplete → the close was NEVER
+    /// reached, the tab is KEPT (the "RETIRE INCOMPLET" flag). Re-retire is replayable
+    /// (idempotent up to the close).
+    Incomplete(&'static str),
+    /// Archive OK but a terminal step (de-register or shutdown) failed → the tab is
+    /// KEPT and NOT a ghost: `shutdown` is the LAST effect, after the durable
+    /// de-register, so the forbidden {closed BUT still registered} can't happen.
+    CloseFailed,
+}
+
+/// The retire window: archive the record, RE-READ it, and — only on a complete
+/// read-back — de-register then close. PURE + persist-gated + fully mockable.
+///
+/// Every effect is an INJECTED closure, so a test records the call + its ORDER without
+/// touching a real tab (the same pattern as the repo's other `perform_*` windows). The
+/// persist-gate is the [`read_back`] + [`CatalogRecord::is_complete`] check between the
+/// archive and the close: a failed / empty / incomplete read-back means the close is
+/// NEVER reached.
+///
+/// Order of effects: `write_catalog` → `read_back` → [gate] → `deregister` →
+/// `shutdown`. `shutdown` (the only real-tab-touching seam) runs LAST, after the
+/// durable de-register, so a failure never leaves {closed BUT still registered}.
+pub fn perform_retire<Wc, Rb, Dr, Sd>(
+    record: &CatalogRecord,
+    ack_safe_to_close: bool,
+    had_session: bool,
+    write_catalog: Wc,
+    read_back: Rb,
+    deregister: Dr,
+    shutdown: Sd,
+) -> RetireOutcome
+where
+    Wc: FnOnce(&CatalogRecord) -> std::io::Result<()>,
+    Rb: FnOnce(&str) -> Option<CatalogRecord>,
+    Dr: FnOnce() -> std::io::Result<()>,
+    Sd: FnOnce() -> std::io::Result<()>,
+{
+    // GATE 3a (fail-safe, cumulative + INDEPENDENT of the archive gate): no
+    // `safe-to-close` ACK → NO close, the tab is kept.
+    if !ack_safe_to_close {
+        return RetireOutcome::Incomplete("no safe-to-close ACK — RETIRE INCOMPLET, tab kept");
+    }
+    // 1. Archive the record.
+    if write_catalog(record).is_err() {
+        return RetireOutcome::Incomplete("archive write failed — tab kept");
+    }
+    // 2. READ-BACK (proof, not "I wrote it") + gate on completeness. The invariant
+    //    cœur: no close unless the re-read archive is non-empty and complete.
+    match read_back(&record.id) {
+        Some(rb) if rb.is_complete(had_session) => {}
+        _ => return RetireOutcome::Incomplete("archive read-back empty/incomplete — RETIRE INCOMPLET, tab kept"),
+    }
+    // 3. De-register from tabs.json (durable) BEFORE the irreversible close.
+    if deregister().is_err() {
+        return RetireOutcome::CloseFailed;
+    }
+    // 4. Close the tab — the LAST effect, the only one that touches a real tab.
+    if shutdown().is_err() {
+        return RetireOutcome::CloseFailed;
+    }
+    RetireOutcome::Retired
+}
+
+// ---------------------------------------------------------------------------
 // CLI (thin HTTP client).
 // ---------------------------------------------------------------------------
 
-/// `tab-atelier catalog <list>` — the v2 skill read-model CLI.
+/// The catalogue CLI: the v2 read-model (`list`) and the retire write-path (`retire`).
 #[must_use]
 pub fn run(args: &[String]) -> i32 {
-    if args.first().map(String::as_str) == Some("list") {
-        run_list()
-    } else {
-        eprintln!("usage:\n  tab-atelier catalog list");
-        2
+    match args.first().map(String::as_str) {
+        Some("list") => run_list(),
+        Some("retire") => run_retire(&args[1..]),
+        _ => {
+            eprintln!(
+                "usage:\n  tab-atelier catalog list\n  tab-atelier catalog retire <id> --skill <name> [--prompt <text>] [--json <record>]"
+            );
+            2
+        }
     }
 }
 
@@ -1069,6 +1305,89 @@ fn spawn_from_skill_run(name: &str, task: Option<&str>, resume: bool) -> i32 {
             1
         }
     }
+}
+
+/// Parse the retire input: a full `--json <record>` body, or the `--skill <name>
+/// [--prompt <text>]` shortcut for the common case.
+fn parse_retire_request(args: &[String]) -> Result<RetireRequest, String> {
+    if let Some(json) = arg_after(args, "--json") {
+        return serde_json::from_str(json).map_err(|e| format!("bad --json record: {e}"));
+    }
+    let Some(skill) = arg_after(args, "--skill") else {
+        return Err("need --skill <name> (or a full --json record)".into());
+    };
+    Ok(RetireRequest {
+        stamp: V2Stamp {
+            skill: Some(skill.to_string()),
+            prompt: arg_after(args, "--prompt").map(str::to_string),
+            ..V2Stamp::default()
+        },
+        ..RetireRequest::default()
+    })
+}
+
+/// `tab-atelier catalog retire <id> --skill <name> [--prompt <text>] [--json <record>]`
+/// `[--ack-safe-to-close]` — the v2 WRITE path.
+///
+/// This is the trigger of the improvement loop: a finished run becomes a catalogue
+/// data-point (profile + telemetry + bilan) an eventual `spawn --from-skill` re-seeds
+/// from.
+///
+/// `--json` carries the full [`RetireRequest`] (stamp + bilan); `--skill`/`--prompt` is
+/// the shortcut. The close is destructive, so it also needs `--ack-safe-to-close` —
+/// that ACK is GATE 3a of [`perform_retire`]: without it nothing is written at all and
+/// the tab is kept.
+#[must_use]
+pub fn run_retire(args: &[String]) -> i32 {
+    let Some(id) = args.first().filter(|a| !a.starts_with("--")) else {
+        eprintln!(
+            "usage:\n  tab-atelier catalog retire <id> --skill <name> [--prompt <text>] [--json <record>] [--ack-safe-to-close]"
+        );
+        return 2;
+    };
+    let req = match parse_retire_request(args) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("catalog retire: {e}");
+            return 2;
+        }
+    };
+    let record = req.into_record(id, crate::unix_millis());
+    let cat = catalog_path();
+    // `had_session`: v2 completeness ignores it (the baseline is A/B-isolated), and this
+    // verb archives no session id, so the v1 session branch is unreachable from here.
+    let outcome = perform_retire(
+        &record,
+        args.iter().any(|a| a == "--ack-safe-to-close"),
+        false,
+        |c| append_catalog_line(&cat, c),
+        |rid| read_back(&cat, rid),
+        // v2 has no separate registration to undo: the tab lives in the daemon's
+        // tabs.json, and the DELETE below persists that state itself (single writer).
+        || Ok(()),
+        || close_tab(id),
+    );
+    match outcome {
+        RetireOutcome::Retired => {
+            println!("{{\"retired\":\"{id}\"}}");
+            0
+        }
+        RetireOutcome::Incomplete(flag) => {
+            eprintln!("catalog retire: {flag}");
+            1
+        }
+        RetireOutcome::CloseFailed => {
+            eprintln!("catalog retire: close failed — the profile is archived, the tab is kept");
+            1
+        }
+    }
+}
+
+/// The close seam: `DELETE /tabs/by-id/{id}` on the local daemon — the LAST effect, the
+/// only one that touches a real tab.
+fn close_tab(id: &str) -> std::io::Result<()> {
+    let ep = crate::cli::client::discover_endpoint().map_err(std::io::Error::other)?;
+    crate::cli::client::api_delete(&ep, &format!("/tabs/by-id/{id}")).map_err(std::io::Error::other)
 }
 
 /// `catalog list` — GET the read-model and print it. READ-ONLY.
@@ -1430,5 +1749,256 @@ mod tests {
         assert_eq!(arg_after(&args, "--from-skill"), Some("build"));
         assert_eq!(arg_after(&args, "--task"), Some("x"));
         assert_eq!(arg_after(&args, "--missing"), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // The retire WRITE path — the loop that improves the prompt.
+    // -----------------------------------------------------------------------
+
+    const RETIRED_AT: u64 = 1_700_000_000_000;
+
+    /// A minimal v2 request: the profile a run distils into.
+    fn v2_request(skill: &str, prompt: &str) -> RetireRequest {
+        RetireRequest {
+            stamp: V2Stamp {
+                skill: Some(skill.into()),
+                prompt: Some(prompt.into()),
+                ..V2Stamp::default()
+            },
+            ..RetireRequest::default()
+        }
+    }
+
+    /// Recording seams for the retire window: `log` is the call ORDER, `archived` what
+    /// the write seam received. Lets the pure retire be tested without a real tab.
+    #[derive(Default)]
+    struct Seams {
+        log: Vec<&'static str>,
+        archived: Option<CatalogRecord>,
+    }
+
+    /// Run a retire with recording seams and an INJECTED read-back (the fake archive
+    /// reader), returning the outcome + the recorded call order.
+    fn retire_with(
+        record: &CatalogRecord,
+        ack: bool,
+        readback: impl FnOnce() -> Option<CatalogRecord>,
+    ) -> (RetireOutcome, Vec<&'static str>) {
+        use std::cell::RefCell;
+        let seams = RefCell::new(Seams::default());
+        let out = perform_retire(
+            record,
+            ack,
+            false,
+            |c| {
+                let mut s = seams.borrow_mut();
+                s.log.push("write");
+                s.archived = Some(c.clone());
+                Ok(())
+            },
+            |_id| {
+                seams.borrow_mut().log.push("read-back");
+                readback()
+            },
+            || {
+                seams.borrow_mut().log.push("deregister");
+                Ok(())
+            },
+            || {
+                seams.borrow_mut().log.push("shutdown");
+                Ok(())
+            },
+        );
+        let log = seams.borrow().log.clone();
+        (out, log)
+    }
+
+    // (a) round-trip byte-complete: every durable field of the retired profile — the
+    // stamp AND the bilan — survives the real append + read-back path.
+    #[test]
+    fn retire_round_trip_is_byte_complete() {
+        let bilan = Bilan {
+            learned: vec!["the gate must precede the close".into()],
+            problems: vec!["stale main".into()],
+            add_directives: vec!["read back what you wrote".into()],
+            drop_directives: vec!["drop the slug fallback".into()],
+        };
+        let stamp = V2Stamp {
+            skill: Some("olympe".into()),
+            prompt_version: Some(4),
+            prompt: Some("You are Olympe.".into()),
+            tools: vec!["Read".into(), "Bash".into()],
+            patterns: vec!["verify-before-claim".into()],
+            spawn_mode: Some(SpawnMode::Resume),
+            outcome: Some(Outcome::Success),
+            tokens: Some(12_345),
+            cost: Some(0.42),
+            difficulty: Some(3),
+        };
+        let record = RetireRequest {
+            bilan: Some(bilan.clone()),
+            stamp,
+        }
+        .into_record("tab-max", RETIRED_AT);
+
+        let path = temp_catalog("");
+        append_catalog_line(&path, &record).expect("archive");
+        let back = read_back(&path, "tab-max").expect("read-back non-empty");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(back, record, "every durable field round-trips byte-complete");
+        assert_eq!(back.id, "tab-max");
+        assert_eq!(back.skill.as_deref(), Some("olympe"));
+        assert_eq!(back.prompt.as_deref(), Some("You are Olympe."));
+        assert_eq!(back.prompt_version, Some(4));
+        assert_eq!(back.tools, vec!["Read", "Bash"]);
+        assert_eq!(back.patterns, vec!["verify-before-claim"]);
+        assert_eq!(back.spawn_mode, Some(SpawnMode::Resume));
+        assert_eq!(back.outcome, Some(Outcome::Success));
+        assert_eq!(back.tokens, Some(12_345));
+        assert_eq!(back.cost, Some(0.42));
+        assert_eq!(back.difficulty, Some(3));
+        assert_eq!(back.schema_version, Some(2), "a retire writes a v2 record");
+        assert_eq!(back.bilan, Some(bilan), "all 4 bilan fields survive");
+        assert_eq!(back.retired_at, RETIRED_AT);
+    }
+
+    // (b) THE GATE: an empty OR incomplete read-back → Incomplete, and the tab is NOT
+    // closed. The assertion that counts is that the `shutdown` seam never ran.
+    #[test]
+    fn retire_gate_keeps_the_tab_on_empty_or_incomplete_read_back() {
+        let record = v2_request("olympe", "You are Olympe.").into_record("t1", RETIRED_AT);
+
+        // (i) the write "succeeded" but nothing landed → empty read-back.
+        let (out, log) = retire_with(&record, true, || None);
+        assert!(
+            matches!(out, RetireOutcome::Incomplete(_)),
+            "empty read-back → Incomplete"
+        );
+        assert_eq!(
+            log,
+            vec!["write", "read-back"],
+            "no de-register, NO close — the tab is KEPT"
+        );
+
+        // (ii) the archive landed but WITHOUT the prompt the v2 gate requires.
+        let mut truncated = record.clone();
+        truncated.prompt = None;
+        let (out, log) = retire_with(&record, true, move || Some(truncated));
+        assert!(
+            matches!(out, RetireOutcome::Incomplete(_)),
+            "incomplete read-back → Incomplete"
+        );
+        assert!(
+            !log.contains(&"shutdown"),
+            "shutdown is NEVER called on an incomplete read-back"
+        );
+        assert_eq!(log, vec!["write", "read-back"], "the tab is KEPT");
+    }
+
+    // (d) the ORDER of effects: shutdown (the only real-tab-touching seam) runs LAST.
+    #[test]
+    fn retire_orders_write_readback_deregister_then_close() {
+        let record = v2_request("olympe", "p").into_record("t1", RETIRED_AT);
+        let archived = record.clone();
+        let (out, log) = retire_with(&record, true, move || Some(archived));
+        assert_eq!(out, RetireOutcome::Retired);
+        assert_eq!(
+            log,
+            vec!["write", "read-back", "deregister", "shutdown"],
+            "close runs LAST, only after write → read-back → de-register"
+        );
+    }
+
+    // GATE 3a: no safe-to-close ACK → NO close, and nothing is even written.
+    #[test]
+    fn retire_without_the_safe_to_close_ack_touches_nothing() {
+        let record = v2_request("olympe", "p").into_record("t1", RETIRED_AT);
+        let archived = record.clone();
+        let (out, log) = retire_with(&record, false, move || Some(archived));
+        assert!(matches!(out, RetireOutcome::Incomplete(_)));
+        assert!(log.is_empty(), "no ACK → not even the archive write");
+    }
+
+    // (c) a v2 retire is VISIBLE in the read-model: `schema_version == 2` + skill +
+    // prompt ⇒ the record folds into a `SkillProfile`.
+    #[test]
+    fn a_v2_retire_lands_in_the_skill_read_model() {
+        let path = temp_catalog("");
+        let record = v2_request("olympe", "You are Olympe.").into_record("tab-1", RETIRED_AT);
+        append_catalog_line(&path, &record).expect("archive");
+        let back = read_back(&path, "tab-1").expect("read-back");
+        assert!(back.is_complete(false), "skill + prompt ⇒ a complete v2 profile");
+
+        let profiles = read_skill_profiles_at(&path);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(profiles.len(), 1, "the retired profile folds into the read-model");
+        assert_eq!(profiles[0].skill, "olympe");
+        assert_eq!(profiles[0].prompt.as_deref(), Some("You are Olympe."));
+        assert_eq!(
+            profiles[0].metrics.by_mode.resume.spawns + profiles[0].metrics.by_mode.fresh.spawns,
+            0
+        );
+    }
+
+    // A retire that names NO skill is an incomplete profile: the gate refuses the close
+    // and the record is quarantined from the read-model (no half-built profile).
+    #[test]
+    fn a_skill_less_retire_is_quarantined() {
+        let record = RetireRequest::default().into_record("t1", RETIRED_AT);
+        assert_eq!(record.schema_version, Some(2));
+        assert!(
+            !record.is_complete(false),
+            "no skill/prompt ⇒ the gate refuses the close"
+        );
+
+        let path = temp_catalog("");
+        append_catalog_line(&path, &record).expect("archive");
+        let profiles = read_skill_profiles_at(&path);
+        let _ = std::fs::remove_file(&path);
+        assert!(profiles.is_empty(), "an incomplete profile is quarantined");
+
+        let archived = record.clone();
+        let (out, log) = retire_with(&record, true, move || Some(archived));
+        assert!(matches!(out, RetireOutcome::Incomplete(_)));
+        assert!(!log.contains(&"shutdown"), "no close on an incomplete profile");
+    }
+
+    // An EMPTY bilan records nothing — a telemetry-only retire stays untouched.
+    #[test]
+    fn an_empty_bilan_records_nothing() {
+        let record = RetireRequest {
+            bilan: Some(Bilan::default()),
+            stamp: v2_request("olympe", "p").stamp,
+        }
+        .into_record("t1", RETIRED_AT);
+        assert!(record.bilan.is_none());
+    }
+
+    // The CLI input contract: a retire body carries the camelCase stamp (flattened at
+    // the top level) + the nested bilan, as the orchestrator sends it.
+    #[test]
+    fn a_retire_body_parses_the_stamp_and_the_bilan() {
+        let body = r#"{"skill":"olympe","promptVersion":3,"prompt":"p","spawnMode":"fresh",
+                       "outcome":"success","tokens":7,"difficulty":2,"bilan":{"learned":["x"]}}"#;
+        let req: RetireRequest = serde_json::from_str(body).expect("a retire body parses");
+        assert!(req.stamp.is_v2());
+        assert_eq!(req.stamp.prompt_version, Some(3));
+        assert_eq!(req.stamp.spawn_mode, Some(SpawnMode::Fresh));
+        assert_eq!(req.stamp.outcome, Some(Outcome::Success));
+        assert_eq!(req.stamp.difficulty, Some(2));
+        assert_eq!(req.bilan.map(|b| b.learned.len()), Some(1));
+    }
+
+    // The verbose path (the anti-typo guard): without `--ack-safe-to-close` the verb
+    // reports the refusal and writes nothing.
+    #[test]
+    fn the_verbose_retire_refuses_without_the_dry_run_flag() {
+        let args: Vec<String> = ["t1", "--skill", "olympe", "--prompt", "p"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert!(!args.iter().any(|a| a == "--ack-safe-to-close"));
+        assert_eq!(run_retire(&args), 1, "no ACK ⇒ refusal, exit 1");
     }
 }
