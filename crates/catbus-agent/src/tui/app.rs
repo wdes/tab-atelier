@@ -1514,8 +1514,8 @@ enum Flow {
 }
 
 impl Repl<'_> {
-    /// The status row: the spinner, what the agent is doing, the input estimate, and how
-    /// much is waiting.
+    /// The status row: the spinner, what the agent is doing, what the turn has cost so far,
+    /// and how much is waiting.
     fn status(&mut self) -> Option<String> {
         // A command reports itself whether or not a turn is running: it is the thing the
         // operator started, and a foreground one is *why* the prompt is not taking input. Checked

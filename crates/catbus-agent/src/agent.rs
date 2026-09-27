@@ -307,11 +307,27 @@ pub struct Agent {
     /// What the provider has reported about the request in flight, as it streams past.
     ///
     /// Reset as each request is sent and written per chunk by the assembler, so it describes the
-    /// request being answered and never a previous one. Deliberately *not* cleared when the
-    /// request finishes: a turn that is between tool rounds still has a cost worth seeing, and a
-    /// figure that blinked out during every tool call would be harder to read than one that stays
-    /// up until the next request replaces it.
+    /// request being answered and never a previous one — the moment a reply is in hand its counts
+    /// are folded into [`Self::turn_spent`] and this is emptied, which is what keeps the two from
+    /// counting the same request twice. It is the *live* half: what is arriving now.
     live: std::sync::Mutex<LiveReport>,
+    /// What the turn now running has already been billed, summed over the requests that finished.
+    ///
+    /// A turn is several requests — the model thinks, calls a tool, thinks again — and each one is
+    /// billed, so the figure worth watching is their sum. Without this the row restarts at zero
+    /// every round: an operator watching a four-round turn used to see `12,000 in` become nothing,
+    /// then `6,000 in` on the round after the tool result, and could not tell a turn that was
+    /// nearly done from one that had just begun.
+    ///
+    /// Kept as a [`Usage`] rather than folded into the two atomics beside it because the row prices
+    /// it, and pricing needs the four kinds separately; those two are process-cumulative on purpose
+    /// and are what the totals line under a finished answer prints. This one is the turn's, and is
+    /// emptied where a turn begins — see [`Self::clear_live`].
+    ///
+    /// Only counts the *provider* reported are added to this total. The row's byte estimate of a
+    /// request in flight is a stand-in for a count that has not arrived, and it stays out of here —
+    /// it is folded in at display time instead, where it can be marked as the guess it is.
+    turn_spent: std::sync::Mutex<Usage>,
     /// Cancellation flag for the currently-running turn. Re-built at
     /// the start of every `run_user_prompt` so Ctrl+C only kills the
     /// in-flight request, not future ones.
@@ -355,8 +371,16 @@ struct LiveReport {
 /// * **`None`** when nothing has been measured and nothing reported, which is the row's state
 ///   between turns. A request whose payload has been serialised but not yet sent still counts as
 ///   something to show: the estimate is exactly what the row displayed before this existed.
-fn live_figures(report: LiveReport, inflight_bytes: u64) -> Option<crate::statusline::Live> {
-    if !report.started && report.output_bytes == 0 && inflight_bytes == 0 {
+///
+/// `spent` is what the requests of this turn that have *finished* were billed, and it is added to
+/// what the request in flight is up to. A turn is several requests — think, call a tool, think
+/// again — so the row's figure is their running sum rather than the current request's own: an
+/// operator watching a long turn wants to know what it has cost, and a number that fell back to a
+/// single request's size at every tool call answered a different question. It also means the row
+/// climbs toward the same total the line under the finished answer prints, which is the figure an
+/// operator compares it with.
+fn live_figures(report: LiveReport, inflight_bytes: u64, spent: Usage) -> Option<crate::statusline::Live> {
+    if spent.is_empty() && !report.started && report.output_bytes == 0 && inflight_bytes == 0 {
         // Nothing reported and nothing measured, so the row has nothing to say about cost. That is
         // the state between turns, and between the payload being serialised and being sent.
         return None;
@@ -383,10 +407,20 @@ fn live_figures(report: LiveReport, inflight_bytes: u64) -> Option<crate::status
         }
     };
     usage.output_tokens = output;
+    let mut total = spent;
+    total.absorb(usage);
     Some(crate::statusline::Live {
-        usage,
-        reported: report.started,
-        output_estimated: report.usage.output_tokens == 0,
+        usage: total,
+        // The input figure is the provider's when either the reply has opened — it carries its own
+        // count — or there is no request in flight whose length is being guessed. The second case
+        // is the gap between two tool rounds: nothing is going out, so the sum is nothing but
+        // counts the provider already reported, and marking *that* as an estimate would put a `~`
+        // on the most exact figure the row ever shows.
+        reported: report.started || inflight_bytes == 0,
+        // Only when the reply's own bytes are standing in for a count. `report.usage.output_tokens
+        // == 0` alone would mark the gap between rounds too, where the output shown is entirely
+        // the finished requests' real count and no byte estimate is in the sum at all.
+        output_estimated: report.usage.output_tokens == 0 && report.output_bytes > 0,
         model: report.model,
     })
 }
@@ -517,6 +551,7 @@ impl Agent {
             tokens_out,
             inflight_input_bytes: std::sync::atomic::AtomicU64::new(0),
             live: std::sync::Mutex::new(LiveReport::default()),
+            turn_spent: std::sync::Mutex::new(Usage::default()),
             cancel: std::sync::Mutex::new(CancellationToken::new()),
         }
     }
@@ -579,9 +614,23 @@ impl Agent {
     /// Called as each request is sent, not when a reply lands: the last line stays on screen until
     /// it is replaced, which is what keeps the row from blinking out between a reply and the tool
     /// call that follows it.
-    fn clear_live(&self) {
+    ///
+    /// The turn's running total is deliberately left alone — see [`Self::turn_spent`]. A turn is
+    /// several requests, and this is the boundary between two of them, not the end of the turn: a
+    /// row that went back to zero here is the bug that total exists to fix.
+    fn clear_request(&self) {
         self.clear_reasoning();
         *self.live.lock().expect("live mutex") = LiveReport::default();
+    }
+
+    /// Forget the whole previous turn, where a new one begins.
+    ///
+    /// Both halves of the row go: the request in flight (which there is not one of yet) and the
+    /// turn's running total. A figure carried across turns would be worse than one that reset —
+    /// it would be the sum of two turns labelled as one.
+    fn clear_live(&self) {
+        self.clear_request();
+        *self.turn_spent.lock().expect("turn spend mutex") = Usage::default();
     }
 
     /// The question channel. See the field.
@@ -771,18 +820,21 @@ impl Agent {
         self.tokens_out.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// What the request in flight has cost so far, or `None` when there is nothing to show.
+    /// What the turn running now has cost so far, or `None` when there is nothing to show.
     ///
     /// This is the figure the status row puts a *price* on while the model works, which is the
     /// point of it: the totals line under a finished answer is the same arithmetic applied to a
     /// turn that is already paid for, and by then the decision an operator wanted the number for
-    /// has been made. See [`statusline::Live`] for what each count means and
-    /// [`live_figures`] for how the two sources are reconciled.
+    /// has been made. Summed over the turn's finished requests and the one in flight — see
+    /// [`Self::turn_spent`] — so it climbs across tool rounds rather than restarting at each.
+    /// See [`statusline::Live`] for what each count means and [`live_figures`] for how the
+    /// sources are reconciled.
     #[must_use]
     pub fn live_cost(&self) -> Option<crate::statusline::Live> {
         let report = self.live.lock().expect("live mutex").clone();
+        let spent = *self.turn_spent.lock().expect("turn spend mutex");
         let bytes = self.inflight_input_bytes.load(std::sync::atomic::Ordering::Relaxed);
-        live_figures(report, bytes)
+        live_figures(report, bytes, spent)
     }
 
     /// The prices the catalog holds for a model, if it holds any.
@@ -1078,6 +1130,20 @@ impl Agent {
                 .fetch_add(resp.usage.input_tokens, std::sync::atomic::Ordering::Relaxed);
             self.tokens_out
                 .fetch_add(resp.usage.output_tokens, std::sync::atomic::Ordering::Relaxed);
+            // The request is answered, so its counts move out of the live report and into the
+            // turn's running total, which is what the status row shows. Folded here rather than
+            // when the next request is sent so that a reply which never streamed — a provider that
+            // answers a `stream: true` request with a whole body — is summed the same way as one
+            // that did; the report is only ever written by the streaming loop, and would have
+            // stayed empty for it. Emptying the report in the same breath is what stops the two
+            // from counting this request twice.
+            //
+            // The report names the model as well as the counts, and emptying it takes that with it.
+            // Harmless, because the two lines below put the name back before anything can read it
+            // — there is no `await` between here and `costs.record`, and the row falls back to the
+            // ledger's model, which is the one this reply just filed.
+            self.turn_spent.lock().expect("turn spend mutex").absorb(resp.usage);
+            *self.live.lock().expect("live mutex") = LiveReport::default();
             // And the priced view of the same turn. Recorded with the model the relay just
             // reported, so a session that spans providers prices each turn at the rate of the
             // model that actually served it — which is why the totals are grouped by currency
@@ -1525,8 +1591,9 @@ impl Agent {
         let _clear = InflightGuard(&self.inflight_input_bytes);
         // And forget what the *previous* request reported, so the row cannot price this request
         // with the last one's numbers. The reasoning buffer is cleared in the same place and for
-        // the same reason — see `clear_live`, which says why the two are one call.
-        self.clear_live();
+        // the same reason — see `clear_request`, which says why the two are one call, and why the
+        // turn's running total survives it.
+        self.clear_request();
         // Sent through the retry helper rather than straight: a 429 here used
         // to end the turn, and a rate limit is a statement about timing, not
         // about the request. The closure rebuilds the request per attempt
@@ -2139,6 +2206,40 @@ pub struct Usage {
 }
 
 impl Usage {
+    /// Whether anything has been counted at all.
+    ///
+    /// The four kinds together, because a request can be billed in any of them: a reply that was
+    /// entirely a cached read still cost something, and a test on the input count alone would call
+    /// it nothing.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.input_tokens == 0
+            && self.output_tokens == 0
+            && self.cache_read_input_tokens == 0
+            && self.cache_creation_input_tokens == 0
+    }
+
+    /// Add another request's counts to these, kind by kind.
+    ///
+    /// A turn is several requests and the status row shows their sum, so this is the arithmetic
+    /// that makes that figure. Saturating rather than wrapping: the counts come off the wire, and a
+    /// total that wrapped to nearly nothing would be a worse reading than one that stuck at the
+    /// top — the figure is shown to a person, not used for anything that must be exact.
+    ///
+    /// The four kinds are added separately, never as one number, because the price depends on the
+    /// split: a cached read is roughly a tenth of a fresh input token, and collapsing the four into
+    /// a single total would lose exactly the distinction the row exists to price.
+    pub const fn absorb(&mut self, other: Self) {
+        self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
+        self.cache_read_input_tokens = self
+            .cache_read_input_tokens
+            .saturating_add(other.cache_read_input_tokens);
+        self.cache_creation_input_tokens = self
+            .cache_creation_input_tokens
+            .saturating_add(other.cache_creation_input_tokens);
+    }
+
     /// The four kinds as one value, for the cost arithmetic.
     #[must_use]
     pub const fn tokens(&self) -> crate::cost::Tokens {
@@ -2392,9 +2493,12 @@ mod tests {
     /// be a regression from showing an estimate.
     #[test]
     fn before_the_reply_opens_the_only_figure_is_the_requests_own_size() {
-        let live = live_figures(LiveReport::default(), 400_000).expect("something to show");
+        let live = live_figures(LiveReport::default(), 400_000, Usage::default()).expect("something to show");
         assert!(!live.reported, "it is arithmetic, not a count");
-        assert!(live.output_estimated, "and no output has arrived");
+        assert!(
+            !live.output_estimated,
+            "nothing has arrived to estimate, so the zero output is a measurement and not a guess"
+        );
         assert_eq!(live.usage.input_tokens, 100_000, "400 kB at 4 bytes a token");
         assert_eq!(live.usage.output_tokens, 0);
     }
@@ -2402,7 +2506,58 @@ mod tests {
     /// Nothing measured and nothing reported is nothing to show, which is the row between turns.
     #[test]
     fn a_request_that_has_not_been_sized_shows_nothing() {
-        assert!(live_figures(LiveReport::default(), 0).is_none());
+        assert!(live_figures(LiveReport::default(), 0, Usage::default()).is_none());
+    }
+
+    /// A turn's finished requests are added to the one in flight, which is the whole point of the
+    /// accumulator: a four-round turn used to show nothing but its last request.
+    #[test]
+    fn the_finished_requests_of_a_turn_are_added_to_the_one_in_flight() {
+        let spent = Usage {
+            input_tokens: 50_000,
+            output_tokens: 900,
+            cache_read_input_tokens: 40_000,
+            ..Usage::default()
+        };
+        let live = live_figures(LiveReport::default(), 0, spent).expect("the turn so far");
+        assert_eq!(
+            live.usage.input_tokens, 50_000,
+            "no request is in flight, so the row is the turn's finished ones alone"
+        );
+        assert_eq!(live.usage.output_tokens, 900);
+        assert_eq!(
+            live.usage.cache_read_input_tokens, 40_000,
+            "and the kinds are kept apart"
+        );
+        assert!(
+            live.reported,
+            "nothing is being guessed between rounds, so the sum is exact and takes no `~`"
+        );
+        assert!(!live.output_estimated, "and the output figure is a real count too");
+    }
+
+    /// The sum is what a reader watching a second round sees: the first round's counts are still
+    /// there, and the second's are added to them.
+    #[test]
+    fn a_later_round_climbs_from_where_the_previous_one_stopped() {
+        let spent = Usage {
+            input_tokens: 50_000,
+            output_tokens: 900,
+            ..Usage::default()
+        };
+        let report = LiveReport {
+            started: true,
+            usage: Usage {
+                input_tokens: 62_000,
+                output_tokens: 300,
+                ..Usage::default()
+            },
+            output_bytes: 0,
+            ..LiveReport::default()
+        };
+        let live = live_figures(report, 0, spent).expect("something to show");
+        assert_eq!(live.usage.input_tokens, 112_000, "50,000 then 62,000, not 62,000 alone");
+        assert_eq!(live.usage.output_tokens, 1_200, "900 then 300");
     }
 
     /// Once the reply opens, the input count is the provider's own and the output is counted from
@@ -2419,7 +2574,7 @@ mod tests {
             output_bytes: 8_000,
             model: Some("claude-sonnet-4-6".to_owned()),
         };
-        let live = live_figures(report, 900_000).expect("something to show");
+        let live = live_figures(report, 900_000, Usage::default()).expect("something to show");
         assert!(live.reported, "the input count is the provider's");
         assert_eq!(
             live.usage.input_tokens, 54_321,
@@ -2448,7 +2603,7 @@ mod tests {
             output_bytes: 8_000,
             ..LiveReport::default()
         };
-        let live = live_figures(report, 0).expect("something to show");
+        let live = live_figures(report, 0, Usage::default()).expect("something to show");
         assert_eq!(
             live.usage.output_tokens, 640,
             "the count, not the 2,000 the bytes imply"
@@ -2469,10 +2624,32 @@ mod tests {
             output_bytes: 4_000,
             ..LiveReport::default()
         };
-        let live = live_figures(report, 40_000).expect("something to show");
+        let live = live_figures(report, 40_000, Usage::default()).expect("something to show");
         assert!(!live.reported, "nothing was confirmed, so the figures are estimates");
         assert_eq!(live.usage.input_tokens, 10_000, "the request's own size");
         assert_eq!(live.usage.output_tokens, 1_000);
+    }
+
+    /// A request in flight that the provider has not answered yet is in the sum as an estimate, and
+    /// the `~` says so.
+    ///
+    /// The turn's figure is meant to answer "what has this cost so far", and a round that is on the
+    /// wire has been sent whether or not it has been answered — so its length is in the sum, marked
+    /// as the arithmetic it is rather than left out. Leaving it out would make the figure *drop* at
+    /// the end of a round, when the estimate is replaced by a real count that is usually larger.
+    #[test]
+    fn a_round_still_on_the_wire_is_in_the_sum_as_an_estimate() {
+        let spent = Usage {
+            input_tokens: 50_000,
+            output_tokens: 900,
+            ..Usage::default()
+        };
+        let live = live_figures(LiveReport::default(), 40_000, spent).expect("something to show");
+        assert_eq!(
+            live.usage.input_tokens, 60_000,
+            "the turn's 50,000 plus this request's 40 kB estimate"
+        );
+        assert!(!live.reported, "and the sum is marked as holding a guess");
     }
 
     /// The two counts are the four kinds the pricing applies to, which is what makes the price on
@@ -2490,7 +2667,7 @@ mod tests {
             output_bytes: 0,
             ..LiveReport::default()
         };
-        let live = live_figures(report, 0).expect("something to show");
+        let live = live_figures(report, 0, Usage::default()).expect("something to show");
         let tokens = live.tokens();
         assert_eq!(tokens.input, 0, "900 sent of which 900 cached reads");
         assert_eq!(tokens.cache_read, 5_000);

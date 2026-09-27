@@ -214,7 +214,12 @@ pub const fn estimate_input_tokens(bytes: usize) -> u64 {
     (bytes / BYTES_PER_TOKEN) as u64
 }
 
-/// What the request in flight has used and what the provider has confirmed about it.
+/// What the turn running now has used and what the provider has confirmed about it.
+///
+/// "Turn", not "request": a turn is several requests — the model thinks, calls a tool, thinks again
+/// — and each is billed, so these counts are the sum over the ones that have finished plus what the
+/// one in flight is up to. A figure that restarted at each round answered a different question, and
+/// the operator watching the row is asking what the turn has cost so far.
 ///
 /// The two are separate fields because they are separate claims. `usage` is what has been counted,
 /// from whichever source was available — the provider's own figures once it has reported any, the
@@ -263,7 +268,7 @@ impl Live {
     }
 }
 
-/// The cost of the request in flight, for the row that is repainted while it runs.
+/// The cost of the turn running now, for the row that is repainted while it runs.
 ///
 /// This is deliberately *not* [`cost_line`]. That line is printed once, under a finished answer,
 /// where there is room for the model, the currency codes and a note about unpriced tokens; this one
@@ -271,17 +276,19 @@ impl Live {
 /// queue count, and it is repainted several times a second. So it is short, and it gives up the
 /// money before it gives up the counts.
 ///
-/// The order of that last decision matters. A narrow terminal should lose the price and keep the
-/// tokens, not the other way round: the counts are the fact the price is computed from, they are
-/// what the totals line under the answer will agree with, and a price with no counts above it
-/// invites the reader to wonder what it was charged for.
-///
-/// `~` marks one figure, not the line: it sits on exactly the number that is local arithmetic rather
+/// The figure covers the turn, not the request: it is the sum of the requests that have finished
+/// and the one in flight, so it climbs across tool rounds instead of starting again at each. `~`
+/// marks one figure, not the line: it sits on exactly the number that is local arithmetic rather
 /// than the provider's own count. Before the reply opens that is both of them; after it opens the
 /// input side is exact and the output side is still being counted from the bytes received, so the
 /// row reads `12,345 in · ~900 out` — which is the whole point of carrying the two flags separately.
 /// A single mark over the pair would either understate a count the provider gave or overstate one it
 /// has not.
+///
+/// The order of the give-up matters. A narrow terminal should lose the price and keep the tokens,
+/// not the other way round: the counts are the fact the price is computed from, they are what the
+/// totals line under the answer will agree with, and a price with no counts above it invites the
+/// reader to wonder what it was charged for.
 ///
 /// `price` is the catalog entry for the model the session is running as, or `None` when no catalog
 /// has arrived or the model is not in it. Money is grouped by currency for the same reason
