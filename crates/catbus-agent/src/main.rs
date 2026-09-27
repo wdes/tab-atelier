@@ -234,6 +234,30 @@ struct Args {
     #[arg(long, env = "CATBUS_OPENAI_MODEL", requires = "openai_url")]
     openai_model: Option<String>,
 
+    /// `reasoning_effort` to send to --openai-url, for a model that needs one.
+    ///
+    /// Left unset by default, and that default is deliberate: there is no value
+    /// that suits every model, so guessing would break the ones that work today.
+    /// Both directions are measured:
+    ///
+    /// * A **reasoning** model of the gpt-5/gpt-6 or o-series generation refuses
+    ///   a request that carries function tools unless this is sent as `none` —
+    ///   `400 Function tools with reasoning_effort are not supported for
+    ///   <model> in /v1/chat/completions`. The tool loop cannot run without it.
+    /// * A **classic** model (`gpt-4.1`, `gpt-4o`, `gpt-3.5-turbo`) refuses the
+    ///   field outright — `400 Unrecognized request argument supplied:
+    ///   reasoning_effort` — so sending it unconditionally would break the models
+    ///   that work today.
+    ///
+    /// Because the two families disagree, the value has to come from the operator
+    /// who knows which model they pointed at. `none` is the value a tool-using
+    /// agent wants from a reasoning model: the reasoning trace is not rendered on
+    /// this wire (see `openai.rs`), so paying for it and losing it buys nothing.
+    /// A provider that ignores the field entirely (a local Ollama server does)
+    /// is unaffected either way.
+    #[arg(long, env = "CATBUS_OPENAI_REASONING_EFFORT", requires = "openai_url")]
+    openai_reasoning_effort: Option<String>,
+
     /// Infomaniak AI Tools product id — a shortcut for --openai-url
     /// that builds the product-scoped Infomaniak endpoint. Together
     /// with --infomaniak-token this routes the session through
@@ -387,12 +411,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 chat_url: openai::chat_url_from_base(&url),
                 token,
                 model,
+                reasoning_effort: args.openai_reasoning_effort,
             })
         } else if let (Some(product_id), Some(token)) = (args.infomaniak_product_id, args.infomaniak_token) {
             agent::Provider::OpenAiCompat(openai::Config {
                 chat_url: openai::infomaniak_chat_url(&product_id),
                 token,
                 model: args.infomaniak_model,
+                // Infomaniak's models are not the reasoning family, and the field
+                // is refused by models that do not know it.
+                reasoning_effort: None,
             })
         } else {
             let relay = relay::Relay::resolve(args.relay_url.as_deref(), args.relay_token.as_deref())?;

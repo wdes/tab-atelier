@@ -1696,7 +1696,14 @@ impl Agent {
         let system = INSTRUCTIONS_MARKDOWN.to_owned();
         let tool_specs = self.tools.specs().to_vec();
         let state = cache::env_text(&active.session.cwd.display().to_string(), self.gate().as_str());
-        let body = crate::openai::build_request(&cfg.model, &system, &state, &tool_specs, &active.history);
+        let body = crate::openai::build_request(
+            &cfg.model,
+            &system,
+            &state,
+            &tool_specs,
+            &active.history,
+            cfg.reasoning_effort.as_deref(),
+        );
         drop(active);
         let resp = self
             .http

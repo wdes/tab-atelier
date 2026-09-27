@@ -249,6 +249,17 @@ fn openai_backend_runs_a_tool_round_trip() {
     );
     let req = body_of(&first);
     assert_eq!(req["model"], "test-model");
+    // The output ceiling goes out under the name every service reads. This is the
+    // end-to-end half of the fix in `openai.rs`: a model from the gpt-5/gpt-6 or
+    // o-series generation fails the whole request with `400 Unsupported
+    // parameter: 'max_tokens'`, so a body still carrying the legacy key would
+    // make those models unreachable however correct the rest of the request is.
+    assert_eq!(req["max_completion_tokens"], 8192);
+    assert!(
+        req.get("max_tokens").is_none(),
+        "the legacy field must not be sent at all: {}",
+        req["max_tokens"]
+    );
     assert_eq!(req["messages"][0]["role"], "system");
     assert_eq!(req["messages"][1]["role"], "user");
     assert_eq!(req["messages"][1]["content"], "read hello.txt please");
