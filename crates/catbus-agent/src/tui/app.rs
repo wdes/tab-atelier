@@ -528,10 +528,18 @@ impl Ui {
     /// written once and scrolls away naturally, instead of being part of the area
     /// the app repaints.
     pub fn print_above(&mut self, text: &str) -> std::io::Result<()> {
-        let height = u16::try_from(text.trim_end_matches('\n').split('\n').count()).unwrap_or(u16::MAX);
-        let body = text.trim_end_matches('\n').to_owned();
+        // Wrapped to the terminal so the whole line survives. The buffer these rows are painted
+        // into stops at its right edge rather than continuing on the next row, so a line that
+        // reached it unbroken lost everything past it — see `wrap_plain`.
+        let width = usize::from(self.terminal.size()?.width).max(1);
+        let lines: Vec<String> = text
+            .trim_end_matches('\n')
+            .split('\n')
+            .flat_map(|line| wrap_plain(line, width))
+            .collect();
+        let height = u16::try_from(lines.len()).unwrap_or(u16::MAX);
         self.insert(height, move |buf| {
-            for (i, line) in body.split('\n').enumerate() {
+            for (i, line) in lines.iter().enumerate() {
                 let y = buf.area.top().saturating_add(u16::try_from(i).unwrap_or(0));
                 buf.set_string(buf.area.left(), y, line, Style::default());
             }
@@ -546,10 +554,14 @@ impl Ui {
     /// rendered text, which matters for tables: see `tui::markdown` for why they are
     /// padded pipes rather than box-drawing.
     pub fn print_markdown(&mut self, text: &str) -> std::io::Result<()> {
-        let lines = crate::tui::markdown::render(text);
-        if lines.is_empty() {
+        let rendered = crate::tui::markdown::render(text);
+        if rendered.is_empty() {
             return Ok(());
         }
+        // Wrapped for the same reason as `print_above`, and through the styled wrapper so the
+        // emphasis survives: a rendered line is spans, and the row it is cut into has to carry them.
+        let width = usize::from(self.terminal.size()?.width).max(1);
+        let lines: Vec<Line<'static>> = rendered.iter().flat_map(|line| wrap_styled(line, width)).collect();
         let height = u16::try_from(lines.len()).unwrap_or(u16::MAX);
         self.insert(height, move |buf| {
             for (i, line) in lines.iter().enumerate() {
@@ -575,22 +587,11 @@ impl Ui {
         } else {
             Style::default()
         };
-        let body = prompt
-            .trim_end()
-            .lines()
-            .enumerate()
-            .map(|(i, line)| {
-                if i == 0 {
-                    format!("> {line}")
-                } else {
-                    format!("  {line}")
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        let height = u16::try_from(body.split('\n').count()).unwrap_or(u16::MAX);
+        let width = usize::from(self.terminal.size()?.width).max(1);
+        let body = marked_prompt_rows(prompt, width);
+        let height = u16::try_from(body.len()).unwrap_or(u16::MAX);
         self.insert(height, move |buf| {
-            for (i, line) in body.split('\n').enumerate() {
+            for (i, line) in body.iter().enumerate() {
                 let y = buf.area.top().saturating_add(u16::try_from(i).unwrap_or(0));
                 buf.set_string(buf.area.left(), y, line, style);
             }
@@ -1070,6 +1071,110 @@ fn wrap_prompt(prompt: &str, before: &str, after: &str, width: usize) -> Wrapped
 fn split_at_chars(text: &str, at: usize) -> (&str, &str) {
     let byte = text.char_indices().nth(at).map_or(text.len(), |(index, _)| index);
     text.split_at(byte)
+}
+
+/// The operator's prompt as the rows it will be echoed on.
+///
+/// `> ` marks the first row and two spaces every row after it, so a multi-line prompt still reads as
+/// one unit — and a *wrapped* line does too, which is why the indent follows the text rather than
+/// the marker: the continuation rows line up under the prompt instead of under the `> `, where they
+/// would look like a new prompt.
+///
+/// Wrapped for the same reason a reply is. The echoed prompt goes through the same drawing path,
+/// which stops at the right-hand edge, so a long line pasted in from a file used to lose its end —
+/// and the operator's own words are the last thing that should come back to them truncated.
+#[must_use]
+fn marked_prompt_rows(prompt: &str, width: usize) -> Vec<String> {
+    // Two columns go to the marker, so the text gets the rest.
+    let inner = width.saturating_sub(2).max(1);
+    prompt
+        .trim_end()
+        .lines()
+        .enumerate()
+        .flat_map(|(line, text)| {
+            wrap_plain(text, inner).into_iter().enumerate().map(move |(row, text)| {
+                if line == 0 && row == 0 {
+                    format!("> {text}")
+                } else {
+                    format!("  {text}")
+                }
+            })
+        })
+        .collect()
+}
+
+/// A line broken into the rows it takes to fit `width`, losing nothing.
+///
+/// Hard-wrapped, breaking mid-word where a word does not fit, because that is what a terminal does
+/// with text longer than it is wide — this exists so the view agrees with the terminal, not so it
+/// re-flows anything. The alternative it replaces is not a prettier wrap but no wrap at all: the
+/// view paints into a buffer (see [`Ui::insert`]), the buffer's own setters stop at the right edge
+/// rather than continuing on the next row, so a line wider than the terminal was simply *gone* past
+/// that edge. That is the bug this fixes — a reply was not wrapped, it was cut.
+///
+/// By character count rather than display width, matching [`wrap_prompt`] and the status line: the
+/// three of them have to agree about where a row ends or they contradict each other on the same
+/// screen, and one place to be wrong about wide characters is as much as this needs.
+#[must_use]
+fn wrap_plain(line: &str, width: usize) -> Vec<String> {
+    // A width of zero would make `chunks` panic and is not a real terminal; treating it as one
+    // column keeps a broken size from taking the session down with it.
+    let width = width.max(1);
+    if line.chars().count() <= width {
+        return vec![line.to_owned()];
+    }
+    line.chars()
+        .collect::<Vec<char>>()
+        .chunks(width)
+        .map(|row| row.iter().collect())
+        .collect()
+}
+
+/// A rendered line broken into the rows it takes to fit `width`, styles intact.
+///
+/// The styled counterpart of [`wrap_plain`], and separate because a rendered line is spans rather
+/// than characters. Flattening it to text would drop the emphasis the renderer exists to produce,
+/// and moving a whole span down when it did not fit would leave a ragged edge on any paragraph of
+/// ordinary prose — so spans are split where the row ends and the remainder keeps the style it had.
+/// A bold run broken across two rows is bold on both halves.
+///
+/// All three of the line's own properties travel to every row it becomes, `alignment` included:
+/// a centred heading that wrapped is still centred, and dropping it would leave the continuation
+/// rows ranged left under it.
+#[must_use]
+fn wrap_styled(line: &Line<'_>, width: usize) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    let mut rows: Vec<Vec<Span<'static>>> = Vec::new();
+    let mut row: Vec<Span<'static>> = Vec::new();
+    let mut used = 0;
+    for span in &line.spans {
+        let mut rest = span.content.as_ref();
+        while !rest.is_empty() {
+            if used == width {
+                rows.push(std::mem::take(&mut row));
+                used = 0;
+            }
+            let (head, tail) = split_at_chars(rest, width - used);
+            row.push(Span::styled(head.to_owned(), span.style));
+            used += head.chars().count();
+            rest = tail;
+        }
+    }
+    // The last row holds whatever is left, and an empty line becomes one empty row — which is what
+    // a blank line between two paragraphs is, and has to keep counting as one row of height.
+    rows.push(row);
+    rows.into_iter()
+        .map(|spans| {
+            // The builder takes the alignment itself rather than the `Option` the field holds, so
+            // it is only applied when there is one: calling it unconditionally would turn a line
+            // that never asked for an alignment into an explicitly left-aligned one.
+            let mut rendered = Line::from(spans).style(line.style);
+            if let Some(alignment) = line.alignment {
+                rendered = rendered.alignment(alignment);
+            }
+            rendered
+        })
+        .collect()
 }
 
 /// The key hints that fit on the note row, after the note itself.
@@ -2220,6 +2325,9 @@ async fn run_inner(ui: &mut Ui, agent: Arc<Agent>, cwd: &Path) -> std::io::Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the wrap tests need to name it — `wrap_styled` passes an alignment through without ever
+    // spelling out its type — so importing it at the top would be an unused import in the binary.
+    use ratatui::layout::HorizontalAlignment;
 
     /// A two-option question, as the tool would hand one over.
     fn question(prompt: &str, multi: bool) -> crate::tools::ask::Question {
@@ -2776,6 +2884,132 @@ mod tests {
         // A terminal with no rows to spare, and one with no columns.
         assert!(live_lines(Some("thinking"), 40, 0).is_empty());
         assert!(live_lines(Some("thinking"), 0, 3).is_empty());
+    }
+
+    /// A line that fits its width is left exactly as it was: wrapping is for lines that do not.
+    #[test]
+    fn a_wrapped_line_that_fits_is_unchanged() {
+        assert_eq!(wrap_plain("short", 40), vec!["short"]);
+        // Exactly the width is a fit, not an overflow: a row of `width` characters occupies one row.
+        assert_eq!(wrap_plain("12345", 5), vec!["12345"]);
+        // An empty line is one empty row, so a blank line still counts as a row of height.
+        assert_eq!(wrap_plain("", 10), vec![""]);
+    }
+
+    /// A line longer than the width is broken into rows, and **nothing is lost** — which is the
+    /// whole point, since the alternative the view used to have was losing everything past the edge.
+    #[test]
+    fn a_wrapped_line_keeps_every_character() {
+        let line = "the quick brown fox jumps over the lazy dog and keeps on running past the edge";
+        for width in 1..=line.len() {
+            let rows = wrap_plain(line, width);
+            assert_eq!(rows.concat(), line, "width {width} lost or reordered text: {rows:?}");
+            for row in &rows {
+                assert!(
+                    row.chars().count() <= width,
+                    "width {width} produced an over-long row: {row:?}"
+                );
+            }
+        }
+    }
+
+    /// Wrapping counts characters, not bytes: multi-byte text must not be split down the middle,
+    /// where a byte offset would panic.
+    #[test]
+    fn a_wrapped_line_never_splits_a_character() {
+        let line = "éééééééééé"; // two bytes each
+        let rows = wrap_plain(line, 3);
+        assert_eq!(rows.concat(), line);
+        assert_eq!(rows, vec!["ééé", "ééé", "ééé", "é"]);
+    }
+
+    /// The rendered (styled) wrap keeps the styling on every row it produces.
+    ///
+    /// A bold run broken across a row boundary has to be bold on both halves, or the wrap would
+    /// quietly reformat the answer — which is worse than the clipping it replaces, because the
+    /// text would still look deliberate.
+    #[test]
+    fn a_wrapped_span_keeps_its_style_on_every_row() {
+        let bold = Style::default().add_modifier(Modifier::BOLD);
+        let line = Line::from(Span::styled("abcdefghij", bold));
+        let rows = wrap_styled(&line, 4);
+        assert_eq!(rows.len(), 3);
+        let carried: Vec<String> = rows.iter().map(|row| row.spans[0].content.to_string()).collect();
+        assert_eq!(carried, vec!["abcd", "efgh", "ij"]);
+        for row in &rows {
+            assert_eq!(row.spans[0].style, bold, "the emphasis was dropped by the wrap");
+        }
+    }
+
+    /// A line of several spans wraps at the row edge, in order, with each span's own style kept.
+    #[test]
+    fn a_wrapped_run_of_spans_is_split_at_the_row_edge() {
+        let plain = Style::default();
+        let bold = Style::default().add_modifier(Modifier::BOLD);
+        // "aaaa" plain, then "bbbb" bold: at width 3 the split lands mid-span on both.
+        let line = Line::from(vec![Span::styled("aaaa", plain), Span::styled("bbbb", bold)]);
+        let rows = wrap_styled(&line, 3);
+        let text: Vec<String> = rows
+            .iter()
+            .map(|row| row.spans.iter().map(|s| s.content.to_string()).collect::<String>())
+            .collect();
+        assert_eq!(text, vec!["aaa", "abb", "bb"]);
+        assert_eq!(rows[0].spans[0].style, plain);
+        // The span that straddles the boundary is bold on both of the rows it reaches.
+        assert_eq!(rows[1].spans[1].style, bold);
+        assert_eq!(rows[2].spans[0].style, bold);
+    }
+
+    /// The line's own properties — its base style and its alignment — travel to every row, so a
+    /// centred heading that wrapped is still centred, and its continuation rows line up with it.
+    #[test]
+    fn a_wrapped_line_carries_its_alignment_to_every_row() {
+        let base = Style::default().fg(Color::Red);
+        let line = Line::from("a rather long centred heading")
+            .style(base)
+            .alignment(HorizontalAlignment::Center);
+        let rows = wrap_styled(&line, 10);
+        assert!(rows.len() > 1, "the fixture has to wrap for this to test anything");
+        for row in &rows {
+            assert_eq!(row.alignment, Some(HorizontalAlignment::Center));
+            assert_eq!(row.style, base);
+        }
+        // A line that asked for no alignment does not acquire one on the way through.
+        let unaligned = wrap_styled(&Line::from("no alignment asked for"), 5);
+        assert!(unaligned.iter().all(|row| row.alignment.is_none()));
+    }
+
+    /// An empty rendered line stays one row, so blank lines keep their place in the output.
+    #[test]
+    fn a_wrapped_empty_line_is_one_row() {
+        let rows = wrap_styled(&Line::from(""), 10);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].spans.iter().map(|s| s.content.to_string()).collect::<String>(),
+            ""
+        );
+    }
+
+    /// The echoed prompt keeps its `> ` on the first row and indents the rest — including the rows
+    /// a long line was wrapped onto, so they do not read as new prompts.
+    #[test]
+    fn the_echoed_prompt_marks_the_first_row_and_indents_the_wrapped_ones() {
+        let rows = marked_prompt_rows("hello", 20);
+        assert_eq!(rows, vec!["> hello"]);
+
+        // Two lines, neither needing a wrap: the marker is on the first only.
+        let rows = marked_prompt_rows("first\nsecond", 20);
+        assert_eq!(rows, vec!["> first", "  second"]);
+
+        // One long line: the continuation rows are indented, and every character survives.
+        let rows = marked_prompt_rows("abcdefghij", 6);
+        assert_eq!(rows, vec!["> abcd", "  efgh", "  ij"]);
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.chars().skip(2).collect::<String>())
+                .collect::<String>(),
+            "abcdefghij"
+        );
     }
 
     /// A clipped line is exactly the width it was given, so it cannot wrap.

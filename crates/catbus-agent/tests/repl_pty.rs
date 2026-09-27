@@ -1101,6 +1101,21 @@ const REPLY_WITH_TABLE: &str = r###"{
     "usage": { "input_tokens": 10, "output_tokens": 10 }
 }"###;
 
+/// A reply whose answer is a single line far wider than the 80-column terminal.
+///
+/// The end marker is the point: it sits past column 80, so a view that paints the line without
+/// wrapping loses it entirely. Asserting the marker survives is asserting the wrap happened, and
+/// nothing about the wrap's shape has to be guessed at.
+const REPLY_WITH_LONG_LINE: &str = r#"{
+    "id": "msg_long",
+    "type": "message",
+    "role": "assistant",
+    "model": "claude-sonnet-4-6",
+    "content": [{ "type": "text", "text": "this answer is deliberately one single line far wider than the terminal so that a version which does not wrap it will lose the end of the sentence entirely TAILMARKER" }],
+    "stop_reason": "end_turn",
+    "usage": { "input_tokens": 10, "output_tokens": 10 }
+}"#;
+
 /// The screen a terminal would be showing, given what the app wrote to it.
 ///
 /// This is the point of the test below being worth anything. A pty capture is not a picture of a
@@ -2002,5 +2017,45 @@ fn leaving_the_repl_ends_the_output_with_a_newline() {
         shown.ends_with('\n'),
         "the shell would have continued the app's last line. Output ended with: {:?}",
         &shown[shown.len().saturating_sub(60)..]
+    );
+}
+
+/// A reply wider than the terminal is wrapped onto the following rows, not cut off at the edge.
+///
+/// The view paints into a buffer whose setters stop at the right edge rather than continuing on the
+/// next row, so an unwrapped line was silently *lost* past column 80 — not clipped with a visible
+/// marker, just gone, which is the kind of truncation that has already caused confusion on this
+/// project. The fixture puts its marker past that column for exactly this reason.
+#[test]
+fn a_reply_wider_than_the_terminal_is_wrapped_rather_than_cut() {
+    let port = spawn_delayed_relay(REPLY_WITH_LONG_LINE, Duration::from_millis(0));
+    // Wait on the *opening* words, which arrive whether or not the wrap works. Waiting on the tail
+    // instead would make a timeout ambiguous — a lost tail and a turn that never ran would look
+    // the same, and the point of this test is to tell those apart.
+    let (started, seen) = type_and_expect_at(port, &[], "one long line", "this answer is deliberately");
+    assert!(started, "the reply never reached the screen:\n{seen}");
+
+    let screen = screen_of(&seen, 200, 80);
+    // The rows are joined back together before looking for the marker, because a correct wrap is
+    // allowed to fall *inside* it — at 80 columns `TAILMARKER` straddles the boundary, and a test
+    // that searched row by row would fail on a wrap that had worked perfectly. Joining is also the
+    // stronger claim: it asserts the whole answer is on screen, not merely that some row is.
+    let rejoined: String = screen.iter().map(|row| row.trim_end()).collect();
+    let text = screen.join("\n");
+    assert!(
+        rejoined.contains("TAILMARKER"),
+        "the end of the reply was cut off rather than wrapped:\n{text}"
+    );
+    // And it is the same reply, not a second one: the opening words are still there above it.
+    assert!(
+        rejoined.contains("this answer is deliberately"),
+        "the reply was replaced rather than wrapped:\n{text}"
+    );
+    // The wrap is a wrap, not a shorter copy of the text: every character of the answer is present
+    // once, in order, with only the row breaks added.
+    assert_eq!(
+        rejoined.matches("this answer is deliberately").count(),
+        1,
+        "the reply appears more than once on the screen:\n{text}"
     );
 }
