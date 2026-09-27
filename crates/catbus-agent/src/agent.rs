@@ -534,14 +534,15 @@ impl Agent {
         // The session's own model, so reopening continues with it. Read once and
         // used for both the request and the identity decision below.
         let from_transcript = session.last_model();
+        // The provider's own config names a model explicitly on the
+        // OpenAI-compatible path, so it is a better default there than ours.
+        let provider_model = match &provider {
+            Provider::OpenAiCompat(config) => Some(config.model.clone()),
+            Provider::Relay(_) => None,
+        };
         let model = session
             .saved_model()
-            // The provider's own config names a model explicitly on the
-            // OpenAI-compatible path, so it is a better default there than ours.
-            .or_else(|| match &provider {
-                Provider::OpenAiCompat(config) => Some(config.model.clone()),
-                Provider::Relay(_) => None,
-            })
+            .or_else(|| provider_model.clone())
             .unwrap_or_else(|| DEFAULT_MODEL.to_owned());
         Self {
             provider,
@@ -582,7 +583,14 @@ impl Agent {
             // the first request of a resumed session behave like the last request
             // of the session it is continuing, instead of like a brand-new one.
             model: std::sync::Mutex::new(model),
-            served_model: std::sync::Mutex::new(from_transcript),
+            // What actually answered, when the transcript says. Failing that, the
+            // model the provider was configured with — on the OpenAI-compatible
+            // path there is no relay to answer with something else, so the
+            // configured name is not a guess and the first turn can already know
+            // whether the Claude identity line is a lie. The relay path keeps
+            // `None` until a reply names a model, which is the only honest answer
+            // there: the client does not decide what serves it.
+            served_model: std::sync::Mutex::new(from_transcript.or(provider_model)),
             status: std::sync::Mutex::new(None),
             reasoning: std::sync::Mutex::new(String::new()),
             answer: std::sync::Mutex::new(String::new()),
@@ -592,6 +600,37 @@ impl Agent {
             live: std::sync::Mutex::new(LiveReport::default()),
             turn_spent: std::sync::Mutex::new(Usage::default()),
             cancel: std::sync::Mutex::new(CancellationToken::new()),
+        }
+    }
+
+    /// The identity text to send, or `None` to send none.
+    ///
+    /// One answer for both wires. They call different APIs and need different
+    /// bodies, but "who is this agent" is not part of that difference, and when
+    /// each decided for itself the OpenAI-compatible path simply never asked —
+    /// see its call site.
+    ///
+    /// The rule itself is the one the relay always had: the operator's file
+    /// replaces the prompt outright, and failing that, the Claude line goes out
+    /// only for an Anthropic model, or before any reply has named one (a first
+    /// turn cannot know, so it keeps the old behaviour).
+    fn identity_text(&self) -> Option<std::borrow::Cow<'_, str>> {
+        match &self.identity {
+            crate::identity::Identity::Text { text, .. } => Some(std::borrow::Cow::Owned(text.clone())),
+            crate::identity::Identity::Omitted { .. } => None,
+            crate::identity::Identity::Auto => {
+                let non_anthropic = self
+                    .served_model
+                    .lock()
+                    .expect("served model mutex")
+                    .as_deref()
+                    .is_some_and(|model| !crate::identity::is_anthropic(model));
+                if non_anthropic {
+                    None
+                } else {
+                    Some(std::borrow::Cow::Borrowed(crate::identity::CLAUDE_CODE_PREFIX))
+                }
+            }
         }
     }
 
@@ -1569,28 +1608,19 @@ impl Agent {
         // when no reply has named a model yet: the first turn of a session cannot
         // know, so it keeps the old behaviour, and from the second on the served
         // model decides.
-        let identity = self.identity.clone();
+        //
+        // The rule lives in `identity_text` because both wires need it, and the
+        // OpenAI-compatible one did not ask for it: it built its system string
+        // from the brief and the rendering rules alone, dropping the identity
+        // silently. An operator's `identity.md` was read, resolved, and then
+        // never sent — which is why the two wires disagreed about who the agent
+        // was rather than about how to reach it.
         // Held across the body construction: `MessagesReq` borrows it, so the
         // guard has to outlive the request value.
         let session_model = self.model.lock().expect("model mutex").clone();
-        let non_anthropic = self
-            .served_model
-            .lock()
-            .expect("served model mutex")
-            .as_deref()
-            .is_some_and(|model| !crate::identity::is_anthropic(model));
-        let mut system = match identity {
-            crate::identity::Identity::Text { text, .. } => vec![SystemBlock {
-                kind: "text",
-                text: std::borrow::Cow::Owned(text),
-            }],
-            crate::identity::Identity::Omitted { .. } => Vec::new(),
-            crate::identity::Identity::Auto if non_anthropic => Vec::new(),
-            crate::identity::Identity::Auto => vec![SystemBlock {
-                kind: "text",
-                text: std::borrow::Cow::Borrowed(crate::identity::CLAUDE_CODE_PREFIX),
-            }],
-        };
+        let mut system = self
+            .identity_text()
+            .map_or_else(Vec::new, |text| vec![SystemBlock { kind: "text", text }]);
         // The project's brief, when the tree has one, goes between the identity and
         // the rendering rules. That order is the whole design: who the agent is,
         // then how work is done here, then how to write to this terminal. It is
@@ -1728,14 +1758,23 @@ impl Agent {
         // put mutable bytes at the very front — the defect this change exists
         // to remove. `build_request` appends it after the history instead, for
         // the same reason it goes last on the relay wire.
-        // The project's brief first, then the terminal's rules — the same order as
-        // the relay wire, and for the same reason: the specific word about this tree
-        // comes before the general word about how to write.
-        let system = if self.brief.is_empty() {
-            INSTRUCTIONS_MARKDOWN.to_owned()
-        } else {
-            format!("{}\n\n{INSTRUCTIONS_MARKDOWN}", self.brief)
-        };
+        // The identity first, then the project's brief, then the terminal's rules
+        // — the same order and the same three parts as the relay wire.
+        //
+        // The identity used to be missing here, and that is not a matter of style:
+        // this path built its system string from the brief and the instructions
+        // alone, so an operator's `identity.md` was read, resolved, and dropped.
+        // An agent pointed at any OpenAI-compatible endpoint therefore answered
+        // "who are you" from its own training data — it had never been told.
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(identity) = self.identity_text() {
+            parts.push(identity.into_owned());
+        }
+        if !self.brief.is_empty() {
+            parts.push(self.brief.clone());
+        }
+        parts.push(INSTRUCTIONS_MARKDOWN.to_owned());
+        let system = parts.join("\n\n");
         let tool_specs = self.tools.specs().to_vec();
         let state = cache::env_text(&active.session.cwd.display().to_string(), self.gate().as_str());
         let body = crate::openai::build_request(

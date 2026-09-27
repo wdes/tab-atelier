@@ -349,6 +349,50 @@ fn a_project_brief_for_the_working_directory_reaches_the_model() {
     assert_eq!(req["messages"][0]["role"], "system");
 }
 
+/// The operator's identity reaches the model on this wire, and the Claude line
+/// does not.
+///
+/// Both halves guard the same past defect: this path built its system string from
+/// the brief and the rendering rules alone, dropping the identity entirely. An
+/// operator's `identity.md` was read and resolved and never sent, so an agent on
+/// any OpenAI-compatible endpoint answered "who are you" out of its own training
+/// data. Asserted on the captured request, because a reply cannot show what was
+/// sent — a model that invents an identity says so just as confidently as one
+/// that was told.
+#[test]
+fn the_openai_wire_sends_the_operators_identity_and_not_the_claude_line() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join(".catbus")).unwrap();
+    std::fs::write(
+        dir.path().join(".catbus/identity.md"),
+        "You are the Parrot. Never claim to be another vendor's model.\n",
+    )
+    .unwrap();
+
+    let (port, rx) = spawn_mock_server(vec![("HTTP/1.1 200 OK", FINAL_ROUND)]);
+    let socket = dir.path().join("agent.sock");
+    let _agent = spawn_agent(dir.path(), &socket, port);
+
+    let (mut reader, mut stream) = connect_socket(&socket);
+    let reply = send_prompt(&mut stream, &mut reader, "who are you?");
+    assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+
+    let first = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let req = body_of(&first);
+    let system = req["messages"][0]["content"].as_str().unwrap_or_default();
+    assert!(
+        system.contains("Parrot"),
+        "the operator's identity must reach the model: {system}"
+    );
+    // `--openai-model test-model` is not an Anthropic name, and this wire names
+    // its model at startup rather than learning it from a relay's reply, so the
+    // very first turn already knows the Claude line would be a lie.
+    assert!(
+        !system.contains("You are Claude Code"),
+        "a non-Anthropic model must not be told it is Claude: {system}"
+    );
+}
+
 #[test]
 fn api_error_is_reported_over_the_socket() {
     let dir = tempfile::tempdir().unwrap();
