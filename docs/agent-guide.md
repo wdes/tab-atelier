@@ -17,8 +17,9 @@ the library or package that is missing.
 Type a prompt and press Enter. While a long answer is arriving you can keep typing: press
 Enter again and the line queues, and the status row shows `· 1 queued`. Nothing starts
 until the current turn finishes, so the transcript stays in the order you asked things.
-`Ctrl-C` aborts the turn and clears anything queued — the queued lines are in your history,
-so the up arrow brings them back.
+`Ctrl-C` ends the turn in flight and the queue carries on — the next prompt starts as soon
+as the cancelled one has unwound, which is usually what you wanted when you typed it. Type
+ahead freely while the model works.
 
 A prompt can be several lines. **Shift+Enter** (or **Alt+Enter**) inserts a newline instead
 of sending, so you can lay out a list or a small script and send it whole; Enter is still

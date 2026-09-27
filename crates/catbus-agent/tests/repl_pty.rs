@@ -352,6 +352,26 @@ impl AgentRepl {
         matched
     }
 
+    /// Wait for the screen to satisfy `pred`, without typing anything.
+    ///
+    /// The complement of [`Self::type_and_watch`]: some of what a test wants to see arrives on its
+    /// own — a cancelled turn unwinding, a queued prompt starting on the far side of that — and
+    /// typing a line to look at it would start another turn instead.
+    fn watch(&mut self, rows: u16, pred: impl Fn(&str) -> bool, within: Duration) -> bool {
+        let mut seen = self.seen.clone();
+        let matched = self.pty.drain_until_screen(&mut seen, rows, &pred, within);
+        self.seen = seen;
+        matched
+    }
+
+    /// Send raw bytes: for a keystroke that is not a line of text.
+    ///
+    /// Ctrl-C is one byte, `0x03`. [`Self::type_and_watch`] would append a newline, which is an
+    /// Enter — a different key, and one this test must not press.
+    fn press(&mut self, bytes: &str) {
+        self.pty.send(bytes);
+    }
+
     /// The last `cols`-wide `rows` lines of what the terminal drew, as text.
     fn screen(&self, rows: u16, cols: u16) -> String {
         screen_of(&self.seen, rows, cols).join("\n")
@@ -654,6 +674,88 @@ data: {"type":"message_stop"}
 }
 
 ///
+/// A relay that answers two model calls: the first opens its reply and then holds, the second
+/// answers at once.
+///
+/// The hold is the whole point — it is what keeps a turn in flight long enough to cancel — and the
+/// replies are worded differently, so a test can tell "the queued prompt ran" from "the first one
+/// finished after all". A fixture that answered the same text twice could not, and the second
+/// turn has to be *fast*: a test that held both would not know which reply it was reading.
+fn spawn_two_turn_relay(hold: Duration) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let mut served = 0;
+        while served < 2 {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let raw = read_request(&mut stream);
+            if raw.starts_with("GET ") {
+                let prices = MOCK_PRICES;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
+                     connection: close\r\n\r\n{prices}",
+                    prices.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+                continue;
+            }
+            served += 1;
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncache-control: no-cache\r\n\
+                  connection: close\r\n\r\n",
+            );
+            let _ = stream.flush();
+            let head = [
+                r#"event: message_start
+data: {"type":"message_start","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":120000,"output_tokens":0}}}
+
+"#,
+                r#"event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+"#,
+            ];
+            for event in head {
+                let _ = stream.write_all(event.as_bytes());
+                let _ = stream.flush();
+            }
+            if served == 1 {
+                std::thread::sleep(hold);
+            }
+            let text = if served == 1 { "First reply." } else { "Second reply." };
+            let rest = [
+                format!(
+                    "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{text}\"}}}}\n\n"
+                ),
+                r#"event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+"#
+                .to_owned(),
+                r#"event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":6789}}
+
+"#
+                .to_owned(),
+                r#"event: message_stop
+data: {"type":"message_stop"}
+
+"#
+                .to_owned(),
+            ];
+            for event in rest {
+                let _ = stream.write_all(event.as_bytes());
+                let _ = stream.flush();
+            }
+        }
+    });
+    port
+}
+
+///
 /// Two models in two currencies, so the totals a session accumulates can be shown to group rather
 /// than to add: a session that used one reply from each has spent dollars and euros, and no single
 /// figure expresses that. The ids match the `model` the canned replies report, so a reply's model
@@ -846,6 +948,81 @@ fn the_spinner_row_prices_a_streaming_turn_while_it_runs() {
     assert!(
         !screen.contains("Hello there."),
         "the reply had already finished, so this proves nothing about the live row:\n{screen}"
+    );
+}
+
+/// Ctrl-C ends the turn in flight, and the prompt queued behind it still runs.
+///
+/// The queue used to go with the turn, so an operator who typed an instruction while the model
+/// worked and then gave up on that turn lost the instruction too. It is typed *because* the turn is
+/// slow, which makes dropping it exactly backwards: the cancel was about the wait, not about the
+/// second question.
+#[test]
+fn ctrl_c_ends_the_turn_and_the_queued_prompt_runs_next() {
+    // Held long enough that the first turn is comfortably in flight when Ctrl-C arrives — so that
+    // a version which failed to cancel would time out here rather than pass by luck.
+    let port = spawn_two_turn_relay(Duration::from_secs(5));
+    let rows = 40;
+    let mut repl = AgentRepl::start(port, &[("TERM", "xterm-256color")]);
+
+    // The first prompt, and confirmation that the turn is really running: a priced row needs counts
+    // the provider has reported, which cannot happen before the reply opens.
+    let started = repl.type_and_watch(
+        "first",
+        rows,
+        |s| s.contains("USD") && s.contains(" in"),
+        Duration::from_secs(20),
+    );
+    assert!(
+        started,
+        "the first turn never started:\n{}",
+        repl.report(&repl.screen(rows, 80))
+    );
+
+    // The second prompt, typed while that turn runs. It queues, and the status row is asserted to
+    // say so rather than assumed: everything after this is only meaningful if the line is genuinely
+    // in the queue when Ctrl-C lands.
+    let queued = repl.type_and_watch("second", rows, |s| s.contains("1 queued"), Duration::from_secs(10));
+    assert!(
+        queued,
+        "the second prompt never queued:\n{}",
+        repl.report(&repl.screen(rows, 80))
+    );
+
+    // Cancel. The message has to say what happened and what runs next, because that is what turns
+    // the continuation from a surprise into a promise.
+    repl.press("\u{3}");
+    let cancelled = repl.watch(rows, |s| s.contains("^C cancelled this turn"), Duration::from_secs(10));
+    assert!(
+        cancelled,
+        "Ctrl-C was not acknowledged:\n{}",
+        repl.report(&repl.screen(rows, 80))
+    );
+
+    // The queued prompt ran. This is the change: the reply is the *second* fixture answer, so it
+    // cannot be the first turn finishing after all.
+    let ran = repl.watch(rows, |s| s.contains("Second reply."), Duration::from_secs(20));
+    let screen = repl.screen(rows, 80);
+    assert!(
+        ran,
+        "the queued prompt did not run after Ctrl-C:\n{}",
+        repl.report(&screen)
+    );
+    assert!(
+        screen.contains("cancelled this turn — the queued prompt runs next"),
+        "the message did not promise the queued prompt:\n{screen}"
+    );
+    // And the cancelled turn's own answer never arrived. A screen holding it would be a plain
+    // two-turn transcript, which is not what was asked for.
+    assert!(
+        !screen.contains("First reply."),
+        "the cancelled turn produced its answer, so nothing was cancelled:\n{screen}"
+    );
+    // The old wording, which is what a regression to clearing the queue would print — named so the
+    // failure says which behaviour came back rather than only that an assertion tripped.
+    assert!(
+        !screen.contains("cancelled this turn, and dropped"),
+        "the queue was cleared again, so the old behaviour is back:\n{screen}"
     );
 }
 

@@ -1785,6 +1785,9 @@ impl Repl<'_> {
     }
 
     /// Report a finished turn, then start whatever was queued behind it.
+    ///
+    /// A cancelled turn arrives here too, and that is deliberate: it ends the same way any other
+    /// turn does, which is what lets a queue outlive Ctrl-C. See [`Self::cancel`].
     async fn finished(
         &mut self,
         result: Result<Result<crate::agent::Turn, crate::agent::AgentError>, tokio::task::JoinError>,
@@ -1793,6 +1796,10 @@ impl Repl<'_> {
         self.spinner = None;
         match result {
             Ok(Ok(turn)) => report_turn(self.ui, &self.agent, &turn).await?,
+            // Ctrl-C, and not a failure: `cancel()` has already said what happened and what runs
+            // next, so reporting the cancellation again here would dress up something the operator
+            // asked for as an error they should look into.
+            Ok(Err(crate::agent::AgentError::Cancelled)) => {}
             Ok(Err(e)) => self.ui.print_above(&format!("error: {e}"))?,
             Err(join) if join.is_cancelled() => {}
             Err(join) => self.ui.print_above(&format!("error: turn failed: {join}"))?,
@@ -1805,36 +1812,45 @@ impl Repl<'_> {
         // up to the frame the answer replaces it.
         self.agent.clear_view();
         // Started here rather than when it was queued, so the transcript reads in order:
-        // answer, then the prompt that prompted the next one. Nothing is left to start
-        // after a cancellation, because that path clears the queue.
+        // answer, then the prompt that prompted the next one. A cancelled turn reaches this too
+        // — `cancel()` ends the turn but lets it unwind, so it arrives here like any other — and
+        // that is what keeps a queue alive across Ctrl-C.
         if let Some(next) = self.queued.pop_front() {
             self.start(next)?;
         }
         Ok(())
     }
 
-    /// Abort the turn in flight, and be explicit about what happens to the queue.
+    /// End the turn in flight, and let anything queued behind it run.
+    ///
+    /// Ctrl-C cancels the turn, not the session. A prompt typed while the model worked is still
+    /// what the operator asked for — it was typed *because* that turn was taking too long — so
+    /// this ends the turn and the queue carries on, the next prompt starting as soon as this one
+    /// has unwound.
+    ///
+    /// The queue used to go with the turn, on the reasoning that a prompt which ran anyway after
+    /// an abort would be a surprise rather than an abort. That had it backwards: the surprise is
+    /// losing instructions you typed, the remedy it offered was to go and retype them, and what
+    /// takes the surprise out of the continuation is saying so — which the message does.
+    ///
+    /// The turn is ended cooperatively rather than aborted, and that is what the rest depends on.
+    /// The cancellation token is checked at every await that can be slow — the model call, each
+    /// tool call — so nothing is lost in responsiveness, and the turn unwinds through its own
+    /// ending instead of being dropped where it stood. Aborting is in fact why the queue did not
+    /// survive: `abort()` takes the task away, the loop's turn branch is guarded by `turn.is_some()`
+    /// so it goes quiet, and [`Self::finished`] — the one place that starts the next prompt — never
+    /// runs. Letting the turn finish unwinding on its own is what brings it back through there.
+    ///
+    /// The spinner is deliberately left alone: it belongs to the turn, and the turn is not over
+    /// until it has unwound. [`Self::finished`] clears it a frame later, which is also when the
+    /// operator sees the next prompt start.
     fn cancel(&mut self) -> std::io::Result<()> {
-        if let Some(handle) = self.turn.take() {
-            handle.abort();
-        }
-        self.spinner = None;
         self.agent.cancel_current();
-        let dropped = self.queued.len();
-        // The queue goes with it: Ctrl-C is the abort key, and a prompt that ran anyway
-        // afterwards would be a surprise rather than an abort. Nothing is lost — a
-        // submitted line is in the editor's history, so Up brings it back — and the
-        // message says so, because otherwise it reads as data loss.
-        self.queued.clear();
-        self.ui.print_above(&match dropped {
+        let waiting = self.queued.len();
+        self.ui.print_above(&match waiting {
             0 => "^C cancelled this turn".to_owned(),
-            1 => "^C cancelled this turn, and dropped the queued prompt (it is in your history \
-                  — Up to recall it)"
-                .to_owned(),
-            n => format!(
-                "^C cancelled this turn, and dropped {n} queued prompts (they are in your \
-                 history — Up to recall them)"
-            ),
+            1 => "^C cancelled this turn — the queued prompt runs next".to_owned(),
+            n => format!("^C cancelled this turn — {n} queued prompts still to run"),
         })
     }
 
@@ -2014,7 +2030,8 @@ impl Repl<'_> {
         }
         // While a turn runs the line stays editable — a turn can take minutes, and a
         // locked editor is what makes a session feel stuck. Ctrl-C is the exception: it
-        // is the abort key, and there is nothing else to do with it mid-flight.
+        // ends the turn in flight, and there is nothing else to do with it mid-flight. It
+        // does not end the *session* — see `cancel` for what survives it.
         if self.turn.is_some() && key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             self.cancel()?;
             return Ok(Flow::Continue);
