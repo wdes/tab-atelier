@@ -851,7 +851,13 @@ fn a_turn_paints_the_spinner_and_then_the_totals_line() {
     // A colour-capable tab, because the spinner line carries SGR and the
     // `\r\x1b[K` repaint is only meaningful on a terminal that interprets it.
     let port = spawn_delayed_relay(REPLY_WITH_USAGE, Duration::from_secs(3));
-    let (matched, seen) = type_and_expect_at(port, &[("TERM", "xterm-256color")], "hello", "12,345 in");
+    // Wait on the totals line's own text, not on the digits. The live row paints the same two
+    // numbers a moment earlier, from the same reply, so waiting for `12,345 in` was satisfied by
+    // that row — and `seen` was then snapshotted before the totals line had been printed, so the
+    // assertions below ran against a screen that could not contain it. The two lines use different
+    // separators (`-` against `·`), which is what makes this name the totals line and nothing else;
+    // `statusline::tests::the_live_row_and_the_totals_line_read_differently` holds that apart.
+    let (matched, seen) = type_and_expect_at(port, &[("TERM", "xterm-256color")], "hello", "12,345 in - 6,789 out");
 
     assert!(
         matched,

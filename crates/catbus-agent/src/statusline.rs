@@ -1024,6 +1024,32 @@ mod tests {
         assert_eq!(live_line(&empty, Some(&price()), 200), "");
     }
 
+    /// The live row and the totals line spell the same two numbers with different punctuation, and
+    /// that difference is load-bearing.
+    ///
+    /// A `repl_pty` test waits for the totals line to appear before asserting on it. The live row
+    /// prints the *same* counts a moment earlier, from the same reply — so a wait that named only
+    /// the numbers used to be satisfied by the row instead, and the assertion then ran against a
+    /// screen the totals line had not reached. It failed intermittently on CI for exactly that
+    /// reason. The separators are what keep the two apart, so they are asserted here: if a later
+    /// change made either line imitate the other's punctuation, this fails where the cause is
+    /// obvious rather than as a flaky pty test.
+    #[test]
+    fn the_live_row_and_the_totals_line_read_differently() {
+        let totals = tokens_label(12_345, 6_789);
+        assert_eq!(totals, "12,345 in - 6,789 out", "the totals line's form changed");
+        let row = live_line(&live(12_345, 6_789, true, false), Some(&price()), 200);
+        assert!(
+            row.contains("12,345 in · 6,789 out"),
+            "the live row no longer reads with its own separator: {row:?}"
+        );
+        assert!(
+            !row.contains(&totals),
+            "the live row now contains the totals line's own text, so a wait for one is satisfied \
+             by the other: {row:?}"
+        );
+    }
+
     /// A request whose tokens are all cache is not an empty row: the input count the provider
     /// reports includes the cached reads, and they are charged at the cache rate rather than the
     /// input one — which is what stops the price on this row disagreeing with the totals line.
