@@ -4,7 +4,7 @@ version = "0.1.0-dev"
 edition = "2024"
 rust-version = "1.92"
 authors = ["William Desportes <williamdes@wdes.fr>"]
-description = "Claude agent runner for tab-atelier — many tabs, many windows."
+description = "Model-agnostic agent runner for tab-atelier — many tabs, many windows."
 license = "MPL-2.0"
 publish = false
 

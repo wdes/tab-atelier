@@ -59,7 +59,7 @@ mod tui;
     // same. A `catbus-agent` in a tab can be older than the checkout that
     // started it, and this is the first thing anyone asks.
     version = concat!("v", env!("CARGO_PKG_VERSION"), " (", env!("BUILD_HASH"), ")"),
-    about = "Claude agent for tab-atelier. Many tabs, many windows.",
+    about = "Model-agnostic agent for tab-atelier. Many tabs, many windows.",
     long_about = None,
 )]
 struct Args {
