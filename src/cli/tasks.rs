@@ -217,8 +217,10 @@ pub fn rank_tasks<'a>(tasks: &'a [TaskView], me: &str) -> Vec<&'a TaskView> {
     // chokepoint (`rank_tasks` is take-only) — this is the missing policy the
     // "automatic verification" note calls for: the board already routes a
     // `verify:<task>` to a peer, but nothing stopped the announcer taking it back.
-    let mut open: Vec<&TaskView> =
-        tasks.iter().filter(|t| t.is_takeable() && t.announced_by.as_deref() != Some(me)).collect();
+    let mut open: Vec<&TaskView> = tasks
+        .iter()
+        .filter(|t| t.is_takeable() && t.announced_by.as_deref() != Some(me))
+        .collect();
     open.sort_by_key(|t| {
         // Task id as the tie-break keeps the order total even if two weights
         // collide, so the ranking is deterministic for a given agent.
