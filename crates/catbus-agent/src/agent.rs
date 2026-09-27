@@ -269,6 +269,13 @@ pub struct Agent {
     model: std::sync::Mutex<String>,
     /// What to send as the system prompt. See [`crate::identity`].
     identity: crate::identity::Identity,
+    /// The working directory's own brief, rendered once at startup.
+    ///
+    /// Sits between the identity and the rendering instructions, and survives an
+    /// operator identity for the same reason those do: it describes the project
+    /// rather than the model, so it is true whatever the operator wrote about
+    /// themselves. Empty when the tree has no brief — nothing is sent for it.
+    brief: String,
     /// The model the relay reported serving, from the last reply.
     ///
     /// Only knowable from a reply, so the first turn of a session has none — see
@@ -500,6 +507,18 @@ impl Agent {
         let gate = session.saved_gate().unwrap_or(tools::Gate::Open);
         // Read now, before `session` is moved into the `Arc` below.
         let session_id = session.id.clone();
+        // The project brief for this working directory, read once because that is
+        // what a brief is: a statement of how work is done in this tree. Read at
+        // startup rather than per request, for the reason `briefs` gives — context
+        // can be added to a session but not withdrawn, so a mid-session edit must
+        // not change the rules under a model that has already acted on the old
+        // ones.
+        //
+        // Read here rather than injected by the launcher, and that is the point:
+        // the selection rule lives in the shared crate, so this agent finds the
+        // same files a Claude tab is briefed with, without depending on a hook that
+        // only one of them installs.
+        let brief = tab_atelier_briefs::for_cwd(&session.cwd);
         // What this session had already spent, so a resume continues the count instead of
         // starting from zero. Both halves matter: the token counts are what the status lines
         // show, and the amounts cannot be recomputed here at all — the price list arrives later
@@ -554,6 +573,10 @@ impl Agent {
             // Built-in behaviour until an operator says otherwise. See
             // `crate::identity`.
             identity: crate::identity::Identity::Auto,
+            // The working directory's own brief, already rendered. Empty when the
+            // tree has none, which is the common case and costs nothing: no block
+            // is sent for it, exactly as if this field did not exist.
+            brief,
             // Everything learned from the transcript is seeded here, so a resumed
             // session starts knowing rather than discovering — which is what makes
             // the first request of a resumed session behave like the last request
@@ -1568,6 +1591,18 @@ impl Agent {
                 text: std::borrow::Cow::Borrowed(crate::identity::CLAUDE_CODE_PREFIX),
             }],
         };
+        // The project's brief, when the tree has one, goes between the identity and
+        // the rendering rules. That order is the whole design: who the agent is,
+        // then how work is done here, then how to write to this terminal. It is
+        // pushed rather than folded into the identity so that an operator's
+        // `identity.md` — which replaces the identity outright — cannot silently
+        // drop the project's own conventions along with it.
+        if !self.brief.is_empty() {
+            system.push(SystemBlock {
+                kind: "text",
+                text: std::borrow::Cow::Borrowed(&self.brief),
+            });
+        }
         // The rendering instructions always go last, and survive an operator
         // identity: they describe the terminal, not the model, so they are true
         // whatever the operator wrote. Dropping them with the identity text would
@@ -1693,7 +1728,14 @@ impl Agent {
         // put mutable bytes at the very front — the defect this change exists
         // to remove. `build_request` appends it after the history instead, for
         // the same reason it goes last on the relay wire.
-        let system = INSTRUCTIONS_MARKDOWN.to_owned();
+        // The project's brief first, then the terminal's rules — the same order as
+        // the relay wire, and for the same reason: the specific word about this tree
+        // comes before the general word about how to write.
+        let system = if self.brief.is_empty() {
+            INSTRUCTIONS_MARKDOWN.to_owned()
+        } else {
+            format!("{}\n\n{INSTRUCTIONS_MARKDOWN}", self.brief)
+        };
         let tool_specs = self.tools.specs().to_vec();
         let state = cache::env_text(&active.session.cwd.display().to_string(), self.gate().as_str());
         let body = crate::openai::build_request(

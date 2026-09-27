@@ -32,6 +32,9 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 # false` drops the ureq transport: this crate is async and already has reqwest,
 # and a second TLS stack would be pure weight.
 claude-api = { path = "../claude-api", default-features = false }
+# The per-project briefs, shared with the app so the two agree on where a brief
+# lives and which cwd selects it. Read at startup; see `crate::agent`.
+tab-atelier-briefs = { path = "../tab-atelier-briefs" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # The tools config in TOML as well as JSON. TOML because a tool config is

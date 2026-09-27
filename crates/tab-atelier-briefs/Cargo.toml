@@ -1,0 +1,21 @@
+[package]
+name = "tab-atelier-briefs"
+version = "0.5.0-dev"
+edition = "2024"
+license = "MPL-2.0"
+description = "Per-project markdown briefs, selected by working directory"
+repository = "https://github.com/wdes/tab-atelier"
+publish = false
+
+# No dependencies on purpose: the parsing is a `key: value` reader over two keys,
+# not YAML, and every consumer (the app, the agent) already has what it needs.
+# A crate that adds weight to the two binaries that share it would be a poor
+# trade for a module this small.
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+
+[lints.rust]
+unsafe_code = "forbid"

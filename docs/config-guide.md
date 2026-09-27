@@ -12,6 +12,7 @@ has. Written for someone with the package installed and no checkout.
 | `<cwd>/.catbus/identity.md` | The system prompt for one directory. See below. | You. Ignored by git, not committed. |
 | `~/.config/tab-atelier/catbus-agent/tools.json` | Which tools the agent has. See below. | You, passed with `--tools-config`. |
 | `<cwd>/.catbus/tools.toml` | Tools for one directory, found without being named. See below. | You. Ignored by git, not committed. |
+| `~/.config/tab-atelier/briefs/*.md` | Per-directory briefs. See below. | You. Also read from `/etc/tab-atelier/briefs/`. |
 | `~/.claude/projects/<escaped-cwd>/<id>.jsonl` | The transcript, one file per session. | The agent. |
 | `~/.claude/projects/<escaped-cwd>/<id>.name` | A session's `/rename`d name. | The agent. |
 | `~/.claude/projects/<escaped-cwd>/<id>.gate` | The permission mode the session was last left in. | The agent. |
@@ -252,6 +253,32 @@ field, such as a local Ollama server, is unaffected either way.
 The output ceiling is handled for you and needs no flag: it goes out as
 `max_completion_tokens`, the name every endpoint reads, since the newer models refuse the
 legacy `max_tokens` outright while the older ones accept either.
+
+## Project briefs
+
+A brief is a markdown file that reaches an agent when it starts in a matching directory —
+how work is done in *this tree*, as opposed to who the agent is. Drop one in
+`~/.config/tab-atelier/briefs/` (or `/etc/tab-atelier/briefs/` for the whole machine) with
+a `baseDir` in its front matter:
+
+    ---
+    baseDir: /mnt/clients/ABCD
+    ---
+    Client ABCD: PHP 7.4, no composer update without asking.
+
+Every brief whose `baseDir` contains the working directory applies, joined from least to
+most specific so the narrowest note is read last. `always: true` applies everywhere. The
+whole set is capped, and over the cap the least specific are dropped whole with a line
+saying so rather than truncated mid-sentence.
+
+They are read **once, at session start**, from the directory the session runs in: context
+can be added to a session but not withdrawn, so editing a brief must not change the rules
+under an agent that has already acted on them.
+
+Both the app and `catbus-agent` find them the same way, through the same crate — a brief
+written for one kind reaches the other, and there is one place that decides which file
+matches which directory. `tab-atelier brief --cwd <dir>` prints what a session starting
+there is told, and `--list` shows which files matched and why.
 
 ## Limiting the network
 

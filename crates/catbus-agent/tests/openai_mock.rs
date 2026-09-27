@@ -304,6 +304,51 @@ fn openai_backend_runs_a_tool_round_trip() {
     );
 }
 
+/// A brief for the working directory reaches the model without anyone injecting
+/// it: the agent finds it the way a Claude tab does, through the shared rule.
+///
+/// This is the end-to-end half of the brief wiring. The file is written into the
+/// agent's own `HOME`, and named by no flag — so if the selection rule, the
+/// parsing, or the system-block assembly regress, the model simply never sees it
+/// and this fails.
+#[test]
+fn a_project_brief_for_the_working_directory_reaches_the_model() {
+    let dir = tempfile::tempdir().unwrap();
+    let briefs = dir.path().join(".config/tab-atelier/briefs");
+    std::fs::create_dir_all(&briefs).unwrap();
+    std::fs::write(
+        briefs.join("project.md"),
+        format!(
+            "---\nbaseDir: {}\n---\nRead the tree before you write in it.\n",
+            dir.path().display()
+        ),
+    )
+    .unwrap();
+
+    let (port, rx) = spawn_mock_server(vec![("HTTP/1.1 200 OK", FINAL_ROUND)]);
+    let socket = dir.path().join("agent.sock");
+    let _agent = spawn_agent(dir.path(), &socket, port);
+
+    let (mut reader, mut stream) = connect_socket(&socket);
+    let reply = send_prompt(&mut stream, &mut reader, "hello");
+    assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+
+    let first = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let req = body_of(&first);
+    let system = req["messages"][0]["content"].as_str().unwrap_or_default();
+    assert!(
+        system.contains("Read the tree before you write in it."),
+        "the brief must reach the model as a system block, got: {system}"
+    );
+    // Sent as its own statement about the project rather than merged into the
+    // rendering rules, which describe the terminal and are not the project's.
+    assert!(
+        system.contains("<env") || system.len() > 100,
+        "the rendering instructions should still be sent alongside it: {system}"
+    );
+    assert_eq!(req["messages"][0]["role"], "system");
+}
+
 #[test]
 fn api_error_is_reported_over_the_socket() {
     let dir = tempfile::tempdir().unwrap();
