@@ -59,9 +59,9 @@ const QUEUED_MARK: &str = "↳";
 
 /// The most rows the waiting prompts may take from the band.
 ///
-/// Two of the band's five on an ordinary terminal, and one row is held back for the reasoning
-/// before they are placed — so the model is never both busy and invisible, whatever is queued.
-/// The status row counts the rest; past the cap, printing every one would say less than the
+/// Two of the band's five on an ordinary terminal, and one row is held back for the live reply
+/// text before they are placed — so the model is never both busy and invisible, whatever is
+/// queued. The status row counts the rest; past the cap, printing every one would say less than the
 /// count already does.
 const MAX_QUEUED_ROWS: usize = 2;
 
@@ -670,17 +670,17 @@ impl Ui {
     /// the screen rather than between the conversation and the prompt.
     ///
     /// Stacked above the prompt are the things the operator is waiting on rather than typing:
-    /// the agent's own list (`task`), what the model is thinking (`reasoning`), and the prompts
-    /// given while it works (`queued`). They take rows off the top of the band rather than being
-    /// printed, so they are looked at while they are true and are gone afterwards — and nothing
-    /// lands in scrollback above an answer it does not belong to. How the band's few rows are
-    /// shared between them is [`above_lines`]'s decision, not this one's.
+    /// the agent's own list (`task`), the reply as it is being produced (`live_text`), and the
+    /// prompts given while it works (`queued`). They take rows off the top of the band rather than
+    /// being printed, so they are looked at while they are true and are gone afterwards — and
+    /// nothing lands in scrollback above an answer it does not belong to. How the band's few rows
+    /// are shared between them is [`above_lines`]'s decision, not this one's.
     pub fn draw(
         &mut self,
         prompt: &str,
         editor: &Editor,
         status: Option<&str>,
-        reasoning: Option<&str>,
+        live_text: Option<&str>,
         task: Option<&str>,
         queued: &[String],
     ) -> std::io::Result<()> {
@@ -690,7 +690,7 @@ impl Ui {
         let size = self.terminal.size()?;
         let width = usize::from(size.width).max(1);
         let wrapped = wrap_prompt(&prompt, &before, &after, width);
-        // The live view of what the model is thinking, above the prompt. It takes rows off the top
+        // The live view of the reply as it is produced, above the prompt. It takes rows off the top
         // of the band rather than being printed above it: printed rows become scrollback, and this
         // is meant to be looked at while it is happening and then be gone, not to pile up behind
         // the answer the way a printed line would. The same is true of the rows under it — see
@@ -698,7 +698,7 @@ impl Ui {
         //
         // The prompt keeps a row of its own whatever else is on screen — the operator is still
         // typing — and the status row is never given up, because it is where the spinner lives.
-        let above = above_lines(task, reasoning, queued, width, self.rows);
+        let above = above_lines(task, live_text, queued, width, self.rows);
         let live_rows = above.len();
         // The band's last row is the status row whenever the buffer needs all of the others.
         let text_rows = usize::from(self.rows.saturating_sub(1)).max(1) - live_rows;
@@ -719,8 +719,9 @@ impl Ui {
         self.terminal.draw(move |frame| {
             let area = frame.area();
             let top = area.top();
-            // The reasoning reads as secondary: it is the model's working, not something to reply
-            // to, and italic grey keeps it from being mistaken for the answer.
+            // The live text reads as secondary: while it is the model's working it is not something
+            // to reply to, and italic grey keeps it from being mistaken for the finished answer —
+            // which is printed above the band, in its own styling, once the turn is over.
             let live_style = Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC);
             for (offset, row) in above.iter().enumerate() {
                 let y = top.saturating_add(u16::try_from(offset).unwrap_or(0));
@@ -854,35 +855,35 @@ fn prompt_rows(height: u16) -> u16 {
     WANTED.min(half).max(2).min(height.max(1))
 }
 
-/// The rows stacked above the prompt, top to bottom: the agent's list, the model's reasoning, the
+/// The rows stacked above the prompt, top to bottom: the agent's list, the reply being produced, the
 /// prompts waiting to be asked.
 ///
 /// Three things want the band's spare rows, and there are only three of them on an ordinary
 /// terminal, so the shares are decided here rather than left to whatever happens to be drawn.
 ///
-/// The reasoning is served first, and served as one guaranteed row: a model that went quiet
-/// mid-turn is indistinguishable from one that died, so something of its thinking is always on
-/// screen while a turn runs. Then the waiting prompts, which are what the operator just did — a
+/// The live reply text is served first, and served as one guaranteed row: a model that went quiet
+/// mid-turn is indistinguishable from one that died, so something of what it is producing is always
+/// on screen while a turn runs. Then the waiting prompts, which are what the operator just did — a
 /// prompt that looks like it went nowhere is the failure this exists to prevent — capped so a
 /// long queue cannot be the whole band. Then the list, which is the context for everything else
 /// and the same line a second later, so it is the one that gives way. Whatever is left goes back
-/// to the reasoning, which is the only one of the three read a line at a time.
+/// to the live text, which is the only one of the three read a line at a time.
 ///
 /// The waiting prompts are drawn nearest the prompt, because the thing just typed belongs beside
 /// the line it was typed on.
-fn above_lines(task: Option<&str>, reasoning: Option<&str>, queued: &[String], width: usize, band: u16) -> Vec<String> {
+fn above_lines(task: Option<&str>, live_text: Option<&str>, queued: &[String], width: usize, band: u16) -> Vec<String> {
     // Two of the band's rows are not the stack's to give: the status row, where the spinner
     // lives, and the prompt's own row, where the operator is typing.
     let spare = usize::from(band.saturating_sub(2));
     if spare == 0 || width == 0 {
         return Vec::new();
     }
-    // A row of reasoning is held back before anything else is placed, so the model is never both
-    // busy and invisible. Only a turn that has actually thought something out loud counts — an
-    // empty stream must not reserve the row, or the prompt would sit a line lower for no reason.
-    let thinking = reasoning.is_some_and(|text| text.lines().any(|line| !line.trim().is_empty()));
+    // A row is held back for the live text before anything else is placed, so the model is never
+    // both busy and invisible. Only a reply that has actually produced something counts — an empty
+    // stream must not reserve the row, or the prompt would sit a line lower for no reason.
+    let saying = live_text.is_some_and(|text| text.lines().any(|line| !line.trim().is_empty()));
     let mut left = spare;
-    let held = usize::from(thinking && left > 0);
+    let held = usize::from(saying && left > 0);
     left -= held;
     // Then the prompts, up to the cap: past that the status row is doing the counting, and one
     // long queue must not be the whole band.
@@ -896,10 +897,10 @@ fn above_lines(task: Option<&str>, reasoning: Option<&str>, queued: &[String], w
     } else {
         None
     };
-    // Whatever survived goes to the reasoning, on top of the row held back for it.
-    let reasoning_rows = live_lines(reasoning, width, held + left);
+    // Whatever survived goes to the live text, on top of the row held back for it.
+    let live_rows = live_lines(live_text, width, held + left);
     let mut above: Vec<String> = task_row.into_iter().collect();
-    above.extend(reasoning_rows);
+    above.extend(live_rows);
     above.extend(waiting);
     above
 }
@@ -923,17 +924,17 @@ fn queued_rows(queued: &[String], width: usize, cap: usize) -> Vec<String> {
         .collect()
 }
 
-/// The tail of the model's reasoning, one entry per row it will occupy.
+/// The tail of the live reply text, one entry per row it will occupy.
 ///
-/// The end of the text is what is shown, not the start: reasoning arrives a word at a time, and
-/// what matters is what the model is thinking *now*, not how it opened. Blank lines are dropped
+/// The end of the text is what is shown, not the start: both phases arrive a word at a time, and
+/// what matters is what the model is producing *now*, not how it opened. Blank lines are dropped
 /// — a stream that has only just crossed a line break would otherwise put an empty row on screen
 /// for a frame — and each line is clipped, so one long line cannot push the rest away.
 ///
 /// `cap` is how many rows the band can spare. Zero returns nothing, which is what happens on a
-/// terminal too short to show the reasoning and the prompt at the same time.
-fn live_lines(reasoning: Option<&str>, width: usize, cap: usize) -> Vec<String> {
-    let Some(text) = reasoning else {
+/// terminal too short to show the live text and the prompt at the same time.
+fn live_lines(live_text: Option<&str>, width: usize, cap: usize) -> Vec<String> {
+    let Some(text) = live_text else {
         return Vec::new();
     };
     if cap == 0 || width == 0 {
@@ -1531,8 +1532,13 @@ impl Repl<'_> {
         // name back until the activity has been up long enough to read, and leaves a check
         // behind when one finishes, so a run of fast tools cannot strobe names and a tool that
         // did finish is distinguishable from one that never started.
+        //
+        // The reply's phase is passed alongside because the agent's marker covers two of them: it
+        // says `thinking` both while the model deliberates and while it writes the answer, and the
+        // row has to tell those apart — see `Activity::label`.
         let activity = self.activity.label(
             &self.agent.status().unwrap_or_else(|| "thinking".to_owned()),
+            self.agent.is_writing(),
             std::time::Instant::now(),
         );
         // What the turn is costing, live, and the model it is being served by. The two are read
@@ -1623,16 +1629,26 @@ impl Repl<'_> {
         ))
     }
 
-    /// What the model has reasoned so far, for the rows above the prompt.
+    /// What the model is producing right now, for the rows above the prompt.
     ///
-    /// `None` when no turn is running, and when the model has not thought anything out loud yet —
-    /// a model that answers without visible reasoning, or one whose provider does not send any,
-    /// shows nothing rather than an empty frame. Emptiness is checked on the trimmed text so a
-    /// stream that has so far produced only whitespace does not reserve rows for nothing.
-    fn live_reasoning(&self) -> Option<String> {
+    /// The reply's two phases are one slot on the screen: while the model is thinking this is its
+    /// reasoning, and the moment it starts writing it is the answer, because a model that has begun
+    /// its answer has finished deliberating. Showing the reasoning under a reply that was already
+    /// being written put the reader in front of a conclusion that had been reached — with the
+    /// deliberation still on screen, and nothing to say the thinking was over. That is the whole
+    /// reason the answer is streamed here rather than left to appear when the turn ends.
+    ///
+    /// The answer wins when both are non-empty, which is the ordinary shape of a reply: the model
+    /// thinks, then writes, and the thinking is not retracted so much as finished.
+    ///
+    /// `None` when no turn is running, and when the reply has produced nothing to show yet — a
+    /// model that answers without visible reasoning, or one whose provider does not send any, shows
+    /// nothing rather than an empty frame. Emptiness is checked on the trimmed text so a stream that
+    /// has so far produced only whitespace does not reserve rows for nothing.
+    fn live_text(&self) -> Option<String> {
         self.turn.as_ref()?;
-        let reasoning = self.agent.reasoning_so_far();
-        (!reasoning.trim().is_empty()).then_some(reasoning)
+        let pick = |text: String| (!text.trim().is_empty()).then_some(text);
+        pick(self.agent.answer_so_far()).or_else(|| pick(self.agent.reasoning_so_far()))
     }
 
     /// The prompts waiting behind the turn, for the rows above the prompt: the oldest first, as
@@ -1781,6 +1797,13 @@ impl Repl<'_> {
             Err(join) if join.is_cancelled() => {}
             Err(join) => self.ui.print_above(&format!("error: turn failed: {join}"))?,
         }
+        // The band's copy of the reply goes, now that the reply itself is in scrollback. It would
+        // otherwise sit above the prompt duplicating the answer three lines up, and leave the reader
+        // to work out which of the two was the one to read. Done for every ending — a failure, a
+        // cancellation — because in each the live rows are describing a turn that is no longer
+        // running. Cleared *after* `report_turn` rather than before so the text is on screen right
+        // up to the frame the answer replaces it.
+        self.agent.clear_view();
         // Started here rather than when it was queued, so the transcript reads in order:
         // answer, then the prompt that prompted the next one. Nothing is left to start
         // after a cancellation, because that path clears the queue.
@@ -2118,10 +2141,10 @@ async fn run_inner(ui: &mut Ui, agent: Arc<Agent>, cwd: &Path) -> std::io::Resul
             repl.refresh_task_line();
         }
         let status = repl.status();
-        let reasoning = repl.live_reasoning();
+        let live_text = repl.live_text();
         // An open question is drawn where the prompt would be, because that is where the
         // operator is looking and a panel below a live-looking prompt invites typing into
-        // the wrong thing. Its own panel is not the place for the reasoning: a question is a
+        // the wrong thing. Its own panel is not the place for the live reply text: a question is a
         // request for a decision, and the model's working behind it is not what is being asked.
         if let (Some(panel), Some((_, questions))) = (repl.panel.as_ref(), repl.question.as_ref()) {
             repl.ui.draw_panel(panel, questions, status.as_deref())?;
@@ -2133,7 +2156,7 @@ async fn run_inner(ui: &mut Ui, agent: Arc<Agent>, cwd: &Path) -> std::io::Resul
                 &prompt,
                 &repl.editor,
                 status.as_deref(),
-                reasoning.as_deref(),
+                live_text.as_deref(),
                 task.as_deref(),
                 &queued,
             )?;
@@ -2695,6 +2718,32 @@ mod tests {
         let wide = "aaaaaaaaaa\nbb";
         assert_eq!(live_lines(Some(wide), 5, 4)[0], "aaaa…");
         assert_eq!(live_lines(Some(wide), 5, 4)[1], "bb");
+    }
+
+    /// The live slot shows the answer once there is one, and the reasoning until then.
+    ///
+    /// The two are opposite phases of one reply, and the whole complaint this answers is that the
+    /// screen showed the second while the first was over: the reasoning stayed put under a reply
+    /// that had already begun, so the end of thinking had no moment to it.
+    #[test]
+    fn the_live_slot_shows_the_answer_once_there_is_one() {
+        // The pick is `answer_so_far().or_else(reasoning_so_far)`, spelled out here so the rule is
+        // asserted rather than the wiring: whichever has something in it, the answer first.
+        let pick = |answer: &str, reasoning: &str| {
+            let take = |text: &str| (!text.trim().is_empty()).then(|| text.to_owned());
+            take(answer).or_else(|| take(reasoning))
+        };
+        assert_eq!(
+            pick("", "weighing the two options").as_deref(),
+            Some("weighing the two options"),
+            "before the answer starts, the reasoning is what there is to show"
+        );
+        assert_eq!(
+            pick("The answer is 42.", "weighing the two options").as_deref(),
+            Some("The answer is 42."),
+            "once writing starts the answer wins, and the deliberation goes"
+        );
+        assert_eq!(pick("", "").as_deref(), None, "and nothing to show is no rows at all");
     }
 
     /// Nothing to show means no rows taken from the prompt.

@@ -55,6 +55,14 @@ pub struct Assembler {
     /// it belongs to rather than derived from it, so reading it costs nothing
     /// and cannot disturb assembly.
     reasoning: String,
+    /// The answer text so far, mirrored on the same terms as [`Self::reasoning`].
+    ///
+    /// Kept for the live view, which shows the reply as it is written — see [`Self::answer`]. The
+    /// two are separate because they are opposite phases of one reply and the view shows one or the
+    /// other: a model that has started writing its answer has finished thinking about it, so a
+    /// reader who was shown the reasoning would be reading a conclusion that had already been
+    /// reached.
+    answer: String,
     /// Bytes of reply content received so far: text, reasoning and tool arguments.
     ///
     /// The only output figure that exists while a reply is still coming. The provider
@@ -105,6 +113,17 @@ impl Assembler {
     #[must_use]
     pub fn reasoning(&self) -> &str {
         &self.reasoning
+    }
+
+    /// The answer text received so far.
+    ///
+    /// Empty until the reply stops thinking and starts writing, which is what the live view keys
+    /// the change of phase on: it is not a flag the provider sends anywhere, it is the reply
+    /// moving from one content block to another, and the first text delta is where that becomes
+    /// visible.
+    #[must_use]
+    pub fn answer(&self) -> &str {
+        &self.answer
     }
 
     /// The counts the provider has reported so far, if it has reported any.
@@ -289,6 +308,11 @@ impl Assembler {
                 if let Some(Partial::Text(text)) = self.at(index) {
                     text.push_str(&piece);
                 }
+                // Mirrored for the live view, on the terms [`Self::reasoning`] sets: this is the
+                // reply's answer as it is written, and the first non-empty piece is what moves the
+                // display off the reasoning. Mirrored even for a delta whose block is missing, so
+                // the phase still turns over on a frame this build could not place.
+                self.answer.push_str(&piece);
             }
             Some("thinking_delta") => {
                 let piece = field("thinking");

@@ -82,8 +82,12 @@ account without ever believing one of its own tools produced it. The second: if 
 already mid-turn, the notice waits for its turn rather than interrupting it, and if a turn is not
 running, the notice starts one.
 
-While the model works, its reasoning streams above the prompt in grey. It is there to be watched
-and clears when the answer arrives — the transcript stays the answer.
+While the model works, its reply streams above the prompt in grey — the reasoning while it is
+still thinking, then the answer itself the moment it starts writing it. The two are one slot
+rather than two, and that is what tells you the thinking is over: the status row beneath goes
+from `Thinking` to `Writing` at the same moment, and the text changes from the model's working
+into the reply you asked for. The band clears when the turn ends and the answer is printed into
+the conversation proper — the transcript stays the answer.
 
 ## Permission modes
 

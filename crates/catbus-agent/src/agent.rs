@@ -295,6 +295,18 @@ pub struct Agent {
     /// through [`Turn::reasoning`] as it always did, and this is cleared as a
     /// turn starts so it is never a stale copy left on screen.
     reasoning: std::sync::Mutex<String>,
+    /// The answer being written by the model call streamed right now.
+    ///
+    /// The other half of [`Self::reasoning`], written by the same loop and read on the same tick,
+    /// and separate from it because the two are opposite phases of one call: a model that has begun
+    /// writing its answer has finished thinking about it. The display shows one or the other rather
+    /// than both — a reader shown the reasoning when the answer had already started would be
+    /// reading a conclusion that had been reached some time ago, with nothing to say so.
+    ///
+    /// Kept here rather than derived from the reasoning buffer so the two cannot be confused at a
+    /// call site: which one is on screen is a fact the agent knows and the UI is told, and inferring
+    /// it from "is the reasoning still growing" would be a guess about the wire made in the view.
+    answer: std::sync::Mutex<String>,
     /// Cumulative tokens consumed across all turns in this process.
     /// Both counters accumulate monotonically and are never reset.
     pub tokens_in: std::sync::atomic::AtomicU64,
@@ -417,10 +429,13 @@ fn live_figures(report: LiveReport, inflight_bytes: u64, spent: Usage) -> Option
         // counts the provider already reported, and marking *that* as an estimate would put a `~`
         // on the most exact figure the row ever shows.
         reported: report.started || inflight_bytes == 0,
-        // Only when the reply's own bytes are standing in for a count. `report.usage.output_tokens
-        // == 0` alone would mark the gap between rounds too, where the output shown is entirely
-        // the finished requests' real count and no byte estimate is in the sum at all.
-        output_estimated: report.usage.output_tokens == 0 && report.output_bytes > 0,
+        // The output side is a guess for as long as a request is on the wire without the provider's
+        // closing count — which covers both the reply that has produced nothing yet (a price built
+        // on an output of zero, which will certainly move) and the one whose count is being read off
+        // its bytes. The gap between two tool rounds is the case this must *not* catch: nothing is
+        // in flight there, so every count in the sum is one the provider reported, and marking that
+        // as an estimate would put `est.` on the row's most exact figure.
+        output_estimated: report.usage.output_tokens == 0 && inflight_bytes > 0,
         model: report.model,
     })
 }
@@ -547,6 +562,7 @@ impl Agent {
             served_model: std::sync::Mutex::new(from_transcript),
             status: std::sync::Mutex::new(None),
             reasoning: std::sync::Mutex::new(String::new()),
+            answer: std::sync::Mutex::new(String::new()),
             tokens_in,
             tokens_out,
             inflight_input_bytes: std::sync::atomic::AtomicU64::new(0),
@@ -594,18 +610,52 @@ impl Agent {
         self.reasoning.lock().expect("reasoning mutex").clone()
     }
 
-    /// Forget the last turn's reasoning, at the start of a new one.
+    /// The answer being written by the model call currently being streamed.
     ///
-    /// Cleared here rather than when the turn ends so the screen keeps its last
-    /// line until the answer actually arrives, instead of going blank for the
-    /// time it takes the reply to be formatted and printed.
-    fn clear_reasoning(&self) {
+    /// The same terms as [`Self::reasoning_so_far`], and the REPL shows whichever of the two is
+    /// non-empty: this one while the reply is being written, that one while it is still being
+    /// thought out. Empty until the reply produces its first text.
+    #[must_use]
+    pub fn answer_so_far(&self) -> String {
+        self.answer.lock().expect("answer mutex").clone()
+    }
+
+    /// Whether the reply being streamed has started writing its answer.
+    ///
+    /// The predicate form of [`Self::answer_so_far`], for the status row: it is asked once per frame
+    /// and only needs the phase, so cloning the whole answer into it every redraw would be copying
+    /// a growing reply several times a second to look at its first character.
+    #[must_use]
+    pub fn is_writing(&self) -> bool {
+        !self.answer.lock().expect("answer mutex").trim().is_empty()
+    }
+
+    /// Forget what the last reply was saying, at the start of a new request or turn.
+    ///
+    /// Cleared here rather than the moment a turn ends so the screen keeps its last line until the
+    /// next one has something to put there, instead of going blank in between. The turn's *own* end
+    /// is the exception and clears this explicitly — see [`Self::clear_view`] — because by then the
+    /// answer has been printed above the band and the live copy has become a duplicate rather than a
+    /// preview.
+    fn clear_saying(&self) {
         self.reasoning.lock().expect("reasoning mutex").clear();
+        self.answer.lock().expect("answer mutex").clear();
+    }
+
+    /// Forget the last reply's text, where a turn ends.
+    ///
+    /// Unlike the clears below this is not about a figure going stale — it is about the band
+    /// holding a second copy of something that has just been printed above it. The turn's answer is
+    /// written to scrollback as it finishes, so the live rows that previewed it would otherwise sit
+    /// between that copy and the prompt, saying the same thing twice and leaving the reader to work
+    /// out which one was the answer.
+    pub fn clear_view(&self) {
+        self.clear_saying();
     }
 
     /// Forget everything the previous request reported about itself.
     ///
-    /// The reasoning and the live cost are cleared together and deliberately, because they are the
+    /// The reply's text and the live cost are cleared together and deliberately, because they are the
     /// same fact about the same request: one is what it is saying, the other is what it is costing,
     /// and both describe the call in flight rather than the session. Clearing one and not the other
     /// is how the row would price a fresh request at the previous one's rates for the round trip —
@@ -619,7 +669,7 @@ impl Agent {
     /// several requests, and this is the boundary between two of them, not the end of the turn: a
     /// row that went back to zero here is the bug that total exists to fix.
     fn clear_request(&self) {
-        self.clear_reasoning();
+        self.clear_saying();
         *self.live.lock().expect("live mutex") = LiveReport::default();
     }
 
@@ -1626,6 +1676,7 @@ impl Agent {
                 attempt.body(payload.clone())
             },
             &self.reasoning,
+            &self.answer,
             &self.live,
         )
         .await
@@ -1789,10 +1840,12 @@ fn rebuild_history(project_dir: &std::path::Path, id: &str) -> Vec<ApiMessage> {
 /// final, which is why the retry lives around the response rather than inside
 /// the read.
 ///
-/// `live` is the agent's reasoning buffer, written after every chunk: it is the
-/// only thing on screen while the model works, so it is updated as the words
-/// arrive rather than once at the end. A view that only filled in when the reply
-/// completed would be no better than the spinner it replaces.
+/// `live` is the agent's reasoning buffer and `answer` its answer buffer, both written after every
+/// chunk: they are the only things on screen while the model works, so they are updated as the words
+/// arrive rather than once at the end. A view that only filled in when the reply completed would be
+/// no better than the spinner it replaces. They are two buffers rather than one because they are
+/// opposite phases of the reply, and the view shows whichever has something in it — see
+/// [`Agent::reasoning_so_far`].
 ///
 /// `report` is the other half of the same idea and is written on the same tick — what the provider
 /// has said about the request's cost. Both are taken here rather than by the caller because this
@@ -1801,6 +1854,7 @@ fn rebuild_history(project_dir: &std::path::Path, id: &str) -> Vec<ApiMessage> {
 async fn send_streaming<F>(
     mut build: F,
     live: &std::sync::Mutex<String>,
+    answer: &std::sync::Mutex<String>,
     report: &std::sync::Mutex<LiveReport>,
 ) -> Result<MessagesResp, AgentError>
 where
@@ -1867,6 +1921,10 @@ where
                         // every reply, and reusing the buffer the lock already holds turns a fresh
                         // allocation per chunk into a copy into memory that is there anyway.
                         asm.reasoning().clone_into(&mut live.lock().expect("reasoning mutex"));
+                        // The reply's answer, on the same tick and for the same reason. It is what
+                        // the view switches to the moment the model stops thinking, so it cannot
+                        // arrive any later than this.
+                        asm.answer().clone_into(&mut answer.lock().expect("answer mutex"));
                         // The same tick carries what the chunk said about the request's cost. Read
                         // from the assembler rather than from the frame directly, so the parsing
                         // rule lives in one place — and so a provider whose usage arrives in an
@@ -2496,8 +2554,9 @@ mod tests {
         let live = live_figures(LiveReport::default(), 400_000, Usage::default()).expect("something to show");
         assert!(!live.reported, "it is arithmetic, not a count");
         assert!(
-            !live.output_estimated,
-            "nothing has arrived to estimate, so the zero output is a measurement and not a guess"
+            live.output_estimated,
+            "and the price built on it is a guess: the reply has not opened, so its output — the \
+             half the money will move on — is not yet known at all"
         );
         assert_eq!(live.usage.input_tokens, 100_000, "400 kB at 4 bytes a token");
         assert_eq!(live.usage.output_tokens, 0);
