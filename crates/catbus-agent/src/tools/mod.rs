@@ -25,6 +25,10 @@ mod phpunit;
 mod plouf;
 mod read;
 mod spawn;
+// Visible past this module because the identity file's `AllowedTools` has to be read differently for
+// a child than for a session — see `spawn::is_subagent` and `ToolSet::capped_to`. One reader of the
+// spawn depth rather than a second one in `main` that could disagree with it.
+pub use spawn::is_subagent;
 pub mod ssh;
 // Visible past this module for the same reason `bash` is: the REPL shows the head of
 // the list above its prompt, and reading it the way the tool does beats a second

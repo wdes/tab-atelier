@@ -556,14 +556,61 @@ impl ToolSet {
         if !unknown.is_empty() {
             unknown.sort_unstable();
             unknown.dedup();
+            // "the launcher's set" rather than "this set", because the identity file is shared: the
+            // same line is reported by a spawned child whose own set is far smaller, and a reader
+            // then takes the list for their own tools. What is listed is the set being narrowed
+            // *from*, which for the child is its parent's.
             return Err(format!(
-                "unknown tool(s) in AllowedTools: {} — this set offers {}",
+                "unknown tool(s) in AllowedTools: {} — the launcher's set offers {}",
                 unknown.join(", "),
                 available.join(", ")
             ));
         }
 
-        let keep: std::collections::BTreeSet<&str> = allowed.iter().map(String::as_str).collect();
+        let narrowed = self.retaining(&allowed.iter().map(String::as_str).collect());
+        if narrowed.specs.is_empty() {
+            // Reachable only by intersecting two sources that share no tool. An
+            // agent with no tools can do nothing at all, so it is a configuration
+            // conflict to report rather than a state to run in.
+            return Err(format!(
+                "AllowedTools leaves no tools at all — it names {} but the launcher's set offers {}",
+                allowed.join(", "),
+                available.join(", ")
+            ));
+        }
+        Ok(narrowed)
+    }
+
+    /// Keep the named tools this set already offers, and report the ones it could not grant.
+    ///
+    /// The lenient counterpart of [`Self::narrowed_to`], for a **sub-agent** — a child a tool call
+    /// started. A child's tool set was chosen narrower by its parent before it ran, so a name in the
+    /// identity file that the child does not offer cannot widen anything by being ignored: for a
+    /// child the ceiling is vacuous rather than violated, and the names it lacks are simply not
+    /// granted.
+    ///
+    /// Refusing instead is what made `Spawn` unusable in any project whose `.catbus/identity.md`
+    /// names tools a `minimal` child does not have. The child died at startup applying a permission
+    /// list written for the full session, and its parent was told the *tool set* was wrong — when
+    /// what was wrong was reading a session's list as a child's contract. The failure is returned
+    /// rather than logged here so the caller can name both sides of it.
+    ///
+    /// A result with no tools in it is returned as such rather than refused: the caller is the one
+    /// that knows whether an agent with nothing can be useful, and for a child the answer is that it
+    /// is not.
+    pub fn capped_to(&self, allowed: &[String]) -> (Self, Vec<String>) {
+        let mut ungranted: Vec<String> = allowed.iter().filter(|name| !self.offers(name)).cloned().collect();
+        ungranted.sort_unstable();
+        ungranted.dedup();
+        (self.retaining(&allowed.iter().map(String::as_str).collect()), ungranted)
+    }
+
+    /// The filtering both of the two above share, so they cannot drift apart.
+    ///
+    /// Shared rather than written twice because this is a permission list: a `capped_to` that kept a
+    /// different set from `narrowed_to` on the same input would grant in one path what the other
+    /// refuses, and that is a divergence nobody would notice until it mattered.
+    fn retaining(&self, keep: &std::collections::BTreeSet<&str>) -> Self {
         let specs: Vec<Value> = self
             .specs
             .iter()
@@ -575,17 +622,6 @@ impl ToolSet {
             .cloned()
             .collect();
 
-        if specs.is_empty() {
-            // Reachable only by intersecting two sources that share no tool. An
-            // agent with no tools can do nothing at all, so it is a configuration
-            // conflict to report rather than a state to run in.
-            return Err(format!(
-                "AllowedTools leaves no tools at all — it names {} but this set offers {}",
-                allowed.join(", "),
-                available.join(", ")
-            ));
-        }
-
         let custom = self
             .custom
             .iter()
@@ -593,7 +629,7 @@ impl ToolSet {
             .map(|(name, tool)| (name.clone(), tool.clone()))
             .collect();
 
-        Ok(Self {
+        Self {
             specs,
             custom,
             // Carried through narrowing, so restricting the tools cannot silently drop the host
@@ -602,7 +638,7 @@ impl ToolSet {
             // And the PHP function list for the same reason: `AllowedTools` is about which tools
             // exist, not about what a surviving one may do.
             phpunit_functions: self.phpunit_functions.clone(),
-        })
+        }
     }
 
     /// Whether auto mode should grade this tool before running it.
@@ -965,6 +1001,80 @@ mod tests {
         // unknown-name path; an empty list is the empty path.
         let err = set.narrowed_to(&[]).unwrap_err();
         assert!(err.contains("no tools at all"), "{err}");
+    }
+
+    /// A sub-agent is capped, not held to the ceiling: the tools it does offer are granted, and the
+    /// names it does not offer are reported rather than refused.
+    ///
+    /// This is the difference that made `Spawn` unusable. A child's set was chosen narrower by its
+    /// parent before it ran, so an identity naming a tool the child lacks cannot widen anything — the
+    /// list is vacuous for the child, not violated by it. Refusing instead killed the child at
+    /// start-up over a permission list written for the full session it was spawned from.
+    #[test]
+    fn capping_grants_what_is_offered_and_reports_the_rest() {
+        let set = ToolSet::from_config(ToolConfig {
+            allow: Some(vec!["Read".into(), "Edit".into()]),
+            ..ToolConfig::default()
+        })
+        .expect("valid");
+
+        let (capped, ungranted) = set.capped_to(&[
+            "Read".to_owned(),
+            "Bash".to_owned(),
+            "Spawn".to_owned(),
+            "Git".to_owned(),
+        ]);
+        assert_eq!(names(&capped), vec!["Read"], "the tool it has is granted");
+        assert_eq!(
+            ungranted,
+            vec!["Bash", "Git", "Spawn"],
+            "and the ones it does not have are named, sorted, so the caller can say which"
+        );
+        // The original is untouched. `Edit` was not asked for, so it is not in the result — a cap
+        // narrows to what was named, exactly as `narrowed_to` does.
+        assert_eq!(names(&set), vec!["Edit", "Read"]);
+    }
+
+    /// Capping to nothing is a result, not a refusal — the caller decides whether an agent with no
+    /// tools is useful, and for a sub-agent the caller already knows it is not.
+    #[test]
+    fn capping_to_nothing_returns_an_empty_set_rather_than_an_error() {
+        let set = ToolSet::from_config(ToolConfig {
+            allow: Some(vec!["Read".into()]),
+            ..ToolConfig::default()
+        })
+        .expect("valid");
+
+        let (capped, ungranted) = set.capped_to(&["Bash".to_owned(), "Git".to_owned()]);
+        assert!(capped.specs().is_empty(), "nothing was offered, so nothing is granted");
+        assert_eq!(ungranted, vec!["Bash", "Git"], "and both are reported");
+    }
+
+    /// The host policy and the PHP function list survive a cap, for the same reason they survive
+    /// `narrowed_to`: they are set independently of which tools exist, and neither implies the other.
+    ///
+    /// Asserted separately from the `narrowed_to` case because the two now share one filter — this
+    /// is the test that would catch the shared helper being changed in a way that only one of the
+    /// two callers wanted.
+    #[test]
+    fn capping_keeps_the_policy_and_the_php_functions() {
+        let dir = tempfile::tempdir().unwrap();
+        let catbus = dir.path().join(".catbus");
+        std::fs::create_dir_all(&catbus).unwrap();
+        let base = dir.path().join("launcher.toml");
+        std::fs::write(&base, r#"phpunit_disable_functions = ["exec"]"#).unwrap();
+
+        let set = ToolSet::load_layered(Some(&base), dir.path()).expect("valid");
+        // A launcher config that sets only the function list leaves the full built-in tool set, so
+        // `Read` is offered and capped to — and `GiteaPr` stands for the realistic case: a name the
+        // identity carries because a project file defines it, which this set has never heard of.
+        let (capped, ungranted) = set.capped_to(&["Read".to_owned(), "GiteaPr".to_owned()]);
+        assert_eq!(names(&capped), vec!["Read"]);
+        assert_eq!(ungranted, vec!["GiteaPr"]);
+        assert!(
+            capped.phpunit_disable_functions().is_some(),
+            "a cap is about which tools exist, not about what a surviving one may do"
+        );
     }
 
     /// The example config the README points at must actually work.

@@ -308,6 +308,12 @@ async fn main() {
 /// of the ceiling — the wrapper answer is the same tool list the operator already
 /// chose, minus what the prompt file removes.
 ///
+/// A **sub-agent** is the exception, and read leniently: a child's set was chosen
+/// narrower by the parent that spawned it before it ran, so the same ceiling cannot
+/// be violated by a name the child does not offer — it is vacuous rather than broken.
+/// Refusing there is what made `Spawn` unusable in any project whose identity names
+/// tools a `minimal` child does not have; see [`tools::ToolSet::capped_to`].
+///
 /// `cwd` is threaded in rather than looked up, because the identity is also found
 /// at `<cwd>/.catbus/identity.md` and the session's directory is `--cwd` when the
 /// launcher named one.
@@ -323,7 +329,30 @@ fn resolve_tools(args: &Args, cwd: &Path) -> Result<(tools::ToolSet, identity::I
         return Ok((tool_set, identity));
     };
 
-    let narrowed = tool_set.narrowed_to(allowed)?;
+    let narrowed = if tools::is_subagent() {
+        let (capped, ungranted) = tool_set.capped_to(allowed);
+        if !ungranted.is_empty() {
+            log::info!(
+                "the identity names {}, which a sub-agent's set does not offer; not granted",
+                ungranted.join(", ")
+            );
+        }
+        if capped.specs().is_empty() {
+            // Still a conflict, and still worth a sentence: the identity named tools and the child
+            // has none of them, so it would run unable to do anything at all. Unreachable in
+            // practice — `minimal` offers `Read` — but a child that appears to work while holding
+            // nothing is worse than a startup error naming the two lists.
+            return Err(format!(
+                "AllowedTools leaves a sub-agent with no tools — it names {} and a sub-agent offers \
+                 none of them",
+                allowed.join(", ")
+            )
+            .into());
+        }
+        capped
+    } else {
+        tool_set.narrowed_to(allowed)?
+    };
     log::info!(
         "the identity file limits the tool set to {} (from {})",
         narrowed.names().join(", "),
