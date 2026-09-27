@@ -1073,13 +1073,19 @@ fn the_spinner_repaints_rather_than_appending() {
     // simply absent and the byte assertion stopped describing anything.
     //
     // Within this capture there is only one frame to look at, for a reason worth
-    // recording: the expectation stops at `tokens in`, and that text is painted on the
-    // *first* status frame. So the two things that can be checked here are that the
-    // animation started, and that the frame was painted at a cursor position rather
-    // than written as a new line — which is exactly the difference between repainting
-    // and appending, and is what the old assertion was reaching for.
+    // recording: the expectation stops at the status row's own activity label, which is
+    // painted on the *first* status frame. So the two things that can be checked here
+    // are that the animation started, and that the frame was painted at a cursor
+    // position rather than written as a new line — which is exactly the difference
+    // between repainting and appending, and is what the old assertion was reaching for.
+    //
+    // The label is the thing to wait for rather than a cost figure: it appears nowhere
+    // else on the screen or in the transcript. The expectation used to stop at
+    // `tokens in`, a form the row stopped using, so the wait expired on every run and
+    // the capture was whatever happened to have arrived by then.
     let port = spawn_delayed_relay(REPLY_WITH_USAGE, Duration::from_secs(2));
-    let (_, seen) = type_and_expect_at(port, &[], "hello", "tokens in");
+    let (painted, seen) = type_and_expect_at(port, &[], "hello", "Thinking");
+    assert!(painted, "the status row never painted its activity label:\n{seen}");
 
     assert!(
         "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏".chars().any(|c| seen.contains(c)),
