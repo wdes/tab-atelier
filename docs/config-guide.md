@@ -230,6 +230,29 @@ On the relay path the model is chosen by the relay, not here — `/model` record
 client asks for, and the relay decides what answers. The transcript records what *did*
 answer, which is why the two can differ.
 
+### A reasoning model needs one more flag
+
+The gpt-5/gpt-6 and o-series families refuse to combine function tools with their default
+reasoning, on the chat-completions endpoint this agent speaks:
+
+    400 Function tools with reasoning_effort are not supported for gpt-6-luna in
+    /v1/chat/completions. To use function tools, use /v1/responses or set
+    reasoning_effort to 'none'.
+
+Since the tool loop is the point, pass `--openai-reasoning-effort none` — or set
+`CATBUS_OPENAI_REASONING_EFFORT=none`. Nothing is lost by doing so: this wire has no field
+for a reasoning trace, so it would be discarded on arrival anyway.
+
+It is **not** sent for you, because the classic models answer the other way — `gpt-4.1`,
+`gpt-4o` and `gpt-3.5-turbo` reject the field with `400 Unrecognized request argument
+supplied: reasoning_effort`. A default would break one family whichever way it was set, so
+the operator who knows which model they pointed at says it. A provider that ignores the
+field, such as a local Ollama server, is unaffected either way.
+
+The output ceiling is handled for you and needs no flag: it goes out as
+`max_completion_tokens`, the name every endpoint reads, since the newer models refuse the
+legacy `max_tokens` outright while the older ones accept either.
+
 ## Limiting the network
 
 A tab can have its internet switched off. When it does, the agent is pointed at the app's own
