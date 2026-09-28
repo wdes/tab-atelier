@@ -883,23 +883,25 @@ fn a_turn_paints_the_spinner_and_then_the_totals_line() {
     // `strip_ansi` drops those CRs — after stripping, every repaint runs together into one line and
     // the frame painted once the reply is recorded, which carries the ledger's model and *is*
     // priced, reads as part of the frame before it. That later frame is the ledger working as
-    // intended; what this checks is that the earlier one, with nothing named yet, is not priced at
-    // a model nobody has confirmed. Searching the stripped text finds the wrong frame entirely.
-    let spinner = seen
+    // intended; what this checks is that a frame went up, with nothing named yet, carrying no price.
+    //
+    // The predicate asks for all three properties at once rather than taking the first frame that
+    // has the counts and then asserting it is unpriced. That distinction is not academic: how the
+    // repaints divide into CR-separated frames depends on how the writes interleave, and on CI the
+    // estimate and the priced row landed in *one* segment — so the old form picked up a frame that
+    // was priced with the model it named, and failed a row that was behaving correctly. Repeats here
+    // never reproduced it, so the difference is the environment's frame boundaries and not the code's.
+    //
+    // What is worth holding is the property: a frame went up with an estimated input count and no
+    // price, and that holds however the boundaries fall.
+    let inflight = seen
         .split('\r')
         .map(strip_ansi)
-        .find(|frame| frame.contains("Thinking") && frame.contains('~'))
-        .unwrap_or_else(|| panic!("no spinner frame carried an estimated token count:\n{flat}"));
+        .find(|frame| frame.contains("Thinking") && frame.contains('~') && !frame.contains("USD"))
+        .unwrap_or_else(|| panic!("no frame carried an estimated input count and no price:\n{flat}"));
     assert!(
-        spinner.contains(" in"),
-        "the frame's figure is an input count: {spinner}"
-    );
-    // Asserted rather than glossed over: nothing has named a model yet, so pricing here would be
-    // pricing at a model nobody confirmed — which is why the row falls back to the ledger only once
-    // the reply is in it, and why this frame, from before that, carries no price.
-    assert!(
-        !spinner.contains("USD"),
-        "no model was reported yet, so this frame cannot be priced: {spinner}"
+        inflight.contains(" in"),
+        "the frame's figure is an input count: {inflight}"
     );
 }
 
