@@ -176,11 +176,11 @@ impl Panel {
         }
     }
 
-    /// The question the cursor is in, if the set is non-empty.
-    fn current<'q>(&self, questions: &'q [crate::tools::ask::Question]) -> Option<&'q crate::tools::ask::Question> {
-        questions.get(self.question)
-    }
-
+    /// The live question's ticks.
+    ///
+    /// There was a `current` beside this returning the question itself, for a panel that drew only
+    /// that one. Every question is drawn now, so the drawing indexes the slice and the accessor had
+    /// no callers left — removed rather than left as a method someone would have to wonder about.
     fn ticks_mut(&mut self) -> Option<&mut Ticks> {
         self.ticks.get_mut(self.question)
     }
@@ -285,16 +285,20 @@ impl Panel {
         }
     }
 
-    /// The option row, windowed to `width` columns.
+    /// One question's option row, windowed to `width` columns.
     ///
     /// Windowing rather than truncating keeps the option under the cursor visible: the cursor
     /// is what the arrows move, so scrolling it out of view would make the UI unusable on a
     /// narrow terminal — and the labels come from a model, so their length is not ours to bound.
-    fn options_row(&self, question: &crate::tools::ask::Question, width: usize) -> String {
-        let Some(ticks) = self.ticks.get(self.question) else {
+    ///
+    /// `index` is which question this row is for, rather than the panel's current one, because every
+    /// question is drawn at once: a row that always read the cursor's ticks could only ever render
+    /// the question the cursor was in.
+    fn options_row(&self, index: usize, question: &crate::tools::ask::Question, width: usize) -> String {
+        let Some(ticks) = self.ticks.get(index) else {
             return String::new();
         };
-        let mut cells: Vec<String> = question
+        let cells: Vec<String> = question
             .options
             .iter()
             .enumerate()
@@ -308,17 +312,9 @@ impl Panel {
                 format!("{arrow}[{box_}] {}", option.label)
             })
             .collect();
-        // Mark which of the set this is, so three questions are not answered blind.
-        if self.ticks.len() > 1 {
-            let position = self.question + 1;
-            let total = self.ticks.len();
-            // `get_mut` and not `cells[self.question]`: a question with no options has no cell to
-            // write the marker into, and the marking is decoration — losing it beats a panic on a
-            // value the panel did not author.
-            if let Some(cell) = cells.get_mut(self.question) {
-                let _ = write!(cell, " ({position}/{total})");
-            }
-        }
+        // No `(2/3)` marker on the option under the cursor any more: it was there so a set of
+        // questions was not answered blind, and every row is on screen now. The cursor is already
+        // marked by its arrow, so a second mark would only say what the row's position says.
         let joined = cells.join("  ");
         if joined.chars().count() <= width {
             return joined;
@@ -797,9 +793,10 @@ impl Ui {
 
     /// Repaint the viewport as the question panel, in place of the prompt.
     ///
-    /// The panel is one row of options and one row that is either the note being typed or the
-    /// key hints. It draws into the top of the band, so the remaining reserved rows stay blank —
-    /// which the next frame clears, because ratatui repaints any cell that changed.
+    /// One row per question, in the order they were asked, and one row under them that is either the
+    /// note being typed or the key hints. It draws into the top of the band, so the remaining
+    /// reserved rows stay blank — which the next frame clears, because ratatui repaints any cell
+    /// that changed.
     fn draw_panel(
         &mut self,
         panel: &Panel,
@@ -811,19 +808,57 @@ impl Ui {
             let area = frame.area();
             let top = area.top();
             let width = usize::from(area.width);
-            let options = panel
-                .current(questions)
-                .map_or_else(String::new, |question| panel.options_row(question, width));
-            frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    options,
-                    // Bold, because this row is the question: the prompt text scrolled past
-                    // above and the options did not, so the eye needs somewhere to land.
-                    Style::default().add_modifier(Modifier::BOLD),
-                ))),
-                Rect::new(area.left(), top, area.width, 1),
-            );
-            let second = Rect::new(area.left(), top.saturating_add(1), area.width, 1);
+            // Every question on screen at once, one row each, rather than the current one with a
+            // `(2/3)` beside it. A set of questions is one decision, and showing them one at a time
+            // made the operator answer blind and page back with `tab` to recall the others — the
+            // marker existed only to say how many they could not see. With the set visible, what
+            // needs saying instead is which of them the keys are acting on, so that is the styled one.
+            //
+            // Windowed on the cursor when there are more questions than rows, the same way
+            // `options_row` windows its options: the question the keys act on has to stay visible,
+            // and how many questions there are comes from a model, so it is not ours to bound.
+            let room = usize::from(self.rows).saturating_sub(1).max(1);
+            let total = questions.len();
+            let first = if total <= room {
+                0
+            } else {
+                (panel.question + 1).saturating_sub(room).min(total - room)
+            };
+            let last = (first + room).min(total);
+            for (offset, question) in questions[first..last].iter().enumerate() {
+                let index = first + offset;
+                let options = panel.options_row(index, question, width);
+                // The header first, where there is one: it is the column heading, and the options
+                // read as that heading's choices. Skipped when the model sent none, rather than
+                // leaving a gap the width of a label that does not exist.
+                let row = if question.header.trim().is_empty() {
+                    options
+                } else {
+                    format!("{}  {options}", question.header)
+                };
+                frame.render_widget(
+                    Paragraph::new(Line::from(Span::styled(
+                        row,
+                        if index == panel.question {
+                            Style::default().add_modifier(Modifier::BOLD)
+                        } else {
+                            // Legible but quiet: the others are context for the decision, not
+                            // candidates for the arrow keys.
+                            Style::default().fg(Color::DarkGray)
+                        },
+                    ))),
+                    Rect::new(
+                        area.left(),
+                        top.saturating_add(u16::try_from(offset).unwrap_or(0)),
+                        area.width,
+                        1,
+                    ),
+                );
+            }
+            // The note or the hint goes under the last question drawn, not at a fixed second row,
+            // since how many rows the questions took is not known until they are placed.
+            let under = top.saturating_add(u16::try_from(last - first).unwrap_or(0));
+            let second = Rect::new(area.left(), under, area.width, 1);
             if panel.typing {
                 // The one place in the panel where text is written rather than chosen, so it
                 // is coloured differently from the boxes and carries the terminal's cursor.
@@ -848,7 +883,7 @@ impl Ui {
                     .saturating_add(label_width)
                     .saturating_add(u16::try_from(panel.note.cursor()).unwrap_or(0))
                     .min(area.right().saturating_sub(1));
-                frame.set_cursor_position((column, top.saturating_add(1)));
+                frame.set_cursor_position((column, under));
             } else {
                 let hint = panel_hint(panel, questions, width);
                 let line = match status.as_deref() {
@@ -2579,7 +2614,7 @@ mod tests {
             .collect();
         let mut panel = Panel::new(std::slice::from_ref(&q));
 
-        let wide = panel.options_row(&q, 300);
+        let wide = panel.options_row(0, &q, 300);
         assert!(
             wide.contains("option-number-11") && !wide.contains('…'),
             "everything fits, so nothing is hidden: {wide}"
@@ -2589,13 +2624,47 @@ mod tests {
             panel.handle(key(KeyCode::Down), std::slice::from_ref(&q));
         }
         assert_eq!(panel.ticks[0].at, 11);
-        let narrow = panel.options_row(&q, 24);
+        let narrow = panel.options_row(0, &q, 24);
         assert!(
             narrow.contains("option-number-11"),
             "the cursor must never scroll out of view: {narrow}"
         );
         assert!(narrow.chars().count() <= 24, "and the row must fit the width: {narrow}");
         assert!(narrow.starts_with('…'), "there is more before it: {narrow}");
+    }
+
+    /// A row is drawn for the question it is asked about, not for the one the cursor is in.
+    ///
+    /// This is what lets every question be on screen at once: the drawing asks for each index in
+    /// turn, so a row that read the cursor's ticks could only ever render one of them — which is
+    /// what the panel used to do.
+    #[test]
+    fn a_row_can_be_drawn_for_a_question_the_cursor_is_not_in() {
+        let first = question("Which schema?", false);
+        let mut second = question("Which transport?", false);
+        second.options = vec![
+            crate::tools::ask::Choice {
+                label: "http".to_owned(),
+                description: String::new(),
+            },
+            crate::tools::ask::Choice {
+                label: "stdio".to_owned(),
+                description: String::new(),
+            },
+        ];
+        let questions = vec![first, second.clone()];
+        let panel = Panel::new(&questions);
+
+        // `Panel::new` puts the cursor on the first question, and the second question's row still
+        // has to come back with the second question's options.
+        assert_eq!(panel.question, 0);
+        let row = panel.options_row(1, &second, 80);
+        assert!(row.contains("http"), "the second question's own options: {row}");
+        assert!(row.contains("stdio"), "and all of them: {row}");
+
+        // An index past the end has no ticks, so the row is empty rather than a panic. The drawing
+        // windows the slice, but this guard is what makes windowing safe to get wrong.
+        assert_eq!(panel.options_row(9, &second, 80), "");
     }
 
     /// Replace the question with a test one that has no options.
@@ -2615,14 +2684,15 @@ mod tests {
     #[test]
     fn a_question_with_no_options_is_still_answerable() {
         let q = without_options(&question("What should the budget be?", false));
-        // A second question as well, so the option row has to draw the "n/m" position marker for
-        // a question that has no cells to put it in — the one place an empty option list could
-        // index out of bounds.
-        let questions = vec![q.clone(), question("And which one?", false)];
+        // One question, because an option-less row is the whole case: it has no cells to draw, and
+        // the drawing must handle that rather than indexing into a list that is not there. It used
+        // to share the set with a second question so the `(n/m)` position marker had somewhere to
+        // go; the marker is gone, because every question is on screen now and needed no telling.
+        let questions = vec![q.clone()];
         let mut panel = Panel::new(&questions);
         assert!(!panel.ticks[0].on.iter().any(|on| *on), "nothing to tick");
         assert_eq!(panel.ticks[0].on.len(), 0, "and no boxes to draw either");
-        assert_eq!(panel.options_row(&q, 80), "", "so the row is empty, not a panic");
+        assert_eq!(panel.options_row(0, &q, 80), "", "so the row is empty, not a panic");
 
         // Pressing space on nothing must not panic or invent a tick.
         panel.handle(key(KeyCode::Char(' ')), &questions);
