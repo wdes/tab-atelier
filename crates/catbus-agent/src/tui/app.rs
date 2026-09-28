@@ -579,16 +579,43 @@ impl Ui {
     /// earlier exchange, and indented on continuation lines so a multi-line prompt
     /// still reads as one.
     pub fn print_user(&mut self, prompt: &str, styled: bool) -> std::io::Result<()> {
-        // Dimmed cyan where the session asks for styling, plain otherwise: the marker
-        // is what distinguishes it, so a `NO_COLOR` session gets the marker without the
-        // colour rather than nothing.
-        let style = if styled {
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM)
-        } else {
-            Style::default()
-        };
+        // The operator's turns carry a band of their own, so scrolling back finds them without
+        // reading them — see [`user_band`] for why it is that colour. Nothing else changes for a
+        // `NO_COLOR` session: the styling is a convenience and the `> ` marker is what identifies
+        // the line, so an unstyled session loses the colour and keeps the marker.
         let width = usize::from(self.terminal.size()?.width).max(1);
-        let body = marked_prompt_rows(prompt, width);
+        let rows = marked_prompt_rows(prompt, width);
+        // Padded only where there is a band to carry. An unstyled session would otherwise get a row
+        // of trailing spaces for nothing.
+        let (style, body) = if styled {
+            (user_band(), pad_to_width(rows, width))
+        } else {
+            (Style::default(), rows)
+        };
+        let height = u16::try_from(body.len()).unwrap_or(u16::MAX);
+        self.insert(height, move |buf| {
+            for (i, line) in body.iter().enumerate() {
+                let y = buf.area.top().saturating_add(u16::try_from(i).unwrap_or(0));
+                buf.set_string(buf.area.left(), y, line, style);
+            }
+        })
+    }
+
+    /// Print text above the prompt with a background of its own, out to the terminal's width.
+    ///
+    /// The padding is what makes it a *band* rather than a highlight: a background set on the glyphs
+    /// alone traces the shape of the text, and one that runs to the edge reads as a block. The style
+    /// is the caller's rather than this function's, so the band under a just-typed prompt and the one
+    /// over a prompt replayed from an earlier session are the same colour by construction — see
+    /// [`user_band`].
+    pub fn print_banded(&mut self, text: &str, style: Style) -> std::io::Result<()> {
+        let width = usize::from(self.terminal.size()?.width).max(1);
+        let rows: Vec<String> = text
+            .trim_end_matches('\n')
+            .split('\n')
+            .flat_map(|line| wrap_plain(line, width))
+            .collect();
+        let body = pad_to_width(rows, width);
         let height = u16::try_from(body.len()).unwrap_or(u16::MAX);
         self.insert(height, move |buf| {
             for (i, line) in body.iter().enumerate() {
@@ -1071,6 +1098,36 @@ fn wrap_prompt(prompt: &str, before: &str, after: &str, width: usize) -> Wrapped
 fn split_at_chars(text: &str, at: usize) -> (&str, &str) {
     let byte = text.char_indices().nth(at).map_or(text.len(), |(index, _)| index);
     text.split_at(byte)
+}
+
+/// The band behind the operator's own words, wherever they are shown.
+///
+/// A dark olive-yellow rather than a bright one. The band sits behind ordinary prose, and a
+/// saturated yellow is the loudest thing a terminal can draw — the colour has to say "yours" from the
+/// corner of an eye without becoming the thing you are looking at. Answered the same way Claude Code
+/// does, which is where the idea comes from.
+///
+/// Named through the 256-colour index because the named sixteen have no dark yellow: `Color::Yellow`
+/// is the bright one, and there is nothing between it and black. The foreground is named rather than
+/// left to the terminal, because the band is dark — on a light terminal the default foreground would
+/// be dark-on-dark across the whole quote.
+///
+/// One function rather than a colour written at each use, because a prompt typed just now and one
+/// replayed from an earlier session are the same thing and have to look it. Both callers take this.
+fn user_band() -> Style {
+    Style::default().fg(Color::White).bg(Color::Indexed(58))
+}
+
+/// Pad rows out to `width`, so a background covers the row rather than tracing the glyphs.
+///
+/// By character count, like everything else that measures these rows — see [`wrap_plain`].
+fn pad_to_width(rows: Vec<String>, width: usize) -> Vec<String> {
+    rows.into_iter()
+        .map(|row| {
+            let padding = width.saturating_sub(row.chars().count());
+            format!("{row}{}", " ".repeat(padding))
+        })
+        .collect()
 }
 
 /// The operator's prompt as the rows it will be echoed on.
@@ -3010,6 +3067,35 @@ mod tests {
                 .collect::<String>(),
             "abcdefghij"
         );
+    }
+
+    /// A row padded for the operator's band reaches the terminal's edge, and no further.
+    #[test]
+    fn a_banded_row_is_padded_to_the_full_width() {
+        let rows = pad_to_width(vec!["> hi".to_owned(), "  there".to_owned()], 10);
+        assert_eq!(rows, vec!["> hi      ", "  there   "]);
+        // Every row is exactly the width, which is what makes the band a block rather than a
+        // highlight tracing the glyphs.
+        assert!(rows.iter().all(|row| row.chars().count() == 10));
+
+        // A row already at the width is left alone, and one longer is *not* truncated — the padding
+        // saturates at zero. Clipping here would lose text the caller had already wrapped to fit.
+        assert_eq!(pad_to_width(vec!["12345".to_owned()], 5), vec!["12345"]);
+        assert_eq!(
+            pad_to_width(vec!["1234567".to_owned()], 5),
+            vec!["1234567"],
+            "a row wider than the terminal is left for the terminal, not cut here"
+        );
+    }
+
+    /// Padding counts characters, so a multi-byte row is padded by what it *shows*.
+    #[test]
+    fn a_banded_row_is_padded_by_character_count() {
+        // Six `é`, at two bytes each. Counting bytes would pad this four short, and the band would
+        // stop before the edge it is supposed to reach.
+        let rows = pad_to_width(vec!["éééééé".to_owned()], 10);
+        assert_eq!(rows[0].chars().count(), 10);
+        assert_eq!(rows[0], format!("éééééé{}", " ".repeat(4)));
     }
 
     /// A clipped line is exactly the width it was given, so it cannot wrap.
