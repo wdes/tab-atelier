@@ -74,8 +74,11 @@ so `!make test &` is almost always what you want over `!make test`. The only cos
 to be looking when the notice arrives.
 
 A foreground command owns the prompt until it finishes, and the status row says so. Press
-**Ctrl-B** to stop waiting for it — it carries on in the background — or **Ctrl-C** to stop the
-command itself. Nothing is lost either way; a background command still reports when it ends.
+**Ctrl-B** to stop waiting for it — it carries on in the background — or **Ctrl-C** to stop it
+outright. That stops the command *and everything it started*, because a command line is usually
+more than one process: a pipeline, an `&&` chain, or a test runner that fanned out to workers all
+go on one press, rather than leaving the work running under the shell that launched it. Nothing is
+lost either way; a background command still reports when it ends.
 
 Two things to know about the model's side of it. The first: what the model is told is that *you*
 ran the command, quoting it, with the exit status and the output — so it takes the result into

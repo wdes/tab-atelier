@@ -33,6 +33,7 @@ mod guard;
 mod identity;
 mod logging;
 mod openai;
+mod proc;
 mod progress;
 mod relay;
 mod retry;

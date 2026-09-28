@@ -247,6 +247,16 @@ fn read_http_request(stream: &mut TcpStream) -> String {
 /// SIGKILL only if it hasn't exited within 5 s.
 struct KillOnDrop(Child);
 
+impl KillOnDrop {
+    /// The child's pid, which is what names the sockets of the sub-agents it starts.
+    ///
+    /// A sub-agent's socket is `catbus-sub-<parent pid>-<n>.sock` (see `tools::spawn`), so this is
+    /// how a test tells *its own* sub-agents apart from every other agent's on the machine.
+    fn pid(&self) -> u32 {
+        self.0.id()
+    }
+}
+
 impl Drop for KillOnDrop {
     fn drop(&mut self) {
         let _ = Command::new("kill").args(["-TERM", &self.0.id().to_string()]).status();
@@ -2486,6 +2496,11 @@ fn processes_with(needle: &str) -> Vec<String> {
 /// in the command line of whatever shell launched this test — a heredoc, a
 /// `cargo test` wrapper — and the `/proc` scan below would then find *that* and
 /// report a phantom leak. Same trick as the `env::args` guard in `cli`.
+///
+/// What it returns is only the prefix, and a caller appends the pid of the parent it started:
+/// the prefix on its own also matches the sub-agents of every other agent on the machine, and a
+/// test that scans for it fails whenever a real session happens to have one running. See
+/// `a_spawned_sub_agent_answers_and_is_reaped` for the scoped form.
 fn sub_agent_socket_prefix() -> String {
     std::env::temp_dir()
         .join(concat!("catbus-", "sub-"))
@@ -2511,13 +2526,6 @@ fn a_spawned_sub_agent_answers_and_is_reaped() {
     let home = dir.path();
     let work = home.join("work");
     std::fs::create_dir_all(&work).unwrap();
-    let marker = sub_agent_socket_prefix();
-
-    // Before: nothing of ours is running.
-    assert!(
-        processes_with(&marker).is_empty(),
-        "a previous run left a sub-agent behind"
-    );
 
     // The child's relay. One canned reply, and it is what the tool result must
     // carry — a reply the parent could only have obtained by asking.
@@ -2535,7 +2543,7 @@ fn a_spawned_sub_agent_answers_and_is_reaped() {
     ]);
 
     let socket = home.join("agent.sock");
-    let (_agent, mut reader, mut stream) = spawn_agent_in(home, home, &socket, |cmd| {
+    let (agent, mut reader, mut stream) = spawn_agent_in(home, home, &socket, |cmd| {
         // The parent's own endpoint, given as a flag.
         cmd.args([
             "--relay-url",
@@ -2548,6 +2556,20 @@ fn a_spawned_sub_agent_answers_and_is_reaped() {
         cmd.env("CATBUS_RELAY_URL", format!("http://127.0.0.1:{child_port}"));
         cmd.env("CATBUS_RELAY_TOKEN", RELAY_TOKEN);
     });
+
+    // Scoped to *this* parent's pid. A sub-agent's socket is `catbus-sub-<parent pid>-<n>.sock`, so
+    // naming the parent is what makes this scan find the children of this run and no other agent's.
+    // The bare prefix matched every live sub-agent on the machine — including one a real tab had
+    // started elsewhere — and failed the run through no fault of the code under test.
+    let marker = format!("{}{}-", sub_agent_socket_prefix(), agent.pid());
+
+    // Before: this parent has no children yet, so anything the scan below finds is ours. Read here
+    // rather than ahead of the spawn because the marker needs the pid — and a pid reused from a
+    // previous run is the one case a stale sub-agent could still be picked up by it.
+    assert!(
+        processes_with(&marker).is_empty(),
+        "a previous run left a sub-agent behind"
+    );
 
     let reply = send_prompt(&mut stream, &mut reader, "start a helper");
     assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");

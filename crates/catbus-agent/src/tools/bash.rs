@@ -25,11 +25,22 @@ pub async fn run(input: &serde_json::Value, cwd: &Path) -> Result<String, String
         .map_or(DEFAULT_TIMEOUT, |d| d.min(MAX_TIMEOUT));
 
     let child = spawn(command, cwd)?;
+    // Armed before the wait, and disarmed only once the command has ended on its own terms. Held
+    // across the await because this is the cancellation case: Ctrl-C drops the future of the model
+    // call that is running this tool, so no line after the `await` is ever reached — a kill written
+    // there would be a kill that does not happen, and the command would keep running with nothing
+    // left holding it. Dropping the guard is what stops the whole tree instead.
+    let mut group = crate::proc::Group::of(&child);
     let out = match tokio::time::timeout(timeout, child.wait_with_output()).await {
         Ok(Ok(out)) => out,
+        // A failure or a timeout returns with the guard still armed, which stops a command we have
+        // given up on — including the tree a timed-out command would otherwise have left running.
         Ok(Err(e)) => return Err(format!("wait: {e}")),
         Err(_) => return Err(format!("timed out after {}s", timeout.as_secs())),
     };
+    // The command finished by itself, so anything it deliberately left running — a server started
+    // with `&` — is left alone. Killing the group here would take down what the caller asked for.
+    group.disarm();
     let mut combined = bytes_to_string(out.stdout);
     if !out.stderr.is_empty() {
         if !combined.is_empty() && !combined.ends_with('\n') {
@@ -66,8 +77,10 @@ pub async fn run(input: &serde_json::Value, cwd: &Path) -> Result<String, String
 ///
 /// `bash -lc` so we inherit the user's PATH and aliases. `kill_on_drop` matters
 /// to whoever holds the returned child: a `Child` does not kill on drop, so
-/// without it a command the operator abandoned keeps running — together with
-/// anything it started — with nothing left to reap it or report on it.
+/// without it a command the operator abandoned keeps running — a command is
+/// usually a pipeline or an `&&` chain, so "the command" is the whole tree, and
+/// the child is put in a process group of its own for that reason. `kill_on_drop`
+/// stops the shell; [`crate::proc::Group`] is what stops what the shell started.
 ///
 /// # Errors
 /// Returns a description when the shell cannot be started at all.
@@ -80,6 +93,10 @@ pub fn spawn(command: &str, cwd: &Path) -> Result<tokio::process::Child, String>
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
+    // Before the spawn, so the shell leads a group nobody else is in and a later group signal
+    // reaches every process the command forks. Without it there is no group to signal, and
+    // stopping the command stops only its shell.
+    crate::proc::in_own_group(&mut cmd);
     cmd.spawn().map_err(|e| format!("spawn bash: {e}"))
 }
 
