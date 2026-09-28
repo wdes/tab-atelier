@@ -2122,13 +2122,19 @@ fn switching_to_an_earlier_session_replays_its_tail() {
 
     // `/clear` starts a fresh session and names the one it left, which is how the operator (and this
     // test) learns the id to go back to.
-    let (cleared, seen) = repl.type_and_expect("/clear", "is still on disk");
+    let (cleared, seen) = repl.type_and_expect("/clear", "to return to it");
     assert!(
         cleared,
         "`/clear` did not name the session it left:\n{}",
         strip_ansi(&seen)
     );
-    let id = session_id_in(&seen).expect("no session id in the `/clear` hint");
+    // Searched in the *joined* text, not the raw bytes. The hint is one long line, so it is wrapped
+    // onto the rows below — and at 80 columns the break falls inside the word `/resume`, leaving
+    // `/resum` at the end of one row and `e <id>` at the start of the next. `strip_ansi` drops the
+    // carriage returns that separate rows, so the stripped text is the rows rejoined and the phrase
+    // is whole again; searching the raw bytes looks for a string the terminal never receives.
+    let joined = strip_ansi(&seen);
+    let id = session_id_in(&joined).unwrap_or_else(|| panic!("no session id in the `/clear` hint:\n{joined}"));
     assert!(
         !seen.contains("--- last "),
         "a fresh session must not claim earlier messages:\n{}",
