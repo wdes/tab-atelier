@@ -65,16 +65,49 @@ const ACTIONS: &[&str] = &[
 pub async fn run(input: &serde_json::Value, cwd: &Path) -> Result<String, String> {
     let action = text(input, "action").ok_or_else(|| format!("missing action — one of: {}", ACTIONS.join(", ")))?;
     match action {
-        "show" => show(cwd).await,
-        "commit" => commit(input, cwd).await,
-        "tag" => tag(input, cwd).await,
-        "history" => history(input, cwd).await,
+        // The worktree verbs run in the session's own directory: their `path` names the worktree
+        // being created or removed, which is an argument rather than a place to run.
         "worktree-add" => worktree_add(input, cwd).await,
         "worktree-remove" => worktree_remove(input, cwd).await,
-        "worktree-list" => worktree_list(cwd).await,
-        "push" => push(input, cwd).await,
-        other => Err(format!("unknown action `{other}` — one of: {}", ACTIONS.join(", "))),
+        other => {
+            // Everything else runs where `path` points, or in the session's own directory when it
+            // names none. This is what makes a worktree usable at all: without it `commit`, `push`
+            // and the reads all acted on the shared checkout, so the branch a request opened was
+            // never the branch it committed to.
+            let dir = checkout(input, cwd)?;
+            match other {
+                "show" => show(&dir).await,
+                "commit" => commit(input, &dir).await,
+                "tag" => tag(input, &dir).await,
+                "history" => history(input, &dir).await,
+                "worktree-list" => worktree_list(&dir).await,
+                "push" => push(input, &dir).await,
+                unknown => Err(format!("unknown action `{unknown}` — one of: {}", ACTIONS.join(", "))),
+            }
+        }
     }
+}
+
+/// The checkout an action runs in: the session's directory, or a worktree inside it.
+///
+/// Every action used to run in the session's directory, which is fixed when the agent starts and
+/// cannot be changed. So a session could create a worktree and edit files in it by their full
+/// relative path, but `commit`, `push`, `tag` and `history` still acted on the shared checkout — the
+/// branch a request opened was never the branch it committed to. That is why the rule at the top of
+/// `AGENTS.md`, that every session works in its own worktree, could not be followed from here, and
+/// why sessions kept editing the shared checkout instead.
+///
+/// `path` is resolved and confined the same way the worktree verbs resolve theirs, and for the same
+/// reason: a worktree is a whole checkout, so a path outside the working directory would be a way to
+/// write anywhere.
+///
+/// # Errors
+/// Returns the refusal when `path` leaves the working directory.
+fn checkout(input: &serde_json::Value, cwd: &Path) -> Result<std::path::PathBuf, String> {
+    let Some(path) = text(input, "path") else {
+        return Ok(cwd.to_path_buf());
+    };
+    Ok(cwd.join(inside(cwd, "path", Some(path))?))
 }
 
 /// Whether an action changes anything, so the gate can be asked about the action itself.
@@ -693,8 +726,11 @@ pub fn spec() -> serde_json::Value {
                         `worktree-remove` and `worktree-list` manage worktrees inside the working \
                         directory; `push` sends a sha to a named remote and branch. Every commit \
                         carries the co-author trailer. `push` always names both a remote and a \
-                        branch — there is no bare push. The writing actions run the repository's \
-                        hooks, and all of them are judged in auto mode and refused in plan-mode.",
+                        branch — there is no bare push. `path` picks which checkout the action \
+                        runs in, so a request that opened a worktree can commit and push from that \
+                        worktree rather than from the shared checkout. The writing actions run the \
+                        repository's hooks, and all of them are judged in auto mode and refused in \
+                        plan-mode.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -727,10 +763,14 @@ pub fn spec() -> serde_json::Value {
                 "limit": { "type": "integer", "description": "For `history`: how many commits, default 20, max 500." },
                 "path": {
                     "type": "string",
-                    "description": "For the `worktree` actions: the worktree's directory, relative \
-                                    to the working directory. A worktree is a whole checkout, so \
-                                    absolute paths and `..` are refused — that is the sandbox \
-                                    boundary."
+                    "description": "Which checkout to act on, relative to the working directory. \
+                                    Defaults to the working directory itself. Point it at a \
+                                    worktree — `.claude/worktrees/<branch>` — to commit, push, \
+                                    tag, read history or report status there instead of in the \
+                                    shared checkout. For `worktree-add` and `worktree-remove` it \
+                                    names the worktree being created or removed. A worktree is a \
+                                    whole checkout, so absolute paths and `..` are refused — that \
+                                    is the sandbox boundary."
                 },
                 "branch": {
                     "type": "string",
@@ -1001,6 +1041,42 @@ u UU N... 100644 100644 100644 100644 aaa bbb ccc conflicted.rs
         // A path that is only a parent step is not a path.
         assert!(inside(cwd, "path", Some("..")).is_err());
         assert!(inside(cwd, "path", None).is_err());
+    }
+
+    /// Without a `path`, an action runs where the session is — what every action did before this
+    /// parameter existed, and what keeps the common case unchanged.
+    #[test]
+    fn an_action_without_a_path_runs_in_the_sessions_directory() {
+        let cwd = Path::new("/work");
+        let input = serde_json::json!({ "action": "show" });
+        assert_eq!(checkout(&input, cwd).unwrap(), std::path::PathBuf::from("/work"));
+    }
+
+    /// A `path` sends the action to a worktree, which is what makes one usable: without it a session
+    /// could edit files in a worktree but could not commit or push in it, so the branch it opened was
+    /// never the branch it committed to.
+    #[test]
+    fn a_path_sends_the_action_to_a_worktree() {
+        let cwd = Path::new("/work");
+        let input = serde_json::json!({ "action": "commit", "path": ".claude/worktrees/topic" });
+        assert_eq!(
+            checkout(&input, cwd).unwrap(),
+            std::path::PathBuf::from("/work/.claude/worktrees/topic")
+        );
+    }
+
+    /// And refuses a path that leaves the working directory, for the same reason the worktree verbs
+    /// do: a worktree is a whole checkout, so an unconfined path would be a way to write anywhere.
+    #[test]
+    fn a_path_outside_the_working_directory_is_refused() {
+        let cwd = Path::new("/work");
+        for outside in ["/tmp/wt", "../wt", "a/../../wt"] {
+            let input = serde_json::json!({ "action": "commit", "path": outside });
+            assert!(
+                checkout(&input, cwd).is_err(),
+                "`{outside}` should be refused for leaving the working directory"
+            );
+        }
     }
 
     /// `amend` is the one action where naming no files means something.
