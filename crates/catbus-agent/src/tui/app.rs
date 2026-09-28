@@ -580,25 +580,21 @@ impl Ui {
     /// still reads as one.
     pub fn print_user(&mut self, prompt: &str, styled: bool) -> std::io::Result<()> {
         // The operator's turns carry a band of their own, so scrolling back finds them without
-        // reading them — see [`user_band`] for why it is that colour. Nothing else changes for a
-        // `NO_COLOR` session: the styling is a convenience and the `> ` marker is what identifies
-        // the line, so an unstyled session loses the colour and keeps the marker.
+        // reading them — see [`user_band`] for why it is that colour.
+        //
+        // Handed to [`Self::print_banded`] rather than printed here, so a prompt typed just now and
+        // one replayed from an earlier session go through one path and cannot drift apart in colour
+        // or padding. Re-wrapping there costs nothing: these rows were wrapped to this width already,
+        // and a row that fits is left as it is.
         let width = usize::from(self.terminal.size()?.width).max(1);
-        let rows = marked_prompt_rows(prompt, width);
-        // Padded only where there is a band to carry. An unstyled session would otherwise get a row
-        // of trailing spaces for nothing.
-        let (style, body) = if styled {
-            (user_band(), pad_to_width(rows, width))
+        let marked = marked_prompt_rows(prompt, width).join("\n");
+        if styled {
+            self.print_banded(&marked, user_band())
         } else {
-            (Style::default(), rows)
-        };
-        let height = u16::try_from(body.len()).unwrap_or(u16::MAX);
-        self.insert(height, move |buf| {
-            for (i, line) in body.iter().enumerate() {
-                let y = buf.area.top().saturating_add(u16::try_from(i).unwrap_or(0));
-                buf.set_string(buf.area.left(), y, line, style);
-            }
-        })
+            // Nothing to band, and no trailing spaces wanted either — a `NO_COLOR` session keeps the
+            // marker and the plain path, where padding would only add blanks to the transcript.
+            self.print_above(&marked)
+        }
     }
 
     /// Print text above the prompt with a background of its own, out to the terminal's width.
