@@ -1041,7 +1041,112 @@ fn ctrl_c_ends_the_turn_and_the_queued_prompt_runs_next() {
     );
 }
 
-/// Whether the text contains a CSI cursor-position sequence: `ESC [ <r> ; <c> H`.
+/// A command typed while a turn runs is obeyed now — as a command, not as a prompt.
+///
+/// This was the bug. Every line but `/exit` queued, and the queue held *strings* that went straight
+/// to the model when the turn ended, so `/help` typed mid-turn was sent upstream to be read out as
+/// prose. The two assertions are aimed at the two halves: the listing is on screen while the first
+/// reply is still coming back (it acted now), and the status row never counted a queued line (it was
+/// never a prompt). Had the line gone to the model the listing could not appear at all, because the
+/// relay would have answered with the fixture — so this fails if the routing regresses, not just if
+/// the timing does.
+///
+/// The listing's own last line is the marker rather than a command name: `/help` names every command,
+/// so a name would match text already on screen from this run and prove nothing.
+#[test]
+fn a_command_typed_mid_turn_is_obeyed_now_and_not_sent_as_a_prompt() {
+    // Held open for five seconds, so the command is submitted while the turn is genuinely still out.
+    let port = spawn_two_turn_relay(Duration::from_secs(5));
+    let rows = 40;
+    let mut repl = AgentRepl::start(port, &[("TERM", "xterm-256color")]);
+
+    // A priced row needs counts the provider has reported, which cannot happen before the reply
+    // opens — so seeing it is proof the turn is in flight rather than merely submitted.
+    let started = repl.type_and_watch(
+        "first",
+        rows,
+        |s| s.contains("USD") && s.contains(" in"),
+        Duration::from_secs(20),
+    );
+    assert!(
+        started,
+        "the turn never started:\n{}",
+        repl.report(&repl.screen(rows, 80))
+    );
+
+    let helped = repl.type_and_watch(
+        "/help",
+        rows,
+        |s| s.contains("stop waiting for a `!` command"),
+        Duration::from_secs(10),
+    );
+    let screen = repl.screen(rows, 80);
+    assert!(helped, "`/help` was not obeyed mid-turn:\n{}", repl.report(&screen));
+    // The status row only carries the word when something is waiting, so its absence is the proof
+    // that the command was never a prompt. `/help`'s own text does not contain it, which is what
+    // makes the absence meaningful rather than an artefact of the marker.
+    assert!(
+        !screen.contains("queued"),
+        "the command was queued rather than obeyed:\n{screen}"
+    );
+    assert!(
+        !screen.contains("will run when this turn finishes"),
+        "a command that can act at once was told to wait:\n{screen}"
+    );
+}
+
+/// A command that has to wait is *run as a command* when its turn comes.
+///
+/// `/clear` cannot be obeyed mid-turn: a turn snapshots the session it writes to, so swapping
+/// mid-turn files the reply in the transcript that was just left. It queues — and the queue is the
+/// thing that used to be broken, because what it held was text. The evidence that it ran as a command
+/// is the wording only [`run_slash`] prints, which a prompt cannot produce: the model would have
+/// answered with the fixture reply.
+#[test]
+fn a_command_that_has_to_wait_runs_as_a_command_when_the_turn_ends() {
+    let port = spawn_two_turn_relay(Duration::from_secs(5));
+    let rows = 40;
+    let mut repl = AgentRepl::start(port, &[("TERM", "xterm-256color")]);
+
+    let started = repl.type_and_watch(
+        "first",
+        rows,
+        |s| s.contains("USD") && s.contains(" in"),
+        Duration::from_secs(20),
+    );
+    assert!(
+        started,
+        "the turn never started:\n{}",
+        repl.report(&repl.screen(rows, 80))
+    );
+
+    // It waits, and says so — otherwise a command that will not act until later looks like one that
+    // was swallowed or taken for text.
+    let waited = repl.type_and_watch(
+        "/clear",
+        rows,
+        |s| s.contains("will run when this turn finishes"),
+        Duration::from_secs(10),
+    );
+    assert!(
+        waited,
+        "`/clear` was not queued with a word about waiting:\n{}",
+        repl.report(&repl.screen(rows, 80))
+    );
+
+    // Then the turn ends, and the waiting command runs — as the command it was.
+    let ran = repl.watch(rows, |s| s.contains("is still on disk"), Duration::from_secs(20));
+    let screen = repl.screen(rows, 80);
+    assert!(ran, "the queued command never ran:\n{}", repl.report(&screen));
+    // The relay's *second* answer would be the one a queued `/clear` came back as, had it been sent
+    // upstream as text. It cannot have been printed and then purged, either: a purge only happens
+    // when `/clear` runs as itself, which is the behaviour under test.
+    assert!(
+        !screen.contains("Second reply."),
+        "the queued command was sent to the model as a prompt:\n{screen}"
+    );
+}
+
 ///
 /// Looked for structurally rather than as a literal, because the sequence that
 /// immediately precedes a paint is often an SGR colour (`ESC [ 38;5;8;49 m`) and
@@ -1990,6 +2095,65 @@ fn a_streamed_reply_arrives_whole_and_the_turn_ends() {
         "the turn never completed, or its output tokens were lost:\n{}",
         strip_ansi(&seen)
     );
+}
+
+/// Switching to an earlier session replays its tail, so a session you return to shows where it left.
+///
+/// This is the whole point of the tail: `/clear` starts a *fresh* session and `/resume <id>` goes
+/// back to an old one, and only the second arrives at a transcript that already has messages in it.
+/// Without the replay the operator gets a session id and an empty screen, which is exactly the
+/// "no way to know where it left" this closes.
+///
+/// The heading is the evidence, not the words: the prompt and the answer are already in the stream
+/// from the turn that wrote them, so a check for those alone would pass with no replay at all. A
+/// session with one turn shows no tail before the switch, which is what makes the heading appearing
+/// afterwards proof that the transcript was read back.
+#[test]
+fn switching_to_an_earlier_session_replays_its_tail() {
+    let port = spawn_sse_relay("a-thought", "the-answer", Duration::from_millis(50));
+    let mut repl = AgentRepl::start(port, &[]);
+    let (answered, seen) = repl.type_and_expect("hello", "the-answer");
+    assert!(answered, "the turn never finished:\n{}", strip_ansi(&seen));
+    assert!(
+        !seen.contains("--- last "),
+        "a session with one turn should show no tail:\n{}",
+        strip_ansi(&seen)
+    );
+
+    // `/clear` starts a fresh session and names the one it left, which is how the operator (and this
+    // test) learns the id to go back to.
+    let (cleared, seen) = repl.type_and_expect("/clear", "is still on disk");
+    assert!(
+        cleared,
+        "`/clear` did not name the session it left:\n{}",
+        strip_ansi(&seen)
+    );
+    let id = session_id_in(&seen).expect("no session id in the `/clear` hint");
+    assert!(
+        !seen.contains("--- last "),
+        "a fresh session must not claim earlier messages:\n{}",
+        strip_ansi(&seen)
+    );
+
+    let (resumed, seen) = repl.type_and_expect(&format!("/resume {id}"), "--- end of earlier turns ---");
+    assert!(
+        resumed,
+        "`/resume {id}` did not replay the tail:\n{}",
+        strip_ansi(&seen)
+    );
+    assert!(
+        seen.contains("--- last 2 message(s) in this session ---"),
+        "the replayed tail did not name its two messages:\n{}",
+        strip_ansi(&seen)
+    );
+}
+
+/// The session id the `/clear` hint points at, for a `/resume` to use.
+fn session_id_in(text: &str) -> Option<String> {
+    const MARKER: &str = "/resume ";
+    let start = text.rfind(MARKER)? + MARKER.len();
+    let id: String = text.get(start..)?.chars().take(36).collect();
+    (id.len() == 36).then_some(id)
 }
 
 /// Leaving the REPL hands the terminal back on a fresh line.

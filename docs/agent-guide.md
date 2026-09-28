@@ -21,6 +21,12 @@ until the current turn finishes, so the transcript stays in the order you asked 
 as the cancelled one has unwound, which is usually what you wanted when you typed it. Type
 ahead freely while the model works.
 
+Slash commands are not queued: a command says *now*, so `/help`, `/model`, `/rename`, the gate
+modes and the `/resume` listing are obeyed the moment you press Enter. The two that swap the
+session — `/clear` and `/resume <id>` — have to wait, because a turn files its answer in the
+session it started in, so switching mid-turn would lose the answer. They say they are waiting,
+and then run as commands when the turn ends.
+
 A prompt can be several lines. **Shift+Enter** (or **Alt+Enter**) inserts a newline instead
 of sending, so you can lay out a list or a small script and send it whole; Enter is still
 what sends. A newline does not submit, so a pasted block of several lines arrives as one
@@ -52,8 +58,17 @@ dispatches on — so a command cannot exist without being documented.
 | `/model <name>` | Switch it. Remembered for the session, so reopening continues with it. |
 | `/rename <name>` | Name the session, so `/resume` lists something recognisable. |
 | `/resume` | List this directory's earlier sessions, with the first thing you asked each one. |
-| `/resume <id>` | Switch to one, in place. |
-| `/exit` (alias `/quit`) | Leave. Works even while a turn is running. |
+| `/resume <id>` | Switch to one, in place, and replay its last messages. |
+| `/exit` (alias `/quit`) | Leave. Never waits — not even behind a full queue. |
+
+When a session starts — a tab reopened, `--resume <id>`, or `/resume <id>` — the banner above
+the prompt replays the last 200 messages of that transcript, oldest first, prompts marked `> `.
+Each reply is truncated to its opening, and tool calls are one line each; the transcript keeps
+all of it. This is how you see where the session left off without scrolling, and it includes a
+prompt that never got a reply — which is what a session closed mid-turn ends on.
+
+`/clear` starts a *fresh* session, so its banner has no earlier messages to replay; it names the
+id of the session it left instead, which `/resume <id>` takes you back to — tail and all.
 
 ## Your own shell
 

@@ -102,7 +102,7 @@ const RENAME_DESCRIPTION: &str = "rename the current session";
 
 const RESUME_NAME: &str = "/resume";
 const RESUME_ARG: &str = "<id>";
-const RESUME_DESCRIPTION: &str = "list previous sessions in this cwd, or switch to one in-place";
+const RESUME_DESCRIPTION: &str = "list previous sessions in this cwd, or switch to one and replay its last messages";
 
 const MODEL_NAME: &str = "/model";
 const MODEL_ARG: &str = "<name>";

@@ -376,12 +376,14 @@ impl Panel {
 /// and it is in the editor's history either way.
 const QUEUE_LIMIT: usize = 5;
 
-/// How many earlier exchanges the banner shows when a session is resumed.
+/// How many earlier messages the banner replays when a session is resumed.
 ///
-/// A few, not all: the point is to show where the session was, and a resumed
-/// transcript can be thousands of turns long. They go into scrollback, so the rest
-/// is still there to scroll past.
-const BANNER_EXCHANGES: usize = 4;
+/// The tail, not the whole conversation: a resumed transcript can be thousands of
+/// turns long, and what the operator needs when a tab comes back is where it left
+/// off — which the last two hundred messages say without the wait and the
+/// scrollback that the whole file would cost. Each assistant message is truncated,
+/// so this is a compact replay rather than a reprint of every reply.
+const BANNER_MESSAGES: usize = 200;
 
 /// The viewport is a fixed band: the prompt rows, and a status row under them.
 ///
@@ -1415,16 +1417,28 @@ async fn print_banner(ui: &mut Ui, agent: &Agent) -> std::io::Result<()> {
     out.push_str("/help for commands, Ctrl-D to leave\n");
 
     let path = agent.transcript_path().await;
-    let exchanges = crate::session::last_exchanges(&path, BANNER_EXCHANGES);
-    if !exchanges.is_empty() {
-        let _ = writeln!(out, "\n--- last {} exchange(s) in this session ---", exchanges.len());
-        for exchange in &exchanges {
-            out.push_str(&format_turn(&exchange.user_text, "> "));
-            out.push_str(&format_turn(&exchange.assistant_text, ""));
-        }
-        out.push_str("--- end of earlier turns ---\n");
+    let messages = crate::session::last_messages(&path, BANNER_MESSAGES);
+    if messages.is_empty() {
+        return ui.print_above(out.trim_end());
     }
-    ui.print_above(out.trim_end())
+    let _ = writeln!(out, "\n--- last {} message(s) in this session ---", messages.len());
+    // Printed in two parts rather than as the one blob it used to be, because the replay is styled a
+    // turn at a time: a single string can carry one style, and a prompt from an earlier session has to
+    // look like one typed just now. Everything before the replay is still the one call it always was.
+    ui.print_above(out.trim_end())?;
+    for message in &messages {
+        // A prompt is marked `> ` and carries the operator's band, an assistant turn is neither —
+        // the same way the live conversation distinguishes them, so the replay reads as a conversation
+        // rather than as one undifferentiated block, and the operator's own turns are findable in it.
+        let turn = format_turn(&message.text, if message.user { "> " } else { "" });
+        let text = turn.trim_end();
+        if message.user {
+            ui.print_banded(text, user_band())?;
+        } else {
+            ui.print_above(text)?;
+        }
+    }
+    ui.print_above("--- end of earlier turns ---")
 }
 
 /// Format one side of an exchange, indenting continuation lines so a long turn
@@ -1531,6 +1545,14 @@ enum Outcome {
     /// line would leave the old session's output in the scrollback, which is the one
     /// thing this is for.
     Cleared(String),
+    /// Print this, then reprint the banner, keep going — without wiping.
+    ///
+    /// Switching session with `/resume <id>` arrives at an existing conversation,
+    /// so it needs the same tail a start does. The old session's output stays in
+    /// the scrollback rather than being purged: it is history the operator may
+    /// still be reading, and the banner's heading names which session the tail
+    /// below belongs to.
+    Switched(String),
     /// Leave the REPL.
     Exit,
 }
@@ -1618,7 +1640,7 @@ async fn run_slash(agent: &Agent, cwd: &Path, command: &slash::SlashCommand, arg
                         match agent.swap_session(new_session).await {
                             Ok(()) => {
                                 let label = if name.is_empty() { id } else { format!("{name}  {id}") };
-                                Outcome::Print(format!("switched to session {label}"))
+                                Outcome::Switched(format!("switched to session {label}"))
                             }
                             Err(e) => Outcome::Print(format!("error: {e}")),
                         }
@@ -1967,7 +1989,7 @@ impl Repl<'_> {
     /// which is right: the model is mid-thought, and cutting it off to report a
     /// command would lose work to gain nothing.
     fn notify_model(&mut self, notice: String) -> std::io::Result<()> {
-        match submit_action(self.turn.is_some(), self.queued.len(), &notice) {
+        match submit_action(self.turn.is_some(), self.queued.len(), &notice, Origin::Notice) {
             Submit::Now => self.start(notice)?,
             Submit::Queue => self.queued.push_back(notice),
             Submit::Refuse => self
@@ -2013,14 +2035,19 @@ impl Repl<'_> {
         Ok(())
     }
 
-    /// Report a finished turn, then start whatever was queued behind it.
+    /// Report a finished turn, then run whatever was queued behind it.
+    ///
+    /// Returns [`Flow`] because a queued line is run through [`Self::run_line`], which can end the
+    /// session — the reason this is not `()` any more. Nothing that can queue is a `/exit` today, since
+    /// that acts at once, so in practice this always continues; carrying the `Flow` rather than
+    /// discarding it is what keeps that a property of the queue instead of an assumption here.
     ///
     /// A cancelled turn arrives here too, and that is deliberate: it ends the same way any other
     /// turn does, which is what lets a queue outlive Ctrl-C. See [`Self::cancel`].
     async fn finished(
         &mut self,
         result: Result<Result<crate::agent::Turn, crate::agent::AgentError>, tokio::task::JoinError>,
-    ) -> std::io::Result<()> {
+    ) -> std::io::Result<Flow> {
         self.turn = None;
         self.spinner = None;
         match result {
@@ -2040,14 +2067,15 @@ impl Repl<'_> {
         // running. Cleared *after* `report_turn` rather than before so the text is on screen right
         // up to the frame the answer replaces it.
         self.agent.clear_view();
-        // Started here rather than when it was queued, so the transcript reads in order:
-        // answer, then the prompt that prompted the next one. A cancelled turn reaches this too
-        // — `cancel()` ends the turn but lets it unwind, so it arrives here like any other — and
+        // Run here rather than when it was queued, so the transcript reads in order: answer, then
+        // what was asked next. Through `run_line` rather than `start`, so a command that waited is
+        // obeyed as a command rather than sent to the model as text. A cancelled turn reaches this
+        // too — `cancel()` ends the turn but lets it unwind, so it arrives here like any other — and
         // that is what keeps a queue alive across Ctrl-C.
         if let Some(next) = self.queued.pop_front() {
-            self.start(next)?;
+            return self.run_line(next).await;
         }
-        Ok(())
+        Ok(Flow::Continue)
     }
 
     /// End the turn in flight, and let anything queued behind it run.
@@ -2192,21 +2220,40 @@ impl Repl<'_> {
         if let Some(shell_line) = slash::shell(&trimmed) {
             return self.run_shell(&shell_line);
         }
-        match submit_action(self.turn.is_some(), self.queued.len(), &trimmed) {
+        match submit_action(self.turn.is_some(), self.queued.len(), &trimmed, Origin::Typed) {
             Submit::Refuse => {
                 self.ui.print_above(&format!(
                     "already {QUEUE_LIMIT} prompts waiting — this one was not queued (it is in \
                      your history)"
                 ))?;
-                return Ok(Flow::Continue);
+                Ok(Flow::Continue)
             }
             Submit::Queue => {
+                // A command that has to wait says so. A prompt says nothing, because the status row
+                // already counts what is waiting and a prompt is what waiting is for — but a command
+                // is not a prompt, and its effect will not appear until the turn ends, so silence
+                // here would read as the line having been taken for text.
+                if slash::lookup(&trimmed).is_some() {
+                    self.ui
+                        .print_above(&format!("{trimmed} — will run when this turn finishes"))?;
+                }
                 self.queued.push_back(trimmed);
-                return Ok(Flow::Continue);
+                Ok(Flow::Continue)
             }
-            Submit::Now => {}
+            Submit::Now => self.run_line(trimmed).await,
         }
-        if let Some((command, argument)) = slash::lookup(&trimmed) {
+    }
+
+    /// Run a line now: as a command if it names one, as a turn otherwise.
+    ///
+    /// The only place that decides command-versus-prompt, which is what lets a line that had to wait
+    /// its turn be treated exactly as a line typed when nothing was running. That is the bug this
+    /// closes: a slash command typed mid-turn was queued as a *string*, so when the turn ended it went
+    /// straight to [`Self::start`] and the model was asked to read `/help` out as prose. Routing the
+    /// flush back through here, rather than starting the line directly, is what keeps a command a
+    /// command when its turn comes.
+    async fn run_line(&mut self, line: String) -> std::io::Result<Flow> {
+        if let Some((command, argument)) = slash::lookup(&line) {
             match run_slash(&self.agent, self.cwd, command, argument).await {
                 Outcome::Print(text) => self.ui.print_above(&text)?,
                 Outcome::Cleared(text) => {
@@ -2216,11 +2263,17 @@ impl Repl<'_> {
                     }
                     print_banner(self.ui, &self.agent).await?;
                 }
+                Outcome::Switched(text) => {
+                    if !text.is_empty() {
+                        self.ui.print_above(&text)?;
+                    }
+                    print_banner(self.ui, &self.agent).await?;
+                }
                 Outcome::Exit => return Ok(Flow::Exit),
             }
             return Ok(Flow::Continue);
         }
-        self.start(trimmed)?;
+        self.start(line)?;
         Ok(Flow::Continue)
     }
 
@@ -2318,19 +2371,39 @@ enum Submit {
     Refuse,
 }
 
+/// Where a submitted line came from, which decides whether it can be a command at all.
+///
+/// The distinction is not cosmetic. A notice is *generated* text that happens to be long and may
+/// contain anything — including, one day, a line starting with `/`. Treating one as a command would
+/// have it acted on mid-turn, and [`Repl::start`] with a turn already in flight silently replaces the
+/// running task's handle rather than refusing, so the turn in flight would be abandoned without a
+/// word. Naming the origin keeps that impossibility in the type rather than in the current wording of
+/// the notice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Origin {
+    /// Typed at the prompt, so it may name a slash command.
+    Typed,
+    /// Text asking the model to be told something — a finished `!` command. Never a command: it is
+    /// something to report, not something to obey.
+    Notice,
+}
+
 /// Decide what a submitted line does, given the state it arrives in.
 ///
 /// Separated from the effects so the *policy* can be tested without a terminal: the
 /// interesting cases are all about timing — a line typed mid-turn queues, a full queue
-/// refuses, and `/exit` acts regardless — and driving them through a pty would test the
-/// terminal as much as the decision.
+/// refuses, and a command that can act at once acts at once — and driving them through a pty
+/// would test the terminal as much as the decision.
 ///
-/// Everything queues while a turn is in flight, *including* slash commands, so the
-/// transcript stays in the order things were asked. `/exit` is the one exception:
-/// leaving is not a turn, and waiting for one to finish before obeying it would make the
-/// command feel broken.
-fn submit_action(turn_in_flight: bool, queued: usize, line: &str) -> Submit {
-    if !turn_in_flight || slash_is_exit(line) {
+/// A prompt queues while a turn is in flight, so the transcript stays in the order things were
+/// asked. A slash command is not a prompt, and the ones that can be obeyed without disturbing the
+/// turn in flight are obeyed now — see [`slash_acts_mid_turn`] for which, and why the rest cannot.
+fn submit_action(turn_in_flight: bool, queued: usize, line: &str, origin: Origin) -> Submit {
+    let acts_now = match origin {
+        Origin::Typed => !turn_in_flight || slash_acts_mid_turn(line),
+        Origin::Notice => !turn_in_flight,
+    };
+    if acts_now {
         return Submit::Now;
     }
     if queued >= QUEUE_LIMIT {
@@ -2340,10 +2413,31 @@ fn submit_action(turn_in_flight: bool, queued: usize, line: &str) -> Submit {
     }
 }
 
-/// Whether a line names `/exit` or one of its aliases — the commands that act even
-/// mid-turn.
-fn slash_is_exit(line: &str) -> bool {
-    slash::lookup(line).is_some_and(|(command, _)| matches!(command.action, slash::Action::Exit))
+/// Whether a line is a slash command that may act while a turn is in flight.
+///
+/// The commands that only read or that steer the session — `/help`, `/exit`, the gate modes,
+/// `/model`, `/rename`, and `/resume` with no id — are obeyed at once, because that is what typing
+/// one means. `/model` and the gate modes matter most: their whole point is to change what the next
+/// request does, and `/model` already answers "in use from the next request", so making the operator
+/// wait for a turn to end before the change even registers would misdescribe what it does.
+///
+/// The two that swap the session — `/clear`, and `/resume <id>` — wait, and not for tidiness. A turn
+/// snapshots the session it writes to, so swapping mid-turn records the reply in the transcript that
+/// was just left and leaves the new session with no record of the turn, while the totals written when
+/// it ends go to whichever session is active by then. That is a corruption rather than a reordering,
+/// so those two queue and are *run as commands* when the turn ends.
+fn slash_acts_mid_turn(line: &str) -> bool {
+    slash::lookup(line).is_some_and(|(command, argument)| match command.action {
+        // Listing sessions reads this cwd's directory and nothing else, so asking for the list
+        // mid-turn is safe; switching to one is not.
+        slash::Action::Resume => argument.is_empty(),
+        slash::Action::Exit
+        | slash::Action::Help
+        | slash::Action::Model
+        | slash::Action::Gate
+        | slash::Action::Rename => true,
+        slash::Action::Clear => false,
+    })
 }
 
 async fn run_inner(ui: &mut Ui, agent: Arc<Agent>, cwd: &Path) -> std::io::Result<()> {
@@ -2445,7 +2539,11 @@ async fn run_inner(ui: &mut Ui, agent: Arc<Agent>, cwd: &Path) -> std::io::Resul
             }
 
             result = async { repl.turn.as_mut().expect("guarded").await }, if repl.turn.is_some() => {
-                repl.finished(result).await?;
+                // A queued line runs when the turn ends, and running one can end the session
+                // (`/exit`), so the ending has to travel back out of `finished` to here.
+                if matches!(repl.finished(result).await?, Flow::Exit) {
+                    return Ok(());
+                }
             }
         }
     }
@@ -2864,43 +2962,94 @@ mod tests {
         assert_eq!(char_boundary("", 10), 0);
     }
 
-    /// Type-ahead: a line typed while a turn runs is queued, not refused.
+    /// Type-ahead: a prompt typed while a turn runs is queued, not refused.
     ///
     /// The behaviour this replaces took every key but Ctrl-C and dropped it, so the editor
     /// was read-only for the whole of a turn — which can be minutes, and is what makes a
     /// session feel locked. The policy now: queue, refuse only when the queue is full, and
-    /// let  through because leaving is not a turn.
+    /// let `/exit` through because leaving is not a turn.
     #[test]
     fn a_line_typed_mid_turn_queues_and_a_full_queue_refuses() {
         // Idle: run it.
-        assert_eq!(submit_action(false, 0, "read the parser"), Submit::Now);
+        assert_eq!(submit_action(false, 0, "read the parser", Origin::Typed), Submit::Now);
 
         // Mid-turn: queue it.
-        assert_eq!(submit_action(true, 0, "read the parser"), Submit::Queue);
+        assert_eq!(submit_action(true, 0, "read the parser", Origin::Typed), Submit::Queue);
 
         // Mid-turn with room left: still queues, right up to the cap.
-        assert_eq!(submit_action(true, QUEUE_LIMIT - 1, "one more"), Submit::Queue);
+        assert_eq!(
+            submit_action(true, QUEUE_LIMIT - 1, "one more", Origin::Typed),
+            Submit::Queue
+        );
 
         // At the cap: refused, with a message, rather than dropped silently — the
         // operator is told and the line is still in the editor's history.
-        assert_eq!(submit_action(true, QUEUE_LIMIT, "too many"), Submit::Refuse);
-        assert_eq!(submit_action(true, QUEUE_LIMIT + 5, "way too many"), Submit::Refuse);
+        assert_eq!(
+            submit_action(true, QUEUE_LIMIT, "too many", Origin::Typed),
+            Submit::Refuse
+        );
+        assert_eq!(
+            submit_action(true, QUEUE_LIMIT + 5, "way too many", Origin::Typed),
+            Submit::Refuse
+        );
     }
 
-    ///  acts even mid-turn, and so do its aliases.
+    /// A command that can act without disturbing the turn in flight acts at once.
     ///
-    /// Leaving is not a turn: waiting for one to finish before obeying it would make the
-    /// command feel broken, and the operator asking to leave mid-answer means leave now.
+    /// Typing a command and watching nothing happen until the answer lands is the complaint this
+    /// addresses. `/exit` must not wait — leaving is not a turn — and neither must the commands that
+    /// only read or that steer what happens next: a `/model` that took effect only after a turn would
+    /// be claiming something the model request cannot honour, since the request already in flight was
+    /// built with the old one.
     #[test]
-    fn exit_acts_even_while_a_turn_runs() {
-        for line in ["/exit", "/quit"] {
-            assert_eq!(submit_action(true, 0, line), Submit::Now, "{line} must not wait");
+    fn a_command_that_can_act_mid_turn_does_not_wait() {
+        for line in [
+            "/exit",
+            "/quit",
+            "/help",
+            "/model",
+            "/model opus",
+            "/rename x",
+            "/plan",
+            "/auto",
+            "/noplan",
+            "/noauto",
+        ] {
+            assert_eq!(
+                submit_action(true, 0, line, Origin::Typed),
+                Submit::Now,
+                "{line} must not wait"
+            );
         }
-        // And a slash command that is *not* exit waits its turn, so the transcript stays
-        // in the order things were asked.
-        assert_eq!(submit_action(true, 0, "/model"), Submit::Queue);
-        assert_eq!(submit_action(true, 0, "/help"), Submit::Queue);
-        assert_eq!(submit_action(true, 0, "/clear"), Submit::Queue);
+    }
+
+    /// The two session swaps wait, because obeying them mid-turn corrupts the transcript.
+    ///
+    /// A turn snapshots the session it writes to, so `/clear` or `/resume <id>` mid-turn would file
+    /// the reply under the session just left while the new one never learns the turn happened. Waiting
+    /// is not a preference here; acting would lose the answer.
+    #[test]
+    fn the_session_swaps_wait_for_the_turn_to_end() {
+        assert_eq!(submit_action(true, 0, "/clear", Origin::Typed), Submit::Queue);
+        assert_eq!(submit_action(true, 0, "/resume 3f2a", Origin::Typed), Submit::Queue);
+        // Listing sessions only reads this cwd's directory, so it is safe to answer at once — and
+        // the id it prints is the one the next line switches to.
+        assert_eq!(submit_action(true, 0, "/resume", Origin::Typed), Submit::Now);
+        // With nothing running there is nothing to disturb.
+        assert_eq!(submit_action(false, 0, "/clear", Origin::Typed), Submit::Now);
+    }
+
+    /// A notice is never a command, whatever it happens to say.
+    ///
+    /// A `!` command's notice is generated text that can run to many lines, and one day could begin
+    /// with a `/`. If it were treated as a command it would be obeyed mid-turn — and `start` with a
+    /// turn already in flight replaces the task handle rather than refusing, so the turn in flight
+    /// would be abandoned silently. The origin, not the wording, is what keeps that impossible.
+    #[test]
+    fn a_notice_is_never_taken_for_a_command() {
+        let command = "/help";
+        assert_eq!(submit_action(true, 0, command, Origin::Typed), Submit::Now);
+        assert_eq!(submit_action(true, 0, command, Origin::Notice), Submit::Queue);
     }
 
     /// The prompt echo marks continuation lines so a multi-line prompt reads as one.
