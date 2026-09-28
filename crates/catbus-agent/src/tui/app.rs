@@ -1161,6 +1161,42 @@ fn pad_to_width(rows: Vec<String>, width: usize) -> Vec<String> {
         .collect()
 }
 
+/// The answered questions, as the lines the transcript shows for them.
+///
+/// `question → answer` per line, which is the shape the pair takes when the answer is a label or two:
+/// the options are short by construction, so a column of arrows reads down the block the way the
+/// questions were read, and the eye finds "which schema → normalised" without parsing a sentence.
+///
+/// Numbered only when there was more than one question, matching how the questions themselves were
+/// put on screen — a lone question needs no number to tell it from nothing.
+///
+/// A question with nothing ticked says so rather than being left out. Silence would read as the
+/// question never having been asked, and "asked and skipped" is a different fact from that.
+///
+/// The note is printed under the choices it was written about, because it is part of the same reply
+/// and reads as a qualification of them.
+fn answered_summary(questions: &[crate::tools::ask::Question], chosen: &crate::tools::ask::Chosen) -> String {
+    let many = questions.len() > 1;
+    let mut out = String::new();
+    for (index, (question, picks)) in questions.iter().zip(&chosen.labels).enumerate() {
+        let answer = if picks.is_empty() {
+            "(nothing ticked)".to_owned()
+        } else {
+            picks.join(", ")
+        };
+        let number = if many {
+            format!("{}. ", index + 1)
+        } else {
+            String::new()
+        };
+        let _ = writeln!(out, "{number}{} → {answer}", question.prompt);
+    }
+    if let Some(note) = &chosen.note {
+        let _ = writeln!(out, "note → {note}");
+    }
+    out.trim_end().to_owned()
+}
+
 /// The operator's prompt as the rows it will be echoed on.
 ///
 /// `> ` marks the first row and two spaces every row after it, so a multi-line prompt still reads as
@@ -2070,8 +2106,13 @@ impl Repl<'_> {
             return Ok(Flow::Continue);
         }
         let chosen = panel.chosen(questions);
+        // Built before the reply is handed over, because `answer` takes it.
+        let summary = answered_summary(questions, &chosen);
         if self.agent.asker().answer(id, chosen) {
-            self.ui.print_above("answered")?;
+            // What was answered, not merely that something was. A question that only prints
+            // "answered" leaves the transcript saying a decision happened and never which one, so a
+            // reader coming back to it has to ask again — which is the thing a transcript is for.
+            self.ui.print_above(&summary)?;
         } else {
             // The question closed between rendering and answering — it timed out, or the turn
             // was cancelled. Saying so beats silence, and the answer is genuinely not used.
@@ -2665,6 +2706,59 @@ mod tests {
         // An index past the end has no ticks, so the row is empty rather than a panic. The drawing
         // windows the slice, but this guard is what makes windowing safe to get wrong.
         assert_eq!(panel.options_row(9, &second, 80), "");
+    }
+
+    /// The transcript line for an answered set names each question *and* what was answered.
+    ///
+    /// The old line said "answered", which records that a decision happened and never which — so a
+    /// reader coming back to the transcript has to ask again, which is the one thing a transcript is
+    /// for.
+    #[test]
+    fn the_answered_questions_are_shown_with_their_answers() {
+        let chosen = crate::tools::ask::Chosen {
+            labels: vec![
+                vec!["normalised".to_owned()],
+                vec!["http".to_owned(), "stdio".to_owned()],
+            ],
+            note: None,
+        };
+        let questions = vec![question("Which schema?", false), question("Which transport?", true)];
+        assert_eq!(
+            answered_summary(&questions, &chosen),
+            "1. Which schema? → normalised\n2. Which transport? → http, stdio"
+        );
+    }
+
+    /// One question is not numbered, because there is nothing to tell it apart from.
+    #[test]
+    fn a_lone_answered_question_is_not_numbered() {
+        let chosen = crate::tools::ask::Chosen {
+            labels: vec![vec!["normalised".to_owned()]],
+            note: None,
+        };
+        assert_eq!(
+            answered_summary(&[question("Which schema?", false)], &chosen),
+            "Which schema? → normalised"
+        );
+    }
+
+    /// A question left unticked says so rather than vanishing, and a note goes under the choices.
+    ///
+    /// "Asked and skipped" is a different fact from "never asked", and the summary is the only place
+    /// the difference is recorded once the panel has gone.
+    #[test]
+    fn a_skipped_question_and_a_note_are_both_recorded() {
+        let chosen = crate::tools::ask::Chosen {
+            labels: vec![vec!["normalised".to_owned()], Vec::new()],
+            note: Some("did not need the second".to_owned()),
+        };
+        let questions = vec![question("Which schema?", false), question("Which transport?", false)];
+        assert_eq!(
+            answered_summary(&questions, &chosen),
+            "1. Which schema? → normalised\n\
+             2. Which transport? → (nothing ticked)\n\
+             note → did not need the second"
+        );
     }
 
     /// Replace the question with a test one that has no options.
