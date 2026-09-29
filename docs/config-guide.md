@@ -212,6 +212,32 @@ embedded, as `{good}..{bad}` above.
 config says otherwise. A tool that only reads should say `"judged": false`: the author states
 a lower risk rather than the code assuming one.
 
+`sha256` pins the program a tool runs, as lowercase hex:
+
+```toml
+[[add]]
+name = "GitStatus"
+argv = ["./.catbus/bin/git.sh", "status", "{view}"]
+sha256 = "d9eaedb13338f666dcf98637a30bf9b477a4e6a831ddccfa33fa6348ee806d4f"
+```
+
+Set it when the program lives somewhere the session can write to. A `[[add]]` script is usually
+inside the checkout, and a session holds `Write`, so without the field a session could rewrite the
+script and have its own code run on the next call — a shell by another name, whatever
+`AllowedTools` says. With the digest pinned, the rewritable file stops deciding what runs: the call
+is refused and the tool result says which file changed, so accepting the change takes an operator
+editing the config and relaunching.
+
+The check covers the **program** — the first `argv` element — and nothing else; `argv` is fixed, so
+there are no arguments to pin. A tool that needs several files covered should name one entry point
+that calls them. Resolution follows the OS: an absolute path, a `./`-relative path from the
+directory the tool runs in, or a bare name searched on `PATH`. Anything that cannot be found or read
+is refused rather than run unverified — a check that passes when it cannot do its job is worse than
+no check, since the config author is relying on it.
+
+The engine has no tool to write the digest; use `sha256sum` and put the value in by hand, then
+relaunch. The refusal names both the expected and the found digest, so a mismatch is easy to read.
+
 **A custom tool may not take a built-in's name.** The agent refuses to start if one shadows
 the other, on the grounds that a familiar name with different behaviour is worse than a
 refusal. The built-ins are `Read`, `Write`, `Edit`, `FileTree`, `Bash`, `ListAgents`,

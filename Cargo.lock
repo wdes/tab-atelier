@@ -1032,6 +1032,7 @@ dependencies = [
  "roxmltree",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "strip-ansi-escapes",
  "tab-atelier-briefs",
  "tempfile",

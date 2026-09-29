@@ -60,6 +60,23 @@ pub struct CustomTool {
     /// the code assuming one.
     #[serde(default = "yes")]
     pub judged: bool,
+    /// The SHA-256 of the program this tool runs, as lowercase hex.
+    ///
+    /// When set, the file the command names is hashed before the call, and the tool is refused if
+    /// it does not match. This closes a real hole rather than a theoretical one. A project's
+    /// wrapper scripts live in the checkout the session may write to, so without this a session
+    /// could rewrite the script and have the rewritten version run on its very next call — a shell
+    /// by another name, whatever `AllowedTools` says. With the digest pinned in *this* config,
+    /// which is read once at launch, the rewritable file stops being the thing that decides what
+    /// runs: the next call fails, and accepting the change takes an operator editing the config
+    /// and relaunching.
+    ///
+    /// The digest covers the **program** — the first `argv` element — and nothing else. `argv` is
+    /// fixed, so there is no argument to pin. A tool that needs several files covered should name
+    /// one entry point that calls them, which is also what makes the digest easy to state and to
+    /// keep current.
+    #[serde(default)]
+    pub sha256: Option<String>,
 }
 
 /// The config file.
@@ -463,7 +480,7 @@ impl ToolSet {
             specs.push(serde_json::json!({
                 "name": tool.name,
                 "description": tool.description,
-                "input_schema": tool.schema,
+                "input_schema": with_worktree(tool.schema.clone()),
             }));
         }
 
@@ -796,14 +813,22 @@ impl ToolSet {
     pub(crate) async fn run_custom(&self, tool: &CustomTool, input: &Value, cwd: &Path) -> Result<String, String> {
         use tokio::io::AsyncReadExt as _;
 
+        // A custom tool honours `worktree` exactly as the built-ins do. Without this a wrapper
+        // always ran in the shared checkout — so a project whose rule is "work in your own
+        // worktree" could not follow it through *any* tool it was given, and the rule read as a
+        // model failure rather than as a missing parameter.
+        let cwd = super::checkout(input, cwd)?;
         let argv = Self::expand(tool, input)?;
         let (program, rest) = argv
             .split_first()
             .ok_or_else(|| format!("tool {:?} has an empty argv", tool.name))?;
+        if let Some(expected) = tool.sha256.as_deref() {
+            verify_sha256(tool, program, &cwd, expected)?;
+        }
         let mut command = tokio::process::Command::new(program);
         command
             .args(rest)
-            .current_dir(cwd)
+            .current_dir(&cwd)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -851,6 +876,94 @@ impl ToolSet {
     }
 }
 
+/// Where a tool's program actually is, so it can be hashed.
+///
+/// The three cases the OS itself distinguishes: an absolute path, a path relative to the directory
+/// the tool runs in, and a bare name to be looked for on `PATH`. Resolving the third means the
+/// check follows the same search the spawn will, rather than hashing something the process would
+/// never have run.
+fn program_path(program: &str, cwd: &Path) -> Option<std::path::PathBuf> {
+    let as_path = Path::new(program);
+    if as_path.is_absolute() {
+        return Some(as_path.to_path_buf());
+    }
+    if program.contains(std::path::MAIN_SEPARATOR) {
+        return Some(cwd.join(as_path));
+    }
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|dir| dir.join(program))
+        .find(|candidate| candidate.is_file())
+}
+
+/// SHA-256 of a file, as lowercase hex.
+fn sha256_of(path: &Path) -> std::io::Result<String> {
+    use sha2::Digest as _;
+    let mut file = std::fs::File::open(path)?;
+    // `Sha256` implements `io::Write`, so the file streams through it instead of
+    // being read into memory — a script is small, but the habit is the point.
+    let mut hasher = sha2::Sha256::new();
+    std::io::copy(&mut file, &mut hasher)?;
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Refuse a tool whose program is not the file that was approved.
+///
+/// Fails closed at every step: a program that cannot be found, or read, is refused rather than run
+/// unverified. A check that quietly passes when it cannot do its job is worse than no check, since
+/// the config author is relying on it.
+fn verify_sha256(tool: &CustomTool, program: &str, cwd: &Path, expected: &str) -> Result<(), String> {
+    let expected = expected.trim();
+    let path = program_path(program, cwd).ok_or_else(|| {
+        format!(
+            "tool {:?} was refused before it ran: it pins a sha256, but its program {program:?} \
+             could not be found to hash. Fix the path, or drop the `sha256` field.",
+            tool.name
+        )
+    })?;
+    let found = sha256_of(&path).map_err(|e| {
+        format!(
+            "tool {:?} was refused before it ran: it pins a sha256, but {} could not be read to \
+             hash it ({e}).",
+            tool.name,
+            path.display()
+        )
+    })?;
+    if found.eq_ignore_ascii_case(expected) {
+        return Ok(());
+    }
+    Err(format!(
+        "tool {:?} was refused before it ran: {} is not the file that was approved.\n  \
+         expected sha256 {expected}\n  \
+         found          {found}\n\
+         It has changed since the digest was recorded. This check exists so that a rewritten \
+         script does not run without someone deciding it should — do not work around it, and do \
+         not assume the new contents do what the description says. Report that the file changed. \
+         If the change was intended, an operator updates this tool's `sha256` in the tool config \
+         and relaunches, which is the decision this check is holding open.",
+        tool.name,
+        path.display()
+    ))
+}
+
+/// A custom tool's schema, with the `worktree` property every process-running tool offers.
+///
+/// The built-ins all carry it (see [`super::checkout_property`]), and a project wrapper that could
+/// not would be the one tool a worktree rule could not be followed through — which is the failure
+/// this closes. A tool that declares its own `worktree` keeps it: the author's wording is about
+/// their own tool, and the property means the same thing either way.
+fn with_worktree(mut schema: Value) -> Value {
+    let Some(object) = schema.as_object_mut() else {
+        // A schema that is not an object is the author's problem, not ours to repair here; leave
+        // it exactly as written so the model still sees what they wrote.
+        return schema;
+    };
+    let properties = object.entry("properties").or_insert_with(|| serde_json::json!({}));
+    if let Some(map) = properties.as_object_mut() {
+        map.entry("worktree").or_insert_with(super::checkout_property);
+    }
+    schema
+}
+
 /// Cap a tool's output so one command cannot fill the context window.
 ///
 /// The same reasoning as compaction's: an unbounded result is a result that
@@ -883,6 +996,7 @@ mod tests {
             argv: argv.iter().map(|s| (*s).to_owned()).collect(),
             timeout_secs: 5,
             judged: true,
+            sha256: None,
         }
     }
 
@@ -1212,6 +1326,237 @@ mod tests {
             ..ToolConfig::default()
         };
         assert!(ToolSet::from_config(fine).is_ok());
+    }
+
+    /// Every custom tool offers `worktree`, so a wrapper can be pointed at a checkout.
+    ///
+    /// This mirrors `tools::tests::the_tools_that_run_a_process_offer_a_worktree` for the built-ins.
+    /// Without it the one tool a project defines to honour its own "work in your worktree" rule is
+    /// the one tool that cannot — and it fails quietly, by running in the shared checkout.
+    #[test]
+    fn a_custom_tool_offers_the_worktree_property() {
+        let config = ToolConfig {
+            add: vec![tool(&["git", "status"])],
+            ..ToolConfig::default()
+        };
+        let set = ToolSet::from_config(config).expect("a plain tool is fine");
+        let spec = set
+            .specs()
+            .iter()
+            .find(|s| s.get("name").and_then(Value::as_str) == Some("T"))
+            .expect("the custom tool is in the set");
+        let properties = &spec["input_schema"]["properties"];
+        assert!(
+            properties.get("worktree").is_some(),
+            "a custom tool must be offered `worktree`: {spec}"
+        );
+    }
+
+    /// A tool that declares its own `worktree` keeps the author's wording, not ours.
+    #[test]
+    fn a_custom_tool_keeping_its_own_worktree_property_is_left_alone() {
+        let mut authored = tool(&["git", "status"]);
+        authored.schema = json!({
+            "type": "object",
+            "properties": { "worktree": { "type": "string", "description": "the author's words" } }
+        });
+        let config = ToolConfig {
+            add: vec![authored],
+            ..ToolConfig::default()
+        };
+        let set = ToolSet::from_config(config).expect("fine");
+        let spec = set
+            .specs()
+            .iter()
+            .find(|s| s.get("name").and_then(Value::as_str) == Some("T"))
+            .expect("present");
+        assert_eq!(
+            spec["input_schema"]["properties"]["worktree"]["description"], "the author's words",
+            "the author's description must survive"
+        );
+    }
+
+    /// A custom tool naming `worktree` runs there, not in the session directory.
+    #[tokio::test]
+    async fn a_custom_tool_runs_in_the_worktree_it_is_given() {
+        let dir = tempfile::tempdir().unwrap();
+        let here = dir.path().join("shared");
+        std::fs::create_dir_all(&here).unwrap();
+        std::fs::write(dir.path().join("cwd.marker"), "cwd").unwrap();
+        std::fs::write(here.join("where.marker"), "worktree").unwrap();
+
+        // The command names which directory it started in via a marker file, so the assertion does
+        // not depend on canonicalisation of the temp path.
+        let set = ToolSet::from_config(ToolConfig {
+            add: vec![tool(&["sh", "-c", "test -f where.marker && echo worktree || echo cwd"])],
+            ..ToolConfig::default()
+        })
+        .expect("fine");
+
+        let tool = set.custom_tool("T").expect("the tool is registered");
+        let out = set
+            .run_custom(tool, &json!({ "worktree": "shared" }), dir.path())
+            .await
+            .expect("the command runs");
+        assert_eq!(out.trim(), "worktree", "the tool ran in the worktree it named");
+
+        let out = set
+            .run_custom(tool, &json!({}), dir.path())
+            .await
+            .expect("the command runs");
+        assert_eq!(out.trim(), "cwd", "and in the session directory with none");
+    }
+
+    /// `worktree` may not name a place outside the working directory, exactly as for a built-in.
+    #[tokio::test]
+    async fn a_custom_tool_refuses_a_worktree_outside_the_working_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let set = ToolSet::from_config(ToolConfig {
+            add: vec![tool(&["true"])],
+            ..ToolConfig::default()
+        })
+        .expect("fine");
+        let tool = set.custom_tool("T").expect("registered");
+        let err = set
+            .run_custom(tool, &json!({ "worktree": "../escape" }), dir.path())
+            .await
+            .expect_err("an escaping worktree is refused");
+        assert!(err.contains(".."), "the refusal must explain itself: {err}");
+    }
+
+    /// A small executable, which is what a pinned tool's program is.
+    #[cfg(unix)]
+    fn script(dir: &Path, name: &str, body: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = dir.join(name);
+        std::fs::write(&path, body).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    fn pinned(name: &str, digest: Option<String>) -> ToolSet {
+        // `./` so the program is found in the directory the tool runs in — the
+        // same relative form a project config uses, and the only form that works
+        // for a file that is not on `PATH`.
+        let program = format!("./{name}");
+        let mut t = tool(&[&program]);
+        t.sha256 = digest;
+        ToolSet::from_config(ToolConfig {
+            add: vec![t],
+            ..ToolConfig::default()
+        })
+        .expect("a pinned tool is valid")
+    }
+
+    /// A digest that matches lets the tool run, and the path is resolved relative
+    /// to the directory the tool runs in.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_tool_pinned_to_its_program_runs_when_the_digest_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = script(dir.path(), "ok.sh", "#!/bin/sh\necho approved\n");
+        let digest = sha256_of(&path).unwrap();
+        let set = pinned("ok.sh", Some(digest));
+        let out = set
+            .run_custom(set.custom_tool("T").unwrap(), &json!({}), dir.path())
+            .await
+            .expect("a matching digest runs");
+        assert_eq!(out.trim(), "approved");
+    }
+
+    /// The point of the field: the digest is recorded, the file is rewritten
+    /// afterwards, and the rewrite does not get to run.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_tool_whose_program_changed_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = script(dir.path(), "swap.sh", "#!/bin/sh\necho approved\n");
+        let approved = sha256_of(&path).unwrap();
+        // Exactly what a session holding Write could do between two calls.
+        std::fs::write(&path, "#!/bin/sh\necho tampered\n").unwrap();
+
+        let set = pinned("swap.sh", Some(approved.clone()));
+        let err = set
+            .run_custom(set.custom_tool("T").unwrap(), &json!({}), dir.path())
+            .await
+            .expect_err("a rewritten program is refused");
+
+        assert!(err.contains("not the file that was approved"), "{err}");
+        assert!(err.contains(&approved), "the refusal names what was approved: {err}");
+        assert!(
+            err.contains(&sha256_of(&path).unwrap()),
+            "and what is actually there: {err}"
+        );
+    }
+
+    /// Fail closed: a program that cannot be found at all is refused, not run unverified.
+    ///
+    /// A check that passes when it cannot do its job is worse than no check,
+    /// because whoever wrote the config is relying on it.
+    ///
+    /// A bare name, so the lookup goes to `PATH` and finds nothing — the branch
+    /// where the program cannot even be *named*.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_tool_pinned_to_a_program_that_cannot_be_found_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut t = tool(&["definitely-not-a-real-program-2f8c1a"]);
+        t.sha256 = Some("00".repeat(32));
+        let set = ToolSet::from_config(ToolConfig {
+            add: vec![t],
+            ..ToolConfig::default()
+        })
+        .unwrap();
+        let err = set
+            .run_custom(set.custom_tool("T").unwrap(), &json!({}), dir.path())
+            .await
+            .expect_err("a program that cannot be hashed is refused");
+        assert!(err.contains("could not be found to hash"), "{err}");
+    }
+
+    /// The same refusal by the other branch: a relative path that names nothing
+    /// can be resolved, and then fails to read. Both fail closed, and a caller
+    /// should be told which happened.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_tool_pinned_to_a_path_that_does_not_exist_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let set = pinned("absent.sh", Some("00".repeat(32)));
+        let err = set
+            .run_custom(set.custom_tool("T").unwrap(), &json!({}), dir.path())
+            .await
+            .expect_err("a file that cannot be read is refused");
+        assert!(err.contains("could not be read to hash"), "{err}");
+    }
+
+    /// A digest pasted in upper case still matches — the value is hex, not a
+    /// spelling.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_digest_recorded_in_upper_case_still_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = script(dir.path(), "caps.sh", "#!/bin/sh\necho fine\n");
+        let set = pinned("caps.sh", Some(sha256_of(&path).unwrap().to_uppercase()));
+        let out = set
+            .run_custom(set.custom_tool("T").unwrap(), &json!({}), dir.path())
+            .await
+            .expect("case does not matter");
+        assert_eq!(out.trim(), "fine");
+    }
+
+    /// A tool with no digest is unaffected — the field is opt-in.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_tool_without_a_digest_runs_as_before() {
+        let dir = tempfile::tempdir().unwrap();
+        script(dir.path(), "plain.sh", "#!/bin/sh\necho plain\n");
+        let set = pinned("plain.sh", None);
+        let out = set
+            .run_custom(set.custom_tool("T").unwrap(), &json!({}), dir.path())
+            .await
+            .expect("unpinned tools are not checked");
+        assert_eq!(out.trim(), "plain");
     }
 
     /// The property that makes custom tools safe to hand a model. This is the
@@ -1590,5 +1935,25 @@ argv = ["scripts/claude-gitea-pr.sh", "--get", "1"]
         let bad = "[[add]]\nname = \"T\"\ndescription = \"d\"\nschema = { type = \"object\" }\nargv = [\"true\"]\ndisable = [\"Bash\"]\n";
         let config: ToolConfig = toml::from_str(bad).unwrap();
         assert!(config.disable.is_empty(), "absorbed by the table above it");
+    }
+
+    /// `sha256` survives the trip in from a file, and an absent one is `None`.
+    ///
+    /// The execution tests build the struct in memory, which would still pass if the field were
+    /// dropped while parsing — and a dropped field means the check never runs, silently, which is
+    /// the one way this feature can fail without saying so.
+    #[test]
+    fn a_pinned_digest_survives_the_toml_round_trip() {
+        let pinned = "[[add]]\nname = \"T\"\ndescription = \"d\"\n\
+                      schema = { type = \"object\" }\nargv = [\"./x.sh\"]\nsha256 = \"abc123\"\n";
+        let config: ToolConfig = toml::from_str(pinned).unwrap();
+        assert_eq!(config.add[0].sha256.as_deref(), Some("abc123"));
+
+        // The same table without it, so a tool that never asked to be pinned is not refused for a
+        // field it does not have.
+        let plain = "[[add]]\nname = \"T\"\ndescription = \"d\"\n\
+                     schema = { type = \"object\" }\nargv = [\"./x.sh\"]\n";
+        let config: ToolConfig = toml::from_str(plain).unwrap();
+        assert_eq!(config.add[0].sha256, None);
     }
 }
