@@ -1,6 +1,4 @@
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// SPDX-License-Identifier: MPL-2.0
 
 //! The core tab collection: the `GET /` / `/tabs` list (ETag-cached), tab
 //! creation (`POST /tabs`) and close (`DELETE /tabs/<id>`).
@@ -72,6 +70,18 @@ pub(super) fn list<W: Write>(
             context: t.context.as_deref().map(str::to_string),
             meta: t.meta.clone(),
             badge: t.badge.as_deref().map(str::to_string),
+            // Mirror what /output would serve: raw_output when present (what
+            // the viewer and brain read), else the joined form.
+            output_crc: if t.raw_output.is_empty() {
+                t.output_crc
+            } else {
+                t.raw_output_crc
+            },
+            output_len: if t.raw_output.is_empty() {
+                t.output.len() as u64
+            } else {
+                t.raw_output.len() as u64
+            },
             net_disabled: t.net_disabled,
             connections: t.connections,
             tx_bytes: t.tx_bytes,

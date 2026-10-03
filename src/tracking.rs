@@ -1,6 +1,4 @@
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// SPDX-License-Identifier: MPL-2.0
 
 // `WakatimeTracker` is currently a GUI-only feature. Headless builds
 // still need `USER_AGENT` (the API server identifies itself with it),
@@ -111,10 +109,7 @@ impl WakatimeTracker {
 }
 
 fn unix_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
+    crate::unix_secs()
 }
 
 fn detect_project(cwd: &Path) -> Option<String> {

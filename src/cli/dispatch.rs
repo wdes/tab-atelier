@@ -1,6 +1,4 @@
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// SPDX-License-Identifier: MPL-2.0
 
 //! Top-level clap dispatcher for `tab-atelier-headless`.
 //!
@@ -54,6 +52,13 @@ pub struct Cli {
     /// Used by CI; no daemon work happens.
     #[arg(long, global = true, hide = true)]
     pub check_crypto: bool,
+
+    /// Preflight what this build needs at run time — the GUI's libraries, the
+    /// pty, the state and config dirs — name the package that supplies anything
+    /// missing, and exit. Run this first when a build that compiled cleanly
+    /// will not start.
+    #[arg(long, global = true)]
+    pub check: bool,
 
     /// Start in forced Claude-only mode: every new tab launches `claude` in
     /// `auto` mode instead of a shell (the right-click "New bash tab" item
@@ -296,13 +301,28 @@ pub enum Commands {
     ///
     /// `relay on|off` toggles the mode; `relay via <label|id>` picks the remote
     /// to relay through (`""` clears); `relay egress on|off` makes this host the
-    /// terminal hop to Anthropic; `relay status` prints the live config.
+    /// terminal hop to Anthropic; `relay status` prints the live config;
+    /// `relay token` prints the relay-only credential a peer authenticates with;
+    /// `relay push-credentials` repairs a proxy whose Claude login has been
+    /// revoked, using this machine's own.
     Relay {
-        /// `on`, `off`, `via`, `egress`, or `status`.
-        #[arg(value_parser = ["on", "off", "via", "egress", "status"])]
+        /// `on`, `off`, `via`, `egress`, `status`, or `token`.
+        #[arg(value_parser = ["on", "off", "via", "egress", "status", "token", "push-credentials"])]
         action: String,
         /// For `via`: endpoint label/id (or empty to clear). For `egress`: on|off.
         arg: Option<String>,
+    },
+
+    /// Check the relay chain end to end and name the fix for anything broken.
+    ///
+    /// Three hops and four credentials, each of which fails with a message
+    /// that is accurate about what happened and silent about which credential
+    /// was wrong. This says which.
+    Doctor {
+        /// Repair what can be repaired without asking — currently, pre-approve
+        /// the relay token in Claude Code's API-key gate.
+        #[arg(long)]
+        fix: bool,
     },
 
     /// Set/unset/list env vars injected into tabs' PTYs (applies on next spawn).
@@ -426,8 +446,30 @@ pub enum Commands {
         args: Vec<String>,
     },
 
+    /// Tail the running daemon's log (`GET /logs`, loopback callers only).
+    ///
+    /// Distinct from `log <filter>`, which configures what the NEXT start
+    /// writes to a file. This reads the in-memory ring of a live instance.
+    Logs {
+        /// Passed straight through to `cli::logs::run`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
     /// Agent card — hard-wired specialty (persisted, hook-immune).
     SetSpecialty {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// Post work to the shared blackboard: `announce <task-id> <title>`.
+    ///
+    /// The start of a contract net (Smith, 1980): any tab may announce, any
+    /// tab may take. Task ids are free-form but conventionally scoped —
+    /// `cov:src/api.rs`, `audit:src/relay.rs` — so a generator can derive them
+    /// and stay idempotent.
+    Announce {
+        /// Passed straight through to `cli::work::announce`.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -438,8 +480,22 @@ pub enum Commands {
         args: Vec<String>,
     },
 
+    /// Offer to do an announced task: `bid <task-id> --cost <n>` (lower wins).
+    Bid {
+        /// Passed straight through to `cli::work::bid`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
     /// Agent card — this tab's current objective.
     SetObjective {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// Hand a task to a bidder: `award <task-id> --to <agent>`.
+    Award {
+        /// Passed straight through to `cli::work::award`.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -450,8 +506,30 @@ pub enum Commands {
         args: Vec<String>,
     },
 
+    /// Lease the best open task for this agent: `take [--ttl <s>]`.
+    ///
+    /// Ranks open tasks by a hash of (task, agent) so agents spread out
+    /// without coordinating, then claims the first one that is free. Exits 3
+    /// when there is nothing to take, so a polling loop can tell idle from
+    /// broken.
+    Take {
+        /// Passed straight through to `cli::work::take`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
     /// Agent card — toggle supervision-rounds status (`true`/`false`).
     SetRoundsActive {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// Report a task finished: `done <task-id> [--fail] [result…]`.
+    ///
+    /// The explicit termination signal. Everything else has to infer
+    /// completion from a screen that stopped changing, which is a guess.
+    Done {
+        /// Passed straight through to `cli::work::done`.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -462,8 +540,27 @@ pub enum Commands {
         args: Vec<String>,
     },
 
+    /// Block until named tasks finish: `wait <task-id>… [--timeout <s>]`.
+    ///
+    /// Reports the outcome as an exit code (0 done, 1 failed, 3 still running,
+    /// 4 unknown task) so a shell can compose it, rather than holding a
+    /// connection open and guessing from a screen that stopped changing. Cheap
+    /// enough to run many at once.
+    Wait {
+        /// Passed straight through to `cli::await_task::run`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
     /// Agent card — APPEND one evaluation record (JSON) to the bounded ring.
     SetEvaluation {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// Show the blackboard folded into tasks: `tasks [--all]`.
+    Tasks {
+        /// Passed straight through to `cli::work::tasks`.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -474,9 +571,65 @@ pub enum Commands {
         args: Vec<String>,
     },
 
+    /// What a Claude session starting here would be told: `brief [--cwd <dir>]`.
+    ///
+    /// The brief is assembled at session start and never shown again, so a
+    /// wrong `baseDir` is invisible — the agent simply never mentions what you
+    /// wrote. This prints the same text the hook injects. `--list` shows which
+    /// files matched and from where.
+    Brief {
+        /// Passed straight through to `cli::brief::run`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
     /// Mark a predecessor tab's re-home progress (`rehome-tab.sh`).
     SetRehomeStatus {
         /// Passed straight through to `cli::set_rehome::run`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// Who is working on what: `fleet [--json]`.
+    ///
+    /// `--json` is `GET /fleet` verbatim — nodes (`host`/`agent`/`task`) and
+    /// edges (`runs_on`/`announced`/`bid`/`works_on`/`home`/`peer`) for a
+    /// graph renderer. `works_on` says whether a live lease still backs the
+    /// award, which is how an agent that died mid-task shows up.
+    Fleet {
+        /// Passed straight through to `cli::work::fleet`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// Compact the blackboard: `prune [--older-than <days>] [--dry-run]`.
+    ///
+    /// Drops entries for FINISHED tasks that have been quiet for the cutoff.
+    /// Never touches open, bidding or awarded work — that is live state.
+    /// Removal cannot be gossiped, so a peer still holding an entry will send
+    /// it back; prune each host.
+    Prune {
+        /// Passed straight through to `cli::prune::run`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// Exchange blackboard entries with configured remotes: `gossip`.
+    ///
+    /// Anti-entropy, not replication: the log is a grow-only set, so a round
+    /// is a union in both directions and repeats are free. Safe on a timer.
+    Gossip {
+        /// Passed straight through to `cli::gossip::run`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// Announce work derived from a coverage report: `backlog [--lcov <path>]`.
+    ///
+    /// Idempotent, so it can run on a timer: tasks already open (or finished
+    /// within `--cooldown`) are not announced again.
+    Backlog {
+        /// Passed straight through to `cli::backlog::run`.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -747,10 +900,28 @@ pub enum Commands {
 /// inside the dispatched subcommand for code-path consistency.
 #[must_use]
 pub fn dispatch(cli: Cli) -> bool {
-    let Some(cmd) = cli.command else {
+    // A global flag rather than a verb, because it has to answer on both
+    // editions and before any daemon work — it reports on process start-up, not
+    // on a running instance. Checked before the verb so `--check` alone, with
+    // no subcommand, still runs.
+    if cli.check {
+        std::process::exit(crate::cli::check::report());
+    }
+    let Some(code) = command_exit_code(cli) else {
         return false;
     };
-    let code = match cmd {
+    std::process::exit(code);
+}
+
+/// The exit code a parsed subcommand should terminate with, or `None` when the
+/// line carried no subcommand (the caller then starts the daemon).
+///
+/// Split out of [`dispatch`], which can't be called from a test: it ends in
+/// `process::exit`, so it would take the test binary down with it — silently,
+/// and with a success code.
+fn command_exit_code(cli: Cli) -> Option<i32> {
+    let cmd = cli.command?;
+    Some(match cmd {
         Commands::Add { path, name } => {
             let mut args = vec![path.to_string_lossy().into_owned()];
             if let Some(n) = name {
@@ -818,6 +989,7 @@ pub fn dispatch(cli: Cli) -> bool {
         }
         Commands::ClaudeOnly { state } => crate::cli::share_link::claude_only(&[state]),
         Commands::Relay { action, arg } => crate::cli::share_link::relay(&action, arg.as_deref()),
+        Commands::Doctor { fix } => crate::cli::doctor::run(fix),
         Commands::Env {
             action,
             args,
@@ -924,6 +1096,19 @@ pub fn dispatch(cli: Cli) -> bool {
         Commands::BumpUsage { args } => crate::cli::client::run("bump-usage", &args),
         Commands::SetRehomeStatus { args } => crate::cli::client::run("set-rehome-status", &args),
         Commands::Style { args } => crate::cli::client::run("style", &args),
+        Commands::Logs { args } => crate::cli::client::run("logs", &args),
+        Commands::Announce { args } => crate::cli::client::run("announce", &args),
+        Commands::Bid { args } => crate::cli::client::run("bid", &args),
+        Commands::Award { args } => crate::cli::client::run("award", &args),
+        Commands::Take { args } => crate::cli::client::run("take", &args),
+        Commands::Done { args } => crate::cli::client::run("done", &args),
+        Commands::Tasks { args } => crate::cli::client::run("tasks", &args),
+        Commands::Wait { args } => crate::cli::client::run("wait", &args),
+        Commands::Brief { args } => crate::cli::client::run("brief", &args),
+        Commands::Fleet { args } => crate::cli::client::run("fleet", &args),
+        Commands::Gossip { args } => crate::cli::client::run("gossip", &args),
+        Commands::Prune { args } => crate::cli::client::run("prune", &args),
+        Commands::Backlog { args } => crate::cli::client::run("backlog", &args),
         Commands::Token => crate::cli::client::run("token", &[]),
         Commands::RotateTokens => crate::cli::client::run("rotate-tokens", &[]),
         Commands::ResetMasterToken => crate::cli::client::run("reset-master-token", &[]),
@@ -1084,14 +1269,92 @@ pub fn dispatch(cli: Cli) -> bool {
             crate::cli::client::run("bench", &args)
         }
         Commands::BenchLag { url, samples } => crate::cli::bench_lag::run(&url, samples.unwrap_or(25)),
-    };
-    std::process::exit(code);
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    /// Drive whole command lines through `dispatch` against a real
+    /// in-process API server, so the mapping from a parsed variant to its verb
+    /// (and its argument order) is exercised rather than just the parse.
+    ///
+    /// Only non-destructive verbs: anything that patches the user's
+    /// preferences.json (`ports`, `net-default`, `bg-color --global`) would
+    /// edit the machine running the tests.
+    #[test]
+    fn dispatch_routes_each_command_to_its_verb() {
+        crate::cli::share_link::with_test_server(|state| {
+            let lines: &[&[&str]] = &[
+                &["tab-atelier-headless", "tabs"],
+                &["tab-atelier-headless", "tabs", "--json"],
+                &["tab-atelier-headless", "close", "1"],
+                &["tab-atelier-headless", "rename", "0", "renamed"],
+                &["tab-atelier-headless", "lock", "0"],
+                &["tab-atelier-headless", "unlock", "0"],
+                &["tab-atelier-headless", "net-off", "0"],
+                &["tab-atelier-headless", "net-on", "0"],
+                &["tab-atelier-headless", "share-link", "0"],
+                &["tab-atelier-headless", "share-link", "0", "--ro"],
+                &["tab-atelier-headless", "output", "0"],
+                &["tab-atelier-headless", "input", "0", "echo hi"],
+                &["tab-atelier-headless", "peers"],
+                &["tab-atelier-headless", "peers", "--all"],
+                &["tab-atelier-headless", "peek", "0"],
+                &["tab-atelier-headless", "stats", "0"],
+                &["tab-atelier-headless", "stats", "0", "--json"],
+                &["tab-atelier-headless", "resize", "0", "--cols", "100", "--rows", "40"],
+                &["tab-atelier-headless", "resize", "0", "--clear"],
+                &["tab-atelier-headless", "limit", "0", "--memory", "512M"],
+                &["tab-atelier-headless", "limit", "0", "--clear"],
+                &["tab-atelier-headless", "schedule", "0", "--clear"],
+                &["tab-atelier-headless", "env", "list"],
+                &["tab-atelier-headless", "env", "set", "K=V", "--global"],
+                &["tab-atelier-headless", "net-stats"],
+                &["tab-atelier-headless", "net-dns"],
+                &["tab-atelier-headless", "net-allow", "0", "--clear"],
+                &["tab-atelier-headless", "claude-only", "on"],
+                &["tab-atelier-headless", "relay", "status"],
+                &["tab-atelier-headless", "ssh-agent", "0", "--off"],
+                &["tab-atelier-headless", "style", "--list"],
+                &["tab-atelier-headless", "token"],
+            ];
+            for line in lines {
+                let cli = Cli::try_parse_from(*line).unwrap_or_else(|e| panic!("parse {line:?}: {e}"));
+                assert!(
+                    command_exit_code(cli).is_some(),
+                    "{line:?} must be handled as a subcommand"
+                );
+            }
+            // The verbs really reached the daemon, not just the match arm.
+            // Counted only for routes both editions implement on any host:
+            // net-off needs bubblewrap (412 without it) and net-allow /
+            // ssh-agent are headless-only (501 on the GUI), so those would
+            // make the assertion depend on the machine and the feature set.
+            let s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let (closes, renames, locks, inputs) = (
+                s.pending_closes.len(),
+                s.pending_renames.len(),
+                s.pending_lock_changes.len(),
+                s.pending_input.len(),
+            );
+            drop(s);
+            assert_eq!((closes, renames, locks, inputs), (1, 1, 2, 1));
+        });
+    }
+
+    #[test]
+    fn a_bare_invocation_is_not_a_subcommand() {
+        // `dispatch` returning false is what makes the binary fall through to
+        // starting the daemon, so a flags-only line must not be swallowed.
+        let cli = Cli::try_parse_from(["tab-atelier-headless"]).expect("parse");
+        assert!(command_exit_code(cli).is_none());
+        let cli = Cli::try_parse_from(["tab-atelier-headless", "--read-only"]).expect("parse");
+        assert!(cli.read_only);
+        assert!(command_exit_code(cli).is_none());
+    }
 
     /// Catches accidental subcommand drift: every variant must keep
     /// parsing from a representative command line.
@@ -1368,5 +1631,128 @@ mod tests {
                 "missing subcommand {expected}, got: {names:?}"
             );
         }
+    }
+
+    /// Every arm of the command table, driven through the parser.
+    ///
+    /// The point is coverage of the DISPATCH, not of each verb: inside
+    /// `with_test_server` the endpoint is redirected at a fake daemon, so even
+    /// `close` and `rename` act on a throwaway snapshot. Exit codes are not
+    /// asserted — several of these legitimately fail against a two-tab
+    /// fixture — only that the table routes them somewhere.
+    #[test]
+    fn every_subcommand_routes_through_the_table() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        crate::cli::team::set_blackboard_path(Some(dir.path().join("blackboard.jsonl")));
+        crate::claims::set_registry_path(Some(dir.path().join("claims.json")));
+        crate::claims::reset_for_test();
+
+        crate::cli::share_link::with_test_server(|_| {
+            let cases: Vec<Vec<&str>> = vec![
+                vec!["tabs"],
+                vec!["peers"],
+                vec!["peers", "--all"],
+                vec!["peek", "tab-a"],
+                vec!["output", "tab-a"],
+                vec!["stats", "tab-a"],
+                vec!["notes"],
+                vec!["note", "hello"],
+                vec!["tasks"],
+                vec!["tasks", "--all"],
+                vec!["announce", "t-dispatch", "some work"],
+                vec!["bid", "t-dispatch", "--cost", "1"],
+                vec!["award", "t-dispatch", "--to", "someone"],
+                vec!["take", "--dry-run"],
+                vec!["done", "t-dispatch", "finished"],
+                vec!["wait", "t-dispatch", "--timeout", "0", "--quiet"],
+                vec!["fleet"],
+                vec!["brief"],
+                // Not `gossip` with no arguments: that exchanges boards with
+                // every configured remote, i.e. real network traffic to the
+                // developer's actual peers. `--peer` with a name nothing
+                // matches routes the arm and stops.
+                vec!["gossip", "--peer", "definitely-not-a-configured-peer"],
+                vec!["backlog", "--from-file", "/nonexistent-source.tsv"],
+                vec!["rename", "tab-a", "renamed"],
+                vec!["lock", "tab-a"],
+                vec!["unlock", "tab-a"],
+                vec!["input", "tab-a", "x"],
+                vec!["share-link", "tab-a"],
+                vec!["set-status", "idle"],
+                vec!["set-context", "--clear"],
+                vec!["token"],
+                // API-backed verbs: all of these hit the harness daemon, so
+                // they exercise their arm without touching the real one.
+                vec!["limit", "tab-a"],
+                vec!["resize", "tab-a", "--cols", "100", "--rows", "40"],
+                vec!["net-stats"],
+                vec!["net-dns"],
+                vec!["net-allow", "tab-a", "--clear"],
+                vec!["ssh-agent", "tab-a", "--off"],
+                // set-meta and set-font are routed via their USAGE-ERROR form
+                // on purpose. Both write real user state — set-font edits
+                // preferences.json, and set-meta reads TAB_ATELIER_API_URL
+                // from the environment rather than the test endpoint, so it
+                // posts to the developer's live daemon. Running the working
+                // form here changed the GUI font size out from under the user.
+                vec!["set-meta"],
+                vec!["set-font"],
+                vec!["env", "list"],
+                vec!["settings"],
+                vec!["schedule", "tab-a", "--clear"],
+                vec!["flags"],
+                vec!["logs", "--lines", "1"],
+                vec!["claude-only", "off"],
+                vec!["relay", "status"],
+                vec!["style", "--list"],
+                vec!["peek", "tab-a", "--lines", "2"],
+                vec!["handoff", "/nonexistent-file.txt", "tab-a"],
+                vec!["add", "/tmp"],
+                vec!["close", "tab-b"],
+                // Verbs that refuse bad input before doing anything: the
+                // rejection path is the one worth routing here.
+                vec!["remote", "add"],
+                vec!["dispatch"],
+            ];
+            for argv in cases {
+                let mut full = vec!["tab-atelier"];
+                full.extend(argv.iter().copied());
+                let cli = match super::Cli::try_parse_from(&full) {
+                    Ok(c) => c,
+                    Err(e) => panic!("{full:?} did not parse: {e}"),
+                };
+                assert!(
+                    super::command_exit_code(cli).is_some(),
+                    "{full:?} parsed but routed nowhere"
+                );
+            }
+        });
+
+        crate::claims::reset_for_test();
+        crate::claims::set_registry_path(None);
+        crate::cli::team::set_blackboard_path(None);
+    }
+
+    #[test]
+    fn contradictory_allowlist_flags_are_refused_by_the_parser() {
+        // `net_allow` itself resolves add+remove by letting add win silently.
+        // Nothing downstream re-checks, so the parser IS the guarantee — and
+        // an unasserted `conflicts_with_all` is one refactor away from gone.
+        let both = super::Cli::try_parse_from(["tab-atelier", "net-allow", "tab-a", "--add", "--remove"]);
+        assert!(both.is_err(), "--add with --remove must not parse");
+        let with_clear = super::Cli::try_parse_from(["tab-atelier", "net-allow", "tab-a", "--add", "--clear"]);
+        assert!(with_clear.is_err(), "--add with --clear must not parse");
+        // Each alone is fine.
+        assert!(super::Cli::try_parse_from(["tab-atelier", "net-allow", "tab-a", "--add"]).is_ok());
+        assert!(super::Cli::try_parse_from(["tab-atelier", "net-allow", "tab-a", "--clear"]).is_ok());
+    }
+
+    #[test]
+    fn no_subcommand_means_run_the_daemon_not_an_error() {
+        // `tab-atelier` with no verb starts the daemon, so the table must
+        // return None rather than an exit code — a non-None here would make
+        // the binary exit instead of launching.
+        let cli = super::Cli::try_parse_from(["tab-atelier"]).expect("parse");
+        assert!(super::command_exit_code(cli).is_none());
     }
 }

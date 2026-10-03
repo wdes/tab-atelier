@@ -1,5 +1,9 @@
 # Teamwork — making Claude tabs work together
 
+> Agents don't have to be told any of this by hand: the `SessionStart` hook
+> injects a short brief into every session that starts inside a tab. See
+> [agent-brief.md](./agent-brief.md) for what they're told and how to change it.
+
 Every tab can shell out to the local API (the CLI discovers the token the same
 way `brain` does), so the `claude` sessions can coordinate directly — no catbus
 agents involved. The verbs live in `src/cli/team.rs` (`peers`, `note`/`notes`,
@@ -16,6 +20,36 @@ tab-atelier dispatch --new --name build "<prompt>"   # spin up a fresh agent tab
 `<tab>` is a name, index, or UUID. `--wait` polls the target's screen until it's
 been unchanged for `--quiet` seconds (default 8) — the agent went idle — then
 prints it. See `cli::delegate` for `--timeout`.
+
+## An agent starting another agent — `Spawn`
+
+`dispatch` is how a *tab* hands work to another tab. A catbus agent has the same
+gap one level down: it can find peers and prompt them, but until `Spawn` it could
+not start one, so any "spawn a worker" workflow had to be driven from outside the
+agent, by a script the agent could not see.
+
+| tool | what it does |
+| --- | --- |
+| `ListAgents` | finds catbus agents already running, by their sockets |
+| `Delegate` | prompts one of those agents and waits for its reply |
+| `Spawn` | **starts a new agent** for one task, takes its reply, and stops it |
+
+`Spawn` runs the same binary as the agent that called it, in a directory the
+caller chooses, with a tool set the caller chooses (default `minimal` — `Read`,
+`Write`, `FileTree`, and deliberately no shell). It is ephemeral: the child runs
+with `--once`, so it answers one prompt and exits on its own rather than waiting
+to be reaped. That is what makes the cleanup structural — an agent killed
+mid-call runs no cleanup at all, so a child that waited to be killed would stay
+alive forever.
+
+Three things bound the cost, since every child is a full agent session: two
+generations (`CATBUS_SPAWN_DEPTH`, inherited so the ceiling holds across
+processes), three children at once, and `Delegate`'s timeout. `Spawn` is refused
+outright in plan-mode — a child begins with its gate open, so spawning one would
+leave plan-mode by the side door.
+
+`Spawn` is what `docs/fleet-playbook.md` means by "spawn workers"; the playbook's
+other half, the board and `dispatch`, is above.
 
 ## See who's around — `peers`
 
@@ -48,6 +82,20 @@ tab-atelier handoff ./report.md db-expert
 Copies the file into the target tab's `inbox/` (the same place web uploads land),
 so its agent can pick it up. Target resolved by name/index/UUID; an ambiguous
 name errors with the candidate indexes.
+
+## Take work off a shared board — `announce` / `take` / `done`
+
+The verbs above are point-to-point: you decide who does what. For a fleet that
+divides work itself, see **[self-organization](./self-organization.md)** —
+contract-net tasks on the same blackboard, a daemon-enforced lease so two
+agents never take one task, and `gossip` to span hosts.
+
+```
+tab-atelier backlog                     # announce work from a coverage report
+tab-atelier tasks                       # what's on the board
+tab-atelier take                        # lease the best open task for me
+tab-atelier done cov:src/api.rs "61% -> 72%"
+```
 
 ## Label a tab — `set-meta`
 

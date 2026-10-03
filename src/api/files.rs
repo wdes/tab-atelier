@@ -1,6 +1,4 @@
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// SPDX-License-Identifier: MPL-2.0
 
 //! File transfer inside a tab's sandbox: upload into `inbox/` (atomic,
 //! symlink-guarded, per-token concurrency cap) and download from `inbox/` /
@@ -146,6 +144,47 @@ pub(super) fn upload<W: Write>(
     }))
     .unwrap_or_default();
     respond_json(stream, 201, &body);
+}
+
+/// `GET /tabs/{key}/outbox/{name}` — the same download, addressed by path.
+///
+/// The viewer used `…/files?path=outbox/x.md`, whose LAST URL SEGMENT is
+/// `files`. An `<a download>` only applies same-origin, so the moment the page
+/// and the API differ (a share link, a tunnel), the browser ignores the
+/// attribute and names the file after the URL — hence `files.bin`, the segment
+/// plus an extension guessed from `application/octet-stream`.
+///
+/// With the name in the path there is nothing left to guess: the fallback name
+/// IS the filename, `Content-Disposition` agrees with it, and a plain
+/// `<a href download>` needs no JavaScript to work.
+pub(super) fn download_by_path<W: Write>(
+    stream: &mut W,
+    state: &Arc<Mutex<TabSnapshot>>,
+    p: &str,
+    accept_gzip: bool,
+    if_none_match: Option<&str>,
+) {
+    // `/tabs/<key>/outbox/<rel>` → key, and `outbox/<rel>` as the sandbox path.
+    let Some((left, rest)) = p.split_once("/outbox/") else {
+        error_json(stream, 404, "not a file path");
+        return;
+    };
+    let rel = super::url_decode(rest);
+    if rel.is_empty() {
+        error_json(stream, 404, "no file named");
+        return;
+    }
+    // Reuse the query-form handler so the sandbox check, the ETag and the
+    // Content-Disposition are the same code — a second copy of a path check
+    // is a second chance to get it wrong.
+    download(
+        stream,
+        state,
+        &format!("{left}/files"),
+        Some(&format!("outbox/{rel}")),
+        accept_gzip,
+        if_none_match,
+    );
 }
 
 pub(super) fn download<W: Write>(

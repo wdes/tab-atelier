@@ -1,6 +1,4 @@
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// SPDX-License-Identifier: MPL-2.0
 
 // Integration test crate — unwrap/expect are idiomatic here.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -151,6 +149,15 @@ fn agent_command(dir: &Path) -> Command {
         .env_remove("CATBUS_OPENAI_MODEL")
         .env_remove("INFOMANIAK_PRODUCT_ID")
         .env_remove("INFOMANIAK_API_TOKEN")
+        .env_remove("CATBUS_RELAY_URL")
+        .env_remove("CATBUS_RELAY_TOKEN")
+        .env_remove("CATBUS_PREFERENCES")
+        .env_remove("XDG_CONFIG_HOME")
+        // Reply formatting is steered by these; cleared so the suite does not
+        // depend on the shell that launched it.
+        .env_remove("CATBUS_ANSI")
+        .env_remove("NO_COLOR")
+        .env_remove("CLICOLOR")
         .env(
             "LLVM_PROFILE_FILE",
             format!("{}/catbus-e2e-%p.profraw", env!("CARGO_TARGET_TMPDIR")),
@@ -242,6 +249,17 @@ fn openai_backend_runs_a_tool_round_trip() {
     );
     let req = body_of(&first);
     assert_eq!(req["model"], "test-model");
+    // The output ceiling goes out under the name every service reads. This is the
+    // end-to-end half of the fix in `openai.rs`: a model from the gpt-5/gpt-6 or
+    // o-series generation fails the whole request with `400 Unsupported
+    // parameter: 'max_tokens'`, so a body still carrying the legacy key would
+    // make those models unreachable however correct the rest of the request is.
+    assert_eq!(req["max_completion_tokens"], 8192);
+    assert!(
+        req.get("max_tokens").is_none(),
+        "the legacy field must not be sent at all: {}",
+        req["max_tokens"]
+    );
     assert_eq!(req["messages"][0]["role"], "system");
     assert_eq!(req["messages"][1]["role"], "user");
     assert_eq!(req["messages"][1]["content"], "read hello.txt please");
@@ -253,46 +271,165 @@ fn openai_backend_runs_a_tool_round_trip() {
 
     // Round 2 must feed the tool output back as a `tool` message tied
     // to the call id, preceded by the assistant tool-call turn.
+    //
+    // The state turn is appended after all of it, so the last message is the
+    // env block rather than the tool result. That ordering is deliberate and
+    // also what this wire requires: OpenAI is strict that a `tool` message
+    // directly follows the assistant turn carrying its `tool_calls`, so the
+    // state turn must not land between them.
     let second = rx.recv_timeout(Duration::from_secs(5)).unwrap();
     let req = body_of(&second);
     let messages = req["messages"].as_array().unwrap();
-    let assistant = &messages[messages.len() - 2];
+    let last = messages.len() - 1;
+
+    let assistant = &messages[last - 2];
     assert_eq!(assistant["role"], "assistant");
     assert_eq!(assistant["tool_calls"][0]["id"], "call_1");
-    let tool_msg = &messages[messages.len() - 1];
-    assert_eq!(tool_msg["role"], "tool");
+    let tool_msg = &messages[last - 1];
+    assert_eq!(
+        tool_msg["role"], "tool",
+        "a tool result must immediately follow its call"
+    );
     assert_eq!(tool_msg["tool_call_id"], "call_1");
+    let state = &messages[last];
+    assert_eq!(state["role"], "user");
+    assert!(
+        state["content"].as_str().unwrap_or_default().starts_with("<env "),
+        "the state turn goes last, got: {}",
+        state["content"]
+    );
     assert!(
         tool_msg["content"].as_str().unwrap().contains("mock says hi"),
         "tool result should carry the file contents: {tool_msg}"
     );
 }
 
+/// A brief for the working directory reaches the model without anyone injecting
+/// it: the agent finds it the way a Claude tab does, through the shared rule.
+///
+/// This is the end-to-end half of the brief wiring. The file is written into the
+/// agent's own `HOME`, and named by no flag — so if the selection rule, the
+/// parsing, or the system-block assembly regress, the model simply never sees it
+/// and this fails.
+#[test]
+fn a_project_brief_for_the_working_directory_reaches_the_model() {
+    let dir = tempfile::tempdir().unwrap();
+    let briefs = dir.path().join(".config/tab-atelier/briefs");
+    std::fs::create_dir_all(&briefs).unwrap();
+    std::fs::write(
+        briefs.join("project.md"),
+        format!(
+            "---\nbaseDir: {}\n---\nRead the tree before you write in it.\n",
+            dir.path().display()
+        ),
+    )
+    .unwrap();
+
+    let (port, rx) = spawn_mock_server(vec![("HTTP/1.1 200 OK", FINAL_ROUND)]);
+    let socket = dir.path().join("agent.sock");
+    let _agent = spawn_agent(dir.path(), &socket, port);
+
+    let (mut reader, mut stream) = connect_socket(&socket);
+    let reply = send_prompt(&mut stream, &mut reader, "hello");
+    assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+
+    let first = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let req = body_of(&first);
+    let system = req["messages"][0]["content"].as_str().unwrap_or_default();
+    assert!(
+        system.contains("Read the tree before you write in it."),
+        "the brief must reach the model as a system block, got: {system}"
+    );
+    // Sent as its own statement about the project rather than merged into the
+    // rendering rules, which describe the terminal and are not the project's.
+    assert!(
+        system.contains("<env") || system.len() > 100,
+        "the rendering instructions should still be sent alongside it: {system}"
+    );
+    assert_eq!(req["messages"][0]["role"], "system");
+}
+
+/// The operator's identity reaches the model on this wire, and the Claude line
+/// does not.
+///
+/// Both halves guard the same past defect: this path built its system string from
+/// the brief and the rendering rules alone, dropping the identity entirely. An
+/// operator's `identity.md` was read and resolved and never sent, so an agent on
+/// any OpenAI-compatible endpoint answered "who are you" out of its own training
+/// data. Asserted on the captured request, because a reply cannot show what was
+/// sent — a model that invents an identity says so just as confidently as one
+/// that was told.
+#[test]
+fn the_openai_wire_sends_the_operators_identity_and_not_the_claude_line() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join(".catbus")).unwrap();
+    std::fs::write(
+        dir.path().join(".catbus/identity.md"),
+        "You are the Parrot. Never claim to be another vendor's model.\n",
+    )
+    .unwrap();
+
+    let (port, rx) = spawn_mock_server(vec![("HTTP/1.1 200 OK", FINAL_ROUND)]);
+    let socket = dir.path().join("agent.sock");
+    let _agent = spawn_agent(dir.path(), &socket, port);
+
+    let (mut reader, mut stream) = connect_socket(&socket);
+    let reply = send_prompt(&mut stream, &mut reader, "who are you?");
+    assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+
+    let first = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let req = body_of(&first);
+    let system = req["messages"][0]["content"].as_str().unwrap_or_default();
+    assert!(
+        system.contains("Parrot"),
+        "the operator's identity must reach the model: {system}"
+    );
+    // `--openai-model test-model` is not an Anthropic name, and this wire names
+    // its model at startup rather than learning it from a relay's reply, so the
+    // very first turn already knows the Claude line would be a lie.
+    assert!(
+        !system.contains("You are Claude Code"),
+        "a non-Anthropic model must not be told it is Claude: {system}"
+    );
+}
+
 #[test]
 fn api_error_is_reported_over_the_socket() {
     let dir = tempfile::tempdir().unwrap();
-    let (port, _rx) = spawn_mock_server(vec![(
-        "HTTP/1.1 500 Internal Server Error",
-        r#"{"error":"mock exploded"}"#,
-    )]);
+    // Four responses, because a 500 is retryable and the agent now sends up to
+    // four attempts before giving up. One response would leave the second
+    // connection refused — a transport error rather than the status the test is
+    // about — so the mock has to answer every attempt for the assertion below
+    // to be testing error reporting rather than connection handling.
+    let (port, _rx) = spawn_mock_server(vec![
+        ("HTTP/1.1 500 Internal Server Error", r#"{"error":"mock exploded"}"#),
+        ("HTTP/1.1 500 Internal Server Error", r#"{"error":"mock exploded"}"#),
+        ("HTTP/1.1 500 Internal Server Error", r#"{"error":"mock exploded"}"#),
+        ("HTTP/1.1 500 Internal Server Error", r#"{"error":"mock exploded"}"#),
+    ]);
     let socket = dir.path().join("agent.sock");
     let _agent = spawn_agent(dir.path(), &socket, port);
 
     let (mut reader, mut stream) = connect_socket(&socket);
 
-    // Flip plan-mode over the socket first, so the failing request is
-    // also built with the plan-mode system prompt branch.
+    // Flip to plan mode over the socket first, so the failing request is
+    // also built with the plan gate in its environment turn. The reply text
+    // changed from `plan-mode = true` when the two-state boolean became a
+    // three-state gate; the message is presentation, and nothing parses it.
     stream.write_all(b"{\"kind\":\"set_plan_mode\",\"on\":true}\n").unwrap();
     let mut line = String::new();
     reader.read_line(&mut line).unwrap();
-    assert!(line.contains("plan-mode = true"), "unexpected reply: {line}");
+    assert!(line.contains("gate = plan"), "unexpected reply: {line}");
 
+    // Retries make this take a few seconds: the backoff is 1s, 2s and 4s
+    // between four attempts. The socket read timeout is 30s, so it fits, but
+    // the wait is real and this test is the slowest here because of it.
     let reply = send_prompt(&mut stream, &mut reader, "hello?");
     assert_eq!(reply["kind"], "error", "unexpected reply: {reply}");
     let message = reply["message"].as_str().unwrap();
     assert!(
         message.contains("500") && message.contains("mock exploded"),
-        "error should surface status and body: {message}"
+        "error should surface status and body after the retries are exhausted: {message}"
     );
 }
 
@@ -322,19 +459,25 @@ fn print_socket_works_with_the_infomaniak_shortcut() {
 }
 
 #[test]
-fn anthropic_is_the_default_backend_when_credentials_exist() {
+fn the_relay_is_resolved_from_preferences_when_no_flags_are_given() {
     let dir = tempfile::tempdir().unwrap();
-    let claude_dir = dir.path().join(".claude");
-    std::fs::create_dir_all(&claude_dir).unwrap();
-    // Far-future expiry so load() succeeds without hitting the
-    // refresh endpoint; --print-socket exits before any API call.
+    let prefs = dir.path().join("preferences.json");
     std::fs::write(
-        claude_dir.join(".credentials.json"),
-        r#"{"claudeAiOauth":{"accessToken":"sk-test","refreshToken":"sk-r","expiresAt":9999999999999,"scopes":["user:inference"]}}"#,
+        &prefs,
+        r#"{
+            "relay_endpoint_id": "relay-id",
+            "remote_endpoints": [
+                { "id": "other", "url": "https://ignored.example", "relay_token": "tap_ignored" },
+                { "id": "relay-id", "url": "https://relay.example", "relay_token": "tap_chosen" }
+            ]
+        }"#,
     )
     .unwrap();
     let socket = dir.path().join("agent.sock");
+    // --print-socket exits before any HTTP, so the relay is resolved but
+    // never contacted.
     let out = agent_command(dir.path())
+        .env("CATBUS_PREFERENCES", &prefs)
         .args([
             "--new-session",
             "--cwd",
@@ -347,4 +490,35 @@ fn anthropic_is_the_default_backend_when_credentials_exist() {
         .unwrap();
     assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), socket.to_str().unwrap());
+}
+
+#[test]
+fn a_local_claude_login_alone_is_not_enough() {
+    // The regression this guards: catbus used to read the operator's own
+    // ~/.claude OAuth credential and call Anthropic directly. The login
+    // lives on the proxy now, so a machine with those credentials but no
+    // relay configured must fail with the relay's own advice rather than
+    // quietly going direct.
+    let dir = tempfile::tempdir().unwrap();
+    let claude_dir = dir.path().join(".claude");
+    std::fs::create_dir_all(&claude_dir).unwrap();
+    std::fs::write(
+        claude_dir.join(".credentials.json"),
+        r#"{"claudeAiOauth":{"accessToken":"sk-test","refreshToken":"sk-r","expiresAt":9999999999999,"scopes":["user:inference"]}}"#,
+    )
+    .unwrap();
+    let out = agent_command(dir.path())
+        .args([
+            "--new-session",
+            "--cwd",
+            dir.path().to_str().unwrap(),
+            "--socket",
+            dir.path().join("agent.sock").to_str().unwrap(),
+            "--print-socket",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "credentials alone must not be enough");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("no relay configured"), "stderr: {stderr}");
 }

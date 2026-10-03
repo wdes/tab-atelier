@@ -35,6 +35,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use clap::Parser;
 use serde::{Deserialize, Serialize};
 
 use crate::cli::share_link::{Endpoint, agent, discover_endpoint};
@@ -296,9 +297,14 @@ pub fn compact(entries: &[SwampEntry], cursor: usize) -> Vec<SwampEntry> {
 }
 
 /// Options parsed from `aligator [--once] [--interval SECS]`.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Parser, Debug, PartialEq, Eq)]
+#[command(name = "tab-atelier aligator", disable_help_subcommand = true)]
 pub struct RunOpts {
+    /// Run one round and exit, instead of looping.
+    #[arg(long)]
     pub once: bool,
+    /// Seconds between rounds.
+    #[arg(long, default_value_t = DEFAULT_INTERVAL_SECS, value_parser = clap::value_parser!(u64).range(1..))]
     pub interval: u64,
 }
 
@@ -310,43 +316,11 @@ pub struct RunOpts {
 /// `Err(0)` on `-h`/`--help` (usage printed), `Err(2)` on an unknown argument
 /// or a non-numeric / zero `--interval`.
 pub fn parse_run_opts(args: &[String]) -> Result<RunOpts, i32> {
-    let mut opts = RunOpts {
-        once: false,
-        interval: DEFAULT_INTERVAL_SECS,
-    };
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--once" => opts.once = true,
-            "--interval" => {
-                i += 1;
-                match args.get(i).and_then(|v| v.parse::<u64>().ok()) {
-                    Some(n) if n >= 1 => opts.interval = n,
-                    _ => {
-                        eprintln!("aligator: --interval expects a number >= 1");
-                        return Err(2);
-                    }
-                }
-            }
-            "-h" | "--help" => {
-                eprintln!(
-                    "usage: tab-atelier aligator [--once] [--interval SECS]\n\
-                     Drains the swamp queue and types each entry's input into the target\n\
-                     tab. Delivers ONLY to a live Claude agent tab (agent_kind == \"claude\"\n\
-                     + a session) — never a plain shell. Cursor-based (exactly-once best\n\
-                     effort), one round every {DEFAULT_INTERVAL_SECS}s by default.\n\
-                     Enqueue with: tab-atelier swamp <tab-uuid> \"<text>\" [--no-submit]"
-                );
-                return Err(0);
-            }
-            other => {
-                eprintln!("aligator: unknown argument: {other}");
-                return Err(2);
-            }
-        }
-        i += 1;
-    }
-    Ok(opts)
+    RunOpts::try_parse_from(std::iter::once("aligator".to_owned()).chain(args.iter().cloned())).map_err(|err| {
+        let code = err.exit_code();
+        err.print().ok();
+        code
+    })
 }
 
 /// What to do with one swamp entry this round.

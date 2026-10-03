@@ -1,6 +1,4 @@
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// SPDX-License-Identifier: MPL-2.0
 
 use std::fmt::Write as _;
 use std::path::Path;
@@ -26,22 +24,23 @@ pub async fn run(input: &serde_json::Value, cwd: &Path) -> Result<String, String
         .map(Duration::from_secs)
         .map_or(DEFAULT_TIMEOUT, |d| d.min(MAX_TIMEOUT));
 
-    // `bash -lc` so we inherit the user's PATH / aliases. Stderr is
-    // merged with stdout to give the model one chunk of context.
-    let mut cmd = Command::new("bash");
-    cmd.arg("-lc")
-        .arg(command)
-        .current_dir(cwd)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-
-    let child = cmd.spawn().map_err(|e| format!("spawn bash: {e}"))?;
+    let child = spawn(command, cwd)?;
+    // Armed before the wait, and disarmed only once the command has ended on its own terms. Held
+    // across the await because this is the cancellation case: Ctrl-C drops the future of the model
+    // call that is running this tool, so no line after the `await` is ever reached — a kill written
+    // there would be a kill that does not happen, and the command would keep running with nothing
+    // left holding it. Dropping the guard is what stops the whole tree instead.
+    let mut group = crate::proc::Group::of(&child);
     let out = match tokio::time::timeout(timeout, child.wait_with_output()).await {
         Ok(Ok(out)) => out,
+        // A failure or a timeout returns with the guard still armed, which stops a command we have
+        // given up on — including the tree a timed-out command would otherwise have left running.
         Ok(Err(e)) => return Err(format!("wait: {e}")),
         Err(_) => return Err(format!("timed out after {}s", timeout.as_secs())),
     };
+    // The command finished by itself, so anything it deliberately left running — a server started
+    // with `&` — is left alone. Killing the group here would take down what the caller asked for.
+    group.disarm();
     let mut combined = bytes_to_string(out.stdout);
     if !out.stderr.is_empty() {
         if !combined.is_empty() && !combined.ends_with('\n') {
@@ -53,13 +52,52 @@ pub async fn run(input: &serde_json::Value, cwd: &Path) -> Result<String, String
     if combined.len() > MAX_OUTPUT {
         // Keep the tail — typical when a build dumps thousands of
         // OK lines followed by the actual error.
-        let tail = combined.split_off(combined.len() - MAX_OUTPUT);
+        //
+        // The offset comes from `text::tail_start` rather than being `len - MAX_OUTPUT`, which is a
+        // byte count where the string is characters: a cut inside a multi-byte character made
+        // `split_off` panic, and a command printing enough accented or box-drawing text is all it
+        // takes. That panic ended a live turn.
+        let start = crate::text::tail_start(&combined, MAX_OUTPUT);
+        let tail = combined.split_off(start);
         combined = format!("[...truncated...]\n{tail}");
     }
     if !out.status.success() {
         let _ = write!(combined, "\n[exit {}]", out.status.code().unwrap_or(-1));
     }
     Ok(combined)
+}
+
+/// Start `command` with this crate's conventions, without waiting for it.
+///
+/// Split out of [`run`] so the REPL can run a command the same way the tool does
+/// and still watch the output as it arrives: [`run`] has to wait for the whole
+/// thing because the model wants one finished chunk, whereas the operator wants
+/// to see it happening. The conventions themselves are not two decisions, so
+/// they live in one place.
+///
+/// `bash -lc` so we inherit the user's PATH and aliases. `kill_on_drop` matters
+/// to whoever holds the returned child: a `Child` does not kill on drop, so
+/// without it a command the operator abandoned keeps running — a command is
+/// usually a pipeline or an `&&` chain, so "the command" is the whole tree, and
+/// the child is put in a process group of its own for that reason. `kill_on_drop`
+/// stops the shell; [`crate::proc::Group`] is what stops what the shell started.
+///
+/// # Errors
+/// Returns a description when the shell cannot be started at all.
+pub fn spawn(command: &str, cwd: &Path) -> Result<tokio::process::Child, String> {
+    let mut cmd = Command::new("bash");
+    cmd.arg("-lc")
+        .arg(command)
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    // Before the spawn, so the shell leads a group nobody else is in and a later group signal
+    // reaches every process the command forks. Without it there is no group to signal, and
+    // stopping the command stops only its shell.
+    crate::proc::in_own_group(&mut cmd);
+    cmd.spawn().map_err(|e| format!("spawn bash: {e}"))
 }
 
 /// Move-friendly bytes → String conversion: for valid UTF-8 (the common
@@ -70,5 +108,65 @@ fn bytes_to_string(bytes: Vec<u8>) -> String {
     match String::from_utf8(bytes) {
         Ok(s) => s,
         Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Output past the cap must be cut down without panicking on a character boundary.
+    ///
+    /// This reproduces a crash from a live session: the model ran a grep, the output was over the
+    /// 256 KB cap, and the cut landed inside a multi-byte character — which `String::split_off`
+    /// treats as a programming error and asserts against, ending the turn with
+    /// `assertion failed: self.is_char_boundary(at)`.
+    ///
+    /// The character width is chosen rather than picked: an em dash is three bytes, and
+    /// `MAX_OUTPUT` is `0b100_0000_0000_0000`, whose remainder modulo three is one — so
+    /// `len - MAX_OUTPUT` lands two bytes *into* a character rather than at its start. Two-byte
+    /// characters would not do it: the offset stays even and even offsets are all boundaries, so the
+    /// test would pass whether or not the bug was there. That is asserted below, so the test cannot
+    /// quietly stop reproducing if the cap changes.
+    #[tokio::test]
+    async fn output_past_the_cap_is_cut_without_splitting_a_character() {
+        // Written by us and `cat`ed rather than generated by `printf`: the bytes have to be exactly
+        // the ones this test reasons about, and `\u` handling in the shell is one more thing that
+        // could differ.
+        let file = std::env::temp_dir().join(format!("catbus-bash-cap-{}.txt", std::process::id()));
+        let content = "\u{2014}".repeat(100_000); // 300_000 bytes, three per character
+        std::fs::write(&file, &content).expect("write the large file");
+
+        // The premise: this input is over the cap, and the arithmetic the bug used would have landed
+        // inside a character. If either stops being true the test is no longer a reproduction, and
+        // it should say so rather than pass.
+        assert!(content.len() > MAX_OUTPUT, "the input must be over the cap");
+        assert!(
+            !content.is_char_boundary(content.len() - MAX_OUTPUT),
+            "the input must put the old byte-counted cut inside a character, or this proves nothing"
+        );
+
+        let command = format!("cat {}", file.display());
+        let out = run(&serde_json::json!({ "command": command }), Path::new("/tmp"))
+            .await
+            .expect("a large output should be trimmed, not fail");
+        let _ = std::fs::remove_file(&file);
+
+        assert!(out.starts_with("[...truncated...]"), "the cut should be marked");
+        assert!(out.len() <= MAX_OUTPUT + 32, "the tail should be the capped size");
+        // The tail is still the output, whole and undamaged. A lossy decode would have shown its
+        // damage as replacement characters instead.
+        assert!(out.contains('\u{2014}'), "the tail should hold the output itself");
+        assert!(out.is_char_boundary(out.len()));
+    }
+
+    /// A command whose output fits is returned whole, with no marker.
+    #[tokio::test]
+    async fn output_under_the_cap_is_untouched() {
+        let command = "printf 'small \u{e9} output\\n'";
+        let out = run(&serde_json::json!({ "command": command }), Path::new("/tmp"))
+            .await
+            .expect("a small output should come back");
+        assert_eq!(out, "small \u{e9} output\n");
     }
 }

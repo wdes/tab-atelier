@@ -1,0 +1,14 @@
+#!/bin/sh
+# Removing the service account does not remove /var/lib/tab-atelier-kiosk:
+# purge should not erase any future operator settings or Kiosk data implicitly.
+set -e
+case "$1" in
+    purge)
+        if getent passwd tab-atelier-kiosk >/dev/null; then
+            deluser --system tab-atelier-kiosk >/dev/null 2>&1 || true
+        fi
+        echo "note: /var/lib/tab-atelier-kiosk kept — remove it manually if intended."
+        ;;
+esac
+#DEBHELPER#
+exit 0

@@ -1,0 +1,353 @@
+<!-- SPDX-License-Identifier: MPL-2.0 -->
+
+# Proxy-side request compaction
+
+The proxy already reads every request body whole. `shape_and_admit` parses it to
+a `serde_json::Value` to find `model`, decides where the call goes, and
+`rewrite_model` re-serializes it. Compaction is one more mutation on a parse the
+proxy is already paying for — no new endpoint, no new credential, no client
+change.
+
+It is also, on any hop that still has a warm cache, **worth much less than the
+byte count says**. Most of this document is the argument for why.
+
+## What it is worth, measured
+
+A Claude Code request is not a short question. It is the *entire conversation*,
+resent every turn, with `cache_control` breakpoints placed so that everything
+before the last one is a cache read at ~10% of list price.
+
+The render order is `tools` → `system` → `messages`, and **any byte change
+anywhere in the prefix invalidates every breakpoint after it.** So a compactor
+that rewrites the middle of `messages` turns that turn into a full-price cache
+miss. Shorter body, bigger bill — for one turn.
+
+A real body, measured (77 messages, 306,158 bytes, bound for `deepseek-flash`):
+
+| where the breakpoints are | what that means |
+|---|---|
+| `system[1]`, `system[2]` | the system prompt and tool-definition tail are cached |
+| `messages[76].content[0]` | **the last message** — so the *entire* history is inside the cached prefix |
+
+`tools[]` carries **no** breakpoint, so every tool sits ahead of all three; the
+same byte changed in the tail costs nothing, and changed in a tool description
+costs everything. That is `docs/proxy-tools.md`'s subject.
+
+**The obvious inference from that table is wrong.** An Anthropic prompt cache
+does not follow a request to a provider that is not Anthropic — so it looks like
+a reroute forfeits the cache, and *that* is the free hop. It is not. Probed
+against the second provider's Anthropic-compatible endpoint, the real session
+was served from cache on its 77th turn:
+
+```
+input_tokens 195   cache_read_input_tokens 77,312   cache_creation 0
+```
+
+77,312 of 77,507 tokens read from cache, ~195 uncached — the new message only.
+**This endpoint prefix-caches a Claude Code session**, and does not honour the
+client's breakpoint structure while doing it: it matches its own longest prefix.
+The same body, compacted, and both re-sent warm:
+
+| | before | after | |
+|---|---|---|---|
+| body bytes | 306,158 | 174,777 | **−43 %** |
+| input tokens (measured, not `len/4`) | 77,507 | 45,640 | **−41.1 %** |
+| `tool_result` (43 blocks) | 129,896 B | 21,836 B | 34 of 43 elided |
+| `thinking` (25 blocks) | 27,799 B | 6,343 B | 19 dropped, last 6 kept |
+| `tool_use` / `text` / `system[]` / `tools[]` | — | identical | untouched |
+
+So the framing is not "the cache is gone, the bytes are free". It is this:
+
+```
+baseline   195 + 0.1 × 77,312  =  7,926  effective
+compacted  200 + 0.1 × 45,440  =  4,744  effective      →  −40 %
+```
+
+**The percentage survives; the money does not.** A cache scales both sides
+equally, so 41 % off the tokens is still 41 % off the input bill — but the bill
+being discounted is already a tenth of what a cold request costs, so the
+absolute saving is roughly **10× smaller than the byte count advertises.**
+
+That is still a saving, and on a provider whose whole reason for existing is
+price it is a real one. It is just not the slam dunk a −43 % figure reads as,
+and the decision belongs per-provider for exactly that reason: the operator is
+choosing where 40 % of a small number beats the cache churn and the semantic
+loss below, not where 43 % of a large one does.
+
+
+## The four layers
+
+Deterministic — identical input bytes produce identical output bytes, so the
+rewrite happens once and the cache (if any) re-warms on that one turn instead of
+missing forever. That rules out anything time-based or random.
+
+| # | layer | what it does | kept verbatim |
+|---|-------|--------------|---------------|
+| A | `tools` | replaces old `tool_result` **content** with a stub naming the byte count and the call that produced it | last **6** tool-result turns |
+| B | `+thinking` | drops `thinking` blocks on older assistant turns | last **6** assistant turns |
+| C | `+notices` | drops stale injected system notices — the `<total_tokens>` banner, `[SYSTEM NOTIFICATION …]`, PostToolUse notes, "user sent a new message" | the newest banner, plus the last **6** notices |
+
+There used to be a fourth layer, `+writes`, and it was **removed**. It stubbed
+the long string arguments (`content`, `new_string`, `old_string`, …) of old
+write-tool calls, and in doing so it let a stub be written into a file: a marker
+left in the history was reproduced by the model as the argument of a later
+write. That destroyed a boot script, a `policies.json` and four memory files,
+and reached pull requests. The mechanism is worth stating plainly — the marker
+was not "executed" by anything. It was text in the conversation, and the model,
+asked to author a file, copied text it could see.
+
+`Bash` had been exempted for exactly this reason: a shell command is the agent's
+stated intent, not a payload, so its `command` text was never stubbed. Applying
+that rule consistently means a file body the model authored is never replaced by
+a marker either, so the layer is gone rather than narrowed — there was no safe
+subset, because its bytes sit in volume (11,026 payloads averaging 1.2 KB) and
+not in outliers that could be singled out.
+
+The saving was real but small: over the captures sampled it removed **12.9 MB
+against layer A's 107 MB** — 11% of everything this pass removes — and bodies
+came out about 5% smaller because of it.
+
+The stubs are the point of layer A: `"[elided:9073B; Read /src/lib.rs]"` keeps the
+block and its position, and tells the model *that something was there* rather
+than pretending it was always empty. It deliberately does not repeat the
+`tool_use_id`, which is already a sibling field on the same block — 803 of 804
+stubs were duplicating it at 44 bytes each.
+
+It **does** name the call, and that is a fix, not a flourish. The byte count alone
+tells the model *whether* something was there and how big it was, which leaves it
+to work out whether the content it needs is inside — and the safe answer to that
+question, when the task depends on it, is to read it again. Naming the call
+answers the question the model actually has: *have I already read this file this
+conversation?* With the name in the stub it can see that it has. Without it,
+re-reading is the only way to find out.
+
+That is not hypothetical. On 2026-09-25 a `catbus-agent` tab hit exactly that
+wall: 200 rounds, 2.55M input tokens, re-reading the same files because the stubs
+were indistinguishable from results it had never seen. The name is what the model
+writes in the call, so it is the string it can match against its own history — the
+`tool_use_id` cannot serve there, because the model never saw the id when it made
+the call.
+
+The marker is matched in both forms. Conversations already in flight when it
+shrank still carry the long one, and recognising only the short form would make
+the pass re-stub them — nesting a stub inside a stub and recomputing the byte
+count from the stub rather than from the result it replaced, so the original
+size would be lost and the number would shrink on every pass.
+
+**Nothing shorter than 200 bytes is stubbed at all.** A tool result is evidence,
+and the short ones are the evidence that matters most: "The file /src/lib.rs has
+been updated." is the only record in the conversation that a call succeeded.
+Stub that and the model cannot tell "it worked" from "that call never happened",
+so it repeats work it has already done.
+
+That floor used to be implicit, and the accident is worth recording. The rule was
+"stub only when the stub is strictly shorter than the result", which with a
+102-byte stub meant "over 102 bytes" without anyone deciding it. Shrinking the
+stub to 14 would have quietly moved the floor to 14 and started eating
+acknowledgements; `a_short_acknowledgement_is_never_elided` failed the moment the
+marker changed, which is how it was caught.
+
+## Layer A only runs above a size floor
+
+**`ELIDE_ABOVE_BYTES` (256 KiB) gates the whole of layer A.** The pass counts the
+elidable bytes in the stale region first; below the floor it returns the body
+untouched and reports the count as `tool_results_kept_under_budget`.
+
+The reasoning is the same as the 200-byte floor, one scale up. Elision exists to
+keep a request inside the model's context window, and that is a problem only above
+a certain size — most bytes in a long session are machine payload, so on a
+transcript measured in megabytes the pass pays for itself many times over. On a
+request that already fits, it pays for nothing the provider was charging for,
+while costing the model the contents of calls it is still working with. On any hop
+with a prompt cache it is worse than that: rewriting old `tool_result` bodies
+invalidates the cached prefix outright, which is why `ELIDE_BATCH` exists to make
+the rewrite all-or-nothing.
+
+And it is what let the loop happen. The 2026-09-25 tab was never over any budget —
+its requests fit. The pass ran anyway, stubbed what it was not entitled to stub,
+and left the model with nothing to reason over and no way to tell. The floor is
+the fix at the source; the call-name in the stub is the fix at the point of
+contact; `catbus-agent`'s own loop guard is the client-side half that does not
+depend on the relay at all.
+
+The count is reported rather than silently swallowed: a transcript the panel shows
+as repeatedly compacted with nothing saved is `0` here when there was genuinely
+nothing to do, and nonzero when elision was available and declined. Those want
+opposite investigations.
+
+Layer C is the biggest of the last two wins on a measured body: 51.7 KB of a
+353 KB request was injected system notices — harness notifications, PostToolUse
+notes, token banners — a class no earlier layer looked at. A stale notice is
+noise re-read on every later turn. Keeping the newest banner and the last six
+notices preserves the signal — what the harness said most recently, and what
+just happened — without paying for the rest of the history.
+
+### What a "turn" is
+
+A message. Layer A counts back over messages that contain a `tool_result`; the
+last six of those are the window, and anything earlier is elided.
+
+Layer B counts back over messages that contain a `thinking` block — *not* over
+every assistant message. On the measured body those coincide, because each
+assistant turn carries one thinking block. They part company the moment a turn
+does not, and counting those would shrink the window by exactly the number of
+turns it never needed to protect: a "keep 6" rule that quietly keeps 3.
+
+### Idempotent, and why that is load-bearing
+
+An elided block is recognised by its own stub marker, and left alone on a second
+pass. Without that check the pass is merely *deterministic*, not idempotent —
+and the difference is not academic. A retry, or one request crossing two route
+changes, re-runs the pass over its own output, elides the stubs again, and
+recomputes their byte count **from the stub**: the number in the message shrinks
+on every pass and the size of the result it replaced is gone. The marker is
+what makes the count mean "how much this cost" rather than "how big the last
+thing I wrote was".
+
+## The control
+
+A `<select>` on each **account** in the admin UI, written to that account's entry
+in `users.json`:
+
+```html
+<select :value="u.compact" @change="setUserCompact(u, $event.target.value)">
+  <option value="none">None</option>
+  <option value="tools">Remove old tool results</option>
+  <option value="tools_thinking">Remove old tool results and thinking</option>
+  <option value="all">Remove old tool results, thinking and notices</option>
+</select>
+```
+
+`v-model` is not used, and that is the point of the binding: this page persists
+through the API rather than into a local object, so a change that the server
+refuses has to snap the control back to what is actually stored. The four
+labels are *served*, not written here — `Compact::label()` is the same enum
+routing reads, and a second copy in TypeScript would be a second thing to keep
+in step.
+
+### Why it is per account, not per provider
+
+It reads like a property of the hop, because the harm it can do *is* one (see
+[The honest limits](#the-honest-limits)). But the operator reasoning about it is
+looking at a **person** — "this account is dragging a context it stopped
+needing" — and routing picks the hop **per request**. A level filed under a
+provider therefore silently changes meaning the moment that provider stops being
+where the traffic goes: the setting stays put, and the thing it governs does not.
+
+So the level lives on the account, and the hop's objection is raised *against
+whatever route was actually taken*. `Provider::compact_refusal` still exists and
+still answers for one hop; the server asks it of every destination the account
+could reach — its pin, or every enabled provider — and refuses the save if any of
+them is the subscription. An account that *might* be sent through the
+subscription is one whose compaction is not free, and a refusal that only fired
+once there was no alternative would fire too late to be useful.
+
+Parsed as a field on the account, defaulting to `"none"` for every account
+already in the file:
+
+```json
+{
+  "id": "…",
+  "email": "someone@example.com",
+  "compact": "tools_thinking"
+}
+```
+
+`#[serde(default)]` is what makes that backward compatible: a file without the
+key loads as `none` rather than failing. A file that does not parse costs every
+key in it, which is every login in the file.
+
+**`none` is the default, and it is the right value on the Anthropic provider.**
+The whole point is that the operator sets it per hop, with the reasoning above
+visible in the same file the routing already reads.
+
+Worth saying plainly: a global `compact: "all"` on every provider would be a
+configuration that quietly costs its owner money. If a global control is ever
+added it should refuse to apply to a provider whose `auth.kind` is
+`claude_oauth` — a setting that cannot be correct is a setting that should not
+be offerable.
+
+That rule is enforced on the four levels that exist, not merely in the UI:
+`Provider::compact_refusal` is checked on the save path, so `POST
+/api/providers` answers 400 with the reason, and the UI shows the server's own
+words rather than keeping a second copy of the rule.
+
+## What must never change
+
+Verified on the body above, before and after:
+
+- **`tool_use` ↔ `tool_result` pairing.** 43 ids on each side, the sets
+  *identical* in both versions. Elision replaces content, never the block — a
+  dropped `tool_result` leaves its `tool_use` unanswered, which is a 400.
+- **The tail.** The 6 kept `thinking` blocks and the 9 kept `tool_result` blocks
+  are byte-identical to the originals.
+- **`system[]`, `tools[]`, `metadata`, `context_management`, `thinking`,
+  `output_config`.** All hash identical. The cache root and the tool schema are
+  not in the blast radius.
+
+The last one is not decoration: `tools[]` sits at the front of the cache prefix,
+and editing a schema can desync the `tool_use` arguments the model already
+emitted.
+
+And one whole request class is out of scope by construction: the **auto-mode
+permission classifier** is never compacted, whatever level the account is set
+to. Its transcript is *text inside one user turn*, not `tool_result` blocks, so
+today's pass would find nothing to elide — but that is a coincidence of the
+current elision target, and a pass must never be the thing that decides which
+part of a safety judgement the judge gets to read. See
+[`proxy-classifier.md`](proxy-classifier.md).
+
+## Where it hooks in
+
+In `shape_and_admit` ([`server.rs`](../crates/tab-atelier-proxy/src/server.rs)),
+after `routing::choose` has picked a destination and before `qos::estimate_cost`
+scores it — so the admission decision is made at the size that will actually be
+sent. The body has already been parsed once, to find `model` and to tell the
+conversation from the auto-mode classifier, and `shape_body` is where the parse
+is reused for both mutations rather than repeated.
+
+The policy itself lives in the proxy crate, in `src/compact.rs`, beside
+[`src/transcript_compact.rs`](../src/transcript_compact.rs) in the sense of
+being the same *idea* — that module implements layers equivalent to B and A
+(its `keep_thinking(K)` and `tool_cap(N)`) over the on-disk JSONL.
+
+They cannot share code, and it is worth being explicit about why, because the
+temptation is real. The input shapes differ (a stored transcript versus a
+request body), the operation differs (a byte cap on a tool output there,
+whole-block elision with a stub here), and the proxy does not depend on the
+desktop crate — doing so would drag a GUI toolkit into a server. What the two
+*do* share is the one invariant that must not drift: **a `tool_use` and its
+`tool_result` are a pair, and a dropped `tool_result` leaves its `tool_use`
+unanswered, which is a 400.**
+
+## The honest limits
+
+**Elided errors are not just bulk.** In the measured body a 454-byte `PreToolUse`
+hook error — *"use the Grep tool instead of shelling out to `grep`"* — was
+elided. It is older than the 6-turn window, so the model has moved past it, but
+it is the one elision class where the loss is semantic rather than size. The
+safe rule is to keep every `is_error: true` result regardless of age, at a cost
+of a few KB.
+
+**This is not context editing.** Anthropic's own `context_management.edits`
+(`clear_tool_uses_20250919`, `clear_thinking_20251015`) does the same clearing
+**server-side**, cache-aware, with the pairing rules enforced by the thing that
+defines them. Claude Code already sends
+`{"keep":"all","type":"clear_thinking_20251015"}` — it declares the mechanism and
+then tells it to keep everything. Tightening that edit is a one-field change
+with a fraction of the blast radius of rewriting the body, and it should be the
+first thing tried on a provider that honours it. This document describes the
+fallback for the providers that do not.
+
+**And it is not free of the cache argument even here.** Compact early and often
+and you re-warm a truncated prefix on every route change. The setting is
+per-account so that the decision stays with the person it is about, and the
+hop's objection is raised against whatever route their traffic actually takes.
+
+## See also
+
+- [Proxy-side tool policy](proxy-tools.md) — the same chokepoint and the same
+  per-account control applied to `tools[]`, which is 19 % of the request and
+  sits *ahead of* every breakpoint this document reasons about.
+- [The auto-mode permission classifier](proxy-classifier.md) — the one request
+  class this pass must never touch, and why.

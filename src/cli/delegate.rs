@@ -1,6 +1,4 @@
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// SPDX-License-Identifier: MPL-2.0
 
 //! `tab-atelier dispatch` — hand work from one tab to another.
 //!
@@ -23,13 +21,15 @@ use std::time::{Duration, Instant};
 
 use crate::cli::share_link::{Endpoint, agent, discover_endpoint, fetch_tabs, resolve};
 
+#[derive(Debug, PartialEq, Eq)]
 struct Opts {
     target: Option<String>, // --to <tab>
     new: bool,              // --new
     prompt: Option<String>,
-    name: Option<String>, // --new: rename the tab
-    cwd: Option<String>,  // --new: working dir
-    cmd: String,          // --new: launcher (default "claude")
+    name: Option<String>,            // --new: rename the tab
+    cwd: Option<String>,             // --new: working dir
+    cmd: String,                     // --new: launcher (default "claude")
+    permission_mode: Option<String>, // --new: claude --permission-mode <mode>
     wait: bool,
     quiet: u64,
     timeout: u64,
@@ -45,6 +45,7 @@ impl Default for Opts {
             name: None,
             cwd: None,
             cmd: "claude".into(),
+            permission_mode: None,
             wait: false,
             quiet: 8,
             timeout: 300,
@@ -71,16 +72,26 @@ fn usage() {
            --no-submit    type the prompt but don't press Enter\n  \
            --name <n>     (--new) name the new tab\n  \
            --cwd <d>      (--new) working directory\n  \
-           --cmd <c>      (--new) launcher, default \"claude\" (e.g. \"claude -p\")\n\n\
+           --cmd <c>      (--new) launcher, default \"claude\" (e.g. \"claude -p\")\n  \
+           --permission-mode <m>  (--new) pass `--permission-mode <m>` to claude, so a\n  \
+           \x20             fleet worker starts non-interactive (e.g. acceptEdits,\n  \
+           \x20             bypassPermissions) instead of stalling on the first take's gate\n\n\
          examples:\n  \
            tab-atelier dispatch --to m-invoice \"summarise the failing test and fix it\"\n  \
            tab-atelier dispatch --new --name worker --cwd ~/proj \"run the test suite\" --wait\n  \
+           tab-atelier dispatch --new --permission-mode acceptEdits --cwd ~/proj \"take a task\"\n  \
            tab-atelier dispatch --new --cmd \"claude -p\" \"what is 2+2\" --wait"
     );
 }
 
-#[must_use]
-pub fn run(args: &[String]) -> i32 {
+/// Pure arg parser + the two "did you ask for something coherent" checks, so
+/// the branch table is testable without a daemon. Returns the options and the
+/// prompt, or an exit code with the message already printed.
+///
+/// # Errors
+/// `Err(0)` on `-h`/`--help`, `Err(2)` on an unknown flag, on passing neither
+/// or both of `--to`/`--new`, or on a missing prompt.
+fn parse_opts(args: &[String]) -> Result<(Opts, String), i32> {
     let mut o = Opts::default();
     let mut i = 0;
     while i < args.len() {
@@ -99,6 +110,7 @@ pub fn run(args: &[String]) -> i32 {
                     o.cmd = c;
                 }
             }
+            "--permission-mode" => o.permission_mode = take(&mut i),
             "--wait" => o.wait = true,
             "--no-submit" => o.submit = false,
             "--quiet" => {
@@ -113,12 +125,12 @@ pub fn run(args: &[String]) -> i32 {
             }
             "-h" | "--help" => {
                 usage();
-                return 0;
+                return Err(0);
             }
             other if !other.starts_with('-') && o.prompt.is_none() => o.prompt = Some(other.to_owned()),
             other => {
                 eprintln!("dispatch: unexpected argument: {other}");
-                return 2;
+                return Err(2);
             }
         }
         i += 1;
@@ -126,11 +138,20 @@ pub fn run(args: &[String]) -> i32 {
 
     if o.new == o.target.is_some() {
         eprintln!("dispatch: pass exactly one of --to <tab> or --new (see --help)");
-        return 2;
+        return Err(2);
     }
     let Some(prompt) = o.prompt.clone() else {
         eprintln!("dispatch: a prompt is required (positional or --prompt)");
-        return 2;
+        return Err(2);
+    };
+    Ok((o, prompt))
+}
+
+#[must_use]
+pub fn run(args: &[String]) -> i32 {
+    let (o, prompt) = match parse_opts(args) {
+        Ok(v) => v,
+        Err(code) => return code,
     };
 
     let ep = match discover_endpoint() {
@@ -238,10 +259,7 @@ fn spawn_agent_tab(ep: &Endpoint, o: &Opts, prompt: &str) -> Result<String, Stri
         || "{}".to_string(),
         |c| format!("{{\"cwd\":{}}}", serde_json::Value::String(c.clone())),
     );
-    agent()
-        .post(format!("{}/tabs", ep.url))
-        .header("Authorization", format!("Bearer {}", ep.token))
-        .header("Content-Type", "application/json")
+    crate::cli::client::authed_post(ep, "/tabs")
         .send(body.as_bytes())
         .map_err(|e| format!("POST /tabs: {e}"))?;
 
@@ -264,19 +282,31 @@ fn spawn_agent_tab(ep: &Endpoint, o: &Opts, prompt: &str) -> Result<String, Stri
 
     if let Some(name) = &o.name {
         let (idx, _) = resolve(ep, &uuid).map_err(|e| format!("resolve new tab: {e}"))?;
-        let _ = agent()
-            .post(format!("{}/tabs/{idx}/rename", ep.url))
-            .header("Authorization", format!("Bearer {}", ep.token))
-            .header("Content-Type", "application/json")
+        let _ = crate::cli::client::authed_post(ep, &format!("/tabs/{idx}/rename"))
             .send(format!("{{\"name\":{}}}", serde_json::Value::String(name.clone())).as_bytes());
     }
 
     // Give the shell a moment to print its prompt, then launch the agent.
     std::thread::sleep(Duration::from_millis(1500));
-    let launch = format!("{} {}\r", o.cmd, shell_single_quote(prompt));
+    let launch = build_launch(&o.cmd, o.permission_mode.as_deref(), prompt);
     send_input(ep, &uuid, launch.as_bytes())?;
-    println!("→ launched: {} {}", o.cmd, shell_single_quote(prompt));
+    println!("→ launched: {}", launch.trim_end_matches('\r'));
     Ok(uuid)
+}
+
+/// Build the shell line typed into a fresh tab to launch the agent:
+/// `<cmd> [--permission-mode <mode>] '<prompt>'` followed by a submitting CR.
+///
+/// `--permission-mode` is threaded to the launcher verbatim — `claude` accepts
+/// it (as does `tab-atelier claude`, a pass-through) — so a fleet worker can
+/// start in a non-interactive mode (`acceptEdits`, `bypassPermissions`).
+/// Without it the worker starts in the default mode and stalls on the first
+/// `tab-atelier take`'s bash permission gate; this is the first-class mirror of
+/// what `spawn-bot.sh` does by hand (`claude --permission-mode …`). The mode
+/// is quoted, so it survives the shell as a single word.
+fn build_launch(cmd: &str, permission_mode: Option<&str>, prompt: &str) -> String {
+    let perm = permission_mode.map_or_else(String::new, |m| format!(" --permission-mode {}", shell_single_quote(m)));
+    format!("{cmd}{perm} {}\r", shell_single_quote(prompt))
 }
 
 /// Floor before the submitting Enter — always waited, so a small prompt keeps
@@ -347,9 +377,7 @@ fn send_input(ep: &Endpoint, uuid: &str, bytes: &[u8]) -> Result<(), String> {
 }
 
 fn read_output(ep: &Endpoint, uuid: &str) -> Result<String, String> {
-    agent()
-        .get(format!("{}/tabs/by-id/{uuid}/output", ep.url))
-        .header("Authorization", format!("Bearer {}", ep.token))
+    crate::cli::client::authed_get(ep, &format!("/tabs/by-id/{uuid}/output"))
         .call()
         .map_err(|e| format!("GET output for {uuid}: {e}"))?
         .body_mut()
@@ -366,6 +394,11 @@ fn read_output(ep: &Endpoint, uuid: &str) -> Result<String, String> {
 // `claude -p` during its API call) can read as idle early — for those,
 // use a `--quiet` longer than the silent period, or the default
 // streaming `claude`.
+/// Poll `uuid`'s screen until it stops changing for `quiet` seconds.
+///
+/// Returns `(screen, timed_out)` — the bool is **true when the deadline was
+/// hit**, not when the tab settled. Reading it the other way round is an easy
+/// mistake and reports a timeout as a clean finish.
 fn wait_for_idle(ep: &Endpoint, uuid: &str, quiet: u64, timeout: u64) -> Result<(String, bool), String> {
     let start = Instant::now();
     // Initial grace so we don't read "idle" before the agent even starts.
@@ -395,7 +428,97 @@ fn shell_single_quote(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{SUBMIT_DELAY_MAX, SUBMIT_DELAY_MIN, SUBMIT_SETTLE_POLL, SUBMIT_SETTLE_QUIET, shell_single_quote};
+    use super::{
+        SUBMIT_DELAY_MAX, SUBMIT_DELAY_MIN, SUBMIT_SETTLE_POLL, SUBMIT_SETTLE_QUIET, build_launch, parse_opts,
+        shell_single_quote,
+    };
+
+    fn args(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn parses_a_targeted_dispatch_with_its_defaults() {
+        let (o, prompt) = parse_opts(&args(&["--to", "3", "review this"])).expect("valid");
+        assert_eq!(o.target.as_deref(), Some("3"));
+        assert_eq!(prompt, "review this");
+        // Defaults that decide behaviour downstream: Enter is pressed, we
+        // don't wait, and `--new` would launch claude.
+        assert!(o.submit && !o.wait && !o.new);
+        assert_eq!((o.quiet, o.timeout, o.cmd.as_str()), (8, 300, "claude"));
+    }
+
+    #[test]
+    fn a_prompt_can_be_positional_or_flagged_and_only_the_first_wins() {
+        let (_, p) = parse_opts(&args(&["--to", "3", "--prompt", "flagged"])).expect("valid");
+        assert_eq!(p, "flagged");
+        // A second bare word is a mistake, not a silently-appended prompt —
+        // an unquoted multi-word prompt would otherwise dispatch its first
+        // word only.
+        assert_eq!(parse_opts(&args(&["--to", "3", "one", "two"])), Err(2));
+    }
+
+    #[test]
+    fn every_option_is_read_off_the_line() {
+        let (o, _) = parse_opts(&args(&[
+            "--new",
+            "--name",
+            "build",
+            "--cwd",
+            "/tmp",
+            "--cmd",
+            "claude -p",
+            "--wait",
+            "--no-submit",
+            "--quiet",
+            "3",
+            "--timeout",
+            "42",
+            "go",
+        ]))
+        .expect("valid");
+        assert!(o.new && o.wait && !o.submit);
+        assert_eq!(o.name.as_deref(), Some("build"));
+        assert_eq!(o.cwd.as_deref(), Some("/tmp"));
+        assert_eq!(o.cmd, "claude -p");
+        assert_eq!((o.quiet, o.timeout), (3, 42));
+        // A non-numeric --quiet/--timeout keeps the default rather than
+        // aborting: the dispatch still happens, just with sane waits.
+        let (o, _) = parse_opts(&args(&["--to", "1", "--quiet", "abc", "--timeout", "x", "go"])).expect("valid");
+        assert_eq!((o.quiet, o.timeout), (8, 300));
+    }
+
+    #[test]
+    fn target_and_prompt_are_both_required() {
+        // Exactly one destination: neither is a no-op, both is ambiguous.
+        assert_eq!(parse_opts(&args(&["go"])), Err(2));
+        assert_eq!(parse_opts(&args(&["--to", "3", "--new", "go"])), Err(2));
+        // A destination with nothing to say would type an empty line into
+        // someone else's agent.
+        assert_eq!(parse_opts(&args(&["--to", "3"])), Err(2));
+        assert_eq!(parse_opts(&args(&["--new"])), Err(2));
+        assert_eq!(parse_opts(&args(&["--to", "3", "--nope", "go"])), Err(2));
+        assert_eq!(parse_opts(&args(&["--help"])), Err(0));
+    }
+
+    #[test]
+    fn permission_mode_threads_through_to_the_launch_line() {
+        // The flag is parsed off the `--new` line…
+        let (o, _) = parse_opts(&args(&["--new", "--permission-mode", "acceptEdits", "take a task"])).expect("valid");
+        assert_eq!(o.permission_mode.as_deref(), Some("acceptEdits"));
+        // …and lands in the launcher invocation as `--permission-mode <mode>`
+        // BEFORE the positional prompt — this is what stops a fleet worker
+        // stalling on the first `take`'s bash gate. Without it, the launch is
+        // just `<cmd> '<prompt>'` and the mode defaults to interactive.
+        let with = build_launch("claude", Some("acceptEdits"), "take a task");
+        assert_eq!(with, "claude --permission-mode 'acceptEdits' 'take a task'\r");
+        let without = build_launch("claude", None, "take a task");
+        assert_eq!(without, "claude 'take a task'\r");
+        // The mode is a single shell word even if an attacker-ish value tries
+        // to break out — it can never inject a second command.
+        let evil = build_launch("claude", Some("x; rm -rf /"), "go");
+        assert_eq!(evil, "claude --permission-mode 'x; rm -rf /' 'go'\r");
+    }
 
     #[test]
     fn single_quotes_are_escaped() {
@@ -417,5 +540,85 @@ mod tests {
         // Polling coarser than the settle window would risk missing an
         // intermediate change and declaring "settled" too early.
         assert!(SUBMIT_SETTLE_POLL <= SUBMIT_SETTLE_QUIET);
+    }
+
+    /// Everything below runs against the harness server `share_link` spawns:
+    /// two tabs, `tab-a` (shell, with output) and `tab-b` (build).
+    fn with_server<T>(body: impl FnOnce() -> T) -> T {
+        crate::cli::share_link::with_test_server(|_| body())
+    }
+
+    #[test]
+    fn a_target_resolves_by_name_index_or_uuid() {
+        with_server(|| {
+            let ep = crate::cli::share_link::discover_endpoint().expect("test endpoint");
+            // Three ways to name the same tab; an orchestrator uses whichever
+            // it happens to hold.
+            let by_name = super::resolve_target(&ep, "tab-a").expect("by name");
+            let by_index = super::resolve_target(&ep, "0").expect("by index");
+            assert_eq!(by_name, by_index, "name and index must resolve to one tab");
+            assert_eq!(super::resolve_target(&ep, &by_name).expect("by uuid"), by_name);
+            // A miss is an error rather than a silent default — dispatching to
+            // the wrong tab types a stranger's prompt into someone's session.
+            assert!(super::resolve_target(&ep, "no-such-tab").is_err());
+            assert!(super::resolve_target(&ep, "999").is_err());
+        });
+    }
+
+    #[test]
+    fn input_and_output_round_trip_through_the_api() {
+        with_server(|| {
+            let ep = crate::cli::share_link::discover_endpoint().expect("test endpoint");
+            let uuid = super::resolve_target(&ep, "tab-a").expect("resolve");
+            // The harness tab starts with known output; reading it back is how
+            // `--wait` decides an agent has gone quiet.
+            let out = super::read_output(&ep, &uuid).expect("read output");
+            assert!(out.contains("foo bar baz"), "{out}");
+            // Sending input must not error even though the harness has no PTY
+            // behind the tab — the CLI's job ends at the API.
+            super::send_input(&ep, &uuid, b"echo hi\n").expect("send input");
+            assert!(super::read_output(&ep, "nope-not-a-uuid").is_err());
+        });
+    }
+
+    #[test]
+    fn waiting_for_idle_gives_up_at_the_timeout() {
+        with_server(|| {
+            let ep = crate::cli::share_link::discover_endpoint().expect("test endpoint");
+            let uuid = super::resolve_target(&ep, "tab-a").expect("resolve");
+            // The bool is `timed_out`, NOT `settled` — the harness output never
+            // changes, so one quiet window ends the wait cleanly and the flag
+            // must stay false.
+            let (screen, timed_out) = super::wait_for_idle(&ep, &uuid, 1, 20).expect("wait");
+            assert!(!timed_out, "unchanging output should settle, not time out");
+            assert!(screen.contains("foo bar baz"), "{screen}");
+            // A quiet window longer than the timeout can never be satisfied, so
+            // the deadline wins and the flag must say so — reporting a timeout
+            // as a clean finish is how a caller mistakes a hung agent for a
+            // finished one.
+            let (_, timed_out) = super::wait_for_idle(&ep, &uuid, 60, 3).expect("wait");
+            assert!(timed_out, "a deadline hit must be reported as a timeout");
+        });
+    }
+
+    #[test]
+    fn run_requires_a_target_and_a_prompt() {
+        with_server(|| {
+            // Neither --to nor --new: refuse rather than guess a target.
+            assert_eq!(super::run(&args(&["hello"])), 2);
+            // A target with no prompt would type an empty line into a session.
+            assert_eq!(super::run(&args(&["--to", "tab-a"])), 2);
+            // Unknown tab: exit non-zero, having typed nothing anywhere.
+            assert_ne!(super::run(&args(&["--to", "ghost", "hello"])), 0);
+        });
+    }
+
+    #[test]
+    fn dispatch_types_the_prompt_into_the_named_tab() {
+        with_server(|| {
+            // --no-submit types without pressing Enter, which is the safe form
+            // to assert on: nothing runs, but the text has to arrive.
+            assert_eq!(super::run(&args(&["--to", "tab-a", "--no-submit", "hello there"])), 0);
+        });
     }
 }
