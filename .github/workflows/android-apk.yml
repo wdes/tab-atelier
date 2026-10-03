@@ -55,6 +55,15 @@ jobs:
         # -> android-app must permit "android-app".
         environment: android-app
         if: ${{ needs.changes.outputs.build == 'true' && !contains(github.event.head_commit.message, '[skip apk]') }}
+        # The runner image's SDK location, stated explicitly because the NDK
+        # cache below names a path that does not exist until the NDK is
+        # installed. If ANDROID_HOME resolved to nothing the cache would silently
+        # save and restore the wrong directory. setup-android uses this same path
+        # by default, and build-apk.sh keeps it (its own default only applies
+        # when the variable is unset).
+        env:
+            ANDROID_HOME: /usr/local/lib/android/sdk
+            ANDROID_NDK_VERSION: "26.1.10909125"
         steps:
             # recursive: upstream ConnectBot is a submodule, pinned to the
             # commit this branch records. It is public, so no credentials.
@@ -62,33 +71,53 @@ jobs:
               with:
                   submodules: recursive
 
-            - uses: actions/setup-java@v4
+            - uses: actions/setup-java@v6
               with:
                   distribution: temurin
                   java-version: '21'
 
-            # The action's default package list is "tools platform-tools", and
-            # the standalone "tools" package no longer exists in the SDK
-            # repository: sdkmanager exits 1 with "Failed to find package
-            # 'tools'", which fails the job before the build even starts. Ask for
-            # platform-tools only; the next step installs the platform and NDK.
-            - uses: android-actions/setup-android@v3
+            # v4, not v3: the action's default package list used to include
+            # "tools", a package the SDK repository no longer publishes, so v3
+            # died with "Failed to find package 'tools'" before the build began.
+            # v4.0.2 fixed that upstream; asking only for what we need is still
+            # quicker, and the platform and NDK come from the step below.
+            - uses: android-actions/setup-android@v4
               with:
                   packages: platform-tools
 
-            # compileSdk is 37, and its platform package is "android-37.0" —
-            # there is no plain "platforms;android-37". The overlay pins NDK
-            # 26.1.10909125 because the app still compiles mosh's JNI.
+            # The NDK is the slow part of this job: about 1 GB, and the runner
+            # image ships 27.3.13750724, 28.2.13676358 and 29.0.14206865 but not
+            # the 26.1.10909125 the overlay pins. Cache it on the version, so it
+            # is fetched once and the sdkmanager call below becomes a no-op.
+            # This whole step goes away with the SSH strip: compiling mosh's JNI
+            # is the only reason this app needs an NDK at all.
+            - name: Restore the NDK
+              id: ndk-cache
+              uses: actions/cache/restore@v6
+              with:
+                  path: ${{ env.ANDROID_HOME }}/ndk/${{ env.ANDROID_NDK_VERSION }}
+                  key: android-ndk-${{ env.ANDROID_NDK_VERSION }}-${{ runner.os }}
+
+            # compileSdk is 37 and its platform package is "android-37.0" — there
+            # is no plain "platforms;android-37". The platform is already on the
+            # runner image, so in practice only the NDK is installed here.
             - name: Install SDK platform and NDK
               run: |
                   yes | sdkmanager --licenses > /dev/null 2>&1 || true
-                  sdkmanager "platforms;android-37.0" "ndk;26.1.10909125"
+                  sdkmanager "platforms;android-37.0" "ndk;${ANDROID_NDK_VERSION}"
                   # Breadcrumbs, not assertions: if something did not land the
                   # build says so with a real error rather than a bare test.
                   echo "platforms: $(ls "$ANDROID_HOME/platforms" | tr '\n' ' ')"
                   echo "ndk: $(ls "$ANDROID_HOME/ndk" | tr '\n' ' ')"
 
-            - uses: gradle/actions/setup-gradle@v4
+            - name: Save the NDK
+              if: steps.ndk-cache.outputs.cache-hit != 'true'
+              uses: actions/cache/save@v6
+              with:
+                  path: ${{ env.ANDROID_HOME }}/ndk/${{ env.ANDROID_NDK_VERSION }}
+                  key: android-ndk-${{ env.ANDROID_NDK_VERSION }}-${{ runner.os }}
+
+            - uses: gradle/actions/setup-gradle@v6
 
             # Both secrets come from the android-app environment, the same one
             # main's Android workflow uses. Both are required and neither has a
