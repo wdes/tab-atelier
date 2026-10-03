@@ -59,12 +59,24 @@ the strings a user sees, and the files the product actually needs to differ.
 - `ndkVersion` pinned to an installed NDK. Upstream wants 28.2.13676358. The
   only native code in the app is mosh and the local-shell `exec`, both of which
   the SSH strip removes; until then the pin lets the build run without it.
+- `BuildConfig.BUILD_COMMIT` from `-PbuildCommit`, defaulting to `"unknown"`.
+  `scripts/build-apk.sh` passes it — CI the short SHA it computed for the APK
+  filename, a local build `git rev-parse --short HEAD` — so the About screen
+  names the commit the installed APK was built from.
 
 ### 0002 — identity strings
 
 `app_name`, `app_desc` and the help/report links. Upstream's strings name their
 project and point at connectbot.org; ours must not (§6). `app_copyright` keeps
 Kenny Root's notice and adds ours beside it, rather than replacing it.
+
+### 0003 — About: credit and build commit
+
+`HelpScreen.kt`'s About section. It shows `ConnectBot & Tab-Atelier`, naming
+upstream and this fork on one line, and the build's commit under the version
+(`Version <name>` / `Commit <sha>`). Both are literals rather than resources on
+purpose: they are the same in every locale, and a translated commit hash would
+be a defect.
 
 ## What is deliberately *not* here yet
 

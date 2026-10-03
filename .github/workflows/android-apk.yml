@@ -175,10 +175,15 @@ jobs:
               # variable names, so nothing lands in the working tree.
               # ANDROID_KEYSTORE_ALIAS is optional; build-apk.sh defaults to
               # "ta-remote".
+              # APP_BUILD_COMMIT is the short SHA compute-version already put in
+              # SHA (8 characters). It becomes BuildConfig.BUILD_COMMIT, which
+              # the Help screen's About section shows next to the version, so an
+              # installed APK names the commit it was built from.
               env:
                   ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
                   ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
                   ANDROID_KEYSTORE_ALIAS: ${{ secrets.ANDROID_KEYSTORE_ALIAS }}
+                  APP_BUILD_COMMIT: ${{ env.SHA }}
               run: |
                   APP_VERSION_CODE="$CODE" APP_VERSION_NAME="$NAME" scripts/build-apk.sh
                   src=connectbot/app/build/outputs/apk/oss/release/app-oss-release.apk

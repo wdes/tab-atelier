@@ -81,6 +81,12 @@ fi
 [[ -n "${APP_VERSION_CODE:-}" ]] && args+=("-PappVersionCode=$APP_VERSION_CODE")
 [[ -n "${APP_VERSION_NAME:-}" ]] && args+=("-PappVersionName=$APP_VERSION_NAME")
 
+# The commit the APK was built from, shown on the About screen. CI passes the
+# short SHA it already computed; a local build names the commit it is building,
+# so the About screen of a hand-built APK is not a different kind of "unknown".
+APP_BUILD_COMMIT="${APP_BUILD_COMMIT:-$(git -C "$root" rev-parse --short HEAD 2>/dev/null || true)}"
+[[ -n "$APP_BUILD_COMMIT" ]] && args+=("-PbuildCommit=$APP_BUILD_COMMIT")
+
 cd "$upstream"
 ./gradlew --no-daemon -Dorg.gradle.jvmargs="-Xmx2g -XX:MaxMetaspaceSize=1g" \
     "$task" "${args[@]}"

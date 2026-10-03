@@ -1,0 +1,36 @@
+diff --git a/app/src/main/java/org/connectbot/ui/screens/help/HelpScreen.kt b/app/src/main/java/org/connectbot/ui/screens/help/HelpScreen.kt
+index d29c1f26..8353ffd8 100644
+--- a/app/src/main/java/org/connectbot/ui/screens/help/HelpScreen.kt
++++ b/app/src/main/java/org/connectbot/ui/screens/help/HelpScreen.kt
+@@ -109,6 +109,17 @@ fun HelpScreen(
+                         text = "Version ${BuildConfig.VERSION_NAME}",
+                         style = MaterialTheme.typography.bodyMedium,
+                         color = MaterialTheme.colorScheme.onSurfaceVariant,
++                        modifier = Modifier.padding(bottom = 8.dp),
++                    )
++                    // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)):
++                    // the commit the APK was built from, so a bug report names
++                    // the exact build. See overlay/README.md. BUILD_COMMIT comes
++                    // from -PbuildCommit (Build the signed release APK in CI),
++                    // and reads "unknown" for a build that did not pass one.
++                    Text(
++                        text = "Commit ${BuildConfig.BUILD_COMMIT}",
++                        style = MaterialTheme.typography.bodyMedium,
++                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                         modifier = Modifier.padding(bottom = 24.dp),
+                     )
+                 }
+@@ -181,6 +192,13 @@ fun HelpScreen(
+                     style = MaterialTheme.typography.bodyMedium,
+                     modifier = Modifier.padding(bottom = 16.dp),
+                 )
++                // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)):
++                // credit both projects on one line. See overlay/README.md.
++                Text(
++                    text = "ConnectBot & Tab-Atelier",
++                    style = MaterialTheme.typography.bodyMedium,
++                    modifier = Modifier.padding(bottom = 8.dp),
++                )
+                 Text(
+                     text = stringResource(R.string.app_copyright),
+                     style = MaterialTheme.typography.bodySmall,
