@@ -1,0 +1,34 @@
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA512
+
+Architectures: amd64
+Codename: nightly
+Components: main
+Date: Sat, 03 Oct 2026 09:42:27 +0000
+Description: tab-atelier nightly channel
+Label: tab-atelier
+Origin: tab-atelier
+Suite: nightly
+MD5Sum:
+ b0f49f3e822f13e8a87363ac56b277dd              189 Release
+ 7bbbc1a51142f6f81ba16cd1d8de68d7            47771 main/binary-amd64/Packages
+ b9a0d19b84356ff998e941b57570cea6            10066 main/binary-amd64/Packages.gz
+SHA1:
+ 33508b2e9cbe79e0815667f29c1b96d4368750de              189 Release
+ f61d289ccf5698520ddae47ec0dd1887befb0589            47771 main/binary-amd64/Packages
+ 1592d4471f4517cc13152f0ac76f65a02c75d94d            10066 main/binary-amd64/Packages.gz
+SHA256:
+ 30e7c582450a73ce9143ac9175fea8efc2e0d1892854fbcff9ebdc42589d1daf              189 Release
+ 2f9c5ef654b2e4a8a8aaa38d109cde135bcfd19e5151bad1eb9d624119b68370            47771 main/binary-amd64/Packages
+ 1b54ad6238d4ac998f3edca05beeccd6e28dd7f64d9daf611a53306e8271e402            10066 main/binary-amd64/Packages.gz
+SHA512:
+ 1c250a439d3fbac059651f5a71d8b15040566e6da6aec4e87c38970905842fa33aaff8ff2cce8ea32ed1a9f988dc034db16fa67758da3108e600016fd7376308              189 Release
+ 4406b722615aaa500952c1cdd79b507651a78924e7bf86596bec1c64b8158a9402f979f61009b0f3a01b21e5394501692dae39695fd26fa7d6c3f453676d89ba            47771 main/binary-amd64/Packages
+ b8f931808979f4a00db42c9b95eeb068ecdcea0421b4c6da631cb5cee096d78bedc231a19e5a371e8a08907b5c96b0a5265a179a2acae5d6f33c076bbbd39aa3            10066 main/binary-amd64/Packages.gz
+-----BEGIN PGP SIGNATURE-----
+
+iHUEARYKAB0WIQSPsuszZUSCzHA3AUn+9Q7Wwd5HEQUCasDOAwAKCRD+9Q7Wwd5H
+EWpjAP4u50cQ2aHBx4DdzjbWLqskAs75CiZZrdn7EKTY9NR7PAEAtu16Bs75GoMb
++r1xI64e3cSmqZBXLOXy8GyuB1MMXQI=
+=WfdD
+-----END PGP SIGNATURE-----
