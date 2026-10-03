@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 // Harness control panel. Slice S3. See docs/dashboard.md.
 // Polls GET /dashboard/state every ~1.5s and renders the phase diagram.
 // ES module: the pure functions are exported so assets/dashboard.test.mjs can
