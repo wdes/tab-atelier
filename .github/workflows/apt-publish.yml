@@ -34,6 +34,16 @@ permissions:
     contents: write
     actions: read # download the latest windows-msi artifact for /windows/
 
+# gh-pages has two writers: this workflow, and android-apk on the android-app
+# branch (which serves /android/). Both rebuild the branch from a fresh clone
+# of it, so if they overlapped, whichever pushed second would do so from a tree
+# that does not contain the first one's change and would revert it. This group
+# is shared with android-apk.yml deliberately — same name means GitHub runs
+# them one at a time across both workflows.
+concurrency:
+    group: gh-pages
+    cancel-in-progress: false
+
 env:
     RUST_VERSION: "1.95.0"
 
