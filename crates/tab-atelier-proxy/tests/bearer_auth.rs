@@ -114,29 +114,47 @@ impl Proxy {
     /// before the server comes up — the CLI writes the same files the server
     /// reads, so arranging state means running the CLI first.
     fn start_with(scratch: Scratch) -> Self {
-        let port = free_port();
         let token = cli(scratch.path(), &["admin-token"]).trim().to_owned();
         assert!(token.starts_with("tap_"), "unexpected token: {token}");
 
-        let child = Command::new(BIN)
-            .args(["serve", "--listen", &format!("127.0.0.1:{port}")])
-            .env("TAB_ATELIER_PROXY_CONFIG", scratch.path().join("config"))
-            .env("TAB_ATELIER_PROXY_STATE", scratch.path().join("state"))
-            .env("HOME", scratch.path().join("home"))
-            // The repository's own assets, so `/` serves a real page rather than
-            // whatever the installed package happens to hold.
-            .env(
-                "TAB_ATELIER_PROXY_WEB",
-                Path::new(env!("CARGO_MANIFEST_DIR")).join("assets"),
-            )
-            .env("RUST_LOG", "warn")
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn the proxy");
+        // A port is picked, then released, then handed to the child — and any
+        // test running in parallel can take it in that window, which is a
+        // `free_port` race and not a defect in the proxy. It shows up as the
+        // child exiting before it listens, so the failure is visible and the
+        // only sane response is another port. Three attempts: a port lost three
+        // times in a row means something other than scheduling, and the real
+        // diagnostics are more useful than a fourth try.
+        let mut attempt = 0;
+        let (port, child) = loop {
+            attempt += 1;
+            let port = free_port();
+            let child = Command::new(BIN)
+                .args(["serve", "--listen", &format!("127.0.0.1:{port}")])
+                .env("TAB_ATELIER_PROXY_CONFIG", scratch.path().join("config"))
+                .env("TAB_ATELIER_PROXY_STATE", scratch.path().join("state"))
+                .env("HOME", scratch.path().join("home"))
+                // The repository's own assets, so `/` serves a real page rather than
+                // whatever the installed package happens to hold.
+                .env(
+                    "TAB_ATELIER_PROXY_WEB",
+                    Path::new(env!("CARGO_MANIFEST_DIR")).join("assets"),
+                )
+                .env("RUST_LOG", "warn")
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn the proxy");
 
-        let mut child = Serving(child);
-        wait_until_listening(port, &mut child.0);
+            let mut child = Serving(child);
+            match wait_until_listening(port, &mut child.0) {
+                Ok(()) => break (port, child),
+                Err(why) if attempt < 3 => {
+                    eprintln!("attempt {attempt} on port {port} lost: {why}; retrying");
+                }
+                Err(why) => panic!("the proxy never came up in {attempt} attempts: {why}"),
+            }
+        };
+
         Self {
             scratch,
             child,
@@ -146,22 +164,29 @@ impl Proxy {
     }
 }
 
-/// Block until the port answers, or the server dies trying.
-fn wait_until_listening(port: u16, child: &mut Child) {
+/// Block until the port answers.
+///
+/// Returns the reason it did not, rather than panicking, so a caller can pick
+/// another port and try again — see [`Proxy::start_with`] for why it must.
+fn wait_until_listening(port: u16, child: &mut Child) -> Result<(), String> {
     for _ in 0..200 {
-        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return;
-        }
+        // The child's death is checked first, and the order matters: `connect`
+        // succeeds against any socket bound to the port, including one belonging
+        // to another test. Asking whether our child is alive is the only question
+        // whose answer is unambiguous.
         if let Ok(Some(status)) = child.try_wait() {
             let mut err = String::new();
             if let Some(mut e) = child.stderr.take() {
                 let _ = e.read_to_string(&mut err);
             }
-            panic!("the proxy exited ({status}) before listening: {err}");
+            return Err(format!("exited ({status}) before listening: {err}"));
+        }
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            return Ok(());
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    panic!("the proxy never listened on {port}");
+    Err(format!("never listened on {port}"))
 }
 
 /// One request, as raw bytes, with an explicit `Connection: close`.
