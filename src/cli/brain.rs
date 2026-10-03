@@ -1,6 +1,4 @@
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// SPDX-License-Identifier: MPL-2.0
 
 //! ⛑ brain — a "rescue tab" that watches every running tab for
 //! known agent-failure signatures and auto-sends remediation
@@ -223,12 +221,20 @@ pub const PATTERNS: &[Pattern] = &[
         label: "connection-closed-mid-response",
         action: "continue\r",
     },
-    // Auto-mode model-routing classifier briefly unavailable
-    // (Anthropic-side dependency that decides which model to use
-    // for the next turn). Shape Claude Code prints:
+    // The auto-mode permission classifier could not return a verdict, so
+    // auto mode will not gate the next action. Shape Claude Code prints:
     //   "<model> is temporarily unavailable, so auto mode cannot
     //    determine the safety of Bash right now. Wait briefly …"
-    // Recovery is identical to the other transient outages.
+    //
+    // The message reads as an upstream outage and the recovery is the same
+    // as for one, but the cause is NOT necessarily Anthropic-side — this is
+    // a separate Messages call per gated action, and through the relay it
+    // can fail for reasons the conversation never sees (a credential for
+    // whoever it was routed to, a 429 there, a proxy hop that dropped it).
+    // So when this fires under tab-atelier, check the proxy before the
+    // vendor: the reply is one parsed tag, and anything that stops it
+    // arriving looks identical from here. See the classifier module in
+    // tab-atelier-proxy for what that call is and why it is treated apart.
     Pattern {
         needle: "auto mode cannot determine the safety",
         label: "auto-mode-classifier-down",
@@ -299,6 +305,13 @@ struct TabInfo {
     /// currently in a session doesn't get auto-`continue`ed.
     #[serde(default)]
     agent_session_id: Option<String>,
+    /// CRC-32 of the tab's current output, served on `/tabs`. When it matches
+    /// what we saw last tick the screen has not moved, so there is nothing to
+    /// re-read — the whole point of a watchdog that mostly watches idle
+    /// screens. `None` from a daemon too old to send it, which then falls back
+    /// to fetching every tab.
+    #[serde(default)]
+    output_crc: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -367,6 +380,11 @@ struct TabWatch {
     next_nudge_at: Option<Instant>,
     /// Error label of the last nudge; a different label resets the streak.
     last_label: Option<&'static str>,
+    /// `/tabs` output CRC at the last fetch, and the tail it corresponds to.
+    /// While the CRC is unchanged the screen is byte-identical, so the tail is
+    /// still accurate and no HTTP is needed to know it.
+    cached_crc: Option<u32>,
+    cached_tail: String,
 }
 
 impl TabWatch {
@@ -381,7 +399,41 @@ impl TabWatch {
             nudge_streak: 0,
             next_nudge_at: None,
             last_label: None,
+            cached_crc: None,
+            cached_tail: String::new(),
         }
+    }
+}
+
+/// The trailing window brain actually reads, on a char boundary.
+///
+/// Cached and hashed in this form so the stability check compares like with
+/// like: feeding the full grid on a fetch and the tail on a cache hit would
+/// change the hash every other tick and no screen would ever look frozen.
+#[must_use]
+fn tail_of(text: &str) -> String {
+    if text.len() <= SCOPE_TAIL_BYTES {
+        return text.to_string();
+    }
+    let mut start = text.len() - SCOPE_TAIL_BYTES;
+    while start > 0 && !text.is_char_boundary(start) {
+        start -= 1;
+    }
+    text[start..].to_string()
+}
+
+/// Must this tab's `/output` be fetched this tick?
+///
+/// Only when the screen moved (CRC differs), when we have nothing cached, or
+/// when the daemon doesn't report a CRC at all. Everything else is answered
+/// from the cache, which is the common case: a fleet of idle agent tabs used
+/// to cost one full grid transfer each, every tick, to learn that nothing had
+/// happened.
+#[must_use]
+const fn needs_output(listed_crc: Option<u32>, cached_crc: Option<u32>, has_cached: bool) -> bool {
+    match (listed_crc, cached_crc) {
+        (Some(listed), Some(cached)) => listed != cached || !has_cached,
+        _ => true,
     }
 }
 
@@ -626,25 +678,35 @@ impl Brain {
         for idx in scan_order(claude.len(), self.scan_cursor) {
             let tab = &claude[idx];
             scanned += 1;
-            let output = match ag
-                .get(format!("{}/tabs/by-id/{}/output", ep.url, tab.id))
-                .header("Authorization", &auth)
-                .call()
-                .map_err(|e| format!("GET output for {}: {e}", tab.id))
-                .and_then(|mut r| {
-                    r.body_mut()
-                        .read_to_string()
-                        .map_err(|e| format!("read output for {}: {e}", tab.id))
-                }) {
-                Ok(o) => o,
-                // One tab closing mid-tick must not strand every tab after it.
-                Err(e) => {
-                    eprintln!("⛑ brain: {e}");
-                    continue;
-                }
-            };
-
             let watch = self.watches.entry(tab.id.clone()).or_insert_with(|| TabWatch::new(now));
+            // The listing already said whether this screen moved. When it
+            // didn't, the cached tail is still byte-accurate and no request is
+            // needed — with dozens of mostly-idle agent tabs that turns a
+            // full-grid transfer per tab per tick into nothing at all.
+            if needs_output(tab.output_crc, watch.cached_crc, !watch.cached_tail.is_empty()) {
+                let fetched = ag
+                    .get(format!("{}/tabs/by-id/{}/output", ep.url, tab.id))
+                    .header("Authorization", &auth)
+                    .call()
+                    .map_err(|e| format!("GET output for {}: {e}", tab.id))
+                    .and_then(|mut r| {
+                        r.body_mut()
+                            .read_to_string()
+                            .map_err(|e| format!("read output for {}: {e}", tab.id))
+                    });
+                match fetched {
+                    Ok(o) => {
+                        watch.cached_tail = tail_of(&o);
+                        watch.cached_crc = tab.output_crc;
+                    }
+                    // One tab closing mid-tick must not strand every tab after it.
+                    Err(e) => {
+                        eprintln!("⛑ brain: {e}");
+                        continue;
+                    }
+                }
+            }
+            let output = watch.cached_tail.clone();
             if let Some(trigger) = evaluate_tab(watch, &output, tab.agent_state.as_deref(), now) {
                 eligible.push(Eligible {
                     tab_id: tab.id.clone(),
@@ -767,59 +829,74 @@ fn crash_log(msg: &str) {
     }
 }
 
+/// `tab-atelier brain [--once] [--interval SECS]`
+///
+/// The long help is built at runtime because it quotes the tuning constants;
+/// a hand-written copy would drift from them the first time one changed.
+#[derive(clap::Parser, Debug)]
+#[command(
+    name = "tab-atelier brain",
+    about = "Watch Claude tabs for known failure signatures and nudge them"
+)]
+struct Cli {
+    /// One tick, then exit.
+    #[arg(long)]
+    once: bool,
+    /// Seconds between ticks.
+    #[arg(long, value_name = "SECS", default_value_t = DEFAULT_INTERVAL_SECS, value_parser = clap::value_parser!(u64).range(1..))]
+    interval: u64,
+}
+
+/// What `--help` explains beyond the one-line summary.
+fn long_help() -> String {
+    format!(
+        "Watches every Claude tab for known agent-failure signatures and\n\
+         sends `continue\\r` to the matching tab. A tab is nudged only when\n\
+         its screen has been FROZEN for {STABLE_SECS}s (so an actively-working\n\
+         or auto-retrying agent — whose output is still moving — is never\n\
+         interrupted), and only ONCE per frozen screen (re-nudges wait for\n\
+         the output to change first).\n\
+         Patterns: {n} known signatures (Anthropic API connectivity).\n\
+         Connectivity probe (Google generate_204 + Cloudflare 1.1.1.1) gates\n\
+         every send; offline → suppress, retry on next tick when back online.\n\
+         Round-robin: at most one send per tick across all eligible tabs.\n\
+         Repeat nudges for the SAME error back off exponentially, {b}s → {m}s.\n\
+         When more than {t} eligible tabs are stuck on an Anthropic capacity\n\
+         error (529 / 503 / 5xx / rate-limited) the fleet is capped upstream,\n\
+         so sends drop to one every {c}s until it recovers — spaced, never\n\
+         silent. Each tick scans for at most {budget}s and resumes where it\n\
+         stopped, so a large fleet can't outrun the poll interval.",
+        n = PATTERNS.len(),
+        b = NUDGE_BACKOFF_BASE_SECS,
+        m = NUDGE_BACKOFF_MAX_SECS,
+        t = CIRCUIT_BREAKER_THRESHOLD,
+        c = CIRCUIT_BREAKER_COOLDOWN.as_secs(),
+        budget = TICK_BUDGET.as_secs(),
+    )
+}
+
 #[must_use]
 pub fn run(args: &[String]) -> i32 {
-    let mut once = false;
-    let mut interval = DEFAULT_INTERVAL_SECS;
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--once" => once = true,
-            "--interval" => {
-                i += 1;
-                match args.get(i).and_then(|v| v.parse::<u64>().ok()) {
-                    Some(n) if n >= 1 => interval = n,
-                    _ => {
-                        eprintln!("brain: --interval expects a number >= 1");
-                        return 2;
-                    }
-                }
-            }
-            "-h" | "--help" => {
-                eprintln!(
-                    "usage: tab-atelier-headless brain [--once] [--interval SECS]\n\
-                     Watches every Claude tab for known agent-failure signatures and\n\
-                     sends `continue\\r` to the matching tab. A tab is nudged only when\n\
-                     its screen has been FROZEN for {STABLE_SECS}s (so an actively-working\n\
-                     or auto-retrying agent — whose output is still moving — is never\n\
-                     interrupted), and only ONCE per frozen screen (re-nudges wait for\n\
-                     the output to change first).\n\
-                     Patterns: {n} known signatures (Anthropic API connectivity).\n\
-                     Connectivity probe (Google generate_204 + Cloudflare 1.1.1.1) gates\n\
-                     every send; offline → suppress, retry on next tick when back online.\n\
-                     Round-robin: at most one send per tick across all eligible tabs.\n\
-                     Repeat nudges for the SAME error back off exponentially, {b}s → {m}s.\n\
-                     When more than {t} eligible tabs are stuck on an Anthropic capacity\n\
-                     error (529 / 503 / 5xx / rate-limited) the fleet is capped upstream,\n\
-                     so sends drop to one every {c}s until it recovers — spaced, never\n\
-                     silent. Each tick scans for at most {budget}s and resumes where it\n\
-                     stopped, so a large fleet can't outrun the poll interval.",
-                    n = PATTERNS.len(),
-                    b = NUDGE_BACKOFF_BASE_SECS,
-                    m = NUDGE_BACKOFF_MAX_SECS,
-                    t = CIRCUIT_BREAKER_THRESHOLD,
-                    c = CIRCUIT_BREAKER_COOLDOWN.as_secs(),
-                    budget = TICK_BUDGET.as_secs(),
-                );
-                return 0;
-            }
-            other => {
-                eprintln!("brain: unknown argument: {other}");
+    let cmd = <Cli as clap::CommandFactory>::command().long_about(long_help());
+    let argv = std::iter::once("tab-atelier brain".to_owned()).chain(args.iter().cloned());
+    let cli = match cmd.try_get_matches_from(argv) {
+        Ok(m) => match <Cli as clap::FromArgMatches>::from_arg_matches(&m) {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = e.print();
                 return 2;
             }
+        },
+        Err(e) => {
+            let help = matches!(
+                e.kind(),
+                clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+            );
+            let _ = e.print();
+            return i32::from(!help) * 2;
         }
-        i += 1;
-    }
+    };
+    let Cli { once, interval } = cli;
 
     // Name the tab so the share-link viewer's <title> and any /tabs
     // consumer see the right label. OSC 2 = window title.
@@ -1186,6 +1263,74 @@ mod tests {
     }
 
     #[test]
+    fn an_unchanged_screen_costs_no_request() {
+        // The point of the /tabs CRC: brain watches dozens of tabs that are,
+        // by definition, mostly not moving. Re-reading every grid each tick to
+        // learn that was ~1.4 MiB per sweep on a 63-tab fleet.
+        assert!(needs_output(Some(7), None, false), "nothing cached yet → fetch");
+        assert!(needs_output(Some(7), Some(9), true), "screen moved → fetch");
+        assert!(!needs_output(Some(7), Some(7), true), "unchanged → cache answers it");
+        // A cached CRC with no cached text is a torn state, not a hit.
+        assert!(needs_output(Some(7), Some(7), false));
+        // A daemon too old to report a CRC falls back to always fetching,
+        // which is exactly the previous behaviour.
+        assert!(needs_output(None, Some(7), true));
+        assert!(needs_output(None, None, true));
+    }
+
+    #[test]
+    fn the_cached_tail_is_what_gets_hashed_either_way() {
+        // Fetch and cache-hit must present the SAME bytes to `evaluate_tab`:
+        // feeding the full grid one tick and the tail the next would change
+        // the hash every other tick, reset the freeze clock, and no screen
+        // would ever look frozen — the watchdog would go silent.
+        let long = format!("{}TAIL-MARKER", "x".repeat(SCOPE_TAIL_BYTES * 2));
+        let tail = tail_of(&long);
+        assert!(tail.len() <= SCOPE_TAIL_BYTES);
+        assert!(tail.ends_with("TAIL-MARKER"), "keeps the NEWEST bytes");
+        assert_eq!(tail_of(&tail), tail, "already-tailed text is unchanged");
+        assert_eq!(hash_output(&tail_of(&long)), hash_output(&tail), "stable hash");
+        // Short output passes through untouched.
+        assert_eq!(tail_of("short"), "short");
+        // A multi-byte char straddling the cut must not panic or split.
+        let accented = format!("{}é{}", "y".repeat(SCOPE_TAIL_BYTES - 1), "z".repeat(SCOPE_TAIL_BYTES));
+        let cut = tail_of(&accented);
+        assert!(cut.len() <= SCOPE_TAIL_BYTES);
+        assert!(std::str::from_utf8(cut.as_bytes()).is_ok());
+        // And what brain scans is unaffected by the truncation.
+        let err = format!("{}\n● API Error: 529 Overloaded", "x".repeat(SCOPE_TAIL_BYTES * 3));
+        assert_eq!(
+            scan_output(&tail_of(&err)).map(|p| p.label),
+            scan_output(&err).map(|p| p.label),
+            "the tail carries the same verdict as the whole grid"
+        );
+    }
+
+    #[test]
+    fn one_tick_over_a_live_api_finds_no_claude_tabs() {
+        // Drives the real tick against an in-process daemon: fetch /tabs,
+        // filter for Claude sessions, find none, leave every tab alone. The
+        // fixture's tabs have no agent_kind, which is exactly the "brain must
+        // not type into a shell" case.
+        crate::cli::share_link::with_test_server(|state| {
+            assert_eq!(run(&["--once".to_string()]), 0);
+            let s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let typed = s.pending_input.len();
+            drop(s);
+            assert_eq!(typed, 0, "a non-agent tab must never be nudged");
+        });
+    }
+
+    #[test]
+    fn run_rejects_a_bad_interval_and_prints_help() {
+        assert_eq!(run(&["--help".to_string()]), 0);
+        assert_eq!(run(&["--interval".to_string()]), 2, "flag with no value");
+        assert_eq!(run(&["--interval".to_string(), "0".to_string()]), 2, "0s would spin");
+        assert_eq!(run(&["--interval".to_string(), "abc".to_string()]), 2);
+        assert_eq!(run(&["--nope".to_string()]), 2);
+    }
+
+    #[test]
     fn local_mass_freeze_drains_one_per_tick_instead_of_a_burst() {
         // 50 tabs wedge on the same LOCAL fault in the same tick — the herd.
         // There is no explicit fleet-wide simultaneous cap, and the breaker
@@ -1470,5 +1615,62 @@ mod tests {
         // A one-second countdown tick changes the hash → resets the
         // stability clock → an auto-retrying agent is never nudged.
         assert_ne!(hash_output("retrying in 38s"), hash_output("retrying in 37s"));
+    }
+
+    #[test]
+    fn a_tick_against_a_live_daemon_scans_without_nudging_idle_tabs() {
+        // `tick` is the brain's whole job and was uncovered because it needs
+        // a daemon. The harness gives it one: two tabs, neither of them a
+        // stalled claude, so a correct tick reads the fleet and sends nothing.
+        crate::cli::share_link::with_test_server(|_| {
+            let mut brain = super::Brain::default();
+            brain.tick().expect("a tick against a healthy daemon must succeed");
+            // The scan is resumable, so a second tick is also fine and must
+            // not double-count anything.
+            brain.tick().expect("second tick");
+            // Nothing on the fixture is an idle claude with unseen output, so
+            // nothing should have been nudged — a brain that nudges a shell
+            // types "continue" into someone's terminal.
+            assert!(
+                brain.last_nudge_at.is_none(),
+                "nudged a tab that was not a stalled agent"
+            );
+        });
+    }
+
+    #[test]
+    fn a_tick_without_a_daemon_is_an_error_not_a_panic() {
+        // The daemon restarts; the brain outlives it. A tick during that gap
+        // must return Err so the loop can retry, never unwind the thread.
+        let ep = crate::cli::share_link::Endpoint {
+            url: "http://127.0.0.1:1".into(),
+            token: "t".into(),
+        };
+        // Through the helper: the endpoint is process-global, and setting it
+        // directly raced every harness-using test in other modules.
+        let got = crate::cli::share_link::with_test_endpoint(ep, || super::Brain::default().tick());
+        assert!(got.is_err(), "an unreachable daemon must be an error");
+    }
+
+    #[test]
+    fn the_connectivity_probe_reports_a_reachable_or_unreachable_network() {
+        // `is_online` gates the systemic-freeze breaker: if it lies, the brain
+        // either nudges into a dead network or refuses to nudge a healthy one.
+        let mut probe = super::ConnectivityProbe::default();
+        let first = probe.is_online();
+        // Whatever the answer, it must be stable within the cache window
+        // rather than re-probing (and re-costing) on every tab.
+        assert_eq!(probe.is_online(), first, "the probe must be cached between calls");
+    }
+
+    #[test]
+    fn the_crash_log_never_panics_on_a_hostile_message() {
+        // It is called from the panic path, so it must survive anything —
+        // including a message that is not valid UTF-8-shaped text or is
+        // enormous.
+        super::crash_log("ordinary message");
+        super::crash_log("");
+        super::crash_log(&"x".repeat(100_000));
+        super::crash_log("null\0byte and \u{1b}[31m escapes");
     }
 }

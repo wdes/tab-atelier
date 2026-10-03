@@ -1,6 +1,4 @@
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// SPDX-License-Identifier: MPL-2.0
 
 //! WebSocket transport for one attached tab — used by the xterm.js
 //! viewer and (eventually) `tab-atelier remote attach`.
@@ -37,9 +35,41 @@
 //! | 0x07 | activate | C→S | empty — make this tab active           |
 //! | 0x08 | rename   | C→S | JSON `{"name":"…"}`                    |
 //! | 0x09 | close    | C→S | empty — close this tab                 |
+//! | 0x0C | preview  | S→C | UTF-8 ANSI text — quick approximate paint |
 //!
 //! Ping/pong stay on tungstenite's built-in control frames; no
 //! application-layer keepalive.
+//!
+//! ## Fast first paint (`preview`)
+//!
+//! A `since=0` bootstrap on a long-running tab can mean replaying
+//! megabytes of raw PTY history (see [`PtyRing`]'s docs on why the
+//! ring, not alacritty's grid, is the source of truth) — that's
+//! multiple seconds of transfer on a slow link, plus real client-side
+//! `xterm.js` parse time before anything is visible. Slicing the raw
+//! byte stream by count to send "just the tail" was considered and
+//! rejected: raw PTY bytes are a STATEFUL stream (cursor position, SGR
+//! colours, screen contents all depend on everything before the cut),
+//! so an arbitrary byte-count cut can start mid escape-sequence
+//! (printing its tail as literal garbage text) or mid a full-screen
+//! redraw (leaving rows blank that a correct render would have
+//! filled) — reproduced with a synthetic 4 MiB TUI-like corpus during
+//! this change's development.
+//!
+//! Instead, on a `since=0` bootstrap big enough to matter
+//! ([`OFFLOAD_MIN_BYTES`]), the server parses the SAME bytes it's
+//! about to replay through a disposable, throwaway
+//! `alacritty_terminal::Term` (server-side, Rust — not xterm.js) and
+//! ships just the last `2 * rows` screen rows as a `preview` frame
+//! FIRST — small and always byte-correct because it's derived from
+//! the authoritative grid, not a slice of the wire format. The real,
+//! unchanged full replay (`out` / `out-gz`) follows right behind and
+//! is what the client's `since=` reconnect bookkeeping tracks; the
+//! `preview` frame is a pure bonus paint that never advances that
+//! offset. The client resets its terminal before applying the
+//! authoritative replay, so the temporary preview never persists,
+//! never duplicates a line, and the final buffer is byte-identical to
+//! what a single full replay would have produced.
 //!
 //! ## Auth + RO
 //!
@@ -87,6 +117,12 @@ const TAG_FOCUS: u8 = 0x0B;
 /// only for frames over [`COMPRESS_MIN_BYTES`] where it actually
 /// shrinks them — keystroke echoes stay raw `TAG_OUT`.
 const TAG_OUT_DEFLATE: u8 = 0x0A;
+/// S→C: a quick, approximate paint of the last `2 * rows` screen rows,
+/// sent (at most once) ahead of a big `since=0` bootstrap so the
+/// viewer shows something almost immediately. NOT counted in the
+/// client's `since=` reconnect offset — see the module docs' "Fast
+/// first paint" section and [`build_preview`].
+const TAG_PREVIEW: u8 = 0x0C;
 
 /// Don't bother gzipping `out` frames below this — gzip's ~18-byte
 /// header + deflate framing would erase the win on tiny payloads, and
@@ -95,6 +131,23 @@ const TAG_OUT_DEFLATE: u8 = 0x0A;
 /// repetitive VT text → ~10-15× smaller). We also re-check the
 /// compressed size and fall back to raw if it didn't actually shrink.
 const COMPRESS_MIN_BYTES: usize = 256;
+
+/// Frames at or above this get gzip level 6 instead of level 1. The
+/// split exists because the two kinds of `out` frame want opposite
+/// things: a keystroke echo is latency-critical and barely
+/// compressible, while the `since=0` bootstrap is a one-shot bulk
+/// transfer whose size is what makes a phone wait. Measured on real
+/// rings dumped from this app — 15 distinct tabs, 4,463,190 B total:
+/// level 1 → 803,795 B in 40 ms, level 6 → 644,513 B in 85 ms. Trading
+/// 45 ms of one-off server CPU for 20% less to push over a mobile link
+/// is worth it; on a single typical 368 KB tab it is 61,693 → 49,019 B
+/// for 2 ms. Level 9 was measured too and rejected: only 4% beyond
+/// level 6 for 3x the CPU (273 ms).
+///
+/// Deliberately equal to [`OFFLOAD_MIN_BYTES`] — the same threshold
+/// that decides a frame is a bulk replay worth rendering a preview
+/// for also decides it is worth compressing hard.
+const COMPRESS_HARD_MIN_BYTES: usize = OFFLOAD_MIN_BYTES;
 
 /// When `TAB_ATELIER_WS_DEBUG_INPUT` is set in the environment, every
 /// inbound `TAG_IN` frame is logged to stderr (wall-clock ms, raw
@@ -748,6 +801,32 @@ async fn run_pump(
             None
         };
 
+    // Fast first paint: on a brand-new bootstrap (since=0) with a
+    // nontrivial amount of history queued, ship a small, byte-correct
+    // preview of the last `2 * rows` rows BEFORE the real (potentially
+    // multi-MB) replay. See the module docs' "Fast first paint"
+    // section for why this is NOT a slice of the raw ring bytes.
+    if since == 0
+        && let Some(meta) = last_meta.as_ref()
+        && meta.cols > 0
+        && meta.rows > 0
+    {
+        let snapshot = {
+            let Ok(r) = ring.lock() else { return };
+            r.since(0)
+        };
+        if snapshot.len() >= OFFLOAD_MIN_BYTES {
+            let (cols, rows) = (meta.cols, meta.rows);
+            let preview = tokio::task::spawn_blocking(move || build_preview(&snapshot, cols, rows)).await;
+            if let Ok(Some(text)) = preview {
+                let frame = encode_frame(TAG_PREVIEW, text.into_bytes());
+                if sink.send(Message::Binary(frame.into())).await.is_err() {
+                    return;
+                }
+            }
+        }
+    }
+
     // Event-driven output: wake on a `PtyRing` push and flush
     // immediately. `notify` is cloned from the ring once up front, along
     // with the viewer-count handle.
@@ -916,14 +995,63 @@ fn encode_out_frame(chunk: Vec<u8>) -> Vec<u8> {
     encode_frame(TAG_OUT, chunk)
 }
 
-/// gzip `data` at a fast level (terminal text compresses well even at
-/// level 1, and this can sit on the output hot path). `None` on the
+/// gzip `data`, hard for a bulk bootstrap and fast for anything that
+/// might be on the keystroke path — see [`COMPRESS_HARD_MIN_BYTES`] for
+/// the measurements behind the split. `None` on the
 /// practically-impossible encoder error so the caller falls back to raw.
+///
+/// gzip and not brotli/zstd on purpose: a WebSocket payload has to be
+/// inflated by the page itself, and `DecompressionStream` takes
+/// `brotli` only on Firefox 147+/Safari 18.4+ and `zstd` only on
+/// Firefox 138+ — neither on Chrome, which is most of mobile. `gzip` is
+/// the only format every engine decodes natively.
 fn gzip(data: &[u8]) -> Option<Vec<u8>> {
     use std::io::Write;
-    let mut enc = flate2::write::GzEncoder::new(Vec::with_capacity(data.len() / 3 + 32), flate2::Compression::fast());
+    let level = if data.len() >= COMPRESS_HARD_MIN_BYTES {
+        flate2::Compression::new(6)
+    } else {
+        flate2::Compression::fast()
+    };
+    let mut enc = flate2::write::GzEncoder::new(Vec::with_capacity(data.len() / 3 + 32), level);
     enc.write_all(data).ok()?;
     enc.finish().ok()
+}
+
+/// A `Term` event listener that does nothing — [`build_preview`] only
+/// needs the grid `Term::advance` populates, not damage/title/bell
+/// events.
+struct NopEventListener;
+impl alacritty_terminal::event::EventListener for NopEventListener {}
+
+/// Parse `bytes` (a `since=0` ring snapshot) through a disposable,
+/// throwaway `alacritty_terminal::Term` sized `cols x rows`, and
+/// return the last `2 * rows` screen rows as ANSI text — a small,
+/// byte-CORRECT preview of the current screen, safe to paint before
+/// the real (identical-content) replay arrives. `None` when the
+/// parsed screen is entirely blank (nothing worth painting early).
+///
+/// Deliberately does NOT reuse the tab's live `Term` (owned by the GUI
+/// or headless tab, each generic over a different `EventListener`):
+/// this keeps the fast path self-contained in `api_ws.rs`, with no
+/// coupling to either binary's rendering thread, at the cost of
+/// re-parsing the snapshot once more — offloaded to `spawn_blocking`
+/// by the caller, same as the existing gzip path for payloads this
+/// size. See the module docs' "Fast first paint" section for why this
+/// parses instead of slicing the raw bytes.
+fn build_preview(bytes: &[u8], cols: u16, rows: u16) -> Option<String> {
+    let term = alacritty_terminal::term::Term::new(
+        alacritty_terminal::term::Config::default(),
+        &crate::term_export::TermDims {
+            columns: usize::from(cols),
+            screen_lines: usize::from(rows),
+        },
+        NopEventListener,
+    );
+    let term = alacritty_terminal::sync::FairMutex::new(term);
+    let mut parser: vte::ansi::Processor = vte::ansi::Processor::new();
+    parser.advance(&mut *term.lock(), bytes);
+    let (text, _cursor) = crate::term_export::term_to_ansi_rows(&term, Some(usize::from(rows) * 2));
+    (!text.trim().is_empty()).then_some(text)
 }
 
 /// Dispatch a single C→S frame into the snapshot's pending queues.
@@ -1247,12 +1375,12 @@ mod tests {
     #[test]
     fn origin_ok_matching_host_accepted() {
         assert!(origin_ok(&req_with_headers(&[
-            ("origin", "https://example.org"),
-            ("host", "example.org"),
+            ("origin", "https://host.example.org"),
+            ("host", "host.example.org"),
         ])));
         assert!(origin_ok(&req_with_headers(&[
-            ("origin", "http://192.168.27.77:7890"),
-            ("host", "192.168.27.77:7890"),
+            ("origin", "http://192.0.2.10:7890"),
+            ("host", "192.0.2.10:7890"),
         ])));
     }
 
@@ -1260,16 +1388,16 @@ mod tests {
     fn origin_ok_mismatched_host_rejected() {
         assert!(!origin_ok(&req_with_headers(&[
             ("origin", "https://attacker.evil"),
-            ("host", "example.org"),
+            ("host", "host.example.org"),
         ])));
     }
 
     #[test]
     fn origin_ok_falls_back_to_forwarded_host_for_proxies() {
         assert!(origin_ok(&req_with_headers(&[
-            ("origin", "https://example.org"),
+            ("origin", "https://host.example.org"),
             ("host", "127.0.0.1:7890"),
-            ("x-forwarded-host", "example.org"),
+            ("x-forwarded-host", "host.example.org"),
         ])));
     }
 
@@ -1607,5 +1735,228 @@ mod tests {
         state.lock().unwrap().tabs[0].locked = true;
         let err = handle_inbound(&frame, Authz::Rw, false, &state, "uuid-1", &mut dedup).unwrap_err();
         assert_eq!(err.code, CloseCode::Policy);
+    }
+
+    /// A request carrying `uri` and optional headers, for the extractors.
+    fn req_with(uri: &str, headers: &[(&str, &str)]) -> http::Request<()> {
+        let mut b = http::Request::builder().uri(uri);
+        for (k, v) in headers {
+            b = b.header(*k, *v);
+        }
+        b.body(()).expect("request")
+    }
+
+    #[test]
+    fn the_resume_offset_comes_from_the_query_or_defaults_to_zero() {
+        // `since` is how a reconnecting viewer avoids re-rendering the whole
+        // scrollback. A wrong default here is a full redraw on every blip.
+        assert_eq!(super::extract_since(&req_with("/ws/tabs/0", &[])), 0);
+        assert_eq!(super::extract_since(&req_with("/ws/tabs/0?since=42", &[])), 42);
+        assert_eq!(super::extract_since(&req_with("/ws/tabs/0?token=x&since=7", &[])), 7);
+        // Junk must fall back to 0 (send everything) rather than to a huge
+        // offset that would silently show the viewer nothing.
+        assert_eq!(super::extract_since(&req_with("/ws/tabs/0?since=abc", &[])), 0);
+        assert_eq!(super::extract_since(&req_with("/ws/tabs/0?since=-1", &[])), 0);
+        assert_eq!(super::extract_since(&req_with("/ws/tabs/0?since=", &[])), 0);
+        // A parameter that merely CONTAINS "since" is not the offset.
+        assert_eq!(super::extract_since(&req_with("/ws/tabs/0?notsince=9", &[])), 0);
+    }
+
+    #[test]
+    fn a_token_is_taken_from_the_header_or_the_query() {
+        // Browsers cannot set headers on a WebSocket handshake, so the query
+        // form has to work — but a header must still win where available.
+        let from_query = super::extract_token(&req_with("/ws/tabs/0?token=abc123", &[]));
+        assert_eq!(from_query.as_deref(), Some(&b"abc123"[..]));
+        // Percent-encoding is decoded, or a token with a `+` or `/` in it
+        // would authenticate as a different string.
+        let encoded = super::extract_token(&req_with("/ws/tabs/0?token=a%2Fb%2Bc", &[]));
+        assert_eq!(encoded.as_deref(), Some(&b"a/b+c"[..]));
+        // No credential at all is None, not an empty token.
+        assert!(super::extract_token(&req_with("/ws/tabs/0", &[])).is_none());
+        assert!(super::extract_token(&req_with("/ws/tabs/0?other=1", &[])).is_none());
+    }
+
+    #[test]
+    fn percent_decoding_survives_what_a_url_can_carry() {
+        assert_eq!(super::percent_decode("plain"), b"plain");
+        assert_eq!(super::percent_decode("a%20b"), b"a b");
+        assert_eq!(super::percent_decode("%41%42"), b"AB");
+        // A truncated or invalid escape must not panic or silently drop the
+        // rest of the value — a mangled token should fail auth, not crash.
+        assert_eq!(super::percent_decode("a%"), b"a%");
+        assert_eq!(super::percent_decode("a%2"), b"a%2");
+        assert_eq!(super::percent_decode("a%zz"), b"a%zz");
+        assert_eq!(super::percent_decode(""), b"");
+    }
+
+    mod preview {
+        use super::build_preview;
+
+        /// `\x1b[<row>;<col>H` — 1-indexed absolute cursor position.
+        fn goto(row: usize, col: usize) -> String {
+            format!("\x1b[{row};{col}H")
+        }
+
+        #[test]
+        fn reconstructs_a_later_partial_redraw_over_an_earlier_full_one() {
+            // Mirrors how real TUIs (Claude Code, htop) actually update: a
+            // full-screen paint, then LATER redraws that only touch a few
+            // rows via cursor positioning, leaving the rest as-is. A byte-
+            // count slice of the raw stream landing between the two redraws
+            // would show the untouched rows blank (proven separately with a
+            // client-side xterm.js harness during this change's
+            // development); build_preview parses from the true start, so
+            // every row is correct regardless of where the "interesting"
+            // bytes start.
+            let (cols, rows) = (10usize, 5usize);
+            let mut bytes = String::new();
+            for r in 1..=rows {
+                bytes.push_str(&goto(r, 1));
+                bytes.push_str(&"A".repeat(cols));
+            }
+            // A large gap of unrelated activity between the full paint above
+            // and the partial redraw below — enough that a byte-count tail
+            // slice of `2 * rows * cols` reaches back only into this gap,
+            // NOT to the first redraw. Without this, a small input could
+            // accidentally survive a naive slice intact and this test would
+            // pass for the wrong reason. A no-visual-effect SGR reset (NOT
+            // `\r\n`, which would really scroll rows 1..4 off-screen and make
+            // "untouched rows keep the first redraw" false for a correct
+            // implementation too) keeps this a pure byte-count/escape-parsing
+            // test, not a scrolling one.
+            for _ in 0..2000 {
+                bytes.push_str("\x1b[0m");
+            }
+            // Second pass: only the LAST row changes.
+            bytes.push_str(&goto(rows, 1));
+            bytes.push_str(&"B".repeat(cols));
+
+            let preview = build_preview(bytes.as_bytes(), cols as u16, rows as u16).expect("non-blank");
+            let lines: Vec<&str> = preview.trim_end_matches('\n').split('\n').collect();
+            assert_eq!(lines.len(), rows, "one line per screen row: {lines:?}");
+            for line in &lines[..rows - 1] {
+                assert_eq!(
+                    *line,
+                    "A".repeat(cols),
+                    "untouched rows keep the first redraw: {lines:?}"
+                );
+            }
+            assert_eq!(
+                lines[rows - 1],
+                "B".repeat(cols),
+                "last row shows the later redraw: {lines:?}"
+            );
+        }
+
+        #[test]
+        fn caps_at_two_screen_heights_and_shows_the_tail_not_the_start() {
+            // A grid taller than the screen (real scrollback via newlines) —
+            // the preview must be bounded to `2 * rows` and must be the most
+            // RECENT content, not whatever happened to fit from offset 0.
+            use std::fmt::Write as _;
+            let (cols, rows) = (8usize, 4usize);
+            let mut bytes = String::new();
+            // Scroll through far more than 2*rows distinct lines.
+            for i in 0..500 {
+                let _ = write!(bytes, "{i:0>cols$}\r\n");
+            }
+            let preview = build_preview(bytes.as_bytes(), cols as u16, rows as u16).expect("non-blank");
+            let lines: Vec<&str> = preview.trim_end_matches('\n').split('\n').collect();
+            assert!(
+                lines.len() <= rows * 2,
+                "bounded to 2 screen heights: {} lines",
+                lines.len()
+            );
+            // The newest line pushed was 499 (padded to `cols` width); the
+            // very first was 0. The preview must show the former and never
+            // the latter.
+            assert!(
+                preview.contains("00000499"),
+                "shows the newest content, not the oldest: {preview:?}"
+            );
+            assert!(
+                !preview.contains("00000000"),
+                "must not show the very first (ancient) line: {preview:?}"
+            );
+        }
+
+        #[test]
+        fn blank_screen_yields_none() {
+            assert!(build_preview(b"", 80, 24).is_none());
+            assert!(build_preview(b"   \r\n  \r\n", 80, 24).is_none());
+        }
+
+        #[test]
+        fn survives_a_cut_mid_escape_sequence_without_panicking() {
+            // Not a correctness claim about THIS malformed input (it's
+            // intentionally truncated) — just proof that a stray partial
+            // CSI sequence at the end of a `since=0` snapshot (e.g. the ring
+            // was read mid-PTY-write) can't panic the WS pump.
+            let bytes = b"hello\x1b[31mworld\x1b[";
+            let _ = build_preview(bytes, 20, 5); // must not panic
+        }
+    }
+
+    mod compression {
+        use super::super::{COMPRESS_HARD_MIN_BYTES, TAG_OUT, TAG_OUT_DEFLATE, encode_out_frame, gzip};
+
+        /// Scrollback-shaped filler: repetitive VT text, like the ring
+        /// content this actually compresses in production.
+        fn scrollback(len: usize) -> Vec<u8> {
+            let line = b"\x1b[32m$\x1b[0m cargo build --release   Compiling tab-atelier v0.1.0\r\n";
+            line.iter().copied().cycle().take(len).collect()
+        }
+
+        #[test]
+        fn a_bootstrap_sized_frame_compresses_harder_than_a_live_one() {
+            // The whole point of the level split: the same bytes must come
+            // out smaller when they arrive as one bulk frame than when they
+            // arrive as sub-threshold live chunks.
+            let big = scrollback(COMPRESS_HARD_MIN_BYTES * 4);
+            let small = scrollback(COMPRESS_HARD_MIN_BYTES - 1);
+
+            let bulk = gzip(&big).expect("gzip of scrollback");
+            let live = gzip(&small).expect("gzip of scrollback");
+
+            let bulk_ratio = bulk.len() as f64 / big.len() as f64;
+            let live_ratio = live.len() as f64 / small.len() as f64;
+            assert!(
+                bulk_ratio < live_ratio,
+                "level 6 should beat level 1 on the same shape of data: bulk {bulk_ratio} vs live {live_ratio}"
+            );
+        }
+
+        #[test]
+        fn every_level_round_trips_through_the_client_side_inflate() {
+            // Both branches of the split must still be plain gzip — the
+            // browser inflates them with DecompressionStream('gzip') and has
+            // no idea which level produced them.
+            use std::io::Read;
+            for len in [
+                COMPRESS_HARD_MIN_BYTES - 1,
+                COMPRESS_HARD_MIN_BYTES,
+                COMPRESS_HARD_MIN_BYTES * 3,
+            ] {
+                let data = scrollback(len);
+                let gz = gzip(&data).expect("gzip");
+                let mut back = Vec::new();
+                flate2::read::GzDecoder::new(gz.as_slice())
+                    .read_to_end(&mut back)
+                    .expect("inflate");
+                assert_eq!(back, data, "round trip at len {len}");
+            }
+        }
+
+        #[test]
+        fn a_keystroke_echo_stays_on_the_raw_path() {
+            // Latency, not size, is what matters for an echo — it must not
+            // pick up the compressor at all.
+            let frame = encode_out_frame(b"a".to_vec());
+            assert_eq!(frame.first().copied(), Some(TAG_OUT));
+
+            let frame = encode_out_frame(scrollback(COMPRESS_HARD_MIN_BYTES * 2));
+            assert_eq!(frame.first().copied(), Some(TAG_OUT_DEFLATE));
+        }
     }
 }

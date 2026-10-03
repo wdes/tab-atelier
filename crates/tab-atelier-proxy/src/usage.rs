@@ -1,0 +1,1524 @@
+// SPDX-License-Identifier: MPL-2.0
+
+//! Who spent what — the question a shared token could never answer.
+//!
+//! The proxy sees every call, so it is the only place that can attribute token
+//! spend to a person without asking anyone to self-report. Anthropic returns
+//! the counts it billed; this reads them off the response as it streams past
+//! and files them under the account whose key opened the request.
+//!
+//! # Buckets, not a log
+//!
+//! Usage is kept as hourly buckets per account, not as one row per request.
+//! A busy fleet makes millions of requests and nobody plots them individually;
+//! an append-only log would grow without bound, and answering "last 7 days"
+//! would mean reading all of it. Hourly is the finest granularity any of the
+//! charts draw, [`RETAIN_HOURS`] of them is a bounded amount of state, and
+//! every question the dashboard asks is a sum over a slice.
+//!
+//! It is deliberately NOT an audit log: no prompts, no request bodies, no
+//! per-call records. Counts and timestamps only.
+//!
+//! # On disk
+//!
+//! `usage/<account-id>/YYYY-MM-DD_usage.json` — a directory per account, a
+//! file per UTC day. Every hour records WHICH MODEL was billed, because a
+//! token total cannot say whether it was Opus or Haiku and the price differs
+//! by an order of magnitude. That matters more here than in most proxies:
+//! [`crate::fallback`] rewrites the model under pressure, so what the caller
+//! asked for and what the plan paid for are not always the same thing.
+
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+
+use serde::{Deserialize, Serialize};
+
+/// Roughly 90 days. Long enough to see a quarter's shape, short enough that
+/// the file stays small even with a large team.
+pub const RETAIN_HOURS: u64 = 24 * 90;
+
+const HOUR: u64 = 3600;
+
+/// The four counts Anthropic bills separately.
+///
+/// Cache reads and cache writes are priced differently from ordinary input, so
+/// collapsing them into one "input" number would misreport the thing people
+/// actually want to know.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Tokens {
+    #[serde(default)]
+    pub input: u64,
+    #[serde(default)]
+    pub output: u64,
+    #[serde(default)]
+    pub cache_read: u64,
+    #[serde(default)]
+    pub cache_write: u64,
+    /// Requests the server ran on the model's behalf. Counts, not tokens: a
+    /// `web_search` is billed per request, which is why the four token figures
+    /// could never add up to the invoice on their own.
+    #[serde(default)]
+    pub web_search: u64,
+    #[serde(default)]
+    pub web_fetch: u64,
+    /// `cache_creation` split by TTL. The two sum to `cache_write`; the split
+    /// is what says which of them expires on the 5-minute clock and which on
+    /// the hour, and so which call paid full price to refresh.
+    #[serde(default)]
+    pub cache_write_5m: u64,
+    #[serde(default)]
+    pub cache_write_1h: u64,
+    /// Present only when an upstream reported a tier. Absent and `standard`
+    /// are different facts — one is "not told", the other is "billed at the
+    /// default rate" — so this stays an `Option`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<Tier>,
+}
+
+/// The `service_tier` an upstream billed a call under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Tier {
+    Standard,
+    Priority,
+    Batch,
+    /// A tier this build does not name. Kept rather than folded into
+    /// `Standard`, because an unknown tier billed as standard is a silent lie
+    /// about the price.
+    Other,
+}
+
+impl Tokens {
+    #[must_use]
+    pub const fn total(&self) -> u64 {
+        self.input + self.output + self.cache_read + self.cache_write
+    }
+
+    fn add(&mut self, o: Self) {
+        self.input += o.input;
+        self.output += o.output;
+        self.cache_read += o.cache_read;
+        self.cache_write += o.cache_write;
+        self.web_search += o.web_search;
+        self.web_fetch += o.web_fetch;
+        self.cache_write_5m += o.cache_write_5m;
+        self.cache_write_1h += o.cache_write_1h;
+        // Tiers cannot be summed the way counts can. The incoming one is taken
+        // when it is off-standard — that is the case whose price differs, and
+        // what a window billed at is worth surfacing — or when nothing is held
+        // yet, so a lone standard call is still recorded as standard. A later
+        // standard call therefore cannot downgrade a priority one.
+        let incoming_matters = o.service_tier.is_some_and(|t| t != Tier::Standard);
+        if incoming_matters || self.service_tier.is_none() {
+            self.service_tier = o.service_tier;
+        }
+    }
+
+    #[must_use]
+    pub const fn is_zero(&self) -> bool {
+        self.total() == 0
+    }
+}
+
+/// What a batch of tokens was charged, in micro-USD, priced when it was used.
+///
+/// Stored rather than derived. The graph is read long after the traffic, and a
+/// figure computed at read time is multiplied by whatever the rate table says
+/// *now* — so a month of history would be re-priced at today's rates, and a
+/// price edit or a moved peak window would silently rewrite the past. An amount
+/// recorded beside the tokens it paid for cannot move.
+///
+/// Micro-USD, and the same in/out split the chart draws, so what the far end
+/// charged and what the graph shows are the same number written once.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Cost {
+    pub in_micro: i128,
+    pub out_micro: i128,
+}
+
+impl Cost {
+    /// Add another batch's charge, saturating rather than wrapping: a total that
+    /// silently overflows is worse than one that stops at the ceiling.
+    pub const fn add(&mut self, other: Self) {
+        self.in_micro = self.in_micro.saturating_add(other.in_micro);
+        self.out_micro = self.out_micro.saturating_add(other.out_micro);
+    }
+}
+
+/// One hour of one account's activity.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Bucket {
+    /// Unix seconds, truncated to the hour.
+    pub hour: u64,
+    pub calls: u64,
+    /// Calls the upstream refused (4xx/5xx). Kept apart from `calls` so a
+    /// spike of failures cannot read as a spike of usage.
+    #[serde(default)]
+    pub errors: u64,
+    #[serde(flatten)]
+    pub tokens: Tokens,
+    /// The same hour split by the model that was actually BILLED.
+    ///
+    /// A total says how much was spent; it cannot say whether that was Opus or
+    /// Haiku, which is most of what the number means — the price differs by an
+    /// order of magnitude. It matters more here than in most proxies because
+    /// [`crate::fallback`] rewrites the model under pressure, so what the
+    /// caller asked for and what the plan paid for are not always the same
+    /// thing. This records what upstream reported, which is the one that was
+    /// charged.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub by_model: BTreeMap<String, Tokens>,
+    /// What this hour was charged, priced at the moment it was used.
+    ///
+    /// `None` for an hour nobody has priced, which includes every hour recorded
+    /// before this field existed. Absent rather than zero, so a reader has to
+    /// decide what to do about it instead of reading a free hour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost: Option<Cost>,
+}
+
+/// One account's history.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AccountUsage {
+    /// Ascending by hour, one entry per hour that had traffic.
+    #[serde(default)]
+    pub buckets: Vec<Bucket>,
+    /// All-time totals per model. Small, and it answers "what is this person
+    /// actually running" without scanning buckets.
+    #[serde(default)]
+    pub by_model: BTreeMap<String, Tokens>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct Doc {
+    #[serde(default)]
+    accounts: BTreeMap<String, AccountUsage>,
+}
+
+/// Where a day of one account's buckets lives, under the usage root.
+///
+/// `usage/<account-id>/YYYY-MM-DD_usage.json` — a directory per account and a
+/// file per UTC day. One file for everybody meant every account's history was
+/// rewritten whenever any of them made a call, and it grew without a natural
+/// place to stop. Split this way, a write touches one account's current day,
+/// retention is deleting old files, and "what did this person spend last
+/// Tuesday" is a path rather than a scan.
+///
+/// An account id is a UUID we generated, so it is safe as a directory name —
+/// but it is checked anyway ([`safe_id`]) rather than trusted, because a
+/// path built from a stored value is exactly where traversal creeps in.
+#[derive(Debug)]
+pub struct Store {
+    root: PathBuf,
+    accounts: BTreeMap<String, AccountUsage>,
+    /// Last time this was written. Recording happens on every proxied request,
+    /// and rewriting the file each time would make the disk the bottleneck on
+    /// a busy proxy — so writes are coalesced.
+    last_save: u64,
+    dirty: bool,
+}
+
+/// How long a change may sit unwritten. A crash loses at most this much
+/// accounting, which is the right trade against an fsync per API call.
+const SAVE_EVERY_SECS: u64 = 30;
+
+/// The day part of a bucket's path, from the bucket's own hour.
+#[must_use]
+pub fn day_of(hour: u64) -> String {
+    let days = hour / 86_400;
+    let shifted = i64::try_from(days).unwrap_or(0) + 719_468;
+    let era = shifted.div_euclid(146_097);
+    let day_of_era = shifted.rem_euclid(146_097);
+    let year_of_era = (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_pos = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_pos + 2) / 5 + 1;
+    let month = if month_pos < 10 { month_pos + 3 } else { month_pos - 9 };
+    let year = if month <= 2 { year + 1 } else { year };
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+/// Account ids are UUIDs we minted, but this builds a filesystem path from a
+/// stored value, so it is verified rather than trusted.
+fn safe_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 64 && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+#[must_use]
+pub fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+#[must_use]
+pub const fn hour_of(ts: u64) -> u64 {
+    ts - (ts % HOUR)
+}
+
+/// The start of the calendar week `secs` falls in, in UTC: Monday 00:00.
+///
+/// Deliberately the ISO week rather than the subscription plan's own weekly
+/// window. The two are different things that happen to share a name: the plan
+/// resets at an instant Anthropic chooses, which is what `weekly_last_drop`
+/// records and what the `QoS` scheduler budgets against, while this is a
+/// calendar the reader already knows how to find on a wall. This window covers
+/// every provider an account may have been routed to, and those have no shared
+/// reset instant to align to — so the explainable definition wins.
+///
+/// The weekday comes from jiff, for the reason [`crate::now_rfc3339_at`] gives:
+/// two implementations of one calendar stay correct until a leap year says
+/// otherwise. The day floor is integer arithmetic on epoch seconds, which no
+/// calendar can perturb.
+#[must_use]
+pub fn week_start(secs: u64) -> u64 {
+    let days_back = i64::try_from(secs)
+        .ok()
+        .and_then(|s| jiff::Timestamp::from_second(s).ok())
+        .map_or(0, |ts| {
+            // 0 for Monday through 6 for Sunday, in UTC.
+            i64::from(ts.to_zoned(jiff::tz::TimeZone::UTC).weekday().to_monday_zero_offset())
+        });
+    let monday = secs.saturating_sub(u64::try_from(days_back).unwrap_or(0) * 86_400);
+    hour_of(monday - monday % 86_400)
+}
+
+/// A window over the usage history, as a caller asked for it.
+///
+/// Not a bare hour count, which is what this replaced: "this week" is the
+/// current calendar week and its length depends on when you ask, so no number
+/// of hours expresses it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Window {
+    /// Everything retained — [`RETAIN_HOURS`] at most.
+    All,
+    /// The last `n` hours, the current one included.
+    Hours(u64),
+    /// The current calendar week in UTC, Monday 00:00 through now. See
+    /// [`week_start`].
+    ThisWeek,
+}
+
+/// An inclusive range of hour buckets.
+///
+/// Resolved once per request and passed down, rather than recomputed inside
+/// each call. Two calls to the clock in one response can land either side of an
+/// hour boundary, which would answer the totals and the series for two
+/// different windows — a discrepancy of one bucket, and one nobody would ever
+/// think to look for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Span {
+    pub first: u64,
+    pub last: u64,
+}
+
+impl Span {
+    /// How many hour buckets this covers, always at least one.
+    #[must_use]
+    pub const fn hours(self) -> u64 {
+        (self.last - self.first) / HOUR + 1
+    }
+}
+
+impl Window {
+    /// What `?window=` accepts, and what the admin UI offers, in the order the
+    /// dropdown shows them.
+    ///
+    /// The list is here and the `<option>` markup is in `assets/index.html`,
+    /// because the tokens are a wire contract and the labels are a language.
+    /// A test reads the markup and asserts every value in it parses back to
+    /// the same window, so the two cannot drift into a dropdown that 400s.
+    pub const TOKENS: [&'static str; 9] = ["week", "24h", "2d", "3d", "4d", "5d", "6d", "7d", "30d"];
+
+    /// Parse one `?window=` token.
+    ///
+    /// `12h`, `48h` and `2d` all parse even though only some are offered: the
+    /// parser is `n` plus a unit, so a link written by hand for 36 hours works
+    /// without anybody having to add it to a list first.
+    #[must_use]
+    pub fn parse(token: &str) -> Option<Self> {
+        if token == "week" {
+            return Some(Self::ThisWeek);
+        }
+        if token == "all" {
+            return Some(Self::All);
+        }
+        let unit_at = token.find(|c: char| c.is_ascii_alphabetic())?;
+        let (count, unit) = token.split_at(unit_at);
+        let count: u64 = count.parse().ok()?;
+        if count == 0 {
+            return None;
+        }
+        match unit {
+            "h" => Some(Self::Hours(count)),
+            // Saturating rather than wrapping: `999999999999d` is a nonsense
+            // window, and the honest answer to it is "everything", not a small
+            // number produced by an overflow.
+            "d" => Some(Self::Hours(count.saturating_mul(24))),
+            _ => None,
+        }
+    }
+
+    /// The canonical token for this window.
+    ///
+    /// Prefers a token from [`Window::TOKENS`] and only falls back to `Nh`
+    /// when the window has no offered spelling, so `parse` and `token` are
+    /// inverses on everything the UI can send. `24h` is the case that makes the
+    /// order matter: it IS 1 day, but `1d` is not offered, so canonicalising on
+    /// the arithmetic alone would echo back a value the dropdown cannot show
+    /// and the menu would fall blank on the first refresh.
+    ///
+    /// Not necessarily byte-equal to what the caller sent: `48h` and `2d` are
+    /// both accepted by [`Window::parse`] and both settle to `2d`. That is
+    /// deliberate — a hand-written URL then lives on as one window rather than
+    /// two spellings of one.
+    ///
+    /// `All` has no entry in [`Window::TOKENS`] and no `<option>` in the UI; it
+    /// is reachable by hand and is not a default anywhere.
+    #[must_use]
+    pub fn token(self) -> String {
+        match self {
+            Self::All => "all".to_owned(),
+            Self::ThisWeek => "week".to_owned(),
+            Self::Hours(h) => {
+                let offered = if h % 24 == 0 {
+                    format!("{}d", h / 24)
+                } else {
+                    String::new()
+                };
+                if Self::TOKENS.contains(&offered.as_str()) {
+                    offered
+                } else {
+                    format!("{h}h")
+                }
+            }
+        }
+    }
+
+    /// The range this covers, given the current time.
+    #[must_use]
+    pub fn span(self, now: u64) -> Span {
+        let last = hour_of(now);
+        let first = match self {
+            Self::All => 0,
+            Self::Hours(hours) => last.saturating_sub(hours.saturating_sub(1).saturating_mul(HOUR)),
+            Self::ThisWeek => week_start(now),
+        };
+        Span {
+            first: first.min(last),
+            last,
+        }
+    }
+}
+
+impl Store {
+    /// Load every account's daily files under `root`.
+    ///
+    /// A malformed file is NOT fatal, unlike the account store: usage is
+    /// accounting, not access control, and losing it must never stop the proxy
+    /// serving. The damaged file is renamed aside so it is still there to look
+    /// at, and the rest of the history loads around it.
+    #[must_use]
+    pub fn load(root: impl Into<PathBuf>) -> Self {
+        let root = root.into();
+        let mut accounts: BTreeMap<String, AccountUsage> = BTreeMap::new();
+
+        // The single all-accounts file earlier versions wrote. Still someone's
+        // history, so it is folded in; nothing writes to it again.
+        let legacy = root.join("usage.json");
+        if let Ok(raw) = std::fs::read_to_string(&legacy) {
+            match serde_json::from_str::<Doc>(&raw) {
+                Ok(d) => accounts = d.accounts,
+                Err(e) => {
+                    log::warn!("usage: {} is unreadable ({e}); ignoring it", legacy.display());
+                    let _ = std::fs::rename(&legacy, legacy.with_extension("json.corrupt"));
+                }
+            }
+        }
+
+        if let Ok(entries) = std::fs::read_dir(&root) {
+            for account_dir in entries.flatten().filter(|e| e.path().is_dir()) {
+                let id = account_dir.file_name().to_string_lossy().into_owned();
+                if !safe_id(&id) {
+                    continue;
+                }
+                let entry = accounts.entry(id).or_default();
+                let mut files: Vec<PathBuf> = std::fs::read_dir(account_dir.path())
+                    .map(|d| {
+                        d.flatten()
+                            .map(|e| e.path())
+                            .filter(|p| p.extension().is_some_and(|x| x == "json"))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                files.sort(); // dated names sort into chronological order
+                for f in files {
+                    let Ok(raw) = std::fs::read_to_string(&f) else { continue };
+                    match serde_json::from_str::<AccountUsage>(&raw) {
+                        Ok(day) => {
+                            entry.buckets.extend(day.buckets);
+                            for (model, t) in day.by_model {
+                                entry.by_model.entry(model).or_default().add(t);
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!("usage: {} is unreadable ({e}); skipping", f.display());
+                            let _ = std::fs::rename(&f, f.with_extension("json.corrupt"));
+                        }
+                    }
+                }
+                entry.buckets.sort_by_key(|b| b.hour);
+            }
+        }
+
+        Self {
+            root,
+            accounts,
+            last_save: 0,
+            dirty: false,
+        }
+    }
+
+    /// File one call against an account.
+    ///
+    /// `cost` is what the call was charged, priced by the caller at the moment
+    /// of the request. It is passed in rather than resolved here because this
+    /// store has no view of the rate table — and because a rate read at report
+    /// time is a rate that can move under a number already written.
+    pub fn record(&mut self, account_id: &str, model: Option<&str>, tokens: Tokens, ok: bool, cost: Option<Cost>) {
+        let hour = hour_of(now_secs());
+        let entry = self.accounts.entry(account_id.to_owned()).or_default();
+
+        // Buckets are ascending, and traffic arrives in time order, so the one
+        // being written to is almost always the last.
+        let bucket = match entry.buckets.last_mut() {
+            Some(b) if b.hour == hour => b,
+            _ => {
+                entry.buckets.push(Bucket {
+                    hour,
+                    ..Bucket::default()
+                });
+                entry.buckets.last_mut().unwrap_or_else(|| unreachable!("just pushed"))
+            }
+        };
+        bucket.calls += 1;
+        if !ok {
+            bucket.errors += 1;
+        }
+        bucket.tokens.add(tokens);
+        // Only when something was actually billed. A refused call carries no
+        // tokens and so no charge, and recording a zero would make an hour of
+        // nothing but failures read as costing `$0.00` rather than as unpriced.
+        if let Some(cost) = cost.filter(|_| !tokens.is_zero()) {
+            bucket.cost.get_or_insert_with(Cost::default).add(cost);
+        }
+        if let Some(m) = model.filter(|_| !tokens.is_zero()) {
+            bucket.by_model.entry(m.to_owned()).or_default().add(tokens);
+        }
+
+        if let Some(m) = model.filter(|_| !tokens.is_zero()) {
+            entry.by_model.entry(m.to_owned()).or_default().add(tokens);
+        }
+
+        let cutoff = hour.saturating_sub(RETAIN_HOURS * HOUR);
+        // Deduplicated to days as we go: an expired day holds 24 buckets and
+        // needs one unlink, not 24.
+        let stale: std::collections::BTreeSet<String> = entry
+            .buckets
+            .iter()
+            .filter(|b| b.hour < cutoff)
+            .map(|b| day_of(b.hour))
+            .collect();
+        entry.buckets.retain(|b| b.hour >= cutoff);
+        // Days that fell out of the window lose their file, so retention is a
+        // deletion rather than a file that shrinks to `[]` and stays forever.
+        if safe_id(account_id) {
+            for day in stale {
+                let _ = std::fs::remove_file(self.root.join(account_id).join(format!("{day}_usage.json")));
+            }
+        }
+
+        self.dirty = true;
+        self.maybe_save();
+    }
+
+    fn maybe_save(&mut self) {
+        let now = now_secs();
+        if self.dirty && now.saturating_sub(self.last_save) >= SAVE_EVERY_SECS {
+            let _ = self.save();
+        }
+    }
+
+    /// Write now, whatever the coalescing window says.
+    ///
+    /// Only the days that actually hold buckets are written, so a quiet
+    /// account costs nothing and a busy one rewrites one small file rather
+    /// than everybody's history.
+    ///
+    /// # Errors
+    /// Anything that stops a file reaching disk.
+    pub fn save(&mut self) -> Result<(), String> {
+        for (id, usage) in &self.accounts {
+            if !safe_id(id) {
+                continue;
+            }
+            let dir = self.root.join(id);
+            std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+
+            // Split this account's buckets by day, then write each day whole.
+            let mut days: BTreeMap<String, AccountUsage> = BTreeMap::new();
+            for b in &usage.buckets {
+                days.entry(day_of(b.hour)).or_default().buckets.push(b.clone());
+            }
+            for (day, mut doc) in days {
+                // The all-time per-model totals belong to the account, not to
+                // a day; recording the day's own split keeps each file
+                // self-describing when read on its own.
+                for b in &doc.buckets {
+                    for (model, t) in &b.by_model {
+                        doc.by_model.entry(model.clone()).or_default().add(*t);
+                    }
+                }
+                let path = dir.join(format!("{day}_usage.json"));
+                let json = serde_json::to_string(&doc).map_err(|e| e.to_string())?;
+                let tmp = path.with_extension("json.tmp");
+                std::fs::write(&tmp, json).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+                }
+                std::fs::rename(&tmp, &path).map_err(|e| format!("rename into {}: {e}", path.display()))?;
+            }
+        }
+        self.last_save = now_secs();
+        self.dirty = false;
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn for_account(&self, id: &str) -> Option<&AccountUsage> {
+        self.accounts.get(id)
+    }
+
+    /// Sum a window. Resolve it once with [`Window::span`] and pass the same
+    /// [`Span`] to [`Store::series`], or the two can describe different hours.
+    #[must_use]
+    pub fn totals(&self, id: &str, span: Span) -> (u64, u64, Tokens) {
+        let mut calls = 0;
+        let mut errors = 0;
+        let mut tokens = Tokens::default();
+        if let Some(a) = self.accounts.get(id) {
+            for b in a.buckets.iter().filter(|b| b.hour >= span.first && b.hour <= span.last) {
+                calls += b.calls;
+                errors += b.errors;
+                tokens.add(b.tokens);
+            }
+        }
+        (calls, errors, tokens)
+    }
+
+    /// What the hours in `span` add up to, as charged when each was used.
+    ///
+    /// `None` when no hour in the span carries a charge, which includes every
+    /// span recorded before costs were stored. Absent rather than zero, so the
+    /// caller decides whether to price the gap from the current table instead of
+    /// reading it as free.
+    ///
+    /// This total is stable in a way a computed one cannot be: each hour is
+    /// charged at its own instant, so it already knows whether it was peak, and
+    /// no re-reading of the same span can change it.
+    #[must_use]
+    pub fn cost_total(&self, id: &str, span: Span) -> Option<Cost> {
+        let mut total: Option<Cost> = None;
+        if let Some(a) = self.accounts.get(id) {
+            for b in a.buckets.iter().filter(|b| b.hour >= span.first && b.hour <= span.last) {
+                if let Some(cost) = b.cost {
+                    total.get_or_insert_with(Cost::default).add(cost);
+                }
+            }
+        }
+        total
+    }
+
+    /// A dense hourly series over `span`.
+    ///
+    /// Dense matters: hours with no traffic must appear as zeroes, or a chart
+    /// drawn from this silently compresses idle time and every gap reads as
+    /// activity that never happened.
+    #[must_use]
+    pub fn series(&self, id: &str, span: Span) -> Vec<Bucket> {
+        let (start, hours) = (span.first, span.hours());
+        let mut filled: Vec<Bucket> = (0..hours)
+            .map(|i| Bucket {
+                hour: start + i * HOUR,
+                ..Bucket::default()
+            })
+            .collect();
+        if let Some(a) = self.accounts.get(id) {
+            for b in &a.buckets {
+                if b.hour >= span.first && b.hour <= span.last {
+                    let idx = ((b.hour - start) / HOUR) as usize;
+                    if let Some(slot) = filled.get_mut(idx) {
+                        slot.calls = b.calls;
+                        slot.errors = b.errors;
+                        slot.tokens = b.tokens;
+                        slot.by_model.clone_from(&b.by_model);
+                        // The charge travels with the hour, or the money graph
+                        // reads every bucket as unpriced however much was
+                        // actually spent. The totals below sum `b.cost`
+                        // straight off the account, so leaving this out is
+                        // invisible to them and every figure they show stays
+                        // right — which is exactly why it went unnoticed: only
+                        // the per-hour series the chart draws was blank.
+                        slot.cost = b.cost;
+                    }
+                }
+            }
+        }
+        filled
+    }
+
+    /// Every account that has ever been recorded.
+    #[must_use]
+    pub fn account_ids(&self) -> Vec<String> {
+        self.accounts.keys().cloned().collect()
+    }
+
+    /// Drop an account's history — called when the account is deleted, so
+    /// "forget this person" actually forgets them.
+    pub fn forget(&mut self, id: &str) {
+        if self.accounts.remove(id).is_some() {
+            // The directory goes too, or "forget this person" would leave
+            // their history on disk under an id nothing refers to any more.
+            if safe_id(id) {
+                let _ = std::fs::remove_dir_all(self.root.join(id));
+            }
+            self.dirty = true;
+            let _ = self.save();
+        }
+    }
+}
+
+/// Reads token counts off a response as it streams past.
+///
+/// Anthropic reports usage in two shapes and this has to handle both:
+///
+/// * a plain JSON reply carries one `usage` object;
+/// * an SSE stream reports input counts in `message_start` and then the
+///   running output count in each `message_delta` — the LAST of which is the
+///   real total, so later values replace earlier ones rather than adding.
+///
+/// Memory is bounded either way. The SSE path processes whole lines and drops
+/// them, so a generation of any length costs one partial line; the JSON path
+/// accumulates to a cap and gives up past it rather than buffering a large
+/// response just to count it.
+#[derive(Debug)]
+pub struct Sniffer {
+    sse: bool,
+    pending: Vec<u8>,
+    tokens: Tokens,
+    model: Option<String>,
+    over_cap: bool,
+}
+
+/// Enough for any `messages` reply; past this we stop trying rather than hold
+/// a big body in memory for accounting.
+const JSON_CAP: usize = 256 * 1024;
+
+impl Sniffer {
+    #[must_use]
+    pub fn new(content_type: Option<&str>) -> Self {
+        Self {
+            sse: content_type.is_some_and(|c| c.contains("event-stream")),
+            pending: Vec::new(),
+            tokens: Tokens::default(),
+            model: None,
+            over_cap: false,
+        }
+    }
+
+    /// Feed the next chunk on its way to the client.
+    pub fn feed(&mut self, chunk: &[u8]) {
+        if self.over_cap {
+            return;
+        }
+        self.pending.extend_from_slice(chunk);
+        if !self.sse {
+            if self.pending.len() > JSON_CAP {
+                self.over_cap = true;
+                self.pending = Vec::new();
+            }
+            return;
+        }
+        // Line-oriented: take each complete line, use it, drop it.
+        while let Some(nl) = self.pending.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = self.pending.drain(..=nl).collect();
+            self.take_line(&line);
+        }
+        // A single line this long is not an SSE frame we understand.
+        if self.pending.len() > JSON_CAP {
+            self.over_cap = true;
+            self.pending = Vec::new();
+        }
+    }
+
+    fn take_line(&mut self, line: &[u8]) {
+        let Ok(text) = std::str::from_utf8(line) else { return };
+        let Some(payload) = text.trim_end().strip_prefix("data:") else {
+            return;
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(payload.trim()) else {
+            return;
+        };
+        self.take_value(&v);
+    }
+
+    fn take_value(&mut self, value: &serde_json::Value) {
+        // message_start nests the model and the input counts under `message`;
+        // message_delta and a non-streamed reply carry `usage` at the top.
+        if let Some(name) = value
+            .get("message")
+            .and_then(|msg| msg.get("model"))
+            .or_else(|| value.get("model"))
+            .and_then(serde_json::Value::as_str)
+        {
+            self.model = Some(name.to_owned());
+        }
+        let found = value
+            .get("message")
+            .and_then(|msg| msg.get("usage"))
+            .or_else(|| value.get("usage"));
+        let Some(counts) = found else { return };
+        let pick = |keys: &[&str]| {
+            keys.iter()
+                .find_map(|key| counts.get(*key).and_then(serde_json::Value::as_u64))
+                .unwrap_or(0)
+        };
+        // `OpenAI` names the same two counts `prompt_tokens` and
+        // `completion_tokens`. Reading only Anthropic's names left every OpenAI
+        // call recorded as zero tokens — a statistic that lies by omission, and
+        // the reason its spend never matched the upstream invoice.
+        let (i, o, cr, cw) = (
+            pick(&["input_tokens", "prompt_tokens"]),
+            pick(&["output_tokens", "completion_tokens"]),
+            pick(&["cache_read_input_tokens"]),
+            pick(&["cache_creation_input_tokens"]),
+        );
+        if i > 0 {
+            self.tokens.input = i;
+        }
+        if o > 0 {
+            self.tokens.output = o;
+        }
+        if cr > 0 {
+            self.tokens.cache_read = cr;
+        }
+        if cw > 0 {
+            self.tokens.cache_write = cw;
+        }
+        // The counts above are the whole of what the panel used to show. These
+        // are the rest of the same block, and each was being discarded on
+        // arrival: two server-tool request counts, the cache-write TTL split,
+        // and the billing tier.
+        let nested = |parent: &str, key: &str| {
+            counts
+                .get(parent)
+                .and_then(|p| p.get(key))
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+        };
+        let (ws, wf) = (
+            nested("server_tool_use", "web_search_requests"),
+            nested("server_tool_use", "web_fetch_requests"),
+        );
+        if ws > 0 {
+            self.tokens.web_search = ws;
+        }
+        if wf > 0 {
+            self.tokens.web_fetch = wf;
+        }
+        let (c5, c1) = (
+            nested("cache_creation", "ephemeral_5m_input_tokens"),
+            nested("cache_creation", "ephemeral_1h_input_tokens"),
+        );
+        if c5 > 0 {
+            self.tokens.cache_write_5m = c5;
+        }
+        if c1 > 0 {
+            self.tokens.cache_write_1h = c1;
+        }
+        // Named or not, a tier we were told about is kept: `or` so a later
+        // frame without one cannot erase what the first reported.
+        if let Some(tier) = counts.get("service_tier").and_then(serde_json::Value::as_str) {
+            self.tokens.service_tier = Some(match tier {
+                "standard" => Tier::Standard,
+                "priority" => Tier::Priority,
+                "batch" => Tier::Batch,
+                _ => Tier::Other,
+            });
+        }
+    }
+
+    /// What the response reported.
+    #[must_use]
+    pub fn finish(mut self) -> (Option<String>, Tokens) {
+        if !self.sse && !self.over_cap && !self.pending.is_empty() {
+            let pending = std::mem::take(&mut self.pending);
+            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&pending) {
+                self.take_value(&v);
+            }
+        }
+        (self.model, self.tokens)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The response `usage` block carries more than the four token counts, and
+    /// every one of the rest used to be discarded on arrival. This pins them.
+    #[test]
+    fn the_rest_of_the_usage_block_is_recorded() {
+        let mut s = Sniffer::new(Some("application/json"));
+        s.feed(
+            br#"{"usage":{
+                "input_tokens": 10, "output_tokens": 5,
+                "cache_read_input_tokens": 3, "cache_creation_input_tokens": 7,
+                "server_tool_use": {"web_search_requests": 2, "web_fetch_requests": 1},
+                "cache_creation": {"ephemeral_5m_input_tokens": 4, "ephemeral_1h_input_tokens": 3},
+                "service_tier": "batch"
+            }}"#,
+        );
+        let (_, t) = s.finish();
+        assert_eq!(t.total(), 25, "the four counts are unchanged");
+        assert_eq!((t.web_search, t.web_fetch), (2, 1));
+        assert_eq!((t.cache_write_5m, t.cache_write_1h), (4, 3));
+        assert_eq!(t.service_tier, Some(Tier::Batch));
+    }
+
+    /// A tier this build does not name is kept as `Other`, not folded into
+    /// `Standard` — naming it standard would misstate its price.
+    #[test]
+    fn an_unrecognised_tier_is_kept_as_other() {
+        let mut s = Sniffer::new(Some("application/json"));
+        s.feed(br#"{"usage":{"input_tokens":1,"service_tier":"flex"}}"#);
+        assert_eq!(s.finish().1.service_tier, Some(Tier::Other));
+    }
+
+    /// A window keeps the off-standard tier, and a later standard call cannot
+    /// downgrade it — that call did not change what the window was billed at.
+    #[test]
+    fn a_window_keeps_the_off_standard_tier() {
+        fn tok(tier: Option<Tier>) -> Tokens {
+            Tokens {
+                input: 1,
+                service_tier: tier,
+                ..Tokens::default()
+            }
+        }
+        let mut sum = Tokens::default();
+        sum.add(tok(Some(Tier::Standard)));
+        assert_eq!(
+            sum.service_tier,
+            Some(Tier::Standard),
+            "a lone standard call is recorded"
+        );
+        sum.add(tok(Some(Tier::Priority)));
+        sum.add(tok(Some(Tier::Standard)));
+        assert_eq!(sum.service_tier, Some(Tier::Priority), "not downgraded");
+        sum.add(tok(Some(Tier::Other)));
+        assert_eq!(
+            sum.service_tier,
+            Some(Tier::Other),
+            "an unknown tier is not overwritten"
+        );
+    }
+
+    /// When the upstream sent no TTL split, the totals must not invent one; the
+    /// sum of two absent parts is not the whole.
+    #[test]
+    fn an_absent_split_leaves_the_ttl_counts_at_zero() {
+        let mut s = Sniffer::new(Some("application/json"));
+        s.feed(br#"{"usage":{"input_tokens":1,"cache_creation_input_tokens":9}}"#);
+        let (_, t) = s.finish();
+        assert_eq!(t.cache_write, 9);
+        assert_eq!((t.cache_write_5m, t.cache_write_1h), (0, 0));
+        assert_eq!(t.service_tier, None, "absent and standard are different facts");
+    }
+
+    /// Monday 00:00 UTC is the start of the week, and the epoch is the case a
+    /// hand-rolled `secs / 86_400 % 7` gets wrong: 1970-01-01 was a THURSDAY,
+    /// so a naive modulo puts every week's boundary three days off.
+    #[test]
+    fn the_week_starts_on_monday_in_utc() {
+        let day = |n: u64| n * 86_400;
+        // Epoch day 0 is Thursday 1970-01-01; its week began Monday the 29th of
+        // December, 1969 — three days earlier, which is `saturating_sub`'s job.
+        assert_eq!(week_start(day(0)), 0, "there is no earlier bucket to reach");
+        assert_eq!(week_start(day(3)), 0, "Sunday the 4th is still that week");
+        assert_eq!(week_start(day(4)), day(4), "Monday the 5th opens a new one");
+
+        // A known Monday well past the epoch, so a drift cannot hide.
+        // 2026-09-07 is a Monday and epoch day 20_703.
+        let monday = day(20_703);
+        for h in [0, 1, 12, 23] {
+            assert_eq!(week_start(monday + h * 3_600), monday, "hour {h} of a Monday");
+        }
+        assert_eq!(
+            week_start(monday - 1),
+            monday - 7 * 86_400,
+            "its Sunday is the week before"
+        );
+    }
+
+    #[test]
+    fn a_window_parses_carrying_its_unit() {
+        assert_eq!(Window::parse("24h"), Some(Window::Hours(24)));
+        assert_eq!(Window::parse("48h"), Some(Window::Hours(48)));
+        assert_eq!(Window::parse("2d"), Some(Window::Hours(48)));
+        assert_eq!(Window::parse("7d"), Some(Window::Hours(168)));
+        assert_eq!(Window::parse("30d"), Some(Window::Hours(720)));
+        assert_eq!(Window::parse("week"), Some(Window::ThisWeek));
+        assert_eq!(Window::parse("all"), Some(Window::All));
+        // Not windows, and not silently something else.
+        for bad in [
+            "", "h", "d", "0h", "0d", "24", "-1h", "1w", "24m", "24 h", "nan", "1d2h",
+        ] {
+            assert_eq!(Window::parse(bad), None, "{bad:?} must not parse");
+        }
+    }
+
+    /// A number large enough to be nonsense is "everything", not a wrapped
+    /// small window — the one case in this file where an overflow would be
+    /// indistinguishable from a real answer.
+    #[test]
+    fn an_absurd_hour_count_saturates_rather_than_wrapping() {
+        // 999_999_999_999 days is 2.4e13 hours: no overflow yet, just a number
+        // far larger than anything retained.
+        assert_eq!(
+            Window::parse("999999999999d"),
+            Some(Window::Hours(999_999_999_999 * 24))
+        );
+        // Past that, `saturating_mul` pins to the maximum instead of wrapping
+        // to a small window that would look like a plausible answer. The count
+        // itself still has to fit in a `u64`, so this is the largest one.
+        assert_eq!(Window::parse(&format!("{}d", u64::MAX)), Some(Window::Hours(u64::MAX)));
+        let span = Window::parse(&format!("{}d", u64::MAX))
+            .expect("parses")
+            .span(1_800_000_000);
+        assert_eq!(span.first, 0, "which reaches back to the beginning of time");
+    }
+
+    /// `token` is the inverse of `parse` on every window the UI can offer.
+    /// This is what lets the server echo a value back and have the dropdown
+    /// recognise it.
+    #[test]
+    fn every_offered_token_round_trips_to_itself() {
+        for token in Window::TOKENS {
+            let w = Window::parse(token).unwrap_or_else(|| panic!("{token} must parse"));
+            assert_eq!(w.token(), token, "{token} did not round-trip");
+        }
+    }
+
+    /// And the two spellings of one window collapse to one token, so a
+    /// hand-written URL settles rather than living on as a duplicate entry.
+    #[test]
+    fn alternate_spellings_canonicalise() {
+        assert_eq!(Window::Hours(48).token(), "2d");
+        assert_eq!(Window::Hours(168).token(), "7d");
+        assert_eq!(Window::Hours(36).token(), "36h");
+        assert_eq!(Window::Hours(1).token(), "1h");
+    }
+
+    /// `span` is a closed range of hours, and the two ways of getting it wrong
+    /// — an off-by-one, or a window that starts in the future — are both
+    /// checked here rather than at a chart.
+    #[test]
+    fn a_span_covers_exactly_the_hours_it_names() {
+        let now = 1_700_000_000_u64;
+        let hour = hour_of(now);
+
+        let one = Window::Hours(1).span(now);
+        assert_eq!((one.first, one.last, one.hours()), (hour, hour, 1));
+
+        let day = Window::Hours(24).span(now);
+        assert_eq!(day.last, hour);
+        assert_eq!(day.first, hour - 23 * HOUR, "24 hours ENDS at this one");
+        assert_eq!(day.hours(), 24);
+
+        // `All` reaches back further than anything retained, which is the
+        // point: the totals filter by `first`, so 0 means "no cutoff".
+        let all = Window::All.span(now);
+        assert_eq!((all.first, all.last), (0, hour));
+        assert_eq!(all.hours(), hour / HOUR + 1);
+
+        // An early clock cannot produce a window that starts after it ends.
+        let early = Window::Hours(24).span(3_600);
+        assert!(early.first <= early.last, "{early:?}");
+        assert_eq!(early.first, 0);
+    }
+
+    fn tmp(name: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("ta-proxy-usage-{name}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&p).expect("mkdir");
+        p
+    }
+
+    /// The window a test means by "everything", resolved at the clock.
+    ///
+    /// Resolving through the real [`Window`] rather than hand-building a
+    /// `Span` keeps the fixtures honest about the type they now pass.
+    fn all() -> Span {
+        Window::All.span(now_secs())
+    }
+
+    /// A window of `n` hours ending at the current hour.
+    fn hours(n: u64) -> Span {
+        Window::Hours(n).span(now_secs())
+    }
+
+    #[test]
+    fn a_plain_json_reply_reports_its_usage() {
+        let mut s = Sniffer::new(Some("application/json"));
+        s.feed(br#"{"model":"claude-opus-5","usage":{"input_tokens":12,"#);
+        s.feed(br#""output_tokens":34,"cache_read_input_tokens":5}}"#);
+        let (model, t) = s.finish();
+        assert_eq!(model.as_deref(), Some("claude-opus-5"));
+        assert_eq!(t.input, 12);
+        assert_eq!(t.output, 34);
+        assert_eq!(t.cache_read, 5);
+        assert_eq!(t.total(), 51);
+    }
+
+    /// The failure this guards: `OpenAI` names the same two counts differently,
+    /// so a sniffer that knew only Anthropic's names recorded every `OpenAI` call
+    /// as zero — a spend figure that under-reported instead of erroring.
+    #[test]
+    fn an_openai_reply_reports_its_usage_under_its_own_names() {
+        let mut s = Sniffer::new(Some("application/json"));
+        s.feed(br#"{"model":"gpt-5.6-luna","usage":{"prompt_tokens":25,"#);
+        s.feed(br#""completion_tokens":4,"total_tokens":29}}"#);
+        let (model, t) = s.finish();
+        assert_eq!(model.as_deref(), Some("gpt-5.6-luna"));
+        assert_eq!(t.input, 25);
+        assert_eq!(t.output, 4);
+        assert_eq!(t.total(), 29);
+    }
+
+    /// The streaming case: `OpenAI` puts the counts in a final chunk, and the
+    /// `include_usage` flag is what makes it send them at all.
+    #[test]
+    fn an_openai_stream_takes_usage_from_its_final_chunk() {
+        let mut s = Sniffer::new(Some("text/event-stream"));
+        s.feed(b"data: {\"model\":\"gpt-5.6-luna\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n");
+        s.feed(br#"data: {"model":"gpt-5.6-luna","choices":[],"usage":{"prompt_tokens":25,"completion_tokens":4,"total_tokens":29}}"#);
+        s.feed(b"\n\n");
+        s.feed(b"data: [DONE]\n\n");
+        let (model, t) = s.finish();
+        assert_eq!(model.as_deref(), Some("gpt-5.6-luna"));
+        assert_eq!(t.input, 25);
+        assert_eq!(t.output, 4);
+    }
+
+    /// The failure this guards: `message_delta` repeats a RUNNING output total,
+    /// so summing the deltas reports several times the tokens actually billed.
+    #[test]
+    fn a_streamed_reply_takes_the_last_running_total_not_their_sum() {
+        let mut s = Sniffer::new(Some("text/event-stream"));
+        s.feed(b"event: message_start\n");
+        s.feed(br#"data: {"type":"message_start","message":{"model":"claude-opus-5","usage":{"input_tokens":100,"cache_read_input_tokens":7}}}"#);
+        s.feed(b"\n\n");
+        for running in [10u64, 25, 40] {
+            s.feed(
+                format!("data: {{\"type\":\"message_delta\",\"usage\":{{\"output_tokens\":{running}}}}}\n\n")
+                    .as_bytes(),
+            );
+        }
+        s.feed(b"data: [DONE]\n\n");
+        let (model, t) = s.finish();
+        assert_eq!(model.as_deref(), Some("claude-opus-5"));
+        assert_eq!(t.input, 100);
+        assert_eq!(t.cache_read, 7);
+        assert_eq!(t.output, 40, "the last running total, not 10+25+40");
+    }
+
+    /// A chunk boundary can fall anywhere, including mid-token of the JSON.
+    #[test]
+    fn sse_frames_split_across_chunks_still_parse() {
+        let mut s = Sniffer::new(Some("text/event-stream"));
+        let frame = br#"data: {"type":"message_delta","usage":{"output_tokens":99}}"#;
+        for byte in frame {
+            s.feed(&[*byte]);
+        }
+        s.feed(b"\n");
+        assert_eq!(s.finish().1.output, 99);
+    }
+
+    #[test]
+    fn a_long_stream_does_not_accumulate_memory() {
+        let mut s = Sniffer::new(Some("text/event-stream"));
+        for _ in 0..2000 {
+            s.feed(br#"data: {"type":"content_block_delta","delta":{"text":"................"}}"#);
+            s.feed(b"\n");
+        }
+        assert!(s.pending.len() < 1024, "processed lines must be dropped, not buffered");
+    }
+
+    #[test]
+    fn usage_is_bucketed_by_hour_and_attributed_per_account() {
+        let mut s = Store::load(tmp("bucket"));
+        s.record(
+            "ada",
+            Some("claude-opus-5"),
+            Tokens {
+                input: 10,
+                output: 5,
+                ..Tokens::default()
+            },
+            true,
+            None,
+        );
+        s.record(
+            "ada",
+            Some("claude-opus-5"),
+            Tokens {
+                input: 3,
+                output: 1,
+                ..Tokens::default()
+            },
+            true,
+            None,
+        );
+        s.record("grace", Some("claude-haiku-4-5"), Tokens::default(), false, None);
+
+        let (calls, errors, t) = s.totals("ada", all());
+        assert_eq!((calls, errors), (2, 0));
+        assert_eq!((t.input, t.output), (13, 6));
+        // The whole point: one person's spend is not another's.
+        let (gcalls, gerrors, gt) = s.totals("grace", all());
+        assert_eq!(
+            (gcalls, gerrors),
+            (1, 1),
+            "a refused call counts as a call and an error"
+        );
+        assert!(gt.is_zero());
+
+        let ada = s.for_account("ada").expect("ada");
+        assert_eq!(ada.buckets.len(), 1, "two calls in the same hour share a bucket");
+        assert_eq!(ada.by_model.get("claude-opus-5").map(Tokens::total), Some(19));
+    }
+
+    /// A charge is kept as it was charged, and adds up across hours.
+    ///
+    /// The point of storing it: the amount is decided once, by the caller that
+    /// saw the request, and this store only carries it. Nothing here can consult
+    /// a rate table, so nothing here can re-price an hour later — which is what
+    /// makes a month of history stable while the price list moves under it.
+    #[test]
+    fn a_charge_is_kept_as_recorded_and_sums_across_hours() {
+        let mut s = Store::load(tmp("cost"));
+        let spend = Tokens {
+            input: 10,
+            output: 5,
+            ..Tokens::default()
+        };
+
+        s.record(
+            "ada",
+            Some("claude-opus-5"),
+            spend,
+            true,
+            Some(Cost {
+                in_micro: 100,
+                out_micro: 40,
+            }),
+        );
+        // A refused call carries no tokens and so no charge; it must not create
+        // a priced hour out of nothing.
+        s.record(
+            "ada",
+            Some("claude-opus-5"),
+            Tokens::default(),
+            false,
+            Some(Cost {
+                in_micro: 999,
+                out_micro: 999,
+            }),
+        );
+
+        // The span is hour-aligned, like every span the store is asked for.
+        // Buckets are keyed by the hour that *contains* the call, so a span of a
+        // few seconds around "now" misses the very bucket the call was filed in
+        // whenever the clock is not near the top of the hour — which is almost
+        // always. The first version of this test did exactly that.
+        let total = s.cost_total("ada", hours(1));
+        let total = total.expect("the hour carries a charge");
+        assert_eq!(
+            (total.in_micro, total.out_micro),
+            (100, 40),
+            "the refused call contributed nothing"
+        );
+
+        // An hour outside the span is not counted, so a window means what it says.
+        let future = hours(1);
+        let elsewhere = s.cost_total(
+            "ada",
+            Span {
+                first: future.last + HOUR,
+                last: future.last + 2 * HOUR,
+            },
+        );
+        assert_eq!(elsewhere, None, "no hour in that span was charged");
+
+        // And an account with no charged hours is unpriced, not free: the caller
+        // needs to tell "cost nothing" from "no amount was ever recorded".
+        assert_eq!(s.cost_total("grace", hours(24)), None);
+    }
+
+    /// A total that overflows must stop, not wrap into a negative bill.
+    #[test]
+    fn a_cost_total_saturates_rather_than_wrapping() {
+        let mut total = Cost {
+            in_micro: i128::MAX,
+            out_micro: i128::MIN,
+        };
+        total.add(Cost {
+            in_micro: 1_000,
+            out_micro: -1_000,
+        });
+        assert_eq!(total.in_micro, i128::MAX, "clamped at the ceiling");
+        assert_eq!(total.out_micro, i128::MIN, "clamped at the floor");
+    }
+
+    /// Which model was billed, hour by hour — not just in the all-time total.
+    ///
+    /// Model fallback means the model asked for and the model charged can
+    /// differ, so "how much did we spend" is only half an answer without it.
+    #[test]
+    fn each_hour_records_which_model_was_billed() {
+        let mut s = Store::load(tmp("models"));
+        let opus = Tokens {
+            input: 1_000,
+            output: 500,
+            ..Tokens::default()
+        };
+        let haiku = Tokens {
+            input: 200,
+            output: 100,
+            ..Tokens::default()
+        };
+        s.record("ada", Some("claude-opus-5"), opus, true, None);
+        s.record("ada", Some("claude-haiku-4-5"), haiku, true, None);
+        s.record("ada", Some("claude-haiku-4-5"), haiku, true, None);
+
+        let bucket = &s.for_account("ada").expect("ada").buckets[0];
+        assert_eq!(bucket.calls, 3);
+        assert_eq!(bucket.by_model.len(), 2, "both models must appear in the hour");
+        assert_eq!(bucket.by_model["claude-opus-5"].total(), 1_500);
+        assert_eq!(
+            bucket.by_model["claude-haiku-4-5"].total(),
+            600,
+            "two haiku calls summed"
+        );
+        // The hour's total still agrees with the split.
+        let summed: u64 = bucket.by_model.values().map(Tokens::total).sum();
+        assert_eq!(summed, bucket.tokens.total());
+
+        // And the series carries it, so a chart can break the hour down.
+        let series = s.series("ada", hours(2));
+        let last = series.last().expect("current hour");
+        assert_eq!(last.by_model.len(), 2);
+    }
+
+    #[test]
+    fn the_series_is_dense_so_idle_hours_are_visible() {
+        let mut s = Store::load(tmp("dense"));
+        s.record(
+            "ada",
+            None,
+            Tokens {
+                input: 1,
+                ..Tokens::default()
+            },
+            true,
+            None,
+        );
+        let series = s.series("ada", hours(24));
+        assert_eq!(series.len(), 24, "a fixed-width window, gaps included");
+        assert_eq!(series.last().map(|b| b.calls), Some(1), "now is the last bucket");
+        assert!(
+            series[..23].iter().all(|b| b.calls == 0),
+            "quiet hours must be zeroes, not missing"
+        );
+        // Ascending, so a chart can plot it without sorting.
+        assert!(series.windows(2).all(|w| w[0].hour < w[1].hour));
+    }
+
+    /// The charge has to reach the series, because that is what the chart plots.
+    ///
+    /// `cost_total` reads every bucket off the account directly and was always
+    /// right, which is what hid this: the dense series copied calls, tokens and
+    /// models but never the charge, so the per-hour rows the panel draws carried
+    /// no cost and the money graph stayed empty however much had been spent.
+    /// Nothing else failed — no error, no missing hour — which is why it read as
+    /// "the API does not return the billed prices".
+    #[test]
+    fn the_series_carries_the_charge_the_chart_plots() {
+        let mut s = Store::load(tmp("series-cost"));
+        s.record(
+            "ada",
+            Some("m"),
+            Tokens {
+                input: 10,
+                output: 5,
+                ..Tokens::default()
+            },
+            true,
+            Some(Cost {
+                in_micro: 1,
+                out_micro: 4,
+            }),
+        );
+
+        let series = s.series("ada", hours(24));
+        assert_eq!(
+            series.last().and_then(|b| b.cost),
+            Some(Cost {
+                in_micro: 1,
+                out_micro: 4
+            }),
+            "the hour's charge must reach the series, or the money graph is blank"
+        );
+        // The two readings agree, where before only the series had lost it.
+        assert_eq!(
+            s.cost_total("ada", hours(24)),
+            Some(Cost {
+                in_micro: 1,
+                out_micro: 4
+            })
+        );
+        // And an idle hour stays unpriced rather than becoming free.
+        assert!(series[..23].iter().all(|b| b.cost.is_none()));
+    }
+
+    #[test]
+    fn history_survives_a_reload_and_deletion_forgets_it() {
+        let path = tmp("persist");
+        let mut s = Store::load(&path);
+        s.record(
+            "ada",
+            Some("m"),
+            Tokens {
+                input: 7,
+                ..Tokens::default()
+            },
+            true,
+            None,
+        );
+        s.save().expect("save");
+
+        let mut reloaded = Store::load(&path);
+        assert_eq!(reloaded.totals("ada", all()).2.input, 7);
+        reloaded.forget("ada");
+        assert!(reloaded.for_account("ada").is_none());
+        assert!(Store::load(&path).for_account("ada").is_none(), "and it stays gone");
+        assert!(
+            !path.join("ada").exists(),
+            "the account's directory goes with it — otherwise 'forget' leaves the \
+             history on disk under an id nothing refers to any more"
+        );
+    }
+
+    /// A directory per account, a file per UTC day.
+    #[test]
+    fn each_account_gets_a_folder_and_each_day_a_file() {
+        let root = tmp("layout");
+        let mut s = Store::load(&root);
+        s.record(
+            "ada",
+            Some("claude-opus-5"),
+            Tokens {
+                input: 5,
+                ..Tokens::default()
+            },
+            true,
+            None,
+        );
+        s.record(
+            "grace",
+            Some("claude-haiku-4-5"),
+            Tokens {
+                input: 3,
+                ..Tokens::default()
+            },
+            true,
+            None,
+        );
+        s.save().expect("save");
+
+        let today = day_of(hour_of(now_secs()));
+        for who in ["ada", "grace"] {
+            let f = root.join(who).join(format!("{today}_usage.json"));
+            assert!(f.is_file(), "expected {}", f.display());
+        }
+
+        // One account's traffic must not rewrite another's file — that is the
+        // point of splitting them.
+        let ada = std::fs::read_to_string(root.join("ada").join(format!("{today}_usage.json"))).expect("read");
+        assert!(ada.contains("claude-opus-5"));
+        assert!(
+            !ada.contains("claude-haiku-4-5"),
+            "grace's models must not be in ada's file"
+        );
+
+        // A day file is self-describing when read on its own.
+        let doc: AccountUsage = serde_json::from_str(&ada).expect("parse day");
+        assert_eq!(doc.by_model["claude-opus-5"].total(), 5);
+
+        let back = Store::load(&root);
+        assert_eq!(back.totals("ada", all()).2.input, 5);
+        assert_eq!(back.totals("grace", all()).2.input, 3);
+    }
+
+    /// Dates come from the bucket's own hour, and ids never leave the root.
+    #[test]
+    fn the_day_name_is_the_buckets_utc_date() {
+        assert_eq!(day_of(0), "1970-01-01");
+        assert_eq!(day_of(1_709_164_800), "2024-02-29");
+        assert_eq!(day_of(1_757_320_000 - (1_757_320_000 % 3600)), "2025-09-08");
+        // The id becomes a directory name, so it is verified rather than
+        // trusted — a path built from a stored value is where traversal creeps
+        // in, even when we minted the value ourselves.
+        assert!(safe_id("6f1e4b2a-0000-4000-8000-000000000000"));
+        assert!(!safe_id("../etc"));
+        assert!(!safe_id("a/b"));
+        assert!(!safe_id(""));
+    }
+
+    /// Accounting must never be able to stop the proxy serving.
+    #[test]
+    fn a_corrupt_usage_file_is_survivable() {
+        let root = tmp("corrupt");
+        // One damaged day, and one good one, for the same account.
+        let dir = root.join("ada");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(dir.join("2026-09-07_usage.json"), "{not json").expect("write bad");
+        std::fs::write(
+            dir.join("2026-09-08_usage.json"),
+            r#"{"buckets":[{"hour":1757289600,"calls":2,"input":9}],"by_model":{}}"#,
+        )
+        .expect("write good");
+
+        let s = Store::load(&root);
+        // The good day still loads: one bad file must not cost the history.
+        assert_eq!(s.totals("ada", all()).0, 2, "the intact day should still be there");
+        assert!(
+            dir.join("2026-09-07_usage.json.corrupt").exists(),
+            "the damaged file is kept for inspection, not deleted"
+        );
+        assert!(!dir.join("2026-09-07_usage.json").exists());
+    }
+}

@@ -1,0 +1,1594 @@
+// SPDX-License-Identifier: MPL-2.0
+
+//! Accounts and their keys — what replaced the single relay token.
+//!
+//! One shared secret for a whole fleet answers no useful question. It cannot
+//! say who spent the quota, it cannot be taken away from one laptop without
+//! re-keying every other, and a machine that leaves keeps working. An account
+//! per person, with a key per account, answers all three.
+//!
+//! # Why keys are stored hashed
+//!
+//! A key here is 32 bytes straight from the CSPRNG, so there is no dictionary
+//! to run against a hash of it: the only attack is exhaustive search of a
+//! 256-bit space. That is why plain SHA-256 is the right choice and a slow KDF
+//! (argon2, bcrypt) is not — those exist to make *low-entropy human passwords*
+//! expensive to guess, and buy nothing against a random token while costing
+//! real latency on every single proxied request.
+//!
+//! The consequence is deliberate: a key is displayed once, when it is minted,
+//! and never again. The store cannot show it to you later because it does not
+//! have it. Lost key → rotate.
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+/// Prefix on every minted key, so one is recognisable in a log or an env var
+/// and greppable when it leaks.
+pub const KEY_PREFIX: &str = "tap_";
+
+/// How many sessions one key remembers.
+///
+/// Five is measured, not chosen: a single install in this fleet has held five
+/// concurrent sessions, so anything smaller would evict a tab that is still
+/// running. This bounds a burst; [`SESSION_TTL_SECS`] is what actually bounds
+/// the file.
+pub const SESSIONS_KEPT: usize = 5;
+
+/// How long a session stays worth showing.
+///
+/// A day answers "what is this key running right now" and no more. The point is
+/// to find the tab using a key, not to keep a history of every one it has ever
+/// opened — the same restraint the address beside it argues for.
+pub const SESSION_TTL_SECS: u64 = 24 * 60 * 60;
+
+/// What the client says about itself, unpacked from the body's `metadata`.
+///
+/// Claude Code sends `metadata.user_id` as a STRING holding a JSON document,
+/// so reading it is a parse of a parse:
+///
+/// ```text
+/// {"metadata": {"user_id": "{\"device_id\":\"323056…\",\"account_uuid\":\"\",\"session_id\":\"a3412ddb-…\"}"}}
+/// ```
+///
+/// That shape is Anthropic's doing, not the client's: every `metadata` value
+/// has to be a string, so a structured value has nowhere to go but inside one.
+/// It is unpacked rather than left as one opaque blob because the parts answer
+/// different questions, and a reader who has to decode base64-ish nesting by
+/// eye will not bother.
+///
+/// All three fields are optional and an empty string counts as absent: the
+/// client sends `account_uuid: ""` when nobody is logged in, and rendering that
+/// as a value would state something the wire did not.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Client {
+    /// Stable per install. Answers "same machine, or two?".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
+    /// Per conversation, which is what makes one tab distinguishable from the
+    /// four others running beside it on the same key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// The account the CLIENT is logged into. Frequently empty, and unrelated
+    /// to this proxy's own accounts — it is Anthropic's, seen from the far
+    /// side, and useful mainly for spotting a session running under a login
+    /// nobody expected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_uuid: Option<String>,
+}
+
+impl Client {
+    /// Whether this says anything at all.
+    ///
+    /// A parsed-but-blank `metadata` is not a sighting. Storing it would put an
+    /// empty row in a key's history and make "we were told nothing" read the
+    /// same as "we were told nothing was there".
+    #[must_use]
+    pub fn is_meaningful(&self) -> bool {
+        self != &Self::default()
+    }
+
+    /// Unpack the JSON string that `metadata.user_id` holds.
+    ///
+    /// Returns `None` rather than an all-empty `Client` when there is nothing
+    /// to report, so a caller can store the absence instead of a blank row.
+    #[must_use]
+    pub fn from_user_id(user_id: &str) -> Option<Self> {
+        let parsed: serde_json::Value = serde_json::from_str(user_id).ok()?;
+        // Empty means absent: `account_uuid` is routinely `""` for a session
+        // that is not logged in, and treating that as a value would report a
+        // logged-out tab as belonging to an account named nothing.
+        let field = |key: &str| {
+            parsed
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+        };
+        let client = Self {
+            device_id: field("device_id"),
+            session_id: field("session_id"),
+            account_uuid: field("account_uuid"),
+        };
+        client.is_meaningful().then_some(client)
+    }
+
+    /// The same, from an already-parsed body.
+    ///
+    /// `user_id` is itself a JSON string holding a JSON object, which is why
+    /// this is a two-step unpack and not a field read.
+    #[must_use]
+    pub fn from_body(body: &serde_json::Value) -> Option<Self> {
+        Self::from_user_id(body.get("metadata")?.get("user_id")?.as_str()?)
+    }
+}
+
+/// Just enough of a body to reach `metadata.user_id`.
+///
+/// Deserialising the whole body into a `Value` materialises every message — a
+/// megabyte of transcript on a classifier request — for one small string near
+/// the front. A shape that stops at the field we want lets serde skip the rest,
+/// which matters because this runs on every request rather than only while a
+/// capture is armed. Unknown fields are ignored, which is serde's default.
+#[derive(Deserialize)]
+struct BodyMetadata {
+    #[serde(default)]
+    metadata: Option<MetadataField>,
+}
+
+#[derive(Deserialize)]
+struct MetadataField {
+    #[serde(default)]
+    user_id: Option<String>,
+}
+
+/// Read the client identity out of a request body.
+///
+/// A shallow parse of the whole body, not the bounded prefix scan this used to
+/// claim. `metadata` sits AFTER `messages` on the wire — measured: `messages`
+/// at byte 102, `metadata` at 662,185 in a real Claude Code request — so a scan
+/// stopping at `messages` would never find it, and the feature would silently
+/// never record anything. `serde_json` skips over the conversations inside
+/// `messages` without building values for them, which is what keeps this
+/// affordable on a body that can be most of a megabyte.
+///
+/// Returns `None` for a body that is not JSON, carries no `metadata`, or names
+/// nothing — the same absence [`Client::from_user_id`] reports, so callers have
+/// one case to handle rather than three.
+#[must_use]
+pub fn metadata_client(body: &[u8]) -> Option<Client> {
+    let meta: BodyMetadata = serde_json::from_slice(body).ok()?;
+    Client::from_user_id(meta.metadata?.user_id.as_deref()?)
+}
+
+/// One Claude Code session seen using a key.
+///
+/// `device_id` and `session_id` answer different questions, and the UI shows
+/// them at the two levels they belong to: a device is a machine, a session is
+/// one tab on it. A machine running three tabs is one device with three
+/// sessions — which is the distinction "what is this person running" needs, and
+/// the one a flat list of ids loses.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Session {
+    /// The identity. Without it there is nothing to tell one tab from another,
+    /// so a sighting that names no session is not recorded.
+    pub session_id: String,
+    /// The machine, when the client named one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_uuid: Option<String>,
+    pub first_seen_at: u64,
+    pub last_seen_at: u64,
+}
+
+/// One credential belonging to an account.
+///
+/// A person has several: a laptop, a CI runner, a fleet worker. That is not a
+/// convenience — it is what makes revocation usable. With one key per person,
+/// losing a laptop means re-keying everything that person runs; with a key per
+/// place, it means deleting one row and leaving the rest working.
+///
+/// The dates and the address describe THE KEY, not the person, which is the
+/// only level at which they mean anything: "last used from 203.0.113.7" says
+/// nothing if three keys share an account.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Key {
+    pub id: String,
+    /// What it is for — `laptop`, `ci`, `fleet`. The reason multiple keys are
+    /// manageable at all: an unnamed list of hashes cannot be revoked with any
+    /// confidence about what will break.
+    pub name: String,
+    /// Hex SHA-256. The key itself is shown once, at creation, and never
+    /// stored.
+    pub hash: String,
+    pub created_at: u64,
+    /// Issued and never used is the state worth seeing: either someone never
+    /// took up their access, or the key went astray on the way to them.
+    #[serde(default)]
+    pub first_used_at: Option<u64>,
+    #[serde(default)]
+    pub last_used_at: Option<u64>,
+    /// One address, not a history: enough to notice a key being used from
+    /// somewhere it should not be, without turning the file into a movement
+    /// log of the people using it.
+    #[serde(default)]
+    pub last_used_ip: Option<String>,
+    /// The sessions seen on this key, newest first.
+    ///
+    /// The address above says a key was used; this says by which tab, which the
+    /// address cannot answer when five of them share one key. Bounded twice
+    /// over — see [`SESSIONS_KEPT`] and [`SESSION_TTL_SECS`] — and absent from a
+    /// key whose client sends no `metadata`, so a store written before this
+    /// existed loads unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sessions: Vec<Session>,
+    /// Refused without being deleted, so the name stays attached to past use.
+    #[serde(default)]
+    pub disabled: bool,
+}
+
+impl Key {
+    #[must_use]
+    pub const fn active(&self) -> bool {
+        !self.disabled && !self.hash.is_empty()
+    }
+
+    /// Record a sighting, and report whether anything changed enough to write.
+    ///
+    /// `true` for a session never seen here, and for one whose `last_seen_at`
+    /// had gone stale, so ordinary traffic from an already-known tab writes
+    /// nothing — the same coalescing the address above gets, and for the same
+    /// reason: otherwise every proxied request rewrites the file. A known
+    /// session is still refreshed in memory; only the write is deferred.
+    fn remember_session(&mut self, client: Option<&Client>, now: u64) -> bool {
+        self.prune_sessions(now);
+        // A caller with no `metadata`, or one naming a device but no session,
+        // still gets the pruning above — a sighting is a sighting even when it
+        // carries nothing, and an expired tab should not outlive it. Neither is
+        // an event worth a write.
+        let Some(client) = client.filter(|c| c.is_meaningful()) else {
+            return false;
+        };
+        let Some(session_id) = client.session_id.as_deref() else {
+            return false;
+        };
+        if let Some(seen) = self.sessions.iter_mut().find(|s| s.session_id == session_id) {
+            let stale = now.saturating_sub(seen.last_seen_at) >= 60;
+            // `max`, not assignment: this is a record of the *latest* time we
+            // saw the tab, and the clock is not guaranteed monotonic — an NTP
+            // correction, or a sighting that arrives out of order, must not
+            // rewind it. Expiry is computed from this field, so a rewind would
+            // expire a tab early, and the sort order is this field too.
+            seen.last_seen_at = seen.last_seen_at.max(now);
+            // A device id that only arrives on later requests is still worth
+            // keeping: the client is not obliged to send it every time.
+            if seen.device_id.is_none() {
+                seen.device_id.clone_from(&client.device_id);
+            }
+            seen.account_uuid = seen.account_uuid.take().or_else(|| client.account_uuid.clone());
+            return stale;
+        }
+        self.sessions.push(Session {
+            session_id: session_id.to_owned(),
+            device_id: client.device_id.clone(),
+            account_uuid: client.account_uuid.clone(),
+            first_seen_at: now,
+            last_seen_at: now,
+        });
+        self.prune_sessions(now);
+        true
+    }
+
+    /// Drop what nobody has used for a day, then keep the newest few.
+    ///
+    /// Sorting before truncating is what makes the eviction least-recently-used
+    /// rather than "whichever was pushed first", so a tab that is still active
+    /// cannot be evicted by a burst of short-lived ones.
+    fn prune_sessions(&mut self, now: u64) {
+        self.sessions
+            .retain(|s| now.saturating_sub(s.last_seen_at) < SESSION_TTL_SECS);
+        self.sessions.sort_by_key(|s| std::cmp::Reverse(s.last_seen_at));
+        self.sessions.truncate(SESSIONS_KEPT);
+    }
+}
+
+/// A person who may use the proxy.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Account {
+    pub id: String,
+    pub first_name: String,
+    pub last_name: String,
+    pub email: String,
+    pub created_at: u64,
+    /// Every credential this person holds. See [`Key`].
+    #[serde(default)]
+    pub keys: Vec<Key>,
+    /// The single key this account used to have, read once and folded into
+    /// `keys` on load. Never written again.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub key_hash: String,
+    /// Provenance that used to live on the account, when there was one key.
+    /// Read once during migration and then written on the key instead, where
+    /// it means something.
+    #[serde(default, rename = "first_used_at", skip_serializing_if = "Option::is_none")]
+    pub legacy_first_used_at: Option<u64>,
+    #[serde(default, rename = "last_used_at", skip_serializing_if = "Option::is_none")]
+    pub legacy_last_used_at: Option<u64>,
+    #[serde(default, rename = "last_used_ip", skip_serializing_if = "Option::is_none")]
+    pub legacy_last_used_ip: Option<String>,
+    /// Suspends the WHOLE account, whatever its keys say. Distinct from
+    /// disabling one key: this is "this person is out", not "that laptop is
+    /// gone".
+    #[serde(default)]
+    pub disabled: bool,
+    /// Share of the upstream quota under contention, relative to everyone
+    /// else's. 1 unless someone decided otherwise; see [`crate::qos`].
+    ///
+    /// It only matters when capacity binds — with spare quota a weight-1
+    /// account still gets everything it asks for, because the scheduler is
+    /// work-conserving.
+    #[serde(default = "default_weight")]
+    pub weight: u32,
+    /// How much of an old conversation is elided before this person's request
+    /// goes out — see [`crate::compact`] and `docs/proxy-compaction.md`.
+    ///
+    /// PER PERSON, not per provider. It looks like a property of the hop
+    /// because the harm it can do is a property of the hop, but the operator
+    /// reasoning about it is looking at a person: "Mallory is costing us a
+    /// fortune in context she has already stopped needing". The hop is then an
+    /// implementation detail the routing decides, and the pass handles that —
+    /// see [`crate::compact`] on why it declines to act on the subscription.
+    #[serde(default)]
+    pub compact: crate::compact::Compact,
+    /// Which tools this person's requests may carry — see [`crate::tools`]
+    /// and `docs/proxy-tools.md`.
+    ///
+    /// PER PERSON like `compact` above, and for the same reason. The policy
+    /// reads like a property of the hop, but the person asking for it is
+    /// thinking about a colleague: "the reviewer's agent should not be able
+    /// to push", "this box gets no web tools". Which provider carries it is
+    /// then the routing's business, not the policy's.
+    #[serde(default)]
+    pub tools: crate::tools::Policy,
+    /// Pin every request from this account to one provider, by id.
+    ///
+    /// `None` — the default — means the usual routing, where the proxy picks
+    /// from everything configured. A pin is for the cases routing cannot know
+    /// about: work that must not leave a jurisdiction, a contractor whose
+    /// usage has to land on a particular invoice, a person whose experiments
+    /// have no business spending the shared subscription.
+    ///
+    /// It is enforced, not preferred: an account pinned to a provider that is
+    /// disabled or out of capacity gets a 503 rather than a quiet fall back to
+    /// the thing the operator was keeping it away from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// Pin every request from this account to one model, by id.
+    ///
+    /// PER PERSON like `compact` and `tools`. A model pin is the finer half of
+    /// the `provider` pin above: the provider says where the traffic lands, the
+    /// model says what serves it. Held by id rather than by class because the
+    /// operator choosing it is picking a model, not expressing a preference the
+    /// router should be free to reinterpret.
+    ///
+    /// It does NOT rename the model inside a request body on its own — routing
+    /// resolves the id to the provider that serves it and the usual rename in
+    /// `shape_body` follows from that. An id no configured provider serves
+    /// therefore fails to route, which is the same "enforced, not preferred"
+    /// contract as [`Self::provider`].
+    ///
+    /// Nothing here decides whether tools may ride along. The same pair of
+    /// fields does: pin a model that uses tools with `tools.mode = none` and
+    /// the tools are stripped, leaving the model's own reasoning intact — see
+    /// [`crate::tools`]. That is why this is a plain id and not an enum.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+/// Normal, on the scale the UI presents.
+///
+/// 5 rather than 1 so there is room BELOW the default: a CI account or a
+/// backlog-grinding fleet should be able to yield to people without everyone
+/// else having to be promoted. A scale whose default is also its floor can
+/// only express "raise someone", which is the same decision seen from the
+/// wrong end.
+///
+/// The ladder the UI offers is 1 / 2 / 5 / 10 / 20 / 50 — roughly geometric,
+/// so each step is a real difference rather than a rounding one. Any value in
+/// 1..=100 is accepted; the API is not restricted to the ladder.
+pub const NORMAL_WEIGHT: u32 = 5;
+
+const fn default_weight() -> u32 {
+    NORMAL_WEIGHT
+}
+
+impl Account {
+    #[must_use]
+    pub fn display_name(&self) -> String {
+        let full = format!("{} {}", self.first_name.trim(), self.last_name.trim());
+        let full = full.trim().to_owned();
+        if full.is_empty() { self.email.clone() } else { full }
+    }
+
+    /// Usable right now: not suspended, and holding at least one live key.
+    #[must_use]
+    pub fn active(&self) -> bool {
+        !self.disabled && self.keys.iter().any(Key::active)
+    }
+
+    /// Fold a pre-multi-key account into one named key.
+    ///
+    /// Called on load so an upgrade keeps working: the old single hash becomes
+    /// a key called `default`, carrying the provenance that used to sit on the
+    /// account. Doing this at the boundary means nothing below has to know the
+    /// old shape ever existed.
+    fn migrate_single_key(&mut self) {
+        if self.key_hash.is_empty() {
+            return;
+        }
+        if !self.keys.iter().any(|k| k.hash == self.key_hash) {
+            self.keys.push(Key {
+                id: uuid::Uuid::new_v4().to_string(),
+                name: "default".to_owned(),
+                hash: std::mem::take(&mut self.key_hash),
+                created_at: self.created_at,
+                first_used_at: self.legacy_first_used_at,
+                last_used_at: self.legacy_last_used_at,
+                last_used_ip: self.legacy_last_used_ip.take(),
+                disabled: false,
+                // A key that predates session tracking has no sessions to carry
+                // over; it will acquire them on its next request.
+                sessions: Vec::new(),
+            });
+        }
+        self.key_hash = String::new();
+    }
+}
+
+/// What the account file holds. A struct rather than a bare list so a future
+/// field (quotas, groups) does not need a migration.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct Doc {
+    #[serde(default)]
+    accounts: Vec<Account>,
+}
+
+/// The account store, backed by a JSON file.
+#[derive(Debug)]
+pub struct Store {
+    path: PathBuf,
+    accounts: Vec<Account>,
+    /// hash → index, rebuilt on load and after every mutation. Authentication
+    /// happens on every proxied request; a linear scan over the accounts would
+    /// also make the comparison's cost depend on position in the file.
+    by_hash: BTreeMap<String, (usize, usize)>,
+}
+
+/// Why a mutation was refused. Callers turn these into an exit code or an HTTP
+/// status, so the distinction has to survive out of here.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Error {
+    NotFound(String),
+    DuplicateEmail(String),
+    DuplicateKeyName(String),
+    InvalidEmail(String),
+    MissingName,
+    Io(String),
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound(who) => write!(f, "no such account: {who}"),
+            Self::DuplicateEmail(e) => write!(f, "an account already uses {e}"),
+            Self::DuplicateKeyName(n) => write!(f, "this account already has a key named {n}"),
+            Self::InvalidEmail(e) => write!(f, "not an email address: {e}"),
+            Self::MissingName => write!(f, "first and last name are both required"),
+            Self::Io(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
+
+#[must_use]
+pub fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// Hex SHA-256 — how a key is compared against the file.
+#[must_use]
+pub fn hash_key(key: &str) -> String {
+    use std::fmt::Write as _;
+    let digest = Sha256::digest(key.as_bytes());
+    let mut out = String::with_capacity(64);
+    for b in digest {
+        let _ = write!(&mut out, "{b:02x}");
+    }
+    out
+}
+
+/// 32 CSPRNG bytes, hex, behind [`KEY_PREFIX`].
+///
+/// Reads `/dev/urandom` directly and exits rather than falling back to
+/// anything weaker: a guessable key on a credential proxy is worse than a
+/// process that refuses to start.
+#[must_use]
+pub fn mint_key() -> String {
+    use std::fmt::Write as _;
+    use std::io::Read as _;
+    let mut buf = [0u8; 32];
+    match std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut buf)) {
+        Ok(()) => {}
+        Err(e) => {
+            eprintln!("fatal: cannot read /dev/urandom to mint a key: {e}");
+            std::process::exit(1);
+        }
+    }
+    let mut out = String::with_capacity(KEY_PREFIX.len() + 64);
+    out.push_str(KEY_PREFIX);
+    for b in &buf {
+        let _ = write!(&mut out, "{b:02x}");
+    }
+    out
+}
+
+/// Constant-time compare, so a wrong key cannot be improved a byte at a time
+/// by timing the answer.
+#[must_use]
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// The shape an email has to have to be stored. Deliberately not RFC 5322:
+/// this is a typo guard for an operator typing on a CLI, not an authority on
+/// what an address may contain, and a strict parser here would reject valid
+/// addresses for no gain.
+fn email_ok(email: &str) -> bool {
+    let email = email.trim();
+    if email.len() < 3 || email.contains(char::is_whitespace) {
+        return false;
+    }
+    let mut parts = email.split('@');
+    let (Some(local), Some(domain), None) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    !local.is_empty() && domain.contains('.') && !domain.starts_with('.') && !domain.ends_with('.')
+}
+
+impl Store {
+    /// Load the store, or start an empty one if the file is not there yet.
+    ///
+    /// # Errors
+    /// Unreadable or malformed file. A malformed file is NOT silently replaced
+    /// with an empty one — that would revoke every account on a typo.
+    pub fn load(path: impl Into<PathBuf>) -> Result<Self, Error> {
+        let path = path.into();
+        let accounts = match std::fs::read_to_string(&path) {
+            Ok(raw) if raw.trim().is_empty() => Vec::new(),
+            Ok(raw) => {
+                serde_json::from_str::<Doc>(&raw)
+                    .map_err(|e| Error::Io(format!("{} is not valid account JSON: {e}", path.display())))?
+                    .accounts
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => return Err(Error::Io(format!("read {}: {e}", path.display()))),
+        };
+        let mut store = Self {
+            path,
+            accounts,
+            by_hash: BTreeMap::new(),
+        };
+        // Fold any pre-multi-key account into one named key before anything
+        // else looks at it.
+        for a in &mut store.accounts {
+            a.migrate_single_key();
+        }
+        store.reindex();
+        Ok(store)
+    }
+
+    fn reindex(&mut self) {
+        self.by_hash = self
+            .accounts
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| !a.disabled)
+            .flat_map(|(ai, a)| {
+                a.keys
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, k)| k.active())
+                    .map(move |(ki, k)| (k.hash.clone(), (ai, ki)))
+            })
+            .collect();
+    }
+
+    #[must_use]
+    pub fn accounts(&self) -> &[Account] {
+        &self.accounts
+    }
+
+    /// The account a key belongs to, if it is live.
+    ///
+    /// The map lookup finds the candidate; the constant-time compare is what
+    /// decides. Looking up by hash first means an attacker learns nothing from
+    /// how long a rejection took, because a wrong key simply is not in the map.
+    #[must_use]
+    pub fn authenticate(&self, key: &str) -> Option<&Account> {
+        self.authenticate_key(key).map(|(a, _)| a)
+    }
+
+    /// The account AND which of its keys was used.
+    ///
+    /// Callers that record anything want the key, not just the person: usage
+    /// is billed to the account, but "last used, and from where" belongs to
+    /// the credential that was actually presented.
+    #[must_use]
+    pub fn authenticate_key(&self, key: &str) -> Option<(&Account, &Key)> {
+        let hash = hash_key(key);
+        let (ai, ki) = *self.by_hash.get(&hash)?;
+        let account = self.accounts.get(ai)?;
+        let k = account.keys.get(ki)?;
+        (!account.disabled && k.active() && constant_time_eq(k.hash.as_bytes(), hash.as_bytes()))
+            .then_some((account, k))
+    }
+
+    /// Find by id, or by email, or by unique case-insensitive name fragment.
+    #[must_use]
+    pub fn find(&self, who: &str) -> Option<&Account> {
+        let needle = who.trim().to_lowercase();
+        self.accounts
+            .iter()
+            .find(|a| a.id == who || a.email.to_lowercase() == needle)
+            .or_else(|| {
+                let mut hits = self
+                    .accounts
+                    .iter()
+                    .filter(|a| a.display_name().to_lowercase().contains(&needle));
+                let first = hits.next()?;
+                // Ambiguous is not a match: acting on the wrong person's key
+                // is worse than making the operator be specific.
+                hits.next().is_none().then_some(first)
+            })
+    }
+
+    /// Create an account, with no keys.
+    ///
+    /// It used to mint one called `default`. A key's name says WHERE it is
+    /// used — that is the whole reason there is a key per place rather than
+    /// per person, because revoking a lost laptop should be one row and not a
+    /// re-keying. `default` says nothing, and being handed one at signup meant
+    /// it was the one that got deployed, so the accounts that most needed
+    /// named keys were the ones that never got them.
+    ///
+    /// `add-key <who> <place>` mints the first real one.
+    ///
+    /// # Errors
+    /// Missing names, an unusable email, or an email already in use.
+    pub fn add(&mut self, first: &str, last: &str, email: &str) -> Result<Account, Error> {
+        let (first, last, email) = (first.trim(), last.trim(), email.trim());
+        if first.is_empty() || last.is_empty() {
+            return Err(Error::MissingName);
+        }
+        if !email_ok(email) {
+            return Err(Error::InvalidEmail(email.to_owned()));
+        }
+        if self.accounts.iter().any(|a| a.email.eq_ignore_ascii_case(email)) {
+            return Err(Error::DuplicateEmail(email.to_owned()));
+        }
+        let now = now_secs();
+        let account = Account {
+            id: uuid::Uuid::new_v4().to_string(),
+            first_name: first.to_owned(),
+            last_name: last.to_owned(),
+            email: email.to_owned(),
+            created_at: now,
+            keys: Vec::new(),
+            key_hash: String::new(),
+            legacy_first_used_at: None,
+            legacy_last_used_at: None,
+            legacy_last_used_ip: None,
+            disabled: false,
+            weight: default_weight(),
+            provider: None,
+            model: None,
+            compact: crate::compact::Compact::None,
+            tools: crate::tools::Policy::default(),
+        };
+        self.accounts.push(account.clone());
+        self.reindex();
+        self.save()?;
+        Ok(account)
+    }
+
+    /// Add a named key to an account. Returns it once, in readable form.
+    ///
+    /// This replaces the old `rotate`, and is strictly better: rotation
+    /// revoked the only key and issued another, so there was a moment with no
+    /// working credential and everything using it broke at once. Adding first
+    /// and removing later means a machine can be moved across without a gap.
+    ///
+    /// # Errors
+    /// No such account, a name already in use on this account, or the file
+    /// could not be written.
+    pub fn add_key(&mut self, who: &str, name: &str) -> Result<(Key, String), Error> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(Error::MissingName);
+        }
+        let id = self
+            .find(who)
+            .ok_or_else(|| Error::NotFound(who.to_owned()))?
+            .id
+            .clone();
+        let account = self
+            .accounts
+            .iter_mut()
+            .find(|a| a.id == id)
+            .ok_or_else(|| Error::NotFound(who.to_owned()))?;
+        // Names are how keys are revoked, so two of the same on one account
+        // would make "delete the laptop key" ambiguous.
+        if account.keys.iter().any(|k| k.name.eq_ignore_ascii_case(name)) {
+            return Err(Error::DuplicateKeyName(name.to_owned()));
+        }
+        let secret = mint_key();
+        let key = Key {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: name.to_owned(),
+            hash: hash_key(&secret),
+            created_at: now_secs(),
+            first_used_at: None,
+            last_used_at: None,
+            last_used_ip: None,
+            disabled: false,
+            sessions: Vec::new(),
+        };
+        account.keys.push(key.clone());
+        self.reindex();
+        self.save()?;
+        Ok((key, secret))
+    }
+
+    /// Delete one key. The account and its other keys are untouched.
+    ///
+    /// # Errors
+    /// No such account or key, or the file could not be written.
+    pub fn remove_key(&mut self, who: &str, key_ref: &str) -> Result<Key, Error> {
+        let id = self
+            .find(who)
+            .ok_or_else(|| Error::NotFound(who.to_owned()))?
+            .id
+            .clone();
+        let account = self
+            .accounts
+            .iter_mut()
+            .find(|a| a.id == id)
+            .ok_or_else(|| Error::NotFound(who.to_owned()))?;
+        let idx = account
+            .keys
+            .iter()
+            .position(|k| k.id == key_ref || k.name.eq_ignore_ascii_case(key_ref))
+            .ok_or_else(|| Error::NotFound(format!("key {key_ref}")))?;
+        let gone = account.keys.remove(idx);
+        self.reindex();
+        self.save()?;
+        Ok(gone)
+    }
+
+    /// Turn one key off (or back on) without deleting it.
+    ///
+    /// # Errors
+    /// No such account or key, or the file could not be written.
+    pub fn set_key_disabled(&mut self, who: &str, key_ref: &str, disabled: bool) -> Result<Key, Error> {
+        let id = self
+            .find(who)
+            .ok_or_else(|| Error::NotFound(who.to_owned()))?
+            .id
+            .clone();
+        let account = self
+            .accounts
+            .iter_mut()
+            .find(|a| a.id == id)
+            .ok_or_else(|| Error::NotFound(who.to_owned()))?;
+        let key = account
+            .keys
+            .iter_mut()
+            .find(|k| k.id == key_ref || k.name.eq_ignore_ascii_case(key_ref))
+            .ok_or_else(|| Error::NotFound(format!("key {key_ref}")))?;
+        key.disabled = disabled;
+        let out = key.clone();
+        self.reindex();
+        self.save()?;
+        Ok(out)
+    }
+
+    /// Change an account's share of the quota under contention.
+    ///
+    /// # Errors
+    /// No such account, or the file could not be written.
+    /// Pin an account to a provider, or clear the pin with `None`.
+    ///
+    /// The provider id is NOT validated here: this module knows about people,
+    /// not about where requests can go, and a users.json that could not be
+    /// loaded because it named a provider that has since been removed would be
+    /// a much worse failure than a pin that resolves to nothing at runtime.
+    /// The route validates it, where the registry is in hand.
+    ///
+    /// # Errors
+    /// No such account, or the file could not be written.
+    pub fn set_provider(&mut self, who: &str, provider: Option<&str>) -> Result<Account, Error> {
+        let id = self
+            .find(who)
+            .ok_or_else(|| Error::NotFound(who.to_owned()))?
+            .id
+            .clone();
+        let account = self
+            .accounts
+            .iter_mut()
+            .find(|a| a.id == id)
+            .ok_or_else(|| Error::NotFound(who.to_owned()))?;
+        account.provider = provider.map(str::to_owned).filter(|p| !p.is_empty());
+        let out = account.clone();
+        self.reindex();
+        self.save()?;
+        Ok(out)
+    }
+
+    /// Pin this person's requests to one model, or clear the pin.
+    ///
+    /// # Errors
+    /// No such account, or the file could not be written.
+    pub fn set_model(&mut self, who: &str, model: Option<&str>) -> Result<Account, Error> {
+        let id = self
+            .find(who)
+            .ok_or_else(|| Error::NotFound(who.to_owned()))?
+            .id
+            .clone();
+        let account = self
+            .accounts
+            .iter_mut()
+            .find(|a| a.id == id)
+            .ok_or_else(|| Error::NotFound(who.to_owned()))?;
+        account.model = model.map(str::to_owned).filter(|m| !m.is_empty());
+        let out = account.clone();
+        self.reindex();
+        self.save()?;
+        Ok(out)
+    }
+
+    /// Set how much of this person's old conversation is elided.
+    ///
+    /// # Errors
+    /// No such account, or the file could not be written.
+    pub fn set_compact(&mut self, who: &str, level: crate::compact::Compact) -> Result<Account, Error> {
+        let id = self
+            .find(who)
+            .ok_or_else(|| Error::NotFound(who.to_owned()))?
+            .id
+            .clone();
+        let account = self
+            .accounts
+            .iter_mut()
+            .find(|a| a.id == id)
+            .ok_or_else(|| Error::NotFound(who.to_owned()))?;
+        account.compact = level;
+        let out = account.clone();
+        self.reindex();
+        self.save()?;
+        Ok(out)
+    }
+
+    /// Set which tools this person's requests may carry.
+    ///
+    /// # Errors
+    /// No such account, or the file could not be written.
+    pub fn set_tools(&mut self, who: &str, policy: crate::tools::Policy) -> Result<Account, Error> {
+        let id = self
+            .find(who)
+            .ok_or_else(|| Error::NotFound(who.to_owned()))?
+            .id
+            .clone();
+        let account = self
+            .accounts
+            .iter_mut()
+            .find(|a| a.id == id)
+            .ok_or_else(|| Error::NotFound(who.to_owned()))?;
+        account.tools = policy;
+        let out = account.clone();
+        self.reindex();
+        self.save()?;
+        Ok(out)
+    }
+
+    /// Set an account's share of upstream quota under contention.
+    ///
+    /// # Errors
+    /// No such account, or the file could not be written.
+    pub fn set_weight(&mut self, who: &str, weight: u32) -> Result<Account, Error> {
+        let id = self
+            .find(who)
+            .ok_or_else(|| Error::NotFound(who.to_owned()))?
+            .id
+            .clone();
+        let account = self
+            .accounts
+            .iter_mut()
+            .find(|a| a.id == id)
+            .ok_or_else(|| Error::NotFound(who.to_owned()))?;
+        // Zero would mean "never scheduled", which is what `disable` is for
+        // and is far too easy to do by accident.
+        account.weight = weight.clamp(1, 100);
+        let out = account.clone();
+        self.save()?;
+        Ok(out)
+    }
+
+    /// Turn an account off (or back on) without losing who they were.
+    ///
+    /// # Errors
+    /// No such account, or the file could not be written.
+    pub fn set_disabled(&mut self, who: &str, disabled: bool) -> Result<Account, Error> {
+        let id = self
+            .find(who)
+            .ok_or_else(|| Error::NotFound(who.to_owned()))?
+            .id
+            .clone();
+        let account = self
+            .accounts
+            .iter_mut()
+            .find(|a| a.id == id)
+            .ok_or_else(|| Error::NotFound(who.to_owned()))?;
+        account.disabled = disabled;
+        let out = account.clone();
+        self.reindex();
+        self.save()?;
+        Ok(out)
+    }
+
+    /// Forget an account entirely.
+    ///
+    /// # Errors
+    /// No such account, or the file could not be written.
+    pub fn remove(&mut self, who: &str) -> Result<Account, Error> {
+        let id = self
+            .find(who)
+            .ok_or_else(|| Error::NotFound(who.to_owned()))?
+            .id
+            .clone();
+        let idx = self
+            .accounts
+            .iter()
+            .position(|a| a.id == id)
+            .ok_or_else(|| Error::NotFound(who.to_owned()))?;
+        let gone = self.accounts.remove(idx);
+        self.reindex();
+        self.save()?;
+        Ok(gone)
+    }
+
+    /// Stamp the KEY that was used, from `ip` and the `client` it named.
+    ///
+    /// Best-effort: a failed write must not fail the request it is describing.
+    pub fn touch(&mut self, key_id: &str, ip: Option<&str>, client: Option<&Client>) {
+        self.touch_at(key_id, ip, client, now_secs());
+    }
+
+    /// As [`Self::touch`], at a caller-supplied instant.
+    ///
+    /// Split out so the eviction and expiry rules can be tested against a clock
+    /// the test owns: both are defined in terms of elapsed time, and a test that
+    /// can only observe "now" cannot tell a correct rule from one that ignores
+    /// the clock entirely.
+    pub fn touch_at(&mut self, key_id: &str, ip: Option<&str>, client: Option<&Client>, now: u64) {
+        let persist = self
+            .accounts
+            .iter_mut()
+            .flat_map(|a| a.keys.iter_mut())
+            .find(|k| k.id == key_id)
+            .is_some_and(|k| {
+                // First use of a key, and any change of address, are worth a
+                // write immediately — they are the two things someone
+                // reviewing access actually looks for. So is a session we have
+                // not seen here before. Ordinary traffic is coalesced to one
+                // write a minute, or every proxied request would rewrite the
+                // file.
+                let first = k.first_used_at.is_none();
+                let moved = ip.is_some() && k.last_used_ip.as_deref() != ip;
+                let stale = k.last_used_at.is_none_or(|t| now.saturating_sub(t) >= 60);
+                if first {
+                    k.first_used_at = Some(now);
+                }
+                if let Some(ip) = ip {
+                    k.last_used_ip = Some(ip.to_owned());
+                }
+                k.last_used_at = Some(now);
+                // Sessions are per key and the distinct-tab event is rare, so
+                // it earns a write the way an address change does: it is the
+                // answer to a question someone is actually asking.
+                let new_session = k.remember_session(client, now);
+                first || moved || stale || new_session
+            });
+        if persist {
+            let _ = self.save();
+        }
+    }
+
+    /// Write the file: temp + rename, 0600.
+    ///
+    /// # Errors
+    /// Anything that stops the file reaching disk intact.
+    pub fn save(&self) -> Result<(), Error> {
+        if let Some(dir) = self.path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| Error::Io(format!("create {}: {e}", dir.display())))?;
+        }
+        let json = serde_json::to_string_pretty(&Doc {
+            accounts: self.accounts.clone(),
+        })
+        .map_err(|e| Error::Io(e.to_string()))?;
+        let tmp = self.path.with_extension("json.tmp");
+        std::fs::write(&tmp, json).map_err(|e| Error::Io(format!("write {}: {e}", tmp.display())))?;
+        // Permissions BEFORE the rename: between rename and chmod the real file
+        // would briefly be world-readable, and it holds every key hash.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+        }
+        std::fs::rename(&tmp, &self.path).map_err(|e| Error::Io(format!("rename into {}: {e}", self.path.display())))
+    }
+
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Minimal scratch dir — the crate carries no dev-dependencies and a
+    /// unique path plus cleanup on drop is all a test needs from one.
+    struct TempDir(PathBuf);
+    impl TempDir {
+        fn new() -> Self {
+            let p = std::env::temp_dir().join(format!("ta-proxy-test-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&p).expect("mkdir");
+            Self(p)
+        }
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn store() -> (Store, TempDir) {
+        let dir = TempDir::new();
+        let s = Store::load(dir.path().join("users.json")).expect("load");
+        (s, dir)
+    }
+
+    #[test]
+    fn a_key_authenticates_exactly_its_own_account() {
+        let (mut s, _d) = store();
+        let ada = s.add("Ada", "Lovelace", "ada@example.org").expect("add");
+        // Accounts start with no keys — one is minted per place it is used.
+        let (_k, ada_key) = s.add_key(&ada.email, "laptop").expect("key");
+        let grace = s.add("Grace", "Hopper", "grace@example.org").expect("add");
+        // Accounts start with no keys — one is minted per place it is used.
+        let (_k, grace_key) = s.add_key(&grace.email, "laptop").expect("key");
+
+        assert_eq!(s.authenticate(&ada_key).map(|a| a.id.clone()), Some(ada.id.clone()));
+        assert_ne!(s.authenticate(&grace_key).map(|a| a.id.clone()), Some(ada.id));
+        assert!(s.authenticate("tap_deadbeef").is_none());
+        assert!(s.authenticate("").is_none());
+    }
+
+    /// The point of per-user keys: one person's key can be taken away without
+    /// touching anybody else's. The mono-token setup could not do this.
+    #[test]
+    fn revoking_one_account_leaves_the_others_working() {
+        let (mut s, _d) = store();
+        // Accounts start with no keys — one is minted per place it is used.
+        s.add("Ada", "Lovelace", "ada@example.org").expect("add");
+        let (_, ada_key) = s.add_key("ada@example.org", "laptop").expect("key");
+        s.add("Grace", "Hopper", "grace@example.org").expect("add");
+        let (_, grace_key) = s.add_key("grace@example.org", "laptop").expect("key");
+
+        s.set_disabled("ada@example.org", true).expect("disable");
+        assert!(s.authenticate(&ada_key).is_none(), "a disabled account must be refused");
+        assert!(s.authenticate(&grace_key).is_some(), "and nobody else is affected");
+
+        s.set_disabled("ada@example.org", false).expect("enable");
+        assert!(s.authenticate(&ada_key).is_some(), "re-enabling restores the same key");
+
+        s.remove("grace@example.org").expect("remove");
+        assert!(s.authenticate(&grace_key).is_none());
+        assert!(s.authenticate(&ada_key).is_some());
+    }
+
+    /// Each key carries its own history, which is the only level at which it
+    /// means anything: "last used from 203.0.113.7" says nothing when three
+    /// keys share an account.
+    #[test]
+    fn each_key_records_when_and_where_it_was_used() {
+        let (mut s, _d) = store();
+        let ada = s.add("Ada", "Lovelace", "ada@example.org").expect("add");
+        // Accounts start with no keys — one is minted per place it is used.
+        let (_k, _first) = s.add_key(&ada.email, "laptop").expect("key");
+        let (ci, _ci_secret) = s.add_key("ada@example.org", "ci").expect("add key");
+
+        let laptop = s.find("ada@example.org").expect("a").keys[0].clone();
+        assert_eq!(laptop.first_used_at, None, "issued and never used is worth seeing");
+
+        s.touch(&laptop.id, Some("203.0.113.7"), None);
+        let after = s.find("ada@example.org").expect("a").clone();
+        let seen = after.keys.iter().find(|k| k.id == laptop.id).expect("laptop");
+        assert!(seen.first_used_at.is_some());
+        assert_eq!(seen.last_used_ip.as_deref(), Some("203.0.113.7"));
+
+        // The OTHER key is untouched — that is the whole point of per-key
+        // provenance.
+        let other = after.keys.iter().find(|k| k.id == ci.id).expect("ci");
+        assert_eq!(other.first_used_at, None);
+        assert_eq!(other.last_used_ip, None);
+
+        // A later call from elsewhere moves last_used_ip, never first_used.
+        s.touch(&laptop.id, Some("198.51.100.4"), None);
+        let moved = s.find("ada@example.org").expect("a").keys[0].clone();
+        assert_eq!(moved.first_used_at, seen.first_used_at, "first use is set once");
+        assert_eq!(moved.last_used_ip.as_deref(), Some("198.51.100.4"));
+        assert_eq!(ada.email, "ada@example.org");
+    }
+
+    fn client(session: &str, device: &str) -> Client {
+        Client {
+            device_id: Some(device.to_owned()),
+            session_id: Some(session.to_owned()),
+            account_uuid: None,
+        }
+    }
+
+    /// The point of the whole field: two tabs on one key are told apart.
+    #[test]
+    fn a_key_records_which_tab_and_machine_used_it() {
+        let (mut s, _d) = store();
+        s.add("Ada", "Lovelace", "ada@example.org").expect("add");
+        let (laptop, _secret) = s.add_key("ada@example.org", "laptop").expect("key");
+
+        s.touch(
+            &laptop.id,
+            Some("203.0.113.7"),
+            Some(&client("5b91b78b-71ac-44f6-8ad9-e8e619baf9b5", "323056b1")),
+        );
+
+        let after = s.find("ada@example.org").expect("a");
+        let seen = after.keys.iter().find(|k| k.id == laptop.id).expect("laptop");
+        assert_eq!(seen.sessions.len(), 1);
+        assert_eq!(seen.sessions[0].session_id, "5b91b78b-71ac-44f6-8ad9-e8e619baf9b5");
+        assert_eq!(seen.sessions[0].device_id.as_deref(), Some("323056b1"));
+        assert_eq!(seen.sessions[0].first_seen_at, seen.sessions[0].last_seen_at);
+    }
+
+    /// A machine with four tabs open is one device with four sessions, which is
+    /// what makes "what is this person running" answerable at all.
+    #[test]
+    fn several_tabs_on_one_key_share_a_device_without_merging() {
+        let (mut s, _d) = store();
+        s.add("Ada", "Lovelace", "ada@example.org").expect("add");
+        let (k, _secret) = s.add_key("ada@example.org", "laptop").expect("key");
+
+        s.touch(&k.id, None, Some(&client("aaaa", "machine-1")));
+        s.touch(&k.id, None, Some(&client("bbbb", "machine-1")));
+
+        let after = s.find("ada@example.org").expect("a");
+        let seen = after.keys.iter().find(|x| x.id == k.id).expect("k");
+        assert_eq!(seen.sessions.len(), 2, "two tabs stay two rows");
+        assert_eq!(
+            seen.sessions
+                .iter()
+                .filter(|x| x.device_id.as_deref() == Some("machine-1"))
+                .count(),
+            2
+        );
+    }
+
+    /// A tab lives for days; the ring must not grow a row per request.
+    #[test]
+    fn the_same_tab_seen_again_is_one_session() {
+        let (mut s, _d) = store();
+        s.add("Ada", "Lovelace", "ada@example.org").expect("add");
+        let (k, _secret) = s.add_key("ada@example.org", "laptop").expect("key");
+
+        s.touch(&k.id, None, Some(&client("same", "m1")));
+        let first = s.find("ada@example.org").expect("a").keys[0].sessions[0].first_seen_at;
+
+        // Same session, a later request, and now the client names a device it
+        // had not before.
+        s.touch(&k.id, None, Some(&client("same", "m1")));
+
+        let seen = &s.find("ada@example.org").expect("a").keys[0].sessions;
+        assert_eq!(seen.len(), 1, "not a second row");
+        assert_eq!(seen[0].first_seen_at, first, "first sighting is set once");
+        assert!(seen[0].last_seen_at >= first, "last sighting moves");
+    }
+
+    /// The clock is not monotonic across a restart or a clock correction, and a
+    /// session that appeared to be last seen before it was first seen would
+    /// sort wrongly and read as a bug.
+    #[test]
+    fn an_out_of_order_sighting_does_not_rewind_a_session() {
+        let (mut s, _d) = store();
+        s.add("Ada", "Lovelace", "ada@example.org").expect("add");
+        let (k, _secret) = s.add_key("ada@example.org", "laptop").expect("key");
+
+        s.touch(&k.id, None, Some(&client("same", "m1")));
+        let seen_at = s.find("ada@example.org").expect("a").keys[0].sessions[0].last_seen_at;
+        // Force a second sighting at a time strictly before the first.
+        s.touch_at(&k.id, None, Some(&client("same", "m1")), seen_at.saturating_sub(600));
+
+        let row = &s.find("ada@example.org").expect("a").keys[0].sessions[0];
+        assert_eq!(row.first_seen_at, seen_at);
+        assert_eq!(row.last_seen_at, seen_at, "never moves backwards");
+    }
+
+    /// A device named later fills the blank, rather than replacing the row.
+    #[test]
+    fn a_device_named_later_fills_in_the_blank() {
+        let (mut s, _d) = store();
+        s.add("Ada", "Lovelace", "ada@example.org").expect("add");
+        let (k, _secret) = s.add_key("ada@example.org", "laptop").expect("key");
+
+        let anonymous = Client {
+            device_id: None,
+            session_id: Some("s1".to_owned()),
+            account_uuid: None,
+        };
+        s.touch(&k.id, None, Some(&anonymous));
+        assert_eq!(
+            s.find("ada@example.org").expect("a").keys[0].sessions[0].device_id,
+            None
+        );
+
+        s.touch(&k.id, None, Some(&client("s1", "m1")));
+        let seen = &s.find("ada@example.org").expect("a").keys[0].sessions;
+        assert_eq!(seen.len(), 1, "same session, not a new one");
+        assert_eq!(seen[0].device_id.as_deref(), Some("m1"));
+    }
+
+    /// Eviction is by last use, not by arrival order — a tab that goes quiet
+    /// then comes back is a tab still in use, and must not be the one dropped.
+    #[test]
+    fn the_oldest_by_last_use_is_evicted_not_the_first_seen() {
+        let (mut s, _d) = store();
+        s.add("Ada", "Lovelace", "ada@example.org").expect("add");
+        let (k, _secret) = s.add_key("ada@example.org", "laptop").expect("key");
+
+        let base = 1_700_000_000;
+        // `s0` arrives first and would be the victim under a first-seen rule.
+        for i in 0..SESSIONS_KEPT {
+            let at = base + u64::try_from(i).expect("small") * 60;
+            s.touch_at(&k.id, None, Some(&client(&format!("s{i}"), "m1")), at);
+        }
+        // Bring `s0` back, newest of all.
+        s.touch_at(&k.id, None, Some(&client("s0", "m1")), base + 10_000);
+        // …and add one more, forcing an eviction.
+        s.touch_at(&k.id, None, Some(&client("newest", "m1")), base + 20_000);
+
+        let seen = &s.find("ada@example.org").expect("a").keys[0].sessions;
+        assert_eq!(seen.len(), SESSIONS_KEPT, "capped, not grown");
+        assert!(seen.iter().any(|x| x.session_id == "s0"), "the one just used stays");
+        assert!(seen.iter().any(|x| x.session_id == "newest"));
+        assert!(!seen.iter().any(|x| x.session_id == "s1"), "the stalest goes");
+    }
+
+    #[test]
+    fn a_tab_unused_for_a_day_is_forgotten() {
+        let (mut s, _d) = store();
+        s.add("Ada", "Lovelace", "ada@example.org").expect("add");
+        let (k, _secret) = s.add_key("ada@example.org", "laptop").expect("key");
+
+        let base = 1_700_000_000;
+        s.touch_at(&k.id, None, Some(&client("stale", "m1")), base);
+        // One second past the TTL, so the stale tab's age is strictly greater
+        // than the limit and the fresh sighting lands just inside it. Sitting
+        // exactly on the boundary would assert `<` while looking like `<=`.
+        s.touch_at(&k.id, None, Some(&client("fresh", "m1")), base + SESSION_TTL_SECS + 1);
+
+        let seen = &s.find("ada@example.org").expect("a").keys[0].sessions;
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].session_id, "fresh", "the quiet tab is the one dropped");
+    }
+
+    /// `metadata` that parses but names nothing is not a sighting. "We were
+    /// told nothing" and "we were told there was nothing" must not look alike.
+    #[test]
+    fn metadata_naming_nothing_records_no_session() {
+        let (mut s, _d) = store();
+        s.add("Ada", "Lovelace", "ada@example.org").expect("add");
+        let (k, _secret) = s.add_key("ada@example.org", "laptop").expect("key");
+
+        let blanks = [
+            Client::default(),
+            Client {
+                device_id: Some("m1".to_owned()),
+                session_id: None,
+                account_uuid: None,
+            },
+        ];
+        for c in &blanks {
+            s.touch(&k.id, Some("203.0.113.7"), Some(c));
+        }
+
+        let seen = &s.find("ada@example.org").expect("a").keys[0];
+        assert!(seen.sessions.is_empty(), "no row for a nameless sighting");
+        // The address is still recorded — that part of the request was real.
+        assert_eq!(seen.last_used_ip.as_deref(), Some("203.0.113.7"));
+    }
+
+    /// `metadata.user_id` is a JSON string holding a JSON object, and the empty
+    /// string means absent. Both are easy to get wrong in opposite directions.
+    #[test]
+    fn the_client_unpacks_the_nested_user_id() {
+        let long = Client::from_user_id(
+            r#"{"device_id":"323056b1","account_uuid":"","session_id":"5b91b78b-71ac-44f6-8ad9-e8e619baf9b5"}"#,
+        )
+        .expect("parses");
+        assert_eq!(long.device_id.as_deref(), Some("323056b1"));
+        assert_eq!(long.session_id.as_deref(), Some("5b91b78b-71ac-44f6-8ad9-e8e619baf9b5"));
+        assert_eq!(long.account_uuid, None, "an empty account is no account");
+
+        // A session id alone is meaningful; everything blank is not.
+        assert!(Client::from_user_id(r#"{"session_id":"only-a-session"}"#).is_some());
+        assert!(Client::from_user_id(r#"{"device_id":"","session_id":"","account_uuid":""}"#).is_none());
+        assert!(Client::from_user_id("not json").is_none());
+        assert!(Client::from_user_id("{}").is_none());
+    }
+
+    /// The relay hands us raw bytes, and the metadata sits behind however many
+    /// other fields the client chose to send first.
+    #[test]
+    fn the_client_is_found_in_a_raw_body() {
+        let body = br#"{"model":"deepseek-flash","max_tokens":32000,"messages":[{"role":"user","content":"hi"}],
+            "metadata":{"user_id":"{\"device_id\":\"323056b1\",\"account_uuid\":\"\",\"session_id\":\"5b91b78b\"}"}}"#;
+        let found = metadata_client(body).expect("found");
+        assert_eq!(found.session_id.as_deref(), Some("5b91b78b"));
+        assert_eq!(found.device_id.as_deref(), Some("323056b1"));
+        // Empty on the wire means absent, not an account named nothing.
+        assert_eq!(found.account_uuid, None);
+
+        // Absent, malformed, and truncated bodies are all the same non-event.
+        assert!(metadata_client(br#"{"model":"x"}"#).is_none());
+        assert!(metadata_client(b"<html>").is_none());
+        assert!(metadata_client(br#"{"metadata":{"user_id":"{\"session\""#).is_none());
+        assert!(metadata_client(b"").is_none());
+    }
+
+    /// The shape-limited parse must be indifferent to what surrounds the field.
+    ///
+    /// A classifier body carries the whole conversation after `metadata`, so if
+    /// the reader ever grew to care about it, the per-request cost would jump
+    /// from a small string to a megabyte.
+    #[test]
+    fn a_large_body_does_not_change_the_answer() {
+        let filler = "x".repeat(200_000);
+        let body = format!(
+            r#"{{"messages":[{{"role":"user","content":"{filler}"}}],
+               "metadata":{{"user_id":"{{\"session_id\":\"sess-big\",\"device_id\":\"dev-big\"}}"}}}}"#
+        );
+        let found = metadata_client(body.as_bytes()).expect("found in a big body");
+        assert_eq!(found.session_id.as_deref(), Some("sess-big"));
+        assert_eq!(found.device_id.as_deref(), Some("dev-big"));
+    }
+
+    /// Several named keys, revoked one at a time. With a single key per
+    /// person, losing a laptop meant re-keying everything they run.
+    #[test]
+    fn one_key_can_be_revoked_without_disturbing_the_others() {
+        let (mut s, _d) = store();
+        // An account starts with NO keys; every one is named for where it
+        // lives. There used to be a "default" minted at signup, which is
+        // exactly the key that ended up deployed everywhere unnamed.
+        s.add("Ada", "Lovelace", "ada@example.org").expect("add");
+        let (_k, first) = s.add_key("ada@example.org", "desktop").expect("desktop");
+        let (_lk, laptop) = s.add_key("ada@example.org", "laptop").expect("laptop");
+        let (_k, ci) = s.add_key("ada@example.org", "ci").expect("ci");
+        let (_k2, fleet) = s.add_key("ada@example.org", "fleet").expect("fleet");
+        for k in [&first, &laptop, &ci, &fleet] {
+            assert!(s.authenticate(k).is_some(), "every key should work");
+        }
+
+        // Lose the laptop.
+        s.remove_key("ada@example.org", "laptop").expect("remove");
+        assert!(s.authenticate(&laptop).is_none(), "the lost key must stop working");
+        assert!(s.authenticate(&ci).is_some(), "and nothing else is disturbed");
+        assert!(s.authenticate(&fleet).is_some());
+        assert!(s.authenticate(&first).is_some());
+
+        // Disabling is the reversible form, and keeps the name attached.
+        s.set_key_disabled("ada@example.org", "ci", true).expect("disable");
+        assert!(s.authenticate(&ci).is_none());
+        s.set_key_disabled("ada@example.org", "ci", false).expect("enable");
+        assert!(s.authenticate(&ci).is_some(), "re-enabling restores the same key");
+
+        // Suspending the PERSON stops all of them at once, which is a
+        // different decision from revoking one credential.
+        s.set_disabled("ada@example.org", true).expect("suspend");
+        for k in [&ci, &fleet] {
+            assert!(s.authenticate(k).is_none(), "a suspended account has no working keys");
+        }
+    }
+
+    #[test]
+    fn key_names_are_unique_within_an_account() {
+        let (mut s, _d) = store();
+        s.add("Ada", "Lovelace", "ada@example.org").expect("add");
+        s.add_key("ada@example.org", "ci").expect("ci");
+        assert_eq!(
+            s.add_key("ada@example.org", "CI").unwrap_err(),
+            Error::DuplicateKeyName("CI".to_owned()),
+            "names are how keys are revoked, so a duplicate makes revocation ambiguous"
+        );
+        // But two PEOPLE may each have a key called ci.
+        s.add("Grace", "Hopper", "grace@example.org").expect("add");
+        assert!(s.add_key("grace@example.org", "ci").is_ok());
+    }
+
+    /// An account written before keys were a list still works, and its
+    /// provenance moves onto the key rather than being lost.
+    #[test]
+    fn a_single_key_account_migrates_to_one_named_key() {
+        let dir = TempDir::new();
+        let path = dir.path().join("users.json");
+        let secret = mint_key();
+        let doc = serde_json::json!({
+            "accounts": [{
+                "id": "old-1",
+                "first_name": "Ada",
+                "last_name": "Lovelace",
+                "email": "ada@example.org",
+                "key_hash": hash_key(&secret),
+                "created_at": 1_700_000_000,
+                "first_used_at": 1_700_000_100,
+                "last_used_at": 1_700_000_200,
+                "last_used_ip": "203.0.113.7",
+                "disabled": false,
+                "weight": 5
+            }]
+        });
+        std::fs::write(&path, doc.to_string()).expect("write");
+
+        let s = Store::load(&path).expect("load");
+        let a = s.find("ada@example.org").expect("account survived");
+        assert_eq!(a.keys.len(), 1, "the single key becomes one key");
+        assert_eq!(a.keys[0].name, "default");
+        assert_eq!(
+            a.keys[0].last_used_ip.as_deref(),
+            Some("203.0.113.7"),
+            "the account's provenance moves onto the key, where it means something"
+        );
+        assert_eq!(a.keys[0].first_used_at, Some(1_700_000_100));
+        assert!(
+            s.authenticate(&secret).is_some(),
+            "and the key that was working before must still work"
+        );
+    }
+
+    #[test]
+    fn keys_are_not_recoverable_from_the_file() {
+        let (mut s, _d) = store();
+        s.add("Ada", "Lovelace", "ada@example.org").expect("add");
+        let (_, key) = s.add_key("ada@example.org", "laptop").expect("key");
+        let raw = std::fs::read_to_string(s.path()).expect("read back");
+        assert!(!raw.contains(&key), "the key itself must never reach disk");
+        assert!(raw.contains(&hash_key(&key)));
+    }
+
+    #[test]
+    fn accounts_survive_a_reload() {
+        let (mut s, dir) = store();
+        s.add("Ada", "Lovelace", "ada@example.org").expect("add");
+        let (_, key) = s.add_key("ada@example.org", "laptop").expect("key");
+        drop(s);
+        let s = Store::load(dir.path().join("users.json")).expect("reload");
+        assert_eq!(s.accounts().len(), 1);
+        assert!(s.authenticate(&key).is_some(), "the hash index must be rebuilt on load");
+    }
+
+    /// A corrupt file must not read as "no accounts": that silently revokes
+    /// everyone and looks like a working proxy that rejects every request.
+    #[test]
+    fn a_malformed_file_is_an_error_not_an_empty_store() {
+        let dir = TempDir::new();
+        let path = dir.path().join("users.json");
+        std::fs::write(&path, "{ this is not json").expect("write");
+        assert!(Store::load(&path).is_err());
+    }
+
+    #[test]
+    fn duplicate_and_malformed_details_are_refused() {
+        let (mut s, _d) = store();
+        s.add("Ada", "Lovelace", "ada@example.org").expect("add");
+        assert_eq!(
+            s.add("Ada", "Byron", "ADA@example.org").unwrap_err(),
+            Error::DuplicateEmail("ADA@example.org".to_owned()),
+            "email match is case-insensitive, or one person gets two accounts"
+        );
+        assert_eq!(s.add("", "Lovelace", "x@example.org").unwrap_err(), Error::MissingName);
+        assert!(matches!(
+            s.add("Ada", "Lovelace", "not-an-email").unwrap_err(),
+            Error::InvalidEmail(_)
+        ));
+        assert!(matches!(
+            s.add("Ada", "Lovelace", "a@b").unwrap_err(),
+            Error::InvalidEmail(_)
+        ));
+    }
+
+    #[test]
+    fn an_ambiguous_name_matches_nobody() {
+        let (mut s, _d) = store();
+        s.add("Ada", "Lovelace", "ada@example.org").expect("add");
+        s.add("Ada", "Byron", "byron@example.org").expect("add");
+        assert!(s.find("ada").is_none(), "two people match — acting on either is wrong");
+        assert!(s.find("lovelace").is_some());
+        assert!(s.find("ada@example.org").is_some());
+    }
+
+    /// The priority ladder must have room below the default, or "lower this
+    /// account" is inexpressible and the only move is promoting everyone else.
+    #[test]
+    fn the_default_priority_sits_in_the_middle_of_its_range() {
+        let (mut s, _d) = store();
+        let a = s.add("Ada", "Lovelace", "ada@example.org").expect("add");
+        assert_eq!(a.weight, NORMAL_WEIGHT);
+        const { assert!(NORMAL_WEIGHT > 1, "a default of 1 leaves nothing below it") }
+
+        // Both directions are reachable, and the ratio is a real difference.
+        let down = s.set_weight("ada@example.org", 1).expect("lower");
+        assert_eq!(down.weight, 1);
+        let up = s.set_weight("ada@example.org", 50).expect("raise");
+        assert_eq!(up.weight, 50);
+
+        // Out-of-range values are clamped rather than rejected — and never to
+        // zero, which would mean "never scheduled" and is what `disable` is
+        // for.
+        assert_eq!(s.set_weight("ada@example.org", 0).expect("clamp").weight, 1);
+        assert_eq!(s.set_weight("ada@example.org", 9_999).expect("clamp").weight, 100);
+    }
+
+    #[test]
+    fn minted_keys_are_distinct_and_prefixed() {
+        let a = mint_key();
+        let b = mint_key();
+        assert_ne!(a, b);
+        assert!(a.starts_with(KEY_PREFIX));
+        assert_eq!(a.len(), KEY_PREFIX.len() + 64);
+    }
+
+    #[test]
+    fn constant_time_eq_still_compares_correctly() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"ab"));
+        assert!(constant_time_eq(b"", b""));
+    }
+}

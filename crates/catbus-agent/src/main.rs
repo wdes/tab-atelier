@@ -1,44 +1,66 @@
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// SPDX-License-Identifier: MPL-2.0
 
 //! Catbus — the agent that drives one Claude session per process.
 //!
 //! Named after the many-windowed feline conveyance from *My Neighbor
 //! Totoro*. Each `tab-atelier` tab can run one catbus instance, and
 //! you talk to it through a per-session UNIX socket. Internally it
-//! authenticates via Claude Code's OAuth credentials (so a Max
-//! subscription works without an API key) — or talks to any
-//! OpenAI-compatible service instead (`--openai-url`, `--openai-token`
-//! and `--openai-model` for `x.ai`/Grok, `OpenAI`, a local server,
-//! etc., or the `--infomaniak-*` shortcut for Infomaniak AI Tools).
+//! talks to a tab-atelier relay, which holds the Claude subscription
+//! login and forwards to Anthropic — so a Max subscription works
+//! without an API key, and without the login ever reaching this
+//! process. It can also talk to any OpenAI-compatible service instead
+//! (`--openai-url`, `--openai-token` and `--openai-model` for
+//! `x.ai`/Grok, `OpenAI`, a local server, etc., or the
+//! `--infomaniak-*` shortcut for Infomaniak AI Tools).
 //! It persists the conversation in the same JSONL shape Claude Code
 //! uses (so the existing `/tabs/N/catbus/messages` endpoint Just
 //! Works), and runs a small Read / Write / Edit / Bash tool loop.
 
 #![allow(clippy::module_name_repetitions)]
 
-use std::borrow::Cow;
-use std::path::PathBuf;
+use std::io::IsTerminal;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use clap::Parser;
-use reedline::{
-    FileBackedHistory, Prompt, PromptEditMode, PromptHistorySearch, PromptHistorySearchStatus, Reedline, Signal,
-};
-use tokio::io::AsyncWriteExt;
 
 mod agent;
-mod auth;
+mod ansi;
+mod applink;
+mod cache;
+mod cost;
+mod guard;
+mod identity;
+mod logging;
 mod openai;
+mod proc;
+mod progress;
+mod relay;
+mod retry;
 mod session;
+mod shell;
+mod slash;
 mod socket;
+mod statusline;
+mod stream;
+mod text;
 mod tools;
+mod tui;
 
+// A clap `Args` struct is a bag of independent flags: each one is genuinely
+// boolean and unrelated to the others, which is the shape this lint exists to
+// discourage in a *domain* type. Modelling them as one enum would fuse flags
+// that can be combined (`--print-socket --once`), so the allow is scoped to this
+// struct rather than the crate. The root crate makes the same call for `AppState`.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Parser, Debug)]
 #[command(
-    version,
-    about = "Claude agent for tab-atelier. Many tabs, many windows.",
+    // The commit, not just the crate version, and in the app's own shape
+    // (`v0.1.0-dev (07c49210abcd)`) so the two binaries of one build read the
+    // same. A `catbus-agent` in a tab can be older than the checkout that
+    // started it, and this is the first thing anyone asks.
+    version = concat!("v", env!("CARGO_PKG_VERSION"), " (", env!("BUILD_HASH"), ")"),
+    about = "Model-agnostic agent for tab-atelier. Many tabs, many windows.",
     long_about = None,
 )]
 struct Args {
@@ -47,14 +69,17 @@ struct Args {
     #[arg(long)]
     cwd: Option<PathBuf>,
 
-    /// Resume an existing session by id. Without this flag the
-    /// newest session in the working directory is auto-resumed
-    /// (use --new-session to override).
+    /// Resume an existing session by id. Without it a **new** session is started: continuing an
+    /// earlier conversation is always explicit, so reopening a tab does not silently carry on
+    /// whichever one was last in this directory, and two agents here cannot share a history.
     #[arg(long)]
     resume: Option<String>,
 
-    /// Force a brand-new session even when a previous transcript
-    /// exists in this cwd. Default behaviour is to resume.
+    /// Accepted and does nothing: a new session is the default.
+    ///
+    /// Kept because callers pass it — the app's tab launcher and the `Spawn` tool both name a fresh
+    /// session explicitly — and a flag that vanished would be a break for them. `--resume` still
+    /// wins over it when both are given.
     #[arg(long)]
     new_session: bool,
 
@@ -79,10 +104,116 @@ struct Args {
     #[arg(long)]
     no_tui: bool,
 
+    /// Answer one socket prompt, then exit.
+    ///
+    /// This is how a sub-agent started by the `Spawn` tool is run. It is not a
+    /// convenience: a child that stays up until its parent reaps it cannot
+    /// survive a parent that dies first, and a parent that is killed mid-call
+    /// runs no cleanup at all. A process that leaves on its own cannot be
+    /// orphaned.
+    #[arg(long)]
+    once: bool,
+
+    /// Start in this permission mode: `open` (everything allowed, the default),
+    /// `auto` (a judge checks each write/edit/bash first), or `plan` (write,
+    /// edit, bash and spawn propose instead of acting).
+    ///
+    /// Overrides the mode the session was last left in, so a launcher can pin it
+    /// for a tab. Without this there was no way to start in a mode: the gate was
+    /// reachable only through a slash command or the socket, and neither survives
+    /// the agent being restarted, which is what a tab reopen does.
+    #[arg(long, value_name = "MODE")]
+    gate: Option<String>,
+
+    /// Use this text as the whole system prompt, instead of the built-in one.
+    ///
+    /// The built-in prompt tells the model it is Claude Code, which is untrue on
+    /// any endpoint that is not Anthropic's, and the terminal-rendering rules are
+    /// still appended after this. Takes precedence over `--identity-file`.
+    #[arg(long, value_name = "TEXT", env = "CATBUS_IDENTITY")]
+    identity: Option<String>,
+
+    /// Read the system prompt from this file — markdown, optionally with
+    /// `---`-delimited front matter that may set `AllowedTools`.
+    ///
+    /// The text replaces the whole system prompt. A blank file means "send no
+    /// identity at all". Naming a file that cannot be read, or that holds no
+    /// prompt, is an error: it was asked for by name, so a typo should be loud.
+    /// Without this flag (and without `CATBUS_IDENTITY_FILE`) the built-in
+    /// location is used when it happens to exist, where absence means the
+    /// built-in prompt rather than an error.
+    #[arg(long, value_name = "PATH", env = "CATBUS_IDENTITY_FILE")]
+    identity_file: Option<PathBuf>,
+
+    /// Allow ANSI escapes in text replies.
+    ///
+    /// With no flag, escapes are allowed only when stdout is a terminal *and*
+    /// the environment has not asked for no colour — a session read over the
+    /// socket, shown on a phone, or marked `NO_COLOR` by tab-atelier gets
+    /// plain prose instead, because `[1m` is what a reader with no terminal
+    /// sees otherwise. Setting this forces escapes on, and `--ansi=false`
+    /// forces them off.
+    ///
+    /// Escape sequences are filtered out of anything a non-terminal reader
+    /// would see regardless, so a model that ignores the instruction cannot
+    /// leak them into the transcript.
+    ///
+    /// `num_args = 0..=1` is what lets it be written bare (`--ansi`) while
+    /// still accepting an explicit `--ansi=false`. A plain `Option<bool>`
+    /// would require a value, and the bare form is the one people type.
+    #[arg(long, env = "CATBUS_ANSI", num_args = 0..=1, default_missing_value = "true")]
+    ansi: Option<bool>,
+
+    /// Relay to talk to, e.g. `https://proxy.example` or the full
+    /// `https://proxy.example/relay/anthropic`. Defaults to the relay
+    /// endpoint in tab-atelier's preferences.json, so a machine that
+    /// already runs tab-atelier needs no flag.
+    #[arg(long, env = "CATBUS_RELAY_URL")]
+    relay_url: Option<String>,
+
+    /// This machine's relay token, minted on the proxy. Sent as
+    /// `x-api-key`. Prefer the env var over the flag so the secret stays
+    /// out of `ps` output and shell history.
+    #[arg(long, env = "CATBUS_RELAY_TOKEN", hide_env_values = true)]
+    relay_token: Option<String>,
+
+    /// Model auto mode grades actions with. Defaults to a cheap
+    /// Flash-class model rather than this session's own model: judging a
+    /// proposed command is classification, not reasoning, and grading every
+    /// write with a heavy model costs an order of magnitude more than the
+    /// judgement is worth. The judge's prompt is fixed, so it caches after the
+    /// first call either way.
+    #[arg(long, env = "CATBUS_JUDGE_MODEL")]
+    judge_model: Option<String>,
+
+    /// File holding the monitor prompt for auto mode, in place of the
+    /// built-in one. This exists so an operator can install the exact prompt
+    /// their provider uses without this repository carrying it.
+    #[arg(long, env = "CATBUS_MONITOR_PROMPT")]
+    monitor_prompt: Option<PathBuf>,
+
+    /// JSON file configuring the tool set: `{"disable": [...], "allow": [...],
+    /// "add": [...]}`. Resolved once at startup, so changing it takes a
+    /// restart — a tool array that moved mid-session would invalidate the
+    /// prompt cache on every turn.
+    ///
+    /// The literal word `minimal` is accepted instead of a path, as a
+    /// shorthand for `{"allow": ["Read", "Write", "FileTree", "Grep"]}` — a file-editing
+    /// agent with no shell. A name that is neither a path nor `minimal` is an
+    /// error rather than a silent fallback to the full set.
+    #[arg(long, env = "CATBUS_TOOLS_CONFIG")]
+    tools_config: Option<PathBuf>,
+
     /// Base URL of any OpenAI-compatible service, e.g.
     /// `https://api.x.ai/v1` (Grok) or `http://localhost:11434/v1`
     /// (Ollama). `/chat/completions` is appended when missing. Routes
-    /// the session through that service instead of Anthropic OAuth.
+    /// the session through that service instead of the relay.
+    ///
+    /// Deliberately *not* `conflicts_with` the relay flags: a machine
+    /// that relays by default exports `CATBUS_RELAY_URL`, and that must
+    /// not stop someone reaching for a different backend. An
+    /// OpenAI-compatible backend simply takes precedence when both are
+    /// configured.
     #[arg(
         long,
         env = "CATBUS_OPENAI_URL",
@@ -104,10 +235,34 @@ struct Args {
     #[arg(long, env = "CATBUS_OPENAI_MODEL", requires = "openai_url")]
     openai_model: Option<String>,
 
+    /// `reasoning_effort` to send to --openai-url, for a model that needs one.
+    ///
+    /// Left unset by default, and that default is deliberate: there is no value
+    /// that suits every model, so guessing would break the ones that work today.
+    /// Both directions are measured:
+    ///
+    /// * A **reasoning** model of the gpt-5/gpt-6 or o-series generation refuses
+    ///   a request that carries function tools unless this is sent as `none` —
+    ///   `400 Function tools with reasoning_effort are not supported for
+    ///   <model> in /v1/chat/completions`. The tool loop cannot run without it.
+    /// * A **classic** model (`gpt-4.1`, `gpt-4o`, `gpt-3.5-turbo`) refuses the
+    ///   field outright — `400 Unrecognized request argument supplied:
+    ///   reasoning_effort` — so sending it unconditionally would break the models
+    ///   that work today.
+    ///
+    /// Because the two families disagree, the value has to come from the operator
+    /// who knows which model they pointed at. `none` is the value a tool-using
+    /// agent wants from a reasoning model: the reasoning trace is not rendered on
+    /// this wire (see `openai.rs`), so paying for it and losing it buys nothing.
+    /// A provider that ignores the field entirely (a local Ollama server does)
+    /// is unaffected either way.
+    #[arg(long, env = "CATBUS_OPENAI_REASONING_EFFORT", requires = "openai_url")]
+    openai_reasoning_effort: Option<String>,
+
     /// Infomaniak AI Tools product id — a shortcut for --openai-url
     /// that builds the product-scoped Infomaniak endpoint. Together
     /// with --infomaniak-token this routes the session through
-    /// Infomaniak's OpenAI-compatible API instead of Anthropic OAuth.
+    /// Infomaniak's OpenAI-compatible API instead of the relay.
     #[arg(long, env = "INFOMANIAK_PRODUCT_ID", requires = "infomaniak_token")]
     infomaniak_product_id: Option<String>,
 
@@ -130,41 +285,177 @@ struct Args {
 }
 
 #[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args = Args::parse();
-    // REPL mode shares the tab with stdout, so even "to stderr" logs
-    // print in the same window. Quiet the floor to `warn` unless the
-    // user explicitly set RUST_LOG — the socket-only path still gets
-    // info-level chatter because nobody's reading those tabs.
-    let default_level = if args.no_tui { "info" } else { "warn" };
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default_level))
-        .target(env_logger::Target::Stderr)
-        .init();
+async fn main() {
+    // Print the error's Display form. Returning a Result from `main`
+    // would print the Debug form instead, which for the relay errors
+    // buries the one sentence telling the operator what to configure
+    // inside an enum dump.
+    if let Err(e) = run().await {
+        eprintln!("catbus-agent: {e}");
+        std::process::exit(1);
+    }
+}
 
-    let cwd = match args.cwd {
-        Some(p) => p,
-        None => std::env::current_dir()?,
+/// Resolve the operator's prompt file and the tool set they end up with.
+///
+/// Both are resolved together, and before the agent exists, because the prompt
+/// file is one of the two sources the tool set comes from. A bad file or a bad
+/// tool name is a startup failure rather than something that surfaces as a failed
+/// turn later.
+///
+/// `AllowedTools` in the front matter **narrows** the set the launcher configured
+/// and never widens it: `narrowed_to` refuses a name the launcher's `--tools-config`
+/// withheld, so a prompt file cannot grant itself a tool. That is the whole point
+/// of the ceiling — the wrapper answer is the same tool list the operator already
+/// chose, minus what the prompt file removes.
+///
+/// A **sub-agent** is the exception, and read leniently: a child's set was chosen
+/// narrower by the parent that spawned it before it ran, so the same ceiling cannot
+/// be violated by a name the child does not offer — it is vacuous rather than broken.
+/// Refusing there is what made `Spawn` unusable in any project whose identity names
+/// tools a `minimal` child does not have; see [`tools::ToolSet::capped_to`].
+///
+/// `cwd` is threaded in rather than looked up, because the identity is also found
+/// at `<cwd>/.catbus/identity.md` and the session's directory is `--cwd` when the
+/// launcher named one.
+fn resolve_tools(args: &Args, cwd: &Path) -> Result<(tools::ToolSet, identity::Identity), Box<dyn std::error::Error>> {
+    // Both of the sources that are *named or absent* — the launcher's flag, and the working
+    // directory's own `.catbus/tools.toml` — are resolved here; the third source, the identity
+    // file's `AllowedTools`, narrows the result below. A project tool therefore also has to be
+    // named in `AllowedTools` when the identity has one, because narrowing is the last word.
+    let tool_set = tools::ToolSet::load_layered(args.tools_config.as_deref(), cwd)?;
+    let identity = identity::load(args.identity.as_deref(), args.identity_file.as_deref(), cwd)?;
+    let Some(allowed) = identity.allowed_tools() else {
+        log::info!("offering {} tools", tool_set.specs().len());
+        return Ok((tool_set, identity));
     };
 
-    // Auth must succeed *before* we open the socket — no point
-    // accepting prompts we can't service. With an OpenAI-compatible
-    // backend configured the Claude OAuth credentials are never
-    // touched, so catbus runs on machines without a Claude Code login.
+    let narrowed = if tools::is_subagent() {
+        let (capped, ungranted) = tool_set.capped_to(allowed);
+        if !ungranted.is_empty() {
+            log::info!(
+                "the identity names {}, which a sub-agent's set does not offer; not granted",
+                ungranted.join(", ")
+            );
+        }
+        if capped.specs().is_empty() {
+            // Still a conflict, and still worth a sentence: the identity named tools and the child
+            // has none of them, so it would run unable to do anything at all. Unreachable in
+            // practice — `minimal` offers `Read` — but a child that appears to work while holding
+            // nothing is worse than a startup error naming the two lists.
+            return Err(format!(
+                "AllowedTools leaves a sub-agent with no tools — it names {} and a sub-agent offers \
+                 none of them",
+                allowed.join(", ")
+            )
+            .into());
+        }
+        capped
+    } else {
+        tool_set.narrowed_to(allowed)?
+    };
+    log::info!(
+        "the identity file limits the tool set to {} (from {})",
+        narrowed.names().join(", "),
+        tool_set.names().join(", ")
+    );
+    Ok((narrowed, identity))
+}
+
+/// Apply `--gate`, if the launcher gave one.
+///
+/// An explicit mode wins over the one the session was last left in. Applied here rather than in
+/// `Agent::new` because the flag belongs to this launch while the saved mode belongs to the session —
+/// and it is written back, so pinning a tab once is enough. An unknown word is a hard error: it was
+/// typed by a launcher, so it is a mistake to fix rather than something to default away.
+async fn apply_launch_gate(agent: &Arc<agent::Agent>, word: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(word) = word else {
+        return Ok(());
+    };
+    let gate = tools::parse_gate(word).ok_or_else(|| format!("unknown --gate `{word}` — one of: open, auto, plan"))?;
+    agent.set_gate(gate).await;
+    Ok(())
+}
+
+/// Ask the relay what it charges, without making the session wait for the answer.
+///
+/// In the background on purpose. A price list is an enhancement, and blocking on one before the
+/// session can be typed into is the wrong trade: against an endpoint that black-holes rather than
+/// refusing — a firewall, a typo'd host — the wait is the client's whole connect timeout, and the
+/// operator stares at a session that has not started for reasons nothing on screen explains. Found
+/// by a test that types at a REPL whose relay is a dead port: the prompt simply never appeared.
+///
+/// Until it lands, the totals show tokens with no amounts — the same state as a relay that serves
+/// no prices at all — so nothing waits on it and nothing depends on it succeeding. It is logged at
+/// `info`, because a relay without one is not a fault.
+/// Tell the app this tab now has an agent, before the first turn.
+///
+/// The id is the point: it is what the app stores and hands back through `--resume`, so without this a
+/// reopened tab would start a blank session and the conversation would look lost. `waiting`, not
+/// `thinking` — an agent sitting at its prompt is waiting for the operator.
+///
+/// Spawned like every report but the exit one, so start-up does not wait on a request to the app.
+fn announce_to_app(agent: &Arc<agent::Agent>) {
+    let Some(endpoint) = applink::endpoint() else {
+        return;
+    };
+    let session = agent.session_id_for_report();
+    tokio::spawn(async move {
+        applink::report(&endpoint, applink::State::Waiting, None, &session).await;
+    });
+}
+
+fn fetch_prices_in_background(agent: &Arc<agent::Agent>) {
+    let agent = Arc::clone(agent);
+    tokio::spawn(async move {
+        if let Err(why) = agent.fetch_prices().await {
+            log::info!("no prices available: {why}");
+        }
+    });
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let args = Args::parse();
+    // Destination and level floor are decided together, because the floor depends on the
+    // destination — a log sharing the terminal with the TUI has to be quiet. See `logging`.
+    logging::init(args.no_tui);
+
+    // Resolved early, because the code below moves fields out of `args` — the cwd
+    // and the provider's own config — and these need to read it. The logger is
+    // initialised first so that anything they report is actually seen.
+    let cwd = match &args.cwd {
+        Some(p) => p.clone(),
+        None => std::env::current_dir()?,
+    };
+    // After the cwd, because a project's `.catbus/identity.md` is found *at* it.
+    let (tool_set, identity) = resolve_tools(&args, &cwd)?;
+
+    // The relay must resolve *before* we open the socket — no point
+    // accepting prompts we can't service. Relay resolution only reads
+    // this machine's own preferences and token; the subscription login
+    // stays on the proxy, so catbus works on a box with no Claude Code
+    // credentials at all.
     let provider =
         if let (Some(url), Some(token), Some(model)) = (args.openai_url, args.openai_token, args.openai_model) {
             agent::Provider::OpenAiCompat(openai::Config {
                 chat_url: openai::chat_url_from_base(&url),
                 token,
                 model,
+                reasoning_effort: args.openai_reasoning_effort,
             })
         } else if let (Some(product_id), Some(token)) = (args.infomaniak_product_id, args.infomaniak_token) {
             agent::Provider::OpenAiCompat(openai::Config {
                 chat_url: openai::infomaniak_chat_url(&product_id),
                 token,
                 model: args.infomaniak_model,
+                // Infomaniak's models are not the reasoning family, and the field
+                // is refused by models that do not know it.
+                reasoning_effort: None,
             })
         } else {
-            agent::Provider::Anthropic(auth::load()?)
+            let relay = relay::Relay::resolve(args.relay_url.as_deref(), args.relay_token.as_deref())?;
+            log::info!("relaying to {}", relay.base_url());
+            agent::Provider::Relay(relay)
         };
     let session = session::open(&cwd, args.resume.as_deref(), args.new_session)?;
 
@@ -180,485 +471,272 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    // Refuse to start a second agent on a session that already has one.
+    //
+    // Two agents on one session is not a supported shape, and it fails in a way
+    // that names nothing useful. The default socket is derived from the session
+    // id, so the second agent binds the first one's socket: tab-atelier then
+    // talks to whichever agent won, while the other keeps its own unrelated
+    // history. Both append to the same transcript, so the file alternates
+    // between two conversations — and since each holds an in-memory history that
+    // its sibling keeps invalidating, the transcript can end up with turns no
+    // single agent's history matches. The symptom is a 400 about a message
+    // number that does not correspond to anything the operator typed.
+    //
+    // `--socket` means an operator (or the `Spawn` tool) has picked the endpoint
+    // deliberately and may be starting a second agent for the same directory on
+    // purpose, so the guard is for the derived path: "do not take over a session
+    // that is already being served".
+    if args.socket.is_none() && socket::is_live(&socket_path) {
+        let id = &session.id;
+        let short = id.get(..8).unwrap_or(id);
+        return Err(format!(
+            "a catbus-agent is already serving session {short} at {}.\n  \
+             Another agent here would share this session's transcript with it, and neither \
+             would have a consistent history.\n  \
+             Use that agent — or, to start a second one, pass --socket <path> so the two \
+             do not collide.",
+            socket_path.display()
+        )
+        .into());
+    }
+
     log::info!("session {} ready at {}", session.id, socket_path.display());
-    let agent = Arc::new(agent::Agent::new(provider, session));
+
+    // Read the monitor prompt before building the agent, so a bad path is a
+    // startup failure rather than a surprise the first time auto mode blocks
+    // something. The prompt is only used in auto mode, but a setting that is
+    // wrong should say so immediately.
+    let monitor_prompt = guard::Judge::prompt_from_path(args.monitor_prompt.as_deref())?;
+    let judge_model = args
+        .judge_model
+        .clone()
+        .unwrap_or_else(|| guard::DEFAULT_JUDGE_MODEL.to_owned());
+    // Resolved here, once, before the agent exists. A bad config is a startup
+    // failure: a tool set that silently differs from what the operator wrote
+    // would tell the model it has a tool that behaves otherwise.
+    // Whether the answer may carry escape sequences. Most explicit source
+    // wins: an explicit `--ansi`, then the colour convention, then whether
+    // stdout is really a terminal. The middle step is what makes an agent tab
+    // come out plain without the launcher saying anything — tab-atelier's
+    // `new_tab_env` sets `NO_COLOR=1` for the tabs an *agent* asked for, since
+    // those tabs' output is read by another program (`peek`, `output`, a
+    // `--wait` poll) and escapes there are bytes nothing renders — and what
+    // makes a tab with its right-click colours switched off come out plain too,
+    // since that toggle is expressed as `TERM=dumb`. See `ansi::allow_escapes`
+    // for the full reasoning.
+    let stdout_renders = !args.no_tui && std::io::stdout().is_terminal();
+    let env_disables_colour = ansi::colour_disabled_in_env();
+    let ansi = ansi::allow_escapes(args.ansi, stdout_renders, env_disables_colour);
+    // Log every input, not just the verdict: when the answer looks wrong, the
+    // useful question is *which* source decided it. TERM is included because it
+    // is the signal the app's per-tab colours toggle uses, and a `TERM=dumb` tab
+    // is otherwise indistinguishable from a misconfiguration.
+    log::info!(
+        "ansi escapes in replies: {ansi} \
+         (flag={:?}, stdout_renders={stdout_renders}, colour_disabled={env_disables_colour}, \
+         TERM={:?}, NO_COLOR={:?})",
+        args.ansi,
+        std::env::var("TERM").ok(),
+        std::env::var("NO_COLOR").ok()
+    );
+    let agent = Arc::new(
+        agent::Agent::new(provider, session)
+            .with_judge(judge_model, monitor_prompt)
+            // The identity file's `AllowedHosts`, enforced by the SSH tool itself: the tool needs it
+            // mid-call, and the dispatcher is where a tool is reached.
+            // The identity file's limits on SSH: which destinations, and which jump hosts. Both
+            // travel together, so one cannot be applied while the other is forgotten.
+            .with_tools(tool_set.with_ssh_policy(tools::ssh::Policy {
+                allowed_hosts: identity.allowed_hosts().map(<[String]>::to_vec),
+                allowed_jump_hosts: identity.allowed_jump_hosts().map(<[String]>::to_vec),
+            }))
+            .with_ansi(ansi)
+            .with_identity(identity),
+    );
+
+    fetch_prices_in_background(&agent);
+
+    announce_to_app(&agent);
+
+    apply_launch_gate(&agent, args.gate.as_deref()).await?;
+
+    // Stated at start-up, because "which mode am I in" is the first thing an
+    // operator needs when a write went through that they expected to be checked,
+    // or was refused when they expected it to go. The mode now comes from three
+    // places — this flag, the session's saved value, or the default — and this
+    // line is the only thing that says which one won.
+    log::info!("permission mode: {}", agent.gate().as_str());
 
     let socket_task = tokio::spawn({
         let agent = Arc::clone(&agent);
         let path = socket_path.clone();
-        async move { socket::serve(agent, path).await }
+        let once = args.once;
+        async move { socket::serve(agent, path, once).await }
     });
 
     if args.no_tui {
-        // Headless: just block on the socket task.
+        // Headless: just block on the socket task. With `--once` this returns as
+        // soon as the one prompt has been answered, and the process exits.
         socket_task.await??;
     } else {
-        run_repl(Arc::clone(&agent), &cwd).await?;
+        tui::app::run(Arc::clone(&agent), &cwd).await?;
         // REPL exit (Ctrl-D) brings the whole process down so the
         // tab the user closed feels "closed". Aborting the socket
         // task removes its file in Drop on a best-effort basis.
         socket_task.abort();
     }
+    goodbye_to_app(&agent).await;
     Ok(())
 }
 
-/// Spinner frames — simple ASCII so any font renders them.
-const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-
-/// reedline `Prompt` impl that renders the session-name prefix in cyan.
-/// The name is snapshotted once per `read_line()` call so reedline can
-/// keep calling these methods without touching the async lock.
-struct CatbusPrompt {
-    name: String,
-}
-
-impl Prompt for CatbusPrompt {
-    fn render_prompt_left(&self) -> Cow<'_, str> {
-        Cow::Borrowed("")
-    }
-    fn render_prompt_right(&self) -> Cow<'_, str> {
-        Cow::Borrowed("")
-    }
-    fn render_prompt_indicator(&self, _: PromptEditMode) -> Cow<'_, str> {
-        if self.name.is_empty() {
-            Cow::Borrowed("\x1b[36m>\x1b[0m ")
-        } else {
-            Cow::Owned(format!("\x1b[36m{}>\x1b[0m ", self.name))
-        }
-    }
-    fn render_prompt_multiline_indicator(&self) -> Cow<'_, str> {
-        Cow::Borrowed("\x1b[36m·\x1b[0m ")
-    }
-    fn render_prompt_history_search_indicator(&self, s: PromptHistorySearch) -> Cow<'_, str> {
-        let prefix = match s.status {
-            PromptHistorySearchStatus::Passing => "search",
-            PromptHistorySearchStatus::Failing => "search failed",
-        };
-        Cow::Owned(format!("({prefix}: {}) ", s.term))
-    }
-}
-
-/// History file lives under `XDG_STATE_HOME` (or `~/.local/state`) so it
-/// survives across sessions but stays out of the user's `$HOME`.
-fn history_path() -> PathBuf {
-    let base = std::env::var("XDG_STATE_HOME")
-        .ok()
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var("HOME")
-                .ok()
-                .map(|h| PathBuf::from(h).join(".local/state"))
-        })
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
-    base.join("catbus-agent").join("history.txt")
-}
-
-/// Build a reedline editor with file-backed history. Caps at 5000
-/// entries so the file doesn't grow without bound.
-fn make_editor() -> Reedline {
-    let path = history_path();
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let history = FileBackedHistory::with_file(5000, path).map(Box::new).ok();
-    let mut editor = Reedline::create();
-    if let Some(h) = history {
-        editor = editor.with_history(h);
-    }
-    editor
-}
-
-/// In-tab REPL: print a prompt, read a line, hand it to the agent,
-/// print the answer, repeat.
+/// The last word to the app: this agent is gone, so its tab's indicator should stop rather than keep
+/// showing whatever it was last doing.
 ///
-/// Line editing comes from `reedline` (history, cursor movement,
-/// Ctrl-R search). Ctrl-C while typing clears the buffer and re-prompts;
-/// Ctrl-C while the agent is working cancels the in-flight request via
-/// `agent.cancel_current()`. Ctrl-D exits.
-#[allow(clippy::too_many_lines)]
-async fn run_repl(agent: Arc<agent::Agent>, cwd: &std::path::Path) -> std::io::Result<()> {
-    let mut stdout = tokio::io::stdout();
-
-    print_banner(&mut stdout, &agent).await?;
-
-    // reedline is sync — we move it into a `spawn_blocking` for each
-    // read_line and pull it back so the main task can keep driving the
-    // tokio runtime (signals, agent work, etc.).
-    let mut editor_slot: Option<Reedline> = Some(make_editor());
-
-    loop {
-        let name = agent.session_name().await;
-        let prompt = CatbusPrompt { name };
-        let mut editor = editor_slot.take().expect("editor present");
-        let (sig, returned) = tokio::task::spawn_blocking(move || {
-            let res = editor.read_line(&prompt);
-            (res, editor)
-        })
-        .await
-        .expect("reedline task panicked");
-        editor_slot = Some(returned);
-
-        let line = match sig? {
-            Signal::Success(line) => line,
-            Signal::CtrlC => {
-                // Just clear the line; don't kill the process.
-                continue;
-            }
-            Signal::CtrlD => {
-                stdout.write_all(b"\n").await?;
-                break;
-            }
-        };
-
-        let prompt = line.trim().trim_matches('`');
-        if prompt.is_empty() {
-            continue;
-        }
-
-        // Slash commands are interpreted locally; everything else
-        // becomes a user turn for the model.
-        if prompt == "/help" {
-            stdout
-                .write_all(
-                    b"slash commands:\n  \
-                      /help              show this list\n  \
-                      /plan              enable plan-mode (write/edit/bash refuse)\n  \
-                      /noplan            disable plan-mode\n  \
-                      /rename <name>     rename the current session\n  \
-                      /resume            list previous sessions in this cwd\n  \
-                      /resume <id>       switch to a previous session in-place\n  \
-                      /deb               build the .deb and print its path\n  \
-                      /exit              quit (same as Ctrl-D)\n\n",
-                )
-                .await?;
-            continue;
-        }
-        if prompt == "/exit" || prompt == "/quit" {
-            break;
-        }
-        if prompt == "/plan" {
-            agent.set_plan_mode(true);
-            stdout.write_all(b"plan-mode = true\n").await?;
-            continue;
-        }
-        if prompt == "/noplan" {
-            agent.set_plan_mode(false);
-            stdout.write_all(b"plan-mode = false\n").await?;
-            continue;
-        }
-        if prompt == "/deb" {
-            stdout.write_all(b"\x1b[36mbuilding .deb...\x1b[0m\n").await?;
-            stdout.flush().await?;
-            let out = tokio::process::Command::new("cargo")
-                .args(["deb", "--no-build"])
-                .current_dir(cwd)
-                .output()
-                .await;
-            match out {
-                Ok(o) if o.status.success() => {
-                    // cargo-deb prints the .deb path as the last non-empty
-                    // line of stdout.
-                    let text = String::from_utf8_lossy(&o.stdout);
-                    let path = text.lines().rfind(|l| !l.trim().is_empty()).unwrap_or("(no output)");
-                    let path = path.trim().trim_matches('`');
-                    stdout.write_all(format!("\x1b[1m{path}\x1b[0m\n").as_bytes()).await?;
-                }
-                Ok(o) => {
-                    let stderr = String::from_utf8_lossy(&o.stderr);
-                    stdout
-                        .write_all(format!("\x1b[31merror:\x1b[0m cargo-deb failed\n{stderr}").as_bytes())
-                        .await?;
-                }
-                Err(e) => {
-                    stdout
-                        .write_all(format!("\x1b[31merror:\x1b[0m could not run cargo-deb: {e}\n").as_bytes())
-                        .await?;
-                }
-            }
-            continue;
-        }
-        if let Some(new_name) = prompt.strip_prefix("/rename ") {
-            let new_name = new_name.trim();
-            if new_name.is_empty() {
-                stdout.write_all(b"usage: /rename <name>\n").await?;
-                continue;
-            }
-            match agent.rename_session(new_name).await {
-                Ok(()) => {
-                    stdout
-                        .write_all(format!("session renamed to \x1b[1m{new_name}\x1b[0m\n").as_bytes())
-                        .await?;
-                }
-                Err(e) => {
-                    stdout
-                        .write_all(format!("\x1b[31merror:\x1b[0m {e}\n").as_bytes())
-                        .await?;
-                }
-            }
-            continue;
-        }
-        if prompt == "/rename" {
-            stdout.write_all(b"usage: /rename <name>\n").await?;
-            continue;
-        }
-        if let Some(target_id) = prompt.strip_prefix("/resume ") {
-            let target_id = target_id.trim();
-            if target_id.is_empty() {
-                stdout.write_all(b"usage: /resume <session-id>\n").await?;
-                continue;
-            }
-            match session::open(cwd, Some(target_id), false) {
-                Ok(new_session) => {
-                    let new_id = new_session.id.clone();
-                    let new_name = new_session.session_name();
-                    match agent.swap_session(new_session).await {
-                        Ok(()) => {
-                            let label = if new_name.is_empty() {
-                                format!("\x1b[2m{new_id}\x1b[0m")
-                            } else {
-                                format!("\x1b[1m{new_name}\x1b[0m  \x1b[2m{new_id}\x1b[0m")
-                            };
-                            stdout
-                                .write_all(format!("switched to session {label}\n").as_bytes())
-                                .await?;
-                            let path = agent.transcript_path().await;
-                            print_exchanges(&mut stdout, &path).await?;
-                            stdout.write_all(b"\n").await?;
-                        }
-                        Err(e) => {
-                            stdout
-                                .write_all(format!("\x1b[31merror:\x1b[0m swap failed: {e}\n").as_bytes())
-                                .await?;
-                        }
-                    }
-                }
-                Err(e) => {
-                    stdout
-                        .write_all(format!("\x1b[31merror:\x1b[0m could not open session: {e}\n").as_bytes())
-                        .await?;
-                }
-            }
-            continue;
-        }
-        if prompt == "/resume" {
-            let sessions = session::list_sessions(cwd);
-            if sessions.is_empty() {
-                stdout.write_all(b"no previous sessions in this cwd.\n\n").await?;
-                continue;
-            }
-            let current_id = agent.session_id().await;
-            stdout
-                .write_all(format!("{} session(s) for {}:\n", sessions.len(), cwd.display()).as_bytes())
-                .await?;
-            let now = std::time::SystemTime::now();
-            let project_dir = session::project_dir_for(cwd);
-            for (id, name, ts) in &sessions {
-                let age = now
-                    .duration_since(*ts)
-                    .map_or_else(|_| "in the future".to_string(), |d| humanise_age(d.as_secs()));
-                let marker = if id == &current_id {
-                    " \x1b[32m(current)\x1b[0m"
-                } else {
-                    ""
-                };
-                // Use the /rename'd name when set; otherwise fall back
-                // to the session's first user prompt (truncated) so
-                // every row carries something recognisable, not just a
-                // UUID. The id is always shown after the label.
-                let derived_label = if name.is_empty() {
-                    project_dir
-                        .as_ref()
-                        .and_then(|d| session::first_prompt(&d.join(format!("{id}.jsonl")), 60))
-                } else {
-                    None
-                };
-                let label = match (name.is_empty(), derived_label) {
-                    (false, _) => format!("\x1b[1m{name}\x1b[0m  \x1b[2m{id}\x1b[0m"),
-                    (true, Some(prompt_label)) => {
-                        format!("\x1b[1m{prompt_label}\x1b[0m  \x1b[2m{id}\x1b[0m")
-                    }
-                    (true, None) => format!("\x1b[2m{id}\x1b[0m"),
-                };
-                stdout
-                    .write_all(format!("  {label}  {age}{marker}\n").as_bytes())
-                    .await?;
-            }
-            stdout
-                .write_all(b"\nto switch in-place: /resume <session-id>\n\n")
-                .await?;
-            continue;
-        }
-
-        // Regular prompt — run through the agent, show spinner while working.
-        let agent_clone = Arc::clone(&agent);
-        let prompt_owned = prompt.to_string();
-
-        // Publish "thinking" state to tab-atelier before we hand the
-        // prompt off. Captures the current session id so a /resume
-        // mid-REPL moves the badge to the new session.
-        let session_id_for_status = agent.session_id().await;
-        set_tab_status("thinking", Some(&session_id_for_status));
-
-        // Spawn the agent work on a concurrent task so the main task
-        // can drive the spinner + a SIGINT watcher.
-        let work = tokio::spawn(async move { agent_clone.run_user_prompt(prompt_owned).await });
-
-        // Reedline puts the terminal back into canonical mode when
-        // read_line returns, so Ctrl+C now reaches us as a real SIGINT.
-        // Race it against the spinner loop: first to fire wins.
-        let spinner_agent = Arc::clone(&agent);
-        let mut frame: usize = 0;
-        let mut interrupted = false;
-        loop {
-            tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_millis(120)) => {}
-                res = tokio::signal::ctrl_c() => {
-                    // Best-effort — if the signal handler can't install
-                    // (rare), just fall through and let the spinner finish.
-                    if res.is_ok() {
-                        agent.cancel_current();
-                        interrupted = true;
-                        stdout.write_all(b"\r\x1b[K\x1b[33minterrupted\x1b[0m, cancelling...\n").await?;
-                        stdout.flush().await?;
-                        break;
-                    }
-                }
-            }
-            let current_status = spinner_agent.status.lock().expect("status mutex").clone();
-            let Some(label) = current_status else {
-                // Erase the spinner line before printing the reply.
-                stdout.write_all(b"\r\x1b[K").await?;
-                stdout.flush().await?;
-                break;
-            };
-            let spinner_char = SPINNER[frame % SPINNER.len()];
-            // `\r` parks the cursor; `\x1b[K` erases from the cursor
-            // to end-of-line so a shorter label never leaves the tail
-            // of a previous longer one behind (e.g. "thinking" written
-            // over "Bash: grep -ri ..." used to show "thinking ri ...").
-            stdout
-                .write_all(format!("\r\x1b[K\x1b[36m{spinner_char}\x1b[0m {label}").as_bytes())
-                .await?;
-            stdout.flush().await?;
-            frame += 1;
-        }
-
-        // If we requested cancel, wait briefly for the work task to
-        // notice — but don't hang the REPL on a stuck tool.
-        let result = if interrupted {
-            tokio::time::timeout(std::time::Duration::from_secs(5), work).await
-        } else {
-            Ok(work.await)
-        };
-
-        let session_id_after = agent.session_id().await;
-        match result {
-            Ok(Ok(Ok(reply))) => {
-                // Persist token usage sidecar so tab-atelier can pick it up.
-                let session = agent.active_session().await;
-                let _ = session.save_tokens(
-                    agent.tokens_in.load(std::sync::atomic::Ordering::Relaxed),
-                    agent.tokens_out.load(std::sync::atomic::Ordering::Relaxed),
-                );
-                stdout.write_all(b"\n").await?;
-                stdout.write_all(reply.as_bytes()).await?;
-                stdout.write_all(b"\n\n").await?;
-                set_tab_status("waiting", Some(&session_id_after));
-            }
-            Ok(Ok(Err(e))) => {
-                stdout
-                    .write_all(format!("\n\x1b[31merror:\x1b[0m {e}\n\n").as_bytes())
-                    .await?;
-                set_tab_status("error", Some(&session_id_after));
-            }
-            Ok(Err(join)) => {
-                stdout
-                    .write_all(format!("\n\x1b[31merror:\x1b[0m agent task: {join}\n\n").as_bytes())
-                    .await?;
-                set_tab_status("error", Some(&session_id_after));
-            }
-            Err(_timeout) => {
-                stdout
-                    .write_all(b"\n\x1b[31merror:\x1b[0m cancel timed out; abandoning task\n\n")
-                    .await?;
-                set_tab_status("error", Some(&session_id_after));
-            }
-        }
-    }
-    Ok(())
+/// Awaited, unlike every other report. The process is about to end, so a spawned task would be
+/// cancelled before it sent anything — and this is the one report whose absence leaves a wrong answer
+/// on screen rather than a stale one.
+async fn goodbye_to_app(agent: &Arc<agent::Agent>) {
+    let Some(endpoint) = applink::endpoint() else {
+        return;
+    };
+    applink::report(&endpoint, applink::State::Idle, None, &agent.session_id_for_report()).await;
 }
 
-/// Fire-and-forget `tab-atelier set-status <state> --kind catbus
-/// [--session <id>]`. Errors are swallowed: if the CLI isn't on
-/// PATH (catbus invoked outside a desktop install) or returns
-/// non-zero, the REPL keeps running. The set-status CLI itself
-/// silently no-ops when the `_TAB_ID` env var isn't set.
-fn set_tab_status(state: &str, session: Option<&str>) {
-    let mut cmd = std::process::Command::new("tab-atelier");
-    cmd.arg("set-status").arg(state).arg("--kind").arg("catbus");
-    if let Some(s) = session {
-        cmd.arg("--session").arg(s);
+///
+/// The gate a bare mode command selects, or `None` if `input` is not one.
+///
+/// Extracted from the REPL loop because that loop needs a terminal to run at
+/// all — reedline puts the tty in raw mode — so a test cannot reach the mapping
+/// from the typed word to the mode. That mapping is exactly what can silently
+/// break: a command that prints `gate = auto` while setting something else looks
+/// identical to a working one.
+///
+/// Delegates to [`tools::parse_gate`] after stripping the slash rather than
+/// keeping its own table. The socket's `set_gate` request parses the same words
+/// through the same function, and a second hand-written mapping here is how
+/// `/auto` and `{"kind":"set_gate","gate":"auto"}` would come to mean different
+/// things — a difference nothing would catch, since both would report
+/// `gate = auto`. Delegating makes the two the same code path, and it is why
+/// `/auto` can be checked through the socket, where a tty is not required.
+///
+/// Matched on the whole word, never a prefix: `/autorun` must not enable auto
+/// mode, and `/plan the refactor` must stay a prompt.
+fn gate_command(input: &str) -> Option<tools::Gate> {
+    let word = input.trim().strip_prefix('/')?;
+    match word {
+        // The two aliases are REPL conveniences with no wire spelling: "no
+        // plan" and "no auto" both mean "no gate", and either is what an
+        // operator reaches for. Everything else is the shared vocabulary.
+        "noplan" | "noauto" => Some(tools::Gate::Open),
+        other => tools::parse_gate(other),
     }
-    cmd.stdout(std::process::Stdio::null());
-    cmd.stderr(std::process::Stdio::null());
-    let _ = cmd.spawn();
 }
 
-async fn print_banner(stdout: &mut tokio::io::Stdout, agent: &agent::Agent) -> std::io::Result<()> {
-    stdout
-        .write_all(b"\x1b[1m\xf0\x9f\x90\x88\xef\xb8\x8f\xf0\x9f\x9a\x8c Catbus\x1b[0m \xe2\x80\x94 type a prompt, /help for commands, Ctrl-D to exit.\n")
-        .await?;
-    let id = agent.session_id().await;
-    let name = agent.session_name().await;
-    if name.is_empty() {
-        stdout
-            .write_all(format!("session \x1b[2m{id}\x1b[0m\n").as_bytes())
-            .await?;
-    } else {
-        stdout
-            .write_all(format!("session \x1b[1m{name}\x1b[0m  \x1b[2m{id}\x1b[0m\n").as_bytes())
-            .await?;
-    }
-    let path = agent.transcript_path().await;
-    print_exchanges(stdout, &path).await?;
-    stdout.write_all(b"\n").await?;
-    stdout.flush().await
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-/// Print the last 3 exchanges from `path` as a compact recap.
-/// Each exchange is: dim user prompt, then assistant reply (possibly
-/// truncated). A separator line precedes the block when exchanges exist.
-async fn print_exchanges(stdout: &mut tokio::io::Stdout, path: &std::path::Path) -> std::io::Result<()> {
-    let exchanges = session::last_exchanges(path, 3);
-    if exchanges.is_empty() {
-        return Ok(());
+    #[test]
+    fn each_mode_command_selects_its_own_gate() {
+        // The mapping the REPL acts on. `/auto` in particular is the only way to
+        // reach the judge, so a silent mismatch here would leave auto mode
+        // unreachable while the REPL happily printed "gate = auto".
+        assert_eq!(gate_command("/plan"), Some(tools::Gate::Plan));
+        assert_eq!(gate_command("/auto"), Some(tools::Gate::Auto));
+        assert_eq!(gate_command("/noplan"), Some(tools::Gate::Open));
+        assert_eq!(gate_command("/noauto"), Some(tools::Gate::Open));
     }
-    stdout.write_all(b"\x1b[2m--- recent exchanges ---\x1b[0m\n").await?;
-    for ex in &exchanges {
-        // User line: cyan >, dim text, truncated at 120 chars.
-        let user_preview: String = ex.user_text.lines().next().unwrap_or("").chars().take(120).collect();
-        stdout
-            .write_all(format!("\x1b[36m>\x1b[0m \x1b[2m{user_preview}\x1b[0m\n").as_bytes())
-            .await?;
-        // Assistant reply: indent, wrap long lines with a continuation marker.
-        for part in ex.assistant_text.lines().take(4) {
-            stdout.write_all(format!("  \x1b[2m{part}\x1b[0m\n").as_bytes()).await?;
+
+    #[test]
+    fn the_three_modes_are_distinct_and_named_as_the_model_sees_them() {
+        // Three words, three states. Two commands mapping to one gate would
+        // leave a mode unreachable, and the name the REPL prints has to be the
+        // name the agent puts in the environment turn — otherwise the operator
+        // reads one thing and the model is told another.
+        let gates = [
+            gate_command("/plan").unwrap(),
+            gate_command("/auto").unwrap(),
+            gate_command("/noplan").unwrap(),
+        ];
+        assert_ne!(gates[0], gates[1]);
+        assert_ne!(gates[1], gates[2]);
+        assert_ne!(gates[0], gates[2]);
+        assert_eq!(tools::Gate::Plan.as_str(), "plan");
+        assert_eq!(tools::Gate::Auto.as_str(), "auto");
+        assert_eq!(tools::Gate::Open.as_str(), "open");
+    }
+
+    #[test]
+    fn the_repl_and_the_socket_agree_about_what_each_mode_is_called() {
+        // The guarantee that makes `/auto` trustworthy: it resolves through the
+        // same function the socket's `set_gate` uses, so the two cannot drift
+        // into meaning different things. Without this, the REPL could print
+        // `gate = auto` while the socket's spelling of "auto" did something
+        // else — and nothing would notice, because both would look right from
+        // their own side.
+        for gate in [tools::Gate::Open, tools::Gate::Plan, tools::Gate::Auto] {
+            let socket_parsed = tools::parse_gate(gate.as_str());
+            assert_eq!(
+                socket_parsed,
+                Some(gate),
+                "the wire name {} does not round-trip",
+                gate.as_str()
+            );
+            let repl_parsed = gate_command(&format!("/{}", gate.as_str()));
+            assert_eq!(
+                repl_parsed,
+                socket_parsed,
+                "/{} and set_gate({:?}) disagree",
+                gate.as_str(),
+                gate.as_str()
+            );
         }
-        if ex.assistant_text.lines().count() > 4 {
-            stdout.write_all(b"  \x1b[2m...\x1b[0m\n").await?;
+    }
+
+    #[test]
+    fn auto_mode_is_reachable_from_the_repl_word_that_promises_it() {
+        // The specific claim behind the command: `/auto` selects the judged
+        // mode, not merely a mode that prints "auto".
+        assert_eq!(gate_command("/auto"), Some(tools::Gate::Auto));
+        assert_eq!(gate_command("/auto").map(tools::Gate::as_str), Some("auto"));
+    }
+
+    #[test]
+    fn a_command_is_matched_exactly_never_by_prefix() {
+        // A prompt is not a command unless it is the whole word. `/autorun` must
+        // reach the model as a prompt rather than quietly enabling the judge,
+        // and `/plan the refactor` must stay a prompt.
+        for not_a_command in [
+            "/autorun",
+            "/automatic",
+            "/plan the refactor",
+            "/planning",
+            "/noplan/x",
+            "plain text",
+            "/pla",
+            "",
+            "  ",
+        ] {
+            assert_eq!(gate_command(not_a_command), None, "{not_a_command:?} is not a command");
         }
     }
-    Ok(())
-}
 
-fn humanise_age(secs: u64) -> String {
-    if secs < 60 {
-        format!("{secs}s ago")
-    } else if secs < 3600 {
-        format!("{}m ago", secs / 60)
-    } else if secs < 86_400 {
-        format!("{}h ago", secs / 3600)
-    } else {
-        format!("{}d ago", secs / 86_400)
+    #[test]
+    fn surrounding_whitespace_does_not_hide_a_command() {
+        // Reedline hands over the line as typed, and a pasted command can carry
+        // a trailing space.
+        assert_eq!(gate_command("/auto "), Some(tools::Gate::Auto));
+        assert_eq!(gate_command("  /plan"), Some(tools::Gate::Plan));
+        // `/clear` is a command, but not a mode: it resolves in `slash`'s table
+        // and this parser — which the dispatch reaches only for a `Gate` action —
+        // must not claim it. The REPL asks the table first and never gets here
+        // for a non-gate, so a match here would be a mode nobody can select.
+        assert_eq!(gate_command("/clear "), None, "clear is not a mode");
+        assert_eq!(
+            slash::lookup("/clear ").map(|(command, _)| command.action),
+            Some(slash::Action::Clear),
+            "and the table is where it is owned"
+        );
     }
 }

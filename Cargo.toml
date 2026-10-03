@@ -1,18 +1,54 @@
 [workspace]
-members = ["crates/catbus-agent"]
-default-members = [".", "crates/catbus-agent"]
+members = ["crates/catbus-agent", "crates/claude-api", "crates/tab-atelier-briefs", "crates/tab-atelier-proxy", "crates/tab-atelier-kiosk"]
+# tab-atelier-proxy and tab-atelier-kiosk are deliberately NOT default members: they are
+# servers shipped as separate .debs, and building the desktop should not build them.
+# `cargo build -p <server-crate>` when you want one.
+default-members = [".", "crates/catbus-agent", "crates/claude-api", "crates/tab-atelier-briefs"]
 
 # Release codegen tuned for the hot VT-parse / grid-update loop. Cargo's
 # defaults (lto = false, codegen-units = 16) leave cross-crate inlining
 # on the table — the parser lives in alacritty_terminal/vte while the
-# Term handler and our ring live here, so fat LTO lets LLVM inline across
+# Term handler and our ring live here, so LTO lets LLVM inline across
 # that boundary, and a single codegen unit gives it the whole picture.
 # Biggest near-free win for CPU-bound cases (cursor_motion) and the whole
 # pipeline; panic stays "unwind" because gpui and the test suite rely on
 # it, and target-cpu is left default so the shipped .deb runs everywhere.
+#
+# thin rather than fat: both inline across the alacritty_terminal/vte
+# boundary, but fat merges every module into one and re-optimises the
+# whole program, which is what made a release link take ~6 minutes — the
+# single largest cost in every CI workflow, and three of them run per
+# commit. thin does the cross-module inlining on the hot paths and links
+# in a fraction of the time. If a profile ever shows the difference
+# matters, fat is a one-word change.
+#
+# The debug symbols are NOT set here — see the note in `[profile.release]`
+# below. They cost nothing at runtime (DWARF is not mapped unless a debugger
+# or a panic unwinder asks for it) and cargo-deb splits them into a separate
+# -dbgsym.ddeb, so a shipped .deb stays stripped while the symbols stay
+# retrievable. That is Debian's convention, not a Rust one, which is why the
+# split lives in the deb build rather than in this profile.
 [profile.release]
-lto = "fat"
+lto = "thin"
 codegen-units = 1
+# `debug` is deliberately NOT set here — the two workflows that ship a .ddeb
+# set CARGO_PROFILE_RELEASE_DEBUG themselves, and at different levels:
+# apt-publish builds a per-commit nightly with `line-tables-only` (enough for
+# a `file:line` backtrace, ~131 s cheaper), release.yml builds a tag with the
+# full `2`. A default here could not express that split — it would flatten
+# both channels onto one level.
+#
+# Two further reasons. arch-pkg ships no debug symbols at all
+# (`options=('!debug')` in packaging/arch/PKGBUILD) and was paying ~6 minutes
+# of compile time for artifacts it discards; and a local
+# `cargo build --release` should not carry the whole dependency tree's DWARF
+# unless the build is actually for a debugging artifact. A profile setting
+# here taxes every release build in the repo for the benefit of those two.
+#
+# (cargo-deb force-enables debug info anyway when --dbgsym is passed, so those
+# two would still produce symbols without the variable. Not relying on that:
+# an undocumented side effect is not a reason a nightly's symbols exist, and
+# if it changed they would vanish quietly.)
 
 [package]
 name = "tab-atelier"
@@ -106,6 +142,7 @@ struct_excessive_bools = "allow"
 needless_pass_by_ref_mut = "allow"
 
 [dependencies]
+# hook test comment in the dependencies section
 # Global allocator (both binaries). Replaces glibc malloc, whose per-thread
 # arenas (up to 8×ncpu) fragment badly and hoard freed memory under our
 # many-threaded workload (one PTY-reader thread per tab) — the dominant cause of
@@ -134,6 +171,12 @@ serde_json = "1"
 x11rb = { version = "0.13", features = ["allow-unsafe-code"], optional = true }
 qrcode = { version = "0.14", default-features = false, optional = true }
 ureq = { version = "3", features = ["json"] }
+# Every Anthropic endpoint, header and credential, shared with tab-atelier-proxy
+# and catbus-agent. Three copies of this had drifted apart before it existed.
+claude-api = { path = "crates/claude-api" }
+# The per-project briefs, so the agent that reads one and the app that injects it
+# agree on where the files live and how a cwd selects them.
+tab-atelier-briefs = { path = "crates/tab-atelier-briefs" }
 vte = { version = "0.15", default-features = false, features = ["std", "ansi"] }
 wattaouille = { version = "1.4.0", optional = true }
 ctrlc = { version = "3.4", default-features = false }
@@ -348,6 +391,16 @@ assets = [
     # OpenAPI 3.1 spec for the local HTTP API (also served live at
     # GET /openapi.yaml). Point Swagger UI / codegen at it.
     ["assets/openapi.yaml", "/usr/share/doc/tab-atelier/", "644"],
+    # The fleet handbook. `self-organization.md` is the model (leases, contract
+    # net, gossip, and why not Raft); `fleet-playbook.md` is the operational
+    # side, written to be handed to an agent. Shipped because an agent on a
+    # machine that only has the deb has no checkout to read them from — and
+    # the agent brief points at them by name.
+    ["docs/self-organization.md", "/usr/share/doc/tab-atelier/", "644"],
+    ["docs/fleet-playbook.md", "/usr/share/doc/tab-atelier/", "644"],
+    ["docs/agent-guide.md", "/usr/share/doc/tab-atelier/", "644"],
+    ["docs/config-guide.md", "/usr/share/doc/tab-atelier/", "644"],
+    ["crates/catbus-agent/examples/tools.json", "/usr/share/doc/tab-atelier/", "644"],
     # eSheep pets (the `pets` feature): a baked sprite sheet (<id>.png, alpha-keyed
     # + palette-quantized) beside its animation XML (<id>.xml), loaded at runtime
     # from here (dev falls back to ./assets/pets/).
@@ -406,6 +459,16 @@ assets = [
     ["LICENSE", "/usr/share/doc/tab-atelier-headless/", "644"],
     # OpenAPI 3.1 spec (also served live at GET /openapi.yaml).
     ["assets/openapi.yaml", "/usr/share/doc/tab-atelier-headless/", "644"],
+    # The fleet handbook. `self-organization.md` is the model (leases, contract
+    # net, gossip, and why not Raft); `fleet-playbook.md` is the operational
+    # side, written to be handed to an agent. Shipped because an agent on a
+    # machine that only has the deb has no checkout to read them from — and
+    # the agent brief points at them by name.
+    ["docs/self-organization.md", "/usr/share/doc/tab-atelier-headless/", "644"],
+    ["docs/fleet-playbook.md", "/usr/share/doc/tab-atelier-headless/", "644"],
+    ["docs/agent-guide.md", "/usr/share/doc/tab-atelier-headless/", "644"],
+    ["docs/config-guide.md", "/usr/share/doc/tab-atelier-headless/", "644"],
+    ["crates/catbus-agent/examples/tools.json", "/usr/share/doc/tab-atelier-headless/", "644"],
 ]
 # Service-account lifecycle (adduser/deluser) and unit enable/start
 # are handled by these scripts; cargo-deb installs them as the deb's
