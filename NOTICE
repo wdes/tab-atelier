@@ -1,0 +1,45 @@
+Tab Atelier Remote
+Copyright 2026 William Desportes
+
+--------------------------------------------------------------------------------
+ConnectBot (upstream)
+--------------------------------------------------------------------------------
+
+This product is a modified fork of ConnectBot, and includes software
+developed as part of ConnectBot:
+
+    ConnectBot: simple, powerful, open-source SSH client for Android
+    https://github.com/connectbot/connectbot
+    Copyright 2007-2026 Kenny Root
+    Licensed under the Apache License, Version 2.0
+
+Fork point: e484bd3a84ea5cc22800a8f7067d9984b7ccc7ea (2026-10-02)
+
+The ConnectBot source is not committed here. It is pulled in as a git
+submodule pinned to the commit above, and the files under overlay/ are
+applied on top of it before the build. Per section 4(b) of the Apache
+License, Version 2.0, every file under overlay/ is a modified ConnectBot
+source file and carries a header saying so.
+
+Neither the name "ConnectBot" nor any upstream contributor's name is used to
+endorse this fork. Section 6 of the Apache License, Version 2.0 grants no
+trademark rights, so this application is presented under its own name,
+"Tab Atelier Remote".
+
+--------------------------------------------------------------------------------
+Bundled third-party components
+--------------------------------------------------------------------------------
+
+ConnectBot Terminal (termlib)
+    https://github.com/connectbot/termlib
+    Copyright 2025 Kenny Root
+    Licensed under the Apache License, Version 2.0
+    Consumed as the Maven artifact org.connectbot:termlib.
+
+libvterm (vendored inside termlib)
+    Copyright (c) 2008 Paul Evans <leonerd@leonerd.org.uk>
+    Licensed under the MIT licence.
+
+AndroidX, Jetpack Compose, Material Components, Room, Hilt, OkHttp, Kotlin and
+their transitive dependencies are licensed under the Apache License, Version
+2.0 by The Android Open Source Project, Google LLC and JetBrains s.r.o.
