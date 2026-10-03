@@ -3341,6 +3341,7 @@ pub fn rehome_safe_to_close(status: Option<&str>) -> bool {
     status == REHOME_STEPS.last().map(|st| st.slug)
 }
 
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
 /// Resolve a tab's project, in order: (1) `<project>:` override; (2) basename of
 /// a repo cwd; (3) `méta` lane for a meta-role itinerant; (4) `divers`.
 pub fn project_of(cwd: Option<&str>, assignment: Option<&str>) -> String {
@@ -3384,14 +3385,17 @@ pub fn rehome_badge(status: Option<&str>) -> Option<(&'static str, bool)> {
 
 const META_LANE: &str = "méta";
 
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
 const DIVERS_LANE: &str = "divers";
 
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
 /// Dev work-roots whose basename is NOT a project (a shell parked at the parent
 /// of the repos). `ponytail:` heuristic list, no git detection — a tab actually
 /// inside `~/Dev/kalpin-back` still maps to `kalpin-back`; upgrade = walk to
 /// the enclosing `.git`.
 const WORK_ROOT_NAMES: [&str; 6] = ["dev", "src", "code", "projects", "repos", "workspace"];
 
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
 /// Roles that mark an itinerant meta-specialist: with no repo cwd and no
 /// project override, such a tab lands in the shared **`méta`** lane rather than
 /// `divers`. See docs/dashboard.md "Dimension projet + voie méta".
