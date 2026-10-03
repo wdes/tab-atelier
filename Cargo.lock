@@ -1032,7 +1032,9 @@ dependencies = [
  "roxmltree",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "strip-ansi-escapes",
+ "tab-atelier-briefs",
  "tempfile",
  "terminal_size",
  "thiserror 2.0.18",
@@ -7121,6 +7123,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tab-atelier-briefs",
  "tempfile",
  "time",
  "tokio",
@@ -7135,6 +7138,10 @@ dependencies = [
  "x11rb",
  "x509-parser 0.16.0",
 ]
+
+[[package]]
+name = "tab-atelier-briefs"
+version = "0.5.0-dev"
 
 [[package]]
 name = "tab-atelier-dashboard"

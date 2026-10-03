@@ -78,6 +78,13 @@ pub struct Job {
     /// `kill_on_drop` only works if the child is dropped, and a child moved into
     /// a waiting task would outlive the REPL that started it.
     child: tokio::process::Child,
+    /// The process group the command leads: every process it started.
+    ///
+    /// The child above is the shell; a command line is usually more than that — a pipeline, an `&&`
+    /// chain, a script that runs a test suite — so "stop the command" has to mean the tree. Disarmed
+    /// as soon as the command is seen to have exited, because a job that finished by itself is not
+    /// ours to stop, including anything it deliberately backgrounded.
+    group: crate::proc::Group,
     /// Lines as the readers produce them.
     updates: mpsc::UnboundedReceiver<Update>,
     /// The readers, so completion waits for them and not just for the process.
@@ -99,6 +106,7 @@ impl Job {
     /// Returns a description when the shell cannot be started.
     pub fn start(command: &str, cwd: &Path, tell_model: bool, foreground: bool) -> Result<Self, String> {
         let mut child = crate::tools::bash::spawn(command, cwd)?;
+        let group = crate::proc::Group::of(&child);
         let (tx, updates) = mpsc::unbounded_channel();
         let mut readers = Vec::new();
         // Both streams are gathered into the one queue, tagged so the operator
@@ -121,6 +129,7 @@ impl Job {
             foreground,
             started: Instant::now(),
             child,
+            group,
             updates,
             readers,
             collected: String::new(),
@@ -165,6 +174,10 @@ impl Job {
                     self.exit = Some(Exit::Signal);
                 }
             }
+            // The command is over, so its group is no longer ours to stop. A job that finished on
+            // its own terms keeps what it left behind — a server started with `&` — and killing the
+            // group here would take down exactly what the operator asked to keep running.
+            self.group.disarm();
         }
         self.readers
             .iter()
@@ -180,12 +193,18 @@ impl Job {
 
     /// Stop the command, and whatever it started.
     ///
+    /// The group is signalled first, because the child alone is not the command: for a pipeline or
+    /// an `&&` chain the shell is the one process not doing the work, and Ctrl-C that stopped only
+    /// the shell would leave the work running with nothing holding it. This is the sentence that
+    /// described the intent before the mechanism existed.
+    ///
     /// Best effort: a command already gone is the ordinary case here. Dropping
-    /// the job stops it too — the child is `kill_on_drop`, and the REPL is
-    /// dropped before the terminal is restored — so this is for the times a
+    /// the job stops it too — the child is `kill_on_drop` and the guard it holds kills the group,
+    /// and the REPL is dropped before the terminal is restored — so this is for the times a
     /// command has to stop *now*, with the job still held: Ctrl-C at the prompt,
     /// which is someone saying they have changed their mind.
     pub fn kill(&mut self) {
+        self.group.kill();
         if let Err(e) = self.child.start_kill() {
             log::debug!("a command did not need stopping: {e}");
         }

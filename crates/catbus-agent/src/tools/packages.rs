@@ -31,6 +31,9 @@ const KEEP: usize = 4_000;
 
 /// `composer install`, `update`, or `run <script>`.
 pub async fn composer(input: &serde_json::Value, cwd: &Path) -> Result<String, String> {
+    // The checkout to run in — the session's own directory, or a worktree named by `path`. First,
+    // because the `scripts` read below looks at the manifest in that checkout: a worktree has its own.
+    let cwd = &super::checkout(input, cwd)?;
     let action = action_of(input, &["install", "update", "run", "scripts"])?;
     // Answered from the manifest without spawning anything: listing what a project defines is a
     // read, so it works even where composer is not installed, and costs no process.
@@ -64,6 +67,8 @@ pub async fn composer(input: &serde_json::Value, cwd: &Path) -> Result<String, S
 
 /// `bun run <script>`, `bun install`, or `bun scripts` to list them.
 pub async fn bun(input: &serde_json::Value, cwd: &Path) -> Result<String, String> {
+    // The checkout to run in — see `composer`.
+    let cwd = &super::checkout(input, cwd)?;
     let action = action_of(input, &["run", "install", "scripts"])?;
     if action == "scripts" {
         return list_scripts(cwd, "package.json", None);
@@ -408,7 +413,8 @@ pub fn composer_spec() -> serde_json::Value {
                     "items": { "type": "string" },
                     "description": "Extra arguments, passed to the script for `run` and to composer otherwise."
                 },
-                "timeout_secs": { "type": "integer", "description": "Override the 600s default. Capped at 1800." }
+                "timeout_secs": { "type": "integer", "description": "Override the 600s default. Capped at 1800." },
+                "worktree": super::checkout_property()
             },
             "required": ["action"]
         }
@@ -435,7 +441,8 @@ pub fn bun_spec() -> serde_json::Value {
                     "items": { "type": "string" },
                     "description": "Extra arguments, passed to the script for `run` and to bun otherwise."
                 },
-                "timeout_secs": { "type": "integer", "description": "Override the 600s default. Capped at 1800." }
+                "timeout_secs": { "type": "integer", "description": "Override the 600s default. Capped at 1800." },
+                "worktree": super::checkout_property()
             },
             "required": ["action"]
         }

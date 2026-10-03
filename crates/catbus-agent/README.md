@@ -237,6 +237,9 @@ Two things follow from that, and both are easy to get wrong:
 | `--judge-model` | `CATBUS_JUDGE_MODEL` | what auto mode grades with |
 | `--monitor-prompt` | `CATBUS_MONITOR_PROMPT` | a file to use instead of the built-in prompt |
 | `--tools-config` | `CATBUS_TOOLS_CONFIG` | the tool set file above |
+| `--openai-url` | `CATBUS_OPENAI_URL` | a chat-completions endpoint to talk to instead of the relay |
+| `--openai-model` | `CATBUS_OPENAI_MODEL` | the model to ask that endpoint for |
+| `--openai-reasoning-effort` | `CATBUS_OPENAI_REASONING_EFFORT` | `reasoning_effort` for a model that needs one; unset by default |
 | — | `CATBUS_MAX_ROUNDS` | hard cap on tool rounds in one turn (default 200) |
 | — | `CATBUS_REPEAT_ROUNDS` | rounds of no new information before the loop guard stops the turn (default 3; `0` disables) |
 

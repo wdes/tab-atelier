@@ -47,7 +47,25 @@ const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
 /// a message comes to promise a limit the request does not use, which is exactly
 /// what happened to the round-cap warning that claimed "32" while the default
 /// was 200.
-const MAX_OUTPUT_TOKENS: u32 = 8192;
+///
+/// 65536 because the ceiling is free and the *retry* is not. A reply is billed on
+/// the output tokens it actually produces, so a ceiling above that costs the same
+/// as one below it — the model still stops when it is done. What costs is being
+/// cut: the answer so far is re-sent as input on the next round, and it is always
+/// a cache miss, since that text has never been seen as input before. Measured
+/// against the endpoint, a reply that needed 31405 tokens took four rounds at a
+/// 8192 ceiling and about 40% more than finishing in one.
+///
+/// The number is also about reasoning, which shares this budget rather than
+/// having one of its own — `budget_tokens` is ignored there. A turn whose thinking
+/// runs long can spend the whole ceiling and return no text at all; that was
+/// observed at 8192, and it is a better account of a truncated reply than length
+/// is. So the ceiling has to cover thinking *plus* answer, not the answer alone.
+///
+/// Not the 384K the provider allows: a reply that goes wrong should be cut off
+/// somewhere, and 65536 bounds that at a few cents while leaving the measured
+/// worst case a clear margin.
+const MAX_OUTPUT_TOKENS: u32 = 65_536;
 
 /// What the model is told when its previous reply stopped at the output limit.
 ///
@@ -251,6 +269,13 @@ pub struct Agent {
     model: std::sync::Mutex<String>,
     /// What to send as the system prompt. See [`crate::identity`].
     identity: crate::identity::Identity,
+    /// The working directory's own brief, rendered once at startup.
+    ///
+    /// Sits between the identity and the rendering instructions, and survives an
+    /// operator identity for the same reason those do: it describes the project
+    /// rather than the model, so it is true whatever the operator wrote about
+    /// themselves. Empty when the tree has no brief — nothing is sent for it.
+    brief: String,
     /// The model the relay reported serving, from the last reply.
     ///
     /// Only knowable from a reply, so the first turn of a session has none — see
@@ -277,6 +302,18 @@ pub struct Agent {
     /// through [`Turn::reasoning`] as it always did, and this is cleared as a
     /// turn starts so it is never a stale copy left on screen.
     reasoning: std::sync::Mutex<String>,
+    /// The answer being written by the model call streamed right now.
+    ///
+    /// The other half of [`Self::reasoning`], written by the same loop and read on the same tick,
+    /// and separate from it because the two are opposite phases of one call: a model that has begun
+    /// writing its answer has finished thinking about it. The display shows one or the other rather
+    /// than both — a reader shown the reasoning when the answer had already started would be
+    /// reading a conclusion that had been reached some time ago, with nothing to say so.
+    ///
+    /// Kept here rather than derived from the reasoning buffer so the two cannot be confused at a
+    /// call site: which one is on screen is a fact the agent knows and the UI is told, and inferring
+    /// it from "is the reasoning still growing" would be a guess about the wire made in the view.
+    answer: std::sync::Mutex<String>,
     /// Cumulative tokens consumed across all turns in this process.
     /// Both counters accumulate monotonically and are never reset.
     pub tokens_in: std::sync::atomic::AtomicU64,
@@ -289,11 +326,27 @@ pub struct Agent {
     /// What the provider has reported about the request in flight, as it streams past.
     ///
     /// Reset as each request is sent and written per chunk by the assembler, so it describes the
-    /// request being answered and never a previous one. Deliberately *not* cleared when the
-    /// request finishes: a turn that is between tool rounds still has a cost worth seeing, and a
-    /// figure that blinked out during every tool call would be harder to read than one that stays
-    /// up until the next request replaces it.
+    /// request being answered and never a previous one — the moment a reply is in hand its counts
+    /// are folded into [`Self::turn_spent`] and this is emptied, which is what keeps the two from
+    /// counting the same request twice. It is the *live* half: what is arriving now.
     live: std::sync::Mutex<LiveReport>,
+    /// What the turn now running has already been billed, summed over the requests that finished.
+    ///
+    /// A turn is several requests — the model thinks, calls a tool, thinks again — and each one is
+    /// billed, so the figure worth watching is their sum. Without this the row restarts at zero
+    /// every round: an operator watching a four-round turn used to see `12,000 in` become nothing,
+    /// then `6,000 in` on the round after the tool result, and could not tell a turn that was
+    /// nearly done from one that had just begun.
+    ///
+    /// Kept as a [`Usage`] rather than folded into the two atomics beside it because the row prices
+    /// it, and pricing needs the four kinds separately; those two are process-cumulative on purpose
+    /// and are what the totals line under a finished answer prints. This one is the turn's, and is
+    /// emptied where a turn begins — see [`Self::clear_live`].
+    ///
+    /// Only counts the *provider* reported are added to this total. The row's byte estimate of a
+    /// request in flight is a stand-in for a count that has not arrived, and it stays out of here —
+    /// it is folded in at display time instead, where it can be marked as the guess it is.
+    turn_spent: std::sync::Mutex<Usage>,
     /// Cancellation flag for the currently-running turn. Re-built at
     /// the start of every `run_user_prompt` so Ctrl+C only kills the
     /// in-flight request, not future ones.
@@ -337,8 +390,16 @@ struct LiveReport {
 /// * **`None`** when nothing has been measured and nothing reported, which is the row's state
 ///   between turns. A request whose payload has been serialised but not yet sent still counts as
 ///   something to show: the estimate is exactly what the row displayed before this existed.
-fn live_figures(report: LiveReport, inflight_bytes: u64) -> Option<crate::statusline::Live> {
-    if !report.started && report.output_bytes == 0 && inflight_bytes == 0 {
+///
+/// `spent` is what the requests of this turn that have *finished* were billed, and it is added to
+/// what the request in flight is up to. A turn is several requests — think, call a tool, think
+/// again — so the row's figure is their running sum rather than the current request's own: an
+/// operator watching a long turn wants to know what it has cost, and a number that fell back to a
+/// single request's size at every tool call answered a different question. It also means the row
+/// climbs toward the same total the line under the finished answer prints, which is the figure an
+/// operator compares it with.
+fn live_figures(report: LiveReport, inflight_bytes: u64, spent: Usage) -> Option<crate::statusline::Live> {
+    if spent.is_empty() && !report.started && report.output_bytes == 0 && inflight_bytes == 0 {
         // Nothing reported and nothing measured, so the row has nothing to say about cost. That is
         // the state between turns, and between the payload being serialised and being sent.
         return None;
@@ -365,10 +426,23 @@ fn live_figures(report: LiveReport, inflight_bytes: u64) -> Option<crate::status
         }
     };
     usage.output_tokens = output;
+    let mut total = spent;
+    total.absorb(usage);
     Some(crate::statusline::Live {
-        usage,
-        reported: report.started,
-        output_estimated: report.usage.output_tokens == 0,
+        usage: total,
+        // The input figure is the provider's when either the reply has opened — it carries its own
+        // count — or there is no request in flight whose length is being guessed. The second case
+        // is the gap between two tool rounds: nothing is going out, so the sum is nothing but
+        // counts the provider already reported, and marking *that* as an estimate would put a `~`
+        // on the most exact figure the row ever shows.
+        reported: report.started || inflight_bytes == 0,
+        // The output side is a guess for as long as a request is on the wire without the provider's
+        // closing count — which covers both the reply that has produced nothing yet (a price built
+        // on an output of zero, which will certainly move) and the one whose count is being read off
+        // its bytes. The gap between two tool rounds is the case this must *not* catch: nothing is
+        // in flight there, so every count in the sum is one the provider reported, and marking that
+        // as an estimate would put `est.` on the row's most exact figure.
+        output_estimated: report.usage.output_tokens == 0 && inflight_bytes > 0,
         model: report.model,
     })
 }
@@ -433,6 +507,18 @@ impl Agent {
         let gate = session.saved_gate().unwrap_or(tools::Gate::Open);
         // Read now, before `session` is moved into the `Arc` below.
         let session_id = session.id.clone();
+        // The project brief for this working directory, read once because that is
+        // what a brief is: a statement of how work is done in this tree. Read at
+        // startup rather than per request, for the reason `briefs` gives — context
+        // can be added to a session but not withdrawn, so a mid-session edit must
+        // not change the rules under a model that has already acted on the old
+        // ones.
+        //
+        // Read here rather than injected by the launcher, and that is the point:
+        // the selection rule lives in the shared crate, so this agent finds the
+        // same files a Claude tab is briefed with, without depending on a hook that
+        // only one of them installs.
+        let brief = tab_atelier_briefs::for_cwd(&session.cwd);
         // What this session had already spent, so a resume continues the count instead of
         // starting from zero. Both halves matter: the token counts are what the status lines
         // show, and the amounts cannot be recomputed here at all — the price list arrives later
@@ -448,14 +534,15 @@ impl Agent {
         // The session's own model, so reopening continues with it. Read once and
         // used for both the request and the identity decision below.
         let from_transcript = session.last_model();
+        // The provider's own config names a model explicitly on the
+        // OpenAI-compatible path, so it is a better default there than ours.
+        let provider_model = match &provider {
+            Provider::OpenAiCompat(config) => Some(config.model.clone()),
+            Provider::Relay(_) => None,
+        };
         let model = session
             .saved_model()
-            // The provider's own config names a model explicitly on the
-            // OpenAI-compatible path, so it is a better default there than ours.
-            .or_else(|| match &provider {
-                Provider::OpenAiCompat(config) => Some(config.model.clone()),
-                Provider::Relay(_) => None,
-            })
+            .or_else(|| provider_model.clone())
             .unwrap_or_else(|| DEFAULT_MODEL.to_owned());
         Self {
             provider,
@@ -487,19 +574,63 @@ impl Agent {
             // Built-in behaviour until an operator says otherwise. See
             // `crate::identity`.
             identity: crate::identity::Identity::Auto,
+            // The working directory's own brief, already rendered. Empty when the
+            // tree has none, which is the common case and costs nothing: no block
+            // is sent for it, exactly as if this field did not exist.
+            brief,
             // Everything learned from the transcript is seeded here, so a resumed
             // session starts knowing rather than discovering — which is what makes
             // the first request of a resumed session behave like the last request
             // of the session it is continuing, instead of like a brand-new one.
             model: std::sync::Mutex::new(model),
-            served_model: std::sync::Mutex::new(from_transcript),
+            // What actually answered, when the transcript says. Failing that, the
+            // model the provider was configured with — on the OpenAI-compatible
+            // path there is no relay to answer with something else, so the
+            // configured name is not a guess and the first turn can already know
+            // whether the Claude identity line is a lie. The relay path keeps
+            // `None` until a reply names a model, which is the only honest answer
+            // there: the client does not decide what serves it.
+            served_model: std::sync::Mutex::new(from_transcript.or(provider_model)),
             status: std::sync::Mutex::new(None),
             reasoning: std::sync::Mutex::new(String::new()),
+            answer: std::sync::Mutex::new(String::new()),
             tokens_in,
             tokens_out,
             inflight_input_bytes: std::sync::atomic::AtomicU64::new(0),
             live: std::sync::Mutex::new(LiveReport::default()),
+            turn_spent: std::sync::Mutex::new(Usage::default()),
             cancel: std::sync::Mutex::new(CancellationToken::new()),
+        }
+    }
+
+    /// The identity text to send, or `None` to send none.
+    ///
+    /// One answer for both wires. They call different APIs and need different
+    /// bodies, but "who is this agent" is not part of that difference, and when
+    /// each decided for itself the OpenAI-compatible path simply never asked —
+    /// see its call site.
+    ///
+    /// The rule itself is the one the relay always had: the operator's file
+    /// replaces the prompt outright, and failing that, the Claude line goes out
+    /// only for an Anthropic model, or before any reply has named one (a first
+    /// turn cannot know, so it keeps the old behaviour).
+    fn identity_text(&self) -> Option<std::borrow::Cow<'_, str>> {
+        match &self.identity {
+            crate::identity::Identity::Text { text, .. } => Some(std::borrow::Cow::Owned(text.clone())),
+            crate::identity::Identity::Omitted { .. } => None,
+            crate::identity::Identity::Auto => {
+                let non_anthropic = self
+                    .served_model
+                    .lock()
+                    .expect("served model mutex")
+                    .as_deref()
+                    .is_some_and(|model| !crate::identity::is_anthropic(model));
+                if non_anthropic {
+                    None
+                } else {
+                    Some(std::borrow::Cow::Borrowed(crate::identity::CLAUDE_CODE_PREFIX))
+                }
+            }
         }
     }
 
@@ -541,18 +672,52 @@ impl Agent {
         self.reasoning.lock().expect("reasoning mutex").clone()
     }
 
-    /// Forget the last turn's reasoning, at the start of a new one.
+    /// The answer being written by the model call currently being streamed.
     ///
-    /// Cleared here rather than when the turn ends so the screen keeps its last
-    /// line until the answer actually arrives, instead of going blank for the
-    /// time it takes the reply to be formatted and printed.
-    fn clear_reasoning(&self) {
+    /// The same terms as [`Self::reasoning_so_far`], and the REPL shows whichever of the two is
+    /// non-empty: this one while the reply is being written, that one while it is still being
+    /// thought out. Empty until the reply produces its first text.
+    #[must_use]
+    pub fn answer_so_far(&self) -> String {
+        self.answer.lock().expect("answer mutex").clone()
+    }
+
+    /// Whether the reply being streamed has started writing its answer.
+    ///
+    /// The predicate form of [`Self::answer_so_far`], for the status row: it is asked once per frame
+    /// and only needs the phase, so cloning the whole answer into it every redraw would be copying
+    /// a growing reply several times a second to look at its first character.
+    #[must_use]
+    pub fn is_writing(&self) -> bool {
+        !self.answer.lock().expect("answer mutex").trim().is_empty()
+    }
+
+    /// Forget what the last reply was saying, at the start of a new request or turn.
+    ///
+    /// Cleared here rather than the moment a turn ends so the screen keeps its last line until the
+    /// next one has something to put there, instead of going blank in between. The turn's *own* end
+    /// is the exception and clears this explicitly — see [`Self::clear_view`] — because by then the
+    /// answer has been printed above the band and the live copy has become a duplicate rather than a
+    /// preview.
+    fn clear_saying(&self) {
         self.reasoning.lock().expect("reasoning mutex").clear();
+        self.answer.lock().expect("answer mutex").clear();
+    }
+
+    /// Forget the last reply's text, where a turn ends.
+    ///
+    /// Unlike the clears below this is not about a figure going stale — it is about the band
+    /// holding a second copy of something that has just been printed above it. The turn's answer is
+    /// written to scrollback as it finishes, so the live rows that previewed it would otherwise sit
+    /// between that copy and the prompt, saying the same thing twice and leaving the reader to work
+    /// out which one was the answer.
+    pub fn clear_view(&self) {
+        self.clear_saying();
     }
 
     /// Forget everything the previous request reported about itself.
     ///
-    /// The reasoning and the live cost are cleared together and deliberately, because they are the
+    /// The reply's text and the live cost are cleared together and deliberately, because they are the
     /// same fact about the same request: one is what it is saying, the other is what it is costing,
     /// and both describe the call in flight rather than the session. Clearing one and not the other
     /// is how the row would price a fresh request at the previous one's rates for the round trip —
@@ -561,9 +726,23 @@ impl Agent {
     /// Called as each request is sent, not when a reply lands: the last line stays on screen until
     /// it is replaced, which is what keeps the row from blinking out between a reply and the tool
     /// call that follows it.
-    fn clear_live(&self) {
-        self.clear_reasoning();
+    ///
+    /// The turn's running total is deliberately left alone — see [`Self::turn_spent`]. A turn is
+    /// several requests, and this is the boundary between two of them, not the end of the turn: a
+    /// row that went back to zero here is the bug that total exists to fix.
+    fn clear_request(&self) {
+        self.clear_saying();
         *self.live.lock().expect("live mutex") = LiveReport::default();
+    }
+
+    /// Forget the whole previous turn, where a new one begins.
+    ///
+    /// Both halves of the row go: the request in flight (which there is not one of yet) and the
+    /// turn's running total. A figure carried across turns would be worse than one that reset —
+    /// it would be the sum of two turns labelled as one.
+    fn clear_live(&self) {
+        self.clear_request();
+        *self.turn_spent.lock().expect("turn spend mutex") = Usage::default();
     }
 
     /// The question channel. See the field.
@@ -753,18 +932,21 @@ impl Agent {
         self.tokens_out.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// What the request in flight has cost so far, or `None` when there is nothing to show.
+    /// What the turn running now has cost so far, or `None` when there is nothing to show.
     ///
     /// This is the figure the status row puts a *price* on while the model works, which is the
     /// point of it: the totals line under a finished answer is the same arithmetic applied to a
     /// turn that is already paid for, and by then the decision an operator wanted the number for
-    /// has been made. See [`statusline::Live`] for what each count means and
-    /// [`live_figures`] for how the two sources are reconciled.
+    /// has been made. Summed over the turn's finished requests and the one in flight — see
+    /// [`Self::turn_spent`] — so it climbs across tool rounds rather than restarting at each.
+    /// See [`statusline::Live`] for what each count means and [`live_figures`] for how the
+    /// sources are reconciled.
     #[must_use]
     pub fn live_cost(&self) -> Option<crate::statusline::Live> {
         let report = self.live.lock().expect("live mutex").clone();
+        let spent = *self.turn_spent.lock().expect("turn spend mutex");
         let bytes = self.inflight_input_bytes.load(std::sync::atomic::Ordering::Relaxed);
-        live_figures(report, bytes)
+        live_figures(report, bytes, spent)
     }
 
     /// The prices the catalog holds for a model, if it holds any.
@@ -1060,6 +1242,20 @@ impl Agent {
                 .fetch_add(resp.usage.input_tokens, std::sync::atomic::Ordering::Relaxed);
             self.tokens_out
                 .fetch_add(resp.usage.output_tokens, std::sync::atomic::Ordering::Relaxed);
+            // The request is answered, so its counts move out of the live report and into the
+            // turn's running total, which is what the status row shows. Folded here rather than
+            // when the next request is sent so that a reply which never streamed — a provider that
+            // answers a `stream: true` request with a whole body — is summed the same way as one
+            // that did; the report is only ever written by the streaming loop, and would have
+            // stayed empty for it. Emptying the report in the same breath is what stops the two
+            // from counting this request twice.
+            //
+            // The report names the model as well as the counts, and emptying it takes that with it.
+            // Harmless, because the two lines below put the name back before anything can read it
+            // — there is no `await` between here and `costs.record`, and the row falls back to the
+            // ledger's model, which is the one this reply just filed.
+            self.turn_spent.lock().expect("turn spend mutex").absorb(resp.usage);
+            *self.live.lock().expect("live mutex") = LiveReport::default();
             // And the priced view of the same turn. Recorded with the model the relay just
             // reported, so a session that spans providers prices each turn at the rate of the
             // model that actually served it — which is why the totals are grouped by currency
@@ -1412,28 +1608,31 @@ impl Agent {
         // when no reply has named a model yet: the first turn of a session cannot
         // know, so it keeps the old behaviour, and from the second on the served
         // model decides.
-        let identity = self.identity.clone();
+        //
+        // The rule lives in `identity_text` because both wires need it, and the
+        // OpenAI-compatible one did not ask for it: it built its system string
+        // from the brief and the rendering rules alone, dropping the identity
+        // silently. An operator's `identity.md` was read, resolved, and then
+        // never sent — which is why the two wires disagreed about who the agent
+        // was rather than about how to reach it.
         // Held across the body construction: `MessagesReq` borrows it, so the
         // guard has to outlive the request value.
         let session_model = self.model.lock().expect("model mutex").clone();
-        let non_anthropic = self
-            .served_model
-            .lock()
-            .expect("served model mutex")
-            .as_deref()
-            .is_some_and(|model| !crate::identity::is_anthropic(model));
-        let mut system = match identity {
-            crate::identity::Identity::Text { text, .. } => vec![SystemBlock {
+        let mut system = self
+            .identity_text()
+            .map_or_else(Vec::new, |text| vec![SystemBlock { kind: "text", text }]);
+        // The project's brief, when the tree has one, goes between the identity and
+        // the rendering rules. That order is the whole design: who the agent is,
+        // then how work is done here, then how to write to this terminal. It is
+        // pushed rather than folded into the identity so that an operator's
+        // `identity.md` — which replaces the identity outright — cannot silently
+        // drop the project's own conventions along with it.
+        if !self.brief.is_empty() {
+            system.push(SystemBlock {
                 kind: "text",
-                text: std::borrow::Cow::Owned(text),
-            }],
-            crate::identity::Identity::Omitted { .. } => Vec::new(),
-            crate::identity::Identity::Auto if non_anthropic => Vec::new(),
-            crate::identity::Identity::Auto => vec![SystemBlock {
-                kind: "text",
-                text: std::borrow::Cow::Borrowed(crate::identity::CLAUDE_CODE_PREFIX),
-            }],
-        };
+                text: std::borrow::Cow::Borrowed(&self.brief),
+            });
+        }
         // The rendering instructions always go last, and survive an operator
         // identity: they describe the terminal, not the model, so they are true
         // whatever the operator wrote. Dropping them with the identity text would
@@ -1507,8 +1706,9 @@ impl Agent {
         let _clear = InflightGuard(&self.inflight_input_bytes);
         // And forget what the *previous* request reported, so the row cannot price this request
         // with the last one's numbers. The reasoning buffer is cleared in the same place and for
-        // the same reason — see `clear_live`, which says why the two are one call.
-        self.clear_live();
+        // the same reason — see `clear_request`, which says why the two are one call, and why the
+        // turn's running total survives it.
+        self.clear_request();
         // Sent through the retry helper rather than straight: a 429 here used
         // to end the turn, and a rate limit is a statement about timing, not
         // about the request. The closure rebuilds the request per attempt
@@ -1541,6 +1741,7 @@ impl Agent {
                 attempt.body(payload.clone())
             },
             &self.reasoning,
+            &self.answer,
             &self.live,
         )
         .await
@@ -1557,10 +1758,33 @@ impl Agent {
         // put mutable bytes at the very front — the defect this change exists
         // to remove. `build_request` appends it after the history instead, for
         // the same reason it goes last on the relay wire.
-        let system = INSTRUCTIONS_MARKDOWN.to_owned();
+        // The identity first, then the project's brief, then the terminal's rules
+        // — the same order and the same three parts as the relay wire.
+        //
+        // The identity used to be missing here, and that is not a matter of style:
+        // this path built its system string from the brief and the instructions
+        // alone, so an operator's `identity.md` was read, resolved, and dropped.
+        // An agent pointed at any OpenAI-compatible endpoint therefore answered
+        // "who are you" from its own training data — it had never been told.
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(identity) = self.identity_text() {
+            parts.push(identity.into_owned());
+        }
+        if !self.brief.is_empty() {
+            parts.push(self.brief.clone());
+        }
+        parts.push(INSTRUCTIONS_MARKDOWN.to_owned());
+        let system = parts.join("\n\n");
         let tool_specs = self.tools.specs().to_vec();
         let state = cache::env_text(&active.session.cwd.display().to_string(), self.gate().as_str());
-        let body = crate::openai::build_request(&cfg.model, &system, &state, &tool_specs, &active.history);
+        let body = crate::openai::build_request(
+            &cfg.model,
+            &system,
+            &state,
+            &tool_specs,
+            &active.history,
+            cfg.reasoning_effort.as_deref(),
+        );
         drop(active);
         let resp = self
             .http
@@ -1704,10 +1928,12 @@ fn rebuild_history(project_dir: &std::path::Path, id: &str) -> Vec<ApiMessage> {
 /// final, which is why the retry lives around the response rather than inside
 /// the read.
 ///
-/// `live` is the agent's reasoning buffer, written after every chunk: it is the
-/// only thing on screen while the model works, so it is updated as the words
-/// arrive rather than once at the end. A view that only filled in when the reply
-/// completed would be no better than the spinner it replaces.
+/// `live` is the agent's reasoning buffer and `answer` its answer buffer, both written after every
+/// chunk: they are the only things on screen while the model works, so they are updated as the words
+/// arrive rather than once at the end. A view that only filled in when the reply completed would be
+/// no better than the spinner it replaces. They are two buffers rather than one because they are
+/// opposite phases of the reply, and the view shows whichever has something in it — see
+/// [`Agent::reasoning_so_far`].
 ///
 /// `report` is the other half of the same idea and is written on the same tick — what the provider
 /// has said about the request's cost. Both are taken here rather than by the caller because this
@@ -1716,6 +1942,7 @@ fn rebuild_history(project_dir: &std::path::Path, id: &str) -> Vec<ApiMessage> {
 async fn send_streaming<F>(
     mut build: F,
     live: &std::sync::Mutex<String>,
+    answer: &std::sync::Mutex<String>,
     report: &std::sync::Mutex<LiveReport>,
 ) -> Result<MessagesResp, AgentError>
 where
@@ -1782,6 +2009,10 @@ where
                         // every reply, and reusing the buffer the lock already holds turns a fresh
                         // allocation per chunk into a copy into memory that is there anyway.
                         asm.reasoning().clone_into(&mut live.lock().expect("reasoning mutex"));
+                        // The reply's answer, on the same tick and for the same reason. It is what
+                        // the view switches to the moment the model stops thinking, so it cannot
+                        // arrive any later than this.
+                        asm.answer().clone_into(&mut answer.lock().expect("answer mutex"));
                         // The same tick carries what the chunk said about the request's cost. Read
                         // from the assembler rather than from the frame directly, so the parsing
                         // rule lives in one place — and so a provider whose usage arrives in an
@@ -2121,6 +2352,40 @@ pub struct Usage {
 }
 
 impl Usage {
+    /// Whether anything has been counted at all.
+    ///
+    /// The four kinds together, because a request can be billed in any of them: a reply that was
+    /// entirely a cached read still cost something, and a test on the input count alone would call
+    /// it nothing.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.input_tokens == 0
+            && self.output_tokens == 0
+            && self.cache_read_input_tokens == 0
+            && self.cache_creation_input_tokens == 0
+    }
+
+    /// Add another request's counts to these, kind by kind.
+    ///
+    /// A turn is several requests and the status row shows their sum, so this is the arithmetic
+    /// that makes that figure. Saturating rather than wrapping: the counts come off the wire, and a
+    /// total that wrapped to nearly nothing would be a worse reading than one that stuck at the
+    /// top — the figure is shown to a person, not used for anything that must be exact.
+    ///
+    /// The four kinds are added separately, never as one number, because the price depends on the
+    /// split: a cached read is roughly a tenth of a fresh input token, and collapsing the four into
+    /// a single total would lose exactly the distinction the row exists to price.
+    pub const fn absorb(&mut self, other: Self) {
+        self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
+        self.cache_read_input_tokens = self
+            .cache_read_input_tokens
+            .saturating_add(other.cache_read_input_tokens);
+        self.cache_creation_input_tokens = self
+            .cache_creation_input_tokens
+            .saturating_add(other.cache_creation_input_tokens);
+    }
+
     /// The four kinds as one value, for the cost arithmetic.
     #[must_use]
     pub const fn tokens(&self) -> crate::cost::Tokens {
@@ -2374,9 +2639,13 @@ mod tests {
     /// be a regression from showing an estimate.
     #[test]
     fn before_the_reply_opens_the_only_figure_is_the_requests_own_size() {
-        let live = live_figures(LiveReport::default(), 400_000).expect("something to show");
+        let live = live_figures(LiveReport::default(), 400_000, Usage::default()).expect("something to show");
         assert!(!live.reported, "it is arithmetic, not a count");
-        assert!(live.output_estimated, "and no output has arrived");
+        assert!(
+            live.output_estimated,
+            "and the price built on it is a guess: the reply has not opened, so its output — the \
+             half the money will move on — is not yet known at all"
+        );
         assert_eq!(live.usage.input_tokens, 100_000, "400 kB at 4 bytes a token");
         assert_eq!(live.usage.output_tokens, 0);
     }
@@ -2384,7 +2653,58 @@ mod tests {
     /// Nothing measured and nothing reported is nothing to show, which is the row between turns.
     #[test]
     fn a_request_that_has_not_been_sized_shows_nothing() {
-        assert!(live_figures(LiveReport::default(), 0).is_none());
+        assert!(live_figures(LiveReport::default(), 0, Usage::default()).is_none());
+    }
+
+    /// A turn's finished requests are added to the one in flight, which is the whole point of the
+    /// accumulator: a four-round turn used to show nothing but its last request.
+    #[test]
+    fn the_finished_requests_of_a_turn_are_added_to_the_one_in_flight() {
+        let spent = Usage {
+            input_tokens: 50_000,
+            output_tokens: 900,
+            cache_read_input_tokens: 40_000,
+            ..Usage::default()
+        };
+        let live = live_figures(LiveReport::default(), 0, spent).expect("the turn so far");
+        assert_eq!(
+            live.usage.input_tokens, 50_000,
+            "no request is in flight, so the row is the turn's finished ones alone"
+        );
+        assert_eq!(live.usage.output_tokens, 900);
+        assert_eq!(
+            live.usage.cache_read_input_tokens, 40_000,
+            "and the kinds are kept apart"
+        );
+        assert!(
+            live.reported,
+            "nothing is being guessed between rounds, so the sum is exact and takes no `~`"
+        );
+        assert!(!live.output_estimated, "and the output figure is a real count too");
+    }
+
+    /// The sum is what a reader watching a second round sees: the first round's counts are still
+    /// there, and the second's are added to them.
+    #[test]
+    fn a_later_round_climbs_from_where_the_previous_one_stopped() {
+        let spent = Usage {
+            input_tokens: 50_000,
+            output_tokens: 900,
+            ..Usage::default()
+        };
+        let report = LiveReport {
+            started: true,
+            usage: Usage {
+                input_tokens: 62_000,
+                output_tokens: 300,
+                ..Usage::default()
+            },
+            output_bytes: 0,
+            ..LiveReport::default()
+        };
+        let live = live_figures(report, 0, spent).expect("something to show");
+        assert_eq!(live.usage.input_tokens, 112_000, "50,000 then 62,000, not 62,000 alone");
+        assert_eq!(live.usage.output_tokens, 1_200, "900 then 300");
     }
 
     /// Once the reply opens, the input count is the provider's own and the output is counted from
@@ -2401,7 +2721,7 @@ mod tests {
             output_bytes: 8_000,
             model: Some("claude-sonnet-4-6".to_owned()),
         };
-        let live = live_figures(report, 900_000).expect("something to show");
+        let live = live_figures(report, 900_000, Usage::default()).expect("something to show");
         assert!(live.reported, "the input count is the provider's");
         assert_eq!(
             live.usage.input_tokens, 54_321,
@@ -2430,7 +2750,7 @@ mod tests {
             output_bytes: 8_000,
             ..LiveReport::default()
         };
-        let live = live_figures(report, 0).expect("something to show");
+        let live = live_figures(report, 0, Usage::default()).expect("something to show");
         assert_eq!(
             live.usage.output_tokens, 640,
             "the count, not the 2,000 the bytes imply"
@@ -2451,10 +2771,32 @@ mod tests {
             output_bytes: 4_000,
             ..LiveReport::default()
         };
-        let live = live_figures(report, 40_000).expect("something to show");
+        let live = live_figures(report, 40_000, Usage::default()).expect("something to show");
         assert!(!live.reported, "nothing was confirmed, so the figures are estimates");
         assert_eq!(live.usage.input_tokens, 10_000, "the request's own size");
         assert_eq!(live.usage.output_tokens, 1_000);
+    }
+
+    /// A request in flight that the provider has not answered yet is in the sum as an estimate, and
+    /// the `~` says so.
+    ///
+    /// The turn's figure is meant to answer "what has this cost so far", and a round that is on the
+    /// wire has been sent whether or not it has been answered — so its length is in the sum, marked
+    /// as the arithmetic it is rather than left out. Leaving it out would make the figure *drop* at
+    /// the end of a round, when the estimate is replaced by a real count that is usually larger.
+    #[test]
+    fn a_round_still_on_the_wire_is_in_the_sum_as_an_estimate() {
+        let spent = Usage {
+            input_tokens: 50_000,
+            output_tokens: 900,
+            ..Usage::default()
+        };
+        let live = live_figures(LiveReport::default(), 40_000, spent).expect("something to show");
+        assert_eq!(
+            live.usage.input_tokens, 60_000,
+            "the turn's 50,000 plus this request's 40 kB estimate"
+        );
+        assert!(!live.reported, "and the sum is marked as holding a guess");
     }
 
     /// The two counts are the four kinds the pricing applies to, which is what makes the price on
@@ -2472,7 +2814,7 @@ mod tests {
             output_bytes: 0,
             ..LiveReport::default()
         };
-        let live = live_figures(report, 0).expect("something to show");
+        let live = live_figures(report, 0, Usage::default()).expect("something to show");
         let tokens = live.tokens();
         assert_eq!(tokens.input, 0, "900 sent of which 900 cached reads");
         assert_eq!(tokens.cache_read, 5_000);

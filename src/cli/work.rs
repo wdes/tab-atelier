@@ -414,6 +414,27 @@ mod tests {
         v.iter().map(|s| (*s).to_string()).collect()
     }
 
+    /// Announce a task as a *peer* agent rather than as whoever is running.
+    ///
+    /// `announce()` always stamps `whoami()` as the announcer, and a test cannot
+    /// change that: the crate forbids `unsafe`, so `set_var` is out, and it would
+    /// be a process-global race besides (see [`identity_from`]). So a test that
+    /// needs the announcer to differ from the taker — which, now that `rank_tasks`
+    /// refuses to rank an agent's own announcements, is any test that takes what
+    /// it announced — writes the announcement in the same shape `post()` writes,
+    /// with the peer's name in `from`. `fold_tasks` folds `announced_by` from
+    /// `from`, so the board cannot tell this from a real remote agent's announce.
+    fn announce_as(agent: &str, task: &str, title: &str) {
+        // The rule under test is "a *different* agent announced this". If the
+        // environment ever made the peer indistinguishable from us, the test
+        // would pass while proving nothing — so refuse that rather than let it
+        // rot into a check that no longer checks.
+        assert_ne!(agent, whoami(), "the peer announcer must differ from the taker");
+        let mut n = new_entry(NoteKind::Announce, Some(agent.to_owned()), title);
+        n.task = Some(task.to_owned());
+        append_entry(n).expect("write the peer's announcement");
+    }
+
     #[test]
     fn identity_prefers_the_explicit_override_then_the_tab_id() {
         assert_eq!(identity_from(Some("reviewer-1"), Some("tab-abc"), "h"), "reviewer-1");
@@ -453,13 +474,17 @@ mod tests {
     #[test]
     fn a_task_moves_from_announced_to_taken_to_done() {
         // The whole loop, against a real API: the states an agent walks
-        // through are exactly the states the board reports back.
+        // through are exactly the states the board reports back. A *peer*
+        // announces it, because an agent can no longer take its own announcement
+        // (`rank_tasks`) — so the loop the fleet actually runs is announce-as-A,
+        // take-as-B, done-as-B, and this walks that.
         with_fleet(|| {
-            assert_eq!(announce(&argv(&["cov:src/x.rs", "raise", "coverage"])), 0);
+            announce_as("boss", "cov:src/x.rs", "raise coverage");
             let board = super::super::tasks::fold_tasks(&read_blackboard());
             assert_eq!(board.len(), 1);
             assert_eq!(board[0].title, "raise coverage");
             assert_eq!(board[0].state(), super::super::tasks::TaskState::Open);
+            assert_eq!(board[0].announced_by.as_deref(), Some("boss"));
 
             // take() leases it and records the award, so every other agent's
             // board shows it as spoken for — not just this host's lease table.
@@ -480,6 +505,34 @@ mod tests {
             // the next agent should not wait out work that is finished.
             let live = crate::claims::with_registry(|r| r.active(crate::unix_millis()));
             assert!(live.is_empty(), "done must release: {live:?}");
+        });
+    }
+
+    /// The rule the two tests above now depend on, pinned at the verb an agent
+    /// actually calls.
+    ///
+    /// `rank_tasks` refuses to rank a job its caller announced, so `take` finds
+    /// nothing free — while leaving the job on the board for a peer. The pure
+    /// ranking has its own test in `tasks.rs`; this asserts the same rule
+    /// end-to-end, through the board and the lease table, because that is where
+    /// the fleet meets it.
+    #[test]
+    fn an_agent_cannot_take_back_what_it_announced() {
+        with_fleet(|| {
+            // The real verb, and the only test that asserts it succeeds: the two
+            // above have to announce as a peer, so they write the note themselves.
+            assert_eq!(announce(&argv(&["t1", "roof", "the", "shed"])), 0);
+            // Nothing free — for us, because we are the announcer.
+            assert_eq!(take(&argv(&["--ttl", "60"])), 3);
+            // Still open, and still nobody's: excluded from *our* ranking, not
+            // withdrawn from the board, or a peer arriving later would find
+            // nothing to do and the work would silently stall.
+            let board = super::super::tasks::fold_tasks(&read_blackboard());
+            assert_eq!(board.len(), 1);
+            assert_eq!(board[0].state(), super::super::tasks::TaskState::Open);
+            assert!(board[0].awarded_to.is_none());
+            let live = crate::claims::with_registry(|r| r.active(crate::unix_millis()));
+            assert!(live.is_empty(), "a refused take must not lease: {live:?}");
         });
     }
 
@@ -517,10 +570,12 @@ mod tests {
     #[test]
     fn take_dry_run_shows_the_ranking_without_claiming_anything() {
         // A dry run must not lease: an operator inspecting the board should
-        // not accidentally take work away from an agent.
+        // not accidentally take work away from an agent. Announced by a peer,
+        // for the same reason as the loop above: our own announcements are not
+        // ours to rank, so there would be nothing to show.
         with_fleet(|| {
-            let _ = announce(&argv(&["t1", "one"]));
-            let _ = announce(&argv(&["t2", "two"]));
+            announce_as("boss", "t1", "one");
+            announce_as("boss", "t2", "two");
             assert_eq!(take(&argv(&["--dry-run"])), 0);
             let live = crate::claims::with_registry(|r| r.active(crate::unix_millis()));
             assert!(live.is_empty(), "dry run leased something: {live:?}");

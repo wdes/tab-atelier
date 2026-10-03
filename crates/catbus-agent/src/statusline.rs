@@ -214,7 +214,12 @@ pub const fn estimate_input_tokens(bytes: usize) -> u64 {
     (bytes / BYTES_PER_TOKEN) as u64
 }
 
-/// What the request in flight has used and what the provider has confirmed about it.
+/// What the turn running now has used and what the provider has confirmed about it.
+///
+/// "Turn", not "request": a turn is several requests — the model thinks, calls a tool, thinks again
+/// — and each is billed, so these counts are the sum over the ones that have finished plus what the
+/// one in flight is up to. A figure that restarted at each round answered a different question, and
+/// the operator watching the row is asking what the turn has cost so far.
 ///
 /// The two are separate fields because they are separate claims. `usage` is what has been counted,
 /// from whichever source was available — the provider's own figures once it has reported any, the
@@ -263,7 +268,7 @@ impl Live {
     }
 }
 
-/// The cost of the request in flight, for the row that is repainted while it runs.
+/// The cost of the turn running now, for the row that is repainted while it runs.
 ///
 /// This is deliberately *not* [`cost_line`]. That line is printed once, under a finished answer,
 /// where there is room for the model, the currency codes and a note about unpriced tokens; this one
@@ -271,17 +276,19 @@ impl Live {
 /// queue count, and it is repainted several times a second. So it is short, and it gives up the
 /// money before it gives up the counts.
 ///
-/// The order of that last decision matters. A narrow terminal should lose the price and keep the
-/// tokens, not the other way round: the counts are the fact the price is computed from, they are
-/// what the totals line under the answer will agree with, and a price with no counts above it
-/// invites the reader to wonder what it was charged for.
-///
-/// `~` marks one figure, not the line: it sits on exactly the number that is local arithmetic rather
+/// The figure covers the turn, not the request: it is the sum of the requests that have finished
+/// and the one in flight, so it climbs across tool rounds instead of starting again at each. `~`
+/// marks one figure, not the line: it sits on exactly the number that is local arithmetic rather
 /// than the provider's own count. Before the reply opens that is both of them; after it opens the
 /// input side is exact and the output side is still being counted from the bytes received, so the
 /// row reads `12,345 in · ~900 out` — which is the whole point of carrying the two flags separately.
 /// A single mark over the pair would either understate a count the provider gave or overstate one it
 /// has not.
+///
+/// The order of the give-up matters. A narrow terminal should lose the price and keep the tokens,
+/// not the other way round: the counts are the fact the price is computed from, they are what the
+/// totals line under the answer will agree with, and a price with no counts above it invites the
+/// reader to wonder what it was charged for.
 ///
 /// `price` is the catalog entry for the model the session is running as, or `None` when no catalog
 /// has arrived or the model is not in it. Money is grouped by currency for the same reason
@@ -358,6 +365,15 @@ pub const THINKING: &str = "Thinking";
 /// "thinking" in lower case.
 pub const THINKING_MARKER: &str = "thinking";
 
+/// The label shown while the model has begun writing its answer.
+///
+/// The counterpart of [`THINKING`], and the one that tells the operator the deliberation is over:
+/// the answer is arriving, so what is on the row above is that answer rather than the model's
+/// working. The two used to be one label, which is what made the end of thinking impossible to
+/// place — the row said `Thinking` throughout, while the text above it had already changed from
+/// deliberation to conclusion.
+pub const WRITING: &str = "Writing";
+
 /// The activity text for a spinner frame: the agent's status, presented.
 ///
 /// The agent reports `"thinking"` lower-case while it waits on the model, and a tool description
@@ -427,7 +443,14 @@ impl Activity {
     }
 
     /// What the row should say for `status`, at `now`.
-    pub fn label(&mut self, status: &str, now: Instant) -> String {
+    ///
+    /// `writing` is the reply's own phase and is separate from the agent's activity: the agent
+    /// reports a tool while one runs and the bare marker otherwise, and the marker is what it
+    /// reports both before the model has said anything *and* while it is writing the answer. Only
+    /// the stream knows which of those two it is, so it is passed in rather than inferred here —
+    /// and it only ever changes the label for the marker, because a tool running beside a
+    /// half-written answer is described by the tool.
+    pub fn label(&mut self, status: &str, writing: bool, now: Instant) -> String {
         if status == THINKING_MARKER {
             // The model is being called again, which means whatever was running has finished. The
             // transition is the only signal available: the agent reports the tool while it runs and
@@ -446,9 +469,16 @@ impl Activity {
             {
                 return format!("{} {DONE}", activity_label(label));
             }
-            // The check has been up long enough, or there was nothing to check.
+            // The check has been up long enough, or there was nothing to check. Which of the two
+            // phases this is comes from the reply, not from the clock: the model has either been
+            // thinking or writing since the last chunk, and the row should have said so the whole
+            // time rather than only now that the check has expired.
             self.finished = None;
-            return THINKING.to_owned();
+            return if writing {
+                WRITING.to_owned()
+            } else {
+                THINKING.to_owned()
+            };
         }
 
         // A new activity supersedes a lingering check: the row describes what is happening now, and
@@ -613,17 +643,20 @@ mod tests {
     fn a_fast_activity_is_never_named() {
         let mut activity = Activity::new();
         let start = Instant::now();
-        assert_eq!(activity.label("Read(a.rs)", start), THINKING);
+        assert_eq!(activity.label("Read(a.rs)", false, start), THINKING);
 
         // Still within the debounce window: no name yet, and not because the rules forgot it.
         assert_eq!(
-            activity.label("Read(a.rs)", start + DEBOUNCE / 2),
+            activity.label("Read(a.rs)", false, start + DEBOUNCE / 2),
             THINKING,
             "half the debounce is not long enough"
         );
 
         // Past it, the name appears.
-        assert_eq!(activity.label("Read(a.rs)", start + DEBOUNCE), "Thinking - Read(a.rs)");
+        assert_eq!(
+            activity.label("Read(a.rs)", false, start + DEBOUNCE),
+            "Thinking - Read(a.rs)"
+        );
     }
 
     /// The clock restarts for a *different* activity: a tool that is replaced by another has not
@@ -632,14 +665,17 @@ mod tests {
     fn the_debounce_restarts_for_each_activity() {
         let mut activity = Activity::new();
         let start = Instant::now();
-        assert_eq!(activity.label("Read(a.rs)", start), THINKING);
-        assert_eq!(activity.label("Read(a.rs)", start + DEBOUNCE), "Thinking - Read(a.rs)");
+        assert_eq!(activity.label("Read(a.rs)", false, start), THINKING);
+        assert_eq!(
+            activity.label("Read(a.rs)", false, start + DEBOUNCE),
+            "Thinking - Read(a.rs)"
+        );
 
         // A second tool arriving after the first has been showing is still new.
         let second = start + DEBOUNCE + Duration::from_millis(10);
-        assert_eq!(activity.label("Bash(cargo test)", second), THINKING);
+        assert_eq!(activity.label("Bash(cargo test)", false, second), THINKING);
         assert_eq!(
-            activity.label("Bash(cargo test)", second + DEBOUNCE),
+            activity.label("Bash(cargo test)", false, second + DEBOUNCE),
             "Thinking - Bash(cargo test)"
         );
     }
@@ -652,13 +688,13 @@ mod tests {
     /// about which call starts the clock.
     fn named(activity: &mut Activity, status: &str, start: Instant) -> Instant {
         assert_eq!(
-            activity.label(status, start),
+            activity.label(status, false, start),
             THINKING,
             "the first sight of an activity must be debounced"
         );
         let shown = start + DEBOUNCE;
         assert_eq!(
-            activity.label(status, shown),
+            activity.label(status, false, shown),
             activity_label(status),
             "the name must appear once the debounce has passed"
         );
@@ -675,15 +711,18 @@ mod tests {
         let running = named(&mut activity, "Read(a.rs)", start);
 
         // The agent reports the marker again: the tool returned.
-        assert_eq!(activity.label(THINKING_MARKER, running), "Thinking - Read(a.rs) ✓");
+        assert_eq!(
+            activity.label(THINKING_MARKER, false, running),
+            "Thinking - Read(a.rs) ✓"
+        );
         // And it stays for a moment, so it can actually be seen.
         assert_eq!(
-            activity.label(THINKING_MARKER, running + LINGER / 2),
+            activity.label(THINKING_MARKER, false, running + LINGER / 2),
             "Thinking - Read(a.rs) ✓"
         );
         // Then goes, leaving the row as the plain label.
         assert_eq!(
-            activity.label(THINKING_MARKER, running + LINGER),
+            activity.label(THINKING_MARKER, false, running + LINGER),
             THINKING,
             "the check must not stay forever"
         );
@@ -696,9 +735,9 @@ mod tests {
     fn a_tool_that_returns_before_the_debounce_leaves_no_check() {
         let mut activity = Activity::new();
         let start = Instant::now();
-        assert_eq!(activity.label("Read(a.rs)", start), THINKING);
+        assert_eq!(activity.label("Read(a.rs)", false, start), THINKING);
         // Gone again before it was ever named.
-        assert_eq!(activity.label(THINKING_MARKER, start + DEBOUNCE / 2), THINKING);
+        assert_eq!(activity.label(THINKING_MARKER, false, start + DEBOUNCE / 2), THINKING);
     }
 
     /// A new activity clears a lingering check: the row describes what is happening now, and a
@@ -708,18 +747,21 @@ mod tests {
         let mut activity = Activity::new();
         let start = Instant::now();
         let running = named(&mut activity, "Read(a.rs)", start);
-        assert_eq!(activity.label(THINKING_MARKER, running), "Thinking - Read(a.rs) ✓");
+        assert_eq!(
+            activity.label(THINKING_MARKER, false, running),
+            "Thinking - Read(a.rs) ✓"
+        );
 
         // The next tool starts while the check is still up; it is new, so it is debounced and the
         // stale check must be gone.
         let next = running + Duration::from_millis(50);
         assert_eq!(
-            activity.label("Bash(cargo test)", next),
+            activity.label("Bash(cargo test)", false, next),
             THINKING,
             "the check must not survive into the next activity"
         );
         assert_eq!(
-            activity.label("Bash(cargo test)", next + DEBOUNCE),
+            activity.label("Bash(cargo test)", false, next + DEBOUNCE),
             "Thinking - Bash(cargo test)"
         );
     }
@@ -730,12 +772,59 @@ mod tests {
     fn a_turn_starts_with_nothing_to_check() {
         let mut activity = Activity::new();
         let start = Instant::now();
-        assert_eq!(activity.label(THINKING_MARKER, start), THINKING);
+        assert_eq!(activity.label(THINKING_MARKER, false, start), THINKING);
         assert_eq!(
-            activity.label(THINKING_MARKER, start + Duration::from_secs(5)),
+            activity.label(THINKING_MARKER, false, start + Duration::from_secs(5)),
             THINKING
         );
     }
+
+    /// Once the reply is being written the row says so — the one thing that tells the operator the
+    /// deliberation is over. Without it the row said `Thinking` for the whole turn while the text
+    /// above it had already changed from working to answer.
+    #[test]
+    fn the_row_says_writing_once_the_answer_starts() {
+        let mut activity = Activity::new();
+        let start = Instant::now();
+        assert_eq!(activity.label(THINKING_MARKER, false, start), THINKING);
+        assert_eq!(
+            activity.label(THINKING_MARKER, true, start + Duration::from_millis(10)),
+            WRITING
+        );
+    }
+
+    /// A tool running beside a half-written answer is still described by the tool: the phase only
+    /// ever changes the label for the model's own marker, because what the operator wants to know
+    /// while a tool runs is which tool.
+    #[test]
+    fn a_running_tool_outranks_the_writing_label() {
+        let mut activity = Activity::new();
+        let start = Instant::now();
+        assert_eq!(activity.label("Read(a.rs)", true, start), THINKING);
+        assert_eq!(
+            activity.label("Read(a.rs)", true, start + DEBOUNCE),
+            "Thinking - Read(a.rs)"
+        );
+    }
+
+    /// A check left behind by a finished tool still takes precedence over the phase, then gives way
+    /// to it: the fact that something *completed* is the more recent news, and it is only news for
+    /// as long as it lingers.
+    #[test]
+    fn a_finished_tool_lingers_before_the_writing_label() {
+        let mut activity = Activity::new();
+        let running = named(&mut activity, "Read(a.rs)", Instant::now());
+        assert_eq!(
+            activity.label(THINKING_MARKER, true, running),
+            "Thinking - Read(a.rs) ✓"
+        );
+        assert_eq!(
+            activity.label(THINKING_MARKER, true, running + LINGER),
+            WRITING,
+            "and the phase is what is left once the check has expired"
+        );
+    }
+
     fn tokens(input: u64, output: u64, cache_read: u64, cache_write: u64) -> crate::cost::Tokens {
         crate::cost::Tokens {
             input,
@@ -933,6 +1022,32 @@ mod tests {
         let empty = Live::default();
         assert!(empty.is_empty());
         assert_eq!(live_line(&empty, Some(&price()), 200), "");
+    }
+
+    /// The live row and the totals line spell the same two numbers with different punctuation, and
+    /// that difference is load-bearing.
+    ///
+    /// A `repl_pty` test waits for the totals line to appear before asserting on it. The live row
+    /// prints the *same* counts a moment earlier, from the same reply — so a wait that named only
+    /// the numbers used to be satisfied by the row instead, and the assertion then ran against a
+    /// screen the totals line had not reached. It failed intermittently on CI for exactly that
+    /// reason. The separators are what keep the two apart, so they are asserted here: if a later
+    /// change made either line imitate the other's punctuation, this fails where the cause is
+    /// obvious rather than as a flaky pty test.
+    #[test]
+    fn the_live_row_and_the_totals_line_read_differently() {
+        let totals = tokens_label(12_345, 6_789);
+        assert_eq!(totals, "12,345 in - 6,789 out", "the totals line's form changed");
+        let row = live_line(&live(12_345, 6_789, true, false), Some(&price()), 200);
+        assert!(
+            row.contains("12,345 in · 6,789 out"),
+            "the live row no longer reads with its own separator: {row:?}"
+        );
+        assert!(
+            !row.contains(&totals),
+            "the live row now contains the totals line's own text, so a wait for one is satisfied \
+             by the other: {row:?}"
+        );
     }
 
     /// A request whose tokens are all cache is not an empty row: the input count the provider
