@@ -1,0 +1,4 @@
+{"type":"user","promptSource":"typed","sessionId":"sessionC","timestamp":"2026-08-23T07:00:00.000Z","message":{"role":"user","content":"RESTART mx imminent (raison: lot rehome-GUI). Atteins un POINT SUR MAINTENANT."}}
+{"type":"user","promptSource":"typed","sessionId":"sessionC","timestamp":"2026-08-23T13:00:00.000Z","message":{"role":"user","content":"Watcher restart mx (durable, survit au restart)."}}
+{"type":"user","promptSource":"system","sessionId":"sessionC","timestamp":"2026-08-23T14:58:00.000Z","message":{"role":"user","content":"Ronde surveillance commentaires review (MR groupe)."}}
+{"type":"user","promptSource":"typed","sessionId":"sessionC","timestamp":"2026-08-23T14:59:00.000Z","message":{"role":"user","content":"Ronde monitoring équipe Kalpin : peek team back, front, titour."}}
