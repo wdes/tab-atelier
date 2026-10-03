@@ -108,6 +108,20 @@ jobs:
             # whole crate graph once more just for this step.
             - name: Run headless tests
               run: cargo test --workspace --locked --no-default-features --features headless,energy --no-fail-fast
+            # The Kiosk's assets are plain ES modules with no toolchain of their
+            # own: node runs them directly, so there is nothing to install and no
+            # npm in this repository. They read `kiosk.js` from the source tree
+            # and do not need the crate built — which matters, since it is not a
+            # default member.
+            #
+            # This ran against the dashboard's copy in #59, which was stacked on
+            # an unmerged branch and never reached `main`; the assets moved here,
+            # so the step moves with them.
+            #
+            # The `*.accept.mjs` beside them are NOT run: they drive a real
+            # browser and need playwright, which this repository does not carry.
+            - name: Run Kiosk asset tests
+              run: crates/tab-atelier-kiosk/assets/run-tests.sh
             - name: Check formatting
               run: cargo fmt --all -- --check
             - name: Clippy (GUI)
