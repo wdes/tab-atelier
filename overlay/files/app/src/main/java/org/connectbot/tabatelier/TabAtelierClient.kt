@@ -181,6 +181,20 @@ class TabAtelierClient @Inject constructor(
 
     private val clients = ConcurrentHashMap<ClientKey, OkHttpClient>()
 
+    /**
+     * Keys accepted as first use, before they have earned being pinned.
+     *
+     * The trust manager is where a key is actually seen and verified, so it is
+     * where the candidate comes from. `Response.handshake` would have been the
+     * other source, and it was the original one — but it is not always
+     * populated, and when it is absent nothing was ever recorded. That is how
+     * trust-on-first-use quietly became "trust everything, forever": the accept
+     * happened, the record did not.
+     *
+     * A candidate becomes a pin only once a request has come back over it.
+     */
+    private val pendingPins = ConcurrentHashMap<String, String>()
+
     /** The base URL a host is addressed by, or null if what it holds is not one. */
     fun base(url: String?): TabAtelierBase? = TabAtelierBase.parse(url)
 
@@ -211,6 +225,7 @@ class TabAtelierClient @Inject constructor(
         val prefix = pinPrefix(hostId)
         val recorded = basePrefs.all.keys.filter { it.startsWith(prefix) }
         basePrefs.edit().apply { recorded.forEach { remove(it) } }.apply()
+        pendingPins.keys.filter { it.startsWith(prefix) }.forEach(pendingPins::remove)
         clients.keys.filter { it.hostId == hostId }.forEach(clients::remove)
     }
 
@@ -277,7 +292,13 @@ class TabAtelierClient @Inject constructor(
         // certificate to offer.
         if (!base.secure) return builder.build()
 
-        val trustManager = TrustOnFirstUseManager(hostId, base, basePrefs)
+        val trustManager = TrustOnFirstUseManager(hostId, base, basePrefs) { accepted ->
+            // Remembered here, pinned later: fetchTabs commits it once a
+            // response has come back over this key. pinOf is what turns the
+            // certificate into the form CertificatePinner compares, so the
+            // candidate is stored in that same form.
+            pinOf(accepted)?.let { pendingPins[pinKey(hostId, base.origin)] = it }
+        }
         val sslContext = SSLContext.getInstance(TLS_PROTOCOL).apply {
             init(null as Array<KeyManager>?, arrayOf<TrustManager>(trustManager), null)
         }
@@ -332,10 +353,20 @@ class TabAtelierClient @Inject constructor(
      * against the pin the real daemon earned.
      */
     private fun recordPin(hostId: Long, base: TabAtelierBase, chain: List<Certificate>?) {
+        val key = pinKey(hostId, base.origin)
+        val candidate = pendingPins.remove(key) ?: return
+        // The handshake's own view of the same connection is only used to
+        // disagree: a pin that is not the key just used is worse than no pin.
+        val fromHandshake = chain?.firstOrNull()?.let(::pinOf)
+        if (fromHandshake != null && fromHandshake != candidate) {
+            Timber.w(
+                "Not pinning %s: the handshake key is not the one the trust manager accepted",
+                base.origin,
+            )
+            return
+        }
         if (pin(hostId, base) != null) return
-        val leaf = chain?.firstOrNull() as? X509Certificate ?: return
-        val pin = pinOf(leaf) ?: return
-        basePrefs.edit().putString(pinKey(hostId, base.origin), pin).apply()
+        basePrefs.edit().putString(key, candidate).apply()
         Timber.d("Recorded tab-atelier certificate pin for host %d at %s", hostId, base.origin)
     }
 
@@ -384,14 +415,17 @@ private class TrustOnFirstUseManager(
     private val hostId: Long,
     private val base: TabAtelierBase,
     private val pins: SharedPreferences,
+    private val rememberAsFirstUse: (X509Certificate) -> Unit,
 ) : X509TrustManager {
 
     override fun checkServerTrusted(chain: Array<out X509Certificate>, authType: String) {
         val expected = recordedPin()
         if (expected == null) {
             // Nothing pinned for this server yet: accept, so the request that
-            // earns the pin can be made. Accepting is not recording.
+            // earns the pin can be made. Accepting is not recording — the key is
+            // handed on as a candidate, and only a response makes it a pin.
             Timber.d("First tab-atelier connection to %s; accepting its key for now", base.origin)
+            chain.firstOrNull()?.let(rememberAsFirstUse)
             return
         }
 
@@ -414,14 +448,26 @@ private class TrustOnFirstUseManager(
     override fun getAcceptedIssuers(): Array<X509Certificate> = emptyArray()
 
     /**
-     * Whether [chain] reproduces the pinned key.
+     * Whether the session over [chain] may be used.
      *
-     * False when nothing is pinned: this backs the hostname verifier, where an
-     * absent pin means no response has been recorded yet — a connection that has
-     * not earned its pin, not a first use.
+     * **True when nothing is pinned**, and that is load-bearing rather than
+     * lenient. This backs the hostname verifier, and OkHttp *enforces* a
+     * hostname verifier's answer: answering false for "not pinned yet" fails the
+     * very connection whose response would have recorded the pin. That is
+     * circular — no server could ever be reached for the first time, which is
+     * exactly the bug this class exists to fix, only reported as "hostname not
+     * verified" instead of "self-signed certificate". The trust manager has
+     * already accepted the key as first use by this point; the verifier's job is
+     * only to refuse a *changed* key, not to re-litigate a new one.
+     *
+     * A pin's authority comes from being written after a response has come back
+     * over the key (see `recordPin`), never from this check.
+     *
+     * False when a pin is recorded and [chain] does not reproduce it: the key
+     * changed, and the connection must not be made.
      */
     fun matchesPin(chain: List<Certificate>?): Boolean {
-        val expected = recordedPin() ?: return false
+        val expected = recordedPin() ?: return true
         val leaf = chain?.firstOrNull() ?: return false
         return pinOf(leaf) == expected
     }
