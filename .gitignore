@@ -28,3 +28,7 @@ crates/tab-atelier-proxy/web/node_modules/
 # dirt deleted tracked files, because they looked like build output.
 __pycache__/
 *.py[cod]
+
+# catbus-agent per-directory config, from docs/config-guide.md: a statement
+# about the machine and the operator, not about the work.
+.catbus/

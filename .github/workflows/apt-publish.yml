@@ -148,6 +148,7 @@ jobs:
                   # because it runs on a different machine from the terminal —
                   # see docs/proxy.md.
                   cargo deb -p tab-atelier-proxy --locked --deb-version "${{ steps.ver.outputs.version }}" "${DBGSYM[@]}"
+                  cargo deb -p tab-atelier-kiosk --locked --deb-version "${{ steps.ver.outputs.version }}" "${DBGSYM[@]}"
                   ls -la target/debian/
 
             # Pull the existing gh-pages tree into site/ so the
@@ -194,7 +195,7 @@ jobs:
                   # Three symbol versions is a few days of nightlies, which
                   # covers the case this exists for — "the nightly I am
                   # running crashed"; older versions keep their binaries.
-                  for pkg in tab-atelier tab-atelier-headless tab-atelier-proxy; do
+                  for pkg in tab-atelier tab-atelier-headless tab-atelier-proxy tab-atelier-kiosk; do
                       ls -1t pool/$CHANNEL/main/t/tab-atelier/${pkg}_*.deb 2>/dev/null \
                           | tail -n +11 | xargs -r rm -f
                       ls -1t pool/$CHANNEL/main/t/tab-atelier/${pkg}-dbgsym_*.ddeb 2>/dev/null \
