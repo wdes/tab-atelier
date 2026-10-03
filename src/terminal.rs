@@ -365,6 +365,16 @@ pub struct TerminalView {
     /// terminal, starving keystroke handling (the "typing is laggy" bug).
     /// `None` until first paint, so restored-but-unopened tabs never pump.
     last_render: Rc<Cell<Option<std::time::Instant>>>,
+    /// A dup of the live PTY master fd, kept open so a binary hot-swap can
+    /// hand this shell across the `exec` ([`crate::hotswap`]). `None` for a
+    /// skeleton tab, a failed spawn, or a non-Unix PTY (hot swap is
+    /// Unix-only). Refreshed on adopt.
+    #[cfg(unix)]
+    master_copy: Option<std::fs::File>,
+    /// True when this tab's shell was adopted from a hot-swap handoff rather
+    /// than forked this run. Suppresses the initial Ctrl-L redraw (a live
+    /// inherited shell may hold a half-typed command or a restored screen).
+    adopted: bool,
 }
 
 /// Cached Phase 1 output from the previous paint. See [`TerminalView::prev_frame`].
@@ -845,6 +855,9 @@ impl TerminalView {
             last_prepaint: Rc::new(RefCell::new(None)),
             pinned_grid: Rc::new(Cell::new(None)),
             last_render,
+            #[cfg(unix)]
+            master_copy: None,
+            adopted: false,
         };
         // The active tab forks its shell now (so the first frame is live); a
         // deferred skeleton waits for `ensure_spawned` (the app's boot loader
@@ -899,6 +912,32 @@ impl TerminalView {
             cell_height: f32::from(cell.height) as u16,
         };
         let colors = self.colors_enabled.get();
+        // Hot-swap handoff: if the previous binary handed us this tab's
+        // live PTY (keyed by the `_TAB_ID` it exports into the shell),
+        // adopt it instead of forking a fresh shell. The carried ring
+        // bytes re-seed viewer scrollback either way — if the shell died
+        // mid-swap we fall through to a normal fork and the ring just
+        // shows the pre-swap history above it.
+        #[cfg(unix)]
+        if let Some(adopted) = recipe
+            .extra_env
+            .get("_TAB_ID")
+            .and_then(|id| crate::hotswap::take_adopted(id))
+        {
+            let pid = adopted.pid;
+            if !adopted.ring.is_empty()
+                && let Ok(mut ring) = self.pty_ring.lock()
+            {
+                ring.push(&adopted.ring);
+            }
+            if let Some(pty) = crate::hotswap::AdoptedPty::adopt(adopted.master, pid, ws) {
+                self.master_copy = pty.master_copy();
+                self.adopted = true;
+                self.start_event_loop(pty, pid, "adopted PTY");
+                return;
+            }
+            log::info!("hot swap: tab shell (pid {pid}) exited during handoff — forking fresh");
+        }
         let opts = if crate::clear_env() {
             // Cleared-env mode: exec via `env -i` so the shell inherits only the
             // curated minimal allowlist. `login = true` sources the profile.
@@ -938,20 +977,12 @@ impl TerminalView {
         let pid = pty.child().id();
         #[cfg(windows)]
         let pid = 0u32;
-        let pty = crate::pty_ring::PtyTap::new(pty, self.pty_ring.clone());
-        let el = match EventLoop::new(self.term.clone(), self.event_proxy.clone(), pty, false, false) {
-            Ok(el) => el,
-            Err(e) => {
-                error!("failed to create PTY event loop: {e}");
-                self.exited.store(true, std::sync::atomic::Ordering::Relaxed);
-                return;
-            }
-        };
-        let notifier = el.channel();
-        self.event_proxy.set_notifier(notifier.clone());
-        el.spawn();
-        self.notifier = Some(notifier);
-        self.pid = pid;
+        #[cfg(unix)]
+        {
+            self.master_copy = pty.file().try_clone().ok();
+        }
+        self.adopted = false;
+        self.start_event_loop(pty, pid, "spawn");
         // A shell tab prints its prompt as its first output, which on a fresh /
         // just-resized PTY can land glued to a reprint of itself (`…$ …$` on one
         // line, from bash's SIGWINCH re-display). Send one Ctrl-L (form feed):
@@ -962,12 +993,39 @@ impl TerminalView {
         // (feels like the shell "started weird"). RAW PTY write — NOT via
         // `send_input`, whose keystroke bookkeeping (last_input stamp, predictive
         // echo) must not fire for this synthetic redraw. Agent tabs exec `claude`
-        // (clears + draws its own screen), so skip them.
+        // (clears + draws its own screen), so skip them — and the hot-swap
+        // adoption path above returns early, so a live inherited shell (which
+        // may have a half-typed command at its prompt, or a restored screen a
+        // clear would wipe) never gets one.
         if let Some(byte) = first_prompt_cleanup_byte(is_shell)
             && let Some(n) = &self.notifier
         {
             let _ = n.send(Msg::Input(vec![byte].into()));
         }
+    }
+
+    /// Wrap `pty` in the ring tap, start its event loop, and hook up the
+    /// notifier — shared tail of the fork, respawn, and hot-swap-adopt
+    /// paths (generic because the adopted PTY is our own type, not
+    /// alacritty's).
+    fn start_event_loop<P>(&mut self, pty: P, pid: u32, what: &str)
+    where
+        P: alacritty_terminal::tty::EventedPty + alacritty_terminal::event::OnResize + Send + 'static,
+    {
+        let pty = crate::pty_ring::PtyTap::new(pty, self.pty_ring.clone());
+        let el = match EventLoop::new(self.term.clone(), self.event_proxy.clone(), pty, false, false) {
+            Ok(el) => el,
+            Err(e) => {
+                error!("failed to create PTY event loop ({what}): {e}");
+                self.exited.store(true, std::sync::atomic::Ordering::Relaxed);
+                return;
+            }
+        };
+        let notifier = el.channel();
+        self.event_proxy.set_notifier(notifier.clone());
+        el.spawn();
+        self.notifier = Some(notifier);
+        self.pid = pid;
         self.exited.store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
@@ -975,6 +1033,21 @@ impl TerminalView {
     #[must_use]
     pub const fn is_spawned(&self) -> bool {
         self.spawn_recipe.is_none()
+    }
+
+    /// Whether this tab's shell was adopted from a hot-swap handoff
+    /// rather than forked fresh this run.
+    #[must_use]
+    pub const fn was_adopted(&self) -> bool {
+        self.adopted
+    }
+
+    /// A fresh dup of the live PTY master fd, for the hot-swap handoff.
+    /// `None` while the tab is a skeleton or after a failed spawn.
+    #[cfg(unix)]
+    #[must_use]
+    pub fn handoff_master(&self) -> Option<std::fs::File> {
+        self.master_copy.as_ref().and_then(|f| f.try_clone().ok())
     }
 
     /// Clone of the per-tab PTY ring's Arc. Lets the snapshot
