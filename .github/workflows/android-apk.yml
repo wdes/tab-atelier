@@ -181,20 +181,41 @@ jobs:
                   ANDROID_KEYSTORE_ALIAS: ${{ secrets.ANDROID_KEYSTORE_ALIAS }}
               run: |
                   APP_VERSION_CODE="$CODE" APP_VERSION_NAME="$NAME" scripts/build-apk.sh
-                  test -s connectbot/app/build/outputs/apk/oss/release/app-oss-release.apk
+                  src=connectbot/app/build/outputs/apk/oss/release/app-oss-release.apk
+                  test -s "$src"
+                  # upload-artifact with archive:false takes the artifact name
+                  # from the FILE and ignores `name:` (its README says so, and a
+                  # run confirmed it: the artifact came out as app-oss-release.apk).
+                  # So the file itself is given the name it will have on the site.
+                  cp "$src" "$APK_NAME"
+                  echo "built $APK_NAME ($(du -h "$APK_NAME" | cut -f1))"
+
+            # Guards the app's identity before anything is published. An APK
+            # signed with the wrong key cannot upgrade an installed copy, and
+            # Google's ownership registration is tied to this certificate, so a
+            # rotated or misplaced keystore must fail here rather than reach a
+            # device. The fingerprint is the one NOTICE and the README record.
+            - name: Verify the signing certificate
+              env:
+                  EXPECTED: d8ee6b25599f1d73125ff6cd1d555815d864ca33b86c22642e0ba6bdaa5220ca
+              run: |
+                  got="$(apksigner verify --print-certs "$APK_NAME" \
+                      | sed -n 's/^Signer #1 certificate SHA-256 digest: //p' \
+                      | tr -d ':' | tr 'A-Z' 'a-z')"
+                  if [ "$got" != "$EXPECTED" ]; then
+                      echo "::error::APK signed by $got, expected $EXPECTED — wrong keystore"
+                      exit 1
+                  fi
+                  echo "signed by the expected certificate"
 
             # Kept as a raw file (not zipped) so the bytes are directly
-            # downloadable from the run, like the other artifacts here. The
-            # artifact NAME is the APK's filename on purpose: apt-publish.yml
-            # fetches the newest android-apk artifact and uses its name as the
-            # destination filename in gh-pages, and only picks up names ending
-            # in .apk. Naming it this way keeps both publishers writing the same
-            # file until apt-publish's own android handling is retired.
+            # downloadable from the run, like the other artifacts here. No
+            # `name:` — with archive:false it is ignored, and the artifact takes
+            # the file's name, which is the name it will have on the site.
             - name: Upload the APK artifact
               uses: actions/upload-artifact@v7
               with:
-                  name: ${{ env.APK_NAME }}
-                  path: connectbot/app/build/outputs/apk/oss/release/app-oss-release.apk
+                  path: ${{ env.APK_NAME }}
                   archive: false
                   if-no-files-found: error
 
