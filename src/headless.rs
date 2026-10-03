@@ -1487,6 +1487,8 @@ fn refresh_snapshot(
         };
         let folder = crate::folder_style_of(tab.last_known_cwd_string.as_deref());
         api_tabs.push(api::SnapshotTab {
+            context_pct: None,
+            last_compaction_at: None,
             id: tab.id.clone(),
             name: tab.name.clone(),
             cwd: tab.last_known_cwd_string.clone(),
@@ -1776,6 +1778,7 @@ fn persist(
     // tick — persist() now only does disk I/O.)
 
     let saved = SavedState {
+        dashboard_share_token: String::new(),
         tabs: tab_states,
         active,
         windowed: false,
