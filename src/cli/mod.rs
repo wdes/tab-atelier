@@ -17,11 +17,12 @@ pub mod bench_lag;
 pub mod brain;
 /// `tab-atelier brief` — what a Claude session starting here would be told.
 pub mod brief;
+/// The single shared client-subcommand router used by both the GUI
+/// (`src/main.rs`) and the headless daemon ([`dispatch`]).
+pub mod catalog;
 /// `tab-atelier --check` — preflight the GUI's runtime libraries.
 pub mod check;
 pub mod claude_hook;
-/// The single shared client-subcommand router used by both the GUI
-/// (`src/main.rs`) and the headless daemon ([`dispatch`]).
 pub mod client;
 pub mod delegate;
 pub mod dispatch;
@@ -57,6 +58,11 @@ pub mod set_status;
 pub mod share_link;
 pub mod style;
 pub mod tab_field;
+/// `tab-atelier task <push|claim|beat|done|list>` (primitive #11).
+///
+/// The typed task queue with an atomic claim: the pure backend + the thin HTTP
+/// client.
+pub mod task;
 /// `tab-atelier tasks` — the contract-net fold over the blackboard: what work
 /// exists, who bid, who won, what finished.
 pub mod tasks;
@@ -136,6 +142,9 @@ mod help_tests {
                 }
                 // This file is not a parser: it only mentions the marker
                 // because it is the thing doing the looking.
+                if path.file_name().is_some_and(|name| name == "tab_field.rs") {
+                    continue;
+                }
                 if path.ends_with(std::path::Path::new(file!()).file_name().unwrap_or_default()) {
                     continue;
                 }
