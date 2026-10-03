@@ -113,3 +113,74 @@ index d29c1f26..8c43bf71 100644
                  }
              }
          }
+diff --git a/app/src/test/kotlin/org/connectbot/HelpScreenTest.kt b/app/src/test/kotlin/org/connectbot/HelpScreenTest.kt
+index d3d88bc3..ebcf5752 100644
+--- a/app/src/test/kotlin/org/connectbot/HelpScreenTest.kt
++++ b/app/src/test/kotlin/org/connectbot/HelpScreenTest.kt
+@@ -149,25 +149,57 @@ class HelpScreenTest {
+         assertTrue(eulaCalled)
+     }
+ 
++    // Commented out for Tab Atelier Remote (Apache-2.0 section 4(b)): the
++    // Contact button this drives is commented out of HelpScreen itself, for the
++    // same reason — it leads to ConnectBot's own community (their IRC channels
++    // and mailing list), which is the wrong place to send our users. Restore
++    // both together, or neither.
++    //
++    // @Test
++    // fun helpScreen_contactItemNavigates() {
++    //     var contactCalled = false
++    //
++    //     composeTestRule.setContent {
++    //         ConnectBotTheme {
++    //             HelpScreen(
++    //                 onNavigateBack = {},
++    //                 onNavigateToHints = {},
++    //                 onNavigateToEula = {},
++    //                 onNavigateToContact = { contactCalled = true },
++    //             )
++    //         }
++    //     }
++    //
++    //     composeTestRule
++    //         .onNodeWithText("Contact & Support")
++    //         .performClick()
++    //
++    //     assertTrue(contactCalled)
++    // }
++
++    // Added for Tab Atelier Remote: the About screen's source-code buttons are
++    // ours, and until this existed the only assertion about that screen's
++    // buttons was the commented-out one above — so a fork that quietly lost its
++    // provenance links would still have passed.
++    //
++    // assertExists rather than assertIsDisplayed: the About section is a column
++    // inside a LazyColumn item, and these buttons sit below the fold on a
++    // phone-sized viewport. Being in the tree is the property worth pinning;
++    // how far down they appear is layout, not provenance.
+     @Test
+-    fun helpScreen_contactItemNavigates() {
+-        var contactCalled = false
+-
++    fun helpScreen_sourceCodeItemsAreShown() {
+         composeTestRule.setContent {
+             ConnectBotTheme {
+                 HelpScreen(
+                     onNavigateBack = {},
+                     onNavigateToHints = {},
+                     onNavigateToEula = {},
+-                    onNavigateToContact = { contactCalled = true },
++                    onNavigateToContact = {},
+                 )
+             }
+         }
+ 
+-        composeTestRule
+-            .onNodeWithText("Contact & Support")
+-            .performClick()
+-
+-        assertTrue(contactCalled)
++        composeTestRule.onNodeWithText("Tab Atelier source code").assertExists()
++        composeTestRule.onNodeWithText("ConnectBot source code").assertExists()
+     }
+ }
