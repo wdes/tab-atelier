@@ -25,11 +25,77 @@ index 1058ebfa..dfdc58e4 100644
  			</intent-filter>
  		</activity>
  
+diff --git a/app/src/main/java/org/connectbot/data/ConnectBotDatabase.kt b/app/src/main/java/org/connectbot/data/ConnectBotDatabase.kt
+index c33bfcf3..da1c5fe4 100644
+--- a/app/src/main/java/org/connectbot/data/ConnectBotDatabase.kt
++++ b/app/src/main/java/org/connectbot/data/ConnectBotDatabase.kt
+@@ -64,6 +64,7 @@ import java.util.UUID
+  * - Version 9: Added inline_images to profiles, defaulting to Ask (AutoMigration)
+  * - Version 10: Added mosh_port, mosh_server, and locale columns to hosts for Mosh support (AutoMigration)
+  * - Version 11: UUID automation actions and port-forward startup preference (manual migration)
++ * - Version 12: Added tabatelier_url column to hosts for the tab-atelier server type (AutoMigration)
+  * - Future versions: Use Room AutoMigration when possible for simple schema changes
+  *
+  * Security Considerations:
+@@ -81,7 +82,7 @@ import java.util.UUID
+         Profile::class,
+         AutomationAction::class,
+     ],
+-    version = 11,
++    version = 12,
+     exportSchema = true,
+     autoMigrations = [
+         AutoMigration(from = 1, to = 2),
+@@ -92,6 +93,10 @@ import java.util.UUID
+         AutoMigration(from = 7, to = 8),
+         AutoMigration(from = 8, to = 9),
+         AutoMigration(from = 9, to = 10),
++        // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): hosts gains
++        // a nullable tabatelier_url, which is exactly the additive change Room
++        // can migrate without a hand-written MIGRATION.
++        AutoMigration(from = 11, to = 12),
+     ],
+ )
+ @TypeConverters(Converters::class)
+@@ -142,8 +147,11 @@ abstract class ConnectBotDatabase : RoomDatabase() {
+         /**
+          * Current database schema version.
+          * This is also used for JSON export/import versioning.
++         *
++         * Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): 12, for the
++         * hosts.tabatelier_url added by the tab-atelier server type.
+          */
+-        const val SCHEMA_VERSION = 11
++        const val SCHEMA_VERSION = 12
+ 
+         /**
+          * Migration from version 4 to 5: Add profiles table and profile_id to hosts.
 diff --git a/app/src/main/java/org/connectbot/data/entity/Host.kt b/app/src/main/java/org/connectbot/data/entity/Host.kt
-index ded68890..9c9d743c 100644
+index ded68890..6fc91683 100644
 --- a/app/src/main/java/org/connectbot/data/entity/Host.kt
 +++ b/app/src/main/java/org/connectbot/data/entity/Host.kt
-@@ -147,6 +147,21 @@ data class Host(
+@@ -126,6 +126,20 @@ data class Host(
+      */
+     @ColumnInfo(name = "locale", defaultValue = "en_US.UTF-8")
+     val locale: String = "en_US.UTF-8",
++
++    /**
++     * A tab-atelier daemon's base URL: its scheme (`http` or `https`, which
++     * decides whether TLS is used at all), host, port and optional path prefix,
++     * e.g. `https://host:8443/prefix`. Null for every other protocol, which is
++     * addressed by [hostname] and [port] alone.
++     *
++     * Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): neither a
++     * scheme nor a path prefix fits hostname/port, so this needed a column of
++     * its own. The API token deliberately stays out of the database, in the
++     * Keystore-backed per-host store.
++     */
++    @ColumnInfo(name = "tabatelier_url")
++    val tabAtelierUrl: String? = null,
+ ) {
+     /**
+      * Check if this host is temporary (not saved to database).
+@@ -147,6 +161,21 @@ data class Host(
                  builder.fragment(nickname)
              }
  
@@ -111,37 +177,40 @@ index b0730f42..2b0d091a 100644
          /**
           * Get transport from a URI
 diff --git a/app/src/main/java/org/connectbot/ui/screens/hosteditor/HostEditorScreen.kt b/app/src/main/java/org/connectbot/ui/screens/hosteditor/HostEditorScreen.kt
-index 86d8b485..17a02345 100644
+index 86d8b485..01f304b3 100644
 --- a/app/src/main/java/org/connectbot/ui/screens/hosteditor/HostEditorScreen.kt
 +++ b/app/src/main/java/org/connectbot/ui/screens/hosteditor/HostEditorScreen.kt
-@@ -76,6 +76,7 @@ import org.connectbot.data.entity.ColorScheme
+@@ -76,6 +76,8 @@ import org.connectbot.data.entity.ColorScheme
  import org.connectbot.data.entity.Host
  import org.connectbot.data.entity.Profile
  import org.connectbot.data.entity.Pubkey
++import org.connectbot.tabatelier.TabAtelierBase
 +import org.connectbot.transport.TabAtelier
  import org.connectbot.ui.PreviewScreen
  import org.connectbot.ui.common.getIconColors
  import org.connectbot.ui.common.getLocalizedColorSchemeDescription
-@@ -123,6 +124,8 @@ fun HostEditorScreen(
+@@ -123,6 +125,9 @@ fun HostEditorScreen(
          onIpVersionChange = viewModel::updateIpVersion,
          onPasswordChange = viewModel::updatePassword,
          onClearPassword = viewModel::clearSavedPassword,
 +        onTabAtelierTokenChange = viewModel::updateTabAtelierToken,
 +        onClearTabAtelierToken = viewModel::clearSavedToken,
++        onTabAtelierUrlChange = viewModel::updateTabAtelierUrl,
          onMoshPortChange = viewModel::updateMoshPort,
          onMoshServerChange = viewModel::updateMoshServer,
          onLocaleChange = viewModel::updateLocale,
-@@ -158,6 +161,9 @@ fun HostEditorScreenContent(
+@@ -158,6 +163,10 @@ fun HostEditorScreenContent(
      onIpVersionChange: (String) -> Unit,
      onPasswordChange: (String) -> Unit,
      onClearPassword: () -> Unit,
 +    // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)).
 +    onTabAtelierTokenChange: (String) -> Unit = {},
 +    onClearTabAtelierToken: () -> Unit = {},
++    onTabAtelierUrlChange: (String) -> Unit = {},
      onMoshPortChange: (String) -> Unit = {},
      onMoshServerChange: (String) -> Unit = {},
      onLocaleChange: (String) -> Unit = {},
-@@ -171,8 +177,19 @@ fun HostEditorScreenContent(
+@@ -171,8 +180,24 @@ fun HostEditorScreenContent(
      }
      var showProtocolMenu by remember { mutableStateOf(false) }
      var showAdvancedOptions by rememberSaveable(hostId) { mutableStateOf(false) }
@@ -152,21 +221,96 @@ index 86d8b485..17a02345 100644
 +    // strings; using the same string here keeps that convention.
 +    val protocols = listOf("ssh", "mosh", "telnet", "local", TabAtelier.PROTOCOL)
 +    // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): a tab-atelier
-+    // host is valid with a hostname and a token — no username, no key.
++    // host is entered as one URL, and is only valid once that URL parses — the
++    // same parse every later request uses, so the editor cannot accept an
++    // address the client would reject. It needs a token, and no username.
 +    val isTabAtelier = uiState.protocol == TabAtelier.PROTOCOL
++    val tabAtelierBase = remember(uiState.tabAtelierUrl, isTabAtelier) {
++        if (isTabAtelier) TabAtelierBase.parse(uiState.tabAtelierUrl) else null
++    }
 +    val canSave = when {
 +        uiState.protocol == "local" -> true
-+        isTabAtelier -> uiState.hostname.isNotBlank() &&
++        isTabAtelier -> tabAtelierBase != null &&
 +            (uiState.tabAtelierToken.isNotBlank() || uiState.hasExistingToken)
 +        else -> uiState.hostname.isNotBlank()
 +    }
  
      EditorScaffold(
          title = stringResource(if (hostId == -1L) R.string.hostpref_add_host else R.string.hostpref_setting_title),
-@@ -285,6 +302,42 @@ fun HostEditorScreenContent(
-                     singleLine = true,
-                 )
+@@ -264,26 +289,92 @@ fun HostEditorScreenContent(
+                     )
+                 }
  
+-                OutlinedTextField(
+-                    value = uiState.hostname,
+-                    onValueChange = onHostnameChange,
+-                    label = { Text(stringResource(R.string.hostpref_hostname_title)) },
+-                    isError = uiState.hostname.isBlank(),
+-                    modifier = Modifier
+-                        .fillMaxWidth()
+-                        .padding(top = 8.dp),
+-                    singleLine = true,
+-                )
++                // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): a
++                // tab-atelier daemon is addressed as one URL, so this one field
++                // stands where the hostname and port below it stand for the
++                // other types — a scheme (http or https) and a path prefix have
++                // nowhere else to go, and http versus https is what decides
++                // whether TLS is used at all.
++                if (isTabAtelier) {
++                    OutlinedTextField(
++                        value = uiState.tabAtelierUrl,
++                        onValueChange = onTabAtelierUrlChange,
++                        label = { Text(stringResource(R.string.tabatelier_url_title)) },
++                        placeholder = { Text(stringResource(R.string.tabatelier_url_hint)) },
++                        isError = uiState.tabAtelierUrl.isNotBlank() && tabAtelierBase == null,
++                        supportingText = {
++                            Text(
++                                if (uiState.tabAtelierUrl.isNotBlank() && tabAtelierBase == null) {
++                                    stringResource(R.string.tabatelier_url_error)
++                                } else {
++                                    stringResource(R.string.tabatelier_url_summary)
++                                },
++                            )
++                        },
++                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
++                        modifier = Modifier
++                            .fillMaxWidth()
++                            .padding(top = 8.dp),
++                        singleLine = true,
++                    )
++                } else {
++                    OutlinedTextField(
++                        value = uiState.hostname,
++                        onValueChange = onHostnameChange,
++                        label = { Text(stringResource(R.string.hostpref_hostname_title)) },
++                        isError = uiState.hostname.isBlank(),
++                        modifier = Modifier
++                            .fillMaxWidth()
++                            .padding(top = 8.dp),
++                        singleLine = true,
++                    )
+ 
+-                OutlinedTextField(
+-                    value = uiState.port,
+-                    onValueChange = onPortChange,
+-                    label = { Text(stringResource(R.string.hostpref_port_title)) },
+-                    modifier = Modifier
+-                        .fillMaxWidth()
+-                        .padding(top = 8.dp),
+-                    singleLine = true,
+-                )
++                    OutlinedTextField(
++                        value = uiState.port,
++                        onValueChange = onPortChange,
++                        label = { Text(stringResource(R.string.hostpref_port_title)) },
++                        modifier = Modifier
++                            .fillMaxWidth()
++                            .padding(top = 8.dp),
++                        singleLine = true,
++                    )
++                }
++
 +                // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): the
 +                // daemon's API token is the only credential a tab-atelier host
 +                // has, so it sits beside the address instead of inside the
@@ -202,11 +346,10 @@ index 86d8b485..17a02345 100644
 +                        }
 +                    }
 +                }
-+
+ 
                  Row(
                      modifier = Modifier
-                         .fillMaxWidth()
-@@ -399,12 +452,17 @@ fun HostEditorScreenContent(
+@@ -399,12 +490,17 @@ fun HostEditorScreenContent(
              )
  
              // Pubkey selector
@@ -230,7 +373,7 @@ index 86d8b485..17a02345 100644
  
              // Profile selector
              HorizontalDivider(modifier = Modifier.padding(vertical = 16.dp))
-@@ -425,43 +483,48 @@ fun HostEditorScreenContent(
+@@ -425,43 +521,48 @@ fun HostEditorScreenContent(
                  )
              }
  
@@ -311,18 +454,19 @@ index 86d8b485..17a02345 100644
              // Stay connected
              HorizontalDivider(modifier = Modifier.padding(vertical = 16.dp))
 diff --git a/app/src/main/java/org/connectbot/ui/screens/hosteditor/HostEditorViewModel.kt b/app/src/main/java/org/connectbot/ui/screens/hosteditor/HostEditorViewModel.kt
-index 34cd95e3..7333a90b 100644
+index 34cd95e3..ae18dd2a 100644
 --- a/app/src/main/java/org/connectbot/ui/screens/hosteditor/HostEditorViewModel.kt
 +++ b/app/src/main/java/org/connectbot/ui/screens/hosteditor/HostEditorViewModel.kt
-@@ -38,6 +38,7 @@ import org.connectbot.data.entity.Host
+@@ -38,6 +38,8 @@ import org.connectbot.data.entity.Host
  import org.connectbot.data.entity.Profile
  import org.connectbot.data.entity.Pubkey
  import org.connectbot.di.CoroutineDispatchers
++import org.connectbot.tabatelier.TabAtelierClient
 +import org.connectbot.transport.TabAtelier
  import org.connectbot.transport.Transport
  import org.connectbot.util.InstallMosh
  import org.connectbot.util.SecurePasswordStorage
-@@ -66,6 +67,10 @@ data class HostEditorUiState(
+@@ -66,6 +68,14 @@ data class HostEditorUiState(
      val ipVersion: String = "IPV4_AND_IPV6",
      val password: String = "",
      val hasExistingPassword: Boolean = false,
@@ -330,10 +474,44 @@ index 34cd95e3..7333a90b 100644
 +    // API token, kept in the same Keystore-backed store as a host password.
 +    val tabAtelierToken: String = "",
 +    val hasExistingToken: Boolean = false,
++    // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): a tab-atelier
++    // server is entered as one URL, which is the only field that can carry a
++    // scheme or a path prefix. Blank for every other protocol.
++    val tabAtelierUrl: String = "",
      val hasUnsavedChanges: Boolean = false,
      val isSaving: Boolean = false,
      // Mosh-specific fields
-@@ -161,7 +166,11 @@ class HostEditorViewModel @Inject constructor(
+@@ -85,6 +95,10 @@ class HostEditorViewModel @Inject constructor(
+     private val profileRepository: ProfileRepository,
+     private val prefs: android.content.SharedPreferences,
+     private val securePasswordStorage: SecurePasswordStorage,
++    // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): the client owns
++    // the one parser for a tab-atelier server URL, so the editor saves exactly
++    // what every later call will parse.
++    private val tabAtelierClient: TabAtelierClient,
+     @ApplicationContext private val context: Context,
+     private val dispatchers: CoroutineDispatchers,
+ ) : ViewModel() {
+@@ -155,13 +169,30 @@ class HostEditorViewModel @Inject constructor(
+ 
+     private fun getDefaultPort(protocol: String): String = (Transport.fromProtocol(protocol)?.defaultPort ?: 0).toString()
+ 
++    /**
++     * The URL a tab-atelier host is reached at when none is recorded, from the
++     * hostname and port a host created from a `tabatelier://` link carries.
++     *
++     * Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): a link cannot
++     * express a scheme or a path, so https at the daemon's port is the only
++     * honest guess, and it is the editor's starting point rather than a value
++     * ever saved unlooked-at.
++     */
++    private fun defaultUrlFor(hostname: String, port: Int): String =
++        if (hostname.isBlank()) "" else "https://$hostname:$port"
++
++
+     private fun loadHost() {
+         viewModelScope.launch {
+             _uiState.update { it.copy(isLoading = true) }
              try {
                  val host = repository.findHostById(hostId)
                  if (host != null) {
@@ -346,7 +524,7 @@ index 34cd95e3..7333a90b 100644
                      _uiState.update {
                          it.copy(
                              nickname = host.nickname,
-@@ -180,6 +189,7 @@ class HostEditorViewModel @Inject constructor(
+@@ -180,11 +211,23 @@ class HostEditorViewModel @Inject constructor(
                              jumpHostId = host.jumpHostId,
                              ipVersion = host.ipVersion,
                              hasExistingPassword = hasPassword,
@@ -354,7 +532,23 @@ index 34cd95e3..7333a90b 100644
                              hasUnsavedChanges = false,
                              // Mosh-specific fields
                              moshPort = host.moshPort.toString(),
-@@ -243,7 +253,21 @@ class HostEditorViewModel @Inject constructor(
+                             moshServer = host.moshServer ?: "",
+                             locale = host.locale,
++                            // Changed for Tab Atelier Remote (Apache-2.0 section
++                            // 4(b)): the address a tab-atelier daemon is reached
++                            // at. A host stored before this column existed, or
++                            // one whose URL has been emptied elsewhere, starts
++                            // from the https address its hostname and port
++                            // describe.
++                            tabAtelierUrl = if (host.protocol == TabAtelier.PROTOCOL) {
++                                host.tabAtelierUrl ?: defaultUrlFor(host.hostname, host.port)
++                            } else {
++                                ""
++                            },
+                             isLoading = false,
+                         )
+                     }
+@@ -243,7 +286,30 @@ class HostEditorViewModel @Inject constructor(
  
      fun updateProtocol(value: String) {
          val oldProtocol = _uiState.value.protocol
@@ -372,12 +566,35 @@ index 34cd95e3..7333a90b 100644
 +            } else {
 +                state.port
 +            }
-+            state.copy(protocol = value, port = port, hasUnsavedChanges = true)
++            // The URL is what the tab-atelier type is actually saved from.
++            // When it is empty — a type just picked, or one picked on a host
++            // whose URL the form never held — seed it from the address the rest
++            // of the form already has, so the field is not blank on arrival.
++            val url = if (value == TabAtelier.PROTOCOL && state.tabAtelierUrl.isBlank()) {
++                defaultUrlFor(state.hostname, port.toIntOrNull() ?: TabAtelier.DEFAULT_PORT)
++            } else {
++                state.tabAtelierUrl
++            }
++            state.copy(protocol = value, port = port, tabAtelierUrl = url, hasUnsavedChanges = true)
 +        }
  
          if (value == "mosh" && !InstallMosh.isInstalled(context)) {
              preMoshProtocol = oldProtocol
-@@ -349,6 +373,16 @@ class HostEditorViewModel @Inject constructor(
+@@ -251,6 +317,13 @@ class HostEditorViewModel @Inject constructor(
+         }
+     }
+ 
++    // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): the tab-atelier
++    // server URL, the field the type is addressed and saved by.
++    fun updateTabAtelierUrl(value: String) {
++        nicknameAutofillEnabled = false
++        _uiState.update { it.copy(tabAtelierUrl = value, hasUnsavedChanges = true) }
++    }
++
+     fun cancelMoshInstall() {
+         moshInstallJob?.cancel()
+         moshInstallJob = null
+@@ -349,6 +422,16 @@ class HostEditorViewModel @Inject constructor(
          _uiState.update { it.copy(password = "", hasExistingPassword = false, hasUnsavedChanges = true) }
      }
  
@@ -394,7 +611,57 @@ index 34cd95e3..7333a90b 100644
      fun updateMoshPort(value: String) {
          if (value.isEmpty() || value.all { it.isDigit() }) {
              _uiState.update { it.copy(moshPort = value, hasUnsavedChanges = true) }
-@@ -418,6 +452,25 @@ class HostEditorViewModel @Inject constructor(
+@@ -377,13 +460,36 @@ class HostEditorViewModel @Inject constructor(
+             // Only SSH and Mosh hosts can have a jump host
+             val jumpHostId = if (state.protocol == "ssh" || state.protocol == "mosh") state.jumpHostId else null
+ 
++            // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): a
++            // tab-atelier server is addressed by its URL, and nothing else
++            // speaks that type. The URL is stored canonically — default port
++            // elided, no trailing slash — so the row, the pin key and the
++            // request all agree on what the server is called; hostname and port
++            // are kept in step with it, for the shortcut intent and anything
++            // else that still reads the older fields. A URL that does not parse
++            // is refused here, where the caller can be told, rather than saving
++            // an address every later call would reject.
++            val tabAtelierBase = if (state.protocol == TabAtelier.PROTOCOL) {
++                tabAtelierClient.base(state.tabAtelierUrl)
++                    ?: throw IllegalArgumentException(
++                        "Enter the server's URL, beginning with http:// or https://",
++                    )
++            } else {
++                null
++            }
++            val hostname = tabAtelierBase?.host ?: state.hostname
++            val port = tabAtelierBase?.port
++                ?: state.port.toIntOrNull()
++                ?: getDefaultPort(state.protocol).toIntOrNull()
++                ?: 22
++
+             val host = Host(
+                 id = existingHost?.id ?: 0L,
+                 nickname = state.nickname,
+                 protocol = state.protocol,
+                 username = state.username,
+-                hostname = state.hostname,
+-                port = state.port.toIntOrNull() ?: getDefaultPort(state.protocol).toIntOrNull() ?: 22,
++                hostname = hostname,
++                port = port,
+                 color = state.color.takeIf { it != "gray" },
+                 pubkeyId = state.pubkeyId,
+                 profileId = state.profileId,
+@@ -403,6 +509,10 @@ class HostEditorViewModel @Inject constructor(
+                 moshPort = state.moshPort.toIntOrNull() ?: 0,
+                 moshServer = state.moshServer.ifBlank { null },
+                 locale = state.locale.ifBlank { "en_US.UTF-8" },
++                // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): the
++                // canonical URL, and null for every other protocol so a host
++                // switched away from tab-atelier does not keep one.
++                tabAtelierUrl = tabAtelierBase?.toString(),
+             )
+ 
+             val savedHost = repository.saveHost(host)
+@@ -418,6 +528,25 @@ class HostEditorViewModel @Inject constructor(
                  }
                  // If password is empty but hasExistingPassword is true, keep existing
              }
@@ -421,7 +688,7 @@ index 34cd95e3..7333a90b 100644
          } catch (e: Exception) {
              _uiState.update {
 diff --git a/app/src/main/java/org/connectbot/ui/screens/hostlist/HostListScreen.kt b/app/src/main/java/org/connectbot/ui/screens/hostlist/HostListScreen.kt
-index 6b525d34..69b41732 100644
+index 6b525d34..24425099 100644
 --- a/app/src/main/java/org/connectbot/ui/screens/hostlist/HostListScreen.kt
 +++ b/app/src/main/java/org/connectbot/ui/screens/hostlist/HostListScreen.kt
 @@ -27,10 +27,13 @@ import androidx.compose.foundation.layout.Arrangement
@@ -594,16 +861,17 @@ index 6b525d34..69b41732 100644
      var showMenu by remember { mutableStateOf(false) }
      var showDeleteDialog by remember { mutableStateOf(false) }
      var showDisconnectDialog by remember { mutableStateOf(false) }
-@@ -553,7 +598,15 @@ private fun HostListItem(
+@@ -553,7 +598,16 @@ private fun HostListItem(
      Column(modifier = modifier) {
          ListItem(
              supportingContent = {
 -                Text("${host.protocol}://${host.hostname}:${host.port}")
 +                // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): a
-+                // tab-atelier host really is spoken to over https, so the row
-+                // shows that rather than the internal protocol token.
++                // tab-atelier host's address is its URL, scheme and path prefix
++                // included, so the row shows what was entered rather than the
++                // internal protocol token.
 +                val subtitle = if (isTabAtelier) {
-+                    "https://${host.hostname}:${host.port}"
++                    host.tabAtelierUrl ?: host.hostname
 +                } else {
 +                    "${host.protocol}://${host.hostname}:${host.port}"
 +                }
@@ -611,7 +879,7 @@ index 6b525d34..69b41732 100644
              },
              leadingContent = {
                  Box(
-@@ -575,9 +628,12 @@ private fun HostListItem(
+@@ -575,9 +629,12 @@ private fun HostListItem(
                          contentAlignment = Alignment.Center,
                      ) {
                          Icon(
@@ -624,23 +892,17 @@ index 6b525d34..69b41732 100644
                                  else -> Icons.Default.Link
                              },
                              contentDescription = when (connectionState) {
-@@ -621,6 +677,26 @@ private fun HostListItem(
+@@ -621,6 +678,20 @@ private fun HostListItem(
              },
              trailingContent = {
                  if (!makingShortcut) {
 +                    if (isTabAtelier) {
 +                        // Changed for Tab Atelier Remote (Apache-2.0 section
-+                        // 4(b)): the chevron shows the expansion the row now
-+                        // has, and the refresh re-reads the daemon's tab list.
-+                        IconButton(
-+                            onClick = onRefreshTabs,
-+                            enabled = !tabsLoading,
-+                        ) {
-+                            Icon(
-+                                Icons.Default.Refresh,
-+                                contentDescription = stringResource(R.string.tabatelier_refresh_tabs),
-+                            )
-+                        }
++                        // 4(b)): the chevron shows the expansion the row has,
++                        // and it is the row's only icon button — reloading the
++                        // daemon's tabs is a per-row action like edit and
++                        // delete, so it lives in the overflow below rather than
++                        // crowding it with a second icon beside it.
 +                        Icon(
 +                            imageVector = if (expanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
 +                            contentDescription = stringResource(
@@ -651,7 +913,29 @@ index 6b525d34..69b41732 100644
                      Box {
                          IconButton(
                              onClick = { showMenu = true },
-@@ -1007,3 +1083,155 @@ private fun StartupKeyPasswordDialog(
+@@ -632,6 +703,21 @@ private fun HostListItem(
+                             expanded = showMenu,
+                             onDismissRequest = { showMenu = false },
+                         ) {
++                            // Changed for Tab Atelier Remote (Apache-2.0 section
++                            // 4(b)): re-read this server's tab list.
++                            if (isTabAtelier) {
++                                DropdownMenuItem(
++                                    text = { Text(stringResource(R.string.tabatelier_refresh_tabs)) },
++                                    onClick = {
++                                        showMenu = false
++                                        onRefreshTabs()
++                                    },
++                                    enabled = !tabsLoading,
++                                    leadingIcon = {
++                                        Icon(Icons.Default.Refresh, null)
++                                    },
++                                )
++                            }
+                             DropdownMenuItem(
+                                 text = { Text(stringResource(R.string.list_host_edit)) },
+                                 onClick = {
+@@ -1007,3 +1093,155 @@ private fun StartupKeyPasswordDialog(
          isPassword = true,
      )
  }
@@ -808,7 +1092,7 @@ index 6b525d34..69b41732 100644
 +/** How far a tab row is indented under its server's row. */
 +private val TAB_INDENT = 44.dp
 diff --git a/app/src/main/java/org/connectbot/ui/screens/hostlist/HostListViewModel.kt b/app/src/main/java/org/connectbot/ui/screens/hostlist/HostListViewModel.kt
-index 23108b7f..813f68c0 100644
+index 23108b7f..485c63e6 100644
 --- a/app/src/main/java/org/connectbot/ui/screens/hostlist/HostListViewModel.kt
 +++ b/app/src/main/java/org/connectbot/ui/screens/hostlist/HostListViewModel.kt
 @@ -24,6 +24,7 @@ import androidx.lifecycle.ViewModel
@@ -972,7 +1256,7 @@ index 23108b7f..813f68c0 100644
  
  data class ImportResult(
      val hostsImported: Int,
-@@ -80,9 +209,19 @@ class HostListViewModel @Inject constructor(
+@@ -80,9 +209,26 @@ class HostListViewModel @Inject constructor(
      private val repository: HostRepository,
      private val dispatchers: CoroutineDispatchers,
      private val sharedPreferences: SharedPreferences,
@@ -982,17 +1266,24 @@ index 23108b7f..813f68c0 100644
      private var terminalManager: TerminalManager? = null
 +
 +    /**
-+     * Tab-atelier hosts whose tabs have already been fetched.
-+     *
-+     * The host flow re-emits on every database change, and the tabs must not be
-+     * re-fetched on each of those; this is what makes the fetch once-per-load
-+     * rather than once-per-emission. A manual refresh re-fetches regardless.
++     * What a tab-atelier host's probe depends on: the URL it is reached at, and
++     * whether a token is stored for it. Nothing else about a host is part of it,
++     * and `lastConnect` in particular is not: ConnectBot touches it on every
++     * connect and the hosts Flow emits for that, so re-probing on every emission
++     * would hit the daemon each time a session starts.
 +     */
-+    private val loadedTabHosts = mutableSetOf<Long>()
++    private data class ProbeFingerprint(val url: String, val hasToken: Boolean)
++
++    /**
++     * The fingerprint each tab-atelier host was last probed with, by host id.
++     * A host is probed when it is new, or when this no longer matches — which is
++     * what an edit that changes its URL or its token does, and nothing else.
++     */
++    private val probeFingerprints = mutableMapOf<Long, ProbeFingerprint>()
      private val _uiState = MutableStateFlow(
          HostListUiState(
              isLoading = true,
-@@ -127,10 +266,93 @@ class HostListViewModel @Inject constructor(
+@@ -127,10 +273,122 @@ class HostListViewModel @Inject constructor(
                      _uiState.update {
                          it.copy(hosts = hosts, isLoading = false, error = null)
                      }
@@ -1004,21 +1295,38 @@ index 23108b7f..813f68c0 100644
      }
  
 +    /**
-+     * Fetch the tabs of every tab-atelier host that has not been fetched yet,
-+     * and drop state for hosts that are gone.
++     * Probe every tab-atelier host whose [ProbeFingerprint] has changed, and
++     * drop state for hosts that are gone.
 +     */
 +    private fun syncTabAtelierHosts(hosts: List<Host>) {
 +        val tabHosts = hosts.filter { it.protocol == TabAtelier.PROTOCOL }
 +        val ids = tabHosts.map { it.id }.toSet()
-+        loadedTabHosts.retainAll(ids)
++        probeFingerprints.keys.retainAll(ids)
 +        _uiState.update { state ->
 +            state.copy(tabStates = state.tabStates.filterKeys { it in ids })
 +        }
 +        tabHosts.forEach { host ->
-+            if (loadedTabHosts.add(host.id)) {
-+                fetchTabs(host)
-+            }
++            val fingerprint = fingerprintOf(host)
++            if (probeFingerprints[host.id] == fingerprint) return@forEach
++            probeFingerprints[host.id] = fingerprint
++            // An edited server is probed from scratch: what the last probe found
++            // belongs to an address or a token that is no longer this server's,
++            // and leaving its error on the row is what makes a server someone
++            // just fixed look broken until something else reloads the list.
++            forgetTabs(host.id)
++            fetchTabs(host)
 +        }
++    }
++
++    /** What a host's probe depends on: its URL, and whether it has a token. */
++    private fun fingerprintOf(host: Host): ProbeFingerprint = ProbeFingerprint(
++        url = host.tabAtelierUrl.orEmpty(),
++        hasToken = tabAtelierClient.hasToken(host.id),
++    )
++
++    /** Drop a host's tabs, and with them whatever the last probe said. */
++    private fun forgetTabs(hostId: Long) {
++        _uiState.update { state -> state.copy(tabStates = state.tabStates - hostId) }
 +    }
 +
 +    /**
@@ -1027,7 +1335,10 @@ index 23108b7f..813f68c0 100644
 +     */
 +    fun refreshTabs(host: Host) {
 +        if (host.protocol != TabAtelier.PROTOCOL) return
-+        loadedTabHosts.add(host.id)
++        // A manual refresh probes even when nothing about the server changed,
++        // and records what it probed with, so the next unchanged emission does
++        // not read as a change and probe a second time.
++        probeFingerprints[host.id] = fingerprintOf(host)
 +        fetchTabs(host)
 +    }
 +
@@ -1057,7 +1368,16 @@ index 23108b7f..813f68c0 100644
 +            val result = try {
 +                Result.success(
 +                    withContext(dispatchers.io) {
-+                        tabAtelierClient.fetchTabs(host.id, host.hostname, host.port, tabAtelierClient.token(host.id))
++                        // Changed for Tab Atelier Remote (Apache-2.0 section
++                        // 4(b)): the host is addressed by its URL, which carries
++                        // the scheme — http is not upgraded to https — and any
++                        // path prefix. A URL that does not parse is reported as
++                        // this server's error rather than fetched from a guess.
++                        val base = tabAtelierClient.base(host.tabAtelierUrl)
++                            ?: throw IllegalStateException(
++                                context.getString(R.string.tabatelier_url_invalid),
++                            )
++                        tabAtelierClient.fetchTabs(host.id, base, tabAtelierClient.token(host.id))
 +                    },
 +                )
 +            } catch (e: CancellationException) {
@@ -1086,7 +1406,7 @@ index 23108b7f..813f68c0 100644
      private fun observeHostStatusChanges() {
          val manager = terminalManager ?: return
          viewModelScope.launch {
-@@ -222,6 +444,13 @@ class HostListViewModel @Inject constructor(
+@@ -222,6 +480,13 @@ class HostListViewModel @Inject constructor(
              try {
                  terminalManager?.disconnectHost(host.id)
                  repository.deleteHost(host)
@@ -1096,23 +1416,75 @@ index 23108b7f..813f68c0 100644
 +                if (host.protocol == TabAtelier.PROTOCOL) {
 +                    tabAtelierClient.forgetHost(host.id)
 +                }
-+                loadedTabHosts.remove(host.id)
++                probeFingerprints.remove(host.id)
              } catch (e: Exception) {
                  _uiState.update {
                      it.copy(error = e.message ?: "Failed to delete host")
+diff --git a/app/src/test/kotlin/org/connectbot/ui/screens/hosteditor/HostEditorViewModelTest.kt b/app/src/test/kotlin/org/connectbot/ui/screens/hosteditor/HostEditorViewModelTest.kt
+index c796cb0b..2cbde010 100644
+--- a/app/src/test/kotlin/org/connectbot/ui/screens/hosteditor/HostEditorViewModelTest.kt
++++ b/app/src/test/kotlin/org/connectbot/ui/screens/hosteditor/HostEditorViewModelTest.kt
+@@ -34,6 +34,7 @@ import org.connectbot.data.ProfileRepository
+ import org.connectbot.data.PubkeyRepository
+ import org.connectbot.data.entity.Host
+ import org.connectbot.di.CoroutineDispatchers
++import org.connectbot.tabatelier.TabAtelierClient
+ import org.connectbot.util.SecurePasswordStorage
+ import org.junit.After
+ import org.junit.Assert.assertEquals
+@@ -63,6 +64,7 @@ class HostEditorViewModelTest {
+     private lateinit var profileRepository: ProfileRepository
+     private lateinit var prefs: SharedPreferences
+     private lateinit var securePasswordStorage: SecurePasswordStorage
++    private lateinit var tabAtelierClient: TabAtelierClient
+ 
+     @Before
+     fun setUp() {
+@@ -75,6 +77,7 @@ class HostEditorViewModelTest {
+         profileRepository = mock(ProfileRepository::class.java)
+         prefs = mock(SharedPreferences::class.java)
+         securePasswordStorage = mock(SecurePasswordStorage::class.java)
++        tabAtelierClient = mock(TabAtelierClient::class.java)
+ 
+         // Mock default behavior for observe calls
+         `when`(pubkeyRepository.observeAll()).thenReturn(flowOf(emptyList()))
+@@ -99,6 +102,7 @@ class HostEditorViewModelTest {
+             profileRepository = profileRepository,
+             prefs = prefs,
+             securePasswordStorage = securePasswordStorage,
++            tabAtelierClient = tabAtelierClient,
+             dispatchers = dispatchers,
+         )
+     }
 diff --git a/app/src/test/kotlin/org/connectbot/ui/screens/hostlist/HostListViewModelTest.kt b/app/src/test/kotlin/org/connectbot/ui/screens/hostlist/HostListViewModelTest.kt
-index d627388d..a3913b4a 100644
+index d627388d..87da1495 100644
 --- a/app/src/test/kotlin/org/connectbot/ui/screens/hostlist/HostListViewModelTest.kt
 +++ b/app/src/test/kotlin/org/connectbot/ui/screens/hostlist/HostListViewModelTest.kt
-@@ -33,6 +33,7 @@ import org.connectbot.data.entity.Host
+@@ -33,15 +33,23 @@ import org.connectbot.data.entity.Host
  import org.connectbot.di.CoroutineDispatchers
  import org.connectbot.service.ServiceError
  import org.connectbot.service.TerminalManager
++import org.connectbot.tabatelier.TabAtelierBase
 +import org.connectbot.tabatelier.TabAtelierClient
++import org.connectbot.tabatelier.TabAtelierTab
++import org.connectbot.transport.TabAtelier
  import org.connectbot.util.PreferenceConstants
  import org.junit.After
++import org.junit.Assert.assertEquals
  import org.junit.Assert.assertFalse
-@@ -63,6 +64,7 @@ class HostListViewModelTest {
++import org.junit.Assert.assertNull
+ import org.junit.Assert.assertTrue
+ import org.junit.Before
+ import org.junit.Test
+ import org.mockito.kotlin.any
++import org.mockito.kotlin.anyOrNull
+ import org.mockito.kotlin.inOrder
+ import org.mockito.kotlin.mock
++import org.mockito.kotlin.times
+ import org.mockito.kotlin.verify
+ import org.mockito.kotlin.whenever
+ 
+@@ -63,6 +71,7 @@ class HostListViewModelTest {
      private lateinit var editor: SharedPreferences.Editor
      private lateinit var hostsFlow: MutableStateFlow<List<Host>>
      private lateinit var hostsSortedByColorFlow: MutableStateFlow<List<Host>>
@@ -1120,7 +1492,7 @@ index d627388d..a3913b4a 100644
  
      @Before
      fun setUp() {
-@@ -72,6 +74,7 @@ class HostListViewModelTest {
+@@ -72,6 +81,7 @@ class HostListViewModelTest {
          repository = mock()
          sharedPreferences = mock()
          editor = mock()
@@ -1128,7 +1500,7 @@ index d627388d..a3913b4a 100644
          hostsFlow = MutableStateFlow(emptyList())
          hostsSortedByColorFlow = MutableStateFlow(emptyList())
  
-@@ -89,7 +92,7 @@ class HostListViewModelTest {
+@@ -89,7 +99,7 @@ class HostListViewModelTest {
      private fun createViewModel(sortedByColor: Boolean = false): HostListViewModel {
          whenever(sharedPreferences.getBoolean(PreferenceConstants.SORT_BY_COLOR, false))
              .thenReturn(sortedByColor)
@@ -1137,6 +1509,167 @@ index d627388d..a3913b4a 100644
      }
  
      private fun createTerminalManager(): TerminalManager {
+@@ -230,4 +240,160 @@ class HostListViewModelTest {
+         inOrder.verify(terminalManager).disconnectHost(host.id)
+         inOrder.verify(repository).deleteHost(host)
+     }
++
++    // ---- What re-probes a tab-atelier server, and what deliberately does not -
++    //
++    // A host's tabs are keyed by host id and only re-read when the fingerprint
++    // of what decides the probe — its URL, and whether a token is stored for it
++    // — changes. These tests pin which host writes reach the daemon, because
++    // the hosts Flow also emits for writes that have nothing to do with the
++    // server's configuration. See HostListViewModel.ProbeFingerprint.
++
++    private fun tabAtelierHost(id: Long = 7L, url: String = DAEMON_URL) = Host(
++        id = id,
++        nickname = "daemon",
++        protocol = TabAtelier.PROTOCOL,
++        hostname = "daemon.example",
++        port = 443,
++        tabAtelierUrl = url,
++    )
++
++    /** TabAtelierBase.parse is pure, so the URL parse under test is the real one. */
++    private fun stubBase(vararg urls: String) {
++        urls.forEach { url ->
++            whenever(tabAtelierClient.base(url))
++                .thenReturn(TabAtelierBase.parse(url) ?: error("not a URL: $url"))
++        }
++    }
++
++    /**
++     * The save-from-editor path: a server that could not be reached, whose URL
++     * the user then corrects and saves.
++     *
++     * Expected: the server is probed again and the stale error is gone, because
++     * an error left on the row reads as the edit not having worked.
++     */
++    @Test
++    fun savingAnEditedServer_reprobesIt_andClearsTheStaleError() = runTest {
++        stubBase(DAEMON_URL, FIXED_URL)
++        whenever(tabAtelierClient.fetchTabs(any(), any(), anyOrNull()))
++            .thenThrow(IllegalStateException("connection refused"))
++            .thenReturn(listOf(TabAtelierTab(id = "t1", name = "shell")))
++
++        val host = tabAtelierHost()
++        val viewModel = createViewModel()
++        hostsFlow.value = listOf(host)
++        advanceUntilIdle()
++        assertTrue(
++            "the failed probe should be on the row",
++            viewModel.uiState.value.tabStates[host.id]?.error != null,
++        )
++
++        // Saving the corrected URL is an ordinary host write, and reaches this
++        // ViewModel as the hosts Flow.
++        hostsFlow.value = listOf(host.copy(tabAtelierUrl = FIXED_URL))
++        advanceUntilIdle()
++
++        val state = viewModel.uiState.value.tabStates[host.id]
++        assertNull("the corrected server should not keep the old error", state?.error)
++        assertEquals(1, state?.tabs?.size)
++        verify(tabAtelierClient, times(2)).fetchTabs(any(), any(), anyOrNull())
++    }
++
++    /** A changed URL re-probes the server it now names. */
++    @Test
++    fun aChangedUrl_reprobesTheServer() = runTest {
++        stubBase(DAEMON_URL, FIXED_URL)
++        whenever(tabAtelierClient.fetchTabs(any(), any(), anyOrNull())).thenReturn(emptyList())
++
++        val host = tabAtelierHost()
++        createViewModel()
++        hostsFlow.value = listOf(host)
++        advanceUntilIdle()
++        verify(tabAtelierClient, times(1)).fetchTabs(any(), any(), anyOrNull())
++
++        hostsFlow.value = listOf(host.copy(tabAtelierUrl = FIXED_URL))
++        advanceUntilIdle()
++        verify(tabAtelierClient, times(2)).fetchTabs(any(), any(), anyOrNull())
++    }
++
++    /**
++     * Adding a token re-probes: a daemon that refused the first probe because it
++     * wants a token must be asked again once the editor has stored one. The
++     * address is unchanged, so this is the token half of the fingerprint.
++     */
++    @Test
++    fun storingAToken_reprobesTheServer() = runTest {
++        stubBase(DAEMON_URL)
++        whenever(tabAtelierClient.fetchTabs(any(), any(), anyOrNull())).thenReturn(emptyList())
++
++        val host = tabAtelierHost()
++        createViewModel()
++        hostsFlow.value = listOf(host)
++        advanceUntilIdle()
++        verify(tabAtelierClient, times(1)).fetchTabs(any(), any(), anyOrNull())
++
++        whenever(tabAtelierClient.hasToken(host.id)).thenReturn(true)
++        // A distinct value, so the state flow emits; lastConnect is deliberately
++        // not part of the fingerprint.
++        hostsFlow.value = listOf(host.copy(lastConnect = 1L))
++        advanceUntilIdle()
++        verify(tabAtelierClient, times(2)).fetchTabs(any(), any(), anyOrNull())
++    }
++
++    /**
++     * "Clear saved token" re-probes, and drops the error the unauthorised probe
++     * left: that error describes a credential that is no longer stored.
++     */
++    @Test
++    fun clearingTheToken_reprobesTheServer_andDropsTheUnauthorisedError() = runTest {
++        stubBase(DAEMON_URL)
++        whenever(tabAtelierClient.hasToken(7L)).thenReturn(true)
++        whenever(tabAtelierClient.fetchTabs(any(), any(), anyOrNull()))
++            .thenThrow(IllegalStateException("GET $DAEMON_URL/tabs returned HTTP 401"))
++            .thenReturn(emptyList())
++
++        val host = tabAtelierHost()
++        val viewModel = createViewModel()
++        hostsFlow.value = listOf(host)
++        advanceUntilIdle()
++        assertTrue(viewModel.uiState.value.tabStates[host.id]?.error != null)
++
++        whenever(tabAtelierClient.hasToken(7L)).thenReturn(false)
++        hostsFlow.value = listOf(host.copy(lastConnect = 1L))
++        advanceUntilIdle()
++
++        assertNull(
++            "the error belonged to the token that was cleared",
++            viewModel.uiState.value.tabStates[host.id]?.error,
++        )
++        verify(tabAtelierClient, times(2)).fetchTabs(any(), any(), anyOrNull())
++    }
++
++    /**
++     * The trap the fingerprint exists for. ConnectBot writes `lastConnect` when
++     * a session starts, so the hosts Flow emits while the user is doing
++     * something else entirely; that write must not reach the daemon, or every
++     * connect would re-probe every server.
++     */
++    @Test
++    fun anUnrelatedHostWrite_doesNotReprobeTheServer() = runTest {
++        stubBase(DAEMON_URL)
++        whenever(tabAtelierClient.fetchTabs(any(), any(), anyOrNull())).thenReturn(emptyList())
++
++        val host = tabAtelierHost()
++        createViewModel()
++        hostsFlow.value = listOf(host)
++        advanceUntilIdle()
++
++        hostsFlow.value = listOf(host.copy(lastConnect = System.currentTimeMillis()))
++        advanceUntilIdle()
++
++        verify(tabAtelierClient, times(1)).fetchTabs(any(), any(), anyOrNull())
++    }
++
++    private companion object {
++        const val DAEMON_URL = "https://daemon.example"
++        const val FIXED_URL = "https://fixed.example"
++    }
+ }
 diff --git a/gradle/libs.versions.toml b/gradle/libs.versions.toml
 index 5e4f5370..7fbd45af 100644
 --- a/gradle/libs.versions.toml

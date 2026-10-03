@@ -78,13 +78,20 @@ class TabAtelier : AbsTransport() {
 
     override fun createHost(uri: Uri): Host {
         val hostname = uri.host ?: ""
+        val port = if (uri.port > 0) uri.port else DEFAULT_PORT
         val nickname = uri.fragment?.takeIf { it.isNotEmpty() } ?: getDefaultNickname(null, hostname, uri.port)
         return Host(
             nickname = nickname,
             protocol = PROTOCOL,
             username = "",
             hostname = hostname,
-            port = if (uri.port > 0) uri.port else DEFAULT_PORT,
+            port = port,
+            // A `tabatelier://` link carries no scheme of its own, so the host
+            // starts on the daemon's usual https address: the URL is the field
+            // the editor shows and the row displays, and a host created from a
+            // link should not look empty until it is edited. hostname and port
+            // stay filled for the shortcut intent and the editor's re-entry.
+            tabAtelierUrl = hostname.takeIf { it.isNotEmpty() }?.let { "https://$it:$port" },
         )
     }
 

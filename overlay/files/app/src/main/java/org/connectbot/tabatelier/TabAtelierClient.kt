@@ -15,9 +15,9 @@
  * limitations under the License.
  */
 
-// New file for Tab Atelier Remote, not part of upstream ConnectBot: the HTTP
-// client for a tab-atelier daemon's `GET {base}/tabs`, and the trust-on-first-
-// use pinning of its certificate. See overlay/README.md.
+// New file for Tab Atelier Remote, not part of upstream ConnectBot: the URL a
+// tab-atelier server is addressed by, the HTTP client for its `GET {base}/tabs`,
+// and the trust-on-first-use pinning of its certificate. See overlay/README.md.
 
 package org.connectbot.tabatelier
 
@@ -25,23 +25,141 @@ import android.content.Context
 import android.content.SharedPreferences
 import dagger.hilt.android.qualifiers.ApplicationContext
 import okhttp3.CertificatePinner
+import okhttp3.HttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+import okhttp3.Interceptor
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import org.connectbot.BuildConfig
 import org.connectbot.util.SecurePasswordStorage
 import timber.log.Timber
 import java.security.cert.Certificate
+import java.security.cert.CertificateException
 import java.security.cert.X509Certificate
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import javax.inject.Inject
 import javax.inject.Singleton
+import javax.net.ssl.KeyManager
+import javax.net.ssl.SSLContext
 import javax.net.ssl.SSLPeerUnverifiedException
+import javax.net.ssl.TrustManager
+import javax.net.ssl.X509TrustManager
+
+/**
+ * A tab-atelier daemon's base URL, parsed once.
+ *
+ * A server is one URL — `https://host`, `http://host:7890`,
+ * `https://host:8443/prefix` — because a scheme and a path prefix are exactly
+ * what the internal protocol/hostname/port columns cannot express. The scheme
+ * decides whether the daemon is reached over TLS or plain HTTP; the path prefix
+ * is the mount point the daemon serves under.
+ *
+ * Stage 2's terminal WebSocket hangs off the same base, so deriving a URL from
+ * the base lives here rather than at every call site.
+ */
+class TabAtelierBase private constructor(private val url: HttpUrl) {
+    /** `http` or `https`. */
+    val scheme: String = url.scheme
+
+    val host: String = url.host
+
+    /** The port actually dialled: 443 or 80 was filled in from [scheme]. */
+    val port: Int = url.port
+
+    /**
+     * The path prefix, as an encoded path with no trailing slash: `""` for a
+     * daemon at the root of its host, `/prefix` for one behind a path.
+     */
+    val prefix: String = url.encodedPath.trimEnd('/')
+
+    /** Whether this base is reached over TLS, which is what decides pinning. */
+    val secure: Boolean get() = scheme == HTTPS_SCHEME
+
+    /**
+     * `scheme://host:port` — the connection a certificate pin belongs to, and
+     * the name it is recorded under. No prefix: one daemon serves one key at
+     * every path it is mounted under.
+     */
+    val origin: String = url.newBuilder()
+        .encodedPath(ROOT_PATH)
+        .build()
+        .toString()
+        .removeSuffix(ROOT_PATH)
+
+    /** `GET {this}/tabs`, with exactly one slash between prefix and path. */
+    val tabsUrl: String get() = httpUrl(TABS_PATH).toString()
+
+    /**
+     * [path] on this server, e.g. `https://host:8443/prefix/tabs`. [path] starts
+     * with `/`; the prefix is joined to it without doubling or dropping a slash.
+     */
+    fun httpUrl(path: String): HttpUrl = url.newBuilder().encodedPath(prefix + path).build()
+
+    /**
+     * [path] on this server over WebSocket, e.g. `wss://host:8443/prefix/x`:
+     * stage 2's terminal, built from the same base as [httpUrl].
+     *
+     * A string rather than an [HttpUrl], which accepts only http and https —
+     * `HttpUrl.Builder.scheme("wss")` throws, so the scheme is swapped in the
+     * canonical URL [httpUrl] produced.
+     */
+    fun webSocketUrl(path: String): String {
+        val http = httpUrl(path).toString()
+        return webSocketScheme + http.substring(scheme.length)
+    }
+
+    private val webSocketScheme: String get() = if (secure) "wss" else "ws"
+
+    /**
+     * The canonical base, e.g. `https://host:8443` or `https://host:8443/prefix`
+     * — default port elided, no trailing slash. This is what the editor stores
+     * and the host list shows.
+     */
+    override fun toString(): String = url.newBuilder()
+        .encodedPath(prefix.ifEmpty { ROOT_PATH })
+        .build()
+        .toString()
+        .removeSuffix(ROOT_PATH)
+
+    override fun equals(other: Any?): Boolean = other is TabAtelierBase && other.url == url
+
+    override fun hashCode(): Int = url.hashCode()
+
+    companion object {
+        private const val HTTP_SCHEME = "http"
+        private const val HTTPS_SCHEME = "https"
+        private const val ROOT_PATH = "/"
+        private const val TABS_PATH = "/tabs"
+
+        /**
+         * Parse a server's base URL, or null if it cannot be one.
+         *
+         * Rejected, all for the same reason — quietly dropping part of what the
+         * user typed is worse than saying no:
+         * - what [HttpUrl] itself refuses: no scheme, a scheme other than
+         *   http/https, no host, a port outside 1..65535, a malformed URL;
+         * - credentials, a query or a fragment, which a daemon address has no
+         *   use for and which the request would have to discard.
+         *
+         * Everything else is kept: the scheme chooses TLS or not, the port
+         * defaults to 443/80, and a path prefix is preserved.
+         */
+        fun parse(input: String?): TabAtelierBase? {
+            val url = input?.trim()?.toHttpUrlOrNull() ?: return null
+            if (url.username.isNotEmpty() || url.password.isNotEmpty()) return null
+            if (url.query != null || url.fragment != null) return null
+            return TabAtelierBase(url)
+        }
+    }
+}
 
 /**
  * Talks to a tab-atelier daemon.
  *
  * Stage 1 uses exactly one endpoint, `GET {base}/tabs`; a tab's terminal is a
- * WebSocket and belongs to stage 2.
+ * WebSocket and belongs to stage 2, which asks [clientFor] for the client and
+ * [TabAtelierBase.webSocketUrl] for the URL rather than deriving either again.
  */
 @Singleton
 class TabAtelierClient @Inject constructor(
@@ -53,13 +171,18 @@ class TabAtelierClient @Inject constructor(
     }
 
     /**
-     * A per-host client and the hostname it was built for, so a host's pin is
-     * enforced on its own calls and a certificate learned for one server never
-     * weakens another's.
+     * A client per host *and* origin, so a pin learned for one server is
+     * enforced on that server's own calls and never weakens another's. The
+     * origin is part of the key because it is what a pin is recorded against:
+     * editing a host's URL changes the origin, and the client for the old one is
+     * dropped rather than reused.
      */
-    private data class HostClient(val hostname: String, val client: OkHttpClient)
+    private data class ClientKey(val hostId: Long, val origin: String)
 
-    private val clients = ConcurrentHashMap<Long, HostClient>()
+    private val clients = ConcurrentHashMap<ClientKey, OkHttpClient>()
+
+    /** The base URL a host is addressed by, or null if what it holds is not one. */
+    fun base(url: String?): TabAtelierBase? = TabAtelierBase.parse(url)
 
     /**
      * The token a host's API calls carry, from ConnectBot's Keystore-backed
@@ -70,13 +193,25 @@ class TabAtelierClient @Inject constructor(
 
     fun saveToken(hostId: Long, token: String?) = securePasswordStorage.savePassword(hostId, token)
 
-    /** The SHA-256 Subject Public Key Info pin recorded for this host, if any. */
-    fun pin(hostId: Long): String? = basePrefs.getString(pinKey(hostId), null)
+    /**
+     * Whether a token is stored for a host, without decrypting it.
+     *
+     * One half of what decides whether a server needs probing again — adding or
+     * clearing a token changes how the daemon answers — so it is asked on every
+     * hosts-Flow emission and stays a cheap lookup.
+     */
+    fun hasToken(hostId: Long): Boolean = securePasswordStorage.hasPassword(hostId)
 
-    /** Forget a host's pin, so the next successful call learns it again. */
+    /** The SPKI pin recorded for a host's connection, if it has one. */
+    fun pin(hostId: Long, base: TabAtelierBase): String? =
+        basePrefs.getString(pinKey(hostId, base.origin), null)
+
+    /** Forget a host's pins, so the next successful call learns them again. */
     fun clearPin(hostId: Long) {
-        basePrefs.edit().remove(pinKey(hostId)).apply()
-        clients.remove(hostId)
+        val prefix = pinPrefix(hostId)
+        val recorded = basePrefs.all.keys.filter { it.startsWith(prefix) }
+        basePrefs.edit().apply { recorded.forEach { remove(it) } }.apply()
+        clients.keys.filter { it.hostId == hostId }.forEach(clients::remove)
     }
 
     /** Forget a host's token and pin, for when the host itself is deleted. */
@@ -92,67 +227,92 @@ class TabAtelierClient @Inject constructor(
      *
      * @throws Exception on any network, TLS or parse failure.
      */
-    fun fetchTabs(hostId: Long, hostname: String, port: Int, token: String?): List<TabAtelierTab> {
-        val url = "https://$hostname:$port/tabs"
+    fun fetchTabs(hostId: Long, base: TabAtelierBase, token: String?): List<TabAtelierTab> {
         val request = Request.Builder()
-            .url(url)
+            .url(base.tabsUrl)
             .apply { if (!token.isNullOrEmpty()) header("Authorization", "Bearer $token") }
             .build()
 
-        val response = clientFor(hostId, hostname).newCall(request).execute()
+        val response = clientFor(hostId, base).newCall(request).execute()
         return response.use {
             if (!it.isSuccessful) {
-                throw IllegalStateException("GET $url returned HTTP ${it.code}")
+                throw IllegalStateException("GET ${base.tabsUrl} returned HTTP ${it.code}")
             }
             // The key is only recorded once a request has come back over the
-            // pinned connection successfully, never merely because the socket
-            // was accepted.
-            recordPin(hostId, it.handshake?.peerCertificates)
+            // accepted connection, never merely because the socket was accepted:
+            // see recordPin. A plain-http daemon has no handshake, and so
+            // nothing to pin.
+            if (base.secure) {
+                recordPin(hostId, base, it.handshake?.peerCertificates)
+            }
             parseTabAtelierTabs(it.body.string())
         }
     }
 
-    private fun clientFor(hostId: Long, hostname: String): OkHttpClient =
-        clients.computeIfAbsent(hostId) { id -> HostClient(hostname, buildClient(id, hostname)) }
-            // A hostname edit invalidates the client: the pin is registered
-            // against the name it was learned from.
-            .let { entry ->
-                if (entry.hostname == hostname) {
-                    entry.client
-                } else {
-                    val rebuilt = HostClient(hostname, buildClient(hostId, hostname))
-                    clients[hostId] = rebuilt
-                    rebuilt.client
-                }
-            }
+    /**
+     * The client for a server: built on first use for a host and origin, and
+     * configured for that server alone. Stage 2 reuses it for the WebSocket,
+     * which is what carries the User-Agent and the pin there too.
+     */
+    fun clientFor(hostId: Long, base: TabAtelierBase): OkHttpClient {
+        val key = ClientKey(hostId, base.origin)
+        // The address is part of the key, so editing a host's URL leaves the
+        // client built for its old address unused; drop it, the way the address
+        // it was built for was dropped.
+        clients.keys.filter { it.hostId == hostId && it != key }.forEach(clients::remove)
+        return clients.computeIfAbsent(key) { buildClient(hostId, base) }
+    }
 
-    private fun buildClient(hostId: Long, hostname: String): OkHttpClient {
+    private fun buildClient(hostId: Long, base: TabAtelierBase): OkHttpClient {
         val builder = OkHttpClient.Builder()
             .connectTimeout(CONNECT_TIMEOUT_SECONDS, TimeUnit.SECONDS)
             .readTimeout(READ_TIMEOUT_SECONDS, TimeUnit.SECONDS)
             .callTimeout(CALL_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+            .addInterceptor(userAgentInterceptor)
+
+        // A daemon serving plain HTTP — a trusted LAN, or a tunnel that brings
+        // its own encryption — is reached with no TLS configuration at all: no
+        // pin, no trust manager, no hostname verifier. It is deliberately not
+        // upgraded to https, which would only fail against a daemon with no
+        // certificate to offer.
+        if (!base.secure) return builder.build()
+
+        val trustManager = TrustOnFirstUseManager(hostId, base, basePrefs)
+        val sslContext = SSLContext.getInstance(TLS_PROTOCOL).apply {
+            init(null as Array<KeyManager>?, arrayOf<TrustManager>(trustManager), null)
+        }
+
+        builder
             // The daemon's certificate is self-signed or a Cloudflare Origin
-            // certificate, so name validation cannot be the gate. The gate is
-            // the key pin below: trust on first use, then require that exact
-            // key. This is NOT a blanket trust-all — a certificate whose key
-            // does not match the pin fails the call.
+            // certificate, so neither the system CA store nor name validation
+            // can be the gate. The gate is this trust manager, which decides on
+            // the certificate's public key: trust on first use, then require
+            // that exact key. Setting only a hostname verifier — as this client
+            // did before the trust manager was added — is not enough: OkHttp's
+            // default trust manager rejects the chain during the handshake,
+            // before any verifier is consulted, so a self-signed server never
+            // reaches the pin at all.
+            .sslSocketFactory(sslContext.socketFactory, trustManager)
+            // The second, independent check that it is the same connection: it
+            // compares the pin, and so cannot pass a key the trust manager would
+            // have rejected.
             .hostnameVerifier { _, session ->
                 val chain = try {
                     session.peerCertificates
                 } catch (e: SSLPeerUnverifiedException) {
                     null
                 }
-                pinMatches(hostId, chain?.toList())
+                trustManager.matchesPin(chain?.toList())
             }
 
         // Belt and braces: OkHttp's CertificatePinner pins the Subject Public
         // Key Info rather than the certificate (so a renewal that keeps the key
         // still matches while a swapped key does not), and it reports the
         // failure as an SSLPeerUnverifiedException naming the pin.
-        pin(hostId)?.let { recorded ->
+        pin(hostId, base)?.let { recorded ->
             builder.certificatePinner(
                 CertificatePinner.Builder()
-                    .add(hostname, recorded)
+                    .add(base.host, recorded)
                     .build(),
             )
         }
@@ -160,47 +320,129 @@ class TabAtelierClient @Inject constructor(
     }
 
     /**
-     * Accept a certificate for host [hostId] only if it reproduces the pinned
-     * key; the first certificate seen is accepted and recorded (trust on first
-     * use).
+     * Record the leaf certificate's SPKI pin the first time a response arrives
+     * from this host's origin. Later connections must reproduce it.
+     *
+     * The first handshake is *accepted* before anything is recorded, because the
+     * request that earns the pin cannot be made otherwise; what makes that safe
+     * is that the acceptance only buys that one request, and the pin is written
+     * only once its response has come back. A server that is not the daemon —
+     * anything that answers and then fails, or is refused a response — never
+     * becomes the pinned key, and every later connection to it is rejected
+     * against the pin the real daemon earned.
      */
-    private fun pinMatches(hostId: Long, chain: List<Certificate>?): Boolean {
-        val expected = pin(hostId) ?: return true
-        val leaf = chain?.firstOrNull() ?: return false
-        return pinOf(leaf) == expected
-    }
-
-    /**
-     * Record the leaf certificate's SPKI pin the first time a request succeeds
-     * against this host. Later requests must reproduce it.
-     */
-    private fun recordPin(hostId: Long, chain: List<Certificate>?) {
-        if (pin(hostId) != null) return
+    private fun recordPin(hostId: Long, base: TabAtelierBase, chain: List<Certificate>?) {
+        if (pin(hostId, base) != null) return
         val leaf = chain?.firstOrNull() as? X509Certificate ?: return
-        basePrefs.edit().putString(pinKey(hostId), pinOf(leaf)).apply()
-        Timber.d("Recorded tab-atelier certificate pin for host %d", hostId)
+        val pin = pinOf(leaf) ?: return
+        basePrefs.edit().putString(pinKey(hostId, base.origin), pin).apply()
+        Timber.d("Recorded tab-atelier certificate pin for host %d at %s", hostId, base.origin)
     }
-
-    /**
-     * The OkHttp pin string for a certificate. Delegating to
-     * [CertificatePinner.pin] is deliberate: the value recorded here is then
-     * exactly what [CertificatePinner] compares against, so a pin we recorded
-     * cannot fail to verify against itself.
-     */
-    private fun pinOf(certificate: Certificate): String? =
-        (certificate as? X509Certificate)?.let { CertificatePinner.pin(it) }
-
-    private fun pinKey(hostId: Long): String = "$PIN_PREFIX$hostId"
 
     companion object {
         private const val PREFS_FILE_NAME = "tabatelier_host_pins"
-        private const val PIN_PREFIX = "pin_"
 
         private const val CONNECT_TIMEOUT_SECONDS = 10L
         private const val READ_TIMEOUT_SECONDS = 15L
         private const val CALL_TIMEOUT_SECONDS = 20L
+        private const val TLS_PROTOCOL = "TLS"
+
+        /**
+         * How this app names itself to a daemon: `ta-remote/0.6.10 (Android)`,
+         * the shape the retired Slint client sent, so a daemon's logs read the
+         * same across both clients. The daemon does not branch on it — the
+         * `app` field of its own `/tabs` response is the daemon's User-Agent,
+         * not ours — so this is about identifying ourselves honestly in logs.
+         */
+        private val userAgent: String = "ta-remote/${BuildConfig.VERSION_NAME} (Android)"
+
+        /**
+         * Sent on every request, so the WebSocket upgrade of stage 2 carries it
+         * too without having to remember to.
+         */
+        private val userAgentInterceptor = Interceptor { chain ->
+            chain.proceed(
+                chain.request().newBuilder().header("User-Agent", userAgent).build(),
+            )
+        }
     }
 }
+
+/**
+ * Decides whether a daemon's certificate may be trusted, on the certificate's
+ * public key rather than on a CA or a name.
+ *
+ * First use of a host is accepted, so that a request can be made at all; the key
+ * is remembered later, and only once a response has arrived (see
+ * [TabAtelierClient.recordPin]). Every later connection must reproduce it. A
+ * host whose recorded key no longer matches fails here, during the handshake,
+ * with a message naming it — never by quietly adopting the new key. "No pin" is
+ * only ever the first-use case from this side: a recorded pin that cannot be
+ * read back is a corrupt store, not a reason to trust everything.
+ */
+private class TrustOnFirstUseManager(
+    private val hostId: Long,
+    private val base: TabAtelierBase,
+    private val pins: SharedPreferences,
+) : X509TrustManager {
+
+    override fun checkServerTrusted(chain: Array<out X509Certificate>, authType: String) {
+        val expected = recordedPin()
+        if (expected == null) {
+            // Nothing pinned for this server yet: accept, so the request that
+            // earns the pin can be made. Accepting is not recording.
+            Timber.d("First tab-atelier connection to %s; accepting its key for now", base.origin)
+            return
+        }
+
+        val leaf = chain.firstOrNull()
+            ?: throw CertificateException("No certificate from ${base.host} to compare with its pinned key")
+
+        if (pinOf(leaf) != expected) {
+            throw CertificateException(
+                "The certificate key of ${base.host} does not match the key pinned for it. " +
+                    "Its certificate was replaced, or this is not the server that was trusted; " +
+                    "clear the host's trust to accept the new key.",
+            )
+        }
+    }
+
+    override fun checkClientTrusted(chain: Array<out X509Certificate>, authType: String) {
+        throw CertificateException("A tab-atelier host is a client, not the server being checked")
+    }
+
+    override fun getAcceptedIssuers(): Array<X509Certificate> = emptyArray()
+
+    /**
+     * Whether [chain] reproduces the pinned key.
+     *
+     * False when nothing is pinned: this backs the hostname verifier, where an
+     * absent pin means no response has been recorded yet — a connection that has
+     * not earned its pin, not a first use.
+     */
+    fun matchesPin(chain: List<Certificate>?): Boolean {
+        val expected = recordedPin() ?: return false
+        val leaf = chain?.firstOrNull() ?: return false
+        return pinOf(leaf) == expected
+    }
+
+    private fun recordedPin(): String? = pins.getString(pinKey(hostId, base.origin), null)
+}
+
+/** The preferences key one host's pin for one origin is recorded under. */
+private fun pinKey(hostId: Long, origin: String): String = "${pinPrefix(hostId)}$origin"
+
+/** Every pin key of one host, whatever address it was learned at. */
+private fun pinPrefix(hostId: Long): String = "pin_$hostId@"
+
+/**
+ * The OkHttp pin string for a certificate. Delegating to
+ * [CertificatePinner.pin] is deliberate: the value recorded is then exactly what
+ * [CertificatePinner] compares against, so a pin we recorded cannot fail to
+ * verify against itself.
+ */
+private fun pinOf(certificate: Certificate): String? =
+    (certificate as? X509Certificate)?.let { CertificatePinner.pin(it) }
 
 /**
  * A user-facing explanation of a failed tab-atelier call. The token is never

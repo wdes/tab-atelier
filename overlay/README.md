@@ -108,36 +108,69 @@ the same in every locale, and a translated commit hash or URL would be a defect.
 
 A fifth protocol, `tabatelier`, beside ssh/telnet/mosh/local — added, not
 substituted, so every upstream transport keeps working. A host of this type is a
-tab-atelier daemon: `hostname`/`port` address it, a bearer token authenticates
-against it, and its row in the host list expands into that daemon's tabs,
-newest-used first.
+tab-atelier daemon: one URL addresses it, a bearer token authenticates against
+it, and its row in the host list expands into that daemon's tabs, newest-used
+first.
 
 Files: `transport/Transport.kt`, `transport/AbsTransport.kt`,
-`transport/TransportFactory.kt`, `data/entity/Host.kt`, `HostRepository.kt`,
-`TerminalBridge.kt`, `TerminalManager.kt`, the host list and host editor screens
-and their ViewModels, `AndroidManifest.xml`, and the build files (OkHttp, which
-the app did not previously depend on).
+`transport/TransportFactory.kt`, `data/entity/Host.kt`,
+`data/ConnectBotDatabase.kt`, `HostRepository.kt`, `TerminalBridge.kt`,
+`TerminalManager.kt`, the host list and host editor screens and their
+ViewModels, `AndroidManifest.xml`, and the build files (OkHttp, which the app
+did not previously depend on).
 
 New files live in `files/`, since upstream has nothing like them:
-`tabatelier/TabAtelierClient.kt` (HTTP, TLS), `tabatelier/TabAtelierTab.kt` (the
-model and its parsing), and `transport/TabAtelier.kt` (the transport).
+`tabatelier/TabAtelierClient.kt` (the parsed base URL, HTTP, TLS),
+`tabatelier/TabAtelierTab.kt` (the model and its parsing),
+`transport/TabAtelier.kt` (the transport), and
+`app/schemas/org.connectbot.data.ConnectBotDatabase/12.json` (the Room schema
+for version 12, which upstream's committed `app/schemas/` does not have yet —
+`exportSchema` is on, and an `AutoMigration` is validated against it).
 
-Two decisions worth not re-litigating:
+Three decisions worth not re-litigating:
 
-- **No Room column and no migration.** The token is a per-host secret, so it
-  belongs in the Keystore-backed store upstream already has
-  (`util/SecurePasswordStorage.kt`, keyed `password_<hostId>`), and the address
-  fits the existing `hostname`/`port`. That keeps the schema at version 11,
-  which matters because the app is already installed on a phone: a botched
-  migration costs real data. A path prefix in the URL is the one thing this
-  cannot express, and it is the reason to revisit.
-- **TLS is trust on first use, pinning the key.** The daemon's certificate is
-  self-signed or a Cloudflare Origin certificate, so hostname validation cannot
-  be the gate. The first certificate seen is recorded and every later one must
-  reproduce it. The check is a `hostnameVerifier` that *compares the pin* —
-  deliberately not a blanket trust-all — with OkHttp's `CertificatePinner`
-  layered on top. Both work in SPKI terms: a renewal that keeps the key still
-  matches, a swapped key does not.
+- **The URL is a Room column, and that is a migration.** `tabatelier_url`
+  (nullable, so the migration is a plain `AutoMigration` from 11 to 12) holds
+  `http://host:7890`, `https://host` or `https://host:8443/prefix`. A scheme and
+  a path prefix have nowhere else to live — `hostname`/`port` cannot carry
+  either, and the token must not move: it is a per-host secret and belongs in
+  the Keystore-backed store upstream already has (`util/SecurePasswordStorage.kt`,
+  keyed `password_<hostId>`), out of exports and backups. `hostname` and `port`
+  are kept in step with the URL so the shortcut intent and anything else that
+  still reads them keeps working.
+- **`http` is a real choice, not a fallback.** The daemon can serve plain HTTP
+  (`start_api_server`, distinct from `start_api_server_tls`), which is what a
+  trusted LAN or a tunnel wants. An `http://` base is built with no TLS
+  configuration at all — no pin, no trust manager, no hostname verifier — and is
+  never silently upgraded to https.
+- **TLS is trust on first use, and the gate is a trust manager.** The daemon's
+  certificate is self-signed or a Cloudflare Origin certificate, so neither the
+  system CA store nor name validation can be the gate. The **root cause of the
+  first release's "self-signed certificates do not work"** is worth stating
+  plainly, because the wrong fix is the obvious one: a `hostnameVerifier` alone
+  never runs, since OkHttp's *default* trust manager rejects the chain during
+  the handshake, before any verifier is consulted. So an `X509TrustManager`
+  decides, on the peer's Subject Public Key Info: first use of a host is
+  accepted so the request can be made at all, the key is *persisted* only once a
+  response to that request has come back, and every later connection must
+  reproduce it — including a changed key, which fails during the handshake with
+  a message naming the host. The `hostnameVerifier` (which compares the pin) and
+  OkHttp's `CertificatePinner` stay as independent second checks; the pin string
+  is whatever `CertificatePinner.pin(cert)` produces, so a recorded pin cannot
+  fail to verify against itself.
+
+**A server is re-probed when what the probe depends on changes.** The per-host
+tab state is keyed by host id and invalidated when the host's URL changes or,
+for better or worse, its token appears or disappears — which is how a server
+someone just fixed in the editor stops showing the error the old address earned
+them. It is deliberately *not* re-probed on every hosts-Flow emission:
+ConnectBot writes `Host.lastConnect` on every connect, so "reload when the row
+changes" would hit every daemon each time a session starts.
+
+**The app names itself** `ta-remote/<version> (Android)` on every request, an
+OkHttp interceptor so stage 2's WebSocket carries it too. That is for the
+daemon's logs — the daemon does not branch on it — and it matches the retired
+Slint client's string for continuity.
 
 **Tapping a tab does nothing yet.** The WebSocket terminal is the next stage;
 until it lands, the row says so rather than failing silently.

@@ -18,6 +18,17 @@
 	the build.
 -->
 <resources>
+	<!-- Host editor: a tab-atelier server is one URL — scheme, host, port and
+	     any path prefix the daemon is mounted under — so it is entered as one,
+	     rather than as a hostname and a port that cannot express either. -->
+	<string name="tabatelier_url_title">Server URL</string>
+	<string name="tabatelier_url_hint">https://host:8443</string>
+	<string name="tabatelier_url_summary">The daemon\'s address, including http:// or https:// and any path prefix.</string>
+	<string name="tabatelier_url_error">Enter a URL beginning with http:// or https://, for example https://host:8443</string>
+	<!-- Shown under a server whose stored URL cannot be used, e.g. one from a
+	     backup written by an older version of this app. -->
+	<string name="tabatelier_url_invalid">This server\'s address is not a valid URL. Edit it and enter one, for example https://host:8443</string>
+
 	<!-- Host editor: the tab-atelier server's API token. -->
 	<string name="hostpref_token_title">API token</string>
 	<string name="hostpref_token_unchanged">API token (unchanged)</string>
