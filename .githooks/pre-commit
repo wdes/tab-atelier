@@ -240,7 +240,6 @@ check_clippy() {
 
     for f in "${staged[@]}"; do
         case "$f" in
-            android/*) continue ;;
             crates/*/*)
                 pkg="${f#crates/}"; pkg="${pkg%%/*}"
                 packages+=("$pkg")

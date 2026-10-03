@@ -22,39 +22,25 @@ Tab Atelier is a Guake-style drop-down terminal emulator for Linux (X11), built 
 - `src/tracking.rs` — Wakatime integration
 - `src/platform/linux.rs` — Linux-specific platform code (XDG dirs, X11 hotkeys, process info)
 
-## Mobile app (`android/ta-remote`)
+## Mobile app (the `android-app` branch)
 
-The Android remote client lives IN this repo — a Slint (Rust) app, not a
-separate project:
-- `src/android_app.rs` — native glue + the reachability poller and API calls.
-- `src/onboard.rs` — parses the `taremote://onboard?url&tls_url&token` deep link
-  (the QR from the desktop share modal — note it carries **LAN** addresses only;
-  the public host is the app's separately-set `remote_url`).
-- `ui/*.slint` — the UI; `java/fr/wdes/tab_atelier/WebViewHost.java` — the
-  fullscreen WebView hosting the `/tabs/<id>/view` share-viewer.
-- Build: `cargo-apk2` (config under `[package.metadata.android]` in its
-  `Cargo.toml`; `aarch64-linux-android`, minSdk 23, pkg `fr.wdes.tab_atelier`).
-  Check/build from `android/ta-remote` with `ANDROID_HOME` + `ANDROID_NDK_ROOT`
-  set to an SDK carrying an NDK (25/26): `cargo apk2 check` (compile-check) /
-  `cargo apk2 build` (APK). A plain `cargo check --target aarch64-linux-android`
-  fails on the Slint android-activity build-script — go through `cargo apk2`.
-  Host-only pure logic still runs with `cargo test --lib` there (the `onboard`
-  module is unconditional; `android_app` is `cfg(android)`).
+The Android client is no longer in this repository. It is a **fork of
+ConnectBot** now, living on the `android-app` branch: upstream keeps its own
+history there as a submodule and our changes to it are an overlay, and that
+branch's CI builds the APK and publishes it to `/android/` on the site. Nothing
+in this tree builds or ships the app any more, and `/android/` is maintained
+solely from that branch.
 
-Reachability: the app polls `GET {url|remote_url}/tabs` (Bearer token) with
-`ureq` → `Lan` / `Remote` / `Forbidden` (401/403) / **`Offline`** (anything
-else). A 200 whose body doesn't deserialize into the app's `ApiResponse`, OR any
-non-401/403 error, reads as Offline — so a `/tabs` JSON-shape change can silently
-make the app report the host offline.
+Its README documents the layout, the build, and the signing identity
+(`fr.wdes.tab_atelier` plus its certificate, neither of which may ever change —
+Google's ownership registration and the upgrade path of the installed app both
+key on them).
 
-**TLS gotcha (a recurring "host offline" cause):** the headless origin usually
-serves a self-signed / Cloudflare-Origin cert Android doesn't trust. The WebView
-waves it through (`handler.proceed()` in WebViewHost.java), but the `ureq`
-reachability agent (`android_app.rs`, ~`AgentBuilder::new()`) uses **default TLS
-validation** — so it rejects that cert and shows Offline on remote HTTPS even
-though the browser/WebView works. The bearer token is the authn material; TLS is
-confidentiality only. Any reachability/API agent must accept the host's cert the
-same way the WebView does.
+Two facts from the retired Slint client are worth carrying over when the tab
+list is implemented there: the app fetches `GET {url|remote_url}/tabs` with a
+bearer token, and the headless origin's self-signed / Cloudflare-Origin
+certificate is not trusted by Android — a WebView can wave it through, but an
+HTTP client with default TLS validation rejects it and reports the host offline.
 
 ## Constraints
 

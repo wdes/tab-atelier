@@ -32,3 +32,15 @@ __pycache__/
 # catbus-agent per-directory config, from docs/config-guide.md: a statement
 # about the machine and the operator, not about the work.
 .catbus/
+
+# Signing keys must never be committed: this repository is public, and an APK
+# signing key lets anyone sign a build that installs as an upgrade over the real
+# app. The Android app's key lives in ~/.config/tab-atelier/ (and in the
+# ANDROID_KEYSTORE_BASE64 CI secret), not in the tree.
+*.keystore
+*.jks
+
+# The Android client moved to the android-app branch. Whatever remains here is
+# local build output from the retired Slint client, including its signing key,
+# which is exactly what the rule above is for.
+/android/

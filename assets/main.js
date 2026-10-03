@@ -371,9 +371,9 @@
     }
 
     // ─────────────────────────────────────────────────────────────
-    // Mobile keyboard header — port of the Slint KeyboardHeader from
-    // android/ta-remote/ui/app.slint. Two rows of buttons (escape +
-    // arrows + nav) with an FN mode for F1-F12, plus sticky
+    // Mobile keyboard header — the touch keyboard the Android app's
+    // share-viewer shows. Two rows of buttons (escape + arrows + nav)
+    // with an FN mode for F1-F12, plus sticky
     // CTRL/ALT. Each press emits a `TAG_IN` WS frame via the same
     // sendInputBytes path that `term.onData` uses.
     //

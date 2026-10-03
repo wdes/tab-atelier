@@ -34,12 +34,13 @@ permissions:
     contents: write
     actions: read # download the latest windows-msi artifact for /windows/
 
-# gh-pages has two writers: this workflow, and android-apk on the android-app
-# branch (which serves /android/). Both rebuild the branch from a fresh clone
-# of it, so if they overlapped, whichever pushed second would do so from a tree
-# that does not contain the first one's change and would revert it. This group
-# is shared with android-apk.yml deliberately — same name means GitHub runs
-# them one at a time across both workflows.
+# gh-pages has two writers: this workflow (deb, Arch, Windows) and the
+# android-apk workflow on the android-app branch, which owns /android/ now that
+# the app lives there. Both rebuild the branch from a fresh clone of it, so if
+# they overlapped, whichever pushed second would do so from a tree that does not
+# contain the first one's change and would revert it. The group name is shared
+# with that workflow deliberately — a concurrency group is keyed by name alone,
+# so the two run one at a time across both workflows.
 concurrency:
     group: gh-pages
     cancel-in-progress: false
@@ -335,86 +336,6 @@ jobs:
                       echo '<div class="note"><strong>If double-click install fails with “entrypoint TaskDialogIndirect can not be found in dynamic link library”:</strong> your shell is loading the legacy comctl32 v5 instead of v6. Use the <code>/qb</code> or <code>/qn</code> command-line install above &mdash; it does not invoke TaskDialog at all.</div>'
                       echo '<p><a href="../">&larr; back to the apt repo</a></p>'
                   } > windows/index.html
-
-            # Android APK: built on a runner by android-apk.yml (needs the NDK,
-            # can't be produced here). Same raw-artifact fetch pattern as the MSI
-            # above — pull the latest successful build's .apk into site/android/
-            # and regenerate that folder's index. The gh-pages clone preserved
-            # any previously-published APKs, so if no fresh artifact is found the
-            # existing set carries over.
-            - name: Find latest Android APK run
-              id: apk_run
-              env:
-                  GH_TOKEN: ${{ github.token }}
-              run: |
-                  RUN_ID=$(scripts/ci-artifact-run.sh android-apk.yml 1800)
-                  echo "run_id=${RUN_ID}" >> "$GITHUB_OUTPUT"
-                  if [ -z "$RUN_ID" ]; then
-                      echo "→ no usable android-apk run; keeping existing APKs"
-                  fi
-            - name: Stage APK artifact + regenerate index
-              env:
-                  GH_TOKEN: ${{ github.token }}
-                  RUN_ID: ${{ steps.apk_run.outputs.run_id }}
-              run: |
-                  cd site
-                  mkdir -p android
-                  if [ -n "$RUN_ID" ]; then
-                      # Each artifact's name is the destination filename
-                      # (`ta-remote-<sha>-<ver>.apk`, raw single-file upload).
-                      gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/artifacts" \
-                          --jq '.artifacts[] | "\(.id)\t\(.name)"' \
-                      | while IFS=$'\t' read -r ID NAME; do
-                          case "$NAME" in
-                              *.apk)
-                                  TMP="android/$NAME.partial"
-                                  echo "→ fetching artifact $ID → android/$NAME"
-                                  if curl -fSL --write-out 'http=%{http_code} bytes=%{size_download}\n' \
-                                      -H "Authorization: Bearer $GH_TOKEN" \
-                                      -H "X-GitHub-Api-Version: 2022-11-28" \
-                                      -o "$TMP" \
-                                      "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/artifacts/$ID/zip" \
-                                  ; then
-                                      # APKs are ZIP archives — magic PK\x03\x04
-                                      # (50 4b 03 04). Reject anything else so
-                                      # the site never serves a broken download.
-                                      if head -c 4 "$TMP" | od -An -tx1 | tr -d ' \n' | grep -q '^504b0304$'; then
-                                          mv "$TMP" "android/$NAME"
-                                      else
-                                          echo "  ✗ wrong magic on $NAME — discarding"
-                                          rm -f "$TMP"
-                                      fi
-                                  else
-                                      echo "  ✗ curl failed for artifact $ID — skipping"
-                                      rm -f "$TMP"
-                                  fi
-                                  ;;
-                              *) echo "→ skipping non-APK artifact: $NAME" ;;
-                          esac
-                      done
-                  fi
-                  # Cap at the 10 most recent APKs.
-                  ls -1t android/*.apk 2>/dev/null | tail -n +11 | xargs -r rm -f
-                  # Regenerate the folder index (newest first).
-                  {
-                      echo '<!DOCTYPE html><meta charset=utf-8><title>tab-atelier Android app</title>'
-                      echo '<style>body{font-family:system-ui;max-width:48em;margin:3em auto;padding:0 1em}'
-                      echo 'code{background:#f4f4f4;padding:.1em .3em;border-radius:3px}'
-                      echo '.note{background:#fff8d6;border-left:3px solid #d9a900;padding:.6em .9em;margin:1em 0;font-size:.95em}</style>'
-                      echo '<h1>tab-atelier Android app (ta-remote)</h1>'
-                      echo '<p>Signed release APKs of the remote-control app, newest first. Each filename carries the commit short SHA.</p>'
-                      echo '<ul>'
-                      for f in $(ls -1t android/*.apk 2>/dev/null); do
-                          bn=$(basename "$f")
-                          sz=$(du -h "$f" | cut -f1)
-                          echo "<li><a href=\"$bn\">$bn</a> &mdash; $sz</li>"
-                      done
-                      echo '</ul>'
-                      echo '<h2>Installing</h2>'
-                      echo '<p>Download the newest <code>.apk</code> on your Android device and open it. Android asks you to allow installing from this source the first time (Settings &rarr; Apps &rarr; Special access &rarr; Install unknown apps).</p>'
-                      echo '<div class="note">Self-signed (not on the Play Store). It talks to a tab-atelier headless host over its HTTP API — pair by scanning the QR from the desktop share menu, then set the host&rsquo;s public URL for remote access.</div>'
-                      echo '<p><a href="../">&larr; back to the apt repo</a></p>'
-                  } > android/index.html
 
             # Arch packages: built in an archlinux container by arch-pkg.yml
             # (makepkg can't run here). Same "pull latest successful run" pattern

@@ -11,8 +11,8 @@
 # Needs GH_TOKEN and GITHUB_REPOSITORY in the environment. Prints the id on
 # stdout (empty if there is nothing usable) and its reasoning on stderr.
 #
-# THE RACE THIS EXISTS FOR. apt-publish, arch-pkg and android-apk all trigger
-# on the same push. The publish job used to ask for "the latest successful
+# THE RACE THIS EXISTS FOR. apt-publish and arch-pkg both trigger on the same
+# push. The publish job used to ask for "the latest successful
 # arch-pkg run", which at that moment is the PREVIOUS commit's — the current
 # one is still compiling. So the pacman repo sat exactly one commit behind
 # main, forever, and nobody noticed because every workflow was green.

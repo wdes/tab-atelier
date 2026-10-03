@@ -5,8 +5,9 @@ name: Build Arch package
 # refuses to run as root and needs pacman / base-devel. The built packages are
 # uploaded as an artifact; `apt-publish.yml` (the single gh-pages publisher)
 # pulls the latest successful run into site/arch/, builds the pacman repo db,
-# and serves it from https://deb.tab-atelier.wdes.eu/arch — same pattern as the
-# Windows MSI and Android APK builds.
+# and serves it from https://deb.tab-atelier.wdes.eu/arch — the same pattern as
+# the Windows MSI build. (The Android APK is no longer published from here: the
+# android-app branch builds and publishes it itself.)
 #
 # One rolling channel: each push/tag republishes whatever this builds (capped at
 # 10 by the publisher). The AUR PKGBUILD in packaging/arch/ is the versioned
