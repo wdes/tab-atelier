@@ -3,10 +3,10 @@
 // `$ACTIVITY_STATE_DIR/activity.json`, which the Rust route `/dashboard/activity`
 // (S2) serves and the "Dernières heures" panel (S4) renders.
 //
-// Run:  node scripts/activity-scribe.test.mjs   (exits non-zero on any failure)
+// Run:  node scripts/activity-scribe/test.mjs   (exits non-zero on any failure)
 // No framework — node:assert only. Drives the REAL scribe as a subprocess against
 // tiny committed JSONL fixtures + a throwaway git repo, with a fixed ACTIVITY_NOW
-// so every number is exact. RED until `scripts/activity-scribe` exists — the
+// so every number is exact. RED until `scripts/activity-scribe/scribe` exists — the
 // scribe builder makes it green. Builder: scribe.
 //
 // Contract the scribe MUST honour (env-driven so it is testable AND its feature
@@ -33,8 +33,8 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const SCRIBE = join(HERE, "activity-scribe"); // stable extensionless entrypoint (shebang inside)
-const FIXTURES = join(HERE, "activity-scribe.fixtures", "projects");
+const SCRIBE = join(HERE, "scribe"); // stable extensionless entrypoint (shebang inside)
+const FIXTURES = join(HERE, "fixtures", "projects");
 const NOW = "2026-08-23T15:00:00.000Z";
 
 // --- a throwaway git repo carrying 2 in-window `feat(` commits, 1 `fix(`, and 1
@@ -276,7 +276,7 @@ try {
   }
 } catch (e) {
   failures++;
-  console.log(`  ✗ scribe run crashed (RED until scripts/activity-scribe exists): ${e.message}`);
+  console.log(`  ✗ scribe run crashed (RED until scripts/activity-scribe/scribe exists): ${e.message}`);
 } finally {
   rmSync(repo, { recursive: true, force: true });
   rmSync(stateDir, { recursive: true, force: true });
