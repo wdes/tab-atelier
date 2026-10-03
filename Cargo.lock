@@ -7144,6 +7144,21 @@ name = "tab-atelier-briefs"
 version = "0.5.0-dev"
 
 [[package]]
+name = "tab-atelier-dashboard"
+version = "0.1.0-dev"
+dependencies = [
+ "bytes",
+ "futures-util",
+ "http 1.4.2",
+ "http-body-util",
+ "hyper 1.10.1",
+ "hyper-util",
+ "serde_json",
+ "tokio",
+ "ureq",
+]
+
+[[package]]
 name = "tab-atelier-proxy"
 version = "0.5.0-dev"
 dependencies = [

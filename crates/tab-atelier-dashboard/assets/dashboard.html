@@ -1,0 +1,47 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: MPL-2.0 -->
+<!-- Harness control panel — Kiosk + Catalogue only (fungal-mode trim). See docs/dashboard.md.
+     Vanilla JS, no build step. Served at GET /dashboard. -->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow, noarchive">
+  <!-- Kiosk deploy seam: base for turning a decision's code-source ref (`src/…:line`) into a
+       clickable repo blob link. Bug B (PO « vide-jusqu'au-push ») — EMPTY on purpose: the old
+       a-biskoazh fork 404'd (outbox isn't in the repo), so a code ref degrades to honest
+       copyable text. Set this to the durable repo (e.g. wdes/tab-atelier:tab-atelier-mx) once
+       the durability push lands to re-enable clickable blobs. See classifyDecisionFile in dashboard.js. -->
+  <meta name="repo-blob-base" content="">
+  <!-- volet-3 remote-link: the public host a report viewer link is composed onto so the PO can
+       open/copy it off-LAN (the CF tunnel + its auth are the PO's infra, not ours). DEFAULTS to
+       amaury when absent/empty; a deploy can point it elsewhere. See toRemoteLink in dashboard.js. -->
+  <meta name="remote-base" content="https://amaury.wdes.eu">
+  <title>Harness dashboard · tab-atelier</title>
+  <link rel="stylesheet" href="/assets/dashboard.css">
+</head>
+<body>
+  <header class="topbar">
+    <h1>Harness</h1>
+    <span id="status" class="status" aria-live="polite">prêt</span>
+    <!-- Catalogue #39 SC2: opens the cold catalog read-model in a separate overlay
+         (a skill is NOT a live tab — distinct visual vocabulary). -->
+    <button id="catalog-toggle" class="catalog-toggle" aria-controls="catalog-panel">Catalogue</button>
+    <!-- KIOSK PD2 (#kiosk): the cross-project PENDING-DECISIONS panel, a separate cold
+         source fetched on-demand. The badge = nb of open decisions; hidden when zero. -->
+    <button id="kiosk-toggle" class="kiosk-toggle" aria-controls="kiosk-panel">Kiosk<span id="kiosk-badge" class="kiosk-badge" hidden>0</span></button>
+  </header>
+
+  <main id="dashboard" aria-label="harness kiosk"></main>
+
+  <!-- Catalogue #39 SC2: the cold catalog read-model, opened on-demand from the
+       topbar button. Populated by dashboard.js from catalogView(readModel). -->
+  <div id="catalog-panel" class="catalog-panel" role="dialog" aria-label="catalogue des skills" hidden></div>
+
+  <!-- KIOSK PD2 (#kiosk): the cross-project pending-decisions read-model, opened
+       on-demand from the topbar. Populated by dashboard.js from kioskView(readModel). -->
+  <div id="kiosk-panel" class="kiosk-panel" role="dialog" aria-label="décisions en attente" hidden></div>
+
+  <script type="module" src="/assets/dashboard.js"></script>
+</body>
+</html>
