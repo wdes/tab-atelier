@@ -25,7 +25,7 @@
 
 use std::time::Duration;
 
-use super::{bench, bench_lag, brain, claude_hook, delegate, flags, logging, remote};
+use super::{aligator, bench, bench_lag, brain, claude_hook, delegate, flags, logging, remote};
 use super::{set_context, set_font, set_meta, set_status, share_link, team, tokens};
 
 // ── the local API endpoint ──────────────────────────────────────────
@@ -223,6 +223,9 @@ pub fn dispatch(name: &str, rest: &[String]) -> Option<i32> {
         "dispatch" => delegate::run(rest),
         "remote" => remote::run(rest),
         "brain" => brain::run(rest),
+        // 🐊 aligator (PoC #35): deterministic input router + its producer.
+        "aligator" => aligator::run(rest),
+        "swamp" => aligator::run_swamp(rest),
         "schedule" => share_link::schedule(rest),
         "log" => logging::run(rest),
         "logs" => super::logs::run(rest),

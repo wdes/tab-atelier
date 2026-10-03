@@ -3,6 +3,8 @@
 /// `tab-atelier claude [ARGS…]` — clear the grid + `exec claude` (a correct,
 /// no-fuss agent launcher; see the module docs).
 pub mod agent;
+/// `tab-atelier aligator` — the deterministic input router.
+pub mod aligator;
 /// `tab-atelier wait` — block until named tasks finish.
 ///
 /// Reports the outcome as an exit code, so a shell can compose it.
