@@ -274,6 +274,19 @@ fn depth_from_env() -> u8 {
         .unwrap_or(0)
 }
 
+/// Whether this process is a sub-agent rather than a session someone started.
+///
+/// Asked when the identity file's `AllowedTools` is applied, because that ceiling means something
+/// different for a child: its tool set was chosen narrower by its parent before it ran, so a name it
+/// does not offer cannot widen anything. See [`crate::tools::ToolSet::capped_to`], which is what the
+/// answer selects.
+///
+/// Read from the same depth counter the rest of the tool uses rather than from a second marker, so
+/// the two cannot disagree about whether a process is a child.
+pub fn is_subagent() -> bool {
+    depth_from_env() > 0
+}
+
 /// Parse an inherited depth value, clamping anything unexpected up to the
 /// ceiling.
 ///

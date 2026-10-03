@@ -4,7 +4,7 @@ version = "0.1.0-dev"
 edition = "2024"
 rust-version = "1.92"
 authors = ["William Desportes <williamdes@wdes.fr>"]
-description = "Claude agent runner for tab-atelier — many tabs, many windows."
+description = "Model-agnostic agent runner for tab-atelier — many tabs, many windows."
 license = "MPL-2.0"
 publish = false
 
@@ -32,6 +32,9 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 # false` drops the ureq transport: this crate is async and already has reqwest,
 # and a second TLS stack would be pure weight.
 claude-api = { path = "../claude-api", default-features = false }
+# The per-project briefs, shared with the app so the two agree on where a brief
+# lives and which cwd selects it. Read at startup; see `crate::agent`.
+tab-atelier-briefs = { path = "../tab-atelier-briefs" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # The tools config in TOML as well as JSON. TOML because a tool config is
@@ -81,6 +84,11 @@ terminal_size = "0.4"
 ratatui = "0.30.2"
 base64 = "0.23.1"
 roxmltree = "0.20"
+# SHA-256 for the tool `sha256` field: a script's digest is checked before it
+# runs, so a config can pin the exact bytes someone approved. Pure Rust with no
+# build step, which is why it is acceptable here — a C library would not be, for
+# the same reason the TLS stack is rustls.
+sha2 = "0.10"
 
 [dev-dependencies]
 # Isolated $HOME + cwd for the end-to-end mock-API tests.

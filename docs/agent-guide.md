@@ -17,8 +17,15 @@ the library or package that is missing.
 Type a prompt and press Enter. While a long answer is arriving you can keep typing: press
 Enter again and the line queues, and the status row shows `· 1 queued`. Nothing starts
 until the current turn finishes, so the transcript stays in the order you asked things.
-`Ctrl-C` aborts the turn and clears anything queued — the queued lines are in your history,
-so the up arrow brings them back.
+`Ctrl-C` ends the turn in flight and the queue carries on — the next prompt starts as soon
+as the cancelled one has unwound, which is usually what you wanted when you typed it. Type
+ahead freely while the model works.
+
+Slash commands are not queued: a command says *now*, so `/help`, `/model`, `/rename`, the gate
+modes and the `/resume` listing are obeyed the moment you press Enter. The two that swap the
+session — `/clear` and `/resume <id>` — have to wait, because a turn files its answer in the
+session it started in, so switching mid-turn would lose the answer. They say they are waiting,
+and then run as commands when the turn ends.
 
 A prompt can be several lines. **Shift+Enter** (or **Alt+Enter**) inserts a newline instead
 of sending, so you can lay out a list or a small script and send it whole; Enter is still
@@ -51,8 +58,17 @@ dispatches on — so a command cannot exist without being documented.
 | `/model <name>` | Switch it. Remembered for the session, so reopening continues with it. |
 | `/rename <name>` | Name the session, so `/resume` lists something recognisable. |
 | `/resume` | List this directory's earlier sessions, with the first thing you asked each one. |
-| `/resume <id>` | Switch to one, in place. |
-| `/exit` (alias `/quit`) | Leave. Works even while a turn is running. |
+| `/resume <id>` | Switch to one, in place, and replay its last messages. |
+| `/exit` (alias `/quit`) | Leave. Never waits — not even behind a full queue. |
+
+When a session starts — a tab reopened, `--resume <id>`, or `/resume <id>` — the banner above
+the prompt replays the last 200 messages of that transcript, oldest first, prompts marked `> `.
+Each reply is truncated to its opening, and tool calls are one line each; the transcript keeps
+all of it. This is how you see where the session left off without scrolling, and it includes a
+prompt that never got a reply — which is what a session closed mid-turn ends on.
+
+`/clear` starts a *fresh* session, so its banner has no earlier messages to replay; it names the
+id of the session it left instead, which `/resume <id>` takes you back to — tail and all.
 
 ## Your own shell
 
@@ -73,8 +89,11 @@ so `!make test &` is almost always what you want over `!make test`. The only cos
 to be looking when the notice arrives.
 
 A foreground command owns the prompt until it finishes, and the status row says so. Press
-**Ctrl-B** to stop waiting for it — it carries on in the background — or **Ctrl-C** to stop the
-command itself. Nothing is lost either way; a background command still reports when it ends.
+**Ctrl-B** to stop waiting for it — it carries on in the background — or **Ctrl-C** to stop it
+outright. That stops the command *and everything it started*, because a command line is usually
+more than one process: a pipeline, an `&&` chain, or a test runner that fanned out to workers all
+go on one press, rather than leaving the work running under the shell that launched it. Nothing is
+lost either way; a background command still reports when it ends.
 
 Two things to know about the model's side of it. The first: what the model is told is that *you*
 ran the command, quoting it, with the exit status and the output — so it takes the result into
@@ -82,8 +101,12 @@ account without ever believing one of its own tools produced it. The second: if 
 already mid-turn, the notice waits for its turn rather than interrupting it, and if a turn is not
 running, the notice starts one.
 
-While the model works, its reasoning streams above the prompt in grey. It is there to be watched
-and clears when the answer arrives — the transcript stays the answer.
+While the model works, its reply streams above the prompt in grey — the reasoning while it is
+still thinking, then the answer itself the moment it starts writing it. The two are one slot
+rather than two, and that is what tells you the thinking is over: the status row beneath goes
+from `Thinking` to `Writing` at the same moment, and the text changes from the model's working
+into the reply you asked for. The band clears when the turn ends and the answer is printed into
+the conversation proper — the transcript stays the answer.
 
 ## Permission modes
 
@@ -210,11 +233,14 @@ Two things that look like faults and are not:
 * **A leading `mode open — nothing is checked` line.** That is the banner confirming the
   mode, not a warning.
 * **`120,000 in · ~900 out · USD 0.36000 est.` on the status row.** The live cost of the
-  turn being answered, shown while it runs rather than after it. It comes from two sources
-  and says so: `~` marks a figure this machine worked out (the request's own size before the
-  reply opens, the output count while it is still arriving) and is absent on the provider's
-  own counts. `est.` on the price means the money is still moving with the output. The
-  authoritative figures appear on the line under the finished answer.
+  turn being answered, shown while it runs rather than after it. The figure covers the whole
+  turn, not the call in flight: a turn is a series of requests — think, call a tool, think
+  again — and each is billed, so the counts are their running sum and climb across rounds
+  rather than restarting at each. It comes from two sources and says so: `~` marks a figure
+  this machine worked out (the request's own size before the reply opens, the output count
+  while it is still arriving) and is absent on the provider's own counts. `est.` on the price
+  means the money is still moving with the output. The authoritative figures appear on the
+  line under the finished answer.
 
 If the agent is not running at all, the tab's right-click menu entry is dimmed and says an
 agent already runs there — start one agent per tab, not two.

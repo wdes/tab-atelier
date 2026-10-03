@@ -45,6 +45,10 @@ const MAX_OUTPUT: usize = 2_000;
 /// [`DISABLED_FUNCTIONS`]. It is passed in rather than read here because the tool set owns the
 /// config, and a tool that looked its own limit up could as easily not.
 pub async fn run(input: &serde_json::Value, cwd: &Path, configured: Option<&[String]>) -> Result<String, String> {
+    // The checkout to run in — the session's own directory, or a worktree named by `path`. First,
+    // because both the binary lookup and the run itself are about *that* checkout: a worktree has its
+    // own `vendor/` and its own tests, and running the shared checkout's would test the wrong tree.
+    let cwd = &super::checkout(input, cwd)?;
     let phpunit = find_phpunit(cwd, &disabled_list(configured))?;
     let timeout = input
         .get("timeout_secs")
@@ -523,7 +527,8 @@ pub fn spec() -> serde_json::Value {
                 "timeout_secs": {
                     "type": "integer",
                     "description": "Override the 300s default. Capped at 1800; the run is killed if it exceeds it."
-                }
+                },
+                "worktree": super::checkout_property()
             },
             "required": []
         }

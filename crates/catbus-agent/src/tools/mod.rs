@@ -25,6 +25,10 @@ mod phpunit;
 mod plouf;
 mod read;
 mod spawn;
+// Visible past this module because the identity file's `AllowedTools` has to be read differently for
+// a child than for a session — see `spawn::is_subagent` and `ToolSet::capped_to`. One reader of the
+// spawn depth rather than a second one in `main` that could disagree with it.
+pub use spawn::is_subagent;
 pub mod ssh;
 // Visible past this module for the same reason `bash` is: the REPL shows the head of
 // the list above its prompt, and reading it the way the tool does beats a second
@@ -509,6 +513,91 @@ pub fn resolve(cwd: &Path, path: &str) -> std::path::PathBuf {
     if p.is_absolute() { p.to_path_buf() } else { cwd.join(p) }
 }
 
+/// An argument that must name something inside the working directory.
+///
+/// The stricter counterpart of [`resolve`], and a different question: `resolve` answers "which file
+/// did they mean", where an absolute path is a convenience. This answers "what may we touch", and it
+/// is for the two things that are *not* a file — the directory a worktree is created at, and the
+/// checkout a process runs in. Either of those would be a way to write anywhere if it escaped, and a
+/// worktree is a whole checkout, so an absolute path there is the sandbox boundary rather than a
+/// nicety. Hence no absolute paths, no `..`, and no leading `~`.
+pub fn inside(cwd: &Path, field: &str, raw: Option<&str>) -> Result<String, String> {
+    let trimmed = raw
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| format!("`{field}` is required"))?;
+    let path = Path::new(trimmed);
+    if path.is_absolute() {
+        return Err(format!(
+            "`{field}` must be relative to the working directory, not `{trimmed}` — a worktree is a \
+             whole checkout, so a path outside the project writes outside it."
+        ));
+    }
+    if path.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+        return Err(format!(
+            "`{field}` may not contain `..`: it would leave the working directory"
+        ));
+    }
+    // A leading `~` is refused even though it is a legal *relative* name — it would create a directory
+    // literally called `~` inside the project. Everywhere else a `~` means the home directory, which is
+    // outside, so accepting it does the opposite of what was meant while looking as though it worked.
+    // Found by this function's own test: `~/wt` was accepted, and the test that listed it as a refusal
+    // is what said so.
+    if trimmed.starts_with('~') {
+        return Err(format!(
+            "`{field}` may not begin with `~`: that would create a directory named `~` inside the \
+             working directory, where a `~` usually means your home directory — which is outside it. \
+             Give a path relative to the working directory."
+        ));
+    }
+    if !cwd.join(path).starts_with(cwd) {
+        return Err(format!("`{field}` resolves outside the working directory"));
+    }
+    Ok(trimmed.to_owned())
+}
+
+/// The checkout a tool should run in: the session's own directory, or a worktree inside it.
+///
+/// A session's working directory is fixed when the agent starts and cannot be changed, so a tool
+/// that runs a process there can never reach a worktree. That is why `AGENTS.md`'s first
+/// instruction, to work in your own worktree, could not be followed from here: a session could
+/// create a worktree and edit files in it, and then find every command — commit, push, a test run —
+/// acting on the shared checkout instead. The reasonable conclusion is that worktrees do not work.
+///
+/// `path` names the checkout, relative to the working directory. Absent, the session's own directory
+/// is used, so nothing changes for a session that does not use one.
+///
+/// # Errors
+/// Returns the refusal when `path` leaves the working directory — see [`inside`].
+pub fn checkout(input: &serde_json::Value, cwd: &Path) -> Result<std::path::PathBuf, String> {
+    let Some(path) = input.get("worktree").and_then(serde_json::Value::as_str) else {
+        return Ok(cwd.to_path_buf());
+    };
+    Ok(cwd.join(inside(cwd, "worktree", Some(path))?))
+}
+
+/// The `worktree` property every tool that takes [`checkout`] puts in its schema.
+///
+/// One definition rather than four copies of the same prose, because the four have to agree: a
+/// session learns the parameter from whichever spec it reads first, and a wording that drifted
+/// between them would teach it something different depending on the verb.
+///
+/// Called `worktree` and not `path` for a reason worth keeping: `PHPUnit` already has a `path`, and
+/// it means the test file to run. A second `path` on the same tool would either collide in the JSON
+/// schema or silently repurpose the one that is there — and reading a test file's name as a checkout
+/// directory is the kind of confusion that produces a run against the wrong tree rather than an
+/// error.
+pub fn checkout_property() -> serde_json::Value {
+    serde_json::json!({
+        "type": "string",
+        "description": "Which checkout to run in, relative to the working directory. Defaults to \
+                        the working directory itself. Point it at a worktree — \
+                        `.claude/worktrees/<branch>` — to run there instead of in the shared \
+                        checkout. Absolutes and `..` are refused: a worktree is a whole checkout, \
+                        so that is the sandbox boundary."
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -528,6 +617,30 @@ mod tests {
             assert!(
                 builtin.offers(name),
                 "MINIMAL_TOOLS names {name:?}, which is not a built-in tool"
+            );
+        }
+    }
+
+    /// Every tool that runs a process offers the `worktree` parameter.
+    ///
+    /// That parameter is what makes a worktree usable. A session can create one and edit files in it
+    /// by path, but a tool that cannot be pointed at the worktree runs in the shared checkout — so one
+    /// spec missing the property is enough to make `AGENTS.md`'s first instruction impossible. And it
+    /// fails invisibly: the tool either ignores the argument or rejects the call, and either reads as
+    /// "worktrees do not work" rather than as one forgotten line in a schema.
+    #[test]
+    fn the_tools_that_run_a_process_offer_a_worktree() {
+        for spec in [
+            git::spec(),
+            phpunit::spec(),
+            plouf::spec(),
+            packages::composer_spec(),
+            packages::bun_spec(),
+        ] {
+            let name = spec["name"].as_str().unwrap_or("<unnamed>");
+            assert!(
+                spec["input_schema"]["properties"].get("worktree").is_some(),
+                "`{name}` does not offer `worktree`, so it cannot run in one"
             );
         }
     }

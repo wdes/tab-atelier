@@ -27,27 +27,6 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-/// The reply this harness gives to a cursor-position (DSR) query.
-const DSR_REPLY: &str = "\x1b[1;1R";
-
-/// The same reply as the line discipline echoes it back.
-///
-/// Restoring the terminal on the way out turns ECHO back on, and with ECHOCTL the
-/// kernel echoes an ESC as the two printable characters `^[` — so what lands in the
-/// captured output *after* the app's own last line is caret notation, not the raw
-/// bytes above. A test asserting on that tail must ignore this form; it must also
-/// still ignore the raw form, in case ECHOCTL is off.
-const DSR_ECHO: &str = "^[[1;1R";
-
-/// Drop the harness's own cursor-position reply from the tail of a capture.
-///
-/// Both forms: caret notation (what ECHOCTL gives, the default) and the raw bytes
-/// (in case it is off). A no-op when the reply did not come back at all, which is
-/// the usual case locally — the assertion stays honest either way.
-fn strip_dsr_echo(seen: &str) -> &str {
-    seen.trim_end_matches(DSR_ECHO).trim_end_matches(DSR_REPLY)
-}
-
 /// A pty pair, with the master split into a writer and a reading thread.
 ///
 /// Split because the reading side has to run on its own thread: a blocking read
@@ -73,6 +52,27 @@ impl Pty {
         let pair = nix::pty::openpty(Some(&winsize), None).expect("openpty");
         let master = pair.master;
         let slave = pair.slave;
+
+        // The pty must not echo, and it is worth saying why, because the default is the reason a
+        // test in this file used to fail about one run in three.
+        //
+        // The app is a full-screen TUI: it draws its own input, so the terminal's echo adds nothing
+        // the assertions want — and one thing they cannot ignore. When the app restores cooked mode
+        // on its way out, the terminal echoes whatever input is still queued, and `ECHOCTL` renders
+        // control bytes as caret text. A reply to the app's cursor query (`ESC [ 6 n`) is therefore
+        // echoed *after* the app's final newline, as the literal characters `^[[1;1R` — which no
+        // escape stripper can remove, because by then it is not an escape at all. Whether the reply
+        // was still queued at that moment is a race, hence the intermittency.
+        //
+        // Set here, before the child starts, on purpose: the app saves the terminal's settings when
+        // it enters raw mode and restores *those* on the way out, so a flag cleared after it starts
+        // would only be cleared until the app put it back.
+        let mut flags = nix::sys::termios::tcgetattr(&slave).expect("read pty termios");
+        flags.local_flags.remove(nix::sys::termios::LocalFlags::ECHO);
+        flags.local_flags.remove(nix::sys::termios::LocalFlags::ECHONL);
+        flags.local_flags.remove(nix::sys::termios::LocalFlags::ECHOCTL);
+        nix::sys::termios::tcsetattr(&slave, nix::sys::termios::SetArg::TCSANOW, &flags)
+            .expect("stop the pty echoing input");
 
         let writer = File::from(master.try_clone().expect("dup master"));
         let responder = File::from(master.try_clone().expect("dup master for DSR"));
@@ -105,7 +105,7 @@ impl Pty {
                 for _ in 0..queries {
                     // Row 1, column 1: any position is accepted, it is only
                     // used to place the cursor for redraws.
-                    let _ = responder.write_all(DSR_REPLY.as_bytes());
+                    let _ = responder.write_all(b"\x1b[1;1R");
                 }
                 let _ = responder.flush();
                 carry = window[window.len().saturating_sub(4)..].to_vec();
@@ -350,6 +350,26 @@ impl AgentRepl {
         let matched = self.pty.drain_until_screen(&mut seen, rows, &pred, within);
         self.seen = seen;
         matched
+    }
+
+    /// Wait for the screen to satisfy `pred`, without typing anything.
+    ///
+    /// The complement of [`Self::type_and_watch`]: some of what a test wants to see arrives on its
+    /// own — a cancelled turn unwinding, a queued prompt starting on the far side of that — and
+    /// typing a line to look at it would start another turn instead.
+    fn watch(&mut self, rows: u16, pred: impl Fn(&str) -> bool, within: Duration) -> bool {
+        let mut seen = self.seen.clone();
+        let matched = self.pty.drain_until_screen(&mut seen, rows, &pred, within);
+        self.seen = seen;
+        matched
+    }
+
+    /// Send raw bytes: for a keystroke that is not a line of text.
+    ///
+    /// Ctrl-C is one byte, `0x03`. [`Self::type_and_watch`] would append a newline, which is an
+    /// Enter — a different key, and one this test must not press.
+    fn press(&mut self, bytes: &str) {
+        self.pty.send(bytes);
     }
 
     /// The last `cols`-wide `rows` lines of what the terminal drew, as text.
@@ -654,6 +674,88 @@ data: {"type":"message_stop"}
 }
 
 ///
+/// A relay that answers two model calls: the first opens its reply and then holds, the second
+/// answers at once.
+///
+/// The hold is the whole point — it is what keeps a turn in flight long enough to cancel — and the
+/// replies are worded differently, so a test can tell "the queued prompt ran" from "the first one
+/// finished after all". A fixture that answered the same text twice could not, and the second
+/// turn has to be *fast*: a test that held both would not know which reply it was reading.
+fn spawn_two_turn_relay(hold: Duration) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let mut served = 0;
+        while served < 2 {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let raw = read_request(&mut stream);
+            if raw.starts_with("GET ") {
+                let prices = MOCK_PRICES;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
+                     connection: close\r\n\r\n{prices}",
+                    prices.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+                continue;
+            }
+            served += 1;
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncache-control: no-cache\r\n\
+                  connection: close\r\n\r\n",
+            );
+            let _ = stream.flush();
+            let head = [
+                r#"event: message_start
+data: {"type":"message_start","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":120000,"output_tokens":0}}}
+
+"#,
+                r#"event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+"#,
+            ];
+            for event in head {
+                let _ = stream.write_all(event.as_bytes());
+                let _ = stream.flush();
+            }
+            if served == 1 {
+                std::thread::sleep(hold);
+            }
+            let text = if served == 1 { "First reply." } else { "Second reply." };
+            let rest = [
+                format!(
+                    "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{text}\"}}}}\n\n"
+                ),
+                r#"event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+"#
+                .to_owned(),
+                r#"event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":6789}}
+
+"#
+                .to_owned(),
+                r#"event: message_stop
+data: {"type":"message_stop"}
+
+"#
+                .to_owned(),
+            ];
+            for event in rest {
+                let _ = stream.write_all(event.as_bytes());
+                let _ = stream.flush();
+            }
+        }
+    });
+    port
+}
+
+///
 /// Two models in two currencies, so the totals a session accumulates can be shown to group rather
 /// than to add: a session that used one reply from each has spent dollars and euros, and no single
 /// figure expresses that. The ids match the `model` the canned replies report, so a reply's model
@@ -708,12 +810,54 @@ fn strip_ansi(text: &str) -> String {
     out
 }
 
+/// The harness's pty does not echo what is typed into it.
+///
+/// The exit test depends on this, and the failure it caused was intermittent, so the property is
+/// pinned rather than assumed. A full-screen TUI draws its own input, so the terminal's echo adds
+/// nothing the assertions want — and on the way out it adds something they cannot ignore: the
+/// terminal echoes whatever input is still queued when the app restores cooked mode, and control
+/// bytes come back as caret text, so a reply to the app's cursor query lands *after* the app's
+/// final newline as the literal `^[[1;1R`. No escape stripper can remove that, because by then it
+/// is not an escape — it is six ordinary characters that read as part of the last line.
+///
+/// A pty with no process on the far end is enough to test it: whatever is written to the master
+/// comes back only if the terminal echoes.
+#[test]
+fn the_harness_pty_does_not_echo_typed_input() {
+    let mut pty = Pty::open();
+    pty.send("hello");
+    let mut seen = String::new();
+    pty.drain_for(&mut seen, Duration::from_millis(400));
+    assert!(
+        !seen.contains("hello"),
+        "the pty echoed typed input, which would pollute what the app wrote:\n{seen:?}"
+    );
+}
+
+/// Stripping escapes must not invent a line ending.
+///
+/// The exit test asks whether the app's output ends in a newline, so the stripper has to be
+/// neutral about it. A carriage return is not a line ending — an app that left the terminal
+/// mid-line ended in `\r` and no `\n`, which is exactly the failure that test exists to catch —
+/// and empty output has no newline either.
+#[test]
+fn stripping_does_not_invent_a_line_ending() {
+    assert!(!strip_ansi("working\u{1b}[?2004l\r").ends_with('\n'));
+    assert!(!strip_ansi("").ends_with('\n'));
+}
+
 #[test]
 fn a_turn_paints_the_spinner_and_then_the_totals_line() {
     // A colour-capable tab, because the spinner line carries SGR and the
     // `\r\x1b[K` repaint is only meaningful on a terminal that interprets it.
     let port = spawn_delayed_relay(REPLY_WITH_USAGE, Duration::from_secs(3));
-    let (matched, seen) = type_and_expect_at(port, &[("TERM", "xterm-256color")], "hello", "12,345 in");
+    // Wait on the totals line's own text, not on the digits. The live row paints the same two
+    // numbers a moment earlier, from the same reply, so waiting for `12,345 in` was satisfied by
+    // that row — and `seen` was then snapshotted before the totals line had been printed, so the
+    // assertions below ran against a screen that could not contain it. The two lines use different
+    // separators (`-` against `·`), which is what makes this name the totals line and nothing else;
+    // `statusline::tests::the_live_row_and_the_totals_line_read_differently` holds that apart.
+    let (matched, seen) = type_and_expect_at(port, &[("TERM", "xterm-256color")], "hello", "12,345 in - 6,789 out");
 
     assert!(
         matched,
@@ -734,21 +878,30 @@ fn a_turn_paints_the_spinner_and_then_the_totals_line() {
     // This relay answers with a plain JSON body rather than an SSE stream, so no `message_start`
     // names a model and there is nothing to price — which makes this exactly the state the row
     // displayed before it could price anything, and that state has to survive.
-    let spinner = flat
-        .lines()
-        .find(|row| row.contains("Thinking") && row.contains('~'))
-        .unwrap_or_else(|| panic!("no spinner frame carried an estimated token count:\n{flat}"));
+    //
+    // The frames come from the raw bytes, split on the CR that begins each repaint, because
+    // `strip_ansi` drops those CRs — after stripping, every repaint runs together into one line and
+    // the frame painted once the reply is recorded, which carries the ledger's model and *is*
+    // priced, reads as part of the frame before it. That later frame is the ledger working as
+    // intended; what this checks is that a frame went up, with nothing named yet, carrying no price.
+    //
+    // The predicate asks for all three properties at once rather than taking the first frame that
+    // has the counts and then asserting it is unpriced. That distinction is not academic: how the
+    // repaints divide into CR-separated frames depends on how the writes interleave, and on CI the
+    // estimate and the priced row landed in *one* segment — so the old form picked up a frame that
+    // was priced with the model it named, and failed a row that was behaving correctly. Repeats here
+    // never reproduced it, so the difference is the environment's frame boundaries and not the code's.
+    //
+    // What is worth holding is the property: a frame went up with an estimated input count and no
+    // price, and that holds however the boundaries fall.
+    let inflight = seen
+        .split('\r')
+        .map(strip_ansi)
+        .find(|frame| frame.contains("Thinking") && frame.contains('~') && !frame.contains("USD"))
+        .unwrap_or_else(|| panic!("no frame carried an estimated input count and no price:\n{flat}"));
     assert!(
-        spinner.contains(" in"),
-        "the frame's figure is an input count: {spinner}"
-    );
-    // Scoped to *this* frame, and asserted rather than glossed over: nothing has named a model yet,
-    // so pricing here would be pricing at a model nobody confirmed. A later frame may carry a price
-    // once the reply has been recorded — that is the ledger working, not this — which is why the
-    // check is on the frame rather than on the whole stream.
-    assert!(
-        !spinner.contains("USD"),
-        "no model was reported yet, so this frame cannot be priced: {spinner}"
+        inflight.contains(" in"),
+        "the frame's figure is an input count: {inflight}"
     );
 }
 
@@ -813,7 +966,187 @@ fn the_spinner_row_prices_a_streaming_turn_while_it_runs() {
     );
 }
 
-/// Whether the text contains a CSI cursor-position sequence: `ESC [ <r> ; <c> H`.
+/// Ctrl-C ends the turn in flight, and the prompt queued behind it still runs.
+///
+/// The queue used to go with the turn, so an operator who typed an instruction while the model
+/// worked and then gave up on that turn lost the instruction too. It is typed *because* the turn is
+/// slow, which makes dropping it exactly backwards: the cancel was about the wait, not about the
+/// second question.
+#[test]
+fn ctrl_c_ends_the_turn_and_the_queued_prompt_runs_next() {
+    // Held long enough that the first turn is comfortably in flight when Ctrl-C arrives — so that
+    // a version which failed to cancel would time out here rather than pass by luck.
+    let port = spawn_two_turn_relay(Duration::from_secs(5));
+    let rows = 40;
+    let mut repl = AgentRepl::start(port, &[("TERM", "xterm-256color")]);
+
+    // The first prompt, and confirmation that the turn is really running: a priced row needs counts
+    // the provider has reported, which cannot happen before the reply opens.
+    let started = repl.type_and_watch(
+        "first",
+        rows,
+        |s| s.contains("USD") && s.contains(" in"),
+        Duration::from_secs(20),
+    );
+    assert!(
+        started,
+        "the first turn never started:\n{}",
+        repl.report(&repl.screen(rows, 80))
+    );
+
+    // The second prompt, typed while that turn runs. It queues, and the status row is asserted to
+    // say so rather than assumed: everything after this is only meaningful if the line is genuinely
+    // in the queue when Ctrl-C lands.
+    let queued = repl.type_and_watch("second", rows, |s| s.contains("1 queued"), Duration::from_secs(10));
+    assert!(
+        queued,
+        "the second prompt never queued:\n{}",
+        repl.report(&repl.screen(rows, 80))
+    );
+
+    // Cancel. The message has to say what happened and what runs next, because that is what turns
+    // the continuation from a surprise into a promise.
+    repl.press("\u{3}");
+    let cancelled = repl.watch(rows, |s| s.contains("^C cancelled this turn"), Duration::from_secs(10));
+    assert!(
+        cancelled,
+        "Ctrl-C was not acknowledged:\n{}",
+        repl.report(&repl.screen(rows, 80))
+    );
+
+    // The queued prompt ran. This is the change: the reply is the *second* fixture answer, so it
+    // cannot be the first turn finishing after all.
+    let ran = repl.watch(rows, |s| s.contains("Second reply."), Duration::from_secs(20));
+    let screen = repl.screen(rows, 80);
+    assert!(
+        ran,
+        "the queued prompt did not run after Ctrl-C:\n{}",
+        repl.report(&screen)
+    );
+    assert!(
+        screen.contains("cancelled this turn — the queued prompt runs next"),
+        "the message did not promise the queued prompt:\n{screen}"
+    );
+    // And the cancelled turn's own answer never arrived. A screen holding it would be a plain
+    // two-turn transcript, which is not what was asked for.
+    assert!(
+        !screen.contains("First reply."),
+        "the cancelled turn produced its answer, so nothing was cancelled:\n{screen}"
+    );
+    // The old wording, which is what a regression to clearing the queue would print — named so the
+    // failure says which behaviour came back rather than only that an assertion tripped.
+    assert!(
+        !screen.contains("cancelled this turn, and dropped"),
+        "the queue was cleared again, so the old behaviour is back:\n{screen}"
+    );
+}
+
+/// A command typed while a turn runs is obeyed now — as a command, not as a prompt.
+///
+/// This was the bug. Every line but `/exit` queued, and the queue held *strings* that went straight
+/// to the model when the turn ended, so `/help` typed mid-turn was sent upstream to be read out as
+/// prose. The two assertions are aimed at the two halves: the listing is on screen while the first
+/// reply is still coming back (it acted now), and the status row never counted a queued line (it was
+/// never a prompt). Had the line gone to the model the listing could not appear at all, because the
+/// relay would have answered with the fixture — so this fails if the routing regresses, not just if
+/// the timing does.
+///
+/// The listing's own last line is the marker rather than a command name: `/help` names every command,
+/// so a name would match text already on screen from this run and prove nothing.
+#[test]
+fn a_command_typed_mid_turn_is_obeyed_now_and_not_sent_as_a_prompt() {
+    // Held open for five seconds, so the command is submitted while the turn is genuinely still out.
+    let port = spawn_two_turn_relay(Duration::from_secs(5));
+    let rows = 40;
+    let mut repl = AgentRepl::start(port, &[("TERM", "xterm-256color")]);
+
+    // A priced row needs counts the provider has reported, which cannot happen before the reply
+    // opens — so seeing it is proof the turn is in flight rather than merely submitted.
+    let started = repl.type_and_watch(
+        "first",
+        rows,
+        |s| s.contains("USD") && s.contains(" in"),
+        Duration::from_secs(20),
+    );
+    assert!(
+        started,
+        "the turn never started:\n{}",
+        repl.report(&repl.screen(rows, 80))
+    );
+
+    let helped = repl.type_and_watch(
+        "/help",
+        rows,
+        |s| s.contains("stop waiting for a `!` command"),
+        Duration::from_secs(10),
+    );
+    let screen = repl.screen(rows, 80);
+    assert!(helped, "`/help` was not obeyed mid-turn:\n{}", repl.report(&screen));
+    // The status row only carries the word when something is waiting, so its absence is the proof
+    // that the command was never a prompt. `/help`'s own text does not contain it, which is what
+    // makes the absence meaningful rather than an artefact of the marker.
+    assert!(
+        !screen.contains("queued"),
+        "the command was queued rather than obeyed:\n{screen}"
+    );
+    assert!(
+        !screen.contains("will run when this turn finishes"),
+        "a command that can act at once was told to wait:\n{screen}"
+    );
+}
+
+/// A command that has to wait is *run as a command* when its turn comes.
+///
+/// `/clear` cannot be obeyed mid-turn: a turn snapshots the session it writes to, so swapping
+/// mid-turn files the reply in the transcript that was just left. It queues — and the queue is the
+/// thing that used to be broken, because what it held was text. The evidence that it ran as a command
+/// is the wording only [`run_slash`] prints, which a prompt cannot produce: the model would have
+/// answered with the fixture reply.
+#[test]
+fn a_command_that_has_to_wait_runs_as_a_command_when_the_turn_ends() {
+    let port = spawn_two_turn_relay(Duration::from_secs(5));
+    let rows = 40;
+    let mut repl = AgentRepl::start(port, &[("TERM", "xterm-256color")]);
+
+    let started = repl.type_and_watch(
+        "first",
+        rows,
+        |s| s.contains("USD") && s.contains(" in"),
+        Duration::from_secs(20),
+    );
+    assert!(
+        started,
+        "the turn never started:\n{}",
+        repl.report(&repl.screen(rows, 80))
+    );
+
+    // It waits, and says so — otherwise a command that will not act until later looks like one that
+    // was swallowed or taken for text.
+    let waited = repl.type_and_watch(
+        "/clear",
+        rows,
+        |s| s.contains("will run when this turn finishes"),
+        Duration::from_secs(10),
+    );
+    assert!(
+        waited,
+        "`/clear` was not queued with a word about waiting:\n{}",
+        repl.report(&repl.screen(rows, 80))
+    );
+
+    // Then the turn ends, and the waiting command runs — as the command it was.
+    let ran = repl.watch(rows, |s| s.contains("is still on disk"), Duration::from_secs(20));
+    let screen = repl.screen(rows, 80);
+    assert!(ran, "the queued command never ran:\n{}", repl.report(&screen));
+    // The relay's *second* answer would be the one a queued `/clear` came back as, had it been sent
+    // upstream as text. It cannot have been printed and then purged, either: a purge only happens
+    // when `/clear` runs as itself, which is the behaviour under test.
+    assert!(
+        !screen.contains("Second reply."),
+        "the queued command was sent to the model as a prompt:\n{screen}"
+    );
+}
+
 ///
 /// Looked for structurally rather than as a literal, because the sequence that
 /// immediately precedes a paint is often an SGR colour (`ESC [ 38;5;8;49 m`) and
@@ -847,13 +1180,19 @@ fn the_spinner_repaints_rather_than_appending() {
     // simply absent and the byte assertion stopped describing anything.
     //
     // Within this capture there is only one frame to look at, for a reason worth
-    // recording: the expectation stops at `tokens in`, and that text is painted on the
-    // *first* status frame. So the two things that can be checked here are that the
-    // animation started, and that the frame was painted at a cursor position rather
-    // than written as a new line — which is exactly the difference between repainting
-    // and appending, and is what the old assertion was reaching for.
+    // recording: the expectation stops at the status row's own activity label, which is
+    // painted on the *first* status frame. So the two things that can be checked here
+    // are that the animation started, and that the frame was painted at a cursor
+    // position rather than written as a new line — which is exactly the difference
+    // between repainting and appending, and is what the old assertion was reaching for.
+    //
+    // The label is the thing to wait for rather than a cost figure: it appears nowhere
+    // else on the screen or in the transcript. The expectation used to stop at
+    // `tokens in`, a form the row stopped using, so the wait expired on every run and
+    // the capture was whatever happened to have arrived by then.
     let port = spawn_delayed_relay(REPLY_WITH_USAGE, Duration::from_secs(2));
-    let (_, seen) = type_and_expect_at(port, &[], "hello", "tokens in");
+    let (painted, seen) = type_and_expect_at(port, &[], "hello", "Thinking");
+    assert!(painted, "the status row never painted its activity label:\n{seen}");
 
     assert!(
         "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏".chars().any(|c| seen.contains(c)),
@@ -887,6 +1226,21 @@ const REPLY_WITH_TABLE: &str = r###"{
     "stop_reason": "end_turn",
     "usage": { "input_tokens": 10, "output_tokens": 10 }
 }"###;
+
+/// A reply whose answer is a single line far wider than the 80-column terminal.
+///
+/// The end marker is the point: it sits past column 80, so a view that paints the line without
+/// wrapping loses it entirely. Asserting the marker survives is asserting the wrap happened, and
+/// nothing about the wrap's shape has to be guessed at.
+const REPLY_WITH_LONG_LINE: &str = r#"{
+    "id": "msg_long",
+    "type": "message",
+    "role": "assistant",
+    "model": "claude-sonnet-4-6",
+    "content": [{ "type": "text", "text": "this answer is deliberately one single line far wider than the terminal so that a version which does not wrap it will lose the end of the sentence entirely TAILMARKER" }],
+    "stop_reason": "end_turn",
+    "usage": { "input_tokens": 10, "output_tokens": 10 }
+}"#;
 
 /// The screen a terminal would be showing, given what the app wrote to it.
 ///
@@ -1743,6 +2097,71 @@ fn a_streamed_reply_arrives_whole_and_the_turn_ends() {
     );
 }
 
+/// Switching to an earlier session replays its tail, so a session you return to shows where it left.
+///
+/// This is the whole point of the tail: `/clear` starts a *fresh* session and `/resume <id>` goes
+/// back to an old one, and only the second arrives at a transcript that already has messages in it.
+/// Without the replay the operator gets a session id and an empty screen, which is exactly the
+/// "no way to know where it left" this closes.
+///
+/// The heading is the evidence, not the words: the prompt and the answer are already in the stream
+/// from the turn that wrote them, so a check for those alone would pass with no replay at all. A
+/// session with one turn shows no tail before the switch, which is what makes the heading appearing
+/// afterwards proof that the transcript was read back.
+#[test]
+fn switching_to_an_earlier_session_replays_its_tail() {
+    let port = spawn_sse_relay("a-thought", "the-answer", Duration::from_millis(50));
+    let mut repl = AgentRepl::start(port, &[]);
+    let (answered, seen) = repl.type_and_expect("hello", "the-answer");
+    assert!(answered, "the turn never finished:\n{}", strip_ansi(&seen));
+    assert!(
+        !seen.contains("--- last "),
+        "a session with one turn should show no tail:\n{}",
+        strip_ansi(&seen)
+    );
+
+    // `/clear` starts a fresh session and names the one it left, which is how the operator (and this
+    // test) learns the id to go back to.
+    let (cleared, seen) = repl.type_and_expect("/clear", "to return to it");
+    assert!(
+        cleared,
+        "`/clear` did not name the session it left:\n{}",
+        strip_ansi(&seen)
+    );
+    // Searched in the *joined* text, not the raw bytes. The hint is one long line, so it is wrapped
+    // onto the rows below — and at 80 columns the break falls inside the word `/resume`, leaving
+    // `/resum` at the end of one row and `e <id>` at the start of the next. `strip_ansi` drops the
+    // carriage returns that separate rows, so the stripped text is the rows rejoined and the phrase
+    // is whole again; searching the raw bytes looks for a string the terminal never receives.
+    let joined = strip_ansi(&seen);
+    let id = session_id_in(&joined).unwrap_or_else(|| panic!("no session id in the `/clear` hint:\n{joined}"));
+    assert!(
+        !seen.contains("--- last "),
+        "a fresh session must not claim earlier messages:\n{}",
+        strip_ansi(&seen)
+    );
+
+    let (resumed, seen) = repl.type_and_expect(&format!("/resume {id}"), "--- end of earlier turns ---");
+    assert!(
+        resumed,
+        "`/resume {id}` did not replay the tail:\n{}",
+        strip_ansi(&seen)
+    );
+    assert!(
+        seen.contains("--- last 2 message(s) in this session ---"),
+        "the replayed tail did not name its two messages:\n{}",
+        strip_ansi(&seen)
+    );
+}
+
+/// The session id the `/clear` hint points at, for a `/resume` to use.
+fn session_id_in(text: &str) -> Option<String> {
+    const MARKER: &str = "/resume ";
+    let start = text.rfind(MARKER)? + MARKER.len();
+    let id: String = text.get(start..)?.chars().take(36).collect();
+    (id.len() == 36).then_some(id)
+}
+
 /// Leaving the REPL hands the terminal back on a fresh line.
 ///
 /// The cursor is restored where the viewport left it, which is mid-line, so without an explicit
@@ -1776,48 +2195,58 @@ fn leaving_the_repl_ends_the_output_with_a_newline() {
     // Now collect what it wrote on the way out — the closing bytes are flushed as it hands the
     // terminal back, so some of them land after the process has been reaped.
     pty.drain_for(&mut seen, Duration::from_millis(1500));
-    // A carriage return may precede it — `\r\n` is what the app writes, because which of the two
-    // returns the carriage depends on the terminal having been put back into cooked mode — so the
-    // assertion is on the line ending rather than on the exact pair. Asserted on the tail, which is
-    // the whole point: a newline anywhere earlier would be the prompt's own.
+    // Asserted on the tail, which is the whole point: a newline anywhere earlier would be the
+    // prompt's own.
     //
-    // The tail is read past our own DSR reply first: restoring the terminal turns ECHO back on, so
-    // the reply this harness injected comes back as input echo and lands after the app's last line
-    // (see the responder thread). That echo is the harness's, not the app's, so it must not decide
-    // whether the app ended on a newline. It arrives in caret notation (`DSR_ECHO`) under ECHOCTL,
-    // which is the default; the raw form is stripped too, in case it is not.
-    let tail = strip_dsr_echo(&seen);
+    // Stripped first, and carriage returns with the escapes: the app writes SGR and cursor
+    // sequences on its way out, and `\r\n` for the line ending, so stripping is what leaves the
+    // text a terminal would have shown. What is left is the app's own output and nothing else —
+    // the harness's pty does not echo, and `Pty::open` records what it cost to have it echo. An app
+    // that wrote no newline at all still fails, because nothing else puts one at the end.
+    let shown = strip_ansi(&seen);
     assert!(
-        tail.ends_with('\n'),
+        shown.ends_with('\n'),
         "the shell would have continued the app's last line. Output ended with: {:?}",
-        &tail[tail.len().saturating_sub(60)..]
+        &shown[shown.len().saturating_sub(60)..]
     );
 }
 
-/// The strip handles the exact tail CI produced.
+/// A reply wider than the terminal is wrapped onto the following rows, not cut off at the edge.
 ///
-/// Kept as a test of its own because the pty test cannot reproduce the race on
-/// demand: locally the echo does not land there, so the strip is a no-op and the
-/// pty test would pass with the bug still in. This one pins the bytes instead.
+/// The view paints into a buffer whose setters stop at the right edge rather than continuing on the
+/// next row, so an unwrapped line was silently *lost* past column 80 — not clipped with a visible
+/// marker, just gone, which is the kind of truncation that has already caused confusion on this
+/// project. The fixture puts its marker past that column for exactly this reason.
 #[test]
-fn the_dsr_echo_is_stripped_in_both_forms() {
-    // What CI saw: the app restores the terminal and ends its line, then the
-    // kernel echoes our reply back in caret notation (ECHOCTL).
-    let seen = "\u{1b}[?2004l\r\r\n^[[1;1R";
+fn a_reply_wider_than_the_terminal_is_wrapped_rather_than_cut() {
+    let port = spawn_delayed_relay(REPLY_WITH_LONG_LINE, Duration::from_millis(0));
+    // Wait on the *opening* words, which arrive whether or not the wrap works. Waiting on the tail
+    // instead would make a timeout ambiguous — a lost tail and a turn that never ran would look
+    // the same, and the point of this test is to tell those apart.
+    let (started, seen) = type_and_expect_at(port, &[], "one long line", "this answer is deliberately");
+    assert!(started, "the reply never reached the screen:\n{seen}");
+
+    let screen = screen_of(&seen, 200, 80);
+    // The rows are joined back together before looking for the marker, because a correct wrap is
+    // allowed to fall *inside* it — at 80 columns `TAILMARKER` straddles the boundary, and a test
+    // that searched row by row would fail on a wrap that had worked perfectly. Joining is also the
+    // stronger claim: it asserts the whole answer is on screen, not merely that some row is.
+    let rejoined: String = screen.iter().map(|row| row.trim_end()).collect();
+    let text = screen.join("\n");
     assert!(
-        strip_dsr_echo(seen).ends_with('\n'),
-        "caret-notation echo must not decide the tail"
+        rejoined.contains("TAILMARKER"),
+        "the end of the reply was cut off rather than wrapped:\n{text}"
     );
-
-    // The raw form, should ECHOCTL ever be off.
-    let seen = "\u{1b}[?2004l\r\r\n\u{1b}[1;1R";
-    assert!(strip_dsr_echo(seen).ends_with('\n'));
-
-    // No reply echoed: the capture is returned untouched, so the assertion stays
-    // as strict as it was.
-    assert_eq!(strip_dsr_echo("done\r\n"), "done\r\n");
-
-    // And it still catches a genuine failure: an app that did NOT end its line.
-    let seen = "\u{1b}[?2004l\r\r\n^[[1;1R";
-    assert!(!strip_dsr_echo(&seen[..seen.len() - 2]).ends_with('\n'));
+    // And it is the same reply, not a second one: the opening words are still there above it.
+    assert!(
+        rejoined.contains("this answer is deliberately"),
+        "the reply was replaced rather than wrapped:\n{text}"
+    );
+    // The wrap is a wrap, not a shorter copy of the text: every character of the answer is present
+    // once, in order, with only the row breaks added.
+    assert_eq!(
+        rejoined.matches("this answer is deliberately").count(),
+        1,
+        "the reply appears more than once on the screen:\n{text}"
+    );
 }

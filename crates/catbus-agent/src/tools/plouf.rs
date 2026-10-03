@@ -83,6 +83,10 @@ pub fn action_writes(action: &str) -> bool {
 
 /// Run one action.
 pub async fn run(input: &serde_json::Value, cwd: &Path) -> Result<String, String> {
+    // Which checkout to run in: the session's own directory, or a worktree it names. Resolved before
+    // anything else, because `argv` below resolves the *file* the caller asks about against whatever
+    // `cwd` is by then — so a query aimed at a worktree has to be aimed at the worktree's files.
+    let cwd = &super::checkout(input, cwd)?;
     let args = argv(input, cwd)?;
     let mut command = tokio::process::Command::new("plouf-rs");
     command
@@ -323,6 +327,7 @@ pub fn spec() -> serde_json::Value {
                     "description": "Graph directory. Omit to use plouf-rs's own default, which is \
                                     what you want unless the graph was built somewhere unusual.",
                 },
+                "worktree": super::checkout_property(),
             },
             "required": ["action"],
         },

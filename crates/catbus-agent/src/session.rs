@@ -97,33 +97,48 @@ fn model_sidecar(project_dir: &Path, id: &str) -> PathBuf {
     project_dir.join(format!("{id}.model"))
 }
 
-/// One rendered exchange for the resume preview.
+/// One readable message from a transcript, for the resume tail.
+///
+/// A *message*, not a paired exchange: the last thing in a transcript can be a
+/// prompt with no reply yet — a session closed or killed between the two — and
+/// that prompt is exactly what says where the operator left off. An
+/// exchange-shaped reader drops it, because it has nothing to pair it with.
 #[derive(Debug)]
-pub struct Exchange {
-    pub user_text: String,
-    /// First text block from the assistant turn. Tool-only turns
-    /// (no text block at all) are skipped when building the preview.
-    pub assistant_text: String,
+pub struct Message {
+    /// True for a prompt the operator typed; false for an assistant turn, which
+    /// may be a tool-call summary rather than prose.
+    pub user: bool,
+    pub text: String,
 }
 
-/// Return up to `n` most-recent complete exchanges (user prompt +
-/// assistant reply) from the transcript at `path`. Only plain text
-/// blocks are surfaced — tool calls and tool results are collapsed
-/// to a one-line summary so the preview stays readable.
+/// Longest assistant text block kept in the preview, in characters.
+///
+/// The tail is for orientation, not for reading the conversation back: the full
+/// reply is in the transcript, and the banner only needs enough of it to say
+/// what the session was last doing.
+const ASSISTANT_PREVIEW_CHARS: usize = 200;
+
+/// Return up to `n` most-recent messages from the transcript at `path`.
+///
+/// Only text is surfaced — tool calls are collapsed to a one-line count and tool
+/// results are skipped, so the preview stays readable. Lines that do not parse,
+/// or that hold a shape this build does not know (a newer writer's entry), are
+/// passed over rather than ending the read.
 #[must_use]
-pub fn last_exchanges(path: &Path, n: usize) -> Vec<Exchange> {
+pub fn last_messages(path: &Path, n: usize) -> Vec<Message> {
     use std::collections::VecDeque;
     use std::io::BufRead;
+    if n == 0 {
+        return Vec::new();
+    }
     let Ok(file) = std::fs::File::open(path) else {
         return Vec::new();
     };
     let reader = std::io::BufReader::new(file);
-    // Walk lines, keeping only the last 2*n turns in a ring buffer so we
-    // never hold the whole transcript in memory. (The previous version
-    // read the entire file into a String, which scaled with transcript
-    // size and was called every banner draw.)
-    let max_turns = (n.saturating_mul(2)).max(4);
-    let mut turns: VecDeque<(bool, String)> = VecDeque::with_capacity(max_turns + 1);
+    // A ring of the last `n`, so the whole transcript is never held in memory.
+    // This is called at every banner draw, and a session can be thousands of
+    // turns long.
+    let mut kept: VecDeque<Message> = VecDeque::with_capacity(n + 1);
     for line in reader.lines() {
         let Ok(line) = line else { continue };
         if line.trim().is_empty() {
@@ -132,85 +147,66 @@ pub fn last_exchanges(path: &Path, n: usize) -> Vec<Exchange> {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
         };
-        let Some(role) = v.get("type").and_then(|t| t.as_str()) else {
-            continue;
-        };
-        let Some(msg) = v.get("message") else { continue };
-        let pushed: Option<(bool, String)> = match role {
-            "user" => {
-                // Plain string content = a real user prompt.
-                // Array content = tool results — skip those.
-                if let Some(serde_json::Value::String(s)) = msg.get("content") {
-                    Some((false, s.clone()))
-                } else {
-                    None
-                }
-            }
-            "assistant" => {
-                if let Some(serde_json::Value::Array(blocks)) = msg.get("content") {
-                    // Collect text blocks; note tool calls as <tool>.
-                    let mut parts: Vec<String> = Vec::new();
-                    let mut tool_count = 0usize;
-                    for b in blocks {
-                        match b.get("type").and_then(|t| t.as_str()) {
-                            Some("text") => {
-                                if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
-                                    // Trim to ~200 chars so the preview is compact.
-                                    let trimmed = t.trim();
-                                    if !trimmed.is_empty() {
-                                        parts.push(trimmed.chars().take(200).collect::<String>());
-                                    }
-                                }
+        let Some(message) = message_of(&v) else { continue };
+        kept.push_back(message);
+        if kept.len() > n {
+            kept.pop_front();
+        }
+    }
+    kept.into_iter().collect()
+}
+
+/// The readable message in one transcript line, or `None` when the line is not
+/// one — a tool result, a meta entry, or anything a newer writer adds.
+fn message_of(v: &serde_json::Value) -> Option<Message> {
+    let role = v.get("type")?.as_str()?;
+    let msg = v.get("message")?;
+    match role {
+        // Plain string content = a real user prompt. Array content = tool
+        // results, which are the model's own bookkeeping rather than something
+        // the operator typed, so they are skipped.
+        "user" => {
+            let text = msg.get("content")?.as_str()?.trim();
+            (!text.is_empty()).then(|| Message {
+                user: true,
+                text: text.to_owned(),
+            })
+        }
+        "assistant" => {
+            let blocks = msg.get("content")?.as_array()?;
+            let mut parts: Vec<String> = Vec::new();
+            let mut tool_count = 0usize;
+            for b in blocks {
+                match b.get("type").and_then(|t| t.as_str()) {
+                    Some("text") => {
+                        if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
+                            let trimmed = t.trim();
+                            if !trimmed.is_empty() {
+                                parts.push(trimmed.chars().take(ASSISTANT_PREVIEW_CHARS).collect());
                             }
-                            Some("tool_use") => tool_count += 1,
-                            _ => {}
                         }
                     }
-                    if tool_count > 0 {
-                        parts.push(format!(
-                            "\x1b[2m[{} tool call{}]\x1b[0m",
-                            tool_count,
-                            if tool_count == 1 { "" } else { "s" }
-                        ));
-                    }
-                    if parts.is_empty() {
-                        None
-                    } else {
-                        Some((true, parts.join(" ")))
-                    }
-                } else {
-                    None
+                    Some("tool_use") => tool_count += 1,
+                    _ => {}
                 }
             }
-            _ => None,
-        };
-        if let Some(t) = pushed {
-            turns.push_back(t);
-            if turns.len() > max_turns {
-                turns.pop_front();
+            if tool_count > 0 {
+                // Plain text, not an escape sequence: the banner prints through
+                // `Ui::print_above`, which writes every character into a buffer
+                // cell, so an SGR here would be stored as bytes and shown as
+                // litter rather than dimming anything.
+                parts.push(format!(
+                    "[{tool_count} tool call{}]",
+                    if tool_count == 1 { "" } else { "s" }
+                ));
             }
+            (!parts.is_empty()).then(|| Message {
+                user: false,
+                text: parts.join(" "),
+            })
         }
+        _ => None,
     }
-    // Pair consecutive user→assistant turns, take the last `n`.
-    let turns: Vec<_> = turns.into_iter().collect();
-    let mut exchanges: Vec<Exchange> = Vec::new();
-    let mut i = 0;
-    while i + 1 < turns.len() {
-        let (user_is_assistant, ref user_text) = turns[i];
-        let (assistant_is_assistant, ref asst_text) = turns[i + 1];
-        if !user_is_assistant && assistant_is_assistant {
-            exchanges.push(Exchange {
-                user_text: user_text.clone(),
-                assistant_text: asst_text.clone(),
-            });
-            i += 2;
-        } else {
-            i += 1;
-        }
-    }
-    // Return the last `n`.
-    let skip = exchanges.len().saturating_sub(n);
-    exchanges.into_iter().skip(skip).collect()
 }
 
 /// Read the last non-empty JSONL line of `path` and pluck its
@@ -688,6 +684,97 @@ pub fn assistant_blocks(session: &Session, model: String, content: Vec<Block>) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
+
+    /// Write a transcript of `json!` lines and hand back the path.
+    fn transcript(lines: &[serde_json::Value]) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        let body = lines.iter().fold(String::new(), |mut body, line| {
+            let _ = writeln!(body, "{line}");
+            body
+        });
+        std::fs::write(&path, body).unwrap();
+        (dir, path)
+    }
+
+    fn user(text: &str) -> serde_json::Value {
+        serde_json::json!({"type": "user", "message": {"role": "user", "content": text}})
+    }
+
+    fn assistant(text: &str) -> serde_json::Value {
+        serde_json::json!({"type": "assistant", "message": {"role": "assistant",
+            "content": [{"type": "text", "text": text}]}})
+    }
+
+    /// The tail keeps a prompt that was never answered.
+    ///
+    /// This is the whole reason the reader returns messages rather than paired
+    /// exchanges: a session closed or killed between the prompt and the reply ends
+    /// on a lone user turn, and that turn is exactly what says where the operator
+    /// left off. Pairing dropped it, so a resumed session looked as though it had
+    /// ended with the answer *before* the last thing asked.
+    #[test]
+    fn the_tail_keeps_a_prompt_that_was_never_answered() {
+        let (_dir, path) = transcript(&[user("first"), assistant("done"), user("and now this")]);
+        let tail = last_messages(&path, 10);
+        assert_eq!(tail.len(), 3);
+        assert!(tail[2].user, "the last message is the unanswered prompt");
+        assert_eq!(tail[2].text, "and now this");
+    }
+
+    /// Only the last `n` are returned, oldest first, so the caller prints them in
+    /// the order they happened.
+    #[test]
+    fn only_the_last_n_messages_are_kept() {
+        let (_dir, path) = transcript(&[user("one"), assistant("two"), user("three"), assistant("four")]);
+        let tail = last_messages(&path, 2);
+        assert_eq!(tail.len(), 2);
+        assert_eq!(tail[0].text, "three");
+        assert_eq!(tail[1].text, "four");
+        assert!(tail[0].user, "the pair kept is the newest one, not the oldest");
+        assert!(!tail[1].user);
+    }
+
+    /// Tool results are the model's own bookkeeping rather than something the
+    /// operator wrote, and a tool call is one plain line — the banner prints into
+    /// buffer cells, where an SGR escape would be stored as litter rather than
+    /// dimming anything.
+    #[test]
+    fn tool_traffic_is_summarised_in_plain_text() {
+        let tool_result = serde_json::json!({"type": "user", "message": {"role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "the file"}]}});
+        let tool_use = serde_json::json!({"type": "assistant", "message": {"role": "assistant",
+            "content": [{"type": "tool_use", "id": "t1", "name": "Read", "input": {}}]}});
+        let (_dir, path) = transcript(&[user("go"), tool_use, tool_result, assistant("all done")]);
+        let tail = last_messages(&path, 10);
+        assert_eq!(tail.len(), 3, "the tool result is not a message of its own");
+        assert_eq!(tail[1].text, "[1 tool call]");
+        assert!(!tail[1].text.contains('\u{1b}'), "no escape bytes in a banner line");
+        assert_eq!(tail[2].text, "all done");
+    }
+
+    /// A long reply is truncated so the banner stays a summary; the transcript
+    /// keeps all of it.
+    #[test]
+    fn a_long_reply_is_truncated_for_the_preview() {
+        let long = "x".repeat(ASSISTANT_PREVIEW_CHARS * 3);
+        let (_dir, path) = transcript(&[assistant(&long)]);
+        let tail = last_messages(&path, 10);
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].text.chars().count(), ASSISTANT_PREVIEW_CHARS);
+    }
+
+    /// An absent transcript, and a request for none, are both empty rather than an
+    /// error: the banner is decoration, and its absence must not stop a session
+    /// from starting.
+    #[test]
+    fn an_absent_transcript_yields_no_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(last_messages(&dir.path().join("absent.jsonl"), 10).is_empty());
+        let (_dir, path) = transcript(&[user("hi")]);
+        assert!(last_messages(&path, 0).is_empty());
+    }
 
     /// A transcript the agent wrote must be one it can read back.
     ///

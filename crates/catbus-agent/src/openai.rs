@@ -23,12 +23,54 @@ use crate::session::Block;
 /// text-only answers.
 pub const INFOMANIAK_DEFAULT_MODEL: &str = "mistral24b";
 
+/// Ceiling on the reply length we ask an `OpenAI`-compatible service for.
+///
+/// Deliberately smaller than the relay wire's ceiling, and deliberately its own
+/// constant rather than a shared one: this backend talks to *any* service that
+/// speaks the dialect, including a local Ollama server whose model may have a
+/// window far smaller than a hosted one, so the conservative number is the one
+/// that cannot fail a request a larger one would have been refused for. It is
+/// the field that was wrong, not this value — see [`MAX_TOKENS_FIELD`].
+pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 8192;
+
+/// The field that carries [`DEFAULT_MAX_OUTPUT_TOKENS`] on this wire.
+///
+/// `max_completion_tokens` rather than `max_tokens`, because the two are not
+/// interchangeable across providers and only one of them is universal. Measured
+/// against the services this backend actually talks to:
+///
+/// * `gpt-5.x`, `gpt-6.x` and the o-series **refuse** `max_tokens` outright —
+///   `400 Unsupported parameter: 'max_tokens' is not supported with this model.
+///   Use 'max_completion_tokens' instead.` The whole turn fails, not just the
+///   limit, so a model chosen for its tool-calling is unusable while the field
+///   is wrong.
+/// * `gpt-3.5`, `gpt-4`, `gpt-4o` and `gpt-4.1` accept **either** name.
+/// * A local Ollama server (tested on 0.30.6) accepts either name too.
+///
+/// So the modern name is the one every endpoint reads, and the legacy name is
+/// the one that excludes the newest models. That is the whole reason this is a
+/// constant and not a judgement call: the older spelling would make this backend
+/// silently limited to older models, which is the opposite of what a module
+/// written for "any service that speaks this dialect" promises.
+pub const MAX_TOKENS_FIELD: &str = "max_completion_tokens";
+
+/// The field naming how much reasoning a model should do before answering.
+///
+/// Its own constant to sit beside [`MAX_TOKENS_FIELD`], since the two are the
+/// pair a reasoning model is strict about. Whether it is *sent* is the operator's
+/// call rather than a decision made here — see `openai::Config::reasoning_effort`.
+pub const REASONING_EFFORT_FIELD: &str = "reasoning_effort";
+
 /// Everything needed to reach one `OpenAI`-compatible service.
 pub struct Config {
     /// Full chat-completions endpoint URL.
     pub chat_url: String,
     pub token: String,
     pub model: String,
+    /// `reasoning_effort` to send, when the model needs one. `None` sends the
+    /// field not at all. See the flag's own documentation for why there is no
+    /// default: the families disagree about accepting it.
+    pub reasoning_effort: Option<String>,
 }
 
 /// Turn a base URL (`https://api.x.ai/v1`) into the full
@@ -72,7 +114,14 @@ pub fn infomaniak_chat_url(product_id: &str) -> String {
 /// would buy the ordering and cost a second parser for no visible difference.
 /// See `crate::stream` for the side that does stream.
 #[must_use]
-pub fn build_request(model: &str, system: &str, state: &str, tool_specs: &[Value], history: &[ApiMessage]) -> Value {
+pub fn build_request(
+    model: &str,
+    system: &str,
+    state: &str,
+    tool_specs: &[Value],
+    history: &[ApiMessage],
+    reasoning_effort: Option<&str>,
+) -> Value {
     let mut messages = Vec::with_capacity(history.len() + 2);
     messages.push(json!({ "role": "system", "content": system }));
     for msg in history {
@@ -80,12 +129,21 @@ pub fn build_request(model: &str, system: &str, state: &str, tool_specs: &[Value
     }
     messages.push(json!({ "role": "user", "content": state }));
     let tools: Vec<Value> = tool_specs.iter().map(tool_to_openai).collect();
-    json!({
+    // The key is spelled through the constant rather than written inline, so the
+    // one place that decides which spelling the wire uses is also the place that
+    // records why. See [`MAX_TOKENS_FIELD`].
+    let mut body = json!({
         "model": model,
-        "max_tokens": 8192,
         "messages": messages,
         "tools": tools,
-    })
+    });
+    body[MAX_TOKENS_FIELD] = json!(DEFAULT_MAX_OUTPUT_TOKENS);
+    // Added only when the operator named one: the field is refused by the classic
+    // models that work today, so an unconditional write would be a regression.
+    if let Some(effort) = reasoning_effort {
+        body[REASONING_EFFORT_FIELD] = json!(effort);
+    }
+    body
 }
 
 /// Anthropic tool spec `{name, description, input_schema}` →
@@ -364,10 +422,20 @@ mod tests {
             ),
         ];
         let specs = crate::tools::ToolSet::builtin().specs().to_vec();
-        let req = build_request("test-model", "be helpful", "state", &specs, &history);
+        let req = build_request("test-model", "be helpful", "state", &specs, &history, None);
 
         assert_eq!(req["model"], "test-model");
-        assert_eq!(req["max_tokens"], 8192);
+        // The modern spelling, and *only* it: a body carrying both would still be
+        // refused by the models that reject the legacy key, so leaving the old
+        // one behind as a belt-and-braces would defeat the point. Asserted by
+        // absence because a stray `max_tokens` is exactly the regression this
+        // guards.
+        assert_eq!(req[MAX_TOKENS_FIELD], DEFAULT_MAX_OUTPUT_TOKENS);
+        assert!(
+            req.get("max_tokens").is_none(),
+            "the legacy field must not be sent at all: {}",
+            req["max_tokens"]
+        );
 
         let messages = req["messages"].as_array().unwrap();
         assert_eq!(messages[0]["role"], "system");
@@ -397,6 +465,22 @@ mod tests {
         }
     }
 
+    /// The reasoning field is opt-in, and absence is the point: the classic models
+    /// that work today refuse it outright, so a body carrying it by default would
+    /// trade one broken family for another.
+    #[test]
+    fn build_request_sends_reasoning_effort_only_when_asked() {
+        let absent = build_request("m", "s", "state", &[], &[], None);
+        assert!(
+            absent.get(REASONING_EFFORT_FIELD).is_none(),
+            "an unasked-for reasoning field must not be sent: {}",
+            absent[REASONING_EFFORT_FIELD]
+        );
+
+        let asked = build_request("m", "s", "state", &[], &[], Some("none"));
+        assert_eq!(asked[REASONING_EFFORT_FIELD], "none");
+    }
+
     #[test]
     fn build_request_splits_tool_results_from_trailing_text() {
         let history = vec![blocks(
@@ -420,7 +504,7 @@ mod tests {
                 },
             ],
         )];
-        let req = build_request("m", "s", "state", &[], &history);
+        let req = build_request("m", "s", "state", &[], &history, None);
         let messages = req["messages"].as_array().unwrap();
         // system, the tool result, the trailing text, and the state turn.
         assert_eq!(messages.len(), 4);
@@ -444,7 +528,7 @@ mod tests {
                 content: ApiContent::Plain("not a turn".into()),
             },
         ];
-        let req = build_request("m", "s", "state", &[], &history);
+        let req = build_request("m", "s", "state", &[], &history, None);
         let messages = req["messages"].as_array().unwrap();
         // The system role in the history is not a turn and is dropped, so this
         // is system, the assistant's answer, and the state turn.
@@ -457,7 +541,7 @@ mod tests {
     #[test]
     fn tool_spec_without_schema_gets_empty_parameters() {
         let specs = [json!({ "name": "Bare" })];
-        let req = build_request("m", "s", "state", &specs, &[]);
+        let req = build_request("m", "s", "state", &specs, &[], None);
         let tool = &req["tools"][0]["function"];
         assert_eq!(tool["name"], "Bare");
         assert_eq!(tool["parameters"], json!({ "type": "object", "properties": {} }));
@@ -466,7 +550,7 @@ mod tests {
     #[test]
     fn build_request_drops_empty_assistant_turns() {
         let history = vec![blocks("assistant", vec![])];
-        let req = build_request("m", "s", "state", &[], &history);
+        let req = build_request("m", "s", "state", &[], &history, None);
         let messages = req["messages"].as_array().unwrap();
         // The empty assistant turn contributes nothing, so only the system
         // message and the state turn remain.

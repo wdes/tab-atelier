@@ -12,6 +12,7 @@ has. Written for someone with the package installed and no checkout.
 | `<cwd>/.catbus/identity.md` | The system prompt for one directory. See below. | You. Ignored by git, not committed. |
 | `~/.config/tab-atelier/catbus-agent/tools.json` | Which tools the agent has. See below. | You, passed with `--tools-config`. |
 | `<cwd>/.catbus/tools.toml` | Tools for one directory, found without being named. See below. | You. Ignored by git, not committed. |
+| `~/.config/tab-atelier/briefs/*.md` | Per-directory briefs. See below. | You. Also read from `/etc/tab-atelier/briefs/`. |
 | `~/.claude/projects/<escaped-cwd>/<id>.jsonl` | The transcript, one file per session. | The agent. |
 | `~/.claude/projects/<escaped-cwd>/<id>.name` | A session's `/rename`d name. | The agent. |
 | `~/.claude/projects/<escaped-cwd>/<id>.gate` | The permission mode the session was last left in. | The agent. |
@@ -211,6 +212,32 @@ embedded, as `{good}..{bad}` above.
 config says otherwise. A tool that only reads should say `"judged": false`: the author states
 a lower risk rather than the code assuming one.
 
+`sha256` pins the program a tool runs, as lowercase hex:
+
+```toml
+[[add]]
+name = "GitStatus"
+argv = ["./.catbus/bin/git.sh", "status", "{view}"]
+sha256 = "d9eaedb13338f666dcf98637a30bf9b477a4e6a831ddccfa33fa6348ee806d4f"
+```
+
+Set it when the program lives somewhere the session can write to. A `[[add]]` script is usually
+inside the checkout, and a session holds `Write`, so without the field a session could rewrite the
+script and have its own code run on the next call — a shell by another name, whatever
+`AllowedTools` says. With the digest pinned, the rewritable file stops deciding what runs: the call
+is refused and the tool result says which file changed, so accepting the change takes an operator
+editing the config and relaunching.
+
+The check covers the **program** — the first `argv` element — and nothing else; `argv` is fixed, so
+there are no arguments to pin. A tool that needs several files covered should name one entry point
+that calls them. Resolution follows the OS: an absolute path, a `./`-relative path from the
+directory the tool runs in, or a bare name searched on `PATH`. Anything that cannot be found or read
+is refused rather than run unverified — a check that passes when it cannot do its job is worse than
+no check, since the config author is relying on it.
+
+The engine has no tool to write the digest; use `sha256sum` and put the value in by hand, then
+relaunch. The refusal names both the expected and the found digest, so a mismatch is easy to read.
+
 **A custom tool may not take a built-in's name.** The agent refuses to start if one shadows
 the other, on the grounds that a familiar name with different behaviour is worse than a
 refusal. The built-ins are `Read`, `Write`, `Edit`, `FileTree`, `Bash`, `ListAgents`,
@@ -229,6 +256,55 @@ flags: `--model` and `--api-url` for an Anthropic-compatible endpoint, `--openai
 On the relay path the model is chosen by the relay, not here — `/model` records what the
 client asks for, and the relay decides what answers. The transcript records what *did*
 answer, which is why the two can differ.
+
+### A reasoning model needs one more flag
+
+The gpt-5/gpt-6 and o-series families refuse to combine function tools with their default
+reasoning, on the chat-completions endpoint this agent speaks:
+
+    400 Function tools with reasoning_effort are not supported for gpt-6-luna in
+    /v1/chat/completions. To use function tools, use /v1/responses or set
+    reasoning_effort to 'none'.
+
+Since the tool loop is the point, pass `--openai-reasoning-effort none` — or set
+`CATBUS_OPENAI_REASONING_EFFORT=none`. Nothing is lost by doing so: this wire has no field
+for a reasoning trace, so it would be discarded on arrival anyway.
+
+It is **not** sent for you, because the classic models answer the other way — `gpt-4.1`,
+`gpt-4o` and `gpt-3.5-turbo` reject the field with `400 Unrecognized request argument
+supplied: reasoning_effort`. A default would break one family whichever way it was set, so
+the operator who knows which model they pointed at says it. A provider that ignores the
+field, such as a local Ollama server, is unaffected either way.
+
+The output ceiling is handled for you and needs no flag: it goes out as
+`max_completion_tokens`, the name every endpoint reads, since the newer models refuse the
+legacy `max_tokens` outright while the older ones accept either.
+
+## Project briefs
+
+A brief is a markdown file that reaches an agent when it starts in a matching directory —
+how work is done in *this tree*, as opposed to who the agent is. Drop one in
+`~/.config/tab-atelier/briefs/` (or `/etc/tab-atelier/briefs/` for the whole machine) with
+a `baseDir` in its front matter:
+
+    ---
+    baseDir: /mnt/clients/ABCD
+    ---
+    Client ABCD: PHP 7.4, no composer update without asking.
+
+Every brief whose `baseDir` contains the working directory applies, joined from least to
+most specific so the narrowest note is read last. `always: true` applies everywhere. The
+whole set is capped, and over the cap the least specific are dropped whole with a line
+saying so rather than truncated mid-sentence.
+
+They are read **once, at session start**, from the directory the session runs in: context
+can be added to a session but not withdrawn, so editing a brief must not change the rules
+under an agent that has already acted on them.
+
+Both the app and `catbus-agent` find them the same way, through the same crate — a brief
+written for one kind reaches the other, and there is one place that decides which file
+matches which directory. `tab-atelier brief --cwd <dir>` prints what a session starting
+there is told, and `--list` shows which files matched and why.
 
 ## Limiting the network
 

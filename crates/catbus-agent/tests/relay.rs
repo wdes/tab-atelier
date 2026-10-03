@@ -62,6 +62,36 @@ const CONTINUATION_ROUND: &str = r#"{
     "usage": { "input_tokens": 9, "output_tokens": 3 }
 }"#;
 
+/// The ceiling reached with nothing to show for it.
+///
+/// Measured, not invented: on this endpoint thinking is drawn from the same output budget as the
+/// answer, so a hard-thinking turn can spend the entire ceiling on thinking and return empty
+/// content with `stop_reason: "max_tokens"`. Observed at 8192 — 8192 output tokens, zero
+/// characters of text. See `docs/output-limit.md`.
+const SILENT_CUT_ROUND: &str = r#"{
+    "id": "msg_silent",
+    "type": "message",
+    "role": "assistant",
+    "model": "claude-sonnet-4-6",
+    "content": [],
+    "stop_reason": "max_tokens",
+    "usage": { "input_tokens": 51, "output_tokens": 8192 }
+}"#;
+
+/// A round that hit the ceiling *and* asked for a tool, which is not a truncated answer.
+const CUT_OFF_TOOL_ROUND: &str = r#"{
+    "id": "msg_tool_cut",
+    "type": "message",
+    "role": "assistant",
+    "model": "claude-sonnet-4-6",
+    "content": [
+        { "type": "text", "text": "Let me look." },
+        { "type": "tool_use", "id": "c1", "name": "Read", "input": { "path": "note.txt" } }
+    ],
+    "stop_reason": "max_tokens",
+    "usage": { "input_tokens": 5, "output_tokens": 65536 }
+}"#;
+
 const RELAY_TOKEN: &str = "tap_integration_test_token";
 
 /// Serve one canned `(status line, JSON body)` per connection, in order.
@@ -216,6 +246,16 @@ fn read_http_request(stream: &mut TcpStream) -> String {
 /// exit is what lets a coverage-instrumented binary flush its profile.
 /// SIGKILL only if it hasn't exited within 5 s.
 struct KillOnDrop(Child);
+
+impl KillOnDrop {
+    /// The child's pid, which is what names the sockets of the sub-agents it starts.
+    ///
+    /// A sub-agent's socket is `catbus-sub-<parent pid>-<n>.sock` (see `tools::spawn`), so this is
+    /// how a test tells *its own* sub-agents apart from every other agent's on the machine.
+    fn pid(&self) -> u32 {
+        self.0.id()
+    }
+}
 
 impl Drop for KillOnDrop {
     fn drop(&mut self) {
@@ -1696,11 +1736,98 @@ fn a_reply_that_never_finishes_reports_the_limit() {
     assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
     let text = reply["text"].as_str().unwrap();
     assert!(text.contains("still cut off"), "the limit must be reported:\n{text}");
-    assert!(text.contains("8192"), "and named:\n{text}");
+    // The ceiling we ask for, tracked here because this test cannot see the constant.
+    assert!(text.contains("65536"), "and named:\n{text}");
     assert!(text.contains("continuations"), "and the attempt counted:\n{text}");
     assert!(
         !text.contains("ask for the rest"),
         "the operator is not the retry mechanism any more:\n{text}"
+    );
+}
+
+/// The request asks for the ceiling the truncation message quotes.
+///
+/// Two places hold this number — the request and the note — and a note that promises a limit the
+/// request does not use is a recorded failure in this file already: the round-cap warning used to
+/// claim "32" while the default was 200. Pinned so the two cannot drift apart again.
+#[test]
+fn the_request_asks_for_the_configured_output_ceiling() {
+    let dir = tempfile::tempdir().unwrap();
+    let (port, rx) = spawn_mock_relay(vec![("HTTP/1.1 200 OK", FINAL_ROUND)]);
+    let socket = dir.path().join("agent.sock");
+    let (_agent, mut reader, mut stream) = spawn_agent_at(dir.path(), &socket, port);
+    let _ = send_prompt(&mut stream, &mut reader, "hi");
+
+    let body = body_of(&rx.recv_timeout(Duration::from_secs(5)).unwrap());
+    assert_eq!(
+        body["max_tokens"], 65536,
+        "the ceiling is free (a reply is billed for what it produces) and a retry is not, so \
+         this is set high enough that a normal reply is never cut. See docs/output-limit.md."
+    );
+}
+
+/// A round cut off at the ceiling that produced *no text at all* is still continued.
+///
+/// This is the shape the measurement found, not a hypothetical one: reasoning and the answer
+/// share the output budget on this endpoint, so a hard-thinking turn can spend the whole ceiling
+/// on thinking and return empty content with `stop_reason: "max_tokens"`. That round looks
+/// exactly like a finished reply that chose to say nothing — the failure the old code shipped,
+/// where the operator saw a yellow note and nothing else.
+#[test]
+fn a_cut_round_that_produced_no_text_still_continues() {
+    let dir = tempfile::tempdir().unwrap();
+    let (port, rx) = spawn_mock_relay(vec![
+        ("HTTP/1.1 200 OK", SILENT_CUT_ROUND),
+        ("HTTP/1.1 200 OK", FINAL_ROUND),
+    ]);
+    let socket = dir.path().join("agent.sock");
+    let (_agent, mut reader, mut stream) = spawn_agent_at(dir.path(), &socket, port);
+
+    let reply = send_prompt(&mut stream, &mut reader, "think hard");
+    assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+    assert_eq!(
+        reply["text"], "hi from the relay",
+        "the empty round contributes nothing and the answer is what came next"
+    );
+
+    // And a continuation really was sent, rather than the empty round being taken for an answer.
+    let _first = body_of(&rx.recv_timeout(Duration::from_secs(5)).unwrap());
+    let second = body_of(&rx.recv_timeout(Duration::from_secs(5)).unwrap());
+    assert!(
+        second.to_string().contains("output-token limit"),
+        "an empty round at the ceiling must be continued:\n{second}"
+    );
+}
+
+/// A round that hit the ceiling *and* asked for a tool runs the tool.
+///
+/// `stop_reason: "max_tokens"` with tool calls is not a truncated answer — the call that arrived
+/// is complete, and the loop's job is to run it. The continuation belongs to the other branch,
+/// the one with no tool work to do, and this pins it there: a model cut off after asking for a
+/// tool must not be sent a cue asking it to finish a sentence it already finished.
+#[test]
+fn a_tool_call_that_also_hit_the_limit_runs_the_tool() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("note.txt"), "from the file\n").unwrap();
+    let (port, rx) = spawn_mock_relay(vec![
+        ("HTTP/1.1 200 OK", CUT_OFF_TOOL_ROUND),
+        ("HTTP/1.1 200 OK", FINAL_ROUND),
+    ]);
+    let socket = dir.path().join("agent.sock");
+    let (_agent, mut reader, mut stream) = spawn_agent_at(dir.path(), &socket, port);
+
+    let reply = send_prompt(&mut stream, &mut reader, "look at note.txt");
+    assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+
+    let _first = body_of(&rx.recv_timeout(Duration::from_secs(5)).unwrap());
+    let second = body_of(&rx.recv_timeout(Duration::from_secs(5)).unwrap());
+    assert!(
+        tool_result_of(&second, "c1").contains("from the file"),
+        "the complete call in a cut-off round must still run:\n{second}"
+    );
+    assert!(
+        !second.to_string().contains("output-token limit"),
+        "a round with tool work is not a truncated answer:\n{second}"
     );
 }
 
@@ -2369,6 +2496,11 @@ fn processes_with(needle: &str) -> Vec<String> {
 /// in the command line of whatever shell launched this test — a heredoc, a
 /// `cargo test` wrapper — and the `/proc` scan below would then find *that* and
 /// report a phantom leak. Same trick as the `env::args` guard in `cli`.
+///
+/// What it returns is only the prefix, and a caller appends the pid of the parent it started:
+/// the prefix on its own also matches the sub-agents of every other agent on the machine, and a
+/// test that scans for it fails whenever a real session happens to have one running. See
+/// `a_spawned_sub_agent_answers_and_is_reaped` for the scoped form.
 fn sub_agent_socket_prefix() -> String {
     std::env::temp_dir()
         .join(concat!("catbus-", "sub-"))
@@ -2394,13 +2526,6 @@ fn a_spawned_sub_agent_answers_and_is_reaped() {
     let home = dir.path();
     let work = home.join("work");
     std::fs::create_dir_all(&work).unwrap();
-    let marker = sub_agent_socket_prefix();
-
-    // Before: nothing of ours is running.
-    assert!(
-        processes_with(&marker).is_empty(),
-        "a previous run left a sub-agent behind"
-    );
 
     // The child's relay. One canned reply, and it is what the tool result must
     // carry — a reply the parent could only have obtained by asking.
@@ -2418,7 +2543,7 @@ fn a_spawned_sub_agent_answers_and_is_reaped() {
     ]);
 
     let socket = home.join("agent.sock");
-    let (_agent, mut reader, mut stream) = spawn_agent_in(home, home, &socket, |cmd| {
+    let (agent, mut reader, mut stream) = spawn_agent_in(home, home, &socket, |cmd| {
         // The parent's own endpoint, given as a flag.
         cmd.args([
             "--relay-url",
@@ -2431,6 +2556,20 @@ fn a_spawned_sub_agent_answers_and_is_reaped() {
         cmd.env("CATBUS_RELAY_URL", format!("http://127.0.0.1:{child_port}"));
         cmd.env("CATBUS_RELAY_TOKEN", RELAY_TOKEN);
     });
+
+    // Scoped to *this* parent's pid. A sub-agent's socket is `catbus-sub-<parent pid>-<n>.sock`, so
+    // naming the parent is what makes this scan find the children of this run and no other agent's.
+    // The bare prefix matched every live sub-agent on the machine — including one a real tab had
+    // started elsewhere — and failed the run through no fault of the code under test.
+    let marker = format!("{}{}-", sub_agent_socket_prefix(), agent.pid());
+
+    // Before: this parent has no children yet, so anything the scan below finds is ours. Read here
+    // rather than ahead of the spawn because the marker needs the pid — and a pid reused from a
+    // previous run is the one case a stale sub-agent could still be picked up by it.
+    assert!(
+        processes_with(&marker).is_empty(),
+        "a previous run left a sub-agent behind"
+    );
 
     let reply = send_prompt(&mut stream, &mut reader, "start a helper");
     assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
