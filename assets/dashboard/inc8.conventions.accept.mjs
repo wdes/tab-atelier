@@ -4,7 +4,7 @@
 // Real Chromium against the SHIPPED assets, intercepting /dashboard/state with a
 // fixture whose tabs carry (or omit) `conventions`. RED today. Builder: web.
 //
-// Run:  cd <a dir with playwright installed>; node <repo>/assets/dashboard.inc8.conventions.accept.mjs
+// Run:  cd <a dir with playwright installed>; node <repo>/assets/dashboard/inc8.conventions.accept.mjs
 
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -13,7 +13,7 @@ import { chromium } from "playwright";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const read = (f) => readFileSync(join(HERE, f), "utf8");
-const HTML = read("dashboard.html"), JS = read("dashboard.js"), CSS = read("dashboard.css");
+const HTML = read("index.html"), JS = read("index.js"), CSS = read("index.css");
 const ORIGIN = "http://ta-dash.local", TOKEN = "TESTTOKEN";
 
 let failures = 0;
@@ -26,8 +26,8 @@ async function wireRoutes(page, getState) {
   await page.route(`${ORIGIN}/**`, async (route) => {
     const p = new URL(route.request().url()).pathname;
     if (p === "/dashboard") return route.fulfill({ contentType: "text/html; charset=utf-8", body: HTML });
-    if (p === "/assets/dashboard.js") return route.fulfill({ contentType: "application/javascript; charset=utf-8", body: JS });
-    if (p === "/assets/dashboard.css") return route.fulfill({ contentType: "text/css; charset=utf-8", body: CSS });
+    if (p === "/assets/dashboard/index.js") return route.fulfill({ contentType: "application/javascript; charset=utf-8", body: JS });
+    if (p === "/assets/dashboard/index.css") return route.fulfill({ contentType: "text/css; charset=utf-8", body: CSS });
     if (p === "/tabs/usage") return route.fulfill({ contentType: "application/json", body: "[]" });
     if (p === "/dashboard/activity") return route.fulfill({ contentType: "application/json", body: "{}" });
     if (p === "/dashboard/state") return route.fulfill({ contentType: "application/json", body: JSON.stringify(getState()) });

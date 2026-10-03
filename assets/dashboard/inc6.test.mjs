@@ -1,5 +1,5 @@
 // Self-check for the PURE logic of Increment 6 web slices (docs/dashboard-increment-6.md).
-// Run: node assets/dashboard.inc6.test.mjs   (exits non-zero if a contract breaks)
+// Run: node assets/dashboard/inc6.test.mjs   (exits non-zero if a contract breaks)
 // Namespace import so a not-yet-exported helper surfaces as a failing assertion
 // (RED) rather than a module-link crash. The web builder makes these green:
 //   orgLayout(state)      (S2) — org-chart: méta-top / team lead / workers / serving-joins-team
@@ -7,7 +7,7 @@
 //   activityModel(json)   (S6) — extend with self_tooling / fixes / issues / verdict
 // Builder: web (S2/S4/S6).
 import assert from "node:assert/strict";
-import * as dash from "./dashboard.js";
+import * as dash from "./index.js";
 
 // ============================ S2 — orgLayout ============================
 // The org-chart: a solo méta stays on top; a repo shows its orchestrator as the
@@ -98,4 +98,4 @@ assert.equal(typeof dash.serviceLayout, "function", "S4 RED: export serviceLayou
   assert.ok(!empty.verdict, "empty -> no verdict");
 }
 
-console.log("dashboard.inc6.test.mjs: OK");
+console.log("inc6.test.mjs: OK");

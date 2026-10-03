@@ -1,13 +1,13 @@
 // Characterization coverage — dashboard quality audit #357, PHASE A.
-// Run: node assets/dashboard.characterization.test.mjs   (must stay GREEN)
+// Run: node assets/dashboard/characterization.test.mjs   (must stay GREEN)
 // These lock the CURRENT behavior of the pure dashboard functions the web
 // builder is about to refactor (Q3-Q10), so any behavior change is caught. They
-// assert what the code ACTUALLY produces today — not an ideal. QUE assets/dashboard.*.
+// assert what the code ACTUALLY produces today — not an ideal. QUE assets/dashboard/*.
 import assert from "node:assert/strict";
 import {
   projectTabs, overviewLayout, resolveAltitude, serviceLayout, serviceGrouping,
   metaTopHtml, teamMemberHtml, unassignedTabHtml, popupHtml, tabEntryHtml,
-} from "./dashboard.js";
+} from "./index.js";
 
 // ===== projectTabs — the "all project tabs" flatten (nodes[].tabs then unmapped[]) =====
 {
@@ -139,4 +139,4 @@ import {
   assert.match(entry, /data-viewer="\/e"/);
 }
 
-console.log("dashboard.characterization.test.mjs: OK");
+console.log("characterization.test.mjs: OK");

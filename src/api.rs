@@ -90,8 +90,8 @@ const MAIN_JS: &str = include_str!("../assets/main.js");
 // The harness dashboard's own JS/CSS — served publicly at `/assets/dashboard.*`
 // (the `/dashboard` HTML page itself is behind the auth gate). Same cache-buster
 // story as `main.*`.
-const DASHBOARD_CSS: &str = include_str!("../assets/dashboard.css");
-const DASHBOARD_JS: &str = include_str!("../assets/dashboard.js");
+const DASHBOARD_CSS: &str = include_str!("../assets/dashboard/index.css");
+const DASHBOARD_JS: &str = include_str!("../assets/dashboard/index.js");
 // Site icons + metadata served at the origin root (`/favicon.ico`, …). The
 // `.svg` reuses the app icon; the raster set is rendered from it. `robots.txt`
 // mirrors the `X-Robots-Tag: noindex` stance for crawlers that check it first.

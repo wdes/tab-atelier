@@ -1,5 +1,5 @@
 // Self-check for the PURE logic of Increment 8 Slice 4 (docs/dashboard-increment-8.md).
-// Run: node assets/dashboard.inc8.s4.test.mjs   (exits non-zero if a contract breaks)
+// Run: node assets/dashboard/inc8.s4.test.mjs   (exits non-zero if a contract breaks)
 // Namespace import so a not-yet-exported helper fails an assertion (RED) rather
 // than crashing the module link. The web builder makes this green by exporting:
 //   evalSummary(tab) — the right-click card's evaluations section: the last evals,
@@ -9,7 +9,7 @@
 //                      records: evaluations[].{tokens:{in,out}, scores:{errors}, verdict}.
 // Builder: web (card evaluations render).
 import assert from "node:assert/strict";
-import * as dash from "./dashboard.js";
+import * as dash from "./index.js";
 
 // eval record as exposed on the wire (camelCase; tokens keyed "in"/"out").
 const ev = (errors, tin, tout, verdict = "ok") =>
@@ -46,4 +46,4 @@ assert.equal(typeof dash.evalSummary, "function", "Inc8-S4 RED: export evalSumma
   assert.doesNotThrow(() => dash.evalSummary(null), "null tab must not throw");
 }
 
-console.log("dashboard.inc8.s4.test.mjs: OK");
+console.log("inc8.s4.test.mjs: OK");

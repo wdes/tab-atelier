@@ -1,5 +1,5 @@
 // Self-check for the PURE logic of Increment 7 web slices (docs/dashboard-increment-7.md).
-// Run: node assets/dashboard.inc7.test.mjs   (exits non-zero if a contract breaks)
+// Run: node assets/dashboard/inc7.test.mjs   (exits non-zero if a contract breaks)
 // Namespace import so a not-yet-exported helper fails an assertion (RED) rather
 // than crashing the module link. The web builder makes these green by exporting:
 //   bandLayout(state)        (S1) — the 4-band compact org-chart model
@@ -8,7 +8,7 @@
 //   taskChips(tab)           (S4) — current task + invoked sub-agents render model
 // Builder: web (S1/S2/S3/S4-web).
 import assert from "node:assert/strict";
-import * as dash from "./dashboard.js";
+import * as dash from "./index.js";
 
 // ============================ S1 — bandLayout ============================
 // 4 stacked bands Méta / Orchestrateurs / Workers / Freelancers, with the 3-tier
@@ -173,4 +173,4 @@ assert.equal(typeof dash.taskChips, "function", "S4 RED: export taskChips(tab) f
   assert.doesNotThrow(() => dash.taskChips(null), "null tab must not throw");
 }
 
-console.log("dashboard.inc7.test.mjs: OK");
+console.log("inc7.test.mjs: OK");

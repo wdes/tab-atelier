@@ -1,9 +1,9 @@
 // Coverage lot — dashboard quality audit #357 (topic harness-quality).
-// Run: node assets/dashboard.quality.test.mjs   (exits non-zero if a lock breaks)
+// Run: node assets/dashboard/quality.test.mjs   (exits non-zero if a lock breaks)
 // Namespace import so a not-yet-exported helper fails an assertion (RED) rather
-// than crashing the module link. Builder: web (QUE assets/dashboard.*).
+// than crashing the module link. Builder: web (QUE assets/dashboard/*).
 import assert from "node:assert/strict";
-import * as dash from "./dashboard.js";
+import * as dash from "./index.js";
 
 // ============================ Q7 — buildBandModel invariant ============================
 // buildBandModel is the led+task SIGNATURE that feeds the S3 (Zoetrope) diff, but
@@ -56,4 +56,4 @@ assert.equal(dash.diffRender(dash.buildBandModel(s1), dash.buildBandModel(s1)).l
 assert.doesNotThrow(() => dash.buildBandModel(null), "Q7: buildBandModel(null) must not throw");
 assert.ok(Array.isArray(dash.buildBandModel({}).nodes), "Q7: buildBandModel({}) -> { nodes: [] }");
 
-console.log("dashboard.quality.test.mjs: OK");
+console.log("quality.test.mjs: OK");

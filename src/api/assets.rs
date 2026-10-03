@@ -56,14 +56,14 @@ pub(super) fn try_serve<W: Write>(
         | "/assets/xterm-6.0.0.css"
         | "/assets/main.js"
         | "/assets/main.css"
-        | "/assets/dashboard.js"
-        | "/assets/dashboard.css"
+        | "/assets/dashboard/index.js"
+        | "/assets/dashboard/index.css"
         | "/assets/term-symbols.woff2",
     ) = (method, path)
     {
         let (body, ctype): (&[u8], &str) = match path {
-            "/assets/dashboard.js" => (DASHBOARD_JS.as_bytes(), "application/javascript; charset=utf-8"),
-            "/assets/dashboard.css" => (DASHBOARD_CSS.as_bytes(), "text/css; charset=utf-8"),
+            "/assets/dashboard/index.js" => (DASHBOARD_JS.as_bytes(), "application/javascript; charset=utf-8"),
+            "/assets/dashboard/index.css" => (DASHBOARD_CSS.as_bytes(), "text/css; charset=utf-8"),
             "/assets/xterm-6.0.0.js" => (
                 VENDOR_XTERM_JS_SERVED.as_bytes(),
                 "application/javascript; charset=utf-8",

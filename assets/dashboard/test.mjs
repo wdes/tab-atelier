@@ -1,5 +1,5 @@
 // Self-check for the pure logic of the dashboard web app.
-// Run: node assets/dashboard.test.mjs  (exits non-zero if the mapping breaks)
+// Run: node assets/dashboard/test.mjs  (exits non-zero if the mapping breaks)
 // No framework — just node:assert. Imports the real functions from dashboard.js
 // so this stays a check of shipped code, not a copy.
 import assert from "node:assert/strict";
@@ -10,7 +10,7 @@ import {
   viewerUrlWithToken,
   REHOME_STATES, rehomeStep, rehomePairs, rehomePairHtml,
   usageMap, fmtBytes, fmtCpu, tabDetailChips,
-} from "./dashboard.js";
+} from "./index.js";
 
 // The five led states each map to their own distinct class.
 const cases = {
@@ -260,4 +260,4 @@ assert.equal(fmtCpu(0), "0%");
   assert.doesNotMatch(tabDetailChips({ assignment: "p:build/impl" }, null, id), /RAM|CPU|cwd|rehome/);
 }
 
-console.log("dashboard.test.mjs: OK");
+console.log("test.mjs: OK");

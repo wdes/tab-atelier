@@ -33,7 +33,7 @@ fi
 
 failed=0
 count=0
-for test_file in dashboard.*.test.mjs; do
+for test_file in dashboard/*.test.mjs; do
     [ -e "$test_file" ] || continue
     count=$((count + 1))
     name=$(basename "$test_file")

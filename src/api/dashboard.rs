@@ -25,7 +25,7 @@ use serde::Serialize;
 
 use super::{TabSnapshot, parse_assignment, respond_json, respond_with_etag};
 
-const DASHBOARD_HTML: &str = include_str!("../../assets/dashboard.html");
+const DASHBOARD_HTML: &str = include_str!("../../assets/dashboard/index.html");
 
 /// The seven canonical phase-node ids of the harness dashboard skeleton, in
 /// flow order. A tab whose `assignment` phase is one of these maps to that node;

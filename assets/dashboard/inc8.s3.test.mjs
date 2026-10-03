@@ -1,5 +1,5 @@
 // Self-check for the PURE logic of Increment 8 Slice 3 (docs/dashboard-increment-8.md).
-// Run: node assets/dashboard.inc8.s3.test.mjs   (exits non-zero if a contract breaks)
+// Run: node assets/dashboard/inc8.s3.test.mjs   (exits non-zero if a contract breaks)
 // Namespace import so a not-yet-exported helper fails an assertion (RED) rather
 // than crashing the module link. The web builder makes these green:
 //   agentCardView(tab) — the full right-click "agent card" model (specialty /
@@ -12,7 +12,7 @@
 // Reads the S1 fields exposed on DashboardTab: specialty / orchestrator / objective
 // / currentTaskLog (the bounded permalog) / roundsActive.{active}. Builder: web.
 import assert from "node:assert/strict";
-import * as dash from "./dashboard.js";
+import * as dash from "./index.js";
 
 // ============================ Rouge 1 — agentCardView ============================
 assert.equal(typeof dash.agentCardView, "function", "Inc8-S3 RED: export agentCardView(tab) from dashboard.js");
@@ -169,4 +169,4 @@ assert.equal(typeof dash.clipWords, "function", "Inc9-(2): export clipWords(text
   assert.deepEqual(underL, ["w"], "Inc9: seul le VRAI worker niche sous le lead (les supporters ont précédence)");
 }
 
-console.log("dashboard.inc8.s3.test.mjs: OK");
+console.log("inc8.s3.test.mjs: OK");

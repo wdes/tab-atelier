@@ -1,5 +1,5 @@
 // Self-check for the PURE logic of Increment 5 web slices (docs/dashboard-increment-5.md).
-// Run: node assets/dashboard.inc5.test.mjs   (exits non-zero if a contract breaks)
+// Run: node assets/dashboard/inc5.test.mjs   (exits non-zero if a contract breaks)
 // No framework — node:assert. Uses a NAMESPACE import so a not-yet-exported helper
 // surfaces as a failing assertion (RED) rather than a module-link crash that would
 // take the whole file down. The web builder makes these green by exporting:
@@ -8,7 +8,7 @@
 //   overviewLayout(state)(S6)  — band order (META first / UNASSIGNED last) + repo→orchestrators
 // Builder: web (S1/S4/S6).
 import assert from "node:assert/strict";
-import * as dash from "./dashboard.js";
+import * as dash from "./index.js";
 
 // ============================ S1 — legendModel ============================
 // The legend explains the visual vocabulary: one swatch per led state, the
@@ -110,4 +110,4 @@ assert.equal(typeof dash.overviewLayout, "function", "S6 RED: export overviewLay
   assert.equal(emptyLayout.order[emptyLayout.order.length - 1], "UNASSIGNED");
 }
 
-console.log("dashboard.inc5.test.mjs: OK");
+console.log("inc5.test.mjs: OK");

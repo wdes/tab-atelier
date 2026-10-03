@@ -10,7 +10,7 @@
 //   - backend PRESENT (200 + data)   → the panel POPULATES;
 //   - backend ABSENT  (404)          → the panel shows "indisponible", NO crash.
 //
-// Run: `node --test assets/dashboard.degradation.test.mjs`.
+// Run: `node --test assets/dashboard/degradation.test.mjs`.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -43,7 +43,7 @@ function mockFetch(impl) {
   globalThis.fetch = impl;
 }
 
-const mod = await import("./dashboard.js");
+const mod = await import("./index.js");
 
 // A 404 response like a not-yet-landed route: `res.ok` is false, so the panel's
 // `if (!res.ok) throw` degrades into the catch (the whole point).

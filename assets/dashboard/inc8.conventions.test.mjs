@@ -1,5 +1,5 @@
 // Self-check for the PURE logic of the Inc8 `conventions` fold (docs/dashboard-increment-8.md).
-// Run: node assets/dashboard.inc8.conventions.test.mjs   (exits non-zero on a break)
+// Run: node assets/dashboard/inc8.conventions.test.mjs   (exits non-zero on a break)
 // Namespace import so a not-yet-exported helper fails an assertion (RED) rather
 // than crashing the module link. The web builder makes this green by exporting:
 //   conventionsCheck(tab) — the card's declared-conventions section: the list +
@@ -9,7 +9,7 @@
 // The declared-vs-existing SEMANTIC check is ta-convention-auditor's job, not here.
 // Builder: web (card conventions render).
 import assert from "node:assert/strict";
-import * as dash from "./dashboard.js";
+import * as dash from "./index.js";
 
 assert.equal(typeof dash.conventionsCheck, "function", "Inc8-conventions RED: export conventionsCheck(tab) from dashboard.js");
 {

@@ -8,7 +8,7 @@
 // asserts rendered DOM, not internals.
 //
 // Run:  cd <a dir with playwright installed>; \
-//       node <repo>/assets/dashboard.accept.mjs
+//       node <repo>/assets/dashboard/accept.mjs
 //   (needs `npx playwright install chromium` once. Playwright is an on-demand
 //    dev tool, NOT a committed runtime dep — like the daemon, this test is
 //    driven by a human/CI, never by the shipped binary.)
@@ -22,9 +22,9 @@ import { chromium } from "playwright";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const read = (f) => readFileSync(join(HERE, f), "utf8");
-const HTML = read("dashboard.html");
-const JS = read("dashboard.js");
-const CSS = read("dashboard.css");
+const HTML = read("index.html");
+const JS = read("index.js");
+const CSS = read("index.css");
 
 const ORIGIN = "http://ta-dash.local";
 const POLL_MS = 1500; // must match dashboard.js POLL_MS
@@ -139,7 +139,7 @@ const gridState = () => ({
   ],
 });
 
-// --- Tiny assertion harness (no framework, mirrors dashboard.test.mjs). ---
+// --- Tiny assertion harness (no framework, mirrors test.mjs). ---
 let failures = 0;
 const results = [];
 function ok(label, cond, detail = "") {
@@ -160,9 +160,9 @@ async function wireRoutes(page, getState, seen) {
   await page.route(`${ORIGIN}/**`, async (route) => {
     const url = new URL(route.request().url());
     if (url.pathname === "/dashboard") return route.fulfill({ contentType: "text/html; charset=utf-8", body: HTML });
-    if (url.pathname === "/assets/dashboard.js")
+    if (url.pathname === "/assets/dashboard/index.js")
       return route.fulfill({ contentType: "application/javascript; charset=utf-8", body: JS });
-    if (url.pathname === "/assets/dashboard.css")
+    if (url.pathname === "/assets/dashboard/index.css")
       return route.fulfill({ contentType: "text/css; charset=utf-8", body: CSS });
     if (url.pathname === "/dashboard/state") {
       // Record what the browser actually sent — for the auth finding.

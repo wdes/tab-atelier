@@ -1,5 +1,5 @@
 // Self-check for the PURE logic of Increment 8 Slice 1 (docs/dashboard-increment-8.md).
-// Run: node assets/dashboard.inc8.test.mjs   (exits non-zero if a contract breaks)
+// Run: node assets/dashboard/inc8.test.mjs   (exits non-zero if a contract breaks)
 // Namespace import so a not-yet-exported helper fails an assertion (RED) rather
 // than crashing the module link. The web builder makes this green by exporting:
 //   agentCard(tab)  (S1) — the self-declared "agent card" render model:
@@ -7,7 +7,7 @@
 //                          a `free` flag (orchestrator === "free") for the 'libre' badge.
 // Builder: web (card render).
 import assert from "node:assert/strict";
-import * as dash from "./dashboard.js";
+import * as dash from "./index.js";
 
 assert.equal(typeof dash.agentCard, "function", "Inc8-S1 RED: export agentCard(tab) from dashboard.js");
 {
@@ -51,4 +51,4 @@ assert.equal(typeof dash.agentCard, "function", "Inc8-S1 RED: export agentCard(t
   assert.equal(dash.agentCard({ currentTaskLog: [] }).currentTask, "", "empty permalog -> empty currentTask");
 }
 
-console.log("dashboard.inc8.test.mjs: OK");
+console.log("inc8.test.mjs: OK");
