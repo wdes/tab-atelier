@@ -4,7 +4,20 @@
 connectbot/app/build/
 connectbot/build/
 connectbot/.gradle/
+connectbot/.kotlin/
 connectbot/local.properties
 local.properties
+# The gh-pages tree publish-apk.sh fetches to stage the APK into.
+.publish-site/
 *.apk
 *.aab
+
+# Signing material never enters this repository. It is public, and the
+# certificate is the app's identity: Google's ADI registration and the installed
+# app's upgrade path both key on it, so a leaked key lets anyone sign a build
+# that installs as an upgrade over the real app. Both the key and its password
+# live in ~/.config/tab-atelier/ locally, and reach CI as the
+# ANDROID_KEYSTORE_BASE64 and ANDROID_KEYSTORE_PASSWORD secrets.
+*.keystore
+*.jks
+keystore.properties

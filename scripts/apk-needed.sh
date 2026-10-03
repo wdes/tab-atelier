@@ -5,7 +5,7 @@
 # Prints `true` or `false`, and its reasoning on stderr.
 #
 #     scripts/apk-needed.sh                  # ask GitHub what the push changed
-#     printf 'android/x\n' | scripts/apk-needed.sh --files -   # judge a list
+#     printf 'overlay/x\n' | scripts/apk-needed.sh --files -   # judge a list
 #
 # WHY THIS IS NOT `on.push.paths`. Two reasons, and the second is the one that
 # bites:
@@ -14,25 +14,31 @@
 #   2. GitHub evaluates path filters against the COMMITS in the push. A tag
 #      points at a commit that was already pushed, so the tag push carries no
 #      commits, so no path ever matches — a plain `paths:` filter silently
-#      skips every release build. The APK for v1.2.3 would just never exist.
+#      skips the build.
 #
-# So tags (and manual runs) build unconditionally, and only a push to a branch
-# is judged on its diff.
+# WHAT COUNTS, now that the app is a fork. The app is upstream ConnectBot at a
+# pinned commit, plus the overlay we lay over it. So the inputs are:
 #
-# WHAT COUNTS. android/ta-remote is deliberately outside the desktop workspace
-# — its own [workspace], its own lockfile, a disjoint dependency tree, and no
-# path dependency on the desktop crate. Nothing under src/ can change the APK,
-# which is what makes skipping safe. The workflow file counts too: editing the
-# build is a reason to run it.
+#   connectbot            the submodule PIN — a gitlink, so a bump shows up as
+#                         a one-line diff against this path and nothing else.
+#                         Upstream code changed, so the APK changed.
+#   overlay/              our own changes: patches, copied-in files, deletions.
+#   scripts/*.sh          the build (build-apk applies the overlay, publish-apk
+#                         stages the site). Editing the build is a reason to
+#                         run it.
+#   the workflow itself   same reasoning.
+#
+# Everything else — this repository's daemon, docs, the deb packaging — cannot
+# reach the APK, which is what makes skipping safe.
 #
 # WHEN IN DOUBT, BUILD. Every uncertain branch here answers `true`. A needless
-# 90-second build costs a runner minute; a wrongly skipped one means the site
-# serves an APK that does not match the release it claims to be.
+# five-minute build costs a runner; a wrongly skipped one means the site serves
+# an APK that does not match the commit it claims to be.
 set -euo pipefail
 
 # Paths whose contents end up in, or shape, the APK.
 matches_app() {
-    grep -qE '^(android/|\.github/workflows/android-apk\.yml$|scripts/apk-needed\.sh$)'
+    grep -qE '^(connectbot$|overlay/|scripts/(build-apk|apply-overlay|publish-apk|apk-needed)\.sh$|\.github/workflows/android-apk\.yml$)'
 }
 
 say() {
@@ -49,31 +55,27 @@ if [ "${1:-}" = "--files" ]; then
     if printf '%s\n' "$list" | matches_app; then
         say true "the app changed"
     fi
-    say false "nothing under android/ changed"
+    say false "nothing that reaches the APK changed"
 fi
 
 case "${GITHUB_REF:-}" in
-    # A release must have an APK regardless of what the diff says.
+    # A tagged build must produce an APK whatever the diff says.
     refs/tags/*) say true "tag build" ;;
 esac
 [ "${GITHUB_EVENT_NAME:-push}" = push ] || say true "${GITHUB_EVENT_NAME} run — not a push"
 
+# A push to the branch: ask GitHub which files it changed. `before` is all
+# zeroes on a new branch's first push, and on a force-push it may not be an
+# ancestor, so both cases fall back to building.
 before="${GITHUB_EVENT_BEFORE:-}"
-case "$before" in
-    # First push of a branch: no baseline to diff against.
-    '' | 0000000000000000000000000000000000000000) say true "no baseline commit to compare with" ;;
-esac
-
-repo="${GITHUB_REPOSITORY:?GITHUB_REPOSITORY is required}"
-sha="${GITHUB_SHA:?GITHUB_SHA is required}"
-resp="$(gh api "repos/$repo/compare/$before...$sha" 2>/dev/null || true)"
-[ -n "$resp" ] || say true "could not read the push diff — building rather than guessing"
-
-# The compare API caps `files` at 300. A push that big is not one we can judge.
-count="$(printf '%s' "$resp" | jq '.files | length // 0')"
-[ "$count" -lt 300 ] || say true "diff truncated at 300 files — building rather than guessing"
-
-if printf '%s' "$resp" | jq -r '.files[].filename' | matches_app; then
-    say true "the app changed in $before..$sha"
+if [ -z "$before" ] || [ "${before//0/}" = "" ] || ! git cat-file -e "$before^{commit}" 2>/dev/null; then
+    say true "cannot diff the push (new branch or force-push) — building"
 fi
-say false "nothing under android/ changed in $before..$sha"
+
+files="$(gh api "repos/${GITHUB_REPOSITORY}/compare/${before}...${GITHUB_SHA}" \
+    --jq '.files[].filename' 2>/dev/null)" || say true "could not ask GitHub for the diff — building"
+
+if printf '%s\n' "$files" | matches_app; then
+    say true "the app changed"
+fi
+say false "no file that reaches the APK changed"

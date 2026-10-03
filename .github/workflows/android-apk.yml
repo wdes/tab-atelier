@@ -1,37 +1,36 @@
 name: android-apk
 
-# Builds the ta-remote Android app (android/ta-remote — a Slint/Rust app; see
-# AGENTS.md "Mobile app") into a signed release APK on a GH runner, emitted as a
-# raw (un-zipped) build artifact named with the short commit SHA — the Android
-# analogue of the per-build .deb / .msi. The `apt-publish.yml` workflow pulls the
-# latest successful APK into the gh-pages site under /android/ (the "deb
-# website"), the same way it pulls the Windows MSI into /windows/.
+# Build the Android client and publish it to the website (gh-pages /android/).
 #
-# Run on demand (Actions -> android-apk -> Run workflow), on every push to main
-# (tracks the nightly channel), or on a v* tag.
-
+# The app lives on this branch, not on main: it is a fork of ConnectBot held as
+# a submodule plus an overlay (see README.md), so it is built here and only the
+# APK is published. Nothing about it needs the daemon's tree.
+#
+# on: push to this branch, or run on demand (Actions -> android-apk -> Run
+# workflow). Not `on.push.paths` — the gate is scripts/apk-needed.sh, and the
+# reason is written there: path filters are evaluated against the commits in a
+# push, so a tag push matches nothing and the build is silently skipped.
 on:
     workflow_dispatch:
     push:
-        branches: [main]
+        branches: [android-app]
+        # Tag pushes, as main's Android workflow had: a release tag produces an
+        # APK named after the tag. apk-needed.sh always builds for a tag.
         tags: ['v*']
 
-permissions:
-    contents: read
+# The site has exactly two writers: this workflow and apt-publish.yml on main.
+# Both rebuild gh-pages from a fresh clone of it, so if they overlapped,
+# whichever pushed second would do so from a tree that does not contain the
+# first one's change and would undo it. Serialize them instead of hoping.
+concurrency:
+    group: gh-pages
+    cancel-in-progress: false
 
-env:
-    RUST_VERSION: "1.95.0"
+# peaceiris/actions-gh-pages pushes to gh-pages with this token.
+permissions:
+    contents: write
 
 jobs:
-    # android/ta-remote is deliberately outside the desktop workspace — its own
-    # [workspace], its own lockfile, no path dependency on the desktop crate —
-    # so nothing under src/ can change the APK. Every push to main was
-    # rebuilding and re-signing a bit-identical artifact.
-    #
-    # This is a job rather than `on.push.paths` because a path filter is
-    # evaluated against the commits in the push, and a tag points at a commit
-    # that was already pushed: no commits, no match, and every RELEASE build
-    # silently skipped. See scripts/apk-needed.sh.
     changes:
         name: Did the app change?
         runs-on: ubuntu-latest
@@ -46,87 +45,144 @@ jobs:
               run: echo "build=$(scripts/apk-needed.sh)" >> "$GITHUB_OUTPUT"
 
     apk:
-        name: Build signed release APK
+        name: Build and publish the signed release APK
         needs: changes
         runs-on: ubuntu-latest
-        # The signing keystore + password live in this environment's secrets
-        # (set via `gh secret set --env android-app`), so the APK is signed with
-        # the real release key without committing it.
+        # The signing keystore lives in this environment's secrets, so the APK
+        # is signed with the real release key without it being in the repo.
+        # NOTE: an environment deployment branch policy that does not allow this
+        # branch would hide the secret from this job — Actions -> Environments
+        # -> android-app must permit "android-app".
         environment: android-app
-        # Skip doc-only / chore commits that opt out, matching apt-publish.
         if: ${{ needs.changes.outputs.build == 'true' && !contains(github.event.head_commit.message, '[skip apk]') }}
         steps:
+            # recursive: upstream ConnectBot is a submodule, pinned to the
+            # commit this branch records. It is public, so no credentials.
             - uses: actions/checkout@v7
+              with:
+                  submodules: recursive
 
-            - name: Compute version + short SHA
+            - uses: actions/setup-java@v4
+              with:
+                  distribution: temurin
+                  java-version: '21'
+
+            - uses: android-actions/setup-android@v3
+
+            # compileSdk is 37, and its platform package is "android-37.0" —
+            # there is no plain "platforms;android-37". The overlay pins NDK
+            # 26.1.10909125 because the app still compiles mosh's JNI.
+            - name: Install SDK platform and NDK
               run: |
-                  if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
-                      echo "APK_VERSION=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_ENV"
-                  else
-                      echo "APK_VERSION=$(grep -m1 '^version = ' android/ta-remote/Cargo.toml | cut -d'"' -f2)" >> "$GITHUB_ENV"
+                  yes | sdkmanager --licenses > /dev/null 2>&1 || true
+                  sdkmanager "platforms;android-37.0" "ndk;26.1.10909125"
+                  # Breadcrumbs, not assertions: if something did not land the
+                  # build says so with a real error rather than a bare test.
+                  echo "platforms: $(ls "$ANDROID_HOME/platforms" | tr '\n' ' ')"
+                  echo "ndk: $(ls "$ANDROID_HOME/ndk" | tr '\n' ' ')"
+
+            - uses: gradle/actions/setup-gradle@v4
+
+            # Both secrets come from the android-app environment, the same one
+            # main's Android workflow uses. Both are required and neither has a
+            # fallback: the keystore is not in this repository (it is public) and
+            # neither is its password. Fail here, naming what is missing, rather
+            # than letting Gradle fail later with something less obvious.
+            - name: Check the signing secrets
+              env:
+                  KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+                  KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+              run: |
+                  missing=0
+                  if [ -z "$KEYSTORE_B64" ]; then
+                      echo "::error::ANDROID_KEYSTORE_BASE64 is not set in the 'android-app' environment"
+                      missing=1
                   fi
-                  echo "SHORT_SHA=${GITHUB_SHA::8}" >> "$GITHUB_ENV"
+                  if [ -z "$KEYSTORE_PASSWORD" ]; then
+                      echo "::error::ANDROID_KEYSTORE_PASSWORD is not set in the 'android-app' environment"
+                      missing=1
+                  fi
+                  exit $missing
 
-            - uses: dtolnay/rust-toolchain@stable
-              with:
-                  toolchain: ${{ env.RUST_VERSION }}
-                  targets: aarch64-linux-android
-
-            - uses: Swatinem/rust-cache@v2
-              with:
-                  workspaces: android/ta-remote
-
-            - name: Install cargo-apk2
-              run: cargo install cargo-apk2 --locked
-
-            # The app targets android-33 ([package.metadata.android.sdk]
-            # target_sdk_version), but the runner's preinstalled SDK only ships
-            # newer platforms — cargo-apk2 fails with "Platform `33` is not
-            # installed." Pull it (licenses are pre-accepted on the runner).
-            - name: Install Android platform 33
+            - name: Compute the version
               run: |
-                  yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-33" > /dev/null 2>&1 || \
-                      "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-33"
-                  test -d "$ANDROID_HOME/platforms/android-33" && echo "platform 33 present"
+                  # A tag build takes its name from the tag, as main's Android
+                  # workflow did; otherwise 0.6.<run>, which is enough to tell
+                  # builds apart without a release process.
+                  if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+                      name="${GITHUB_REF#refs/tags/v}"
+                  else
+                      name="0.6.${GITHUB_RUN_NUMBER}"
+                  fi
+                  sha="${GITHUB_SHA::8}"
+                  # versionCode must only ever climb. The app already installed
+                  # on a device is 16777472 and Android refuses an upgrade that
+                  # does not increase it, so it is the run number plus that
+                  # floor, never the version name.
+                  code=$((16777472 + GITHUB_RUN_NUMBER))
+                  # The build time is in the filename because publish-apk.sh
+                  # orders APKs by name: a fresh clone stamps every file with
+                  # the checkout time, so mtime cannot be trusted.
+                  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+                  apk="tab-atelier-remote_${stamp}_${sha}_${name}.apk"
+                  {
+                      echo "NAME=$name"
+                      echo "CODE=$code"
+                      echo "SHA=$sha"
+                      echo "APK_NAME=$apk"
+                  } >> "$GITHUB_ENV"
+                  echo "building ${GITHUB_REF_NAME} as $name (code $code) -> $apk"
 
-            # Provide the release keystore from the environment secret rather
-            # than relying on the copy in the repo — so the signing key can be
-            # rotated (or removed from git) without touching the workflow. The
-            # keystore password stays in Cargo.toml's signing config
-            # ([package.metadata.android.signing.release]).
-            - name: Restore signing keystore from secret
+            - name: Build the signed release APK
+              # build-apk.sh decodes ANDROID_KEYSTORE_BASE64 into a temporary
+              # file outside the checkout and reads the password from the same
+              # variable names, so nothing lands in the working tree.
+              # ANDROID_KEYSTORE_ALIAS is optional; build-apk.sh defaults to
+              # "ta-remote".
+              env:
+                  ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+                  ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+                  ANDROID_KEYSTORE_ALIAS: ${{ secrets.ANDROID_KEYSTORE_ALIAS }}
               run: |
-                  echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > android/ta-remote/release.keystore
-                  test -s android/ta-remote/release.keystore && echo "keystore restored ($(wc -c < android/ta-remote/release.keystore) bytes)"
+                  APP_VERSION_CODE="$CODE" APP_VERSION_NAME="$NAME" scripts/build-apk.sh
+                  test -s connectbot/app/build/outputs/apk/oss/release/app-oss-release.apk
 
-            # ubuntu-latest ships the Android SDK + an NDK preinstalled;
-            # cargo-apk2 needs ANDROID_HOME (already set) and the NDK path.
-            # ANDROID_NDK_LATEST_HOME is the runner's canonical NDK env var.
-            - name: Build signed release APK
-              working-directory: android/ta-remote
-              run: |
-                  export ANDROID_NDK_ROOT="${ANDROID_NDK_ROOT:-$ANDROID_NDK_LATEST_HOME}"
-                  echo "SDK: $ANDROID_HOME"
-                  echo "NDK: $ANDROID_NDK_ROOT"
-                  # Release build is signed with the in-repo release.keystore
-                  # ([package.metadata.android.signing.release] in Cargo.toml).
-                  cargo apk2 build --release
-                  ls -la target/release/apk/
-
-            - name: Stage APK with build name
-              run: |
-                  mkdir -p out
-                  cp android/ta-remote/target/release/apk/ta-remote.apk \
-                     "out/ta-remote-${SHORT_SHA}-${APK_VERSION}.apk"
-                  ls -la out/
-
-            # archive: false emits the .apk as-is (single raw file), not wrapped
-            # in the usual artifact .zip — same as the raw MSI upload, so
-            # apt-publish can fetch the bytes directly from the artifacts API.
-            - name: Upload APK artifact (raw)
+            # Kept as a raw file (not zipped) so the bytes are directly
+            # downloadable from the run, like the other artifacts here. The
+            # artifact NAME is the APK's filename on purpose: apt-publish.yml
+            # fetches the newest android-apk artifact and uses its name as the
+            # destination filename in gh-pages, and only picks up names ending
+            # in .apk. Naming it this way keeps both publishers writing the same
+            # file until apt-publish's own android handling is retired.
+            - name: Upload the APK artifact
               uses: actions/upload-artifact@v7
               with:
-                  name: ta-remote-apk-${{ env.SHORT_SHA }}
-                  path: out/ta-remote-${{ env.SHORT_SHA }}-${{ env.APK_VERSION }}.apk
+                  name: ${{ env.APK_NAME }}
+                  path: connectbot/app/build/outputs/apk/oss/release/app-oss-release.apk
                   archive: false
                   if-no-files-found: error
+
+            - name: Stage the site
+              env:
+                  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+                  PUBLISH_APK_NAME: ${{ env.APK_NAME }}
+              run: |
+                  scripts/publish-apk.sh \
+                      connectbot/app/build/outputs/apk/oss/release/app-oss-release.apk \
+                      "$NAME" "$SHA"
+
+            # Same action, and the same author, as apt-publish.yml uses for the
+            # deb/Arch/Windows sections. force_orphan keeps gh-pages history from
+            # growing by ~13 MB per build; publish-apk.sh fetched the existing
+            # tree first, so the other sections are republished unchanged.
+            - name: Publish to gh-pages
+              uses: peaceiris/actions-gh-pages@v4
+              with:
+                  github_token: ${{ secrets.GITHUB_TOKEN }}
+                  publish_dir: ./.publish-site
+                  publish_branch: gh-pages
+                  user_name: 'Wdes Bot'
+                  user_email: 'williamdes+wdes-bot@wdes.fr'
+                  commit_message: 'Publish Android app ${{ env.NAME }} (${{ env.SHA }})'
+                  keep_files: false
+                  force_orphan: true

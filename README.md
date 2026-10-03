@@ -100,10 +100,14 @@ the website.
   already-pushed commit, so a `paths:` filter silently skips tag builds. The
   script asks GitHub for the push diff instead, and treats the submodule pin
   (`connectbot`) and `overlay/` as the inputs that reach the APK.
-- **The version** is `0.6.<run number>` with versionCode
-  `16777472 + run number`. The installed app is 16777472 and Android refuses an
-  upgrade that does not increase it, so the run number is what keeps it
-  monotonic without a release process.
+- **The version** is the tag for a `v*` tag build, otherwise `0.6.<run number>`,
+  with versionCode `16777472 + run number` either way. The installed app is
+  16777472 and Android refuses an upgrade that does not increase it, so the run
+  number is what keeps it monotonic without a release process.
+- **The APK's filename** is `tab-atelier-remote_<utc>_<sha>_<version>.apk`, and
+  the build artifact carries that same name: `apt-publish.yml` fetches the
+  newest android-apk artifact and uses its name as the destination filename, so
+  the two agree while both publishers are in place.
 - **Publishing** writes only `android/` on gh-pages, keeping the newest 10
   APKs next to an `index.html`. gh-pages also serves the deb, Arch and Windows
   output, so `scripts/publish-apk.sh` fetches the current tree first and hands
