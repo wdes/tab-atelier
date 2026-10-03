@@ -511,6 +511,8 @@ pub enum Commands {
         args: Vec<String>,
     },
 
+    /// Agent card — hard-wired specialty (persisted, hook-immune).
+
     /// Post work to the shared blackboard: `announce <task-id> <title>`.
     ///
     /// The start of a contract net (Smith, 1980): any tab may announce, any
@@ -523,6 +525,8 @@ pub enum Commands {
         args: Vec<String>,
     },
 
+    /// Agent card — the orchestrator this tab serves (a tab UUID or `free`).
+
     /// Offer to do an announced task: `bid <task-id> --cost <n>` (lower wins).
     Bid {
         /// Passed straight through to `cli::work::bid`.
@@ -530,12 +534,16 @@ pub enum Commands {
         args: Vec<String>,
     },
 
+    /// Agent card — this tab's current objective.
+
     /// Hand a task to a bidder: `award <task-id> --to <agent>`.
     Award {
         /// Passed straight through to `cli::work::award`.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+
+    /// Agent card — APPEND one phrase to the bounded current-task permalog.
 
     /// Lease the best open task for this agent: `take [--ttl <s>]`.
     ///
@@ -549,6 +557,8 @@ pub enum Commands {
         args: Vec<String>,
     },
 
+    /// Agent card — toggle supervision-rounds status (`true`/`false`).
+
     /// Report a task finished: `done <task-id> [--fail] [result…]`.
     ///
     /// The explicit termination signal. Everything else has to infer
@@ -558,6 +568,8 @@ pub enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+
+    /// Agent card — declare the `.md` conventions (comma-separated).
 
     /// Block until named tasks finish: `wait <task-id>… [--timeout <s>]`.
     ///
@@ -571,12 +583,16 @@ pub enum Commands {
         args: Vec<String>,
     },
 
+    /// Agent card — APPEND one evaluation record (JSON) to the bounded ring.
+
     /// Show the blackboard folded into tasks: `tasks [--all]`.
     Tasks {
         /// Passed straight through to `cli::work::tasks`.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+
+    /// Agent card — bump a tab's usage counter + stamp last-used.
 
     /// What a Claude session starting here would be told: `brief [--cwd <dir>]`.
     ///
@@ -589,6 +605,8 @@ pub enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+
+    /// Mark a predecessor tab's re-home progress (`rehome-tab.sh`).
 
     /// Who is working on what: `fleet [--json]`.
     ///
