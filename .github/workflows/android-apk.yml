@@ -199,14 +199,27 @@ jobs:
               env:
                   EXPECTED: d8ee6b25599f1d73125ff6cd1d555815d864ca33b86c22642e0ba6bdaa5220ca
               run: |
-                  got="$(apksigner verify --print-certs "$APK_NAME" \
-                      | sed -n 's/^Signer #1 certificate SHA-256 digest: //p' \
-                      | tr -d ':' | tr 'A-Z' 'a-z')"
-                  if [ "$got" != "$EXPECTED" ]; then
-                      echo "::error::APK signed by $got, expected $EXPECTED — wrong keystore"
+                  # apksigner is not on PATH: it ships inside build-tools, and
+                  # the first version of this check failed with "command not
+                  # found" and then reported the empty result as a wrong
+                  # keystore. Resolve it explicitly and say which step failed.
+                  apksigner="$(ls -1 "$ANDROID_HOME"/build-tools/*/apksigner 2>/dev/null | sort -V | tail -1)"
+                  if [ ! -x "$apksigner" ]; then
+                      echo "::error::no apksigner under $ANDROID_HOME/build-tools"
                       exit 1
                   fi
-                  echo "signed by the expected certificate"
+                  got="$("$apksigner" verify --print-certs "$APK_NAME" \
+                      | sed -n 's/^Signer #1 certificate SHA-256 digest: *//p' \
+                      | tr -d ':' | tr 'A-Z' 'a-z')"
+                  if [ -z "$got" ]; then
+                      echo "::error::could not read a certificate from $APK_NAME"
+                      exit 1
+                  fi
+                  if [ "$got" != "$EXPECTED" ]; then
+                      echo "::error::signed by $got, expected $EXPECTED — wrong keystore"
+                      exit 1
+                  fi
+                  echo "signed by the expected certificate: $got"
 
             # Kept as a raw file (not zipped) so the bytes are directly
             # downloadable from the run, like the other artifacts here. No
