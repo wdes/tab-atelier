@@ -67,7 +67,14 @@ jobs:
                   distribution: temurin
                   java-version: '21'
 
+            # The action's default package list is "tools platform-tools", and
+            # the standalone "tools" package no longer exists in the SDK
+            # repository: sdkmanager exits 1 with "Failed to find package
+            # 'tools'", which fails the job before the build even starts. Ask for
+            # platform-tools only; the next step installs the platform and NDK.
             - uses: android-actions/setup-android@v3
+              with:
+                  packages: platform-tools
 
             # compileSdk is 37, and its platform package is "android-37.0" —
             # there is no plain "platforms;android-37". The overlay pins NDK
