@@ -1,3 +1,7 @@
 # tab-atelier-kiosk
 
-A web GUI served alongside the tab-atelier daemon. This crate is currently a structural scaffold; the Kiosk routes and interface will arrive by rebasing the existing Kiosk PRs.
+The tab-atelier web Kiosk: the decision, report and intent panes, over HTTP.
+
+This crate is currently a structural scaffold. The Kiosk routes and interface arrive by
+rebasing the existing Kiosk work into it — see PR #55 (`feat/dashboard-crate`), where the
+Kiosk currently lives under the name "dashboard".

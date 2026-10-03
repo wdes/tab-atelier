@@ -14,7 +14,7 @@ enum Command {
     /// Run the kiosk server.
     Serve {
         /// Address to listen on.
-        #[arg(long, default_value = "127.0.0.1:7901")]
+        #[arg(long, default_value = "127.0.0.1:8282")]
         listen: String,
     },
 }

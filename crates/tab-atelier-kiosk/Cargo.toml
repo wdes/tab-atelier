@@ -39,7 +39,7 @@ name = "tab-atelier-kiosk"
 maintainer = "William Desportes <williamdes@wdes.fr>"
 copyright = "2026, William Desportes <williamdes@wdes.fr>"
 license-file = ["../../LICENSE", "0"]
-extended-description = "A web kiosk for tab-atelier, served alongside its daemon."
+extended-description = "The tab-atelier web Kiosk: decision, report and intent panes, over HTTP."
 section = "utils"
 priority = "optional"
 # The Kiosk is a standalone server package, not part of the desktop install.
