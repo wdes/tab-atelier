@@ -20,6 +20,18 @@
 pub(crate) use super::client::set_test_endpoint;
 pub(crate) use super::client::{Endpoint, agent, discover_endpoint};
 
+/// Inc8 S4 — best-effort `POST /bump-usage` for a tab: increment its usage
+/// counter + stamp last-used. Fire-and-forget (a failed bump must never break
+/// the caller's real work); used by aligator on each swamp delivery to make
+/// "who's being fed from the swamp" observable.
+pub(crate) fn bump_usage(ep: &Endpoint, uuid: &str) {
+    let _ = agent()
+        .post(format!("{}/tabs/by-id/{uuid}/bump-usage", ep.url))
+        .header("Authorization", format!("Bearer {}", ep.token))
+        .header("Content-Type", "application/json")
+        .send("{}");
+}
+
 pub(crate) fn fetch_tabs(ep: &Endpoint) -> Result<Vec<serde_json::Value>, String> {
     let v = super::client::api_get_json(ep, "/tabs")?;
     Ok(v.get("tabs").and_then(|t| t.as_array()).cloned().unwrap_or_default())

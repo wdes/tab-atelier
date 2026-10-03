@@ -236,6 +236,9 @@ pub fn dispatch(name: &str, rest: &[String]) -> Option<i32> {
         "dispatch" => delegate::run(rest),
         "remote" => remote::run(rest),
         "brain" => brain::run(rest),
+        "aligator" => super::aligator::run(rest),
+        "swamp" => super::aligator::run_swamp(rest),
+        "clarify" => super::clarify::run(rest),
         // task primitive (#11): typed queue with an atomic claim.
         "task" => task::run(rest),
         "schedule" => share_link::schedule(rest),
