@@ -65,6 +65,11 @@ pub mod set_status;
 pub mod share_link;
 pub mod style;
 pub mod tab_field;
+/// `tab-atelier task <push|claim|beat|done|list>` (primitive #11).
+///
+/// The typed task queue with an atomic claim: the pure backend + the thin HTTP
+/// client.
+pub mod task;
 /// `tab-atelier tasks` — the contract-net fold over the blackboard: what work
 /// exists, who bid, who won, what finished.
 pub mod tasks;
