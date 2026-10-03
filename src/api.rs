@@ -668,6 +668,13 @@ pub struct EnvChange {
 
 /// One `POST /tabs/by-id/{id}/meta` change, drained by the main loop onto the
 /// tab's [`crate::TabState::meta`]. `value: None` removes the key.
+///
+/// `allow(dead_code)` because the fields are read by the **headless** loop
+/// (`headless.rs`, behind the `headless` feature) and by this module's tests;
+/// neither counts when the lib is compiled for the GUI, which is where the lint
+/// fires. The alternative — reading them from the GUI too — would be inventing
+/// a consumer to please a linter.
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct MetaChange {
     pub tab_id: String,

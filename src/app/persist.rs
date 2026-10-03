@@ -231,6 +231,24 @@ impl AppState {
                 tab.last_context_pct.set(ctx_pct);
             }
             let bg_color = crate::effective_tab_bg(tab.bg_color.as_deref(), None, self.tab_bg_global.as_deref()).into();
+            // A tab that `cd`s into another project, or a rule edited meanwhile,
+            // is re-derived here. The tint is pushed only when it actually
+            // changed, so an unchanged tab costs one comparison.
+            let folder = crate::folder_style_of(tab.last_known_cwd_string.as_deref());
+            let tint = crate::effective_tab_tint(tab.bg_color.as_deref(), folder.color.as_deref())
+                .and_then(crate::parse_hex_rgb);
+            if tab.applied_tint.get() != tint {
+                tab.applied_tint.set(tint);
+                tab.view.update(cx, |v, vcx| {
+                    v.set_bg_override(tint);
+                    vcx.notify();
+                });
+            }
+            // Claude Code's fullscreen transcript scrolls by page, so tell the
+            // view to translate the wheel into PgUp/PgDn for this tab.
+            tab.view
+                .read(cx)
+                .set_alt_scroll_pages(tab.agent_kind.as_deref() == Some("claude"));
             // Per-tab RSS (#28 S1/S5): one /proc-subtree walk at the 2 s persist
             // cadence, cached on the tab for the tab-bar gauge and mirrored to
             // the snapshot below.
@@ -791,19 +809,17 @@ impl AppState {
                 let Some(tab) = self.tabs.iter_mut().find(|t| *t.id == upd.tab_id) else {
                     continue;
                 };
-                // "__clear__" sentinel from a POST with state=idle.
-                // Wipes BOTH the transient state and the durable
-                // session attachment, so the LED actually disappears
-                // on Claude Code's SessionEnd hook (otherwise the
-                // grey "session attached" dot would stick around).
-                if upd.label.as_deref() == Some("__clear__") {
+                if upd.wipe_attachment {
                     tab.agent_state = None;
                     tab.agent_session_id = None;
                     tab.agent_kind = None;
                     tab.agent_plan_mode = None;
                 } else {
-                    // The pile's shape: the option is mapped outside, so the snapshot
-                    // is only built when there is a state to put in it.
+                    // `state: None` (the wire's "idle") takes the indicator
+                    // down. The metadata below still applies either way, so
+                    // an update that names its session parks the LED *and*
+                    // leaves the tab resumable — which is what codex's
+                    // wrapper does on exit.
                     tab.agent_state = upd.state.map(|state| crate::AgentStateSnapshot {
                         state,
                         label: upd.label.clone(),
@@ -817,6 +833,9 @@ impl AppState {
                     }
                     if upd.plan_mode.is_some() {
                         tab.agent_plan_mode = upd.plan_mode;
+                    }
+                    if let Some(d) = upd.daemon {
+                        tab.agent_daemon = d;
                     }
                 }
             }

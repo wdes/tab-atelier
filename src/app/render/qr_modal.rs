@@ -110,7 +110,7 @@ impl AppState {
                                 .flex()
                                 .flex_col()
                                 .gap(px(2.0))
-                                .child(div().text_color(dialog_fg).child("Also reachable at:"));
+                                .child(div().text_color(dialog_fg).child(self.t().also_reachable_at));
                             for ip in ips.iter().skip(1) {
                                 list = list.child(div().text_color(link_fg).child(format!(
                                     "http://{ip}:{}",

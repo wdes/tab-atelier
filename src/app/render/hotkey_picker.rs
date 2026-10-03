@@ -44,9 +44,10 @@ impl AppState {
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
-                        // Swallow the dismiss click so it doesn't also land on
-                        // whatever control sits under the overlay (a theme row,
-                        // a hotkey "×", Save/Cancel).
+                        // Swallow the click: without this it also lands on
+                        // whatever sits underneath; now that the prefs page
+                        // fills the screen, that's always a live control
+                        // (Save/Cancel, a theme row, a hotkey "×").
                         cx.stop_propagation();
                         this.show_hotkey_picker = false;
                         if let Some(ref handle) = this.hotkey_handle {
@@ -69,8 +70,8 @@ impl AppState {
                         .min_w(px(260.0))
                         .text_size(px(14.0))
                         // stop_propagation (not a no-op) so a click inside the
-                        // box doesn't reach the overlay's dismiss handler behind
-                        // it and close the picker.
+                        // box doesn't reach the overlay's dismiss handler
+                        // behind it and close the picker.
                         .on_mouse_down(MouseButton::Left, |_ev: &MouseDownEvent, _window, cx| {
                             cx.stop_propagation();
                         })

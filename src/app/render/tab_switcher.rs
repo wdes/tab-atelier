@@ -11,14 +11,27 @@ impl AppState {
     /// Ctrl+P → Enter jumps straight back. No-op with fewer than two tabs.
     pub(in crate::app) fn open_tab_switcher(&mut self, cx: &mut Context<Self>) {
         // Need something to switch to, and don't stack over another modal.
-        if self.tabs.len() < 2
-            || self.show_preferences
-            || self.show_hotkey_picker
-            || self.show_qr
-            || self.renaming.is_some()
-            || self.exit_confirm.is_some()
-            || self.close_confirm.is_some()
-        {
+        let blocked = if self.tabs.len() < 2 {
+            Some("fewer than two tabs")
+        } else if self.show_preferences {
+            Some("preferences open")
+        } else if self.show_hotkey_picker {
+            Some("hotkey picker open")
+        } else if self.show_qr {
+            Some("QR modal open")
+        } else if self.renaming.is_some() {
+            Some("renaming a tab")
+        } else if self.exit_confirm.is_some() {
+            Some("exit confirm open")
+        } else if self.close_confirm.is_some() {
+            Some("close confirm open")
+        } else {
+            None
+        };
+        if let Some(why) = blocked {
+            // Silent refusals here read as "Ctrl+P is broken"; say which state
+            // ate it so the next report names the blocker.
+            warn!("Ctrl+P declined: {why}");
             return;
         }
         // Order by `last_used_at` (the same field the mobile remote sorts by)
@@ -96,7 +109,7 @@ impl AppState {
                 div()
                     .text_color(muted)
                     .text_size(px(13.0))
-                    .child("Type to filter tabs\u{2026}")
+                    .child(self.t().switcher_filter_placeholder)
             } else {
                 div().text_color(dialog_fg).child(format!("{}\u{258c}", sw.query))
             });
@@ -109,7 +122,7 @@ impl AppState {
                     .py(px(6.0))
                     .text_size(px(13.0))
                     .text_color(muted)
-                    .child("No matching tabs"),
+                    .child(self.t().switcher_no_matches),
             );
         }
         for (row, &idx) in filtered.iter().enumerate() {
@@ -124,7 +137,7 @@ impl AppState {
                 || "never".to_string(),
                 |ms| {
                     let elapsed = std::time::Duration::from_millis(crate::unix_millis().saturating_sub(ms));
-                    format!("{} ago", format_duration(elapsed))
+                    format!("{} ago", crate::fmt::duration(elapsed))
                 },
             );
             let selected = row == sw.selected;
@@ -193,7 +206,7 @@ impl AppState {
                         .overflow_hidden()
                         .text_color(dialog_fg)
                         .text_size(px(14.0))
-                        .child(div().text_size(px(13.0)).text_color(muted).child("Recent tabs"))
+                        .child(div().text_size(px(13.0)).text_color(muted).child(self.t().switcher_recent))
                         .child(query_row)
                         .child(list)
                         .child(

@@ -100,6 +100,12 @@ struct Tab {
     /// spinner, or a `cargo build` printing — which lights the LED green
     /// ("talking") even without a fresh status hook. `None` = no output yet.
     last_output_at: Option<std::time::Instant>,
+    /// Tint last pushed to the view. Compared before every push so an
+    /// unchanged tab costs one comparison instead of a re-render.
+    applied_tint: std::cell::Cell<Option<u32>>,
+    /// The agent in this tab is a daemon (brain/aligator): its liveness is the
+    /// process, not a session, so the LED follows it directly.
+    agent_daemon: bool,
     /// Persisted fixed-grid pin (`tab-atelier resize`), mirrored onto the view's
     /// `pinned_grid`. `None` = window-driven sizing. Round-trips through
     /// tabs.json so the size survives a restart.
@@ -309,6 +315,8 @@ impl Tab {
             // being opened — not instantly on every restart.
             last_focused_at: Some(std::time::Instant::now()),
             last_output_at: None,
+            applied_tint: std::cell::Cell::new(None),
+            agent_daemon: false,
             pinned_cols: ts.pinned_cols,
             pinned_rows: ts.pinned_rows,
             #[cfg(feature = "energy")]
@@ -645,6 +653,19 @@ impl OutputSaver {
 struct AppState {
     tabs: Vec<Tab>,
     active: usize,
+    /// A tab became active from a path with no `Window` in hand, so its
+    /// keyboard focus is still owed.
+    ///
+    /// `persist` (the API's "activate this tab") and `close_tab` (an agent
+    /// closing its own tab) both move `active` off a timer tick, where there is
+    /// no `Window` to call `.focus()` with. Without this the tab paints, the
+    /// mouse wheel still reaches it — scrolling is delivered by hit-test, not
+    /// focus — and every keystroke goes somewhere else: "only scroll works, not
+    /// typing", with app shortcuts dead too because focus sits on a stale view.
+    ///
+    /// `render` has a `Window`, so it settles the debt on the next frame. Same
+    /// trick as the `pending_new_tabs` drain below it.
+    refocus_active: bool,
     context_menu: Option<ContextMenu>,
     /// The desktop screen-mate pet — all its state + rendering lives in
     /// [`crate::pet::PetOverlay`]; summoned/dismissed from the background menu.
@@ -840,6 +861,98 @@ struct AppState {
 }
 
 impl AppState {
+    /// `focus` false leaves the active tab where it is and marks the new tab
+    /// [`Tab::plain`].
+    fn insert_tab_inner(
+        &mut self,
+        at: usize,
+        hint: Option<PathBuf>,
+        focus: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let cwd = hint.filter(|p| p.is_dir()).or_else(|| {
+            let pid = self.tabs[self.active].view.read(cx).pid();
+            platform::process_cwd(pid).or_else(|| self.tabs[self.active].last_known_cwd.clone())
+        });
+        let grid = Self::grid_size(window, &self.font_config);
+        // Only the tab we are leaving gets deactivated; a background insert
+        // leaves the user's tab active and its timer running.
+        if focus {
+            self.tabs[self.active].deactivate();
+        }
+        let fc = self.font_config.clone();
+        let br = self.browser.clone();
+        let ce = self.code_editor.clone();
+        let tn = self.theme_name;
+        let cs = self.cursor_style;
+        let new_id = crate::default_tab_id();
+        let mut env = tab_env_extras(
+            &new_id,
+            &api_url_for_local_clients(&self.api_addr),
+            &self.api_token,
+            &std::collections::BTreeMap::new(),
+        );
+        // `focus` false means the API asked for this tab, so it launches with
+        // colour output off — see `new_tab_env`.
+        env.extend(crate::new_tab_env(!focus));
+        // Claude-only mode: a fresh tab launches `claude` in `auto` permission
+        // mode instead of a plain shell. Under cleared-env we can `exec`
+        // it directly via the shell suffix; otherwise we type the command into
+        // the shell once its prompt appears (`pending_agent_resume`, below) —
+        // the same two mechanisms the restore path uses for agents. Read-only
+        // never force-launches. See `crate::FRESH_CLAUDE_AUTO_CMD`.
+        let force_claude = self.claude_only && !crate::read_only();
+        let exec_claude = force_claude && crate::clear_env();
+        let agent_launch = exec_claude.then(crate::fresh_claude_launch_suffix);
+        let view = cx.new(|cx| {
+            let mut tv = TerminalView::new_with_colors_and_env(
+                cwd.as_deref(),
+                fc,
+                br,
+                ce,
+                true,
+                env,
+                agent_launch,
+                grid,
+                false,
+                window,
+                cx,
+            );
+            tv.set_theme(tn);
+            tv.set_cursor_style(cs);
+            tv
+        });
+        let idx = at.min(self.tabs.len());
+        // Non-exec claude launch: queue the command to be typed into the shell
+        // once it prints its first prompt (`flush_pending_agent_resume`).
+        let pending_claude = (force_claude && !exec_claude).then(|| crate::FRESH_CLAUDE_AUTO_CMD.to_string());
+        let name = if force_claude {
+            format!("claude {}", self.tabs.len())
+        } else {
+            format!("{} {}", self.t().terminal_n, self.tabs.len())
+        };
+        let seed = TabState {
+            id: new_id,
+            name,
+            ..TabState::default()
+        };
+        self.tabs
+            .insert(idx, Tab::from_state(view, &seed, cwd, None, pending_claude, focus));
+        if focus {
+            self.active = idx;
+        } else if idx <= self.active {
+            // Inserting before the active tab shifts its index; without this
+            // the selection silently jumps to a neighbour.
+            self.active += 1;
+        }
+        #[cfg(target_os = "linux")]
+        self.apply_tab_limits(idx, cx);
+        if focus {
+            self.tabs[self.active].view.read(cx).focus_handle(cx).focus(window);
+        }
+        cx.notify();
+    }
     /// The per-tab PTY inputs any (re)spawn needs so the tab comes back as
     /// itself: the API env the in-tab CLI and the Claude hooks read, and — under
     /// cleared env — the `exec <agent> --resume …` suffix. Without the second
@@ -1391,6 +1504,20 @@ impl AppState {
                                 break;
                             }
                         }
+                        // Anything in a tab that asked for the clipboard (OSC 52) is
+                        // handed to gpui here, because this is the UI thread and the
+                        // parser callback that received the request is not. Collected
+                        // first, then written: `write_to_clipboard` borrows `cx`, so
+                        // doing it inside the loop over `app.tabs` would not
+                        // borrow-check.
+                        let asked: Vec<String> = app
+                            .tabs
+                            .iter()
+                            .filter_map(|tab| tab.view.read(cx).take_clipboard())
+                            .collect();
+                        for text in asked {
+                            cx.write_to_clipboard(ClipboardItem::new_string(text));
+                        }
                     }) else {
                         break;
                     };
@@ -1588,6 +1715,7 @@ impl AppState {
         Self {
             tabs,
             active,
+            refocus_active: false,
             context_menu: None,
             #[cfg(feature = "pets")]
             pet: crate::pet::PetOverlay::default(),
@@ -1834,72 +1962,7 @@ impl AppState {
     }
 
     fn insert_tab(&mut self, at: usize, hint: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
-        let cwd = hint.filter(|p| p.is_dir()).or_else(|| {
-            let pid = self.tabs[self.active].view.read(cx).pid();
-            platform::process_cwd(pid).or_else(|| self.tabs[self.active].last_known_cwd.clone())
-        });
-        let grid = Self::grid_size(window, &self.font_config);
-        self.tabs[self.active].deactivate();
-        let fc = self.font_config.clone();
-        let br = self.browser.clone();
-        let ce = self.code_editor.clone();
-        let tn = self.theme_name;
-        let cs = self.cursor_style;
-        let new_id = crate::default_tab_id();
-        let env = tab_env_extras(
-            &new_id,
-            &api_url_for_local_clients(&self.api_addr),
-            &self.api_token,
-            &std::collections::BTreeMap::new(),
-        );
-        // Claude-only mode: a fresh tab launches `claude` in `auto` permission
-        // mode instead of a plain shell. Under cleared-env we can `exec`
-        // it directly via the shell suffix; otherwise we type the command into
-        // the shell once its prompt appears (`pending_agent_resume`, below) —
-        // the same two mechanisms the restore path uses for agents. Read-only
-        // never force-launches. See `crate::FRESH_CLAUDE_AUTO_CMD`.
-        let force_claude = self.claude_only && !crate::read_only();
-        let exec_claude = force_claude && crate::clear_env();
-        let agent_launch = exec_claude.then(crate::fresh_claude_launch_suffix);
-        let view = cx.new(|cx| {
-            let mut tv = TerminalView::new_with_colors_and_env(
-                cwd.as_deref(),
-                fc,
-                br,
-                ce,
-                true,
-                env,
-                agent_launch,
-                grid,
-                false,
-                window,
-                cx,
-            );
-            tv.set_theme(tn);
-            tv.set_cursor_style(cs);
-            tv
-        });
-        let idx = at.min(self.tabs.len());
-        // Non-exec claude launch: queue the command to be typed into the shell
-        // once it prints its first prompt (`flush_pending_agent_resume`).
-        let pending_claude = (force_claude && !exec_claude).then(|| crate::FRESH_CLAUDE_AUTO_CMD.to_string());
-        let name = if force_claude {
-            format!("claude {}", self.tabs.len())
-        } else {
-            format!("{} {}", self.t().terminal_n, self.tabs.len())
-        };
-        let seed = TabState {
-            id: new_id,
-            name,
-            ..TabState::default()
-        };
-        self.tabs
-            .insert(idx, Tab::from_state(view, &seed, cwd, None, pending_claude, true));
-        self.active = idx;
-        #[cfg(target_os = "linux")]
-        self.apply_tab_limits(idx, cx);
-        self.tabs[self.active].view.read(cx).focus_handle(cx).focus(window);
-        cx.notify();
+        self.insert_tab_inner(at, hint, true, window, cx);
     }
 
     fn move_tab(&mut self, from: usize, to: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -1947,6 +2010,11 @@ impl AppState {
         if was_active {
             self.tabs[self.active].activate();
             self.tabs[self.active].flush_pending_restore(cx);
+            // Closing the active tab hands the keyboard to its neighbour. The
+            // GUI callers focus it themselves (they hold a Window); the API
+            // one — an agent closing its own tab when it finishes — does not,
+            // and left the surviving tab unfocused. Harmless to ask twice.
+            self.refocus_active = true;
         }
         self.context_menu = None;
         cx.notify();
@@ -1990,29 +2058,9 @@ impl AppState {
         let ce = self.code_editor.clone();
         let tn = self.theme_name;
         let cs = self.cursor_style;
-        let env = tab_env_extras(
-            &self.tabs[idx].id,
-            &api_url_for_local_clients(&self.api_addr),
-            &self.api_token,
-            &self.tabs[idx].tab_env,
-        );
         // Respawning an agent tab → relaunch the agent directly (exec), same as
-        // a restore, so it comes back as claude rather than a bare shell. Never
-        // in read-only mode — see the restore path: resuming a live session
-        // corrupts the user's session ids.
-        let agent_launch = if crate::clear_env() && !crate::read_only() {
-            match (&self.tabs[idx].agent_kind, &self.tabs[idx].agent_session_id) {
-                (Some(k), Some(s)) => {
-                    // Name the agent process after the tab (see the restore path).
-                    let title =
-                        crate::shell_supports_exec_a(&crate::clear_env_shell_path()).then_some(&*self.tabs[idx].name);
-                    crate::agent_launch_shell_suffix_instrumented(k, s, self.tabs[idx].agent_plan_mode, title)
-                }
-                _ => None,
-            }
-        } else {
-            None
-        };
+        // a restore, so it comes back as claude rather than a bare shell.
+        let (env, agent_launch) = self.respawn_inputs(idx);
         let view = cx.new(|cx| {
             let mut tv = TerminalView::new_with_colors_and_env(
                 cwd.as_deref(),
@@ -2101,14 +2149,7 @@ impl AppState {
                 self.respawn_tab(idx, window, cx);
                 // clear-env respawn already exec's the agent; otherwise queue the
                 // typed `--resume` so the agent comes back in the fresh shell too.
-                if !crate::clear_env() {
-                    let kind = self.tabs[idx].agent_kind.as_deref().map(str::to_string);
-                    let sid = self.tabs[idx].agent_session_id.as_deref().map(str::to_string);
-                    let plan = self.tabs[idx].agent_plan_mode;
-                    if let (Some(k), Some(s)) = (kind, sid) {
-                        self.tabs[idx].pending_agent_resume = crate::build_agent_resume_command(&k, &s, plan);
-                    }
-                }
+                self.queue_typed_resume(idx);
             }
         }
         #[cfg(not(feature = "catbus"))]
@@ -2499,69 +2540,6 @@ fn mru_tab_order<T: Ord>(active: usize, last_focused: &[Option<T>]) -> Vec<usize
     order
 }
 
-fn format_duration(d: std::time::Duration) -> String {
-    let secs = d.as_secs();
-    if secs < 60 {
-        format!("{secs}s")
-    } else if secs < 3600 {
-        format!("{}m {}s", secs / 60, secs % 60)
-    } else {
-        let h = secs / 3600;
-        let m = (secs % 3600) / 60;
-        format!("{h}h {m}m")
-    }
-}
-
-fn run_check() {
-    println!("tab-atelier v{} --check", env!("CARGO_PKG_VERSION"));
-
-    let libs: &[(&str, &str)] = &[
-        ("libfreetype.so.6", "libfreetype6"),
-        ("libxkbcommon.so.0", "libxkbcommon0"),
-        ("libxkbcommon-x11.so.0", "libxkbcommon-x11-0"),
-        ("libxcb.so.1", "libxcb1"),
-        ("libxcb-xkb.so.1", "libxcb-xkb1"),
-    ];
-    let mut ok = true;
-    let mut missing = Vec::new();
-    for (lib, pkg) in libs {
-        print!("  {lib:<30}");
-        let found = std::path::Path::new("/usr/lib/x86_64-linux-gnu").join(lib).exists()
-            || std::path::Path::new("/usr/lib64").join(lib).exists()
-            || std::path::Path::new("/usr/lib").join(lib).exists();
-        if found {
-            println!("ok");
-        } else {
-            println!("MISSING  (apt install {pkg})");
-            missing.push(*pkg);
-            ok = false;
-        }
-    }
-
-    print!("  /dev/ptmx (pty support) ..... ");
-    if std::path::Path::new("/dev/ptmx").exists() {
-        println!("ok");
-    } else {
-        println!("MISSING");
-        ok = false;
-    }
-
-    let state_dir = platform::state_base_dir();
-    print!("  state dir ................... ");
-    println!("{}", state_dir.display());
-
-    let config_dir = platform::config_dir();
-    print!("  config dir .................. ");
-    println!("{}", config_dir.display());
-
-    if ok {
-        println!("all checks passed");
-    } else {
-        println!("\nTo fix, run:\n  sudo apt install {}", missing.join(" "));
-        std::process::exit(1);
-    }
-}
-
 /// Launch the gpui application. Blocks until the window closes.
 ///
 /// # Panics
@@ -2575,16 +2553,10 @@ pub fn run() {
     // file logger is installed.
     crate::init_gui_file_logging();
 
-    let args: Vec<String> = std::env::args().collect();
-    if args.iter().any(|a| a == "--check") {
-        run_check();
-        return;
-    }
-    if args.iter().any(|a| a == "-V" || a == "--version") {
-        println!("tab-atelier v{}", env!("CARGO_PKG_VERSION"));
-        return;
-    }
-
+    // `--check` and `--version` are handled by the clap front end in
+    // `cli::dispatch`, which both editions run before this. Scanning
+    // `env::args` for them here — as this used to — was a second parser that
+    // clap could not see, and it silently disagreed with clap's help.
     info!("starting Tab Atelier v{}", env!("CARGO_PKG_VERSION"));
 
     // Reap agent processes leaked by a prior (unclean) run before we
@@ -2951,23 +2923,25 @@ mod tests {
 
     #[test]
     fn format_duration_seconds() {
-        assert_eq!(format_duration(std::time::Duration::from_secs(0)), "0s");
-        assert_eq!(format_duration(std::time::Duration::from_secs(45)), "45s");
-        assert_eq!(format_duration(std::time::Duration::from_secs(59)), "59s");
+        use crate::fmt::duration;
+        assert_eq!(duration(std::time::Duration::from_secs(0)), "0s");
+        assert_eq!(duration(std::time::Duration::from_secs(45)), "45s");
+        assert_eq!(duration(std::time::Duration::from_secs(59)), "59s");
     }
 
     #[test]
     fn format_duration_minutes() {
-        assert_eq!(format_duration(std::time::Duration::from_mins(1)), "1m 0s");
-        assert_eq!(format_duration(std::time::Duration::from_secs(125)), "2m 5s");
-        assert_eq!(format_duration(std::time::Duration::from_secs(3599)), "59m 59s");
+        use crate::fmt::duration;
+        assert_eq!(duration(std::time::Duration::from_mins(1)), "1m 0s");
+        assert_eq!(duration(std::time::Duration::from_secs(125)), "2m 5s");
+        assert_eq!(duration(std::time::Duration::from_secs(3599)), "59m 59s");
     }
 
     #[test]
     fn format_duration_hours() {
-        assert_eq!(format_duration(std::time::Duration::from_hours(1)), "1h 0m");
-        assert_eq!(format_duration(std::time::Duration::from_mins(121)), "2h 1m");
-        assert_eq!(format_duration(std::time::Duration::from_hours(24)), "24h 0m");
+        assert_eq!(crate::fmt::duration(std::time::Duration::from_hours(1)), "1h 0m");
+        assert_eq!(crate::fmt::duration(std::time::Duration::from_mins(121)), "2h 1m");
+        assert_eq!(crate::fmt::duration(std::time::Duration::from_hours(24)), "24h 0m");
     }
 
     #[test]

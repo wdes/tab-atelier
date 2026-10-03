@@ -272,26 +272,57 @@ impl AppState {
             // half-typed input, then `catbus-agent\n` runs it. No exec —
             // the shell stays alive underneath, so exiting catbus returns
             // the user to their session.
-            container = container.child(
-                div()
-                    .id("menu-catbus")
-                    .px(px(12.0))
-                    .py(px(4.0))
-                    .cursor_pointer()
-                    .hover(|s| s.bg(menu_hover))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
-                            this.tabs[idx]
-                                .view
-                                .read(cx)
-                                .send_input_bytes(b"\x15catbus-agent\n".to_vec());
-                            this.context_menu = None;
-                            cx.notify();
-                        }),
-                    )
-                    .child("\u{1f408}\u{fe0f}\u{1f68c}\u{fe0f} Catbus"),
-            );
+            //
+            // Not offered while an agent is already serving this tab. Clicking it
+            // would type the command regardless, and the new agent would either be
+            // refused by its own start-up guard or — worse, before that guard
+            // existed — bind over the running agent's socket and leave two agents
+            // appending to one transcript. The liveness is the same `agent_pid`
+            // the status dot uses, so the menu and the dot cannot disagree.
+            //
+            // With the `catbus` feature off the sweep never runs, so `agent_pid`
+            // is always None and nothing is known; the item stays offered, which
+            // is what it did before. Same caveat the dot takes.
+            #[cfg(feature = "catbus")]
+            let agent_serving_this_tab =
+                self.tabs[idx].agent_kind.is_some() && self.tabs[idx].agent_pid.get().is_some();
+            #[cfg(not(feature = "catbus"))]
+            let agent_serving_this_tab = false;
+
+            container = if agent_serving_this_tab {
+                // Dimmed rather than hidden: an item that disappears reads as a
+                // bug, and the operator's actual question is "why can't I start
+                // one here", which the label answers.
+                container.child(
+                    div()
+                        .id("menu-catbus-busy")
+                        .px(px(12.0))
+                        .py(px(4.0))
+                        .text_color(th.fg_muted_hsla())
+                        .child("\u{1f408}\u{fe0f}\u{1f68c}\u{fe0f} Catbus — an agent already runs here"),
+                )
+            } else {
+                container.child(
+                    div()
+                        .id("menu-catbus")
+                        .px(px(12.0))
+                        .py(px(4.0))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(menu_hover))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
+                                this.tabs[idx]
+                                    .view
+                                    .read(cx)
+                                    .send_input_bytes(b"\x15catbus-agent\n".to_vec());
+                                this.context_menu = None;
+                                cx.notify();
+                            }),
+                        )
+                        .child("\u{1f408}\u{fe0f}\u{1f68c}\u{fe0f} Catbus"),
+                )
+            };
 
             // ⛑ Brain — same pattern as Catbus: Ctrl-U + the command +
             // newline, takes over the current tab. Inside the brain
@@ -326,7 +357,7 @@ impl AppState {
                             cx.notify();
                         }),
                     )
-                    .child("\u{26d1}\u{fe0f} Brain"),
+                    .child(format!("\u{26d1}\u{fe0f} {}", self.t().brain)),
             );
 
             // 🐊 Aligator — deterministic input router (drains the swamp). Same
@@ -527,7 +558,12 @@ impl AppState {
             let elapsed = self.tabs[stats_idx].uptime();
             let t = self.t();
 
-            let mut stats_lines: Vec<String> = Vec::new();
+            // (label, value) pairs — one row each, ALWAYS, with the value
+            // absent while the sampler hasn't answered. `crate::stats_rows`
+            // renders the placeholder; see its doc for why the COUNT must not
+            // depend on the data. Values are recomputed every frame, so the
+            // numbers stay live while the menu is open.
+            let mut entries: Vec<(&str, Option<String>)> = Vec::new();
 
             #[cfg(feature = "energy")]
             {
@@ -537,42 +573,55 @@ impl AppState {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .get(stats_idx)
                     .cloned();
-                if let Some(ref p) = power_info {
-                    if p.cpu_percent >= 0.1 {
-                        stats_lines.push(format!("{}: {}", t.cpu, p.cpu_label()));
-                    }
-                    let wl = p.watts_label();
-                    if !wl.is_empty() {
-                        stats_lines.push(format!("{}: {wl}", t.power));
-                    }
-                }
+                entries.push((
+                    t.cpu,
+                    power_info
+                        .as_ref()
+                        .filter(|p| p.cpu_percent >= 0.1)
+                        .map(super::super::power::TabPower::cpu_label),
+                ));
+                entries.push((
+                    t.power,
+                    power_info.as_ref().map(super::super::power::TabPower::watts_label),
+                ));
                 let wh = self.tabs[stats_idx].energy_wh;
-                if wh > 0.0 {
-                    if wh >= 1.0 {
-                        stats_lines.push(format!("{}: {wh:.1} Wh", t.energy));
-                    } else {
-                        stats_lines.push(format!("{}: {:.0} mWh", t.energy, wh * 1000.0));
-                    }
-                }
+                entries.push((
+                    t.energy,
+                    (wh > 0.0).then(|| {
+                        if wh >= 1.0 {
+                            format!("{wh:.1} Wh")
+                        } else {
+                            format!("{:.0} mWh", wh * 1000.0)
+                        }
+                    }),
+                ));
             }
-            stats_lines.push(format!("{}: {}", t.uptime, format_duration(elapsed)));
+            entries.push((t.uptime, Some(crate::fmt::duration(elapsed))));
             // How long since this tab was last the foreground tab. The active
             // tab reads ~0 (refreshed every sweep); background tabs age.
-            if let Some(seen) = self.tabs[stats_idx].last_focused_at {
-                stats_lines.push(format!("{}: {}", t.last_seen, format_duration(seen.elapsed())));
-            }
+            entries.push((
+                t.last_seen,
+                self.tabs[stats_idx]
+                    .last_focused_at
+                    .map(|seen| crate::fmt::duration(seen.elapsed())),
+            ));
             // Per-tab consumption (issue #28): resident memory of the shell
-            // subtree + last agent token totals. Sampled once here, on popup
-            // open — not per frame. GUI renders memory in MB.
+            // subtree + last agent token totals, re-read per frame so they
+            // track while the menu is up. GUI renders memory in MB.
             let shell_pid = self.tabs[stats_idx].view.read(cx).pid();
-            if let Some(sample) = crate::agent_probe::sample_tree(shell_pid) {
-                let mb = sample.rss_kb as f64 / 1024.0;
-                stats_lines.push(format!("{}: {mb:.0} MB", t.memory));
-            }
+            entries.push((
+                t.memory,
+                crate::agent_probe::sample_tree(shell_pid)
+                    .map(|sample| format!("{:.0} MB", sample.rss_kb as f64 / 1024.0)),
+            ));
             #[cfg(feature = "catbus")]
-            if let Some(usage) = self.tabs[stats_idx].tokens_last_saved.get() {
-                stats_lines.push(format!("{}: {} in / {} out", t.tokens, usage.input, usage.output));
-            }
+            entries.push((
+                t.tokens,
+                self.tabs[stats_idx]
+                    .tokens_last_saved
+                    .get()
+                    .map(|usage| format!("{} in / {} out", usage.input, usage.output)),
+            ));
             let conns = self
                 .tab_connections
                 .lock()
@@ -580,9 +629,8 @@ impl AppState {
                 .get(&*self.tabs[stats_idx].id)
                 .copied()
                 .unwrap_or(0);
-            if conns > 0 {
-                stats_lines.push(format!("{}: {conns}", t.connections));
-            }
+            entries.push((t.connections, Some(conns.to_string())));
+            let stats_lines = crate::stats_rows(&entries);
 
             if !stats_lines.is_empty() {
                 if has_tab_section {
@@ -967,7 +1015,7 @@ impl AppState {
                             cx.notify();
                         }),
                     )
-                    .child("🐾 Summon a pet"),
+                    .child(format!("🐾 {}", self.t().summon_pet)),
             );
             if self.pet.count() > 0 {
                 container = container.child(
@@ -985,7 +1033,7 @@ impl AppState {
                                 cx.notify();
                             }),
                         )
-                        .child("🐾 Dismiss all pets"),
+                        .child(format!("🐾 {}", self.t().dismiss_pets)),
                 );
             }
         }
