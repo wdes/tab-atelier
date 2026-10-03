@@ -437,6 +437,70 @@ pub enum Commands {
         args: Vec<String>,
     },
 
+    /// Declare this tab's stable workflow assignment (`"[<project>:]<phase>/<role>"`).
+    ///
+    /// Persisted + hook-immune, unlike the volatile `set-context`.
+    SetAssignment {
+        /// Passed straight through to `cli::set_assignment::run`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// Agent card — hard-wired specialty (persisted, hook-immune).
+    SetSpecialty {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// Agent card — the orchestrator this tab serves (a tab UUID or `free`).
+    SetOrchestrator {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// Agent card — this tab's current objective.
+    SetObjective {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// Agent card — APPEND one phrase to the bounded current-task permalog.
+    SetCurrentTask {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// Agent card — toggle supervision-rounds status (`true`/`false`).
+    SetRoundsActive {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// Agent card — declare the `.md` conventions (comma-separated).
+    SetConventions {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// Agent card — APPEND one evaluation record (JSON) to the bounded ring.
+    SetEvaluation {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// Agent card — bump a tab's usage counter + stamp last-used.
+    BumpUsage {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// Mark a predecessor tab's re-home progress (`rehome-tab.sh`).
+    SetRehomeStatus {
+        /// Passed straight through to `cli::set_rehome::run`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
     /// Tail the running daemon's log (`GET /logs`, loopback callers only).
     ///
     /// Distinct from `log <filter>`, which configures what the NEXT start
@@ -446,6 +510,8 @@ pub enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+
+    /// Agent card — hard-wired specialty (persisted, hook-immune).
 
     /// Post work to the shared blackboard: `announce <task-id> <title>`.
     ///
@@ -459,6 +525,8 @@ pub enum Commands {
         args: Vec<String>,
     },
 
+    /// Agent card — the orchestrator this tab serves (a tab UUID or `free`).
+
     /// Offer to do an announced task: `bid <task-id> --cost <n>` (lower wins).
     Bid {
         /// Passed straight through to `cli::work::bid`.
@@ -466,12 +534,16 @@ pub enum Commands {
         args: Vec<String>,
     },
 
+    /// Agent card — this tab's current objective.
+
     /// Hand a task to a bidder: `award <task-id> --to <agent>`.
     Award {
         /// Passed straight through to `cli::work::award`.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+
+    /// Agent card — APPEND one phrase to the bounded current-task permalog.
 
     /// Lease the best open task for this agent: `take [--ttl <s>]`.
     ///
@@ -485,6 +557,8 @@ pub enum Commands {
         args: Vec<String>,
     },
 
+    /// Agent card — toggle supervision-rounds status (`true`/`false`).
+
     /// Report a task finished: `done <task-id> [--fail] [result…]`.
     ///
     /// The explicit termination signal. Everything else has to infer
@@ -494,6 +568,8 @@ pub enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+
+    /// Agent card — declare the `.md` conventions (comma-separated).
 
     /// Block until named tasks finish: `wait <task-id>… [--timeout <s>]`.
     ///
@@ -507,12 +583,16 @@ pub enum Commands {
         args: Vec<String>,
     },
 
+    /// Agent card — APPEND one evaluation record (JSON) to the bounded ring.
+
     /// Show the blackboard folded into tasks: `tasks [--all]`.
     Tasks {
         /// Passed straight through to `cli::work::tasks`.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+
+    /// Agent card — bump a tab's usage counter + stamp last-used.
 
     /// What a Claude session starting here would be told: `brief [--cwd <dir>]`.
     ///
@@ -525,6 +605,8 @@ pub enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+
+    /// Mark a predecessor tab's re-home progress (`rehome-tab.sh`).
 
     /// Who is working on what: `fleet [--json]`.
     ///
@@ -972,6 +1054,16 @@ fn command_exit_code(cli: Cli) -> Option<i32> {
         }
         Commands::SetContext { args } => crate::cli::client::run("set-context", &args),
         Commands::SetMeta { args } => crate::cli::client::run("set-meta", &args),
+        Commands::SetAssignment { args } => crate::cli::client::run("set-assignment", &args),
+        Commands::SetSpecialty { args } => crate::cli::client::run("set-specialty", &args),
+        Commands::SetOrchestrator { args } => crate::cli::client::run("set-orchestrator", &args),
+        Commands::SetObjective { args } => crate::cli::client::run("set-objective", &args),
+        Commands::SetCurrentTask { args } => crate::cli::client::run("set-current-task", &args),
+        Commands::SetRoundsActive { args } => crate::cli::client::run("set-rounds-active", &args),
+        Commands::SetConventions { args } => crate::cli::client::run("set-conventions", &args),
+        Commands::SetEvaluation { args } => crate::cli::client::run("set-evaluation", &args),
+        Commands::BumpUsage { args } => crate::cli::client::run("bump-usage", &args),
+        Commands::SetRehomeStatus { args } => crate::cli::client::run("set-rehome-status", &args),
         Commands::Style { args } => crate::cli::client::run("style", &args),
         Commands::Logs { args } => crate::cli::client::run("logs", &args),
         Commands::Announce { args } => crate::cli::client::run("announce", &args),

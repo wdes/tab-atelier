@@ -122,6 +122,15 @@ jobs:
             # browser and need playwright, which this repository does not carry.
             - name: Run Kiosk asset tests
               run: crates/tab-atelier-kiosk/assets/run-tests.sh
+            # The desktop dashboard's own unit tests: same shape, same rules, same
+            # exclusion of the `*.accept.mjs` that need a real browser.
+            #
+            # They arrived with the `app.rs` split and **nothing ran them** — not
+            # this workflow, not the branch they came from. Ten assertion files in
+            # the tree that no command touched, which is a comment with extra
+            # steps. This step is what turns them back into a check.
+            - name: Run dashboard asset tests
+              run: assets/run-tests.sh
             - name: Check formatting
               run: cargo fmt --all -- --check
             - name: Clippy (GUI)

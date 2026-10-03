@@ -10,10 +10,13 @@ use log::{debug, error, info};
 
 mod assets;
 mod blackboard_route;
+mod cards;
+mod catalog;
 #[cfg(feature = "catbus")]
 mod catbus;
 mod claims_route;
 mod claude_only;
+mod dashboard;
 mod env;
 mod files;
 mod fleet_route;
@@ -32,6 +35,7 @@ mod ssh_agent;
 mod status;
 mod tab_props;
 mod tabs;
+mod task;
 mod tokens;
 mod usage;
 mod view;
@@ -83,6 +87,11 @@ const VENDOR_TERM_SYMBOLS_WOFF2: &[u8] = include_bytes!("../assets/vendor/term-s
 /// next page load with no user intervention.
 const MAIN_CSS: &str = include_str!("../assets/main.css");
 const MAIN_JS: &str = include_str!("../assets/main.js");
+// The harness dashboard's own JS/CSS — served publicly at `/assets/dashboard.*`
+// (the `/dashboard` HTML page itself is behind the auth gate). Same cache-buster
+// story as `main.*`.
+const DASHBOARD_CSS: &str = include_str!("../assets/dashboard/index.css");
+const DASHBOARD_JS: &str = include_str!("../assets/dashboard/index.js");
 // Site icons + metadata served at the origin root (`/favicon.ico`, …). The
 // `.svg` reuses the app icon; the raster set is rendered from it. `robots.txt`
 // mirrors the `X-Robots-Tag: noindex` stance for crawlers that check it first.
@@ -315,6 +324,33 @@ struct TabInfo {
     /// non-agent tabs so existing consumers don't see a new field.
     #[serde(skip_serializing_if = "Option::is_none")]
     tokens: Option<crate::TokenUsage>,
+    // --- Agent card on `/tabs`: the persisted, hook-immune fields so a tool can
+    //     reread its own card. Sourced from TabState via SnapshotTab. Omitted when
+    //     empty/None (a card-less tab stays clean). Snake-case on the wire like the
+    //     rest of TabInfo, except the three that predate this (currentTaskLog /
+    //     roundsActive / usageCount) which stay camelCase for existing consumers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    assignment: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent_tab_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rehome_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    specialty: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    orchestrator: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    objective: Option<String>,
+    #[serde(rename = "currentTaskLog", skip_serializing_if = "Vec::is_empty")]
+    current_task_log: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    conventions: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    evaluations: Vec<crate::Evaluation>,
+    #[serde(rename = "roundsActive", skip_serializing_if = "Option::is_none")]
+    rounds_active: Option<crate::RoundsActive>,
+    #[serde(rename = "usageCount", skip_serializing_if = "Option::is_none")]
+    usage_count: Option<u64>,
     /// CRC-32 of the tab's current output — the same value `/output` returns
     /// as `X-Output-Crc`. Lets a poller learn in ONE request which tabs moved:
     /// `brain` watches every Claude tab for a frozen screen and otherwise
@@ -374,6 +410,8 @@ struct ErrorResponse {
 
 #[derive(Clone)]
 pub struct SnapshotTab {
+    pub last_compaction_at: Option<u64>,
+    pub context_pct: Option<u8>,
     /// Stable per-tab UUID, mirrored from `TabState.id`. Used to route
     /// `POST /tabs/by-id/{id}/status` to the right tab independent of
     /// its position in the list (renames don't change it).
@@ -539,6 +577,34 @@ pub struct SnapshotTab {
     /// Free-form durable labels (`set-meta`), mirrored from the runtime tab so
     /// `/tabs` can serve them. Empty ⇒ none set.
     pub meta: std::collections::BTreeMap<String, String>,
+    // --- Agent card, mirrored from the persisted `TabState` (hook-immune). The
+    //     small strings are `Arc<str>` like the rest of the snapshot so a rebuild
+    //     clones a refcount, not bytes.
+    /// Stable workflow assignment (`set-assignment`, `"[<project>:]<phase>/<role>"`).
+    /// Persisted + hook-immune, unlike `context`. `None` ⇒ unassigned.
+    pub assignment: Option<std::sync::Arc<str>>,
+    /// UUID of the spawning tab (`parent_tab_id`) — the delegation lineage edge.
+    /// `None` ⇒ a root tab.
+    pub parent_tab_id: Option<std::sync::Arc<str>>,
+    /// Re-home progress on a predecessor tab (`handoff-written` → `safe-to-close`).
+    /// `None` ⇒ not rehoming.
+    pub rehome_status: Option<std::sync::Arc<str>>,
+    /// Hard-wired specialty / prompt focus (`set-specialty`).
+    pub specialty: Option<std::sync::Arc<str>>,
+    /// The orchestrator this agent serves: a tab UUID, or `"free"` (`set-orchestrator`).
+    pub orchestrator: Option<std::sync::Arc<str>>,
+    /// The agent's current objective (`set-objective`).
+    pub objective: Option<std::sync::Arc<str>>,
+    /// The bounded `current_task` permalog (see [`crate::append_current_task`]).
+    pub current_task: Vec<String>,
+    /// Supervision-rounds status + last-round stamp (`set-rounds-active`).
+    pub rounds_active: Option<crate::RoundsActive>,
+    /// Bounded ring of evaluation records (`set-evaluation`).
+    pub evaluations: Vec<crate::Evaluation>,
+    /// Generic use counter (`bump-usage`).
+    pub usage_count: Option<u64>,
+    /// Declared conventions — the `.md` files this agent follows (`set-conventions`).
+    pub conventions: Vec<String>,
 }
 
 impl crate::schedule::LockState for SnapshotTab {
@@ -602,11 +668,86 @@ pub struct EnvChange {
 
 /// One `POST /tabs/by-id/{id}/meta` change, drained by the main loop onto the
 /// tab's [`crate::TabState::meta`]. `value: None` removes the key.
+///
+/// `allow(dead_code)` because the fields are read by the **headless** loop
+/// (`headless.rs`, behind the `headless` feature) and by this module's tests;
+/// neither counts when the lib is compiled for the GUI, which is where the lint
+/// fires. The alternative — reading them from the GUI too — would be inventing
+/// a consumer to please a linter.
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct MetaChange {
     pub tab_id: String,
     pub key: String,
     pub value: Option<String>,
+}
+
+/// One queued agent-card mutation for the owner loop to apply + persist.
+///
+/// Overwrite variants carry `Option<String>` (`None` = clear); `CurrentTaskAppend`
+/// appends one phrase to the bounded permalog ([`crate::append_current_task`]);
+/// `RoundsActive` sets the supervision-rounds status; `EvaluationAppend` pushes one
+/// record onto the bounded ring; `Usage` sets the counter + last-used stamp;
+/// `Conventions` OVERWRITES the declared `.md` list. One enum keeps the owner drain
+/// a single pass (vs a queue per field).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CardChange {
+    Specialty(Option<String>),
+    Orchestrator(Option<String>),
+    Objective(Option<String>),
+    CurrentTaskAppend(String),
+    RoundsActive(crate::RoundsActive),
+    EvaluationAppend(crate::Evaluation),
+    Usage(u64, u64),
+    Conventions(Vec<String>),
+}
+
+/// If `p` is a card `set-*` route (`…/specialty`, `…/orchestrator`, `…/objective`,
+/// `…/current-task`, `…/rounds-active`, `…/conventions`), return
+/// `(url-verb, json-body-key)`; else `None`. Drives the one generic card route.
+pub fn card_route_verb(p: &str) -> Option<(&'static str, &'static str)> {
+    const VERBS: [(&str, &str); 6] = [
+        ("specialty", "specialty"),
+        ("orchestrator", "orchestrator"),
+        ("objective", "objective"),
+        ("current-task", "current_task"),
+        ("rounds-active", "rounds_active"),
+        ("conventions", "conventions"),
+    ];
+    VERBS
+        .into_iter()
+        .find(|(v, _)| p.strip_suffix(v).is_some_and(|pre| pre.ends_with('/')))
+}
+
+/// Is `s` one of the canonical re-home states? Used to validate `POST …/rehome`.
+/// The four steps mirror `rehome-tab.sh`'s bidirectional-proof handshake.
+#[must_use]
+pub fn is_rehome_state(s: &str) -> bool {
+    matches!(s, "handoff-written" | "successor-ready" | "ack-sent" | "safe-to-close")
+}
+
+/// Parse an assignment `"[<project>:]<phase>/<role>"` into
+/// `(project_override, phase, role)`. Pure string-splitting; the `<project>:`
+/// prefix (if any) is only recognised before the first `/`. Sole dependency of
+/// [`role_of`]. `pub(crate)` so a downstream branch can call it directly
+/// (project derivation) instead of re-declaring its own copy.
+pub fn parse_assignment(a: &str) -> (Option<String>, String, String) {
+    let head_end = a.find('/').unwrap_or(a.len());
+    let (over, rest) = a[..head_end].find(':').map_or((None, a), |colon| {
+        (Some(a[..colon].trim().to_string()), &a[colon + 1..])
+    });
+    let mut parts = rest.splitn(2, '/');
+    let phase = parts.next().unwrap_or("").trim().to_string();
+    let role = parts.next().unwrap_or("").trim().to_string();
+    (over.filter(|p| !p.is_empty()), phase, role)
+}
+
+/// The agent's role, derived from its `assignment` — never from the volatile
+/// `context`. `None`/empty ⇒ empty string. The `task` capacity gate reads this
+/// off a claimer's card to match a `--to <role>` task.
+#[must_use]
+pub fn role_of(assignment: Option<&str>) -> String {
+    assignment.map(|a| parse_assignment(a).2).unwrap_or_default()
 }
 
 pub struct TabSnapshot {
@@ -618,6 +759,12 @@ pub struct TabSnapshot {
     /// token is persisted to `api.token`, and `tab-atelier token`
     /// re-reads the file. Initialised at server start.
     pub master_token: String,
+    /// Global read-only share token for the dashboard (`GET /dashboard` +
+    /// `/dashboard/state` + `/dashboard/activity`). Empty until minted on the
+    /// first `GET /dashboard/share-token` (master-only). A holder of this token
+    /// can READ the fleet view but nothing else — it is NOT in the per-tab
+    /// share-token set and never authorises a mutating or per-tab route.
+    pub dashboard_share_token: String,
     pub active: usize,
     #[cfg(feature = "energy")]
     pub power: Vec<crate::power::TabPower>,
@@ -666,6 +813,24 @@ pub struct TabSnapshot {
     /// `None` clears the tab's context. Same drain shape as
     /// `pending_bg_color_changes`.
     pub pending_context_changes: Vec<(String, Option<String>)>,
+    /// (`tab_id`, assignment-or-None) queued by `POST /tabs/by-id/{id}/assignment`.
+    /// Unlike `pending_context_changes`, the owner loop mirrors this onto the
+    /// runtime tab AND persists it (it lives on `TabState`).
+    pub pending_assignment_changes: Vec<(String, Option<String>)>,
+    /// (`tab_id`, `parent_tab_id`-or-None) queued by `POST /tabs/by-id/{id}/parent`
+    /// (the delegate stamps a spawned tab's lineage). Mirrored + persisted like
+    /// `pending_assignment_changes`.
+    pub pending_parent_changes: Vec<(String, Option<String>)>,
+    /// (`tab_id`, `rehome_status`-or-None) queued by `POST /tabs/by-id/{id}/rehome`
+    /// (rehome-tab.sh + the old agent's ACK). Mirrored + persisted like
+    /// `pending_assignment_changes`.
+    pub pending_rehome_changes: Vec<(String, Option<String>)>,
+    /// (`tab_id`, agent-card change) queued by the generic `set-*` card routes
+    /// (`/specialty`, `/orchestrator`, `/objective`, `/current-task`,
+    /// `/rounds-active`, `/conventions`, `/evaluation`, `/bump-usage`). ONE generic
+    /// queue (vs a vec per field) so the owner loop drains + persists all card
+    /// mutations in a single pass. Mirrored + persisted like `pending_assignment_changes`.
+    pub pending_card_changes: Vec<(String, CardChange)>,
     /// Tab ids whose per-tab share tokens (`share_token_rw`/`_ro`) the
     /// owner loop should clear, queued by `POST /tabs/rotate-tokens`.
     /// Clearing revokes every outstanding share link for that tab (it
@@ -1645,7 +1810,7 @@ fn handle_connection<S: Read + Write>(
     };
     let raw_path = parts[1].to_string();
 
-    let (path, query_token, query_lines, query_since, query_crc, query_name, query_path) =
+    let (path, query_token, query_lines, query_since, query_crc, query_name, query_path, query_include_deleted) =
         if let Some((p, q)) = raw_path.split_once('?') {
             let qt = q
                 .split('&')
@@ -1665,9 +1830,13 @@ fn handle_connection<S: Read + Write>(
                 .and_then(|s| u32::from_str_radix(s, 16).ok());
             let qn = q.split('&').find_map(|pair| pair.strip_prefix("name=")).map(url_decode);
             let qp = q.split('&').find_map(|pair| pair.strip_prefix("path=")).map(url_decode);
-            (p.to_string(), qt, ql, qs, qc, qn, qp)
+            // `?includeDeleted` (bare flag or `=true`/`=1`) surfaces tombstoned skills.
+            let qid = q
+                .split('&')
+                .any(|pair| matches!(pair, "includeDeleted" | "includeDeleted=true" | "includeDeleted=1"));
+            (p.to_string(), qt, ql, qs, qc, qn, qp, qid)
         } else {
-            (raw_path, None, None, None, None, None, None)
+            (raw_path, None, None, None, None, None, None, false)
         };
     // Strip a trailing slash so a path like `/tabs/.../view/` (added
     // by some reverse proxies / Cloudflare Tunnel normalisation)
@@ -1835,6 +2004,23 @@ fn handle_connection<S: Read + Write>(
                 state_g.touch();
             }
             verdict
+        } else if let Some(p) = provided_token.as_deref()
+            && method.as_str() == "GET"
+            && matches!(path.as_str(), "/dashboard" | "/dashboard/state" | "/dashboard/activity")
+        {
+            // The global dashboard share-token authorises the READ-ONLY fleet
+            // view ONLY — never the `/dashboard/share-token` mint (master-only),
+            // never a per-tab or mutating route (method is pinned to GET here).
+            // Fail-closed: an empty (unminted) token authorises nobody, and a
+            // constant-time compare keeps a brute-force probe from timing bits.
+            let state_g = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let ok = !state_g.dashboard_share_token.is_empty()
+                && constant_time_eq(state_g.dashboard_share_token.as_bytes(), p.as_bytes());
+            if ok {
+                state_g.touch();
+            }
+            drop(state_g);
+            ok.then_some(true)
         } else {
             None
         };
@@ -1880,6 +2066,13 @@ fn handle_connection<S: Read + Write>(
         // `raw_output` scrollback dumps, so it's cheap to poll ~1 s. Same
         // auth gate as `/tabs` (checked upstream of this match).
         ("GET", "/tabs/usage") => usage::run(stream, state, accept_gzip, if_none_match.as_deref()),
+        // The harness dashboard: the app page (behind auth; its `/assets/dashboard.*`
+        // stay public), the aggregated fleet view, the activity passthrough, and
+        // the master-only read-only share-token mint.
+        ("GET", "/dashboard") => dashboard::page(stream, accept_gzip, if_none_match.as_deref()),
+        ("GET", "/dashboard/state") => dashboard::state(stream, state, accept_gzip, if_none_match.as_deref()),
+        ("GET", "/dashboard/activity") => dashboard::activity(stream),
+        ("GET", "/dashboard/share-token") => dashboard::share_token(stream, state),
         #[cfg(feature = "catbus")]
         ("GET", p) if p.starts_with("/tabs/") && p.ends_with("/catbus") => {
             catbus::session(stream, state, p);
@@ -2028,6 +2221,67 @@ fn handle_connection<S: Read + Write>(
         }
         ("POST", p) if p.starts_with("/tabs/by-id/") && p.ends_with("/context") => {
             tab_props::context(stream, state, p, &body_bytes);
+        }
+        // Agent-card setters (master token only, like /context). The generic
+        // `card_verb` arm handles the OVERWRITE/APPEND verbs resolved by
+        // `card_route_verb`; the rest carry field-specific validation.
+        ("POST", p) if p.starts_with("/tabs/by-id/") && p.ends_with("/assignment") => {
+            cards::assignment(stream, state, p, &body_bytes);
+        }
+        ("POST", p) if p.starts_with("/tabs/by-id/") && p.ends_with("/parent") => {
+            cards::parent(stream, state, p, &body_bytes);
+        }
+        ("POST", p) if p.starts_with("/tabs/by-id/") && p.ends_with("/rehome") => {
+            cards::rehome(stream, state, p, &body_bytes);
+        }
+        ("POST", p) if p.starts_with("/tabs/by-id/") && p.ends_with("/evaluation") => {
+            cards::evaluation(stream, state, p, &body_bytes);
+        }
+        ("POST", p) if p.starts_with("/tabs/by-id/") && p.ends_with("/bump-usage") => {
+            cards::bump_usage(stream, state, p);
+        }
+        ("POST", p) if p.starts_with("/tabs/by-id/") && card_route_verb(p).is_some() => {
+            cards::card_verb(stream, state, p, &body_bytes);
+        }
+        // The LIVE retire write-path (RB-wire) — MASTER token only: `retire` isn't in
+        // the per-tab share-token action whitelist above, so a share token reaches the
+        // auth gate's fail-closed 401. Placed before the `/tabs/` catch-all.
+        ("POST", p) if p.starts_with("/tabs/by-id/") && p.ends_with("/retire") => {
+            catalog::retire(stream, state, &body_bytes, p);
+        }
+        // The retired-agent read-model (RB2 + v2 skills). MASTER only (`/catalog/*` is
+        // never under `/tabs/by-id/`, so no share token can reach it).
+        ("GET", "/catalog/list") => catalog::list(stream, query_include_deleted),
+        // Catalogue mutations (SC1 #39) — edit / delete / restore. MASTER only.
+        ("POST", p)
+            if p.starts_with("/catalog/")
+                && (p.ends_with("/edit") || p.ends_with("/delete") || p.ends_with("/restore")) =>
+        {
+            catalog::mutate(stream, state, p, &body_bytes);
+        }
+
+        // Task primitive (#11) — the pull-fabric routes. Master-token only (not in
+        // the share-token whitelist above), so a claim is serialized behind the
+        // daemon's single-writer lock.
+        ("POST", p) if p.starts_with("/task/") && p.ends_with("/push") => {
+            let queue = &p["/task/".len()..p.len() - "/push".len()];
+            task::push(stream, state, queue, &body_bytes);
+        }
+        ("POST", p) if p.starts_with("/task/") && p.ends_with("/claim") => {
+            let queue = &p["/task/".len()..p.len() - "/claim".len()];
+            task::claim(stream, state, queue, &body_bytes);
+        }
+        ("POST", p) if p.starts_with("/task/") && p.ends_with("/beat") => {
+            let id = &p["/task/".len()..p.len() - "/beat".len()];
+            task::beat(stream, state, id, &body_bytes);
+        }
+        ("POST", p) if p.starts_with("/task/") && p.ends_with("/done") => {
+            let id = &p["/task/".len()..p.len() - "/done".len()];
+            task::done(stream, state, id, &body_bytes);
+        }
+        ("GET", p) if p.starts_with("/task/") && p.ends_with("/list") => {
+            let queue = &p["/task/".len()..p.len() - "/list".len()];
+            task::list(stream, state, queue);
         }
         ("POST", p) if p.starts_with("/tabs/") && p.ends_with("/input") => {
             input::run(stream, state, p, body_bytes);
@@ -2974,6 +3228,19 @@ pub fn test_snapshot_tab(id: &str, name: &str) -> SnapshotTab {
         tab_env: std::collections::BTreeMap::new(),
         meta: std::collections::BTreeMap::new(),
         badge: None,
+        assignment: None,
+        parent_tab_id: None,
+        rehome_status: None,
+        specialty: None,
+        orchestrator: None,
+        objective: None,
+        current_task: Vec::new(),
+        rounds_active: None,
+        evaluations: Vec::new(),
+        usage_count: None,
+        conventions: Vec::new(),
+        context_pct: None,
+        last_compaction_at: None,
     }
 }
 
@@ -3040,6 +3307,10 @@ pub fn test_snapshot(tabs: Vec<SnapshotTab>) -> TabSnapshot {
         pending_ssh_agent_changes: vec![],
         pending_bg_color_changes: vec![],
         pending_context_changes: vec![],
+        pending_assignment_changes: vec![],
+        pending_parent_changes: vec![],
+        pending_rehome_changes: vec![],
+        pending_card_changes: vec![],
         pending_token_rotations: vec![],
         pending_schedule_changes: vec![],
         pending_new_tabs: 0,
@@ -3060,7 +3331,108 @@ pub fn test_snapshot(tabs: Vec<SnapshotTab>) -> TabSnapshot {
         activity_waker: std::sync::Arc::new((std::sync::Mutex::new(()), std::sync::Condvar::new())),
         generation: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         master_token: String::new(),
+        dashboard_share_token: String::new(),
     }
+}
+
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+#[must_use]
+pub fn rehome_safe_to_close(status: Option<&str>) -> bool {
+    status == REHOME_STEPS.last().map(|st| st.slug)
+}
+
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+/// Resolve a tab's project, in order: (1) `<project>:` override; (2) basename of
+/// a repo cwd; (3) `méta` lane for a meta-role itinerant; (4) `divers`.
+pub fn project_of(cwd: Option<&str>, assignment: Option<&str>) -> String {
+    let (over, _phase, role) = assignment.map_or((None, String::new(), String::new()), parse_assignment);
+    if let Some(p) = over {
+        return p;
+    }
+    if let Some(c) = cwd {
+        let base = c.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+        if !base.is_empty() && !WORK_ROOT_NAMES.contains(&base.to_ascii_lowercase().as_str()) {
+            return base.to_string();
+        }
+    }
+    if META_ROLES.contains(&role.as_str()) {
+        META_LANE.to_string()
+    } else {
+        DIVERS_LANE.to_string()
+    }
+}
+
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+pub fn dashboard_url_for_role(role: &str, project: &str, base: &str, token: &str) -> String {
+    let base = base.trim_end_matches('/');
+    if role == "tichef" || project == META_LANE || project.is_empty() {
+        format!("{base}/dashboard?token={token}")
+    } else {
+        format!("{base}/dashboard?project={project}&token={token}")
+    }
+}
+
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+#[must_use]
+pub fn rehome_badge(status: Option<&str>) -> Option<(&'static str, bool)> {
+    let last = REHOME_STEPS.len() - 1;
+    REHOME_STEPS
+        .iter()
+        .enumerate()
+        .find(|(_, st)| Some(st.slug) == status)
+        .map(|(i, st)| (st.label, i == last))
+}
+
+const META_LANE: &str = "méta";
+
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+const DIVERS_LANE: &str = "divers";
+
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+/// Dev work-roots whose basename is NOT a project (a shell parked at the parent
+/// of the repos). `ponytail:` heuristic list, no git detection — a tab actually
+/// inside `~/Dev/kalpin-back` still maps to `kalpin-back`; upgrade = walk to
+/// the enclosing `.git`.
+const WORK_ROOT_NAMES: [&str; 6] = ["dev", "src", "code", "projects", "repos", "workspace"];
+
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+/// Roles that mark an itinerant meta-specialist: with no repo cwd and no
+/// project override, such a tab lands in the shared **`méta`** lane rather than
+/// `divers`. See docs/dashboard.md "Dimension projet + voie méta".
+const META_ROLES: [&str; 4] = ["planner", "auditor", "tichef", "orchestrator"];
+
+/// THE single source of truth for the 4 re-home states, in progress order
+/// (audit Q3). Validation (`POST …/rehome`), the safe-to-close gate, and the
+/// badge all derive from this — adding a 5th state means editing only here. The
+/// last step is the terminal `safe-to-close`, posted by the old agent on its
+/// ACK, which gates the "close the predecessor" action. (`set_rehome.rs`'s
+/// `--help` / 400 text is kept in sync by `rehome_help_lists_every_state`.)
+pub const REHOME_STEPS: [RehomeStep; 4] = [
+    RehomeStep {
+        slug: "handoff-written",
+        label: "handoff écrit",
+    },
+    RehomeStep {
+        slug: "successor-ready",
+        label: "successeur prêt",
+    },
+    RehomeStep {
+        slug: "ack-sent",
+        label: "ACK envoyé",
+    },
+    RehomeStep {
+        slug: "safe-to-close",
+        label: "SAFE À FERMER",
+    },
+];
+
+/// One re-home lifecycle step: the wire slug + its French progress-badge label.
+pub struct RehomeStep {
+    pub slug: &'static str,
+    /// Read only by `rehome_badge` (a GUI-only consumer, app.rs); `REHOME_STEPS`
+    /// still sets it in both editions, so it's dead — not absent — in headless.
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
+    pub label: &'static str,
 }
 
 #[cfg(test)]
@@ -3155,6 +3527,17 @@ mod tests {
             dns: vec![],
             resident_memory_bytes: None,
             tokens: None,
+            assignment: None,
+            parent_tab_id: None,
+            rehome_status: None,
+            specialty: None,
+            orchestrator: None,
+            objective: None,
+            current_task_log: vec![],
+            conventions: vec![],
+            evaluations: vec![],
+            rounds_active: None,
+            usage_count: None,
         }
     }
 
@@ -4767,6 +5150,126 @@ mod tests {
         assert_eq!(status_code(&resp), 401);
     }
 
+    /// Round-trip proof (built == wired): POST /assignment → 200, the snapshot
+    /// mirror is set, the change is QUEUED for the owner-loop drain onto the
+    /// runtime tab, AND it comes back out on /tabs through the real tabs handler.
+    #[test]
+    fn set_assignment_roundtrips_to_tabs() {
+        let (port, state, token) = spawn_server();
+        let body = r#"{"assignment":"build/implementer"}"#;
+        let resp = request(
+            port,
+            &format!(
+                "POST /tabs/by-id/tab-a/assignment HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len(),
+            ),
+        );
+        assert_eq!(status_code(&resp), 200);
+        // Snapshot mirror (what /tabs reads) is set.
+        let mirrored = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).tabs[0]
+            .assignment
+            .clone();
+        assert_eq!(mirrored.as_deref(), Some("build/implementer"));
+        // Queued for the drain → the runtime tab is updated + persisted next tick.
+        let queued = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pending_assignment_changes
+            .last()
+            .and_then(|c| c.1.clone());
+        assert_eq!(queued.as_deref(), Some("build/implementer"));
+        let tabs = request(
+            port,
+            &format!("GET /tabs HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n"),
+        );
+        assert_eq!(status_code(&tabs), 200);
+        assert!(
+            tabs.contains(r#""assignment": "build/implementer""#),
+            "assignment missing from /tabs: {tabs}"
+        );
+    }
+
+    /// The generic card verb APPENDS to the bounded permalog and surfaces on /tabs
+    /// under the camelCase `currentTaskLog` key.
+    #[test]
+    fn set_current_task_appends_and_surfaces() {
+        let (port, state, token) = spawn_server();
+        for phrase in ["first phrase", "second phrase"] {
+            let body = format!(r#"{{"current_task":"{phrase}"}}"#);
+            let resp = request(
+                port,
+                &format!(
+                    "POST /tabs/by-id/tab-a/current-task HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len(),
+                ),
+            );
+            assert_eq!(status_code(&resp), 200);
+        }
+        let log = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).tabs[0]
+            .current_task
+            .clone();
+        assert_eq!(log, vec!["first phrase", "second phrase"]);
+        let tabs = request(
+            port,
+            &format!("GET /tabs HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n"),
+        );
+        assert!(
+            tabs.contains(r#""currentTaskLog""#),
+            "currentTaskLog missing from /tabs: {tabs}"
+        );
+    }
+
+    /// bump-usage increments the counter (starting from 1) and surfaces as
+    /// `usageCount` on /tabs.
+    #[test]
+    fn bump_usage_increments_and_surfaces() {
+        let (port, state, token) = spawn_server();
+        let resp = request(
+            port,
+            &format!(
+                "POST /tabs/by-id/tab-a/bump-usage HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Length: 0\r\n\r\n"
+            ),
+        );
+        assert_eq!(status_code(&resp), 200);
+        assert_eq!(
+            state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).tabs[0].usage_count,
+            Some(1)
+        );
+        let tabs = request(
+            port,
+            &format!("GET /tabs HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n"),
+        );
+        assert!(
+            tabs.contains(r#""usageCount": 1"#),
+            "usageCount missing from /tabs: {tabs}"
+        );
+    }
+
+    /// A bogus re-home state is rejected 400 (server-side validation).
+    #[test]
+    fn set_rehome_rejects_unknown_state() {
+        let (port, _, token) = spawn_server();
+        let body = r#"{"rehome_status":"not-a-real-step"}"#;
+        let resp = request(
+            port,
+            &format!(
+                "POST /tabs/by-id/tab-a/rehome HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len(),
+            ),
+        );
+        assert_eq!(status_code(&resp), 400);
+    }
+
+    /// `role_of` returns the `<role>` segment; the `<project>:` prefix is only
+    /// recognised before the first `/` (so it never eats into the role).
+    #[test]
+    fn role_of_extracts_role_after_optional_project() {
+        assert_eq!(super::role_of(Some("build/implementer")), "implementer");
+        assert_eq!(super::role_of(Some("kalpin-back:review/reviewer")), "reviewer");
+        assert_eq!(super::role_of(Some("orchestrator")), ""); // no `/` → no role
+        assert_eq!(super::role_of(None), "");
+    }
+
     #[test]
     fn rotate_tokens_revokes_share_links() {
         let (port, state, master) = spawn_server();
@@ -4870,6 +5373,112 @@ mod tests {
             .master_token = String::new();
         let resp = request(port, "GET /tabs HTTP/1.1\r\n\r\n");
         assert_eq!(status_code(&resp), 401, "empty master rejects token-less request");
+    }
+
+    #[test]
+    fn dashboard_state_route_responds_and_aggregates() {
+        // Anti-built≠wired: the route must actually EXECUTE the aggregation and
+        // return the real fold — not merely answer 200. Inject a tab with an
+        // assignment and assert it lands on its phase node with the derived
+        // role/project/service, i.e. the pure builder ran end to end.
+        let (port, state, master) = spawn_server();
+        {
+            let mut snap = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut t = super::test_snapshot_tab("orch-1", "orchestrator");
+            t.assignment = Some("kalpin-back:build/orchestrator".into());
+            t.cwd = Some("/home/user/kalpin-back".into());
+            // A sibling repo so the `kalpin` service family (≥2 members) forms —
+            // a lone repo would collapse to a mono service under its own name.
+            let mut u = super::test_snapshot_tab("worker-2", "builder");
+            u.assignment = Some("kalpin-front:review/builder".into());
+            u.cwd = Some("/home/user/kalpin-front".into());
+            snap.tabs = vec![t, u];
+        }
+        let resp = request(
+            port,
+            &format!(
+                "GET /dashboard/state HTTP/1.1\r\nAuthorization: Bearer {master}\r\nAccept: application/json\r\n\r\n"
+            ),
+        );
+        assert_eq!(status_code(&resp), 200, "state route responds");
+        let v: serde_json::Value = serde_json::from_str(body(&resp)).expect("valid JSON body");
+        // The tab mapped onto the global `build` node (phase from its assignment).
+        let build = v["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["id"] == "build")
+            .expect("build node exists");
+        let occupant = &build["tabs"][0];
+        assert_eq!(occupant["id"], "orch-1", "tab reached the build node");
+        assert_eq!(occupant["role"], "orchestrator", "role derived from assignment");
+        assert_eq!(occupant["serving"], "kalpin-back", "project override read");
+        // A project bucket + a service family were derived (the fold ran, not a stub).
+        assert!(
+            v["projects"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|p| p["name"] == "kalpin-back"),
+            "project bucket derived"
+        );
+        let kalpin = v["services"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["name"] == "kalpin")
+            .expect("kalpin service family derived from ≥2 sibling repos");
+        let members = kalpin["projects"].as_array().unwrap();
+        assert!(
+            members.iter().any(|p| p == "kalpin-back") && members.iter().any(|p| p == "kalpin-front"),
+            "both sibling repos grouped under the service"
+        );
+    }
+
+    #[test]
+    fn dashboard_state_requires_auth() {
+        let (port, _state, _master) = spawn_server();
+        let resp = request(
+            port,
+            "GET /dashboard/state HTTP/1.1\r\nAccept: application/json\r\n\r\n",
+        );
+        assert_eq!(status_code(&resp), 401, "no token → 401, fail-closed");
+    }
+
+    #[test]
+    fn dashboard_share_token_reads_view_but_not_mint() {
+        // The read-only dashboard share token authorises the fleet view but NOT
+        // the master-only mint route — and an empty (unminted) token authorises
+        // no one (fail-closed).
+        let (port, state, master) = spawn_server();
+        // Unminted (empty) dashboard token → a token-bearing read still 401s.
+        let resp = request(
+            port,
+            "GET /dashboard/state HTTP/1.1\r\nAuthorization: Bearer whatever\r\n\r\n",
+        );
+        assert_eq!(status_code(&resp), 401, "empty dashboard token rejects");
+        state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .dashboard_share_token = "dash-ro".into();
+        let resp = request(
+            port,
+            "GET /dashboard/state HTTP/1.1\r\nAuthorization: Bearer dash-ro\r\n\r\n",
+        );
+        assert_eq!(status_code(&resp), 200, "share token reads the fleet view");
+        // The mint route is master-only: the share token must NOT reach it.
+        let resp = request(
+            port,
+            "GET /dashboard/share-token HTTP/1.1\r\nAuthorization: Bearer dash-ro\r\n\r\n",
+        );
+        assert_eq!(status_code(&resp), 401, "share token can't mint (master-only)");
+        // Master mints + returns the token.
+        let resp = request(
+            port,
+            &format!("GET /dashboard/share-token HTTP/1.1\r\nAuthorization: Bearer {master}\r\n\r\n"),
+        );
+        assert_eq!(status_code(&resp), 200, "master mints the token");
+        assert!(body(&resp).contains("token"), "returns a token field");
     }
 
     #[test]
@@ -6707,5 +7316,732 @@ mod tests {
         assert_eq!(session_id, None);
         assert_eq!(kind, None);
         assert_eq!(state_now, None, "and the indicator comes down");
+    }
+
+    // ===== catalog / lifecycle (retire + catalog mutations) — LIVE handler tests =====
+    /// parallel: [`CatalogCleanup`]'s read-filter-write can clobber a concurrent
+    /// test's just-appended line. Read-only catalog tests don't need this.
+    fn real_catalog_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Removes the given ids' entries from the REAL catalog.jsonl on drop (the
+    /// RB-wire live test writes there; disposable UUIDs never collide with real
+    /// cards, so filtering them out preserves any real data).
+    struct CatalogCleanup(Vec<String>);
+    impl Drop for CatalogCleanup {
+        fn drop(&mut self) {
+            let path = crate::cli::catalog::catalog_path();
+            let Ok(body) = std::fs::read_to_string(&path) else {
+                return;
+            };
+            let kept: Vec<crate::cli::catalog::CatalogCard> = crate::cli::catalog::parse_catalog(&body)
+                .into_iter()
+                .filter(|c| !self.0.contains(&c.id))
+                .collect();
+            if kept.is_empty() {
+                let _ = std::fs::remove_file(&path);
+            } else {
+                let out: String = kept.iter().map(crate::cli::catalog::encode_catalog_line).collect();
+                let _ = std::fs::write(&path, out);
+            }
+        }
+    }
+
+    // RB-wire: the LIVE retire WRITE path (built≠wired gap #3) — a REAL integration
+    // test (NOT a mock): POST /retire on a DISPOSABLE tab → the card is ARCHIVED to
+    // the REAL catalog.jsonl (verified by read-back) AND the close is queued
+    // (de-register effected). Fail-closed gate 3a (no safe-to-close ACK → no
+    // archive, no close). Reuses the RB3 gates on the live path.
+    #[test]
+    fn rbwire_live_retire_archives_for_real_and_triggers_close() {
+        let _catalog_guard = real_catalog_test_guard(); // serialize real-catalog writers
+        let (port, state, token) = spawn_server();
+        let post = |path: &str, body: &str| {
+            format!(
+                "POST /{path}?token={token} HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+        };
+
+        // A disposable tab (created on purpose, not a real agent) AT safe-to-close.
+        let ready = crate::default_tab_id();
+        let mut tab = test_snapshot_tab(&ready, "disposable-ready");
+        tab.rehome_status = Some("safe-to-close".into());
+        tab.agent_session_id = Some("sess-disposable".into());
+        tab.assignment = Some("build/builder".into());
+        // A second disposable tab NOT yet safe-to-close (gate 3a should refuse it).
+        let notready = crate::default_tab_id();
+        let mut tab2 = test_snapshot_tab(&notready, "disposable-notready");
+        tab2.rehome_status = Some("handoff-written".into());
+        tab2.assignment = Some("build/builder".into());
+        {
+            let mut g = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            g.tabs.push(tab);
+            g.tabs.push(tab2);
+        }
+        let _cleanup = CatalogCleanup(vec![ready.clone(), notready.clone()]);
+
+        // (3a fail-closed) the not-ready tab → 409, NOT archived, NOT closed.
+        let refused = request(port, &post(&format!("tabs/by-id/{notready}/retire"), "{}"));
+        assert_eq!(
+            status_code(&refused),
+            409,
+            "no safe-to-close ACK → 409 RETIRE INCOMPLET\n{refused}"
+        );
+        assert!(
+            crate::cli::catalog::read_back(&crate::cli::catalog::catalog_path(), &notready).is_none(),
+            "a refused retire archives NOTHING"
+        );
+
+        // The ready tab → 200, ARCHIVED for real, close queued.
+        let done = request(
+            port,
+            &post(
+                &format!("tabs/by-id/{ready}/retire"),
+                r#"{"after_action":"shipped, handed off"}"#,
+            ),
+        );
+        assert_eq!(
+            status_code(&done),
+            200,
+            "safe-to-close + archive verified → 200\n{done}"
+        );
+        // The card is REALLY in catalog.jsonl (read-back the real file, not a mock).
+        let archived = crate::cli::catalog::read_back(&crate::cli::catalog::catalog_path(), &ready)
+            .expect("the card was archived to the REAL catalog.jsonl");
+        assert_eq!(archived.slug, "builder", "the archived card carries the derived slug");
+        assert_eq!(
+            archived.session_id.as_deref(),
+            Some("sess-disposable"),
+            "session archived"
+        );
+        assert_eq!(
+            archived.last_mission.as_deref(),
+            Some("shipped, handed off"),
+            "after-action archived"
+        );
+        // De-register EFFECTED: the tab's close is queued (the owner loop kills it).
+        {
+            let g = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let ready_idx = g.tabs.iter().position(|t| t.id.as_ref() == ready.as_str());
+            let notready_idx = g.tabs.iter().position(|t| t.id.as_ref() == notready.as_str());
+            let closes = g.pending_closes.clone();
+            drop(g);
+            assert!(
+                ready_idx.is_some_and(|i| closes.contains(&i)),
+                "the retire queued the tab's close"
+            );
+            assert!(
+                notready_idx.is_some_and(|i| !closes.contains(&i)),
+                "the refused tab is kept (not closed)"
+            );
+        }
+    }
+
+    // SV3: the LIVE v2 path — a REAL integration test (NOT a mock). POST /retire with
+    // a v2 stamp on two disposable tabs (SAME skill, one fresh + one resume) → the v2
+    // records are ARCHIVED for real to catalog.jsonl, and GET /catalog/list serves the
+    // DERIVED skill read-model (folded by name, metrics partitioned byMode,
+    // fresh_vs_resume derived at read). Exercises write AND derived-read on the wire.
+    #[test]
+    fn sv3_live_retire_writes_v2_and_serves_derived_skill_read_model() {
+        let _catalog_guard = real_catalog_test_guard(); // serialize real-catalog writers
+        let (port, state, token) = spawn_server();
+        let post = |path: &str, body: &str| {
+            format!(
+                "POST /{path}?token={token} HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+        };
+        let get = |path: &str| format!("GET /{path}?token={token} HTTP/1.1\r\n\r\n");
+
+        // A skill name unique to THIS run so the derived counts are isolated from any
+        // real catalogue data (the disposable ids are cleaned up on drop regardless).
+        let run = crate::default_tab_id();
+        let skill = format!("sv3test-{}", &run[..8.min(run.len())]);
+
+        let fresh_id = crate::default_tab_id();
+        let mut t1 = test_snapshot_tab(&fresh_id, "disposable-fresh");
+        t1.rehome_status = Some("safe-to-close".into());
+        t1.agent_session_id = Some("sess-fresh".into());
+        t1.assignment = Some("build/builder".into());
+        let resume_id = crate::default_tab_id();
+        let mut t2 = test_snapshot_tab(&resume_id, "disposable-resume");
+        t2.rehome_status = Some("safe-to-close".into());
+        t2.agent_session_id = Some("sess-resume".into());
+        t2.assignment = Some("build/builder".into());
+        {
+            let mut g = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            g.tabs.push(t1);
+            g.tabs.push(t2);
+        }
+        let _cleanup = CatalogCleanup(vec![fresh_id.clone(), resume_id.clone()]);
+
+        // Retire #1 — fresh + success + tokens 1000 (with profile fields).
+        let b1 = format!(
+            r#"{{"skill":"{skill}","promptVersion":2,"prompt":"distilled","spawnMode":"fresh","outcome":"success","tokens":1000,"tools":["cargo"],"patterns":["read-back"]}}"#
+        );
+        let r1 = request(port, &post(&format!("tabs/by-id/{fresh_id}/retire"), &b1));
+        assert_eq!(status_code(&r1), 200, "v2 fresh retire → 200\n{r1}");
+        // Retire #2 — resume + problem + tokens 3000.
+        let b2 = format!(
+            r#"{{"skill":"{skill}","promptVersion":2,"prompt":"distilled","spawnMode":"resume","outcome":"problem","tokens":3000}}"#
+        );
+        let r2 = request(port, &post(&format!("tabs/by-id/{resume_id}/retire"), &b2));
+        assert_eq!(status_code(&r2), 200, "v2 resume retire → 200\n{r2}");
+
+        // REAL archive: the fresh record really landed as a v2 record in catalog.jsonl.
+        let back = crate::cli::catalog::read_back(&crate::cli::catalog::catalog_path(), &fresh_id)
+            .expect("the v2 card was archived to the REAL catalog.jsonl");
+        assert_eq!(
+            back.skill.as_deref(),
+            Some(skill.as_str()),
+            "v2 skill archived for real"
+        );
+        assert!(back.is_v2(), "record persisted as v2 (schemaVersion:2)");
+        assert_eq!(back.spawn_mode, Some(crate::cli::catalog::SpawnMode::Fresh));
+        assert_eq!(back.tokens, Some(1000), "per-instance telemetry archived");
+
+        // REAL derived read: GET /catalog/list serves the folded skill read-model.
+        let listed = request(port, &get("catalog/list"));
+        assert_eq!(status_code(&listed), 200, "catalog list → 200\n{listed}");
+        let json: serde_json::Value = serde_json::from_str(body(&listed)).expect("valid json");
+        let skills = json["skills"].as_array().expect("a skills section");
+        let sk = skills
+            .iter()
+            .find(|s| s["skill"] == serde_json::json!(skill))
+            .expect("the skill folded from the two live retires");
+        // ONE skill folded from the two live retires; metrics PARTITIONED by mode.
+        assert_eq!(
+            sk["metrics"]["byMode"]["fresh"]["spawns"].as_u64(),
+            Some(1),
+            "fresh arm from the live write"
+        );
+        assert_eq!(sk["metrics"]["byMode"]["fresh"]["success"].as_u64(), Some(1));
+        assert_eq!(sk["metrics"]["byMode"]["resume"]["spawns"].as_u64(), Some(1));
+        assert_eq!(sk["metrics"]["byMode"]["resume"]["problem"].as_u64(), Some(1));
+        // fresh_vs_resume DERIVED at read: fresh 1/1=1.0 vs resume 0/1=0.0 → delta 1.0;
+        // tokens_ratio 1000/3000 — computed from the LIVE records, never stored.
+        assert_eq!(
+            sk["freshVsResume"]["deliveryDelta"].as_f64(),
+            Some(1.0),
+            "delivery delta derived on the wire"
+        );
+        let tr = sk["freshVsResume"]["tokensRatio"]
+            .as_f64()
+            .expect("tokens ratio derived");
+        assert!(
+            (tr - 1000.0 / 3000.0).abs() < 1e-9,
+            "tokens_ratio derived from the live records"
+        );
+    }
+
+    // SV1: the LIVE path — a REAL integration test (NOT a mock). POST /retire with a
+    // structured bilan on a disposable tab → the 4-field bilan is ARCHIVED for real to
+    // catalog.jsonl (read-back verifies), and it REPLACES lastMission (a one-line
+    // digest is back-filled). Exercises the bilan capture on the wire, before close.
+    #[test]
+    fn sv1_live_retire_archives_the_structured_bilan() {
+        let _catalog_guard = real_catalog_test_guard(); // serialize real-catalog writers
+        let (port, state, token) = spawn_server();
+        let post = |path: &str, body: &str| {
+            format!(
+                "POST /{path}?token={token} HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+        };
+
+        let id = crate::default_tab_id();
+        let mut tab = test_snapshot_tab(&id, "disposable-bilan");
+        tab.rehome_status = Some("safe-to-close".into());
+        tab.agent_session_id = Some("sess-bilan".into());
+        tab.assignment = Some("build/builder".into());
+        {
+            let mut g = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            g.tabs.push(tab);
+        }
+        let _cleanup = CatalogCleanup(vec![id.clone()]);
+
+        let body = r#"{"bilan":{"learned":["read-back gate is core"],"problems":["prompt missed the lease-beat"],"addDirectives":["beat the lease on long slices"],"dropDirectives":["drop the stale slug note"]}}"#;
+        let done = request(port, &post(&format!("tabs/by-id/{id}/retire"), body));
+        assert_eq!(status_code(&done), 200, "retire with a bilan → 200\n{done}");
+
+        // REAL archive: the structured 4-field bilan really landed in catalog.jsonl.
+        let back = crate::cli::catalog::read_back(&crate::cli::catalog::catalog_path(), &id)
+            .expect("the card was archived to the REAL catalog.jsonl");
+        let b = back.bilan.expect("the structured bilan was archived for real");
+        assert_eq!(b.learned, vec!["read-back gate is core"], "learned archived");
+        assert_eq!(b.problems, vec!["prompt missed the lease-beat"], "problems archived");
+        assert_eq!(
+            b.add_directives,
+            vec!["beat the lease on long slices"],
+            "+directives archived"
+        );
+        assert_eq!(
+            b.drop_directives,
+            vec!["drop the stale slug note"],
+            "−directives archived"
+        );
+        // Replaces lastMission: a one-line digest was back-filled for legacy readers.
+        let lm = back
+            .last_mission
+            .expect("the legacy lastMission slot is back-filled with a digest");
+        assert!(
+            lm.contains("learned:") && lm.contains("+prompt:"),
+            "digest present: {lm}"
+        );
+    }
+
+    // SV2: the LIVE éval-à-3 — a REAL integration test (NOT a mock). POST /retire with
+    // a v2 stamp + eval votes on two disposable tabs: (clean) consensus improves the
+    // prompt and the outcome is DERIVED on the wire; (leak) a directive echoing the
+    // tab's PRECISE objective literal is vetoed by the daemon (which derives the
+    // literal itself — FN2 enforced server-side, not trusted) → statu quo.
+    #[test]
+    fn sv2_live_retire_runs_eval_derives_outcome_and_enforces_anti_over_fit() {
+        let _catalog_guard = real_catalog_test_guard();
+        let (port, state, token) = spawn_server();
+        let post = |path: &str, body: &str| {
+            format!(
+                "POST /{path}?token={token} HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+        };
+        let run = crate::default_tab_id();
+        let clean_skill = format!("sv2clean-{}", &run[..8.min(run.len())]);
+        let leak_skill = format!("sv2leak-{}", &run[..8.min(run.len())]);
+
+        let clean_id = crate::default_tab_id();
+        let mut t1 = test_snapshot_tab(&clean_id, "disposable-eval-clean");
+        t1.rehome_status = Some("safe-to-close".into());
+        t1.assignment = Some("build/builder".into());
+        // The leak tab's PRECISE objective carries a concrete literal "RB1".
+        let leak_id = crate::default_tab_id();
+        let mut t2 = test_snapshot_tab(&leak_id, "disposable-eval-leak");
+        t2.rehome_status = Some("safe-to-close".into());
+        t2.assignment = Some("build/builder".into());
+        t2.objective = Some("ship RB1 to prod".into());
+        {
+            let mut g = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            g.tabs.push(t1);
+            g.tabs.push(t2);
+        }
+        let _cleanup = CatalogCleanup(vec![clean_id.clone(), leak_id.clone()]);
+
+        // Clean retire: unanimous approve, run_ok 2/3, a GENERAL directive.
+        let b1 = format!(
+            r#"{{"skill":"{clean_skill}","prompt":"base prompt","spawnMode":"fresh","bilan":{{"addDirectives":["always state the invariant up front"]}},"eval":{{"basePrompt":"base prompt","votes":{{"agent":{{"approvePrompt":true,"runOk":true}},"orchestrator":{{"approvePrompt":true,"runOk":true}},"olympe":{{"approvePrompt":true,"runOk":false}}}}}}}}"#
+        );
+        let r1 = request(port, &post(&format!("tabs/by-id/{clean_id}/retire"), &b1));
+        assert_eq!(
+            status_code(&r1),
+            200,
+            "clean v2 eval retire → 200 (CF1 satisfied)\n{r1}"
+        );
+        let c = crate::cli::catalog::read_back(&crate::cli::catalog::catalog_path(), &clean_id).expect("archived");
+        let ev = c.eval.expect("the eval report is stored on the record");
+        assert_eq!(
+            ev.decision,
+            crate::cli::catalog::EvalDecision::Improved,
+            "consensus + clean → improved"
+        );
+        assert_eq!(
+            ev.outcome,
+            crate::cli::catalog::Outcome::Success,
+            "2/3 run_ok → success DERIVED on the wire"
+        );
+        assert!(
+            c.prompt.unwrap_or_default().contains("always state the invariant"),
+            "the improved prompt landed"
+        );
+
+        // Leak retire: the directive echoes the tab's objective literal "RB1"; the
+        // daemon derives "RB1" from the PRECISE context and vetoes → statu quo.
+        let b2 = format!(
+            r#"{{"skill":"{leak_skill}","prompt":"base2","spawnMode":"fresh","bilan":{{"addDirectives":["remember to ship RB1 first"]}},"eval":{{"basePrompt":"base2","votes":{{"agent":{{"approvePrompt":true,"runOk":true}},"orchestrator":{{"approvePrompt":true,"runOk":true}},"olympe":{{"approvePrompt":true,"runOk":true}}}}}}}}"#
+        );
+        let r2 = request(port, &post(&format!("tabs/by-id/{leak_id}/retire"), &b2));
+        assert_eq!(
+            status_code(&r2),
+            200,
+            "leak retire archives (CF1 ok: skill+prompt present)\n{r2}"
+        );
+        let c2 = crate::cli::catalog::read_back(&crate::cli::catalog::catalog_path(), &leak_id).expect("archived");
+        let ev2 = c2.eval.expect("the eval report is stored");
+        assert_eq!(
+            ev2.decision,
+            crate::cli::catalog::EvalDecision::StatuQuo,
+            "server-derived literal vetoes the change"
+        );
+        assert!(
+            ev2.leaked_literals.iter().any(|l| l == "RB1"),
+            "the daemon derived + flagged the literal (FN2 enforced)"
+        );
+        assert_eq!(
+            c2.prompt.as_deref(),
+            Some("base2"),
+            "statu quo: the original prompt stands on the record"
+        );
+    }
+
+    // CF1 on the wire (Olympe's guard): a v2 retire with a skill but NO prompt is an
+    // incomplete profile → 409 RETIRE INCOMPLET, and the tab is KEPT (never closed).
+    #[test]
+    fn sv2_cf1_live_v2_without_prompt_never_closes() {
+        let _catalog_guard = real_catalog_test_guard();
+        let (port, state, token) = spawn_server();
+        let post = |path: &str, body: &str| {
+            format!(
+                "POST /{path}?token={token} HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+        };
+        let id = crate::default_tab_id();
+        let mut tab = test_snapshot_tab(&id, "disposable-cf1");
+        tab.rehome_status = Some("safe-to-close".into());
+        tab.assignment = Some("build/builder".into());
+        {
+            let mut g = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            g.tabs.push(tab);
+        }
+        let _cleanup = CatalogCleanup(vec![id.clone()]);
+
+        // A v2 retire (skill named) but with NO prompt → CF1 fails.
+        let body = r#"{"skill":"builder","spawnMode":"fresh"}"#;
+        let resp = request(port, &post(&format!("tabs/by-id/{id}/retire"), body));
+        assert_eq!(
+            status_code(&resp),
+            409,
+            "CF1: a v2 profile without a prompt never closes\n{resp}"
+        );
+        // The tab is KEPT — its close was never queued.
+        let g = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let idx = g.tabs.iter().position(|t| t.id.as_ref() == id.as_str());
+        let closes = g.pending_closes.clone();
+        drop(g);
+        assert!(
+            idx.is_some_and(|i| !closes.contains(&i)),
+            "the incomplete v2 tab is kept (not closed)"
+        );
+    }
+
+    /// Removes every catalog.jsonl record for one SKILL on drop — the SC1 mutation
+    /// records (edit/delete/restore) carry no id, so they're keyed by skill here.
+    struct CatalogSkillCleanup(String);
+    impl Drop for CatalogSkillCleanup {
+        fn drop(&mut self) {
+            let path = crate::cli::catalog::catalog_path();
+            let Ok(body) = std::fs::read_to_string(&path) else {
+                return;
+            };
+            let kept: Vec<crate::cli::catalog::CatalogCard> = crate::cli::catalog::parse_catalog(&body)
+                .into_iter()
+                .filter(|c| c.skill.as_deref() != Some(self.0.as_str()))
+                .collect();
+            if kept.is_empty() {
+                let _ = std::fs::remove_file(&path);
+            } else {
+                let out: String = kept.iter().map(crate::cli::catalog::encode_catalog_line).collect();
+                let _ = std::fs::write(&path, out);
+            }
+        }
+    }
+
+    /// GET /catalog/list → the `skills` array (the read-model), for the SC1 live tests.
+    fn catalog_skills(port: u16, token: &str) -> Vec<serde_json::Value> {
+        let listed = request(port, &format!("GET /catalog/list?token={token} HTTP/1.1\r\n\r\n"));
+        let json: serde_json::Value = serde_json::from_str(body(&listed)).expect("catalog list json");
+        json["skills"].as_array().cloned().unwrap_or_default()
+    }
+
+    // SC1 (#39): the LIVE mutation routes — a REAL integration test (real-fs, real
+    // routes, NO mock). Seeds a real v2 record, then EDIT → read-model shows the new
+    // version ; DELETE → skill absent ; edit-after-delete → STILL absent (no implicit
+    // resurrection, borne 5) ; RESTORE → re-present with the latest content.
+    #[test]
+    fn sc1_live_edit_delete_restore_and_no_implicit_resurrection() {
+        use crate::cli::catalog::{RecordKind, SpawnMode, catalog_path, latest_content_for, read_catalog_cards};
+        let _guard = real_catalog_test_guard();
+        let (port, _state, token) = spawn_server();
+        let post = |path: &str, body: &str| {
+            format!(
+                "POST /{path}?token={token} HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+        };
+        let run = crate::default_tab_id();
+        let skill = format!("sc1-{}", &run[..8.min(run.len())]);
+        let _cleanup = CatalogSkillCleanup(skill.clone());
+
+        // Seed a real v2 retire record for the skill (real fs).
+        let seed = crate::cli::catalog::CatalogCard {
+            skill: Some(skill.clone()),
+            prompt: Some("base".into()),
+            prompt_version: Some(1),
+            schema_version: Some(2),
+            spawn_mode: Some(SpawnMode::Fresh),
+            outcome: Some(crate::cli::catalog::Outcome::Success),
+            retired_at: 1,
+            ..Default::default()
+        };
+        crate::cli::catalog::append_catalog_line(&catalog_path(), &seed).unwrap();
+        assert!(
+            catalog_skills(port, &token)
+                .iter()
+                .any(|s| s["skill"] == serde_json::json!(skill)),
+            "seeded"
+        );
+
+        // EDIT via the real route → 200 + read-model shows v2 with the new prompt.
+        let e = request(
+            port,
+            &post(
+                &format!("catalog/{skill}/edit"),
+                r#"{"prompt":"edited","promptVersion":1}"#,
+            ),
+        );
+        assert_eq!(status_code(&e), 200, "edit → 200\n{e}");
+        assert_eq!(
+            latest_content_for(&read_catalog_cards(), &skill).and_then(|c| c.prompt.clone()),
+            Some("edited".into()),
+            "the edit landed in the REAL catalog.jsonl"
+        );
+        let sk = catalog_skills(port, &token);
+        let s = sk
+            .iter()
+            .find(|s| s["skill"] == serde_json::json!(skill))
+            .expect("present");
+        assert_eq!(
+            s["prompt"],
+            serde_json::json!("edited"),
+            "read-model shows the edited prompt"
+        );
+        assert_eq!(s["promptVersion"].as_u64(), Some(2), "promptVersion bumped 1→2");
+
+        // DELETE → 200 + skill ABSENT from the read-model (tombstoned).
+        let d = request(port, &post(&format!("catalog/{skill}/delete"), "{}"));
+        assert_eq!(status_code(&d), 200, "delete → 200\n{d}");
+        assert!(
+            !catalog_skills(port, &token)
+                .iter()
+                .any(|s| s["skill"] == serde_json::json!(skill)),
+            "delete tombstones the skill from the read-model"
+        );
+
+        // ⭐ EDIT after delete → the append succeeds (200) but the skill STAYS hidden.
+        let e2 = request(port, &post(&format!("catalog/{skill}/edit"), r#"{"prompt":"sneaky"}"#));
+        assert_eq!(status_code(&e2), 200, "edit-after-delete appends → 200\n{e2}");
+        assert!(
+            !catalog_skills(port, &token)
+                .iter()
+                .any(|s| s["skill"] == serde_json::json!(skill)),
+            "an edit after delete does NOT resurrect (borne 5)"
+        );
+
+        // RESTORE → 200 + skill re-present with the LATEST content (the post-delete edit).
+        let r = request(port, &post(&format!("catalog/{skill}/restore"), "{}"));
+        assert_eq!(status_code(&r), 200, "restore → 200\n{r}");
+        let sk2 = catalog_skills(port, &token);
+        let s2 = sk2
+            .iter()
+            .find(|s| s["skill"] == serde_json::json!(skill))
+            .expect("restored");
+        assert_eq!(
+            s2["prompt"],
+            serde_json::json!("sneaky"),
+            "restore brings back the latest content"
+        );
+        // Sanity: a mutation record is v-typed on disk (kind present).
+        let _ = RecordKind::Delete;
+
+        // CF1 (borne 4): an edit to an empty prompt → 409, catalogue unchanged.
+        let bad = request(port, &post(&format!("catalog/{skill}/edit"), r#"{"prompt":"   "}"#));
+        assert_eq!(status_code(&bad), 409, "edit to empty prompt → 409 (CF1)\n{bad}");
+    }
+
+    // SC1 borne 3: concurrent EDITs never lose an update — each read-modify-append
+    // under the daemon lock bumps a DISTINCT promptVersion (no two edits collide).
+    #[test]
+    fn sc1_live_concurrent_edits_no_lost_update() {
+        use crate::cli::catalog::{SpawnMode, catalog_path, read_catalog_cards};
+        let _guard = real_catalog_test_guard();
+        let (port, _state, token) = spawn_server();
+        let run = crate::default_tab_id();
+        let skill = format!("sc1c-{}", &run[..8.min(run.len())]);
+        let _cleanup = CatalogSkillCleanup(skill.clone());
+
+        let seed = crate::cli::catalog::CatalogCard {
+            skill: Some(skill.clone()),
+            prompt: Some("base".into()),
+            prompt_version: Some(1),
+            schema_version: Some(2),
+            spawn_mode: Some(SpawnMode::Fresh),
+            outcome: Some(crate::cli::catalog::Outcome::Success),
+            retired_at: 1,
+            ..Default::default()
+        };
+        crate::cli::catalog::append_catalog_line(&catalog_path(), &seed).unwrap();
+
+        // Fire N concurrent edits (each its own TCP connection).
+        let n: usize = 5;
+        let handles: Vec<_> = (0..n)
+            .map(|i| {
+                let skill = skill.clone();
+                let token = token.clone();
+                std::thread::spawn(move || {
+                    let body = format!(r#"{{"prompt":"e{i}"}}"#);
+                    let req = format!(
+                        "POST /catalog/{skill}/edit?token={token} HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}",
+                        body.len()
+                    );
+                    status_code(&request(port, &req))
+                })
+            })
+            .collect();
+        for h in handles {
+            assert_eq!(h.join().unwrap(), 200, "each concurrent edit → 200");
+        }
+
+        // Each edit produced a DISTINCT promptVersion (no lost update / collision): the
+        // seed (v1) + N edits ⇒ N+1 distinct versions, max = N+1.
+        let cards = read_catalog_cards();
+        let versions: std::collections::BTreeSet<u32> = cards
+            .iter()
+            .filter(|c| c.skill.as_deref() == Some(skill.as_str()))
+            .filter_map(|c| c.prompt_version)
+            .collect();
+        assert_eq!(
+            versions.len(),
+            n + 1,
+            "every edit got a distinct version (no lost update): {versions:?}"
+        );
+        assert_eq!(
+            versions.iter().max().copied(),
+            Some((n + 1) as u32),
+            "versions are a dense 1..=N+1 chain"
+        );
+    }
+
+    /// GET /catalog/list with an extra query (`SC1b`) → the `skills` array.
+    fn catalog_skills_q(port: u16, token: &str, extra: &str) -> Vec<serde_json::Value> {
+        let listed = request(
+            port,
+            &format!("GET /catalog/list?token={token}&{extra} HTTP/1.1\r\n\r\n"),
+        );
+        let json: serde_json::Value = serde_json::from_str(body(&listed)).expect("catalog list json");
+        json["skills"].as_array().cloned().unwrap_or_default()
+    }
+
+    // SC1b (#39): the LIVE include-deleted path — a REAL integration test. delete →
+    // the default list HIDES the skill, but `?includeDeleted` surfaces it with
+    // `deleted:true` (so Restore is reachable) → restore → visible in the default list
+    // again, and the deleted marker is gone.
+    #[test]
+    fn sc1b_live_include_deleted_surfaces_tombstone_then_restore() {
+        use crate::cli::catalog::{SpawnMode, catalog_path};
+        let _guard = real_catalog_test_guard();
+        let (port, _state, token) = spawn_server();
+        let post = |path: &str, body: &str| {
+            format!(
+                "POST /{path}?token={token} HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+        };
+        let run = crate::default_tab_id();
+        let skill = format!("sc1b-{}", &run[..8.min(run.len())]);
+        let _cleanup = CatalogSkillCleanup(skill.clone());
+
+        let seed = crate::cli::catalog::CatalogCard {
+            skill: Some(skill.clone()),
+            prompt: Some("base".into()),
+            prompt_version: Some(1),
+            schema_version: Some(2),
+            spawn_mode: Some(SpawnMode::Fresh),
+            outcome: Some(crate::cli::catalog::Outcome::Success),
+            retired_at: 1,
+            ..Default::default()
+        };
+        crate::cli::catalog::append_catalog_line(&catalog_path(), &seed).unwrap();
+
+        // delete → tombstoned.
+        assert_eq!(
+            status_code(&request(port, &post(&format!("catalog/{skill}/delete"), "{}"))),
+            200
+        );
+
+        // Default list HIDES it…
+        assert!(
+            !catalog_skills(port, &token)
+                .iter()
+                .any(|s| s["skill"] == serde_json::json!(skill)),
+            "default list hides the tombstoned skill"
+        );
+        // …but ?includeDeleted surfaces it WITH deleted:true (Restore is reachable).
+        let all = catalog_skills_q(port, &token, "includeDeleted=true");
+        let s = all
+            .iter()
+            .find(|s| s["skill"] == serde_json::json!(skill))
+            .expect("include-deleted surfaces it");
+        assert_eq!(
+            s["deleted"],
+            serde_json::json!(true),
+            "the tombstone carries deleted:true (camelCase)"
+        );
+        assert_eq!(
+            s["prompt"],
+            serde_json::json!("base"),
+            "its profile is folded (Restore UI shows it)"
+        );
+
+        // RESTORE → visible in the DEFAULT list again, marker gone.
+        assert_eq!(
+            status_code(&request(port, &post(&format!("catalog/{skill}/restore"), "{}"))),
+            200
+        );
+        assert!(
+            catalog_skills(port, &token)
+                .iter()
+                .any(|s| s["skill"] == serde_json::json!(skill)),
+            "restore brings the skill back to the default list"
+        );
+        let all2 = catalog_skills_q(port, &token, "includeDeleted=true");
+        let s2 = all2
+            .iter()
+            .find(|s| s["skill"] == serde_json::json!(skill))
+            .expect("present");
+        assert!(
+            s2.get("deleted").is_none(),
+            "a restored skill no longer carries the deleted marker"
+        );
+    }
+
+    // AUTH (fail-closed): the retire + catalogue-mutation routes are MASTER-token only.
+    // `retire` isn't in the per-tab share-token action whitelist, and `/catalog/*` is
+    // never under `/tabs/by-id/`, so ANY non-master token hits the auth gate's 401 —
+    // it never reaches the handler. A missing/unknown token is refused, not allowed.
+    #[test]
+    fn catalog_and_retire_routes_are_master_token_only_fail_closed() {
+        let (port, _state, token) = spawn_server();
+        let bogus = "not-the-master-token";
+        for req in [
+            format!("GET /catalog/list?token={bogus} HTTP/1.1\r\n\r\n"),
+            format!("POST /catalog/some-skill/delete?token={bogus} HTTP/1.1\r\nContent-Length: 2\r\n\r\n{{}}"),
+            format!("POST /tabs/by-id/tab-a/retire?token={bogus} HTTP/1.1\r\nContent-Length: 2\r\n\r\n{{}}"),
+        ] {
+            assert_eq!(
+                status_code(&request(port, &req)),
+                401,
+                "non-master token refused fail-closed:\n{req}"
+            );
+        }
+        // Sanity: the master token REACHES the catalog handler (read-only list → 200).
+        let listed = request(port, &format!("GET /catalog/list?token={token} HTTP/1.1\r\n\r\n"));
+        assert_eq!(
+            status_code(&listed),
+            200,
+            "master token reaches the catalog handler\n{listed}"
+        );
     }
 }
