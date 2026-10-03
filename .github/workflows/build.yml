@@ -39,6 +39,14 @@ jobs:
             - name: Install system dependencies
               run: |
                   sudo apt-get update
+                  # Bootstrap, for the proxy's dashboard. It is a runtime
+                  # dependency of the .deb, and the proxy resolves it from
+                  # /usr/share/javascript/bootstrap5 rather than vendoring a
+                  # copy — so without it here the resolver's paths are never
+                  # exercised in CI, and a typo in one reaches production.
+                  # That is not hypothetical: a missing source-map path did.
+                  # The tests skip these assets when absent, so a contributor
+                  # without the package is unaffected.
                   sudo apt-get install -y --no-install-recommends \
                       build-essential \
                       libvulkan-dev \
@@ -51,7 +59,8 @@ jobs:
                       libxcb-shm0-dev \
                       libxcb-xkb-dev \
                       libfontconfig-dev \
-                      libfreetype-dev
+                      libfreetype-dev \
+                      libjs-bootstrap5
             - name: Install Rust toolchain
               uses: dtolnay/rust-toolchain@stable
               with:
@@ -63,6 +72,13 @@ jobs:
                   # Per-branch multi-GB saves evict main's entry from the
                   # repo's 10 GB cache budget; PR runs restore main's.
                   save-if: ${{ github.ref == 'refs/heads/main' }}
+                  # Shared with apt-publish.yml and release.yml. Without this
+                  # rust-cache puts the JOB ID in the key, so three jobs that
+                  # compile the same graph on the same runner each kept their
+                  # own multi-GB entry — and the budget is 10 GB for the repo,
+                  # so they evicted each other and started cold anyway.
+                  shared-key: linux-x64
+
             - name: Build without energy feature
               run: cargo check --locked --no-default-features --features gui
             - name: Build
@@ -73,8 +89,16 @@ jobs:
                   RUSTDOCFLAGS: "-Cinstrument-coverage"
             - name: Build headless
               run: cargo build --locked --no-default-features --features headless,energy
+            # --workspace is load-bearing, not tidiness. tab-atelier-proxy is
+            # a non-default member (see default-members in Cargo.toml), and
+            # --all-targets selects targets WITHIN the selected packages, never
+            # additional packages — so without this the test, clippy and fmt
+            # steps all skip the proxy crate entirely. The only thing that
+            # compiles it in this job is the `cargo deb -p tab-atelier-proxy`
+            # smoke-build near the bottom, which exercises linking and nothing
+            # else.
             - name: Run tests
-              run: cargo test --locked --all-targets --no-fail-fast
+              run: cargo test --workspace --locked --all-targets --no-fail-fast
               env:
                   CARGO_INCREMENTAL: "0"
                   RUSTFLAGS: "-Cinstrument-coverage"
@@ -83,13 +107,27 @@ jobs:
             # the shipped headless .deb) — a differing set compiles the
             # whole crate graph once more just for this step.
             - name: Run headless tests
-              run: cargo test --locked --no-default-features --features headless,energy --no-fail-fast
+              run: cargo test --workspace --locked --no-default-features --features headless,energy --no-fail-fast
+            # The Kiosk's assets are plain ES modules with no toolchain of their
+            # own: node runs them directly, so there is nothing to install and no
+            # npm in this repository. They read `kiosk.js` from the source tree
+            # and do not need the crate built — which matters, since it is not a
+            # default member.
+            #
+            # This ran against the dashboard's copy in #59, which was stacked on
+            # an unmerged branch and never reached `main`; the assets moved here,
+            # so the step moves with them.
+            #
+            # The `*.accept.mjs` beside them are NOT run: they drive a real
+            # browser and need playwright, which this repository does not carry.
+            - name: Run Kiosk asset tests
+              run: crates/tab-atelier-kiosk/assets/run-tests.sh
             - name: Check formatting
-              run: cargo fmt -- --check
+              run: cargo fmt --all -- --check
             - name: Clippy (GUI)
-              run: cargo clippy --all-targets --locked -- -D warnings
+              run: cargo clippy --workspace --all-targets --locked -- -D warnings
             - name: Clippy (headless)
-              run: cargo clippy --no-default-features --features headless,energy --all-targets --locked -- -D warnings
+              run: cargo clippy --workspace --no-default-features --features headless,energy --all-targets --locked -- -D warnings
             - name: Install grcov
               run: |
                   mkdir -p "${HOME}/.local/bin"
@@ -109,23 +147,52 @@ jobs:
                   flags: rust
                   fail_ci_if_error: false
                   token: ${{ secrets.CODECOV_TOKEN }}
+            - name: Install cargo-deb
+              # Prebuilt release binary rather than `cargo install`, which
+              # recompiles the tool from source in each of three workflows
+              # per commit. Version-pinned too — and that is stricter than
+              # the `--locked` it replaces, which pins cargo-deb's
+              # dependencies rather than cargo-deb itself, so the build
+              # tool floated even with it.
+              uses: taiki-e/install-action@v2
+              with:
+                  tool: cargo-deb@3.2.0
             - name: Build .deb packages (smoke-test only)
-              # These debs only feed the integration job below; users
-              # install the ones apt-publish.yml / release.yml build
-              # with the real fat-LTO profile. Env (not Cargo.toml) so
-              # the target/release/ asset paths stay valid.
-              env:
-                  CARGO_PROFILE_RELEASE_LTO: "off"
-                  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+              # These debs feed the integration job below; the ones users
+              # install come from apt-publish.yml / release.yml.
+              #
+              # This step used to override the profile to LTO off /
+              # codegen-units 16 to build them faster. That override was the
+              # ONLY reason this job's release artifacts had a different
+              # fingerprint from apt-publish's, which run concurrently on the
+              # same commit — so the two jobs could never share a cache, and
+              # each recompiled the whole graph. It also meant the integration
+              # test exercised a binary built differently from the shipped one.
+              # Same profile now, one `shared-key` cache between them.
               run: |
-                  cargo install cargo-deb --locked
-                  cargo deb -p tab-atelier --locked
-                  cargo deb -p tab-atelier --variant headless --locked
+                  # `--revision 0ci` marks these as the throwaway build they
+                  # are: same profile as the published nightly, and `0ci`
+                  # sorts below `1` so one can never shadow the other if
+                  # both end up on a machine. Without a version of their own
+                  # every run's artifact was byte-for-byte the same NAME.
+                  DEB_VERSION="$(scripts/deb-version.sh --revision 0ci)"
+                  echo "→ building $DEB_VERSION"
+                  # --dbgsym so this smoke build exercises the same cargo-deb
+                  # invocation the release uses: a flag that only ever runs
+                  # at tag time is a flag that breaks at tag time.
+                  cargo deb -p tab-atelier --locked --deb-version "$DEB_VERSION" --dbgsym --compress-debug-symbols=zlib
+                  cargo deb -p tab-atelier --variant headless --locked --deb-version "$DEB_VERSION" --dbgsym --compress-debug-symbols=zlib
+                  cargo deb -p tab-atelier-proxy --locked --deb-version "$DEB_VERSION" --dbgsym --compress-debug-symbols=zlib
+                  cargo deb -p tab-atelier-kiosk --locked --deb-version "$DEB_VERSION" --dbgsym --compress-debug-symbols=zlib
+                  ls -la target/debian/
             - name: Upload .deb packages
               id: upload-deb
               uses: actions/upload-artifact@v7
               with:
-                  name: tab-atelier-deb
+                  # The commit is in the artifact name as well as in the .deb
+                  # version inside it: downloading two runs' artifacts used to
+                  # give you two files called `tab-atelier-deb.zip`.
+                  name: tab-atelier-deb-${{ github.sha }}
                   path: target/debian/*.deb
                   retention-days: 5
                   # Two .deb files now (GUI + headless). upload-artifact@v7

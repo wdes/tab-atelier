@@ -1,0 +1,850 @@
+// SPDX-License-Identifier: MPL-2.0
+
+//! The whole thing, through the real binary: mint a key with the CLI, start
+//! the server, and spend that key on a request.
+//!
+//! Every other test here calls library functions. This one runs
+//! `tab-atelier-proxy` as a process, which is the only way to catch the class
+//! of bug that actually reached a deployment: the CLI and the server resolving
+//! DIFFERENT directories, so a key minted by one authenticates nothing on the
+//! other, and `admin-token` printing a token the service has never heard of.
+//! A library test cannot see that, because it never asks where the files are.
+
+use std::io::{BufRead, BufReader, Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+
+/// The binary under test, built by cargo for this integration target.
+const BIN: &str = env!("CARGO_BIN_EXE_tab-atelier-proxy");
+
+struct Scratch(PathBuf);
+
+impl Scratch {
+    fn new(name: &str) -> Self {
+        let p = std::env::temp_dir().join(format!("ta-proxy-e2e-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(p.join("home/.claude")).expect("mkdir");
+        // A far-future expiry, so the egress never tries to refresh against
+        // the real OAuth endpoint during a test.
+        std::fs::write(
+            p.join("home/.claude/.credentials.json"),
+            r#"{"claudeAiOauth":{"accessToken":"oat-e2e","refreshToken":"r","expiresAt":9999999999999,"scopes":[]}}"#,
+        )
+        .expect("write creds");
+        Self(p)
+    }
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// A child that is killed when the test ends, however it ends.
+struct Serving(Child);
+impl Drop for Serving {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Run the CLI exactly as an operator would, with the same environment the
+/// server will get. If these two disagree about the state directory, the whole
+/// point of the test is lost — so they are built from one place.
+fn cli(scratch: &Path, args: &[&str]) -> String {
+    let out = Command::new(BIN)
+        .args(args)
+        .env("TAB_ATELIER_PROXY_CONFIG", scratch.join("config"))
+        .env("TAB_ATELIER_PROXY_STATE", scratch.join("state"))
+        .env("HOME", scratch.join("home"))
+        .output()
+        .expect("run the CLI");
+    assert!(
+        out.status.success(),
+        "`{}` failed: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// A port nothing is listening on. Bound and released, which races in
+/// principle and does not in practice on a test machine.
+fn free_port() -> u16 {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    l.local_addr().expect("addr").port()
+}
+
+/// A stand-in Anthropic that reports usage, so the accounting has something
+/// real to record.
+fn mock_upstream() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock");
+    let port = listener.local_addr().expect("addr").port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut sock) = stream else { break };
+            let _ = sock.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+            // Drain head + declared body before answering: replying and
+            // closing mid-body turns into a connection reset.
+            let mut req = Vec::new();
+            let mut tmp = [0u8; 2048];
+            let mut need: Option<usize> = None;
+            loop {
+                match sock.read(&mut tmp) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => req.extend_from_slice(&tmp[..n]),
+                }
+                if need.is_none()
+                    && let Some(pos) = req.windows(4).position(|w| w == b"\r\n\r\n")
+                {
+                    let len = String::from_utf8_lossy(&req[..pos])
+                        .lines()
+                        .find_map(|l| {
+                            let (k, v) = l.split_once(':')?;
+                            k.eq_ignore_ascii_case("content-length")
+                                .then(|| v.trim().parse::<usize>().ok())?
+                        })
+                        .unwrap_or(0);
+                    need = Some(pos + 4 + len);
+                }
+                if need.is_some_and(|n| req.len() >= n) {
+                    break;
+                }
+            }
+            let body = r#"{"model":"claude-sonnet-5","usage":{"input_tokens":11,"output_tokens":7}}"#;
+            let _ = write!(
+                sock,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = sock.flush();
+        }
+    });
+    port
+}
+
+/// A stand-in upstream that keeps the request body it was sent.
+///
+/// The other mock answers; this one also records, because the question here is
+/// what the proxy *wrote* upstream, not what came back.
+fn capturing_upstream(capture: PathBuf) -> u16 {
+    capturing_upstream_reporting("deepseek-flash", capture)
+}
+
+/// The same, but answering under a chosen model name.
+///
+/// The name in the response is not decoration: it is what the proxy bills the
+/// hour at, so what a vendor echoes about itself is the whole question.
+fn capturing_upstream_reporting(model: &str, capture: PathBuf) -> u16 {
+    let model = model.to_owned();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock");
+    let port = listener.local_addr().expect("addr").port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut sock) = stream else { break };
+            let _ = sock.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+            let mut req = Vec::new();
+            let mut tmp = [0u8; 2048];
+            let mut head: Option<usize> = None;
+            let mut need: Option<usize> = None;
+            loop {
+                match sock.read(&mut tmp) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => req.extend_from_slice(&tmp[..n]),
+                }
+                if head.is_none()
+                    && let Some(pos) = req.windows(4).position(|w| w == b"\r\n\r\n")
+                {
+                    let len = String::from_utf8_lossy(&req[..pos])
+                        .lines()
+                        .find_map(|l| {
+                            let (k, v) = l.split_once(':')?;
+                            k.eq_ignore_ascii_case("content-length")
+                                .then(|| v.trim().parse::<usize>().ok())?
+                        })
+                        .unwrap_or(0);
+                    head = Some(pos + 4);
+                    need = Some(pos + 4 + len);
+                }
+                if need.is_some_and(|n| req.len() >= n) {
+                    break;
+                }
+            }
+            if let Some(start) = head {
+                let _ = std::fs::write(&capture, &req[start..]);
+            }
+            let body = format!(
+                r#"{{"model":"{model}","content":[{{"type":"text","text":"ok"}}],"usage":{{"input_tokens":11,"output_tokens":7}}}}"#
+            );
+            let _ = write!(
+                sock,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = sock.flush();
+        }
+    });
+    port
+}
+
+/// One HTTP request, returning the whole response.
+fn http(port: u16, req: &str) -> String {
+    let mut sock = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    let _ = sock.set_read_timeout(Some(std::time::Duration::from_secs(10)));
+    sock.write_all(req.as_bytes()).expect("write");
+    let mut out = Vec::new();
+    let mut tmp = [0u8; 4096];
+    while let Ok(n) = sock.read(&mut tmp) {
+        if n == 0 {
+            break;
+        }
+        out.extend_from_slice(&tmp[..n]);
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn wait_until_listening(port: u16, child: &mut Child) {
+    for _ in 0..100 {
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            return;
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            panic!("the proxy exited before listening: {status}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    panic!("the proxy never started listening on {port}");
+}
+
+/// CLI mints a key → server accepts it → the call is billed to that account.
+/// The credential-repair route: same boundary rules as everything else, plus
+/// the guard that stops it being a way to repoint a proxy.
+///
+/// Its own function because the walkthrough above is already at the length
+/// clippy allows, and this is a self-contained property.
+fn credential_repair_is_guarded(port: u16, key: &str) {
+    // 6b. The credential-repair route: same key, same boundary rules, and the
+    //     guard that stops it being a way to repoint a proxy.
+    let creds = r#"{"claudeAiOauth":{"accessToken":"a","refreshToken":"r","expiresAt":1}}"#;
+    let post_creds = |auth: &str| {
+        http(
+            port,
+            &format!(
+                "POST /me/credentials HTTP/1.1\r\nHost: x\r\n{auth}\r\n\
+                 Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{creds}",
+                creds.len()
+            ),
+        )
+    };
+    let no_key = post_creds("Connection: close");
+    assert!(
+        no_key.starts_with("HTTP/1.1 401"),
+        "credential repair must require a key:\n{no_key}"
+    );
+    // With a valid key it still refuses, because this scratch proxy has no
+    // recorded identity to check a replacement against. Bootstrapping is a
+    // host-side act on purpose: with nothing on record, "same account" cannot
+    // be enforced, and a guard that cannot be enforced must not be skipped.
+    let bootstrap = post_creds(&format!("x-api-key: {key}"));
+    assert!(
+        bootstrap.starts_with("HTTP/1.1 409"),
+        "expected a refusal naming the missing identity:\n{bootstrap}"
+    );
+    assert!(
+        bootstrap.contains("no identity on record"),
+        "the refusal must say what to do about it:\n{bootstrap}"
+    );
+    // And it is a POST-only route.
+    let wrong_method = http(
+        port,
+        &format!("GET /me/credentials HTTP/1.1\r\nHost: x\r\nx-api-key: {key}\r\nConnection: close\r\n\r\n"),
+    );
+    assert!(
+        wrong_method.starts_with("HTTP/1.1 405"),
+        "credential repair is POST only:\n{wrong_method}"
+    );
+}
+
+#[test]
+fn a_key_minted_by_the_cli_works_against_the_running_server() {
+    let scratch = Scratch::new("full");
+    let upstream = mock_upstream();
+    let port = free_port();
+
+    // 1. Add an account, then mint a key for a named place. `add` deliberately
+    //    mints nothing: a key is named for the machine it lives on, and one
+    //    handed out at signup is the one that gets deployed unnamed. The key
+    //    is printed once, here and nowhere else, which is the behaviour this
+    //    asserts by having to parse it out of the output.
+    let added = cli(scratch.path(), &["add", "Ada", "Lovelace", "ada@example.org"]);
+    assert!(
+        !added.contains("key: "),
+        "creating an account must not mint a key:\n{added}"
+    );
+    let minted = cli(scratch.path(), &["add-key", "ada@example.org", "laptop"]);
+    let key = minted
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("key: "))
+        .expect("the CLI prints the key exactly once")
+        .to_owned();
+    assert!(key.starts_with("tap_"), "key looks wrong: {key}");
+
+    // 2. And the admin token, which must be the SAME one the server uses —
+    //    the bug that reached production was these two disagreeing.
+    let admin = cli(scratch.path(), &["admin-token"]).trim().to_owned();
+    assert!(admin.starts_with("tap_"));
+    assert_ne!(admin, key, "the admin token and a user key are different credentials");
+
+    // 3. Start the server on the same directories.
+    let mut child = Command::new(BIN)
+        .args(["serve", "--listen", &format!("127.0.0.1:{port}")])
+        .env("TAB_ATELIER_PROXY_CONFIG", scratch.path().join("config"))
+        .env("TAB_ATELIER_PROXY_STATE", scratch.path().join("state"))
+        .env("HOME", scratch.path().join("home"))
+        .env("TAB_ATELIER_PROXY_UPSTREAM", format!("http://127.0.0.1:{upstream}"))
+        .env("RUST_LOG", "warn")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn the proxy");
+    wait_until_listening(port, &mut child);
+    let _serving = Serving(child);
+
+    // 4. Spend the key on a real proxied request.
+    let payload = r#"{"model":"claude-sonnet-5","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}"#;
+    let resp = http(
+        port,
+        &format!(
+            "POST /relay/anthropic/v1/messages HTTP/1.1\r\nHost: x\r\nx-api-key: {key}\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
+            payload.len()
+        ),
+    );
+    assert!(resp.starts_with("HTTP/1.1 200"), "proxied call failed:\n{resp}");
+    assert!(
+        resp.contains("x-tab-atelier-proxy-route:"),
+        "the response must name where it was routed:\n{resp}"
+    );
+
+    // 5. The account's own statistics, opened by its own key — the route an
+    //    agent is given.
+    let me = http(
+        port,
+        &format!("GET /me/usage HTTP/1.1\r\nHost: x\r\nx-api-key: {key}\r\nConnection: close\r\n\r\n"),
+    );
+    assert!(me.starts_with("HTTP/1.1 200"), "/me/usage failed:\n{me}");
+    assert!(me.contains("ada@example.org"), "it should answer for the caller:\n{me}");
+    assert!(
+        me.contains("\"all_time\""),
+        "and report the windows an agent asks about:\n{me}"
+    );
+
+    // 6. A user key must NOT open the admin API. This is the boundary the
+    //    whole design rests on, checked through the real server.
+    let refused = http(
+        port,
+        &format!("GET /api/users HTTP/1.1\r\nHost: x\r\nx-api-key: {key}\r\nConnection: close\r\n\r\n"),
+    );
+    assert!(
+        refused.starts_with("HTTP/1.1 401"),
+        "a user key opened the admin API:\n{refused}"
+    );
+
+    credential_repair_is_guarded(port, &key);
+
+    // 7. The admin token does, and sees the account the CLI created.
+    let users = http(
+        port,
+        &format!("GET /api/users HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {admin}\r\nConnection: close\r\n\r\n"),
+    );
+    assert!(users.starts_with("HTTP/1.1 200"), "admin listing failed:\n{users}");
+    assert!(users.contains("ada@example.org"), "{users}");
+
+    // 8. The spend was recorded, under the account, with the model that was
+    //    billed — on disk, in the layout the dashboard reads.
+    let usage_root = scratch.path().join("state/usage");
+    let mut found = None;
+    for _ in 0..50 {
+        if let Some(f) = first_usage_file(&usage_root) {
+            found = Some(f);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let file = found.unwrap_or_else(|| panic!("no usage file appeared under {}", usage_root.display()));
+    let recorded = std::fs::read_to_string(&file).expect("read usage");
+    assert!(
+        recorded.contains("claude-sonnet-5"),
+        "the hour must record which model was billed: {recorded}"
+    );
+    assert!(recorded.contains("\"calls\":1"), "{recorded}");
+}
+
+/// The first `*_usage.json` under any account directory.
+fn first_usage_file(root: &Path) -> Option<PathBuf> {
+    for account in std::fs::read_dir(root).ok()?.flatten() {
+        for day in std::fs::read_dir(account.path()).ok()?.flatten() {
+            let p = day.path();
+            if p.to_string_lossy().ends_with("_usage.json") {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
+/// A key the CLI revoked stops working on the server it is already running
+/// against — without a restart, because the server re-reads the account file.
+#[test]
+fn the_cli_and_the_server_agree_on_where_the_files_are() {
+    let scratch = Scratch::new("agree");
+    let port = free_port();
+
+    // Mint through the CLI…
+    cli(scratch.path(), &["add", "Grace", "Hopper", "grace@example.org"]);
+    let minted = cli(scratch.path(), &["add-key", "grace@example.org", "laptop"]);
+    let key = minted
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("key: "))
+        .expect("key")
+        .to_owned();
+    let admin = cli(scratch.path(), &["admin-token"]).trim().to_owned();
+
+    // …and read it back through the server. If the two resolved different
+    // directories — the failure that reached a live deployment — the account
+    // simply would not be there.
+    let mut child = Command::new(BIN)
+        .args(["serve", "--listen", &format!("127.0.0.1:{port}")])
+        .env("TAB_ATELIER_PROXY_CONFIG", scratch.path().join("config"))
+        .env("TAB_ATELIER_PROXY_STATE", scratch.path().join("state"))
+        .env("HOME", scratch.path().join("home"))
+        .env("RUST_LOG", "warn")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    wait_until_listening(port, &mut child);
+    let mut serving = Serving(child);
+
+    let users = http(
+        port,
+        &format!("GET /api/users HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {admin}\r\nConnection: close\r\n\r\n"),
+    );
+    assert!(
+        users.contains("grace@example.org"),
+        "the server did not see the account the CLI created — the two are reading different \
+         directories:\n{users}"
+    );
+    assert!(key.starts_with("tap_"));
+
+    // The admin token the CLI printed is the one the server accepts. A second
+    // token minted into another directory is exactly how a deployment ends up
+    // answering "admin token required" to a token that looks right.
+    assert!(users.starts_with("HTTP/1.1 200"), "{users}");
+
+    // And nothing was written outside the directories we named.
+    let stderr = serving.0.stderr.take().map(|e| {
+        let mut s = String::new();
+        let _ = BufReader::new(e).read_line(&mut s);
+        s
+    });
+    assert!(
+        !scratch.path().join("home/.config").exists(),
+        "the server wrote into $HOME/.config despite an explicit config dir: {stderr:?}"
+    );
+}
+
+/// An hour a saved-without-its-rate provider served records what it cost.
+///
+/// The config is the shape the provider form writes: `id:class:relative_cost`
+/// and no rate, because the form has no field for one. That is what every
+/// provider in production looks like after a single save, and it is the whole
+/// reason the money unit was empty — the hop kept serving, kept counting tokens,
+/// and had no rate to charge them at. `relative_cost` is a ranking number the
+/// router orders providers by, not a price, so it cannot stand in for one.
+///
+/// The amount asserted is worked out by hand from the rates the catalogue
+/// publishes, so this fails if the arithmetic drifts: the mock reports 11
+/// uncached input tokens and 7 generated ones, and at $0.15/1M in and $0.60/1M
+/// out that is 1.65 and 4.2 micro-dollars, floored to whole micro-dollars —
+/// which is what an hour stores.
+#[test]
+fn a_provider_that_lost_its_rate_still_records_a_cost() {
+    let scratch = Scratch::new("rate-repair");
+    let upstream = capturing_upstream(scratch.path().join("captured.json"));
+    let port = free_port();
+
+    cli(scratch.path(), &["add", "Ada", "Lovelace", "ada@example.org"]);
+    let minted = cli(scratch.path(), &["add-key", "ada@example.org", "laptop"]);
+    let key = minted
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("key: "))
+        .expect("the CLI prints the key exactly once")
+        .to_owned();
+
+    let config = scratch.path().join("config");
+    std::fs::create_dir_all(&config).expect("config dir");
+    let key_file = config.join("deepseek.key");
+    std::fs::write(&key_file, "sk-mock\n").expect("key file");
+    let providers = format!(
+        concat!(
+            r#"{{"providers":[{{"id":"deepseek","label":"DeepSeek (mock)","wire":"anthropic","#,
+            r#""base_url":"http://127.0.0.1:{upstream}","auth":{{"kind":"api_key_file","path":"{key}"}},"#,
+            r#""models":[{{"id":"deepseek-flash","class":"balanced","relative_cost":15}}],"#,
+            r#""preference":0,"enabled":true}}],"#,
+            r#""mappings":[{{"from":"claude-sonnet-5","to":"deepseek-flash"}}]}}"#,
+        ),
+        upstream = upstream,
+        key = key_file.display(),
+    );
+    std::fs::write(config.join("providers.json"), providers).expect("providers.json");
+
+    let mut child = Command::new(BIN)
+        .args(["serve", "--listen", &format!("127.0.0.1:{port}")])
+        .env("TAB_ATELIER_PROXY_CONFIG", &config)
+        .env("TAB_ATELIER_PROXY_STATE", scratch.path().join("state"))
+        .env("HOME", scratch.path().join("home"))
+        .env("RUST_LOG", "warn")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn the proxy");
+    wait_until_listening(port, &mut child);
+    let _serving = Serving(child);
+
+    let payload = concat!(
+        r#"{"model":"claude-sonnet-5","max_tokens":16,"#,
+        r#""messages":[{"role":"user","content":"hi"}]}"#,
+    );
+    let resp = http(
+        port,
+        &format!(
+            "POST /relay/anthropic/v1/messages HTTP/1.1\r\nHost: x\r\nx-api-key: {key}\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+            payload.len()
+        ),
+    );
+    assert!(resp.starts_with("HTTP/1.1 200"), "proxied call failed:\n{resp}");
+
+    let usage_root = scratch.path().join("state/usage");
+    let mut found = None;
+    for _ in 0..50 {
+        if let Some(f) = first_usage_file(&usage_root) {
+            found = Some(f);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let file = found.unwrap_or_else(|| panic!("no usage file appeared under {}", usage_root.display()));
+    let recorded = std::fs::read_to_string(&file).expect("read usage");
+
+    assert!(
+        recorded.contains("deepseek-flash"),
+        "the hour must record the model the vendor billed: {recorded}"
+    );
+    assert!(
+        recorded.contains(r#""cost":{"in_micro":1,"out_micro":4}"#),
+        "the hour must record what it cost, priced where it was served \
+         rather than left empty for want of a rate: {recorded}"
+    );
+}
+
+/// An hour the vendor answered under a legacy name is still billed.
+///
+/// This is the money graph's other loose end, and the one that survives every
+/// other repair: the rate is looked up from the model name the *upstream echoed
+/// about itself*, and a vendor may answer under a name it still accepts for a
+/// model newer than it — `DeepSeek` serves and bills `deepseek-v4-flash` at
+/// Flash's price while the catalogue holds only `deepseek-flash`. Requiring an
+/// exact match threw the hour away entirely: no stored cost, no `cost_model`,
+/// and a dashboard that drew no money even though the tokens were spent.
+///
+/// So this proves the two halves at once — the hour keeps its cost, and it
+/// names the model the price came from rather than the string that arrived.
+#[test]
+fn an_hour_answered_under_a_legacy_model_name_is_still_priced() {
+    let scratch = Scratch::new("legacy-model-name");
+    let upstream = capturing_upstream_reporting("deepseek-v4-flash", scratch.path().join("captured.json"));
+    let port = free_port();
+
+    cli(scratch.path(), &["add", "Ada", "Lovelace", "ada@example.org"]);
+    let minted = cli(scratch.path(), &["add-key", "ada@example.org", "laptop"]);
+    let key = minted
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("key: "))
+        .expect("the CLI prints the key exactly once")
+        .to_owned();
+
+    let config = scratch.path().join("config");
+    std::fs::create_dir_all(&config).expect("config dir");
+    let key_file = config.join("deepseek.key");
+    std::fs::write(&key_file, "sk-mock\n").expect("key file");
+    let providers = format!(
+        concat!(
+            r#"{{"providers":[{{"id":"deepseek","label":"DeepSeek (mock)","wire":"anthropic","#,
+            r#""base_url":"http://127.0.0.1:{upstream}","auth":{{"kind":"api_key_file","path":"{key}"}},"#,
+            r#""models":[{{"id":"deepseek-flash","class":"balanced","relative_cost":15}}],"#,
+            r#""preference":0,"enabled":true}}],"#,
+            r#""mappings":[{{"from":"claude-sonnet-5","to":"deepseek-flash"}}]}}"#,
+        ),
+        upstream = upstream,
+        key = key_file.display(),
+    );
+    std::fs::write(config.join("providers.json"), providers).expect("providers.json");
+
+    let mut child = Command::new(BIN)
+        .args(["serve", "--listen", &format!("127.0.0.1:{port}")])
+        .env("TAB_ATELIER_PROXY_CONFIG", &config)
+        .env("TAB_ATELIER_PROXY_STATE", scratch.path().join("state"))
+        .env("HOME", scratch.path().join("home"))
+        .env("RUST_LOG", "warn")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn the proxy");
+    wait_until_listening(port, &mut child);
+    let _serving = Serving(child);
+
+    let payload = concat!(
+        r#"{"model":"claude-sonnet-5","max_tokens":16,"#,
+        r#""messages":[{"role":"user","content":"hi"}]}"#,
+    );
+    let resp = http(
+        port,
+        &format!(
+            "POST /relay/anthropic/v1/messages HTTP/1.1\r\nHost: x\r\nx-api-key: {key}\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+            payload.len()
+        ),
+    );
+    assert!(resp.starts_with("HTTP/1.1 200"), "proxied call failed:\n{resp}");
+
+    let usage_root = scratch.path().join("state/usage");
+    let mut found = None;
+    for _ in 0..50 {
+        if let Some(f) = first_usage_file(&usage_root) {
+            found = Some(f);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let file = found.unwrap_or_else(|| panic!("no usage file appeared under {}", usage_root.display()));
+    let recorded = std::fs::read_to_string(&file).expect("read usage");
+
+    assert!(
+        recorded.contains(r#""cost":{"in_micro":1,"out_micro":4}"#),
+        "an hour the vendor answered under a legacy name still cost money, and \
+         saying otherwise is the empty graph: {recorded}"
+    );
+
+    // And it survives to the wire the dashboard actually reads. `cost_model` is
+    // the rate's model, not the name the vendor echoed: the figures come from
+    // `deepseek-flash`'s price even though the response said `deepseek-v4-flash`,
+    // so the panel can say which rate it billed at instead of implying the
+    // catalogue holds a model it does not.
+    let admin = cli(scratch.path(), &["admin-token"]).trim().to_owned();
+    let usage = http(
+        port,
+        &format!(
+            "GET /api/usage HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {admin}\r\n\
+             Connection: close\r\n\r\n"
+        ),
+    );
+    assert!(usage.starts_with("HTTP/1.1 200"), "usage failed:\n{usage}");
+    // `series_hourly` is what the money chart is drawn from, and the billed
+    // hour in it must carry the charge. Asserting on the whole body would pass
+    // on the totals alone: they are summed straight off the account and stayed
+    // right while the series — the only thing the graph reads — was blank, which
+    // is exactly why this looked like "the API does not return the billed
+    // prices" rather than like a wrong figure anywhere.
+    let series = usage
+        .split(r#""series_hourly":"#)
+        .nth(1)
+        .and_then(|rest| rest.split(']').next())
+        .expect("the response carries the hourly series the chart plots");
+    assert!(
+        series.contains(r#""cost_in_micro":1"#),
+        "the hour the chart draws must carry its billed price, not null: {series}"
+    );
+    assert!(
+        series.contains(r#""cost_out_micro":4"#),
+        "both halves of the charge reach the series: {series}"
+    );
+    assert!(
+        usage.contains(r#""cost_model":"deepseek-flash""#),
+        "and it names the rate that was used, not the name the vendor echoed: {usage}"
+    );
+}
+
+/// The identity rewrite reaches tool descriptions, proven on the wire.
+///
+/// This is the regression it was written for and missed. Claude Code puts its
+/// commit and PR conventions in the `Bash` tool's description, not the system
+/// prompt, so a rewrite that walked `system` alone left `Co-Authored-By: Claude
+/// …` sitting in the body sent to `DeepSeek`. The mock upstream keeps what it was
+/// sent, so the assertion is over the bytes that would have left the machine.
+#[test]
+fn a_non_anthropic_request_carries_no_claude_attribution() {
+    let scratch = Scratch::new("identity-live");
+    let capture = scratch.path().join("captured-request.json");
+    let upstream = capturing_upstream(capture.clone());
+    let port = free_port();
+
+    cli(scratch.path(), &["add", "Ada", "Lovelace", "ada@example.org"]);
+    let minted = cli(scratch.path(), &["add-key", "ada@example.org", "laptop"]);
+    let key = minted
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("key: "))
+        .expect("the CLI prints the key exactly once")
+        .to_owned();
+
+    // A DeepSeek-shaped provider pointed at the mock. The id contains
+    // "deepseek" on purpose: that substring is what selects the rewrite.
+    let config = scratch.path().join("config");
+    std::fs::create_dir_all(&config).expect("config dir");
+    let key_file = config.join("deepseek.key");
+    std::fs::write(&key_file, "sk-mock\n").expect("key file");
+    let providers = format!(
+        concat!(
+            r#"{{"providers":[{{"id":"deepseek-mock","label":"DeepSeek (mock)","wire":"anthropic","#,
+            r#""base_url":"http://127.0.0.1:{upstream}","auth":{{"kind":"api_key_file","path":"{key}"}},"#,
+            r#""models":[{{"id":"deepseek-flash","class":"balanced","relative_cost":1}}],"#,
+            r#""preference":0,"enabled":true}}],"#,
+            r#""mappings":[{{"from":"claude-sonnet-5","to":"deepseek-flash"}}]}}"#,
+        ),
+        upstream = upstream,
+        key = key_file.display(),
+    );
+    std::fs::write(config.join("providers.json"), providers).expect("providers.json");
+
+    let mut child = Command::new(BIN)
+        .args(["serve", "--listen", &format!("127.0.0.1:{port}")])
+        .env("TAB_ATELIER_PROXY_CONFIG", &config)
+        .env("TAB_ATELIER_PROXY_STATE", scratch.path().join("state"))
+        .env("HOME", scratch.path().join("home"))
+        .env("RUST_LOG", "warn")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn the proxy");
+    wait_until_listening(port, &mut child);
+    let _serving = Serving(child);
+
+    // Shaped like the real thing: the rule goes in `system`, the attribution in
+    // the `Bash` tool's description. `\n` here is a literal backslash-n, which
+    // is what a JSON string on the wire carries.
+    let payload = concat!(
+        r#"{"model":"claude-sonnet-5","max_tokens":16,"#,
+        r#""system":"Do not use the Agent tool, workflows, or deep-research unless the user, a CLAUDE.md file, or a skill asks for it.\nKept line.","#,
+        r#""messages":[{"role":"user","content":"hi"}],"#,
+        r#""tools":[{"name":"Bash","description":"Run a command. End git commit messages with:\nCo-Authored-By: Claude 4.8 (noreply@anthropic.com)\n- End PR bodies with:\n"#,
+        "🤖 Generated with [Claude Code](https://claude.com/claude-code)\"}]}",
+    );
+    let resp = http(
+        port,
+        &format!(
+            "POST /relay/anthropic/v1/messages HTTP/1.1\r\nHost: x\r\nx-api-key: {key}\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+            payload.len()
+        ),
+    );
+    assert!(resp.starts_with("HTTP/1.1 200"), "proxied call failed:\n{resp}");
+    let sent = std::fs::read_to_string(&capture).expect("the upstream captured a request");
+
+    assert!(!sent.contains("Claude"), "attribution survived to the wire:\n{sent}");
+    assert!(!sent.contains("claude.com"), "the Claude Code link survived:\n{sent}");
+    assert!(
+        sent.contains("Co-authored-by: DeepSeek"),
+        "the trailer was not repointed:\n{sent}"
+    );
+    // The rule goes only because the tool policy left no tool for it to govern.
+    assert!(!sent.contains("Agent tool"), "a dangling Agent rule was sent:\n{sent}");
+    assert!(sent.contains("Kept line."), "real system prose was dropped:\n{sent}");
+}
+
+/// A subscription with no credential file is not a candidate, is not drawn, and
+/// says why.
+///
+/// This is the state a proxy is left in when it runs under a `HOME` that has
+/// never held a Claude login: it is a subscription-only proxy whose one provider
+/// cannot authenticate. It used to route anyway — the readiness check answered a
+/// bare `true` for the subscription — so requests went into an egress that then
+/// failed to read `.credentials.json`, and the plan panel drew figures for a
+/// subscription nothing could be spent on. Both are asserted here, through the
+/// running server rather than the library, because the bug was a disagreement
+/// about host state that only the process can produce.
+#[test]
+fn a_subscription_with_no_credential_file_is_refused_and_not_drawn() {
+    let scratch = Scratch::new("keyless");
+    // The state under test, and the whole of the setup: every other test's
+    // `Scratch` writes this file, so removing it is what a never-logged-in host
+    // looks like.
+    std::fs::remove_file(scratch.path().join("home/.claude/.credentials.json")).expect("remove creds");
+    let port = free_port();
+
+    // An account and a key, so the request gets past authentication and reaches
+    // the routing decision this test is about — a 401 would prove nothing.
+    cli(scratch.path(), &["add", "Keyless", "Host", "keyless@example.org"]);
+    let minted = cli(scratch.path(), &["add-key", "keyless@example.org", "laptop"]);
+    let key = minted
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("key: "))
+        .expect("the CLI prints the key exactly once")
+        .to_owned();
+    let admin = cli(scratch.path(), &["admin-token"]).trim().to_owned();
+
+    let mut child = Command::new(BIN)
+        .args(["serve", "--listen", &format!("127.0.0.1:{port}")])
+        .env("TAB_ATELIER_PROXY_CONFIG", scratch.path().join("config"))
+        .env("TAB_ATELIER_PROXY_STATE", scratch.path().join("state"))
+        .env("HOME", scratch.path().join("home"))
+        .env("RUST_LOG", "warn")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn the proxy");
+    wait_until_listening(port, &mut child);
+    let _serving = Serving(child);
+
+    // 1. The graph is not drawn, because there is no plan being spent. The
+    //    router's own answer, not the dashboard's guess.
+    let pressure = http(
+        port,
+        &format!("GET /api/pressure HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {admin}\r\nConnection: close\r\n\r\n"),
+    );
+    assert!(pressure.starts_with("HTTP/1.1 200"), "pressure failed:\n{pressure}");
+    assert!(
+        pressure.contains("\"available\":false"),
+        "the plan must say there is nothing to report on:\n{pressure}"
+    );
+
+    // 2. The request is refused rather than routed into an egress that cannot
+    //    authenticate, and the refusal names the file that would fix it instead
+    //    of leaving a bare "no provider".
+    let payload = r#"{"model":"claude-sonnet-5","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}"#;
+    let resp = http(
+        port,
+        &format!(
+            "POST /relay/anthropic/v1/messages HTTP/1.1\r\nHost: x\r\nx-api-key: {key}\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+            payload.len()
+        ),
+    );
+    assert!(
+        resp.starts_with("HTTP/1.1 503"),
+        "a keyless subscription must not be routed to:\n{resp}"
+    );
+    assert!(
+        resp.contains(".credentials.json"),
+        "the refusal must name the file that would fix it:\n{resp}"
+    );
+    assert!(
+        resp.contains("provider anthropic"),
+        "and the provider the file belongs to:\n{resp}"
+    );
+}

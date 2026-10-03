@@ -1,6 +1,4 @@
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// SPDX-License-Identifier: MPL-2.0
 
 //! The alacritty [`EventListener`] both editions attach to their `Term`.
 //!
@@ -36,17 +34,43 @@ pub struct EventProxy {
     /// into the parser thread.
     #[cfg(feature = "gui")]
     theme: Arc<Mutex<ThemeName>>,
+    /// Per-tab background tint (`#RRGGBB` packed), mirrored from
+    /// `TerminalView::set_bg_override`. An app that asks for the background
+    /// (OSC 11) must be told the colour we actually paint, or it computes its
+    /// own highlights against the theme's colour and they clash — which is
+    /// exactly what happens to Claude Code's submitted input line.
+    #[cfg(feature = "gui")]
+    bg_override: Arc<Mutex<Option<u32>>>,
     /// Flipped by `ChildExit` — alacritty's event loop already watches the PTY
     /// child, so the shell's death arrives as an event instead of a `/proc`
     /// poll. Shared with `TerminalView::exited`.
     #[cfg(feature = "gui")]
     pub exited: Arc<std::sync::atomic::AtomicBool>,
+    /// Text a program in the tab asked to put on the clipboard (OSC 52).
+    ///
+    /// A slot rather than a direct copy, because the copy has to happen on the UI
+    /// thread: writing to the clipboard needs gpui's `App`, and this callback runs on
+    /// the parser thread with none. So it is filled here and drained by the app's
+    /// sweep, the same arrangement as [`Self::exited`].
+    ///
+    /// `Option` rather than a bool because the *text* is the message. A second write
+    /// before the drain replaces the first, which is the right resolution: a clipboard
+    /// holds one value, and the later copy is the one the operator just asked for.
+    #[cfg(feature = "gui")]
+    pub clipboard: Arc<Mutex<Option<String>>>,
 }
 
 impl EventProxy {
     pub fn set_notifier(&self, sender: EventLoopSender) {
         if let Ok(mut slot) = self.notifier.lock() {
             *slot = Some(sender);
+        }
+    }
+
+    #[cfg(feature = "gui")]
+    pub fn set_bg_override(&self, rgb: Option<u32>) {
+        if let Ok(mut b) = self.bg_override.lock() {
+            *b = rgb;
         }
     }
 
@@ -67,8 +91,28 @@ impl EventListener for EventProxy {
                 self.exited.store(true, std::sync::atomic::Ordering::Relaxed);
                 return;
             }
+            // A clipboard **write** — OSC 52 — from whatever is running in the tab.
+            //
+            // catbus-agent uses this to put its raw markdown on the clipboard, because it
+            // is a TUI and has no clipboard of its own: the clipboard belongs to the
+            // terminal it runs inside, and this is the sequence asking for it. The text
+            // arrives already decoded by alacritty — it strips the base64 and the
+            // terminator — so it is stored as it is.
+            //
+            // Deliberately *not* routed through the input channel below: that sends
+            // bytes **to** the pty as though they had been typed, which would write the
+            // clipboard value back into the child.
+            #[cfg(feature = "gui")]
+            AlacrittyEvent::ClipboardStore(_, text) => {
+                if let Ok(mut slot) = self.clipboard.lock() {
+                    *slot = Some(text);
+                }
+                return;
+            }
             // Answer OSC colour queries (OSC 4 palette / 10 fg / 11 bg /
-            // 12 cursor). Without a reply the query times out and the app
+            // 12 cursor).
+            //
+            // Without a reply the query times out and the app
             // assumes a default (near-black) background — Claude Code then
             // computes its diff highlight colours for that imagined bg, and
             // those clash with our real navy theme (added lines render a
@@ -77,7 +121,8 @@ impl EventListener for EventProxy {
             #[cfg(feature = "gui")]
             AlacrittyEvent::ColorRequest(index, formatter) => {
                 let theme = self.theme.lock().map_or_else(|_| ThemeName::default(), |t| *t);
-                formatter(crate::theme::theme(theme).color_index_to_rgb(index)).into_bytes()
+                let tint = self.bg_override.lock().map_or(None, |b| *b);
+                formatter(crate::theme::theme(theme).with_term_bg(tint).color_index_to_rgb(index)).into_bytes()
             }
             _ => return,
         };

@@ -1,0 +1,15 @@
+#!/bin/sh
+# purge removes the service account but NOT /var/lib/tab-atelier-proxy: it holds
+# the account list, and deleting a package should not silently revoke everyone's
+# access with no way back. Remove it by hand if that is what you meant.
+set -e
+case "$1" in
+    purge)
+        if getent passwd tab-atelier-proxy >/dev/null; then
+            deluser --system tab-atelier-proxy >/dev/null 2>&1 || true
+        fi
+        echo "note: /var/lib/tab-atelier-proxy kept (accounts + admin token) — remove it by hand if you meant to."
+        ;;
+esac
+#DEBHELPER#
+exit 0

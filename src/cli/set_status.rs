@@ -1,69 +1,80 @@
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// SPDX-License-Identifier: MPL-2.0
 
 //! `tab-atelier set-status <state> [--label …] [--session …] [--kind …] [--plan]`
 //!
 //! Tiny CLI for tools (catbus-agent, shell hooks, …) running inside a
-//! tab-atelier tab to publish a per-tab agent state. Reads `_TAB_ID`,
-//! `TAB_ATELIER_API_URL`, `TAB_ATELIER_API_TOKEN` from env. Silently
-//! no-ops (exit 0) when those aren't set so a shell rc file calling
-//! it outside a tab doesn't spam errors.
+//! tab-atelier tab to publish a per-tab agent state. Reads `_TAB_ID` from
+//! env and finds the API through the shared discovery in
+//! [`crate::cli::client`] — env vars first, then the daemon's token file,
+//! which is how it reaches an instance running as a system service.
+//! Silently no-ops (exit 0) outside a tab so a shell rc file calling it
+//! doesn't spam errors.
 
-use std::time::Duration;
+/// `tab-atelier set-status <state> [--label …] [--session …] …`
+#[derive(clap::Parser, Debug)]
+#[command(
+    name = "tab-atelier set-status",
+    about = "Publish this tab's agent state, shown as the tab's LED"
+)]
+struct Cli {
+    /// `idle`, `thinking`, `waiting`, `error`, …
+    state: String,
+    /// Free-text label beside the state.
+    #[arg(long)]
+    label: Option<String>,
+    /// The agent session this belongs to.
+    #[arg(long)]
+    session: Option<String>,
+    /// Which agent (`claude`, `catbus`, …).
+    #[arg(long)]
+    kind: Option<String>,
+    /// A session-less daemon tab (`brain`-shaped: a `tab-atelier <verb>` run
+    /// as its own tab) — restore relaunches the verb instead of dropping to a
+    /// shell. Announced by the daemon itself at startup.
+    #[arg(long)]
+    daemon: bool,
+    /// The agent is in plan mode.
+    #[arg(long)]
+    plan: bool,
+    /// The agent is no longer in plan mode.
+    #[arg(long, conflicts_with = "plan")]
+    no_plan: bool,
+}
 
 #[must_use]
 pub fn run(args: &[String]) -> i32 {
+    // Arguments first, endpoint second. The other order meant `set-status
+    // --help` outside a tab exited 0 having printed nothing, because the
+    // silent no-op fired before anything looked at the arguments.
+    let cli = match super::parse::<Cli>("tab-atelier set-status", args) {
+        Ok(c) => c,
+        Err(code) => return code,
+    };
     let Ok(tab_id) = std::env::var("_TAB_ID") else {
         // Outside a tab-atelier tab — silent no-op.
         return 0;
     };
-    let Ok(api_url) = std::env::var("TAB_ATELIER_API_URL") else {
+    // No endpoint at all — silent no-op, as above. Discovery covers the
+    // token file too, so this no longer misses a daemon that runs as a
+    // service and never exported the env vars.
+    let Ok(ep) = super::client::discover_endpoint() else {
         return 0;
     };
-    let Ok(api_token) = std::env::var("TAB_ATELIER_API_TOKEN") else {
-        return 0;
-    };
-
-    let mut state: Option<String> = None;
-    let mut label: Option<String> = None;
-    let mut session: Option<String> = None;
-    let mut kind: Option<String> = None;
-    let mut plan: Option<bool> = None;
-    let mut i = 0;
-    while i < args.len() {
-        let a = &args[i];
-        match a.as_str() {
-            "--label" => {
-                i += 1;
-                label = args.get(i).cloned();
-            }
-            "--session" => {
-                i += 1;
-                session = args.get(i).cloned();
-            }
-            "--kind" => {
-                i += 1;
-                kind = args.get(i).cloned();
-            }
-            "--plan" => plan = Some(true),
-            "--no-plan" => plan = Some(false),
-            other if state.is_none() && !other.starts_with("--") => {
-                state = Some(other.to_string());
-            }
-            other => {
-                eprintln!("tab-atelier set-status: unknown argument: {other}");
-                return 2;
-            }
-        }
-        i += 1;
-    }
-
-    let Some(state) = state else {
-        eprintln!(
-            "usage: tab-atelier set-status <idle|thinking|waiting|error> [--label …] [--session UUID] [--kind catbus|claude] [--plan|--no-plan]"
-        );
-        return 2;
+    let Cli {
+        state,
+        label,
+        session,
+        kind,
+        daemon,
+        plan,
+        no_plan,
+    } = cli;
+    let plan = if plan {
+        Some(true)
+    } else if no_plan {
+        Some(false)
+    } else {
+        None
     };
 
     let mut body = serde_json::Map::new();
@@ -80,20 +91,13 @@ pub fn run(args: &[String]) -> i32 {
     if let Some(v) = plan {
         body.insert("planMode".into(), serde_json::Value::Bool(v));
     }
+    if daemon {
+        body.insert("daemon".into(), serde_json::Value::Bool(true));
+    }
     let body = serde_json::Value::Object(body).to_string();
 
-    let url = format!("{api_url}/tabs/by-id/{tab_id}/status");
-    let agent = ureq::Agent::config_builder()
-        .timeout_global(Some(Duration::from_secs(2)))
-        .build()
-        .new_agent();
-    match agent
-        .post(&url)
-        .header("Authorization", &format!("Bearer {api_token}"))
-        .header("Content-Type", "application/json")
-        .send(&body)
-    {
-        Ok(_) => 0,
+    match super::client::api_post_to(&ep, &format!("/tabs/by-id/{tab_id}/status"), body) {
+        Ok(()) => 0,
         Err(e) => {
             eprintln!("tab-atelier set-status: {e}");
             1

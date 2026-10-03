@@ -25,7 +25,7 @@ sudo apt install tab-atelier            # desktop / GUI
 sudo apt install tab-atelier-headless   # display-less server variant
 ```
 
-Replace `stable` with `nightly` to track `main` (versions look like `0.5.0~nightly20260715.082716-1` — the `~` makes them sort strictly **before** the next stable release per [Debian Versioning](https://wiki.debian.org/Versioning), so apt auto-downgrades-then-upgrades on the next stable bump).
+Replace `stable` with `nightly` to track `main`. Snapshot versions look like `0.5.0~nightly20260715082716.9f3ab21-1`, following [Debian Versioning](https://wiki.debian.org/Versioning): `0.5.0` is the release being headed towards, `~` sorts it strictly **before** that release (so apt steps up onto stable when it lands), the timestamp orders one snapshot against the next, and the short sha tells you which commit a `.deb` on your disk came from.
 
 The two packages **conflict by design** (they both ship `/usr/bin/catbus-agent`). `apt install tab-atelier-headless` after `tab-atelier` swaps cleanly; `dpkg -i …` on both at once is what produced the file-collision error you saw on early `.deb` builds.
 
@@ -101,7 +101,7 @@ Always pass `-p tab-atelier` — a bare `cargo deb` in this workspace can packag
 **Session**
 - Tabs, working directories, and full terminal output persisted across restarts
 - Active tab selection restored on startup
-- **Agent auto-resume**: tabs that were running `catbus-agent` or `claude` at last save reopen with `catbus-agent --resume <uuid>` / `claude --resume <uuid>` typed into the freshly-spawned shell
+- **Agent auto-resume**: tabs that were running `catbus-agent`, `claude` or `codex` at last save reopen with `catbus-agent --resume <uuid>` / `claude --resume <uuid>` / `codex resume <uuid>` typed into the freshly-spawned shell
 
 **Preferences**
 - Theme selection (Dark, Tomorrow Night Blue, Light)
@@ -124,7 +124,10 @@ Always pass `-p tab-atelier` — a bare `cargo deb` in this workspace can packag
 - HTTP API (port 7890) + TLS variant (port 7891) with token auth and QR code for remote tab management from a phone
 - **Browser viewer** — the daemon serves a per-tab [xterm.js](https://xtermjs.org/) terminal view (share-link URLs, `noindex`/`X-Robots-Tag` so a leaked link can't be crawled), with file up/download to each tab's sandboxed `inbox/` / `outbox/`
 - `tab-atelier set-status` CLI for in-tab tools (agents, hooks, scripts) to publish thinking/waiting/error state to the desktop LED
+- `tab-atelier logs [--lines N] [--json]` — tail the **running** daemon's recent log records (`GET /logs`). Loopback callers only: the route refuses anything that isn't 127.0.0.1, because the API binds `0.0.0.0` by default and the records name tabs, working directories and errors. Distinct from `tab-atelier log <filter>`, which sets what the *next* start writes to a file.
 - `tab-atelier remote …` — mirror tabs from another instance, attach a sidecar terminal, transfer files (sandboxed). See [Remote tabs](#remote-tabs)
+- **Anthropic API relay** — run Claude locally but route its API calls through a remote tab-atelier that reuses the remote's Claude login (no API key on the local box). See [Anthropic API relay](#anthropic-api-relay)
+- **Per-tab / global env vars** — inject env into tabs from the CLI (`tab-atelier env set …`). See [Environment variables](#environment-variables)
 - **Headless variant** ships as a separate `tab-atelier-headless.deb` (no gpui / x11rb / qrcode deps, 7.9 MB vs 12 MB) for servers — same HTTP API, no display required
 - Wakatime time tracking (reads API key from Zed settings)
 
@@ -139,9 +142,21 @@ A normal launch acquires a single-instance lock on `~/.local/state/tab-atelier/t
 
 `--read-only` skips the lock so any number of read-only instances can run alongside the primary one. In that mode tab-atelier never writes anything: no `tabs.json` rewrites, no per-tab output / uptime / energy files, no preference saves, no rename-time file moves. The preferences "Save" button is visually disabled. Useful for snapshotting the running workspace from a script or for poking around without disturbing live state.
 
+### Preflight before launching
+
+```sh
+tab-atelier --check
+```
+
+The GUI resolves its libraries at run time, so a build can compile cleanly and still fail to start with nothing but a loader message about a missing `.so`. `--check` looks for each one, prints the `apt install` line for any that are absent, and reports the state and config dirs it will use. Run it first when a launch fails and nothing was written to the log.
+
+It is a global flag, so `tab-atelier --check` works on the headless binary too — there it reports the dirs and the pty and leaves the GUI libraries alone, since that build never loads them.
+
 ### Headless variant
 
 For servers (no display, no gpui), install `tab-atelier-headless.deb` instead. Same HTTP API, same persistence files, same `set-status` / `tabs` / `remote` CLI subcommands — just no window. Ships with a systemd user unit:
+
+> **CLI examples in this README all say `tab-atelier`.** On a headless install the identical verbs live on `tab-atelier-headless` — the two `.deb`s conflict, so each ships only its own name on `PATH`. Substitute accordingly; nothing else differs.
 
 ```sh
 systemctl --user enable --now tab-atelier-headless
@@ -246,7 +261,8 @@ So you can use the API and manage share access without hunting for the `api.toke
 
 ```sh
 tab-atelier token              # print the master API token (stdout) + URL hint (stderr)
-curl -s "$(tab-atelier token | head -1)" ...   # TOKEN=$(tab-atelier token) is scriptable
+curl -s http://127.0.0.1:7890/tabs \
+  -H "Authorization: Bearer $(tab-atelier token)"   # the token is stdout, so this is scriptable
 tab-atelier rotate-tokens      # revoke every tab's share tokens → existing share links 401
 tab-atelier reset-master-token # rotate the master token live (no restart) → old token 401s
 ```
@@ -318,6 +334,191 @@ The relay rotates its self-signed cert ~30 days before expiry (see `cert_needs_r
 
 The connection is allowed through (Phase 2 uses `disable_verification` on the wire) — the warning is the opt-in signal for the user to ack the rotation. Phase 3 will store the cert DER and switch to strict pinning, at which point the warning becomes a hard refuse-until-repinned.
 
+## Anthropic API relay
+
+Run **Claude Code + tab-atelier locally**, but have every Claude → Anthropic API call travel through **another tab-atelier** (a remote `tab-atelier-headless`), which makes the real outbound call **reusing the remote's own `claude` login** (OAuth in `~/.claude`). The local machine never holds an Anthropic credential and doesn't need to reach `api.anthropic.com` — only the remote does.
+
+When relay mode is on, every claude tab is spawned with:
+
+```
+ANTHROPIC_BASE_URL = http://127.0.0.1:7890/relay/anthropic   # the local relay route
+ANTHROPIC_API_KEY  = <the local instance's RELAY token>      # a stand-in, validates the loopback
+```
+
+Claude POSTs to the loopback relay, which forwards to the remote's `/relay/anthropic/*` (bearer + optional CF-Access headers); the remote **egress** swaps the stand-in for its live Claude OAuth token (`Authorization: Bearer …` + `anthropic-version`/`anthropic-beta`) and streams the SSE response back end-to-end.
+
+The stand-in is a **relay-only token** (`<state>/relay.token`, minted on first use, `0600`), and it is the *only* credential the relay route accepts — the master token is refused there. An API key is a value tools copy into debug output, crash reports and shared transcripts; the master token administers every tab, so it must not be the thing sitting in a claude tab's environment. The relay token authenticates `/relay/anthropic/*` and nothing else — it cannot list tabs, read output, inject input or rotate anything. Print it with `tab-atelier relay token`.
+
+One route is exempt from auth: `HEAD`/`GET /relay/anthropic/api/hello`, the reachability probe Claude Code sends **before it has a credential to present**. Answering it with 401 makes the client treat the whole relay as unusable, so it is served locally with a 200 — no upstream call, no token involved, and it reveals nothing that completing the TCP handshake hasn't already.
+
+One endpoint entry, two credentials, neither of them the master token: `--token` is the peer's **sidecar** token (`tab-atelier remote my-token` over there), scoped to listing tabs, mirroring output, sending input and moving files; `--relay-token` is its **relay** token (`tab-atelier relay token`), which can do nothing but proxy. They don't substitute for each other — an entry with no `--relay-token` simply can't relay, and says so, rather than presenting the wrong credential and failing at the peer.
+
+> The master token is not accepted on either path. Re-add any endpoint configured with it: `tab-atelier remote my-token` and `tab-atelier relay token` on the peer, then `remote add --token <sidecar> --relay-token <relay>` here.
+
+**Setup**
+
+On the **remote** (already logged into `claude`, so `~/.claude/.credentials.json` exists):
+
+```sh
+tab-atelier relay egress on          # this host is the terminal hop → Anthropic
+tab-atelier relay token              # grab its RELAY token for the endpoint below
+```
+
+On the **local** machine:
+
+```sh
+tab-atelier remote add --label box --url https://<remote>:7891 \
+  --token <remote-sidecar-token> --relay-token <remote-relay-token>
+tab-atelier relay via box            # relay through the `box` endpoint (by label or id)
+tab-atelier relay on                 # enable; `--relay` at launch also works
+tab-atelier relay status             # {"mode":true,"egress":false,"target":"https://<remote>:7891"}
+```
+
+New claude tabs now relay transparently. The full command:
+
+| Command | Effect |
+|---|---|
+| `relay on` / `relay off` | toggle relay mode |
+| `relay via <label\|id>` | pick the remote to relay through (`relay via ""` clears) |
+| `relay egress on\|off` | mark this host as the terminal hop to Anthropic |
+| `relay status` | print the live config (mode / egress / target) |
+| `relay token` | print this instance's relay-only token (paste into the peer's `remote add --token`) |
+
+All changes apply live (persisted + re-installed, no restart). The `relay_egress` role and `relay_endpoint_id` live in `preferences.json` but are set via the CLI above.
+
+The relay token travels in either `x-api-key` (what a claude client sends) or `Authorization: Bearer` (what the forwarding hop sends); both are accepted whatever the instance's role, so a claude pointed straight at an egress box works the same as one going through a local hop.
+
+**Smoke test** — verify the whole chain without launching Claude:
+
+```sh
+curl -N -H "x-api-key: $(tab-atelier relay token)" -H 'content-type: application/json' \
+  -d '{"model":"claude-sonnet-4-5","max_tokens":64,"stream":true,
+       "messages":[{"role":"user","content":"say hi"}]}' \
+  http://127.0.0.1:7890/relay/anthropic/v1/messages
+```
+
+`-N` disables curl buffering so you see the SSE `data:` frames stream in. Errors map to a stage: `401 relay: unauthorized` (wrong `x-api-key`), `502 relay not configured` (no `relay via`), `502 egress oauth: …` (remote can't read/refresh its Claude creds — re-`/login` there).
+
+### `catbus-agent` relays too
+
+`catbus-agent` is a relay client like any other, not a second implementation of the login:
+
+```sh
+catbus-agent --relay-url https://proxy.example.org --relay-token tap_…
+```
+
+With no flags it reads the relay endpoint from the same `preferences.json`, so on a machine that already runs tab-atelier a plain `catbus-agent` works. `CATBUS_RELAY_URL`, `CATBUS_RELAY_TOKEN` and `CATBUS_PREFERENCES` are the env equivalents.
+
+The Claude login lives **only** on the relay. `catbus-agent` no longer reads `~/.claude/.credentials.json`, no longer refreshes an OAuth token, and cannot be pointed at `api.anthropic.com` — with no relay configured it refuses to start rather than silently going direct. So an agent tab works on a box with no `claude` login at all (a CI runner, a container): it needs only a relay token, and there is no subscription credential in its environment or its crash reports. Reasoning blocks from a model the relay routes to are kept verbatim in the transcript the upstream requires back, but are never shown as the answer.
+
+#### Reply formatting
+
+A `catbus-agent` session has several readers and only some have a terminal. The REPL paints to one; the transcript, the socket, and the tab-atelier chat view do not. So the agent is told to format for the sink that will actually render it:
+
+| Session | Instruction | Reply |
+| --- | --- | --- |
+| REPL, stdout a tty | ANSI SGR colour | keeps its colour |
+| `--no-tui`, or piped | plain prose, no markdown, no escapes | stripped |
+| the transcript on disk | — | always plain |
+
+`--ansi` (or `CATBUS_ANSI=true`) forces escapes on for a pipe known to render them — a `script` capture, an xterm-backed panel. `NO_COLOR` (any non-empty value), `CLICOLOR=0` and `TERM=dumb` force them off, and an explicit `--ansi` wins over all three. The transcript is plain regardless, because tab-atelier renders chat bubbles straight from it and has no terminal to interpret anything.
+
+Precedence, most explicit first: `--ansi`/`--ansi=false` → `NO_COLOR` / `CLICOLOR=0` / `TERM=dumb` → whether stdout is really a terminal.
+
+All three opt-out signals are honoured because the app uses two mechanisms and a client does not get to choose which one it is handed:
+
+- `NO_COLOR`/`CLICOLOR` — what `new_tab_env` sets for the tabs an *agent* asked for, since those tabs' output is read by another program (`peek`, `output`, a `--wait` poll).
+- `TERM=dumb` — what the per-tab **colors** toggle sets (`pty_env`). It is a blunt instrument, and the app's own note says so: `TERM=dumb` claims the terminal *cannot* render colour, which degrades every TUI in the tab rather than just asking for no colour. The tab's colours-off environment now also sets `NO_COLOR=1` and `CLICOLOR=0`, so the standard signal travels with the legacy one and both spawn paths (`pty_env`, `minimal_pty_env`) agree. `TERM` is still set to `dumb` as before, because tools that read nothing else still rely on it — changing what every program in the tab sees is a separate decision.
+
+This is belt-and-braces on purpose: the instruction is a request the model may ignore, and the transcript is written from the reply as the model sent it, so escape sequences are also filtered out on the way to any reader that will not interpret them. That filter lives in `crates/catbus-agent/src/ansi.rs`, on `vte`'s parser via `strip-ansi-escapes` (already in the binary as a `reedline` dependency). `tab-atelier peek` applies the same rule for the same reason.
+
+#### The status line
+
+While a reply is downloading, the REPL repaints one line in place:
+
+```
+⠹ Thinking - ~1,339 tokens in
+```
+
+The spinner animates, the label is the agent's current activity (`Thinking` while waiting on the model, or the tool description it sets otherwise), and the count is an **estimate** — marked `~` because the Messages API reports `usage` only in its *final* response, so until then the only figure available is local arithmetic on the payload size (`statusline::estimate_input_tokens`, 4 bytes/token, deliberately crude). Before this, that field read `0 tokens in` for the entire download, which is worse than no number at all: it looks like the request is stuck. When no request is in flight the count is omitted rather than shown as `~0`, since `~0` claims a measurement of zero.
+
+When the reply lands, a totals line is printed below it:
+
+```
+12,345 in - 6,789 out                                                                         manual
+```
+
+Cumulative tokens on the left, the mode on the right, flush with the terminal edge — and right-aligned by *padding*, not a cursor escape, so the line stays correct in a log or a `script` capture. On a terminal narrower than the text it degrades to a single space and wraps, rather than truncating: a wrapped line is legible, a cut one misreports the numbers.
+
+The right-hand field is `auto` when the judge is in the loop and `manual` otherwise — a two-state answer to "will something be consulted before a change?", which is the distinction worth showing at a glance. `plan` and `open` both read `manual`; the finer distinction is already visible in `/help` and the environment turn.
+
+Both lines are built by `crates/catbus-agent/src/statusline.rs` as pure functions of numbers, so the layout edge cases are unit-tested without a terminal — which matters, because the REPL is only reachable through one.
+
+#### Tools, and the no-shell agent
+
+`FileTree` lists a directory to a depth you choose: `{"path": ".", "depth": 2}`. Output is one **relative path per line**, sorted, directories suffixed `/`, symlinks shown as `name -> target`, then a `---` line and totals:
+
+```
+/home/you/project
+src/
+src/deep/deeper/leaf.txt
+src/lib.rs
+src/main.rs
+README.md
+srclink -> src
+---
+2 directories, 4 files, 1 symlink
+```
+
+Relative, flat paths on purpose: every line can be passed straight back as the `path` of a `Read` or `Write` with no joining, and it is the shape `sort` and `rg --files` print. A path the model has to *derive* from indentation is a path it can get wrong, and a wrong path costs a whole failed round trip — more than the bytes an ancestor prefix repeats. `depth` is required and capped at 6 — a deeper request is refused rather than clamped, because silently showing less than asked for is how a model concludes a directory is empty when it is not. `max_entries` bounds the output and any truncation is reported.
+
+**What is skipped, and why it changed.** Two things only, both reported:
+
+1. **Version-control directories** (`.git`, `.hg`, `.svn`, `.bzr`). `.git` is the one directory guaranteed to dwarf the project it sits in.
+2. **Whatever the project's own ignore rules exclude**, via ripgrep's `ignore` crate — `.gitignore` at any level, `.git/info/exclude`, and the operator's **global** ignore file. So a file `rg` hides is a file this hides.
+
+An earlier version carried a hard-coded noise list (`node_modules`, `target`, `__pycache__`, …). That was the wrong instrument: those directories are already gitignored in nearly every project, so the list was redundant where it was right and *wrong* where the project disagreed — a vendored `target/` that is committed, or a tree with no `node_modules` at all. The project's own rules are correct by construction: they are its statement about what is not source. Dotfiles are **not** skipped (`.github/`, `.env.example`, `.eslintrc` are exactly what an agent gets asked about); VCS directories are the only name-based exception, and they are enumerated rather than pattern-matched.
+
+Two flags widen the listing, both defaulting to false:
+
+- `show_ignored: true` — include ignored paths *and descend into ignored directories*, so `node_modules/` shows its contents. Also the way to tell "missing" from "ignored".
+- `show_vcs: true` — include version-control directories.
+
+Both are gated on the walker rather than filtering entries afterwards, because an ignored *directory* has to be traversed to list what is inside it. Non-boolean values fall back to the quiet default: these flags widen output on purpose, and `"false"` read as truthy is the classic way `show_vcs` would dump a whole `.git` into the context window. When `show_ignored` is set the note says so, since an unqualified "ignore rules applied" would mislead.
+
+**The global ignore file is honoured, which is a real asymmetry.** Unlike the project's rules, `~/.config/git/ignore` (or `core.excludesFile`) is per-machine, so a pattern in *your* global ignore hides a file for your agent and not for a colleague's — the same asymmetry `rg` already has. Each call names the sources it consulted, so a file you expected but cannot see is explicable rather than mysterious. On a default XDG setup the file is read from `$XDG_CONFIG_HOME/git/ignore`.
+
+#### The no-shell agent
+
+`FileTree` exists so that `Read` and `Write` can be a whole tool set. `Read` shows a file but not what sits beside it, so without a listing tool an agent cannot discover a path the prompt never named — it guesses filenames with `Read` until something hits. Hence three tools and not two:
+
+```sh
+catbus-agent --tools-config minimal          # == {"allow": ["Read","Write","FileTree"]}
+```
+
+With no shell the agent cannot run the tests it writes, and `Write` is the only way it can save anything. What is absent cannot be reached even by a confused model: `dispatch` refuses any name the set does not offer, so emitting a `tool_use` for `Bash` on an agent that was never given one returns `unknown tool: Bash` instead of running.
+
+#### A relay must allow `FileTree` in its tool policy
+
+A proxy-side tool policy whitelist **fails closed for names it does not know**, so a newer client tool is stripped before the model ever sees it. The symptom is quiet: nothing errors, the client puts three tools on the wire, the model is told it has two, and it reports the tool as unavailable — while the agent guesses filenames with `Read` and never says why. Add `FileTree` to the account's policy alongside `Read`/`Write` (see `docs/proxy-tools.md`) before expecting the minimal set to work through a relay. If an agent claims a tool is missing, check the policy before the client.
+
+#### `/clear`
+
+`/clear` in the REPL starts a fresh session in the same working directory. Nothing is deleted: the old transcript stays on disk and the reply names its id, so `/resume <id>` goes back. Forgetting the conversation rather than emptying the history keeps the old tokens/turns sidecars meaningful and leaves the operator an undo, which is what makes it safe to offer. The same thing is available over the socket as `{"kind":"clear"}`, so the GUI and a phone can offer it too.
+
+## Environment variables
+
+Inject env vars into tabs' PTYs from the CLI — globally (all tabs) or per-tab:
+
+```sh
+tab-atelier env set FOO=bar --global      # every tab
+tab-atelier env set FOO=bar --tab 3       # one tab (index or UUID)
+tab-atelier env unset FOO --global
+tab-atelier env list --global             # print the global map
+```
+
+Precedence, lowest to highest: **global user env < per-tab env < functional vars** (`_TAB_ID`, `TAB_ATELIER_API_*`) **< relay injection**. Global vars persist in `preferences.json` (`tab_env`); per-tab vars persist per tab in `tabs.json` and are re-injected on respawn. Changes take effect on a tab's **next (re)spawn**.
+
 ## Agent state
 
 Each tab carries an optional **agent state** rendered as a small colored LED to the left of the tab name. The colour answers "_did an agent do work here, and have you seen it?_":
@@ -352,6 +553,11 @@ tab-atelier set-status <state> [--label <hint>] \
                                 [--plan|--no-plan]
 
 # state: idle | thinking | waiting | error
+#
+# `idle` takes the indicator down but keeps whatever --session / --kind it was
+# given, so a wrapper with no hook of its own can say "not working any more" and
+# "here is the session to resume" in one call. The durable attachment is dropped
+# only by `--label __clear__`, which `claude-hook session-end` sends.
 ```
 
 The CLI silently exits 0 when `_TAB_ID` is unset (i.e. invoked outside a tab), so it is safe to call unconditionally from `.bashrc` snippets, agents, or build hooks.
@@ -419,7 +625,15 @@ When a tab carries both `agent_kind` and `agent_session_id` in `tabs.json`, the 
 |---|---|
 | `catbus` | `catbus-agent --resume <uuid>` (plus ` --plan` if the agent was in plan mode at save time) |
 | `claude` | `claude --resume <uuid>` |
+| `codex` | `codex resume <uuid>` |
 | anything else | no-op |
+
+The shape differs per CLI: Claude takes a `--resume` **flag**, codex a `resume`
+**subcommand**. Codex has no hook wired on this machine, so `agent_session_id` is
+discovered by matching the tab's working directory against the `session_meta`
+header of its rollouts (`~/.codex/sessions/…/rollout-*.jsonl`). Launch it through
+`scripts/codex-agent.sh` to have that stamped, along with a state and a label.
+See [docs/agent-support-research.md](docs/agent-support-research.md).
 
 If the agent CLI is no longer on `PATH`, the shell prints `command not found` and the tab is otherwise unaffected.
 
@@ -475,7 +689,47 @@ tab-atelier notes --since 42          # only entries after index 42 (incremental
 tab-atelier handoff ./report.md db-expert
 ```
 
-**Etiquette (and safety):** only `dispatch` to a tab `peers` shows as `idle`/`waiting`, never mid-turn; a locked tab refuses input; and never `--resume`/`--continue` another tab's session — it rotates/strips the session id. To make every agent aware of these verbs, drop the snippet from [`docs/teamwork.md`](docs/teamwork.md) into `~/.claude/CLAUDE.md`.
+**Etiquette (and safety):** only `dispatch` to a tab `peers` shows as `idle`/`waiting`, never mid-turn; a locked tab refuses input; and never `--resume`/`--continue` another tab's session — it rotates/strips the session id. Every Claude that starts **inside a tab** is told these verbs exist automatically: the system-wide `SessionStart` hook the deb installs injects a short brief ([`docs/agent-brief.md`](docs/agent-brief.md)). Nothing to copy into `~/.claude/CLAUDE.md`, and a Claude started outside a tab is told nothing about verbs it can't use. Override the text with `~/.config/tab-atelier/agent-brief.md`, or opt out with `TAB_ATELIER_NO_BRIEF=1`.
+
+**Per-project briefs** go in `~/.config/tab-atelier/briefs/*.md` (or `/etc/tab-atelier/briefs/` machine-wide), selected by working directory:
+
+```markdown
+---
+baseDir: /mnt/clients/ABCD
+---
+Client ABCD: PHP 7.4, no `composer update` without asking. Deploys are manual.
+```
+
+Any agent starting inside that directory is told this on top of the standard brief; matches compose, narrowest last. `tab-atelier brief --cwd <dir>` prints exactly what a session there would receive, and `--list` shows which files matched — worth checking, because a typo'd `baseDir` fails silently.
+
+**Let the fleet divide the work itself** — instead of deciding who does what, put the work on a shared board and let agents take it:
+
+```bash
+tab-atelier backlog --from './my-task-source.sh'   # any source: `id<TAB>title` per line
+tab-atelier backlog --lcov target/lcov.info        # or the built-in coverage source
+tab-atelier tasks                      # the board
+tab-atelier take                       # lease the best open task for THIS agent
+tab-atelier done cov:src/api.rs "40% -> 82%"
+tab-atelier wait cov:src/api.rs && echo "…and now the follow-up"
+tab-atelier fleet                      # who is working on what (--json for a graph)
+tab-atelier gossip                     # converge boards with configured remotes
+```
+
+`take` leases the task through the daemon, so two agents never pick up the same one, and a lease from a tab that dies simply expires. Nothing schedules: agents rank the board by a hash of (task, agent) and spread out without talking to each other. `wait` reports outcomes as exit codes (0 done, 1 failed, 3 running, 4 unknown) instead of holding a connection, so a supervisor can run many at once — or you can skip supervisors entirely, which is the point.
+
+**Across machines**, a task's *home* is the host it was announced on, and taking it means claiming it there over the same `remote` endpoint the sidecar uses — so two machines can't hand out the same work. Everything else stays each host's own business.
+
+**The handbook** — shipped in the deb at `/usr/share/doc/tab-atelier/`, so an agent on a machine with no checkout can still read them. The first two are written for **whoever is using the agent**, not for its developers:
+
+| | |
+|---|---|
+| [`docs/agent-guide.md`](docs/agent-guide.md) | using it: the commands, the three permission modes, every tool, how to answer a question it asks, and what its output means |
+| [`docs/config-guide.md`](docs/config-guide.md) | configuring it: where its files live, the identity file, choosing the tool set, and how an internet-disabled tab still reaches the relay |
+| [`docs/self-organization.md`](docs/self-organization.md) | the model: leases, contract net, gossip, the federation-vs-confederation distinction, and why this is CRDTs rather than Raft |
+| [`docs/fleet-playbook.md`](docs/fleet-playbook.md) | the operational side, written to be handed to an agent: fill a board, spawn workers, and — the part that matters — verify what they report |
+| [`docs/proxy.md`](docs/proxy.md) | `tab-atelier-proxy`: one Claude login shared by a team, with an account and a key per person instead of one token for everybody |
+
+`scripts/self-org-sandbox.sh` runs the whole thing across two sandboxed daemons without touching anything of yours.
 
 ## Wakatime
 
@@ -497,16 +751,30 @@ cargo test
 cargo clippy
 ```
 
-After a fresh clone, opt-in to the repo's pre-commit hook so CI's
-`Check formatting` step can't fail on a freshly-pushed commit:
+After a fresh clone, opt-in to the repo's pre-commit hook so a commit that
+would fail CI fails in three seconds instead of fifteen minutes:
 
 ```sh
 git config core.hooksPath .githooks
 ```
 
-The hook runs `cargo fmt -- --check` and aborts the commit (with the
-offending diff) when the tree drifts from rustfmt. Pass `--no-verify`
-to skip for a one-off WIP commit.
+The hook runs the checks CI blocks on, but only against what you staged —
+a docs-only commit runs none of them, and a commit touching one crate
+lints that crate rather than the workspace:
+
+- **licence headers** — every staged `.rs`/`.js`/`.sh`/`.py`/`.html` file
+  must carry the SPDX line where `licensecheck` looks, since
+  `debian/copyright` is generated from it.
+- **generated assets** — `web/src/*.ts` must ship with a rebuilt
+  `assets/*.js`; a stale bundle passes every test and serves the old UI.
+- **rustfmt** — `cargo fmt --all -- --check`.
+- **clippy** — `-D warnings` on the crates you touched, using the
+  `RUST_VERSION` pinned in `.github/workflows/build.yml`. Set
+  `TA_PRECOMMIT_ALL_FEATURES=1` to also run CI's headless feature pass
+  (it invalidates the build cache, so it is off by default).
+
+`TA_PRECOMMIT_SKIP=licence,fmt,clippy,assets` skips named checks;
+`git commit --no-verify` skips all of them for a one-off WIP commit.
 
 ## License
 

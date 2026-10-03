@@ -1,0 +1,3277 @@
+// SPDX-License-Identifier: MPL-2.0
+
+// Integration test crate — unwrap/expect are idiomatic here.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
+//! End-to-end tests of the relay backend: spawn the real `catbus-agent`
+//! binary in `--no-tui` mode, point it at a mock *relay* on localhost,
+//! drive a prompt through the UNIX socket, and assert on what reached
+//! the relay.
+//!
+//! The distinction from `openai_mock.rs` matters. These tests pin the
+//! whole point of moving the login onto the proxy:
+//!
+//! * the request goes to `/relay/anthropic/v1/messages`, so the client
+//!   is talking to a relay and not to `api.anthropic.com`;
+//! * the relay token travels in `x-api-key`, and **no** `authorization`
+//!   header is sent — the client has no subscription credential to leak;
+//! * no local Claude credential is read or required.
+
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
+
+/// A Messages reply that ends the turn immediately, in the shape the
+/// Anthropic Messages API returns one.
+const FINAL_ROUND: &str = r#"{
+    "id": "msg_1",
+    "type": "message",
+    "role": "assistant",
+    "model": "claude-sonnet-4-6",
+    "content": [{ "type": "text", "text": "hi from the relay" }],
+    "stop_reason": "end_turn",
+    "usage": { "input_tokens": 5, "output_tokens": 4 }
+}"#;
+
+/// A reply the server stopped mid-sentence at the output ceiling.
+///
+/// The text deliberately ends on the word `to` and the continuation below begins with a space,
+/// so the two only read as one sentence if they are joined without anything between them.
+const CUT_OFF_ROUND: &str = r#"{
+    "id": "msg_cut",
+    "type": "message",
+    "role": "assistant",
+    "model": "claude-sonnet-4-6",
+    "content": [{ "type": "text", "text": "Here is the analysis you asked for. The first thing to" }],
+    "stop_reason": "max_tokens",
+    "usage": { "input_tokens": 5, "output_tokens": 8192 }
+}"#;
+
+/// What the model writes when asked to finish [`CUT_OFF_ROUND`].
+const CONTINUATION_ROUND: &str = r#"{
+    "id": "msg_more",
+    "type": "message",
+    "role": "assistant",
+    "model": "claude-sonnet-4-6",
+    "content": [{ "type": "text", "text": " hand back." }],
+    "stop_reason": "end_turn",
+    "usage": { "input_tokens": 9, "output_tokens": 3 }
+}"#;
+
+/// The ceiling reached with nothing to show for it.
+///
+/// Measured, not invented: on this endpoint thinking is drawn from the same output budget as the
+/// answer, so a hard-thinking turn can spend the entire ceiling on thinking and return empty
+/// content with `stop_reason: "max_tokens"`. Observed at 8192 — 8192 output tokens, zero
+/// characters of text. See `docs/output-limit.md`.
+const SILENT_CUT_ROUND: &str = r#"{
+    "id": "msg_silent",
+    "type": "message",
+    "role": "assistant",
+    "model": "claude-sonnet-4-6",
+    "content": [],
+    "stop_reason": "max_tokens",
+    "usage": { "input_tokens": 51, "output_tokens": 8192 }
+}"#;
+
+/// A round that hit the ceiling *and* asked for a tool, which is not a truncated answer.
+const CUT_OFF_TOOL_ROUND: &str = r#"{
+    "id": "msg_tool_cut",
+    "type": "message",
+    "role": "assistant",
+    "model": "claude-sonnet-4-6",
+    "content": [
+        { "type": "text", "text": "Let me look." },
+        { "type": "tool_use", "id": "c1", "name": "Read", "input": { "path": "note.txt" } }
+    ],
+    "stop_reason": "max_tokens",
+    "usage": { "input_tokens": 5, "output_tokens": 65536 }
+}"#;
+
+const RELAY_TOKEN: &str = "tap_integration_test_token";
+
+/// Serve one canned `(status line, JSON body)` per connection, in order.
+/// Each raw request (headers + body) is pushed through the returned
+/// channel for the test to assert on.
+fn spawn_mock_relay(responses: Vec<(&'static str, &'static str)>) -> (u16, mpsc::Receiver<String>) {
+    spawn_mock_relay_owned(
+        responses
+            .into_iter()
+            .map(|(status, body)| (status, body.to_owned()))
+            .collect(),
+    )
+}
+
+/// [`spawn_mock_relay`] for a body that has to be *built* rather than written
+/// as a literal — a reply holding an escape, since a JSON string may not carry
+/// a bare control byte (RFC 8259) and so the escape must be produced by the
+/// serialiser.
+/// The price list the mock serves for `GET /v1/models`.
+///
+/// Two models, in **two different currencies**, which is what makes the grouping testable end
+/// to end: a session that used one reply from each has spent dollars and euros, and no single
+/// figure can express that. The ids match the `model` fields the canned replies in these tests
+/// report, so a reply's model is a model this catalog prices.
+const MOCK_PRICES: &str = r#"{
+    "models": [
+        { "id": "claude-sonnet-4-6", "name": "Claude Sonnet (mock)",
+          "amounts": [
+            { "currency": "USD", "unit_tokens": 1000000, "kind": "input", "price": 3.0 },
+            { "currency": "USD", "unit_tokens": 1000000, "kind": "output", "price": 15.0 },
+            { "currency": "USD", "unit_tokens": 1000000, "kind": "cache_read", "price": 0.3 }
+          ] },
+        { "id": "deepseek-flash", "name": "DeepSeek flash (mock)",
+          "amounts": [
+            { "currency": "EUR", "unit_tokens": 1000000, "kind": "input", "price": 2.0 },
+            { "currency": "EUR", "unit_tokens": 1000000, "kind": "output", "price": 10.0 }
+          ] }
+    ]
+}"#;
+
+fn spawn_mock_relay_owned(responses: Vec<(&'static str, String)>) -> (u16, mpsc::Receiver<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut queued = responses.into_iter();
+        //  rather than binding the Option: the tuple holds a String, so matching on
+        // it by value moves it and then cannot be reassigned after each reply.
+        let mut pending = queued.next();
+        // `is_some` at the head, and `take` only when a canned reply is actually served: a request
+        // answered *without* consuming one — the startup price fetch — loops back here, and taking
+        // at the head would find nothing, break, and drop the listener, leaving the turn that
+        // followed with nothing to connect to. Which is exactly what happened.
+        while pending.is_some() {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+            let raw = read_http_request(&mut stream);
+            // A connection that carried nothing — opened and abandoned. Skipped without consuming a
+            // canned reply, so a client that does this does not eat the answer meant for its next
+            // request.
+            if raw.is_empty() {
+                continue;
+            }
+
+            // The app asks for prices once at startup. Answered here and **not** forwarded on
+            // the channel, and the queue is left untouched: a test asserts on the conversation,
+            // and a startup GET that consumed a canned reply would leave the turn that follows
+            // with nothing to answer it. (It did, before this.)
+            // Only the messages path consumes a canned reply. Anything else the client may send —
+            // the startup price fetch, or any future chatter — is answered without touching the queue,
+            // so it cannot eat the reply meant for a turn. Learned the hard way: a status POST to the
+            // mock consumed one and the turn then failed for no visible reason.
+            if !raw.contains("/relay/anthropic/v1/messages ") {
+                let (status, body) = if raw.starts_with("GET ") {
+                    ("200 OK", MOCK_PRICES)
+                } else {
+                    // Accepted and discarded: fire-and-forget requests do not care, and answering
+                    // keeps a client from waiting.
+                    ("204 No Content", "")
+                };
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\
+                     \nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+                continue;
+            }
+
+            // Taken only here, now that this request is known to want a canned reply.
+            let (status_line, body) = pending.take().expect("the loop checked there is one");
+            tx.send(raw).unwrap();
+            let resp = format!(
+                "{status_line}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(resp.as_bytes()).unwrap();
+            stream.flush().unwrap();
+            pending = queued.next();
+        }
+    });
+    (port, rx)
+}
+
+/// Read one HTTP/1.1 request (headers + `Content-Length` body).
+fn read_http_request(stream: &mut TcpStream) -> String {
+    let mut buf = Vec::new();
+    let mut chunk = [0_u8; 4096];
+    // An empty return means "this connection carried no request" — the peer closed, or went quiet.
+    //
+    // It used to panic, which killed the mock's whole thread on the first connection that closed
+    // without sending: every later request then failed with `error sending request` and nothing said
+    // why. A client that opens a connection and abandons it is ordinary — reqwest's pool does it, and
+    // the agent's startup price fetch made it happen — so a test server has to tolerate it the way a
+    // real one does. The mock loops skip an empty read without consuming a canned reply.
+    let header_end = loop {
+        let n = match stream.read(&mut chunk) {
+            Ok(0) | Err(_) => return String::new(),
+            Ok(n) => n,
+        };
+        buf.extend_from_slice(&chunk[..n]);
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break pos + 4;
+        }
+    };
+    let content_length: usize = String::from_utf8_lossy(&buf[..header_end])
+        .lines()
+        .find_map(|l| {
+            let (key, value) = l.split_once(':')?;
+            if key.eq_ignore_ascii_case("content-length") {
+                value.trim().parse().ok()
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0);
+    while buf.len() < header_end + content_length {
+        // A body that never arrives is the same case as a request that never came: the peer went
+        // away. Reported as an empty request rather than a panic, so one abandoned connection cannot
+        // take the mock's thread down with it.
+        match stream.read(&mut chunk) {
+            Ok(0) | Err(_) => return String::new(),
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+        }
+    }
+    String::from_utf8_lossy(&buf).to_string()
+}
+
+/// Stop the agent when the test ends, pass or fail. SIGTERM first — the
+/// agent exits cleanly on it (`socket.rs` installs a handler), and a clean
+/// exit is what lets a coverage-instrumented binary flush its profile.
+/// SIGKILL only if it hasn't exited within 5 s.
+struct KillOnDrop(Child);
+
+impl KillOnDrop {
+    /// The child's pid, which is what names the sockets of the sub-agents it starts.
+    ///
+    /// A sub-agent's socket is `catbus-sub-<parent pid>-<n>.sock` (see `tools::spawn`), so this is
+    /// how a test tells *its own* sub-agents apart from every other agent's on the machine.
+    fn pid(&self) -> u32 {
+        self.0.id()
+    }
+}
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = Command::new("kill").args(["-TERM", &self.0.id().to_string()]).status();
+        for _ in 0..100 {
+            match self.0.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+                Err(_) => break,
+            }
+        }
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// The agent binary with a hermetic environment: an empty HOME (so no
+/// stray `preferences.json` is picked up) and no relay/OpenAI/XDG vars
+/// inherited from whoever ran the tests.
+///
+/// `NO_COLOR` and `CLICOLOR` are cleared for the same reason as the rest: they
+/// steer reply formatting, and an operator running the suite inside a
+/// `NO_COLOR` shell should not get different results from CI. A test that wants
+/// them sets them for its own child.
+fn agent_command(home: &Path) -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_catbus-agent"));
+    cmd.env("HOME", home)
+        .env_remove("XDG_CONFIG_HOME")
+        // The state dir too: `Tasks` resolves its list through
+        // `$XDG_STATE_HOME` before `$HOME`, so without this a test run from a
+        // shell that sets it would write into the operator's real task lists.
+        .env_remove("XDG_STATE_HOME")
+        .env_remove("CATBUS_RELAY_URL")
+        .env_remove("CATBUS_RELAY_TOKEN")
+        .env_remove("CATBUS_PREFERENCES")
+        .env_remove("CATBUS_OPENAI_URL")
+        .env_remove("CATBUS_OPENAI_TOKEN")
+        .env_remove("CATBUS_OPENAI_MODEL")
+        .env_remove("INFOMANIAK_PRODUCT_ID")
+        .env_remove("INFOMANIAK_API_TOKEN")
+        .env_remove("CATBUS_ANSI")
+        .env_remove("NO_COLOR")
+        .env_remove("CLICOLOR");
+    cmd
+}
+
+/// Spawn the agent, wait for its socket, and return the child (kept alive
+/// by the caller) with a connected reader/writer pair. `configure` gets
+/// the command so each test can add its own flags and env.
+fn spawn_agent(
+    home: &Path,
+    socket: &Path,
+    configure: impl FnOnce(&mut Command),
+) -> (KillOnDrop, BufReader<UnixStream>, UnixStream) {
+    spawn_agent_in(home, home, socket, configure)
+}
+
+/// As [`spawn_agent`], but with the agent's working directory separate from its
+/// HOME.
+///
+/// Two paths rather than one because `--cwd` cannot simply be passed twice: clap
+/// rejects a repeated argument, so a test wanting a fixture tree distinct from
+/// the tempdir holding `.claude` has to say so here. Kept as a delegating
+/// variant rather than a parameter on [`spawn_agent`] so the common case — cwd
+/// is where HOME is — stays a three-argument call.
+fn spawn_agent_in(
+    home: &Path,
+    cwd: &Path,
+    socket: &Path,
+    configure: impl FnOnce(&mut Command),
+) -> (KillOnDrop, BufReader<UnixStream>, UnixStream) {
+    let mut cmd = agent_command(home);
+    cmd.args([
+        "--new-session",
+        "--cwd",
+        cwd.to_str().unwrap(),
+        "--socket",
+        socket.to_str().unwrap(),
+        "--no-tui",
+    ])
+    .stdout(Stdio::null())
+    .stderr(Stdio::piped());
+    configure(&mut cmd);
+    let mut child = KillOnDrop(cmd.spawn().unwrap());
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let stream = loop {
+        if let Ok(s) = UnixStream::connect(socket) {
+            break s;
+        }
+        // A start failure is almost always a bad flag or an unreadable config
+        // file, and the agent explains it on stderr — which the harness would
+        // otherwise discard, leaving "socket never appeared" as the only clue
+        // and forcing a manual repro of whatever the test was doing.
+        assert!(
+            Instant::now() < deadline,
+            "agent socket never appeared; it exited with:\n{}",
+            stop_and_read_stderr(&mut child)
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    stream.set_read_timeout(Some(Duration::from_mins(1))).unwrap();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    let started: serde_json::Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(started["kind"], "started");
+    (child, reader, stream)
+}
+
+/// Everything the child wrote to stderr, after stopping it.
+///
+/// Killed first so the read reaches EOF instead of blocking on a process that
+/// never got far enough to close its own stderr.
+fn stop_and_read_stderr(child: &mut KillOnDrop) -> String {
+    let _ = child.0.kill();
+    let _ = child.0.wait();
+    let mut text = String::new();
+    if let Some(mut err) = child.0.stderr.take() {
+        let _ = err.read_to_string(&mut text);
+    }
+    if text.trim().is_empty() {
+        "<no output>".to_owned()
+    } else {
+        text.trim().to_owned()
+    }
+}
+
+/// The common case: relay address and token given as flags.
+fn spawn_agent_at(home: &Path, socket: &Path, port: u16) -> (KillOnDrop, BufReader<UnixStream>, UnixStream) {
+    spawn_agent(home, socket, |cmd| {
+        cmd.args([
+            "--relay-url",
+            &format!("http://127.0.0.1:{port}"),
+            "--relay-token",
+            RELAY_TOKEN,
+        ]);
+    })
+}
+
+fn send_prompt(stream: &mut UnixStream, reader: &mut BufReader<UnixStream>, text: &str) -> serde_json::Value {
+    let req = serde_json::json!({ "kind": "prompt", "text": text });
+    stream.write_all(format!("{req}\n").as_bytes()).unwrap();
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    serde_json::from_str(&line).unwrap()
+}
+
+fn body_of(raw_request: &str) -> serde_json::Value {
+    let body = raw_request.split("\r\n\r\n").nth(1).unwrap();
+    serde_json::from_str(body).unwrap()
+}
+
+/// The headline test: a full "hi" round trip through the relay.
+#[test]
+fn a_prompt_round_trips_through_the_relay() {
+    let dir = tempfile::tempdir().unwrap();
+    let (port, rx) = spawn_mock_relay(vec![("HTTP/1.1 200 OK", FINAL_ROUND)]);
+    let socket = dir.path().join("agent.sock");
+    let (_agent, mut reader, mut stream) = spawn_agent_at(dir.path(), &socket, port);
+
+    let reply = send_prompt(&mut stream, &mut reader, "hi");
+    assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+    assert_eq!(reply["text"], "hi from the relay");
+
+    let raw = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let lower = raw.to_lowercase();
+    assert!(
+        raw.starts_with("POST /relay/anthropic/v1/messages "),
+        "must post to the relay's messages path, got: {raw}"
+    );
+    // The relay token is the only credential this process has.
+    assert!(
+        lower.contains(&format!("x-api-key: {}", RELAY_TOKEN.to_lowercase())),
+        "missing relay token as x-api-key:\n{raw}"
+    );
+    // If either of these ever comes back, a subscription credential has
+    // leaked into the client and the split has been undone.
+    assert!(
+        !lower.contains("authorization:"),
+        "client must not send Authorization:\n{raw}"
+    );
+    assert!(
+        !lower.contains("anthropic-beta:"),
+        "the relay owns the beta flags, not the client:\n{raw}"
+    );
+
+    let body = body_of(&raw);
+    assert_eq!(body["model"], "claude-sonnet-4-6");
+    assert_eq!(body["messages"][0]["role"], "user");
+    // The content is a block array rather than the bare string `"hi"` because
+    // the last real turn carries a cache breakpoint, and `cache_control`
+    // attaches to a block. See `crate::cache`.
+    assert_eq!(
+        body["messages"][0]["content"][0]["text"], "hi",
+        "the user's text must survive being wrapped for caching: {}",
+        body["messages"][0]["content"]
+    );
+    // The prompt cache is the point of that wrapping, so assert it is really
+    // on the wire rather than only in the unit tests.
+    assert!(
+        body["messages"][0]["content"][0]["cache_control"]["type"] == "ephemeral",
+        "the last real turn must carry a cache breakpoint:\n{raw}"
+    );
+    // The upstream demands the Claude Code identifier in the first system
+    // block, and the relay forwards system blocks untouched — so sending
+    // it is still the client's job and must survive the move.
+    assert!(
+        body["system"][0]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("You are Claude Code"),
+        "system[0] must be the Claude Code identifier, got: {}",
+        body["system"][0]
+    );
+    // Both system blocks are static now, so both are worth caching. This is
+    // the half of the fix that stops a gate or cwd change from invalidating
+    // the whole conversation: nothing session-specific is in either block.
+    let system = body["system"].as_array().expect("system is an array");
+    assert_eq!(system.len(), 2, "both blocks are static, so there are two");
+    for (i, block) in system.iter().enumerate() {
+        assert!(
+            block["cache_control"]["type"] == "ephemeral",
+            "system[{i}] must carry a cache breakpoint:\n{raw}"
+        );
+        let text = block["text"].as_str().unwrap_or_default();
+        assert!(
+            !text.contains(&dir.path().display().to_string()),
+            "system[{i}] must not carry the working directory — live state belongs \
+             in the trailing env turn, or a change to it re-buys the prefix:\n{text}"
+        );
+    }
+    // …and the live state really is there, last, where it cannot invalidate
+    // anything before it.
+    let last = body["messages"].as_array().unwrap().last().unwrap();
+    let last_text = last["content"].as_str().unwrap_or_default();
+    assert!(
+        last_text.contains("<env "),
+        "the working directory and gate belong in a trailing turn, got: {}",
+        last["content"]
+    );
+    let tools = body["tools"].as_array().unwrap();
+    assert!(
+        tools.iter().any(|t| t["name"] == "Read"),
+        "Anthropic-shaped tool spec missing"
+    );
+}
+
+#[test]
+fn a_relay_error_is_reported_over_the_socket() {
+    let dir = tempfile::tempdir().unwrap();
+    // Four responses, because a 502 is retryable and the agent now sends up to
+    // four attempts before giving up — see `crate::retry`. One response would
+    // leave the later connections refused, and the assertion below would then
+    // be testing connection handling rather than error reporting.
+    let bad = (
+        "HTTP/1.1 502 Bad Gateway",
+        r#"{"type":"error","error":{"type":"api_error","message":"upstream is down"}}"#,
+    );
+    let (port, _rx) = spawn_mock_relay(vec![bad, bad, bad, bad]);
+    let socket = dir.path().join("agent.sock");
+    let (_agent, mut reader, mut stream) = spawn_agent_at(dir.path(), &socket, port);
+
+    // Slow, because the retry backoff is 1s + 2s + 4s. The socket timeout is
+    // 30s, so it fits with room to spare.
+    let reply = send_prompt(&mut stream, &mut reader, "hi");
+    assert_eq!(reply["kind"], "error", "unexpected reply: {reply}");
+    let text = reply["message"].as_str().unwrap();
+    assert!(
+        text.contains("upstream is down"),
+        "error text should survive the retries and name the cause: {text}"
+    );
+}
+
+#[test]
+fn a_url_without_a_token_is_refused_with_the_preferences_path() {
+    // A URL alone is a plausible half-configuration; the failure should
+    // name the file to fix rather than looking like a network problem.
+    let dir = tempfile::tempdir().unwrap();
+    let out = agent_command(dir.path())
+        .args([
+            "--new-session",
+            "--cwd",
+            dir.path().to_str().unwrap(),
+            "--socket",
+            dir.path().join("agent.sock").to_str().unwrap(),
+            "--relay-url",
+            "https://relay.example",
+            "--print-socket",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "a URL with no token must not start");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("preferences.json"), "stderr: {stderr}");
+}
+
+#[test]
+fn the_cloudflare_access_pair_comes_from_preferences() {
+    // A relay published through Cloudflare Access needs the service token,
+    // and it must travel alongside the relay token. The URL is overridden
+    // so the token and the Access pair have to come from the file.
+    let dir = tempfile::tempdir().unwrap();
+    let prefs = dir.path().join("preferences.json");
+    std::fs::write(
+        &prefs,
+        r#"{
+            "relay_endpoint_id": "relay-id",
+            "remote_endpoints": [{
+                "id": "relay-id",
+                "url": "https://relay.example",
+                "relay_token": "tap_from_prefs",
+                "cf_access_client_id": "cf-id.access",
+                "cf_access_client_secret": "cf-secret"
+            }]
+        }"#,
+    )
+    .unwrap();
+    let (port, rx) = spawn_mock_relay(vec![("HTTP/1.1 200 OK", FINAL_ROUND)]);
+    let socket = dir.path().join("agent.sock");
+    let (_agent, mut reader, mut stream) = spawn_agent(dir.path(), &socket, |cmd| {
+        cmd.env("CATBUS_PREFERENCES", &prefs)
+            .args(["--relay-url", &format!("http://127.0.0.1:{port}")]);
+    });
+
+    let reply = send_prompt(&mut stream, &mut reader, "hi");
+    assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+
+    let raw = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let lower = raw.to_lowercase();
+    assert!(
+        lower.contains("x-api-key: tap_from_prefs"),
+        "token should come from preferences:\n{raw}"
+    );
+    assert!(
+        lower.contains("cf-access-client-id: cf-id.access"),
+        "missing Access id:\n{raw}"
+    );
+    assert!(
+        lower.contains("cf-access-client-secret: cf-secret"),
+        "missing Access secret:\n{raw}"
+    );
+}
+
+/// A value with every `cache_control` removed, recursively.
+///
+/// The marks move forward as a conversation grows — a breakpoint marks where a
+/// prefix *ends* — so comparing two requests byte-for-byte would compare two
+/// different placements that are both correct. Claude Code's captured bodies
+/// show exactly that shape: one mark, on the last message, at 1562 of 1563.
+///
+/// Content must be identical; the marks are asserted separately, in
+/// `the_breakpoint_stays_on_the_last_real_turn`.
+fn strip_marks(v: &serde_json::Value) -> serde_json::Value {
+    match v {
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.iter()
+                .filter(|(k, _)| k.as_str() != "cache_control")
+                .map(|(k, val)| (k.clone(), strip_marks(val)))
+                .collect(),
+        ),
+        serde_json::Value::Array(items) => items.iter().map(strip_marks).collect(),
+        other => other.clone(),
+    }
+}
+
+/// The text of a message, whether its content is a bare string or blocks.
+fn text_of(message: &serde_json::Value) -> String {
+    match &message["content"] {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Array(blocks) => blocks
+            .iter()
+            .filter_map(|b| b["text"].as_str())
+            .collect::<Vec<_>>()
+            .join(""),
+        _ => String::new(),
+    }
+}
+
+/// Two requests across a permission-mode change must share their cached prefix.
+///
+/// This is the test for the defect this work started from. The working
+/// directory and the mode used to live in a `system` block, *before* the static
+/// instructions — so toggling the mode changed a system block and invalidated
+/// that block and every message behind it. The whole conversation, re-bought to
+/// change twenty bytes, at 50x the hit rate.
+///
+/// A test that only checked one request could not see it: every individual
+/// request was well-formed and cacheable. The fault was only visible by
+/// comparing two, which is what this does.
+#[test]
+fn toggling_the_gate_does_not_move_the_cached_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    let (port, rx) = spawn_mock_relay(vec![("HTTP/1.1 200 OK", FINAL_ROUND), ("HTTP/1.1 200 OK", FINAL_ROUND)]);
+    let socket = dir.path().join("agent.sock");
+    let (_agent, mut reader, mut stream) = spawn_agent_at(dir.path(), &socket, port);
+
+    // One request in the default mode…
+    let first = send_prompt(&mut stream, &mut reader, "first");
+    assert_eq!(first["kind"], "done", "unexpected reply: {first}");
+    let before = body_of(&rx.recv_timeout(Duration::from_secs(5)).unwrap());
+
+    // …then change the mode, which is the thing that used to rewrite the prefix.
+    stream.write_all(b"{\"kind\":\"set_plan_mode\",\"on\":true}\n").unwrap();
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    assert!(line.contains("gate = plan"), "unexpected reply: {line}");
+
+    // …and ask again.
+    let second = send_prompt(&mut stream, &mut reader, "second");
+    assert_eq!(second["kind"], "done", "unexpected reply: {second}");
+    let after = body_of(&rx.recv_timeout(Duration::from_secs(5)).unwrap());
+
+    // The two constants of the prompt: system and tools lead the body, so a
+    // byte of difference here invalidates everything behind it. Compared
+    // serialized, because that is the form the provider hashes.
+    assert_eq!(
+        serde_json::to_string(&before["system"]).unwrap(),
+        serde_json::to_string(&after["system"]).unwrap(),
+        "changing the permission mode rewrote a system block, which invalidates \
+         every message behind it:\nbefore: {}\nafter:  {}",
+        before["system"],
+        after["system"]
+    );
+    assert_eq!(
+        serde_json::to_string(&before["tools"]).unwrap(),
+        serde_json::to_string(&after["tools"]).unwrap(),
+        "the tool array moved between two requests"
+    );
+
+    // The conversation grows; it does not change. Everything the first request
+    // sent, apart from the moving cache markers and the state turn appended
+    // after its last breakpoint, must be the exact beginning of the second.
+    //
+    // Compared with the markers stripped, and that is not a convenience. A
+    // breakpoint marks where a prefix ENDS, so it moves forward as the
+    // conversation grows: turn 1's last message carries a mark, and in turn 2
+    // that same message is mid-history and the new last message carries it
+    // instead. Claude Code's captured requests show exactly this — one mark, on
+    // the last message, at 1562 of 1563 — and it reads its own prefix back at
+    // 97–99%, so moving marks demonstrably do not break a cache. Asserting
+    // byte-identity including the marker would be asserting a stricter rule
+    // than the reference client follows.
+    let real = |body: &serde_json::Value| -> Vec<serde_json::Value> {
+        let mut out: Vec<serde_json::Value> = body["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .map(strip_marks)
+            .collect();
+        // Drop the trailing state turn: it is rendered per request, sits after
+        // the last breakpoint, and is therefore never part of a cached prefix.
+        if out
+            .last()
+            .is_some_and(|m| m["content"].as_str().is_some_and(|s| s.starts_with("<env ")))
+        {
+            out.pop();
+        }
+        out
+    };
+    let before_msgs = real(&before);
+    let after_msgs = real(&after);
+    assert!(
+        after_msgs.len() > before_msgs.len(),
+        "the second request should have grown: {} then {}",
+        before_msgs.len(),
+        after_msgs.len()
+    );
+    for (i, message) in before_msgs.iter().enumerate() {
+        assert_eq!(
+            message, &after_msgs[i],
+            "message {i} differs between the two requests, so the provider cannot \
+             read it back from cache"
+        );
+    }
+
+    // The mark belongs on the last real message, and on the system blocks —
+    // the placement the captured requests use. If a refactor ever moved it onto
+    // the state turn, the prefix would be cached around a block that changes
+    // every request, which is the failure this whole change is about.
+    let marked: Vec<usize> = after["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| {
+            m["content"]
+                .as_array()
+                .is_some_and(|c| c.iter().any(|b| b.get("cache_control").is_some()))
+        })
+        .map(|(i, _)| i)
+        .collect();
+    let last_real = after_msgs.len() - 1;
+    assert_eq!(
+        marked,
+        vec![last_real],
+        "the message breakpoint must be on the last real turn and nowhere else; \
+         got marks on {marked:?} of {} messages",
+        after["messages"].as_array().unwrap().len()
+    );
+    assert!(
+        after["messages"].as_array().unwrap()[last_real + 1]["content"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("<env "),
+        "the state turn must follow the last breakpoint, uncached"
+    );
+
+    // And the mode really did change, so the assertions above are about a
+    // toggle that happened rather than one that silently did nothing.
+    //
+    // The text is read out of the block rather than searched for in
+    // `Value::to_string()`. That serialization escapes the quotes — the needle
+    // would have to be `gate=\"plan\"` — so a search for `gate="plan"` against
+    // it never matches, and the negative assertion below would pass for
+    // entirely the wrong reason. Reading the field is the honest comparison.
+    assert!(
+        !before_msgs.iter().any(|m| text_of(m).contains("gate=\"plan\"")),
+        "the first request should be in the default mode"
+    );
+    let last = after["messages"].as_array().unwrap().last().unwrap();
+    assert!(
+        text_of(last).contains("gate=\"plan\""),
+        "the second request's state turn should carry the new mode:\n{}",
+        last["content"]
+    );
+}
+
+/// A reply that asks for one tool call.
+///
+/// The call id is a parameter, and it matters: the transcript accumulates, so
+/// by the third request the history holds every earlier `tool_result`. Sharing
+/// one id across rounds makes a lookup by id ambiguous — it finds the oldest —
+/// and the test then reads a stale result while believing it read the new one.
+/// Distinct ids also mean the pairing this asserts is the real one.
+fn tool_round(call_id: &str, name: &str, input: &str) -> String {
+    format!(
+        r#"{{
+    "id": "msg_tool",
+    "type": "message",
+    "role": "assistant",
+    "model": "claude-sonnet-4-6",
+    "content": [{{ "type": "tool_use", "id": "{call_id}", "name": "{name}", "input": {input} }}],
+    "stop_reason": "tool_use",
+    "usage": {{ "input_tokens": 5, "output_tokens": 4 }}
+}}"#
+    )
+}
+
+/// The `tool_result` text a request carried back, by call id.
+fn tool_result_of(body: &serde_json::Value, id: &str) -> String {
+    body["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .flat_map(|m| m["content"].as_array().cloned().unwrap_or_default())
+        .find(|b| b["type"] == "tool_result" && b["tool_use_id"] == id)
+        .and_then(|b| b["content"].as_str().map(str::to_owned))
+        .unwrap_or_else(|| panic!("no tool_result for {id} in:\n{body}"))
+}
+
+/// A tool round that also says something, unlike [`tool_round`].
+///
+/// The distinction is not cosmetic: the loop's round cap behaves differently
+/// depending on whether any prose was produced. With text it appends a warning
+/// to what it has; with nothing but tool calls there is no answer to annotate,
+/// so it returns an error instead. Testing the cap therefore needs a round that
+/// talks *and* asks for a tool.
+fn talking_tool_round(call_id: &str, name: &str, input: &str, text: &str) -> String {
+    serde_json::json!({
+        "id": "msg_tool",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-sonnet-4-6",
+        "content": [
+            { "type": "text", "text": text },
+            { "type": "tool_use", "id": call_id, "name": name, "input": serde_json::from_str::<serde_json::Value>(input).unwrap() }
+        ],
+        "stop_reason": "tool_use",
+        "usage": { "input_tokens": 5, "output_tokens": 4 }
+    })
+    .to_string()
+}
+
+/// A throwaway git repository with one commit and one untracked file.
+fn git_repo(dir: &Path) -> PathBuf {
+    let repo = dir.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    for args in [
+        vec!["init", "-q"],
+        vec!["config", "user.email", "t@example.com"],
+        vec!["config", "user.name", "T"],
+        // Signing off explicitly. A developer machine commonly sets
+        // `commit.gpgsign = true` for a hardware key, and `git config` here is
+        // local but `commit.gpgsign` is not — so without this the commit stops
+        // for a PIN prompt no test can answer and the failure reads as a
+        // broken tool rather than an inherited preference.
+        vec!["config", "commit.gpgsign", "false"],
+        vec!["commit", "-q", "--no-gpg-sign", "--allow-empty", "-m", "first commit"],
+    ] {
+        let out = Command::new("git")
+            .args(&args)
+            .current_dir(&repo)
+            // Nothing above the repo: no operator hooks, no aliases, no
+            // conditional includes. The repo's own `config` calls still apply,
+            // since those are written into the work tree we just created.
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    std::fs::write(repo.join("untracked.txt"), "hello").unwrap();
+    repo
+}
+
+/// A config with a git tool, a cargo tool and one taking an argument.
+///
+/// Written to a temp file rather than used from `examples/tools.json` so the
+/// cargo entry can be `--version`: this test runs *inside* `cargo test`, which
+/// holds the target-directory lock, so a nested `cargo test` or `cargo check`
+/// would block until the outer run finished and the test would hang rather than
+/// fail. A version query exercises the same exec path with no lock, and the
+/// shipped example keeps the `cargo test` an operator actually wants.
+fn tools_config(dir: &Path) -> PathBuf {
+    let path = dir.join("tools.json");
+    let config = serde_json::json!({
+        "disable": ["Bash"],
+        "add": [
+            {
+                // Deliberately *not* a built-in's name: a custom tool that shadows one makes
+                // the agent refuse to start, and the built-in list grew after this fixture was
+                // written (`GitStatus` is one of them now). That refusal is checked in
+                // `tools::config`; here the point is only that an argv tool works. The name
+                // matches the shipped example's, so the tree has one custom git tool to follow.
+                "name": "GitBisect",
+                "description": "Show the working tree status.",
+                "schema": { "type": "object", "properties": {}, "required": [] },
+                "argv": ["git", "status", "--short"],
+                "timeout_secs": 15,
+                "judged": false
+            },
+            {
+                "name": "CargoVersion",
+                "description": "Show the cargo version.",
+                "schema": { "type": "object", "properties": {}, "required": [] },
+                "argv": ["cargo", "--version"],
+                "timeout_secs": 30,
+                "judged": false
+            },
+            {
+                "name": "GitLogLimit",
+                "description": "Show the last N commits.",
+                "schema": {
+                    "type": "object",
+                    "properties": { "max": { "type": "integer" } },
+                    "required": ["max"]
+                },
+                "argv": ["git", "log", "--oneline", "--max-count={max}"],
+                "timeout_secs": 15,
+                "judged": false
+            }
+        ]
+    });
+    std::fs::write(&path, config.to_string()).unwrap();
+    path
+}
+
+/// Configured tools really run, on the real binary, with real subprocesses.
+///
+/// The other tests here check what the agent *sends*. This one checks what it
+/// *does*: only the model is mocked, while `dispatch`, `expand`,
+/// `tokio::process::Command` and the socket loop are the shipping code. It also
+/// asserts the configured tool array — `Bash` gone, three tools added — reached
+/// the wire, and that the requests carry cache breakpoints.
+#[test]
+fn configured_tools_execute_for_real() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = git_repo(dir.path());
+    let config = tools_config(dir.path());
+    let socket = dir.path().join("agent.sock");
+
+    // The model calls each tool in turn, then stops. Each result comes back in
+    // the *next* request, which is what the mock captures.
+    let (port, rx) = spawn_mock_relay(vec![
+        (
+            "HTTP/1.1 200 OK",
+            Box::leak(tool_round("call_git", "GitBisect", "{}").into_boxed_str()),
+        ),
+        (
+            "HTTP/1.1 200 OK",
+            Box::leak(tool_round("call_cargo", "CargoVersion", "{}").into_boxed_str()),
+        ),
+        (
+            "HTTP/1.1 200 OK",
+            Box::leak(tool_round("call_log", "GitLogLimit", r#"{"max": 1}"#).into_boxed_str()),
+        ),
+        ("HTTP/1.1 200 OK", FINAL_ROUND),
+    ]);
+    let (_agent, mut reader, mut stream) = spawn_agent(&repo, &socket, |cmd| {
+        cmd.args([
+            "--relay-url",
+            &format!("http://127.0.0.1:{port}"),
+            "--relay-token",
+            "tap_test_token",
+            "--tools-config",
+            config.to_str().unwrap(),
+        ]);
+    });
+
+    let reply = send_prompt(&mut stream, &mut reader, "check the repo");
+    assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+
+    // Every request goes through the channel, including the first — which is
+    // where the tool array belongs, before any tool has run.
+    let first = body_of(&rx.recv_timeout(Duration::from_secs(30)).unwrap());
+
+    // The git tool printed the real `git status --short` output.
+    let second = body_of(&rx.recv_timeout(Duration::from_secs(30)).unwrap());
+    let status = tool_result_of(&second, "call_git");
+    assert!(
+        status.contains("untracked.txt"),
+        "GitStatus should have printed real git output, got: {status}"
+    );
+
+    // The cargo tool ran a real cargo.
+    let third = body_of(&rx.recv_timeout(Duration::from_secs(30)).unwrap());
+    let cargo = tool_result_of(&third, "call_cargo");
+    assert!(
+        cargo.trim().starts_with("cargo "),
+        "CargoVersion should have printed real `cargo --version` output, got: {cargo}"
+    );
+
+    // The argument was substituted as a whole argv element.
+    let fourth = body_of(&rx.recv_timeout(Duration::from_secs(30)).unwrap());
+    let log = tool_result_of(&fourth, "call_log");
+    assert!(
+        log.contains("first commit"),
+        "GitLogLimit should have run `git log --oneline --max-count=1`, got: {log}"
+    );
+
+    // The configured array reached the wire: Bash removed, three tools added.
+    let names: Vec<&str> = first["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .filter_map(|t| t["name"].as_str())
+        .collect();
+    assert!(
+        !names.contains(&"Bash"),
+        "Bash was disabled but is still offered: {names:?}"
+    );
+    assert!(
+        names.contains(&"Read"),
+        "disabling Bash must not take the built-ins nobody asked to remove: {names:?}"
+    );
+    for wanted in ["GitBisect", "CargoVersion", "GitLogLimit"] {
+        assert!(names.contains(&wanted), "{wanted} missing from {names:?}");
+    }
+
+    // Every system block carries a breakpoint, which is the half of the cache
+    // fix that stops a mode toggle from invalidating the whole prompt.
+    assert!(
+        first["system"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|b| b.get("cache_control").is_some()),
+        "every system block should carry a breakpoint:\n{first}"
+    );
+
+    // And the growing transcript carries cache breakpoints, so it is being
+    // cached rather than re-bought every turn.
+    assert!(
+        first["messages"].as_array().unwrap().iter().any(|m| m["content"]
+            .as_array()
+            .is_some_and(|c| c.iter().any(|b| b.get("cache_control").is_some()))),
+        "no cache breakpoints on a real request:\n{first}"
+    );
+}
+
+/// A reply that decorates its prose with SGR — what a model still sends when a
+/// reader with no terminal is listening.
+///
+/// Serialised rather than written out as a literal, because a JSON string may
+/// not contain a bare control byte (RFC 8259) and `serde_json` rejects one.
+/// The `\x1b` below is an ordinary Rust escape in the *source* that becomes a
+/// real ESC at compile time, and the serialiser then emits it in JSON's own
+/// escaped form on the wire — so the client decodes a genuine escape while this
+/// file never holds an invisible byte.
+///
+/// That distinction cost a round of debugging: the first version embedded the
+/// escape directly, and a raw control character is invisible in a diff and easy
+/// to mangle while editing, so the test failed as a *decode* error instead of
+/// failing on the colour bug it was written for.
+///
+/// The judge's answer: a severity on its own, with no closing tag.
+///
+/// The judge is asked with `</severity>` as a stop sequence, so generation stops
+/// *before* the closer is emitted and the real reply is a bare `<severity>N`.
+/// Mimicking that matters: a mock that returned the tidy closed form would test
+/// a shape the server never actually produces.
+fn judge_verdict(severity: u8) -> String {
+    serde_json::json!({
+        "id": "msg_judge",
+        "type": "message",
+        "role": "assistant",
+        "model": "deepseek-flash",
+        "content": [{ "type": "text", "text": format!("<severity>{severity}") }],
+        "stop_reason": "stop_sequence",
+        "usage": { "input_tokens": 5, "output_tokens": 4 }
+    })
+    .to_string()
+}
+
+/// The literal `[0m` in the middle is deliberate: that is *text*, not an
+/// escape, and must survive. A filter matching the visible shape would delete a
+/// sentence like this one.
+fn round_with_escapes() -> String {
+    serde_json::json!({
+        "id": "msg_esc",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-sonnet-4-6",
+        "content": [{
+            "type": "text",
+            "text": "\x1b[1mMy tools\x1b[0m (a literal [0m stays) and \x1b[36mcyan\x1b[0m."
+        }],
+        "stop_reason": "end_turn",
+        "usage": { "input_tokens": 5, "output_tokens": 4 }
+    })
+    .to_string()
+}
+
+/// Every `.jsonl` under `dir`, found recursively.
+fn jsonl_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            jsonl_files(&path, out);
+        } else if path.extension().and_then(|s| s.to_str()) == Some("jsonl") {
+            out.push(path);
+        }
+    }
+}
+
+/// The agent's transcript on disk, as raw text.
+///
+/// Returned raw, not parsed, on purpose: the assertion is that no escape
+/// survived, and `serde_json` writes a control byte as its six-character JSON
+/// spelling rather than the byte itself. So the check has to look for *both*
+/// forms, since neither alone would catch a transcript that kept an escape.
+/// `HOME` is a tempdir here, so there is exactly one project directory with one
+/// transcript — hence the exact-count assertion, which fails loudly rather than
+/// silently reading the wrong file if that ever changes.
+fn transcript_text(home: &Path) -> String {
+    let projects = home.join(".claude").join("projects");
+    let mut files = Vec::new();
+    jsonl_files(&projects, &mut files);
+    assert_eq!(files.len(), 1, "expected one transcript, found {files:?}");
+    std::fs::read_to_string(&files[0]).unwrap()
+}
+
+/// One instruction, and it is markdown.
+///
+/// The regression this replaces: the session used to be told to emit SGR escapes,
+/// so a reader with no terminal — a phone, an API client, a mirror — showed `[36m`
+/// as literal text, which is the emphasis turning into noise. The instruction is now
+/// markdown for every sink, and this says so from both sides, because "one
+/// instruction" is the property rather than any particular wording.
+#[test]
+fn the_instruction_is_markdown_for_every_sink() {
+    let mut seen = Vec::new();
+    for ansi in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let (port, rx) = spawn_mock_relay(vec![("HTTP/1.1 200 OK", FINAL_ROUND)]);
+        let socket = dir.path().join("agent.sock");
+        let (_agent, mut reader, mut stream) = spawn_agent(dir.path(), &socket, |cmd| {
+            cmd.args([
+                "--relay-url",
+                &format!("http://127.0.0.1:{port}"),
+                "--relay-token",
+                RELAY_TOKEN,
+            ]);
+            if ansi {
+                cmd.arg("--ansi");
+            }
+        });
+
+        send_prompt(&mut stream, &mut reader, "hi");
+        let body = body_of(&rx.recv_timeout(Duration::from_secs(5)).unwrap());
+        let instructions = body["system"][1]["text"]
+            .as_str()
+            .expect("instructions block")
+            .to_owned();
+
+        assert!(
+            instructions.contains("Write markdown"),
+            "the model must be asked for markdown (ansi={ansi}):\n{instructions}"
+        );
+        // The forbidding form, not the inviting one: the old instruction *told* the
+        // model to use escapes, and a check for the word "ANSI" alone cannot tell
+        // those apart.
+        assert!(
+            instructions.contains("Do NOT emit ANSI escape sequences"),
+            "escapes must be forbidden, not requested (ansi={ansi}):\n{instructions}"
+        );
+        assert!(
+            !instructions.contains('\u{1b}'),
+            "and the instruction must not demonstrate one (ansi={ansi}):\n{instructions:?}"
+        );
+        seen.push(instructions);
+    }
+    assert_eq!(seen[0], seen[1], "--ansi must not change what the model is asked for");
+}
+
+/// Escapes are removed whichever sink the session has.
+///
+/// The other half of the same bug, and the one that survived the first fix: a
+/// session with a terminal attached kept the model's escapes, on the reasoning that
+/// the terminal would interpret them. A live session showed the flaw — the REPL
+/// draws through ratatui and emits its own styling, so an escape from the model is
+/// never wanted, and what a sink *declares* is not what it does. `--ansi` is the
+/// case that used to keep them.
+#[test]
+fn escapes_are_stripped_whichever_sink_the_session_has() {
+    let dir = tempfile::tempdir().unwrap();
+    let (port, _rx) = spawn_mock_relay_owned(vec![("HTTP/1.1 200 OK", round_with_escapes())]);
+    let socket = dir.path().join("agent.sock");
+    let (_agent, mut reader, mut stream) = spawn_agent(dir.path(), &socket, |cmd| {
+        cmd.args([
+            "--relay-url",
+            &format!("http://127.0.0.1:{port}"),
+            "--relay-token",
+            RELAY_TOKEN,
+            "--ansi",
+        ]);
+    });
+
+    let reply = send_prompt(&mut stream, &mut reader, "hi");
+    assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+    let text = reply["text"].as_str().unwrap();
+    assert!(
+        !text.contains('\u{1b}'),
+        "even with --ansi, a reply must carry no escape a terminal did not ask for: {text:?}"
+    );
+    assert!(text.contains("My tools"), "stripping must not eat the text: {text:?}");
+    // The fixture holds a bare `[0m` with no ESC byte in front of it, on purpose:
+    // stripping removes the escape *sequence*, and text that merely looks like one
+    // is text. Losing it would mean the filter was matching on the shape rather than
+    // on the control character.
+    assert!(
+        text.contains("a literal [0m stays"),
+        "a bare [0m is characters, not an escape: {text:?}"
+    );
+
+    let transcript = transcript_text(dir.path());
+    assert!(
+        !transcript.contains("\\u001b") && !transcript.contains('\u{1b}'),
+        "the transcript stays plain:\n{transcript}"
+    );
+}
+
+/// `--ansi` and `NO_COLOR` no longer reach the prompt, so neither can change it.
+///
+/// Pinned because it is a deliberate loss rather than an oversight: the flag now
+/// decides whether the *REPL* styles its rendering (see `Agent::styles_output`), and
+/// that is not observable from the socket — a client reading `done.text` gets the
+/// same characters either way. A future change that reintroduced a second
+/// instruction variant would fail here, which is the point.
+#[test]
+fn the_colour_flags_no_longer_shape_the_instruction() {
+    let mut seen = Vec::new();
+    for env in [
+        &[][..],
+        &[("NO_COLOR", "1")][..],
+        &[("NO_COLOR", "1"), ("CATBUS_ANSI", "0")][..],
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let (port, rx) = spawn_mock_relay(vec![("HTTP/1.1 200 OK", FINAL_ROUND)]);
+        let socket = dir.path().join("agent.sock");
+        let (_agent, mut reader, mut stream) = spawn_agent(dir.path(), &socket, |cmd| {
+            cmd.args([
+                "--relay-url",
+                &format!("http://127.0.0.1:{port}"),
+                "--relay-token",
+                RELAY_TOKEN,
+            ]);
+            cmd.arg("--ansi");
+            for (key, value) in env {
+                cmd.env(key, value);
+            }
+        });
+
+        send_prompt(&mut stream, &mut reader, "hi");
+        let body = body_of(&rx.recv_timeout(Duration::from_secs(5)).unwrap());
+        seen.push(body["system"][1]["text"].as_str().unwrap_or_default().to_owned());
+    }
+    assert_eq!(seen[0], seen[1], "NO_COLOR must not change the instruction");
+    assert_eq!(seen[1], seen[2], "nor an explicit opt-out");
+}
+
+// ---------------------------------------------------------------------------
+// The minimal tool set: Read + Write + FileTree, no shell.
+//
+// These drive the real binary against a mock relay, so they exercise the whole
+// path a task takes: the specs that reach the wire, the dispatch of each call,
+// and the result the model sees back. A unit test on `filetree::run` would miss
+// whether the tool is registered at all, or whether a `Write` that a FileTree
+// found a path for actually lands on disk.
+// ---------------------------------------------------------------------------
+
+/// `{"allow": ["Read", "Write", "FileTree"]}` — the config that produces
+/// [`catbus_agent::tools::MINIMAL_TOOLS`].
+///
+/// Written as a literal rather than read from `MINIMAL_TOOLS` on purpose: this
+/// is the file an operator would hand-write, and the point of the test is that
+/// *that* JSON yields a working agent. Importing the constant would test the
+/// constant against itself.
+fn minimal_tools_config(dir: &Path) -> PathBuf {
+    let path = dir.join("minimal-tools.json");
+    std::fs::write(
+        &path,
+        serde_json::json!({ "allow": ["Read", "Write", "FileTree"] }).to_string(),
+    )
+    .unwrap();
+    path
+}
+
+/// Spawn an agent with `--tools-config minimal_tools_config`, pointed at a mock
+/// relay, rooted at `root`.
+fn spawn_minimal_agent(
+    home: &Path,
+    root: &Path,
+    socket: &Path,
+    port: u16,
+) -> (KillOnDrop, BufReader<UnixStream>, UnixStream) {
+    let config = minimal_tools_config(home);
+    spawn_agent_in(home, root, socket, |cmd| {
+        cmd.args([
+            "--relay-url",
+            &format!("http://127.0.0.1:{port}"),
+            "--relay-token",
+            RELAY_TOKEN,
+            "--tools-config",
+            config.to_str().unwrap(),
+        ]);
+    })
+}
+
+fn tool_names(body: &serde_json::Value) -> Vec<String> {
+    body["tools"]
+        .as_array()
+        .expect("tools array")
+        .iter()
+        .filter_map(|t| t["name"].as_str().map(str::to_owned))
+        .collect()
+}
+
+/// The tool set actually offered on the wire is exactly the three, so a model
+/// cannot call a capability the operator withheld.
+#[test]
+fn a_minimal_agent_offers_only_read_write_and_filetree() {
+    let dir = tempfile::tempdir().unwrap();
+    let (port, rx) = spawn_mock_relay(vec![("HTTP/1.1 200 OK", FINAL_ROUND)]);
+    let socket = dir.path().join("agent.sock");
+    let (_agent, mut reader, mut stream) = spawn_minimal_agent(dir.path(), dir.path(), &socket, port);
+
+    let reply = send_prompt(&mut stream, &mut reader, "hi");
+    assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+
+    let body = body_of(&rx.recv_timeout(Duration::from_secs(10)).unwrap());
+    let mut names = tool_names(&body);
+    names.sort();
+    assert_eq!(
+        names,
+        vec!["FileTree", "Read", "Write"],
+        "the offered set must be exactly the minimal trio"
+    );
+}
+
+/// The task the user asked for, end to end: the agent looks around with
+/// `FileTree`, reads a file with `Read`, and writes a new one with `Write` —
+/// with no shell anywhere in the loop.
+///
+/// This is the test that would catch a `FileTree` that is registered but whose
+/// output is unusable, or a `Write` that cannot be reached because nothing told
+/// the model which directory it is in.
+#[test]
+fn a_minimal_agent_completes_a_file_task_without_a_shell() {
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(work.join("docs")).unwrap();
+    std::fs::write(work.join("docs/notes.txt"), "the catbus is late").unwrap();
+
+    // The model's plan: see what is here, read the note, write a summary.
+    //
+    // Four responses for four round trips, in order — each request carries the
+    // previous round's tool result, so request N+1 is where result N is found.
+    // The mock blocks on accept, so a fifth would hang the test rather than
+    // fail it.
+    let (port, rx) = spawn_mock_relay_owned(vec![
+        (
+            "HTTP/1.1 200 OK",
+            tool_round("c1", "FileTree", r#"{"path": ".", "depth": 2}"#),
+        ),
+        (
+            "HTTP/1.1 200 OK",
+            tool_round("c2", "Read", r#"{"path": "docs/notes.txt"}"#),
+        ),
+        (
+            "HTTP/1.1 200 OK",
+            tool_round(
+                "c3",
+                "Write",
+                r#"{"path": "SUMMARY.md", "content": "The catbus is late."}"#,
+            ),
+        ),
+        ("HTTP/1.1 200 OK", FINAL_ROUND.to_owned()),
+    ]);
+    let socket = dir.path().join("agent.sock");
+    let (_agent, mut reader, mut stream) = spawn_minimal_agent(dir.path(), &work, &socket, port);
+
+    let reply = send_prompt(&mut stream, &mut reader, "summarise the notes in docs/");
+    assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+
+    let first = body_of(&rx.recv_timeout(Duration::from_secs(30)).unwrap());
+    let second = body_of(&rx.recv_timeout(Duration::from_secs(30)).unwrap());
+    let third = body_of(&rx.recv_timeout(Duration::from_secs(30)).unwrap());
+    let fourth = body_of(&rx.recv_timeout(Duration::from_secs(30)).unwrap());
+
+    // No shell was ever on offer — absent from the first request's specs — and
+    // the task completes anyway, which is the whole claim.
+    let offered = tool_names(&first);
+    assert!(
+        !offered.contains(&"Bash".to_string()),
+        "a shell must not be reachable: {offered:?}"
+    );
+
+    // FileTree showed the real tree, so the agent could find the file.
+    let tree = tool_result_of(&second, "c1");
+    assert!(tree.contains("docs/"), "FileTree found no directory:\n{tree}");
+    assert!(tree.contains("notes.txt"), "FileTree found no file:\n{tree}");
+
+    // Read returned the contents, proving the path FileTree printed is the path
+    // Read accepts. If the two disagreed the pair would be useless together,
+    // which is why this is checked rather than assumed.
+    let read = tool_result_of(&third, "c2");
+    assert!(read.contains("the catbus is late"), "Read got:\n{read}");
+
+    // Write reported success, naming the path it used, and the bytes really
+    // landed there. The byte count is not asserted: its exact value depends on
+    // the fixture string, and hard-coding it tests my arithmetic rather than
+    // the tool — the file's contents check below is the real one.
+    let write = tool_result_of(&fourth, "c3");
+    assert!(
+        write.starts_with("Wrote "),
+        "Write should report what it wrote:\n{write}"
+    );
+    assert!(
+        write.contains("SUMMARY.md"),
+        "Write should name the file it wrote:\n{write}"
+    );
+    // Proves the path was resolved against the session's cwd and not the
+    // process's: `work` is not the process cwd, and only the session's is.
+    assert!(
+        write.contains(work.to_str().unwrap()),
+        "Write resolved against the wrong directory:\n{write}"
+    );
+    let written = std::fs::read_to_string(work.join("SUMMARY.md")).expect("SUMMARY.md should exist");
+    assert_eq!(written, "The catbus is late.");
+}
+
+/// A withheld tool is refused with an error the model can act on, rather than
+/// being dispatched anyway.
+///
+/// Worth pinning because the withholding is done by filtering `specs()`, so the
+/// dispatcher has to agree with the spec list — if it did not, an agent could
+/// reach Bash simply by emitting a `tool_use` for a tool it was never offered,
+/// and a model that hallucinates a familiar tool name does exactly that.
+#[test]
+fn a_withheld_tool_cannot_be_reached_by_naming_it() {
+    let dir = tempfile::tempdir().unwrap();
+    // The model asks for Bash even though it was never offered it — which is
+    // what a hallucinated familiar tool name looks like on the wire.
+    let (port, rx) = spawn_mock_relay_owned(vec![
+        (
+            "HTTP/1.1 200 OK",
+            tool_round("c1", "Bash", r#"{"command": "echo pwned"}"#),
+        ),
+        ("HTTP/1.1 200 OK", FINAL_ROUND.to_owned()),
+    ]);
+    let socket = dir.path().join("agent.sock");
+    let (_agent, mut reader, mut stream) = spawn_minimal_agent(dir.path(), dir.path(), &socket, port);
+
+    let reply = send_prompt(&mut stream, &mut reader, "run echo pwned");
+    assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+
+    let _first = body_of(&rx.recv_timeout(Duration::from_secs(30)).unwrap());
+    let second = body_of(&rx.recv_timeout(Duration::from_secs(30)).unwrap());
+    let result = tool_result_of(&second, "c1");
+
+    // Exact match, not a substring hunt: the loop wraps a dispatch error as
+    // `Error: {e}`, so this pins both the refusal and the fact that nothing
+    // else ran. `pwned` appears nowhere, because the command never executed.
+    assert_eq!(
+        result, "Error: unknown tool: Bash",
+        "Bash must be refused by name, got:\n{result}"
+    );
+    assert!(!result.contains("pwned"), "the shell command ran:\n{result}");
+}
+
+/// The `/clear` socket request starts a fresh session and leaves the old
+/// transcript in place.
+///
+/// The socket form rather than the REPL one, because this is the shape a GUI or
+/// a phone uses — and "nothing is deleted" is the safety property that makes it
+/// reasonable to expose at all.
+#[test]
+fn clearing_starts_a_fresh_session_and_keeps_the_old_transcript() {
+    let dir = tempfile::tempdir().unwrap();
+    let (port, _rx) = spawn_mock_relay(vec![("HTTP/1.1 200 OK", FINAL_ROUND)]);
+    let socket = dir.path().join("agent.sock");
+    let (_agent, mut reader, mut stream) = spawn_agent_at(dir.path(), &socket, port);
+
+    // Have a conversation, so there is a transcript worth preserving.
+    let reply = send_prompt(&mut stream, &mut reader, "hi");
+    assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+
+    let before = transcript_text(dir.path());
+    assert!(before.contains("hi"), "the first turn should be on disk:\n{before}");
+
+    // Clear it.
+    stream.write_all(b"{\"kind\":\"clear\"}\n").unwrap();
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    let cleared: serde_json::Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(cleared["kind"], "done", "clear failed: {cleared}");
+    let text = cleared["text"].as_str().unwrap();
+    assert!(
+        text.contains("still on disk"),
+        "the reply must say the old transcript survives: {text}"
+    );
+
+    // Both transcripts now exist: the cleared one, untouched, and a new one.
+    let mut files = Vec::new();
+    jsonl_files(&dir.path().join(".claude").join("projects"), &mut files);
+    assert_eq!(files.len(), 2, "expected the old transcript and a new one: {files:?}");
+    let preserved = files
+        .iter()
+        .any(|f| std::fs::read_to_string(f).unwrap_or_default().contains("hi"));
+    assert!(preserved, "the old transcript was destroyed by clear");
+}
+
+/// `--tools-config` with `allow` is the only way in: an agent given no config
+/// keeps the full built-in set, so nothing about this change restricts a
+/// normal session.
+#[test]
+fn a_session_without_a_tools_config_still_gets_every_tool() {
+    let dir = tempfile::tempdir().unwrap();
+    let (port, rx) = spawn_mock_relay(vec![("HTTP/1.1 200 OK", FINAL_ROUND)]);
+    let socket = dir.path().join("agent.sock");
+    let (_agent, mut reader, mut stream) = spawn_agent_at(dir.path(), &socket, port);
+
+    send_prompt(&mut stream, &mut reader, "hi");
+    let body = body_of(&rx.recv_timeout(Duration::from_secs(10)).unwrap());
+    let names = tool_names(&body);
+    for expected in ["Read", "Write", "Edit", "Bash", "FileTree"] {
+        assert!(names.contains(&expected.to_string()), "missing {expected} in {names:?}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Auto mode.
+//
+// Three tests cover the chain, because no single one can: the REPL needs a tty
+// to run at all, so the typed command cannot be driven from a subprocess test,
+// and the judge needs a relay the REPL tests cannot provide. Together they pin
+// that `/auto` reaches the judged mode and that the judged mode actually stops a
+// write.
+//
+//   1. `auto_mode_consults_the_judge_and_honours_a_block` (here) — the socket's
+//      `set_gate auto` makes the judge run and its verdict stop a Write.
+//   2. `ansi_and_the_typed_gate_commands_reach_the_repl` (a pty test) — typing
+//      `/auto` at a real prompt makes the REPL report `gate = auto`.
+//   3. `the_repl_and_the_socket_agree_about_what_each_mode_is_called` (unit) —
+//      `/auto` resolves through the very function the socket uses.
+// ---------------------------------------------------------------------------
+
+/// Auto mode consults the judge before a world-changing tool, and a blocking
+/// verdict stops the write from happening.
+///
+/// The write is the point. A test that only checked for a judge *request* would
+/// pass on an agent that asks the judge and then ignores the answer, which is
+/// the failure mode that matters: the gate would look enabled while enforcing
+/// nothing.
+#[test]
+fn auto_mode_consults_the_judge_and_honours_a_block() {
+    let dir = tempfile::tempdir().unwrap();
+    // Four responses, in order: the model asks to Write, the judge blocks it,
+    // the model gives its final answer — and the mock's last entry is consumed
+    // by the third request.
+    let (port, rx) = spawn_mock_relay_owned(vec![
+        (
+            "HTTP/1.1 200 OK",
+            tool_round("c1", "Write", r#"{"path": "evil.txt", "content": "x"}"#),
+        ),
+        // 90 is above the block threshold, so the write must not run.
+        ("HTTP/1.1 200 OK", judge_verdict(90)),
+        ("HTTP/1.1 200 OK", FINAL_ROUND.to_owned()),
+    ]);
+    let socket = dir.path().join("agent.sock");
+    let (_agent, mut reader, mut stream) = spawn_minimal_agent(dir.path(), dir.path(), &socket, port);
+
+    // Enable the gate over the socket. This is the same code path the REPL's
+    // `/auto` uses — both go through `parse_gate` — so what it proves about
+    // `Gate::Auto` holds for the typed command too.
+    stream
+        .write_all(b"{\"kind\":\"set_gate\",\"gate\":\"auto\"}\n")
+        .unwrap();
+    let mut ack = String::new();
+    reader.read_line(&mut ack).unwrap();
+    let ack: serde_json::Value = serde_json::from_str(&ack).unwrap();
+    assert_eq!(ack["kind"], "done", "set_gate failed: {ack}");
+    assert_eq!(ack["text"], "gate = auto", "unexpected ack: {ack}");
+
+    let reply = send_prompt(&mut stream, &mut reader, "write the file");
+    assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+
+    let first = body_of(&rx.recv_timeout(Duration::from_secs(30)).unwrap());
+    let judge = body_of(&rx.recv_timeout(Duration::from_secs(30)).unwrap());
+    let third = body_of(&rx.recv_timeout(Duration::from_secs(30)).unwrap());
+
+    // The judge really ran, and ran as the judge: nothing else in the loop asks
+    // for `deepseek-flash`, and the judge is the only caller that passes a stop
+    // sequence.
+    assert_eq!(
+        judge["model"], "deepseek-flash",
+        "the second request should be the judge's:\n{judge}"
+    );
+    assert!(
+        judge["stop_sequences"].is_array(),
+        "the judge request should carry stop sequences:\n{judge}"
+    );
+    // It was asked about *our* write, not something generic: the tool and the
+    // path it would touch are in the prompt.
+    let judge_text = judge.to_string();
+    assert!(
+        judge_text.contains("evil.txt"),
+        "the judge was not told what to judge:\n{judge}"
+    );
+
+    // And the block was honoured: no file, and a tool result saying so.
+    assert!(
+        !dir.path().join("evil.txt").exists(),
+        "the write ran despite a blocking verdict"
+    );
+    let result = tool_result_of(&third, "c1");
+    assert!(
+        result.contains("blocked") || result.contains("refused"),
+        "the tool result should report the refusal, got:\n{result}"
+    );
+    // The main loop's own request never carried the judge's model, so the two
+    // kinds of call are not being conflated.
+    assert_ne!(first["model"], "deepseek-flash");
+}
+
+/// A reply the server cut off at the output limit is continued, not reported.
+///
+/// `stop_reason: "max_tokens"` with no tool calls used to land in the same branch as a clean
+/// `end_turn` — the model simply stopped — and the answer was handed over with a warning telling
+/// the operator to ask for the rest. That reads as a working feature and is not one: the
+/// operator asks, and the model has to pick up a sentence whose beginning is no longer in its
+/// view. The limit is a property of one request, so the honest repair is to make the next one
+/// and let the model finish its own thought.
+#[test]
+fn a_reply_cut_off_at_the_output_limit_is_continued() {
+    let dir = tempfile::tempdir().unwrap();
+    let (port, rx) = spawn_mock_relay(vec![
+        ("HTTP/1.1 200 OK", CUT_OFF_ROUND),
+        ("HTTP/1.1 200 OK", CONTINUATION_ROUND),
+    ]);
+    let socket = dir.path().join("agent.sock");
+    let (_agent, mut reader, mut stream) = spawn_agent_at(dir.path(), &socket, port);
+
+    let reply = send_prompt(&mut stream, &mut reader, "explain");
+    assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+    let text = reply["text"].as_str().unwrap();
+
+    // The two halves are one answer. The cut fell mid-sentence, so they are joined with
+    // *nothing*: a newline here would put a paragraph break inside a sentence, which is what
+    // the old code did on every tool-loop round and is wrong for exactly this case.
+    assert_eq!(
+        text, "Here is the analysis you asked for. The first thing to hand back.",
+        "the continuation must read as one paragraph:\n{text}"
+    );
+    // And no warning: nothing was lost, so there is nothing to report.
+    assert!(
+        !text.contains("cut off"),
+        "a continued reply is not a truncated one:\n{text}"
+    );
+
+    // The model was told why it was being asked again, and that the text so far is fine —
+    // otherwise it restates the beginning and the operator reads it twice. Not the last message:
+    // the harness appends its own environment block to each request, so the cue is found by
+    // looking for it rather than by assuming where it sits. Matched on the rendered message
+    // because the history builder turns the plain text into a content block and adds a cache
+    // breakpoint to it on the way out.
+    let _first = body_of(&rx.recv_timeout(Duration::from_secs(5)).unwrap());
+    let second = body_of(&rx.recv_timeout(Duration::from_secs(5)).unwrap());
+    let messages = second["messages"].as_array().unwrap();
+    let cue = messages
+        .iter()
+        .find(|m| m.to_string().contains("output-token limit"))
+        .unwrap_or_else(|| panic!("no continuation cue in: {messages:?}"));
+    let cue_text = cue.to_string();
+    assert_eq!(cue["role"], "user", "the protocol has no other role for this");
+    assert!(
+        cue_text.contains("Continue from exactly where it stopped"),
+        "and what is wanted of it:\n{cue_text}"
+    );
+    assert!(
+        cue_text.contains("do not apologise"),
+        "and what it should not spend the budget on:\n{cue_text}"
+    );
+}
+
+/// The cue is sent to the model and kept out of the transcript.
+///
+/// It has to be a `user` message on the wire, because that is the only role this side speaks
+/// in — but it is not the operator's words, and a resumed session that showed it as such would
+/// be showing a message nobody sent.
+#[test]
+fn the_continuation_cue_never_reaches_the_transcript() {
+    let dir = tempfile::tempdir().unwrap();
+    let (port, _rx) = spawn_mock_relay(vec![
+        ("HTTP/1.1 200 OK", CUT_OFF_ROUND),
+        ("HTTP/1.1 200 OK", CONTINUATION_ROUND),
+    ]);
+    let socket = dir.path().join("agent.sock");
+    let (_agent, mut reader, mut stream) = spawn_agent_at(dir.path(), &socket, port);
+    let _ = send_prompt(&mut stream, &mut reader, "explain");
+
+    let history = transcript_text(dir.path());
+    assert!(
+        !history.contains("output-token limit"),
+        "the cue is ours, not the model's, and belongs on no disk:\n{history}"
+    );
+    assert!(history.contains("explain"), "the operator's own words are kept");
+}
+
+/// A reply that stops at the limit again and again is eventually reported.
+///
+/// The automatic continuation is bounded because the ceiling is a property of the request, not
+/// of the answer: a model that reasons its way to 8192 tokens will do it again next round, and
+/// an unbounded loop would spend the turn doing nothing else. When the budget runs out the
+/// operator is told what was already tried — which is the difference between the old message
+/// ("ask for the rest") and this one.
+#[test]
+fn a_reply_that_never_finishes_reports_the_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    // The default is eight continuations, so nine stops in a row exhausts it: each of the first
+    // eight asks again, and the ninth is the one that reports.
+    let replies: Vec<(&'static str, &'static str)> = (0..9).map(|_| ("HTTP/1.1 200 OK", CUT_OFF_ROUND)).collect();
+    let (port, _rx) = spawn_mock_relay(replies);
+    let socket = dir.path().join("agent.sock");
+    let (_agent, mut reader, mut stream) = spawn_agent_at(dir.path(), &socket, port);
+
+    let reply = send_prompt(&mut stream, &mut reader, "explain");
+    assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+    let text = reply["text"].as_str().unwrap();
+    assert!(text.contains("still cut off"), "the limit must be reported:\n{text}");
+    // The ceiling we ask for, tracked here because this test cannot see the constant.
+    assert!(text.contains("65536"), "and named:\n{text}");
+    assert!(text.contains("continuations"), "and the attempt counted:\n{text}");
+    assert!(
+        !text.contains("ask for the rest"),
+        "the operator is not the retry mechanism any more:\n{text}"
+    );
+}
+
+/// The request asks for the ceiling the truncation message quotes.
+///
+/// Two places hold this number — the request and the note — and a note that promises a limit the
+/// request does not use is a recorded failure in this file already: the round-cap warning used to
+/// claim "32" while the default was 200. Pinned so the two cannot drift apart again.
+#[test]
+fn the_request_asks_for_the_configured_output_ceiling() {
+    let dir = tempfile::tempdir().unwrap();
+    let (port, rx) = spawn_mock_relay(vec![("HTTP/1.1 200 OK", FINAL_ROUND)]);
+    let socket = dir.path().join("agent.sock");
+    let (_agent, mut reader, mut stream) = spawn_agent_at(dir.path(), &socket, port);
+    let _ = send_prompt(&mut stream, &mut reader, "hi");
+
+    let body = body_of(&rx.recv_timeout(Duration::from_secs(5)).unwrap());
+    assert_eq!(
+        body["max_tokens"], 65536,
+        "the ceiling is free (a reply is billed for what it produces) and a retry is not, so \
+         this is set high enough that a normal reply is never cut. See docs/output-limit.md."
+    );
+}
+
+/// A round cut off at the ceiling that produced *no text at all* is still continued.
+///
+/// This is the shape the measurement found, not a hypothetical one: reasoning and the answer
+/// share the output budget on this endpoint, so a hard-thinking turn can spend the whole ceiling
+/// on thinking and return empty content with `stop_reason: "max_tokens"`. That round looks
+/// exactly like a finished reply that chose to say nothing — the failure the old code shipped,
+/// where the operator saw a yellow note and nothing else.
+#[test]
+fn a_cut_round_that_produced_no_text_still_continues() {
+    let dir = tempfile::tempdir().unwrap();
+    let (port, rx) = spawn_mock_relay(vec![
+        ("HTTP/1.1 200 OK", SILENT_CUT_ROUND),
+        ("HTTP/1.1 200 OK", FINAL_ROUND),
+    ]);
+    let socket = dir.path().join("agent.sock");
+    let (_agent, mut reader, mut stream) = spawn_agent_at(dir.path(), &socket, port);
+
+    let reply = send_prompt(&mut stream, &mut reader, "think hard");
+    assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+    assert_eq!(
+        reply["text"], "hi from the relay",
+        "the empty round contributes nothing and the answer is what came next"
+    );
+
+    // And a continuation really was sent, rather than the empty round being taken for an answer.
+    let _first = body_of(&rx.recv_timeout(Duration::from_secs(5)).unwrap());
+    let second = body_of(&rx.recv_timeout(Duration::from_secs(5)).unwrap());
+    assert!(
+        second.to_string().contains("output-token limit"),
+        "an empty round at the ceiling must be continued:\n{second}"
+    );
+}
+
+/// A round that hit the ceiling *and* asked for a tool runs the tool.
+///
+/// `stop_reason: "max_tokens"` with tool calls is not a truncated answer — the call that arrived
+/// is complete, and the loop's job is to run it. The continuation belongs to the other branch,
+/// the one with no tool work to do, and this pins it there: a model cut off after asking for a
+/// tool must not be sent a cue asking it to finish a sentence it already finished.
+#[test]
+fn a_tool_call_that_also_hit_the_limit_runs_the_tool() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("note.txt"), "from the file\n").unwrap();
+    let (port, rx) = spawn_mock_relay(vec![
+        ("HTTP/1.1 200 OK", CUT_OFF_TOOL_ROUND),
+        ("HTTP/1.1 200 OK", FINAL_ROUND),
+    ]);
+    let socket = dir.path().join("agent.sock");
+    let (_agent, mut reader, mut stream) = spawn_agent_at(dir.path(), &socket, port);
+
+    let reply = send_prompt(&mut stream, &mut reader, "look at note.txt");
+    assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+
+    let _first = body_of(&rx.recv_timeout(Duration::from_secs(5)).unwrap());
+    let second = body_of(&rx.recv_timeout(Duration::from_secs(5)).unwrap());
+    assert!(
+        tool_result_of(&second, "c1").contains("from the file"),
+        "the complete call in a cut-off round must still run:\n{second}"
+    );
+    assert!(
+        !second.to_string().contains("output-token limit"),
+        "a round with tool work is not a truncated answer:\n{second}"
+    );
+}
+
+/// A clean `end_turn` carries no such warning, so the flag means something.
+///
+/// Without this, the test above would pass on a parser that appended the warning
+/// to every reply.
+#[test]
+fn a_complete_reply_is_not_flagged_as_truncated() {
+    let dir = tempfile::tempdir().unwrap();
+    let (port, _rx) = spawn_mock_relay(vec![("HTTP/1.1 200 OK", FINAL_ROUND)]);
+    let socket = dir.path().join("agent.sock");
+    let (_agent, mut reader, mut stream) = spawn_agent_at(dir.path(), &socket, port);
+
+    let reply = send_prompt(&mut stream, &mut reader, "hi");
+    assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+    let text = reply["text"].as_str().unwrap();
+    assert_eq!(
+        text, "hi from the relay",
+        "an end_turn reply should be verbatim:\n{text}"
+    );
+}
+
+/// The round-cap warning states the limit that is actually in force.
+///
+/// It previously hard-coded "32-round cap" while the default was 200, so an
+/// operator who took it at face value would raise `CATBUS_MAX_ROUNDS` to
+/// something *below* the default and observe no change at all. Set to a small
+/// value here so the cap is reached in a few round trips rather than 200.
+#[test]
+fn the_round_cap_warning_names_the_real_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    // Each response says a little and asks to Read again, so the loop keeps
+    // going until the cap and still has prose to append the warning to. Prose
+    // matters here: a loop of pure tool calls has no partial answer to annotate
+    // and returns the error variant instead, which is asserted separately.
+    let responses: Vec<(&'static str, String)> = (0..8)
+        .map(|i| {
+            (
+                "HTTP/1.1 200 OK",
+                talking_tool_round(
+                    &format!("c{i}"),
+                    "Read",
+                    r#"{"path": "notes.txt"}"#,
+                    &format!("reading pass {i}"),
+                ),
+            )
+        })
+        .collect();
+    let (port, _rx) = spawn_mock_relay_owned(responses);
+    let socket = dir.path().join("agent.sock");
+    std::fs::write(dir.path().join("notes.txt"), "some notes").unwrap();
+
+    let (_agent, mut reader, mut stream) = spawn_agent(dir.path(), &socket, |cmd| {
+        // The repeat guard is switched off so this stays a test of the *cap*. Its
+        // fixture asks for the same read every round and gets the same bytes back,
+        // which is now that guard's business — it would stop the turn at round
+        // three with a loop notice, the cap would never be reached, and the
+        // assertion below could not tell a correct limit string from a missing
+        // one. The cap is the backstop for a loop that keeps changing; a test for
+        // it needs a loop that does, or needs the other guard out of the way.
+        cmd.env("CATBUS_MAX_ROUNDS", "3")
+            .env("CATBUS_REPEAT_ROUNDS", "0")
+            .args([
+                "--relay-url",
+                &format!("http://127.0.0.1:{port}"),
+                "--relay-token",
+                RELAY_TOKEN,
+            ]);
+    });
+
+    let reply = send_prompt(&mut stream, &mut reader, "keep reading");
+    assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+    let text = reply["text"].as_str().unwrap();
+    assert!(
+        text.contains("hit the 3-round cap"),
+        "the real limit must be quoted:\n{text}"
+    );
+    assert!(
+        !text.contains("32-round"),
+        "the stale hard-coded limit is back:\n{text}"
+    );
+    assert!(
+        text.contains("CATBUS_MAX_ROUNDS"),
+        "the warning should name the knob to turn:\n{text}"
+    );
+}
+
+///
+/// Without this, the test above would pass on an implementation that blocked
+/// every write in auto mode — which would be a different feature entirely.
+#[test]
+fn auto_mode_allows_a_write_the_judge_does_not_object_to() {
+    let dir = tempfile::tempdir().unwrap();
+    let (port, rx) = spawn_mock_relay_owned(vec![
+        (
+            "HTTP/1.1 200 OK",
+            tool_round("c1", "Write", r#"{"path": "fine.txt", "content": "ok"}"#),
+        ),
+        ("HTTP/1.1 200 OK", judge_verdict(5)),
+        ("HTTP/1.1 200 OK", FINAL_ROUND.to_owned()),
+    ]);
+    let socket = dir.path().join("agent.sock");
+    let (_agent, mut reader, mut stream) = spawn_minimal_agent(dir.path(), dir.path(), &socket, port);
+
+    stream
+        .write_all(b"{\"kind\":\"set_gate\",\"gate\":\"auto\"}\n")
+        .unwrap();
+    let mut ack = String::new();
+    reader.read_line(&mut ack).unwrap();
+
+    let reply = send_prompt(&mut stream, &mut reader, "write the file");
+    assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+
+    let _first = body_of(&rx.recv_timeout(Duration::from_secs(30)).unwrap());
+    let _judge = body_of(&rx.recv_timeout(Duration::from_secs(30)).unwrap());
+    let third = body_of(&rx.recv_timeout(Duration::from_secs(30)).unwrap());
+
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("fine.txt")).expect("the write should have run"),
+        "ok"
+    );
+    let result = tool_result_of(&third, "c1");
+    assert!(
+        !result.contains("blocked"),
+        "a low severity should not block:\n{result}"
+    );
+    // The record of a check that *allowed* is the whole point: without it, a gate
+    // that works leaves no trace, and "auto mode does nothing" is a report that can
+    // be made about a gate doing its job. Severity 5 is the judge's answer and must
+    // appear in what the operator and the next session can read.
+    assert!(
+        result.contains("auto checked Write"),
+        "an allowed action must leave a record of the check:\n{result}"
+    );
+    assert!(
+        result.contains("severity 5"),
+        "the record should carry the judge's own number:\n{result}"
+    );
+    assert!(result.contains("allowed"), "and say which way it went:\n{result}");
+}
+
+/// With the gate open, no judge call is made at all.
+///
+/// Pins that auto mode is opt-in: if the judge ran unconditionally, every turn
+/// would cost a second round trip and the `gate = open` output would be a lie.
+#[test]
+fn open_mode_does_not_call_the_judge() {
+    let dir = tempfile::tempdir().unwrap();
+    // Only two responses: a Write and then the final answer. If the judge were
+    // consulted the mock would block on a third accept and the test would hang
+    // rather than fail, so this also asserts the *absence* of an extra request.
+    let (port, rx) = spawn_mock_relay_owned(vec![
+        (
+            "HTTP/1.1 200 OK",
+            tool_round("c1", "Write", r#"{"path": "plain.txt", "content": "ok"}"#),
+        ),
+        ("HTTP/1.1 200 OK", FINAL_ROUND.to_owned()),
+    ]);
+    let socket = dir.path().join("agent.sock");
+    let (_agent, mut reader, mut stream) = spawn_minimal_agent(dir.path(), dir.path(), &socket, port);
+
+    let reply = send_prompt(&mut stream, &mut reader, "write the file");
+    assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+
+    let first = body_of(&rx.recv_timeout(Duration::from_secs(30)).unwrap());
+    let second = body_of(&rx.recv_timeout(Duration::from_secs(30)).unwrap());
+    assert_ne!(
+        second["model"], "deepseek-flash",
+        "the judge ran in open mode:\n{second}"
+    );
+    assert_ne!(first["model"], "deepseek-flash");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("plain.txt")).expect("the write should have run"),
+        "ok"
+    );
+}
+
+/// A tool-only loop that hits the cap reports an error rather than a warning.
+///
+/// The other half of the same behaviour: with no prose collected there is no
+/// partial answer to annotate, so the loop must not claim to have produced one.
+/// Both messages have to name the knob — an operator whose agent stops has only
+/// these two strings to work from.
+#[test]
+fn a_tool_only_loop_that_hits_the_cap_reports_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let responses: Vec<(&'static str, String)> = (0..6)
+        .map(|i| {
+            (
+                "HTTP/1.1 200 OK",
+                tool_round(&format!("c{i}"), "Read", r#"{"path": "notes.txt"}"#),
+            )
+        })
+        .collect();
+    let (port, _rx) = spawn_mock_relay_owned(responses);
+    let socket = dir.path().join("agent.sock");
+    std::fs::write(dir.path().join("notes.txt"), "some notes").unwrap();
+
+    let (_agent, mut reader, mut stream) = spawn_agent(dir.path(), &socket, |cmd| {
+        // See the note in `the_round_cap_warning_names_the_real_limit` — this
+        // fixture is a repeat loop too, so the repeat guard has to be off for the
+        // cap to be the thing that stops it.
+        cmd.env("CATBUS_MAX_ROUNDS", "3")
+            .env("CATBUS_REPEAT_ROUNDS", "0")
+            .args([
+                "--relay-url",
+                &format!("http://127.0.0.1:{port}"),
+                "--relay-token",
+                RELAY_TOKEN,
+            ]);
+    });
+
+    let reply = send_prompt(&mut stream, &mut reader, "keep reading");
+    assert_eq!(reply["kind"], "error", "unexpected reply: {reply}");
+    let message = reply["message"].as_str().unwrap();
+    assert!(message.contains("round cap"), "the cap should be named:\n{message}");
+    assert!(
+        message.contains("3-round"),
+        "the error should quote the real limit, as the warning does:\n{message}"
+    );
+    assert!(
+        message.contains("CATBUS_MAX_ROUNDS"),
+        "the error should name the knob to turn:\n{message}"
+    );
+}
+
+/// The loop from 2026-09-25, end to end.
+///
+/// A tab spent 200 rounds and 2.55M input tokens re-reading the same files. The
+/// relay had replaced old `tool_result` bodies with `[elided: …]` stubs to fit
+/// the request in the model's context window, so the model could not tell a
+/// result it had already read from one it had never seen — and reading again was
+/// the only way to find out. Its own account, from that transcript:
+///
+/// > *I kept re-reading the same architectural files and getting `[elided: …]`
+/// > back. Instead of narrowing, I issued more broad reads.*
+///
+/// The relay side is fixed at the source (`tab-atelier-proxy::compact` no longer
+/// elides a body it has no reason to elide, and its stub names the call it
+/// replaced). This is the client's own guard, and the point of it is that the
+/// client had the means to notice all along: an identical call made three rounds
+/// running returns exactly what the second one did.
+///
+/// Caught *before* dispatch, which the transcript proves — the file is read
+/// twice, and the third call is refused rather than run.
+#[test]
+fn a_call_repeated_three_rounds_running_is_refused_before_it_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    // Far more rounds than the guard should ever need, so that a guard which
+    // fails to fire runs all the way to the cap and the notice says `200`.
+    let responses: Vec<(&'static str, String)> = (0..12)
+        .map(|i| {
+            (
+                "HTTP/1.1 200 OK",
+                tool_round(&format!("c{i}"), "Read", r#"{"path": "notes.txt"}"#),
+            )
+        })
+        .collect();
+    let (port, rx) = spawn_mock_relay_owned(responses);
+    let socket = dir.path().join("agent.sock");
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(dir.path().join("notes.txt"), "some notes").unwrap();
+
+    let (_agent, mut reader, mut stream) = spawn_agent_in(&home, dir.path(), &socket, |cmd| {
+        cmd.env("CATBUS_MAX_ROUNDS", "200").args([
+            "--relay-url",
+            &format!("http://127.0.0.1:{port}"),
+            "--relay-token",
+            RELAY_TOKEN,
+        ]);
+    });
+
+    let reply = send_prompt(&mut stream, &mut reader, "keep reading");
+    assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+    let text = reply["text"].as_str().unwrap();
+    assert!(
+        text.contains("3 identical rounds"),
+        "the notice should say how many rounds it took:\n{text}"
+    );
+    assert!(
+        text.contains("Read notes.txt"),
+        "and name the call, so the reader can see what was being repeated:\n{text}"
+    );
+    assert!(
+        !text.contains("200-round"),
+        "the round cap must not be what stopped this:\n{text}"
+    );
+
+    // Three requests: one per round, the third answered from the refusal rather
+    // than the relay. The cap this run was given is 200, so anything near it
+    // means the guard never fired.
+    let seen = rx.try_iter().count();
+    assert!(
+        seen <= 4,
+        "the guard stopped it at 3 rounds, not 200: {seen} requests seen"
+    );
+
+    // The evidence that the third call was not made: the file was read exactly
+    // twice, and the refusal sits in the transcript in place of a third result.
+    let transcript = transcript_text(&home);
+    assert_eq!(
+        transcript.matches("some notes").count(),
+        2,
+        "the file was read exactly twice, not three times:\n{transcript}"
+    );
+    assert!(
+        transcript.contains("Error: not run"),
+        "the refusal is recorded as the third result, so the turn stays valid:\n{transcript}"
+    );
+}
+
+/// The harder shape, and the one the 2026-09-25 tab actually took.
+///
+/// The model did not repeat a call — it *widened* its reads: a page, a wider
+/// page, then the whole file. Every call was different, so call identity says
+/// nothing about this loop. What never changed was the content, because all three
+/// reads were the same file. Asking for it a fourth way cannot return anything
+/// the third way did not.
+///
+/// This is why the guard compares results as well as calls. In the incident the
+/// results were stubs, and a client cannot see those — the relay rewrites the
+/// request after it has left. Result identity is visible from here, needs no
+/// knowledge of the relay, and is the honest question to ask: did this round tell
+/// the model anything it did not already have?
+#[test]
+fn a_loop_that_varies_its_reads_but_gets_the_same_content_is_stopped() {
+    let dir = tempfile::tempdir().unwrap();
+    // Three genuinely different reads of one small file. The last argument names
+    // the file with no range at all, so every read returns its full contents.
+    let reads = [
+        r#"{"path": "notes.txt", "limit": 100}"#,
+        r#"{"path": "notes.txt", "limit": 200}"#,
+        r#"{"path": "notes.txt"}"#,
+    ];
+    let responses: Vec<(&'static str, String)> = (0..12)
+        .map(|i| {
+            let input = reads[i % reads.len()];
+            ("HTTP/1.1 200 OK", tool_round(&format!("c{i}"), "Read", input))
+        })
+        .collect();
+    let (port, _rx) = spawn_mock_relay_owned(responses);
+    let socket = dir.path().join("agent.sock");
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(dir.path().join("notes.txt"), "some notes").unwrap();
+
+    let (_agent, mut reader, mut stream) = spawn_agent_in(&home, dir.path(), &socket, |cmd| {
+        cmd.env("CATBUS_MAX_ROUNDS", "200").args([
+            "--relay-url",
+            &format!("http://127.0.0.1:{port}"),
+            "--relay-token",
+            RELAY_TOKEN,
+        ]);
+    });
+
+    let reply = send_prompt(&mut stream, &mut reader, "keep reading");
+    assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+    let text = reply["text"].as_str().unwrap();
+    assert!(
+        text.contains("changed nothing"),
+        "the notice should describe the stall, not claim a repeat:\n{text}"
+    );
+    assert!(
+        text.contains("3 rounds"),
+        "it took three rounds of the same content to be sure:\n{text}"
+    );
+    assert!(
+        text.contains("byte-identical"),
+        "the notice must say what was seen, not why:\n{text}"
+    );
+
+    // All three rounds ran — none of them was a repeated call — and then it
+    // stopped, rather than running to the 200-round cap.
+    let transcript = transcript_text(&home);
+    assert_eq!(
+        transcript.matches("some notes").count(),
+        3,
+        "three real reads happened before the stall was certain:\n{transcript}"
+    );
+}
+
+/// The threshold is a knob, and it has to be the one that is honoured.
+///
+/// A run that genuinely needs to ask the same thing more times than the default
+/// must not have to patch the binary: `CATBUS_REPEAT_ROUNDS` raises the limit,
+/// and the notice quotes whatever it was set to — so an operator reading the tab
+/// can tell a stop at the default from a stop at their own setting.
+#[test]
+fn the_repeat_limit_is_configurable() {
+    let dir = tempfile::tempdir().unwrap();
+    let responses: Vec<(&'static str, String)> = (0..12)
+        .map(|i| {
+            (
+                "HTTP/1.1 200 OK",
+                tool_round(&format!("c{i}"), "Read", r#"{"path": "notes.txt"}"#),
+            )
+        })
+        .collect();
+    let (port, _rx) = spawn_mock_relay_owned(responses);
+    let socket = dir.path().join("agent.sock");
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(dir.path().join("notes.txt"), "some notes").unwrap();
+
+    let (_agent, mut reader, mut stream) = spawn_agent_in(&home, dir.path(), &socket, |cmd| {
+        cmd.env("CATBUS_MAX_ROUNDS", "50")
+            .env("CATBUS_REPEAT_ROUNDS", "5")
+            .args([
+                "--relay-url",
+                &format!("http://127.0.0.1:{port}"),
+                "--relay-token",
+                RELAY_TOKEN,
+            ]);
+    });
+
+    let reply = send_prompt(&mut stream, &mut reader, "keep reading");
+    assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+    let text = reply["text"].as_str().unwrap();
+    assert!(
+        text.contains("5 identical rounds"),
+        "the notice must quote the configured limit, not the default:\n{text}"
+    );
+
+    let transcript = transcript_text(&home);
+    assert_eq!(
+        transcript.matches("some notes").count(),
+        4,
+        "five rounds means the first four ran and the fifth was refused:\n{transcript}"
+    );
+}
+
+/// A reply that is nothing but an empty `thinking` block must not poison the
+/// next request.
+///
+/// This is the live failure, reproduced. The model streamed a `thinking` block
+/// whose text was empty while its signature survived; the turn was pushed into
+/// history as-is, because the loop moves `resp.content` wholesale, and the next
+/// request carried an assistant message with no content in it. Anthropic
+/// answers that with `messages.N: all messages must have non-empty content` —
+/// a 400 that ends the turn and, for an operator, looks like the session
+/// dying for no reason.
+///
+/// The first reply here is that poisoned turn verbatim: the only block in the
+/// message is a `thinking` block with `"thinking": ""`. The assertion is on the
+/// *second* request, so it fails if the block is ever put back on the wire.
+#[test]
+fn a_turn_of_nothing_but_an_empty_thinking_block_is_pruned_from_the_next_request() {
+    const EMPTY_THINKING: &str = r#"{
+        "id": "msg_empty",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-sonnet-4-6",
+        "content": [{ "type": "thinking", "thinking": "", "signature": "sig" }],
+        "stop_reason": "end_turn",
+        "usage": { "input_tokens": 5, "output_tokens": 4 }
+    }"#;
+
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("agent.sock");
+    let (port, rx) = spawn_mock_relay(vec![
+        ("HTTP/1.1 200 OK", EMPTY_THINKING),
+        ("HTTP/1.1 200 OK", FINAL_ROUND),
+        ("HTTP/1.1 200 OK", FINAL_ROUND),
+    ]);
+    let (_agent, mut reader, mut stream) = spawn_agent(dir.path(), &socket, |cmd| {
+        cmd.args([
+            "--relay-url",
+            &format!("http://127.0.0.1:{port}"),
+            "--relay-token",
+            RELAY_TOKEN,
+        ]);
+    });
+
+    let reply = send_prompt(&mut stream, &mut reader, "one");
+    assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+
+    let reply = send_prompt(&mut stream, &mut reader, "two");
+    assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+
+    // The first request is the prompt on its own; the second is the one that
+    // would have carried the poisoned turn.
+    let _first = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let raw = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let messages = body_of(&raw)["messages"].as_array().expect("messages array").clone();
+
+    assert!(
+        messages.len() >= 2,
+        "the second request should carry the two prompts:\n{raw}"
+    );
+    assert!(
+        messages.iter().all(|m| m["role"] != "assistant"),
+        "the empty assistant turn should not have been sent at all:\n{raw}"
+    );
+    for (i, message) in messages.iter().enumerate() {
+        // The env turn the harness appends is still a plain string; history is
+        // in blocks. Both must be non-empty, which is the property that matters.
+        if let Some(text) = message["content"].as_str() {
+            assert!(!text.trim().is_empty(), "message {i} has no content:\n{raw}");
+            continue;
+        }
+        let blocks = message["content"].as_array().expect("content is a string or blocks");
+        assert!(
+            !blocks.is_empty(),
+            "message {i} has no content, which is the 400 this guards:\n{raw}"
+        );
+        for block in blocks {
+            if block["type"] == "thinking" {
+                assert!(
+                    !block["thinking"].as_str().unwrap_or_default().trim().is_empty(),
+                    "an empty thinking block reached the relay in message {i}:\n{raw}"
+                );
+            }
+        }
+    }
+}
+
+/// Opening a session that already has a transcript continues the conversation.
+///
+/// `session::open` defaults to the newest transcript in the cwd — the "I closed
+/// the tab, I reopened it, pick up where I left off" path — and `--resume <id>`
+/// names one outright. Both land in `Agent::new`, which built an empty history,
+/// so the agent appended to a transcript whose contents it had never read: the
+/// model got no context, and every turn it wrote was a non-sequitur on disk.
+///
+/// The in-REPL `/resume <id>` path rebuilt it all along; this asserts the same
+/// thing is true of the entry points that start a process.
+#[test]
+fn resuming_a_session_gives_the_model_the_history_it_never_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("agent.sock");
+
+    // One exchange, so there is a transcript with something in it.
+    let (port, _rx) = spawn_mock_relay(vec![("HTTP/1.1 200 OK", FINAL_ROUND)]);
+    {
+        let (_agent, mut reader, mut stream) = spawn_agent_at(dir.path(), &socket, port);
+        let reply = send_prompt(&mut stream, &mut reader, "first");
+        assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+    }
+
+    let mut files = Vec::new();
+    jsonl_files(&dir.path().join(".claude").join("projects"), &mut files);
+    assert_eq!(files.len(), 1, "expected one transcript: {files:?}");
+    let id = files[0].file_stem().unwrap().to_str().unwrap().to_owned();
+
+    // Resume that exact session and look at what the first request carries.
+    // `spawn_agent` also passes `--new-session`; `--resume` takes precedence in
+    // `session::open`, so the session opened is the one named here.
+    let (port, rx) = spawn_mock_relay(vec![("HTTP/1.1 200 OK", FINAL_ROUND)]);
+    let (_agent, mut reader, mut stream) = spawn_agent(dir.path(), &socket, |cmd| {
+        cmd.args([
+            "--resume",
+            &id,
+            "--relay-url",
+            &format!("http://127.0.0.1:{port}"),
+            "--relay-token",
+            RELAY_TOKEN,
+        ]);
+    });
+    let reply = send_prompt(&mut stream, &mut reader, "second");
+    assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+
+    let body = body_of(&rx.recv_timeout(Duration::from_secs(10)).unwrap());
+    let messages = body["messages"].as_array().expect("messages");
+    let text = messages.iter().map(text_of).collect::<Vec<_>>().join("\n");
+
+    assert!(
+        text.contains("first"),
+        "the resumed history's prompt is missing:\n{text}"
+    );
+    assert!(
+        text.contains("hi from the relay"),
+        "the resumed reply is missing:\n{text}"
+    );
+    assert!(
+        messages.len() >= 3,
+        "the resumed turns should sit between the two prompts:\n{text}"
+    );
+}
+
+/// A reply that asks for a tool must be answered, whatever its stop reason says.
+///
+/// `end_turn` together with a `tool_use` is contradictory, but providers do
+/// emit it, and the loop trusted the stop reason over the content: it returned
+/// the assistant's text and moved the turn into history with the call
+/// unanswered. Every request after that carried a `tool_use` with no
+/// `tool_result`, which the API rejects outright — so the session answered once
+/// and then failed on every prompt until it was thrown away. The tools never
+/// ran, so nothing in the reply explained why.
+///
+/// Whether the call ran is only observable as a second request carrying its
+/// result, which is what this asserts.
+#[test]
+fn an_end_turn_that_asks_for_a_tool_still_runs_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::write(work.join("note.txt"), "the catbus is late").unwrap();
+
+    let contradictory = serde_json::json!({
+        "id": "msg_contradiction",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-sonnet-4-6",
+        "content": [
+            { "type": "text", "text": "let me look" },
+            { "type": "tool_use", "id": "c1", "name": "Read", "input": { "path": "note.txt" } }
+        ],
+        "stop_reason": "end_turn",
+        "usage": { "input_tokens": 5, "output_tokens": 4 }
+    })
+    .to_string();
+
+    let (port, rx) = spawn_mock_relay_owned(vec![
+        ("HTTP/1.1 200 OK", contradictory),
+        ("HTTP/1.1 200 OK", FINAL_ROUND.to_owned()),
+    ]);
+    let socket = dir.path().join("agent.sock");
+    let (_agent, mut reader, mut stream) = spawn_minimal_agent(dir.path(), &work, &socket, port);
+
+    let reply = send_prompt(&mut stream, &mut reader, "read the note");
+    assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+
+    let _first = rx.recv_timeout(Duration::from_secs(30)).unwrap();
+    let second = rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the call was never run, so its result was never sent");
+    let result = tool_result_of(&body_of(&second), "c1");
+    assert!(
+        result.contains("the catbus is late"),
+        "the tool should have run and its output sent back: {result}"
+    );
+}
+
+/// Every live process whose command line mentions `needle`.
+///
+/// Used to prove a sub-agent is *gone* rather than merely quiet: the socket file
+/// is removed either way, so the file proves nothing, and a leaked child is
+/// invisible in the reply.
+fn processes_with(needle: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return found;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name.to_str().filter(|n| n.chars().all(|c| c.is_ascii_digit())) else {
+            continue;
+        };
+        let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+            continue;
+        };
+        let cmdline = String::from_utf8_lossy(&raw).replace('\0', " ");
+        if cmdline.contains(needle) {
+            found.push(format!("{pid}: {}", cmdline.trim()));
+        }
+    }
+    found
+}
+
+/// The socket path prefix a sub-agent is started with.
+///
+/// Assembled at runtime from two pieces rather than written as one literal, and
+/// derived from the same `temp_dir` the tool uses. A single literal would appear
+/// in the command line of whatever shell launched this test — a heredoc, a
+/// `cargo test` wrapper — and the `/proc` scan below would then find *that* and
+/// report a phantom leak. Same trick as the `env::args` guard in `cli`.
+///
+/// What it returns is only the prefix, and a caller appends the pid of the parent it started:
+/// the prefix on its own also matches the sub-agents of every other agent on the machine, and a
+/// test that scans for it fails whenever a real session happens to have one running. See
+/// `a_spawned_sub_agent_answers_and_is_reaped` for the scoped form.
+fn sub_agent_socket_prefix() -> String {
+    std::env::temp_dir()
+        .join(concat!("catbus-", "sub-"))
+        .display()
+        .to_string()
+}
+
+/// A sub-agent is really started, really answers, and is really reaped.
+///
+/// The three claims need three assertions, because each has a way of passing on
+/// its own: the reply proves the child ran, the child's *own* relay receiving a
+/// request proves `Spawn` started an agent rather than inventing a reply, and the
+/// `/proc` scan proves it was cleaned up. A spawn path whose cleanup is untested
+/// is the ordinary way orphaned agents accumulate.
+///
+/// The child's relay is a second mock server, reached through the environment
+/// rather than a flag: a sub-agent is started with no relay flags of its own, so
+/// this is also the check that a child inherits its endpoint instead of silently
+/// falling back to whatever `preferences.json` holds.
+#[test]
+fn a_spawned_sub_agent_answers_and_is_reaped() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let work = home.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+
+    // The child's relay. One canned reply, and it is what the tool result must
+    // carry — a reply the parent could only have obtained by asking.
+    let (child_port, child_rx) = spawn_mock_relay(vec![("HTTP/1.1 200 OK", FINAL_ROUND)]);
+
+    // The parent's relay: a canned Spawn call, then the final answer.
+    let call = tool_round(
+        "s1",
+        "Spawn",
+        &serde_json::json!({ "task": "say hi", "cwd": work.to_str().unwrap() }).to_string(),
+    );
+    let (port, rx) = spawn_mock_relay_owned(vec![
+        ("HTTP/1.1 200 OK", call),
+        ("HTTP/1.1 200 OK", FINAL_ROUND.to_owned()),
+    ]);
+
+    let socket = home.join("agent.sock");
+    let (agent, mut reader, mut stream) = spawn_agent_in(home, home, &socket, |cmd| {
+        // The parent's own endpoint, given as a flag.
+        cmd.args([
+            "--relay-url",
+            &format!("http://127.0.0.1:{port}"),
+            "--relay-token",
+            RELAY_TOKEN,
+        ]);
+        // What a child of this agent will inherit, since a child is started with
+        // no flags of its own.
+        cmd.env("CATBUS_RELAY_URL", format!("http://127.0.0.1:{child_port}"));
+        cmd.env("CATBUS_RELAY_TOKEN", RELAY_TOKEN);
+    });
+
+    // Scoped to *this* parent's pid. A sub-agent's socket is `catbus-sub-<parent pid>-<n>.sock`, so
+    // naming the parent is what makes this scan find the children of this run and no other agent's.
+    // The bare prefix matched every live sub-agent on the machine — including one a real tab had
+    // started elsewhere — and failed the run through no fault of the code under test.
+    let marker = format!("{}{}-", sub_agent_socket_prefix(), agent.pid());
+
+    // Before: this parent has no children yet, so anything the scan below finds is ours. Read here
+    // rather than ahead of the spawn because the marker needs the pid — and a pid reused from a
+    // previous run is the one case a stale sub-agent could still be picked up by it.
+    assert!(
+        processes_with(&marker).is_empty(),
+        "a previous run left a sub-agent behind"
+    );
+
+    let reply = send_prompt(&mut stream, &mut reader, "start a helper");
+    assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+
+    // Request 1 asks for the tool; request 2 carries its result.
+    let _first = rx.recv_timeout(Duration::from_secs(30)).unwrap();
+    let second = rx
+        .recv_timeout(Duration::from_secs(90))
+        .expect("the parent never sent a second request, so Spawn never returned");
+    let result = tool_result_of(&body_of(&second), "s1");
+
+    assert!(
+        result.contains("hi from the relay"),
+        "the sub-agent's reply must reach the tool result: {result}"
+    );
+    // With `--once` the child exits by itself after answering, so the ordinary
+    // footer is empty and the *only* footer that matters is the warning. Asserting
+    // absence of that warning is what makes this a check on the cleanup rather
+    // than on the wording; the `/proc` scan below is the real proof.
+    assert!(
+        !result.contains("DID NOT STOP"),
+        "the sub-agent would not stop: {result}"
+    );
+    assert!(
+        result.contains("finished in"),
+        "the reply should say what the sub-agent cost in time: {result}"
+    );
+
+    // The child reached its own relay, so a real agent ran.
+    child_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the sub-agent never contacted the relay it was told about");
+
+    // And nothing is left. Retried because the kill is asynchronous: the child
+    // is signalled, then reaped, and a `ps` racing that window would see a
+    // dying process.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let left = processes_with(&marker);
+        if left.is_empty() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "sub-agent(s) outlived the call that started them:\n  {}",
+            left.join("\n  ")
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// The `Tasks` tool works through the dispatcher, not just in its own unit tests.
+///
+/// The unit tests call `apply` directly, so they would all pass with the tool
+/// unregistered — never offered to the model, or offered and then rejected by the
+/// dispatcher's `match`. This asserts what an agent actually experiences: the
+/// schema is on the wire, `add` writes, `list` reads back what `add` wrote, and
+/// the file lands under the pinned state directory.
+///
+/// The state directory is pinned through the environment because that is how the
+/// tool resolves it, and the minimal preset deliberately does not offer `Tasks` —
+/// so this builds its own tool config.
+#[test]
+fn the_tasks_tool_acts_through_the_dispatcher() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let work = home.join("work");
+    let state = home.join("state");
+    std::fs::create_dir_all(&work).unwrap();
+
+    let config = home.join("tools.json");
+    std::fs::write(&config, serde_json::json!({ "allow": ["Read", "Tasks"] }).to_string()).unwrap();
+
+    let rounds = vec![
+        (
+            "HTTP/1.1 200 OK",
+            tool_round(
+                "t1",
+                "Tasks",
+                &serde_json::json!({"action":"add","title":"first"}).to_string(),
+            ),
+        ),
+        (
+            "HTTP/1.1 200 OK",
+            tool_round("t2", "Tasks", &serde_json::json!({"action":"list"}).to_string()),
+        ),
+        ("HTTP/1.1 200 OK", FINAL_ROUND.to_owned()),
+    ];
+    let (port, rx) = spawn_mock_relay_owned(rounds);
+    let socket = home.join("agent.sock");
+    let (_agent, mut reader, mut stream) = spawn_agent_in(home, &work, &socket, |cmd| {
+        cmd.args([
+            "--relay-url",
+            &format!("http://127.0.0.1:{port}"),
+            "--relay-token",
+            RELAY_TOKEN,
+            "--tools-config",
+            config.to_str().unwrap(),
+        ]);
+        // Pinned so a stray run cannot write into the operator's real list.
+        cmd.env("XDG_STATE_HOME", &state);
+    });
+
+    let reply = send_prompt(&mut stream, &mut reader, "add a task");
+    assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+
+    // The first request must carry the schema; otherwise nothing else matters.
+    let first = body_of(&rx.recv_timeout(Duration::from_secs(30)).unwrap());
+    let offered = first["tools"]
+        .as_array()
+        .expect("tools array")
+        .iter()
+        .any(|t| t["name"] == "Tasks");
+    assert!(offered, "Tasks must be offered to the model:\n{first:#?}");
+
+    let second = rx.recv_timeout(Duration::from_secs(30)).unwrap();
+    let added = tool_result_of(&body_of(&second), "t1");
+    assert!(added.contains("#1"), "`add` should have created task 1: {added}");
+    assert!(added.contains("first"), "and echoed the title: {added}");
+
+    let third = rx.recv_timeout(Duration::from_secs(30)).unwrap();
+    let listed = tool_result_of(&body_of(&third), "t2");
+    assert!(
+        listed.contains("first"),
+        "`list` must read back what `add` wrote: {listed}"
+    );
+    assert!(listed.contains("#1"), "{listed}");
+
+    // One list, for one working directory, really on disk.
+    let lists: Vec<PathBuf> = std::fs::read_dir(state.join("tab-atelier").join("agent-tasks"))
+        .expect("the list directory should exist")
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(lists.len(), 1, "one list for one cwd: {lists:?}");
+    let raw = std::fs::read_to_string(&lists[0]).unwrap();
+    assert!(raw.contains("first"), "{raw}");
+}
+
+/// An operator prompt file replaces the whole system prompt.
+///
+/// The point of the file is that the operator owns what the model is told about
+/// itself, so the built-in Claude line must be gone — not merely followed by the
+/// operator's text, which would leave the assertion it replaces standing. The
+/// rendering block still follows, because it describes the terminal rather than
+/// the model: dropping it would let a model emit markdown into a terminal that
+/// cannot render it, which is a property of this TUI and not of anybody's
+/// identity.
+#[test]
+fn an_identity_file_replaces_the_system_prompt() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let identity = home.join("identity.md");
+    std::fs::write(&identity, "---\nAllowedTools: Read\n---\nYou are a parrot.").unwrap();
+
+    let (port, rx) = spawn_mock_relay(vec![("HTTP/1.1 200 OK", FINAL_ROUND)]);
+    let socket = home.join("agent.sock");
+    let (_agent, mut reader, mut stream) = spawn_agent_in(home, home, &socket, |cmd| {
+        cmd.args([
+            "--relay-url",
+            &format!("http://127.0.0.1:{port}"),
+            "--relay-token",
+            RELAY_TOKEN,
+            "--identity-file",
+            identity.to_str().unwrap(),
+        ]);
+    });
+
+    let reply = send_prompt(&mut stream, &mut reader, "hi");
+    assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+
+    let body = body_of(&rx.recv_timeout(Duration::from_secs(30)).unwrap());
+    let system = body["system"].as_array().expect("system array");
+    let all = serde_json::to_string(system).unwrap();
+
+    assert_eq!(
+        system[0]["text"], "You are a parrot.",
+        "the operator's text comes first"
+    );
+    assert_eq!(system.len(), 2, "the identity and the rendering rules: {system:#?}");
+    assert!(
+        !all.contains("You are Claude Code"),
+        "the built-in identity must be replaced, not merely followed:\n{all}"
+    );
+    assert!(
+        !system[1]["text"].as_str().unwrap_or_default().is_empty(),
+        "the rendering block must survive an operator identity:\n{system:#?}"
+    );
+}
+
+/// A relay that says it is serving a non-Anthropic model stops the Claude
+/// identity line going out.
+///
+/// Only a reply can say what is serving, so the first turn of a session keeps the
+/// built-in identity — it cannot know, and behaving as before is the safe default.
+/// From the second turn on, the answer is known, and claiming to be Claude Code
+/// on a model that is not is the thing this exists to stop.
+#[test]
+fn a_non_anthropic_model_drops_the_claude_identity_line() {
+    const DEEPSEEK: &str = r#"{
+        "id": "m1", "type": "message", "role": "assistant", "model": "deepseek-flash",
+        "content": [{ "type": "text", "text": "hello" }],
+        "stop_reason": "end_turn", "usage": { "input_tokens": 5, "output_tokens": 4 }
+    }"#;
+
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let (port, rx) = spawn_mock_relay(vec![("HTTP/1.1 200 OK", DEEPSEEK), ("HTTP/1.1 200 OK", FINAL_ROUND)]);
+    let socket = home.join("agent.sock");
+    let (_agent, mut reader, mut stream) = spawn_agent_in(home, home, &socket, |cmd| {
+        cmd.args([
+            "--relay-url",
+            &format!("http://127.0.0.1:{port}"),
+            "--relay-token",
+            RELAY_TOKEN,
+        ]);
+    });
+
+    let reply = send_prompt(&mut stream, &mut reader, "one");
+    assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+    let first = body_of(&rx.recv_timeout(Duration::from_secs(30)).unwrap());
+    assert!(
+        serde_json::to_string(&first["system"])
+            .unwrap()
+            .contains("You are Claude Code"),
+        "the first turn cannot know the model, so it keeps the built-in identity:\n{first:#?}"
+    );
+
+    let reply = send_prompt(&mut stream, &mut reader, "two");
+    assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+    let second = body_of(&rx.recv_timeout(Duration::from_secs(30)).unwrap());
+    let system = second["system"].as_array().expect("system array");
+    let all = serde_json::to_string(system).unwrap();
+
+    assert!(
+        !all.contains("You are Claude Code"),
+        "a non-Anthropic model must not be told it is Claude Code:\n{all}"
+    );
+    assert!(!system.is_empty(), "the rendering rules must still be sent:\n{all}");
+    assert!(
+        system
+            .iter()
+            .all(|b| !b["text"].as_str().unwrap_or_default().is_empty()),
+        "and no block may be left empty:\n{all}"
+    );
+}
+
+/// `AllowedTools` in the prompt file narrows what the model is offered.
+///
+/// Asserted on the wire rather than on the set, because the tool array is what the
+/// model actually sees: a narrowed set that still sent every spec would be the
+/// same bug wearing a different name.
+#[test]
+fn allowed_tools_in_the_identity_file_narrow_the_offered_tools() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let identity = home.join("identity.md");
+    std::fs::write(&identity, "---\nAllowedTools: Read\n---\nYou are a parrot.").unwrap();
+
+    let (port, rx) = spawn_mock_relay(vec![("HTTP/1.1 200 OK", FINAL_ROUND)]);
+    let socket = home.join("agent.sock");
+    let (_agent, mut reader, mut stream) = spawn_agent_in(home, home, &socket, |cmd| {
+        cmd.args([
+            "--relay-url",
+            &format!("http://127.0.0.1:{port}"),
+            "--relay-token",
+            RELAY_TOKEN,
+            "--identity-file",
+            identity.to_str().unwrap(),
+        ]);
+    });
+
+    let reply = send_prompt(&mut stream, &mut reader, "hi");
+    assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+
+    let body = body_of(&rx.recv_timeout(Duration::from_secs(30)).unwrap());
+    let offered: Vec<&str> = body["tools"]
+        .as_array()
+        .expect("tools array")
+        .iter()
+        .filter_map(|t| t["name"].as_str())
+        .collect();
+    assert_eq!(
+        offered,
+        vec!["Read"],
+        "only the named tool may be offered, got {offered:?}"
+    );
+    // The prompt is still the operator's: narrowing must not disturb the identity.
+    assert_eq!(body["system"][0]["text"], "You are a parrot.");
+}
+
+/// A prompt file cannot grant a tool the launcher withheld.
+///
+/// This is the property that makes `AllowedTools` a ceiling: it narrows the set
+/// `--tools-config` chose and never widens it. `minimal` has no `Bash`, so naming
+/// `Bash` must fail loudly at start-up rather than quietly re-adding the shell the
+/// operator deliberately kept out.
+#[test]
+fn allowed_tools_cannot_grant_a_tool_the_launcher_withheld() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let identity = home.join("identity.md");
+    std::fs::write(&identity, "---\nAllowedTools: Read, Bash\n---\nhi").unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_catbus-agent"))
+        .args([
+            "--no-tui",
+            "--new-session",
+            // `--print-socket` makes the process exit as soon as it has resolved
+            // its tools, which is the step under test. Without it, a run that
+            // *should* have failed but did not would sit in its REPL forever and
+            // this test would hang instead of failing — which is what happened
+            // the first time it was falsified, and a hang is a much worse signal
+            // than a failure.
+            "--print-socket",
+            "--cwd",
+            home.to_str().unwrap(),
+            "--socket",
+            home.join("never.sock").to_str().unwrap(),
+            "--tools-config",
+            "minimal",
+            "--identity-file",
+            identity.to_str().unwrap(),
+        ])
+        .env("HOME", home)
+        .env_remove("XDG_STATE_HOME")
+        .output()
+        .expect("run the binary");
+
+    assert!(
+        !output.status.success(),
+        "a prompt file naming a withheld tool must not start"
+    );
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        said.contains("Bash"),
+        "the failure must name the tool it refused: {said}"
+    );
+    assert!(
+        said.contains("Read"),
+        "and what the set does offer, so the fix is obvious: {said}"
+    );
+}
+/// A session continues with the model it was using, without being told again.
+///
+/// The model is a property of the session, not of one run of the process — Claude
+/// Code records it and carries on, and this is the same idea. It matters here
+/// because Tab Atelier restarts the agent whenever a tab is reopened, so a choice
+/// held only in memory is lost exactly when the operator comes back, and `--resume`
+/// used to start over at the default.
+///
+/// The sidecar is written directly rather than through `/model`, because the
+/// sidecar is the contract between the two: `/model` writes it, and startup reads
+/// it. Its round trip is covered in `session`'s own tests, and `/model`'s wiring to
+/// it in `agent`'s.
+///
+/// Asserted on what the *request* carries, which is the thing that was wrong. The
+/// transcript is the wrong place to look: it records the model the relay served,
+/// not the one the client asked for.
+#[test]
+fn a_resumed_session_keeps_its_model() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let socket = home.join("agent.sock");
+
+    // One exchange, so there is a real session to resume.
+    let (port, _rx) = spawn_mock_relay(vec![("HTTP/1.1 200 OK", FINAL_ROUND)]);
+    let (transcript, session_id) = {
+        let (_agent, mut reader, mut stream) = spawn_agent_in(home, home, &socket, |cmd| {
+            cmd.args([
+                "--relay-url",
+                &format!("http://127.0.0.1:{port}"),
+                "--relay-token",
+                RELAY_TOKEN,
+            ]);
+        });
+        let reply = send_prompt(&mut stream, &mut reader, "first");
+        assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+        let mut files = Vec::new();
+        jsonl_files(home, &mut files);
+        assert_eq!(files.len(), 1, "one transcript: {files:?}");
+        let path = files.pop().unwrap();
+        let id = path.file_stem().unwrap().to_str().unwrap().to_owned();
+        (path, id)
+    };
+
+    // What `/model` leaves behind: a sidecar beside the transcript. Taken from the
+    // transcript's own directory rather than re-deriving the cwd escaping, so this
+    // test cannot drift from `session::open`'s rule.
+    std::fs::write(transcript.with_extension("model"), "claude-opus-4").unwrap();
+
+    // Resume it: the request must ask for the saved model, not the default.
+    let (port, rx) = spawn_mock_relay(vec![("HTTP/1.1 200 OK", FINAL_ROUND)]);
+    let (_agent, mut reader, mut stream) = spawn_agent_in(home, home, &socket, |cmd| {
+        cmd.args([
+            "--resume",
+            &session_id,
+            "--relay-url",
+            &format!("http://127.0.0.1:{port}"),
+            "--relay-token",
+            RELAY_TOKEN,
+        ]);
+    });
+    let reply = send_prompt(&mut stream, &mut reader, "second");
+    assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+
+    let body = body_of(&rx.recv_timeout(Duration::from_secs(30)).unwrap());
+    assert_eq!(
+        body["model"], "claude-opus-4",
+        "a resumed session must ask for the model it was switched to:\n{body:#?}"
+    );
+}
+
+/// Reasoning reaches the caller beside the answer, never inside it.
+///
+/// The whole reason `Turn` has two fields: a harness reading `done.text` — the
+/// tab-atelier API, the phone, the peer verbs — must see exactly the reply it saw
+/// before this existed, so the model's deliberation is a sibling field rather than
+/// a preamble. A model that does not think sends nothing at all, since the field is
+/// skipped when empty.
+#[test]
+fn a_reply_carries_its_reasoning_beside_the_answer() {
+    const WITH_THINKING: &str = r#"{
+        "id": "m1", "type": "message", "role": "assistant", "model": "deepseek-flash",
+        "content": [
+            { "type": "thinking", "thinking": "the operator wants a file", "signature": "sig" },
+            { "type": "text", "text": "Here is the file." }
+        ],
+        "stop_reason": "end_turn", "usage": { "input_tokens": 5, "output_tokens": 4 }
+    }"#;
+
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let (port, _rx) = spawn_mock_relay(vec![("HTTP/1.1 200 OK", WITH_THINKING)]);
+    let socket = home.join("agent.sock");
+    let (_agent, mut reader, mut stream) = spawn_agent_in(home, home, &socket, |cmd| {
+        cmd.args([
+            "--relay-url",
+            &format!("http://127.0.0.1:{port}"),
+            "--relay-token",
+            RELAY_TOKEN,
+        ]);
+    });
+
+    let reply = send_prompt(&mut stream, &mut reader, "make a file");
+    assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+
+    assert_eq!(
+        reply["text"], "Here is the file.",
+        "the answer must be the answer alone:\n{reply:#?}"
+    );
+    assert_eq!(
+        reply["reasoning"], "the operator wants a file",
+        "the deliberation travels in its own field:\n{reply:#?}"
+    );
+
+    // And the transcript keeps both, in the shape Claude Code writes, so a reader
+    // on disk sees the same conversation.
+    let mut files = Vec::new();
+    jsonl_files(home, &mut files);
+    let raw = std::fs::read_to_string(&files[0]).unwrap();
+    assert!(
+        raw.contains("the operator wants a file"),
+        "the transcript should hold the reasoning too:\n{raw}"
+    );
+}
+
+/// A reply with no thinking carries no `reasoning` field at all.
+///
+/// The field is skipped when empty, so a client that predates it sees a byte-identical
+/// message — which is what makes this change safe for the existing consumers.
+#[test]
+fn a_reply_without_thinking_omits_the_reasoning_field() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let (port, _rx) = spawn_mock_relay(vec![("HTTP/1.1 200 OK", FINAL_ROUND)]);
+    let socket = home.join("agent.sock");
+    let (_agent, mut reader, mut stream) = spawn_agent_in(home, home, &socket, |cmd| {
+        cmd.args([
+            "--relay-url",
+            &format!("http://127.0.0.1:{port}"),
+            "--relay-token",
+            RELAY_TOKEN,
+        ]);
+    });
+
+    let reply = send_prompt(&mut stream, &mut reader, "hi");
+    assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+    assert!(
+        reply.get("reasoning").is_none(),
+        "an empty reasoning must not appear on the wire:\n{reply:#?}"
+    );
+}
+/// A reply that reports one model, with a usage block whose kinds are all distinguishable.
+///
+/// The numbers are chosen so a total is checkable by eye: a million input, a million output, and a
+/// million cached, at prices where each kind contributes a different amount. A reply whose kinds
+/// were all the same number could not tell a mis-priced kind from a correct one.
+fn reply_from_model(model: &str) -> String {
+    format!(
+        r#"{{
+            "id": "msg_{model}", "type": "message", "role": "assistant", "model": "{model}",
+            "content": [{{ "type": "text", "text": "ok" }}],
+            "stop_reason": "end_turn",
+            "usage": {{
+                "input_tokens": 1100000,
+                "output_tokens": 1000000,
+                "cache_read_input_tokens": 100000,
+                "cache_creation_input_tokens": 0
+            }}
+        }}"#
+    )
+}
+
+/// Two turns, two providers, two currencies: the money is reported per currency and never added
+/// together, while the tokens are summed.
+///
+/// This is the case the whole shape exists for. A session that spans providers cannot have one
+/// total — dollars and euros do not add — so the amounts are an array grouped by currency, and the
+/// tokens, being counts, are one number per kind whatever served them. The model is the last one
+/// used, because "what am I running" has one answer even after a switch.
+///
+/// Asserted on the sidecar the session writes, which is the artifact tab-atelier reads and the one a
+/// resume restores from — not on the reply, which says nothing about totals.
+#[test]
+fn a_session_that_used_two_providers_reports_amounts_per_currency() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let socket = home.join("agent.sock");
+
+    let first = reply_from_model("claude-sonnet-4-6");
+    let second = reply_from_model("deepseek-flash");
+    let (port, _rx) = spawn_mock_relay_owned(vec![("HTTP/1.1 200 OK", first), ("HTTP/1.1 200 OK", second)]);
+    let (_agent, mut reader, mut stream) = spawn_agent_in(home, home, &socket, |cmd| {
+        cmd.args([
+            "--relay-url",
+            &format!("http://127.0.0.1:{port}"),
+            "--relay-token",
+            RELAY_TOKEN,
+        ]);
+    });
+
+    // First turn: the model priced in USD.
+    let reply = send_prompt(&mut stream, &mut reader, "one");
+    assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+    // Second turn: a model priced in EUR. The price list is fetched once, at startup, so this is
+    // also the check that one catalog covers a session whose model changes.
+    let reply = send_prompt(&mut stream, &mut reader, "two");
+    assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+
+    let totals = read_token_sidecar(home);
+
+    // --- tokens are counts, so they sum ------------------------------------
+    // 1,100,000 input each, of which 100,000 was a cached read, so the full-rate input is
+    // 1,000,000 per turn and 2,000,000 across the two.
+    assert_eq!(
+        totals["cost"]["tokens"]["in"], 2_000_000,
+        "input sums across providers: {totals}"
+    );
+    assert_eq!(totals["cost"]["tokens"]["out"], 2_000_000, "{totals}");
+    assert_eq!(
+        totals["cost"]["tokens"]["cache_read"], 200_000,
+        "and so do cached reads, counted in their own kind rather than as input: {totals}"
+    );
+
+    // --- money is not, so it is grouped ------------------------------------
+    let amounts = totals["cost"]["amounts"].as_array().expect("an array of amounts");
+    assert_eq!(
+        amounts.len(),
+        2,
+        "one provider billed in USD and one in EUR means two totals, never one: {amounts:?}"
+    );
+    let by_currency = |code: &str| -> f64 {
+        amounts
+            .iter()
+            .find(|a| a["currency"] == code)
+            .and_then(|a| a["amount"].as_f64())
+            .unwrap_or_else(|| panic!("no {code} entry in {amounts:?}"))
+    };
+    // USD, from the first turn only: 1 unit of input at 3.0, 1 of output at 15.0, and 0.1 of
+    // cached input at 0.3.
+    let usd = by_currency("USD");
+    assert!(
+        (usd - (3.0 + 15.0 + 0.03)).abs() < 1e-6,
+        "the USD turn should be 18.03, got {usd} in {amounts:?}"
+    );
+    // EUR, from the second: 1 unit of input at 2.0 and 1 of output at 10.0. This catalog lists no
+    // cache price for it, so the cached tokens contribute nothing rather than being charged at the
+    // input rate — which would have made this 12.2 instead of 12.0.
+    let eur = by_currency("EUR");
+    assert!(
+        (eur - 12.0).abs() < 1e-6,
+        "the EUR turn should be 12.0, got {eur} in {amounts:?}"
+    );
+
+    // --- the model is the last one used ------------------------------------
+    assert_eq!(
+        totals["cost"]["model"], "deepseek-flash",
+        "the model is the last used, not the first and not a list: {totals}"
+    );
+
+    // The flat keys tab-atelier reads are still there, unchanged in meaning.
+    assert_eq!(
+        totals["input"], 2_200_000,
+        "raw input tokens, cached included: {totals}"
+    );
+    assert_eq!(totals["output"], 2_000_000, "{totals}");
+}
+
+/// A resumed session carries its money and its counts.
+///
+/// The money is read back rather than recomputed: the price list arrives after the restore, and may
+/// have changed since, so recomputing would restate a session's history at today's prices. Without
+/// this, reopening a session showed it having spent nothing — the totals started again from zero
+/// while the transcript behind them said otherwise.
+#[test]
+fn a_resumed_session_keeps_the_amounts_it_had_spent() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let socket = home.join("agent.sock");
+
+    let (port, _rx) = spawn_mock_relay_owned(vec![("HTTP/1.1 200 OK", reply_from_model("claude-sonnet-4-6"))]);
+    let session_id = {
+        let (_agent, mut reader, mut stream) = spawn_agent_in(home, home, &socket, |cmd| {
+            cmd.args([
+                "--relay-url",
+                &format!("http://127.0.0.1:{port}"),
+                "--relay-token",
+                RELAY_TOKEN,
+            ]);
+        });
+        let reply = send_prompt(&mut stream, &mut reader, "spend something");
+        assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+        let mut files = Vec::new();
+        jsonl_files(home, &mut files);
+        assert_eq!(files.len(), 1, "one transcript: {files:?}");
+        files[0].file_stem().unwrap().to_str().unwrap().to_owned()
+    };
+
+    let before = read_token_sidecar(home);
+    let spent_usd = before["cost"]["amounts"][0]["amount"]
+        .as_f64()
+        .expect("an amount before the resume");
+    assert!(spent_usd > 0.0, "the first turn should have cost something: {before}");
+
+    // Resume it, and read the sidecar again *before* any further turn: what the restored session
+    // knows about itself, which is the thing that used to be zero.
+    let (port, _rx) = spawn_mock_relay_owned(vec![("HTTP/1.1 200 OK", reply_from_model("claude-sonnet-4-6"))]);
+    let (_agent, mut reader, mut stream) = spawn_agent_in(home, home, &socket, |cmd| {
+        cmd.args([
+            "--resume",
+            &session_id,
+            "--relay-url",
+            &format!("http://127.0.0.1:{port}"),
+            "--relay-token",
+            RELAY_TOKEN,
+        ]);
+    });
+    let reply = send_prompt(&mut stream, &mut reader, "carry on");
+    assert_eq!(reply["kind"], "done", "unexpected reply: {reply}");
+
+    let after = read_token_sidecar(home);
+    let usd = after["cost"]["amounts"]
+        .as_array()
+        .expect("amounts")
+        .iter()
+        .find(|a| a["currency"] == "USD")
+        .and_then(|a| a["amount"].as_f64())
+        .expect("a USD amount after the resume");
+
+    assert!(
+        (usd - spent_usd.mul_add(2.0, 0.0)).abs() < 1e-6,
+        "the resumed session should have added to what it had already spent ({spent_usd}), not \
+         started again from zero: got {usd} in {after}"
+    );
+    assert_eq!(
+        after["cost"]["tokens"]["in"].as_u64().unwrap_or(0),
+        before["cost"]["tokens"]["in"].as_u64().unwrap_or(0) * 2,
+        "and the token counts carry on the same way: {after}"
+    );
+}
+
+/// The session's token sidecar, as tab-atelier and a resume both read it.
+fn read_token_sidecar(home: &Path) -> serde_json::Value {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(home.join(".claude").join("projects"))
+        .unwrap()
+        .flatten()
+    {
+        let path = entry.path();
+        if path.is_dir() {
+            for file in std::fs::read_dir(&path).unwrap().flatten() {
+                if file.file_name().to_string_lossy().ends_with(".tokens.json") {
+                    found.push(file.path());
+                }
+            }
+        }
+    }
+    assert_eq!(found.len(), 1, "expected one token sidecar: {found:?}");
+    let raw = std::fs::read_to_string(&found[0]).unwrap();
+    serde_json::from_str(&raw).expect("the sidecar is JSON")
+}

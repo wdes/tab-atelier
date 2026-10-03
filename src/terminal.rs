@@ -1,6 +1,4 @@
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// SPDX-License-Identifier: MPL-2.0
 
 #![cfg(feature = "gui")]
 
@@ -269,9 +267,25 @@ pub struct TerminalView {
     /// Set by the PTY event-loop thread when the shell dies (see
     /// [`EventProxy::exited`]); read on the UI thread by `has_exited`.
     exited: Arc<std::sync::atomic::AtomicBool>,
+    /// Text a program in this tab asked to put on the clipboard, waiting to be
+    /// handed to gpui. See [`EventProxy::clipboard`] — the copy itself has to happen
+    /// on the UI thread, so it is parked here by the parser and drained by
+    /// [`Self::take_clipboard`].
+    #[cfg(feature = "gui")]
+    clipboard: Arc<std::sync::Mutex<Option<String>>>,
     scrollbar_dragging: Rc<Cell<bool>>,
     scroll_acc: Rc<Cell<f32>>,
     pub theme: ThemeName,
+    /// Per-tab background override (`#RRGGBB` resolved to a colour) — the
+    /// project tint from a folder rule, or the tab's own `bg-color`. `None` ⇒
+    /// the theme's `term_bg`. Copied into the element each `render`.
+    bg_override: Option<u32>,
+    /// This tab runs an agent whose fullscreen UI scrolls by page (Claude
+    /// Code), so a wheel notch on the alt screen becomes PgUp/PgDn instead of
+    /// wheel events or arrow keys, neither of which it acts on. Set from the
+    /// tab's durable `agent_kind`; `Cell` because the wheel handler reads it
+    /// through a shared reference.
+    alt_scroll_pages: Rc<Cell<bool>>,
     /// Shape of the cursor quad drawn over the active cell. Copied into the
     /// element each `render` (like `theme`) and read at paint time.
     cursor_style: CursorStyle,
@@ -376,6 +390,14 @@ struct CachedFrame {
     /// have moved (a `scroll_display`) — the signal that makes shifted
     /// reuse safe for user scrolling.
     ring_len: u64,
+    /// Whether the grid was on the ALTERNATE screen (`\x1b[?1049h`, e.g.
+    /// Claude Code's fullscreen mode, vim, less) when this frame was built.
+    /// The alt screen is a *separate* grid with no scrollback, so it always
+    /// reports `history_size == 0` / `display_offset == 0` — identical to a
+    /// fresh primary screen. Without recording it, a primary↔alt toggle looks
+    /// like "same window" to [`Self::shift_for`] and reuses the OTHER screen's
+    /// rows, repainting only the damaged rows over a stale top.
+    alt_screen: bool,
     /// `Rc` so handing the rows to Phase 2 each frame is a refcount
     /// bump per row — the old `RawLine` deep clone (text + segments +
     /// runs for EVERY visible row) ran under the Term lock every paint.
@@ -408,8 +430,15 @@ impl CachedFrame {
         visible_lines: usize,
         history_size: usize,
         ring_len: u64,
+        alt_screen: bool,
     ) -> Option<i32> {
         if self.visible_cols != visible_cols || self.visible_lines != visible_lines {
+            return None;
+        }
+        // A primary↔alt screen switch swaps in an entirely different grid, but
+        // the alt screen's 0/0 offset+history can match a cached primary frame
+        // (and vice-versa). Never reuse across the switch — rebuild every row.
+        if self.alt_screen != alt_screen {
             return None;
         }
         if self.display_offset == display_offset && self.history_size == history_size {
@@ -480,12 +509,51 @@ fn expand_path_prefix(raw: &str) -> Option<std::path::PathBuf> {
     }
 }
 
+/// One `PageUp` / `PageDown` per wheel gesture, for a fullscreen app whose
+/// transcript scrolls by page and which answers to neither the wheel-button
+/// events nor the arrow keys — Claude Code, where PgUp/PgDn is what a user
+/// reaches for by hand. Magnitude is deliberately ignored: a notch is a page,
+/// the same as pressing the key once, rather than `lines` pages.
+fn page_scroll_bytes(lines: i32) -> Vec<u8> {
+    if lines > 0 {
+        b"\x1b[5~".to_vec()
+    } else {
+        b"\x1b[6~".to_vec()
+    }
+}
+
 fn alt_scroll_bytes(lines: i32) -> Vec<u8> {
     let cmd = if lines > 0 { b'A' } else { b'B' };
     let n = lines.unsigned_abs() as usize;
     let mut out = Vec::with_capacity(n * 3);
     for _ in 0..n {
         out.extend_from_slice(&[0x1b, b'O', cmd]);
+    }
+    out
+}
+
+/// Encode wheel notches as mouse-wheel button events for an app that opted
+/// into mouse reporting (Claude Code's fullscreen mode, vim/tmux with mouse,
+/// …). Wheel up = button 4 (code 64), wheel down = button 5 (code 65); one
+/// press event per line (the wheel has no release). SGR (1006) form when the
+/// app requested it, else the legacy X10 form. `col`/`row` are 0-based cell
+/// coordinates; both encodings want 1-based.
+///
+/// Positive `lines` ⇒ older content ⇒ wheel up, matching [`alt_scroll_bytes`].
+fn mouse_wheel_bytes(lines: i32, col: usize, row: usize, sgr: bool) -> Vec<u8> {
+    let code: u32 = if lines > 0 { 64 } else { 65 };
+    let n = lines.unsigned_abs() as usize;
+    // 1-based. The legacy form packs each coordinate into `32 + value` in one
+    // byte, so it can only address 223 cells — clamp to keep the byte valid.
+    let c = (col + 1).clamp(1, 223);
+    let r = (row + 1).clamp(1, 223);
+    let mut out = Vec::new();
+    for _ in 0..n {
+        if sgr {
+            out.extend_from_slice(format!("\x1b[<{code};{c};{r}M").as_bytes());
+        } else {
+            out.extend_from_slice(&[0x1b, b'[', b'M', 32 + code as u8, 32 + c as u8, 32 + r as u8]);
+        }
     }
     out
 }
@@ -724,6 +792,8 @@ impl TerminalView {
         // Shell death arrives as `ChildExit` on this flag (see
         // `EventProxy::exited`) — no per-tab watcher loop needed.
         let exited = proxy.exited.clone();
+        #[cfg(feature = "gui")]
+        let clipboard = proxy.clipboard.clone();
 
         let recipe = SpawnRecipe {
             cwd: cwd.map(std::path::Path::to_path_buf),
@@ -750,9 +820,13 @@ impl TerminalView {
             pid: 0,
             spawn_recipe: Some(recipe),
             exited,
+            #[cfg(feature = "gui")]
+            clipboard,
             scrollbar_dragging: Rc::new(Cell::new(false)),
             scroll_acc: Rc::new(Cell::new(0.0)),
             theme: ThemeName::default(),
+            bg_override: None,
+            alt_scroll_pages: Rc::new(Cell::new(false)),
             cursor_style: CursorStyle::default(),
             font_config,
             browser,
@@ -786,6 +860,21 @@ impl TerminalView {
     /// pulling the working size from `last_size`/`cell_size` and the shell/env
     /// from the stashed [`SpawnRecipe`]. Called eagerly for the active tab, and
     /// in the background for the rest so restored agents come back online.
+    /// Change the rendered font size and re-measure the cell.
+    ///
+    /// `cell_size` is memoised on first paint, and every grid dimension is
+    /// derived from it, so dropping it is what makes the change take effect —
+    /// the next paint re-measures and the PTY resize follows from the new
+    /// columns and rows. Without this the setting would only apply to tabs
+    /// opened afterwards, which is indistinguishable from "does nothing".
+    pub fn set_font_size(&mut self, size: f32) {
+        if (self.font_config.size - size).abs() < f32::EPSILON {
+            return;
+        }
+        self.font_config.size = size;
+        self.cell_size = None;
+    }
+
     pub fn ensure_spawned(&mut self) {
         let Some(recipe) = self.spawn_recipe.take() else {
             return;
@@ -928,6 +1017,20 @@ impl TerminalView {
         self.event_proxy.set_theme(theme);
     }
 
+    /// Mark this tab as running a page-scrolling fullscreen agent (Claude
+    /// Code) so the wheel sends PgUp/PgDn on the alt screen.
+    pub fn set_alt_scroll_pages(&self, on: bool) {
+        self.alt_scroll_pages.set(on);
+    }
+
+    /// Override the terminal background (the project tint), or clear it back
+    /// to the theme's. Takes effect on the next paint.
+    pub fn set_bg_override(&mut self, rgb: Option<u32>) {
+        self.bg_override = rgb;
+        // The PTY side answers OSC colour queries off its own copy.
+        self.event_proxy.set_bg_override(rgb);
+    }
+
     /// Set the cursor shape (block / slim bar / underline). Takes effect on
     /// the next paint; nothing in the PTY or grid changes.
     pub const fn set_cursor_style(&mut self, style: CursorStyle) {
@@ -952,6 +1055,17 @@ impl TerminalView {
 
     pub fn has_exited(&self) -> bool {
         self.exited.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Take any clipboards write this tab's programs asked for since the last call.
+    ///
+    /// Drained on the UI thread because putting something on the clipboard needs
+    /// gpui's `App`, which the parser callback has no access to. Taking rather than
+    /// peeking, so a value is delivered exactly once — a clippy that never cleared
+    /// would re-copy the same text on every sweep.
+    #[cfg(feature = "gui")]
+    pub fn take_clipboard(&self) -> Option<String> {
+        self.clipboard.lock().ok().and_then(|mut slot| slot.take())
     }
 
     /// Drop the render caches (previous frame's rows, shaped-glyph cache,
@@ -1000,7 +1114,20 @@ impl TerminalView {
         self.net_disabled.set(disabled);
     }
 
-    pub fn respawn(&mut self, cwd: Option<&Path>) {
+    /// Re-fork this tab's shell in place, keeping the grid + scrollback.
+    ///
+    /// Takes the same per-tab inputs as the initial spawn so the tab comes back
+    /// as *itself*: `extra_env` carries `_TAB_ID` / `TAB_ATELIER_API_*` (without
+    /// them the in-tab CLI and the Claude hooks silently no-op), and
+    /// `agent_launch` re-execs the agent under cleared env instead of dropping
+    /// to a bare shell. Callers in non-cleared-env mode queue the typed resume
+    /// instead — see `flush_pending_agent_resume`.
+    pub fn respawn(
+        &mut self,
+        cwd: Option<&Path>,
+        extra_env: &HashMap<String, String>,
+        agent_launch: Option<Vec<String>>,
+    ) {
         if let Some(n) = self.notifier.as_ref() {
             let _ = n.send(Msg::Shutdown);
         }
@@ -1021,13 +1148,16 @@ impl TerminalView {
             cell_height: f32::from(cell.height) as u16,
         };
 
+        // The agent suffix is only honoured under cleared env (it's shell args,
+        // not env) — everywhere else the respawn forks a shell and the caller
+        // types the resume in.
+        let execs_agent = crate::clear_env() && agent_launch.is_some();
         let opts = if crate::clear_env() {
-            // Respawn carries no per-tab API extras (same as the
-            // inheriting branch below), so the cleared env is just the
-            // minimal allowlist + colours + telemetry opt-out.
-            let min_env =
-                crate::minimal_pty_env(self.colors_enabled.get(), crate::clear_env_user_vars(), &HashMap::new());
-            let (prog, args) = crate::clear_env_shell_command(&crate::clear_env_shell_path(), true, &min_env);
+            let min_env = crate::minimal_pty_env(self.colors_enabled.get(), crate::clear_env_user_vars(), extra_env);
+            let (prog, mut args) = crate::clear_env_shell_command(&crate::clear_env_shell_path(), true, &min_env);
+            if let Some(suffix) = agent_launch {
+                args.extend(suffix);
+            }
             let (prog, args) = if self.net_disabled.get() {
                 crate::no_internet_command(&prog, &args)
             } else {
@@ -1045,16 +1175,20 @@ impl TerminalView {
             // inside bubblewrap. bwrap inherits `env` and passes it to the
             // child (no --clearenv), so the colour/telemetry vars survive.
             let (prog, args) = crate::no_internet_command(&crate::clear_env_shell_path(), &["-l".to_string()]);
+            let mut env = crate::pty_env(self.colors_enabled.get());
+            env.extend(extra_env.clone());
             tty::Options {
                 shell: Some(tty::Shell::new(prog, args)),
                 working_directory: cwd.map(std::path::Path::to_path_buf),
-                env: crate::pty_env(self.colors_enabled.get()),
+                env,
                 ..Default::default()
             }
         } else {
+            let mut env = crate::pty_env(self.colors_enabled.get());
+            env.extend(extra_env.clone());
             tty::Options {
                 working_directory: cwd.map(std::path::Path::to_path_buf),
-                env: crate::pty_env(self.colors_enabled.get()),
+                env,
                 ..Default::default()
             }
         };
@@ -1097,8 +1231,9 @@ impl TerminalView {
         self.pid = pid;
         // Respawn keeps the old grid, so the re-forked shell's prompt would glue
         // onto it — same clean-line fix as `ensure_spawned` (raw PTY write, not a
-        // keystroke). Respawn always forks a shell.
-        if let Some(n) = &self.notifier {
+        // keystroke). An exec'd agent clears and redraws its own screen, so it
+        // neither needs nor wants the extra line.
+        if !execs_agent && let Some(n) = &self.notifier {
             let _ = n.send(Msg::Input(b"\r".to_vec().into()));
         }
         self.exited.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -1169,6 +1304,25 @@ impl TerminalView {
         let mut term = self.term.lock();
         parser.advance(&mut *term, reset.as_bytes());
         term.grid_mut().scroll_display(Scroll::Bottom);
+    }
+
+    /// Hard-wipe the on-screen render: clear the visible grid AND the
+    /// scrollback, home the cursor, and drop the frame cache so the next
+    /// paint rebuilds from an empty grid. Fed straight to the parser (not the
+    /// PTY), so it takes effect immediately — used right before an agent is
+    /// resumed so its fresh UI paints onto a clean screen instead of over the
+    /// restored previous-session scrollback (which otherwise lingers above /
+    /// through the resumed frame until it happens to overwrite those rows).
+    pub fn wipe_output(&self) {
+        {
+            let mut parser: vte::ansi::Processor = vte::ansi::Processor::new();
+            let mut term = self.term.lock();
+            // ED 3 (scrollback) + cursor home + ED 2 (screen) — same sequence
+            // as `crate::AGENT_LAUNCH_CLEAR`, applied locally and immediately.
+            parser.advance(&mut *term, b"\x1b[3J\x1b[H\x1b[2J");
+            term.grid_mut().scroll_display(Scroll::Bottom);
+        }
+        self.release_render_caches();
     }
 
     /// Turn whatever's on the clipboard (text or image) into a string
@@ -1615,33 +1769,31 @@ impl Render for TerminalView {
                     ks.modifiers.alt,
                     ks.modifiers.function,
                 );
-                if ks.modifiers.control && ks.modifiers.shift {
-                    match ks.key.as_str() {
-                        "c" => {
+                // Window-level chords never reach the PTY. `crate::app_chord`
+                // is the single table both this and the root handler read, so
+                // what we swallow here is exactly what the root acts on when
+                // the event bubbles (see its doc comment).
+                if let Some(chord) =
+                    crate::app_chord(&ks.key, ks.modifiers.control, ks.modifiers.shift, ks.modifiers.alt)
+                {
+                    match chord {
+                        crate::AppChord::Copy => {
                             if let Some(text) = this.copy_selection() {
                                 cx.write_to_clipboard(ClipboardItem::new_string(text));
                             }
-                            return;
                         }
-                        "v" => {
+                        crate::AppChord::Paste => {
                             if let Some(item) = cx.read_from_clipboard()
                                 && let Some(text) = Self::clipboard_to_paste_text(&item)
                             {
                                 this.send_clipboard(&text);
                             }
-                            return;
                         }
-                        "t" => return,
-                        _ => {}
+                        // Swallowed only — the root opens the switcher / adds
+                        // the tab / switches, so the shell never sees `^P`
+                        // (readline "previous") or `^T`.
+                        crate::AppChord::TabSwitcher | crate::AppChord::NewTab | crate::AppChord::NextTab => {}
                     }
-                }
-                if ks.modifiers.alt && ks.key.as_str() == "tab" {
-                    return;
-                }
-                // Ctrl+P opens the app-level MRU tab switcher — handled by the
-                // root `on_key_down` once this bubbles up. Swallow it here so it
-                // doesn't also reach the shell as `^P` (readline "previous").
-                if ks.modifiers.control && !ks.modifiers.shift && !ks.modifiers.alt && ks.key.as_str() == "p" {
                     return;
                 }
                 if ks.modifiers.shift && !ks.modifiers.control {
@@ -1738,9 +1890,33 @@ impl Render for TerminalView {
                         // the guard drops — TermMode is bitflags-derived
                         // and so is Copy.
                         let mode = *this.term.lock().mode();
-                        let alt_scroll =
-                            mode.contains(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL) && !ev.modifiers.shift;
-                        if alt_scroll {
+                        // Shift is the escape hatch: always reach the terminal's
+                        // OWN scrollback, even while a mouse-aware TUI is up.
+                        if ev.modifiers.shift {
+                            this.scroll(lines);
+                        } else if this.alt_scroll_pages.get() && mode.contains(TermMode::ALT_SCREEN) {
+                            // Claude Code ignores both wheel-button events and
+                            // arrow keys; its transcript moves on PgUp/PgDn,
+                            // which is what users were pressing by hand.
+                            this.send_input(page_scroll_bytes(lines));
+                        } else if mode.contains(TermMode::MOUSE_REPORT_CLICK) {
+                            // The app requested mouse reporting → forward the
+                            // wheel as mouse-wheel button events so it scrolls
+                            // its own view (Claude Code fullscreen, vim, tmux).
+                            let origin = this.content_origin.get();
+                            let (gp, _) = this.pixel_to_grid(ev.position, origin);
+                            let bytes = mouse_wheel_bytes(
+                                lines,
+                                gp.column.0,
+                                gp.line.0.max(0) as usize,
+                                mode.contains(TermMode::SGR_MOUSE),
+                            );
+                            this.send_input(bytes);
+                        } else if mode.contains(TermMode::ALT_SCREEN) {
+                            // Alt-screen (fullscreen TUI) has no local scrollback,
+                            // so a viewport scroll is a no-op — forward as arrow
+                            // keys. Previously gated on ALTERNATE_SCROLL; dropped
+                            // so any fullscreen app (new Claude Code) still scrolls.
                             this.send_input(alt_scroll_bytes(lines));
                         } else {
                             this.scroll(lines);
@@ -1919,6 +2095,7 @@ impl Render for TerminalView {
                 line_cache: self.line_cache.clone(),
                 line_cache_scratch: self.line_cache_scratch.clone(),
                 theme: self.theme,
+                bg_override: self.bg_override,
                 cursor_style: self.cursor_style,
                 font_config: self.font_config.clone(),
                 detected_urls: self.detected_urls.clone(),
@@ -1955,6 +2132,7 @@ struct TerminalElement {
     line_cache: Rc<RefCell<HashMap<i32, CachedLine>>>,
     line_cache_scratch: Rc<RefCell<HashMap<i32, CachedLine>>>,
     theme: ThemeName,
+    bg_override: Option<u32>,
     cursor_style: CursorStyle,
     font_config: FontConfig,
     detected_urls: Rc<RefCell<Vec<DetectedUrl>>>,
@@ -2281,7 +2459,10 @@ impl Element for TerminalElement {
             v[3].style = FontStyle::Italic;
             v
         };
-        let t = theme::theme(self.theme);
+        // Cells that resolve "the default background" (SGR 49, index 257, an
+        // inverse cell) must land on the tab's tint, not the theme's colour.
+        let t = theme::theme(self.theme).with_term_bg(self.bg_override);
+        let t = &t;
         let fg_default = t.term_fg_hsla();
 
         // Phase 1: read cell data under the lock — no shaping here.
@@ -2347,6 +2528,11 @@ impl Element for TerminalElement {
             // an animated redraw. SHOW_CURSOR is set by default and
             // cleared by `?25l`, restored by `?25h`.
             let cursor_visible = term.mode().contains(TermMode::SHOW_CURSOR);
+            // Which screen the grid is on. A primary↔alt toggle (Claude Code's
+            // fullscreen mode, vim, less) swaps the whole grid but can keep the
+            // same 0/0 offset+history, so the frame cache must not reuse across
+            // it — see [`CachedFrame::alt_screen`].
+            let alt_screen = term.mode().contains(TermMode::ALT_SCREEN);
 
             // Collect damage BEFORE we re-borrow the grid immutably
             // for the cell scan. `Term::damage()` returns either Full
@@ -2385,9 +2571,16 @@ impl Element for TerminalElement {
             // build loop below rebuilds them; un-damaged slots stay
             // populated and skip the rebuild entirely.
             let prev = self.prev_frame.borrow_mut().take();
-            let shift = prev
-                .as_ref()
-                .and_then(|p| p.shift_for(display_offset, visible_cols, visible_lines, history_size, ring_len));
+            let shift = prev.as_ref().and_then(|p| {
+                p.shift_for(
+                    display_offset,
+                    visible_cols,
+                    visible_lines,
+                    history_size,
+                    ring_len,
+                    alt_screen,
+                )
+            });
             let mut working: Vec<Option<Rc<RawLine>>> = match (prev, shift) {
                 (Some(p), Some(0)) => {
                     let mut v = p.lines;
@@ -2696,6 +2889,7 @@ impl Element for TerminalElement {
                 visible_lines,
                 history_size,
                 ring_len,
+                alt_screen,
                 lines: working,
             });
 
@@ -2876,7 +3070,7 @@ impl Element for TerminalElement {
             // frame. Per-cell bg quads (below) skip default-bg cells —
             // without this base, anything left in the framebuffer from the
             // last redraw (other windows, scrolled-off rows) shows through.
-            let term_bg = theme::theme(self.theme).term_bg_hsla();
+            let term_bg = theme::theme(self.theme).with_term_bg(self.bg_override).term_bg_hsla();
             window.paint_quad(fill(bounds, term_bg));
 
             // Paint backgrounds, with vertically-contiguous identical
@@ -3112,6 +3306,37 @@ mod tests {
     use vte::ansi::{Color, NamedColor};
 
     #[test]
+    fn page_scroll_bytes_are_one_page_per_gesture() {
+        // A fullscreen agent that only answers PgUp/PgDn gets exactly one key
+        // per wheel gesture — `lines` scales the local scroll, not the number
+        // of pages, or a single notch would jump three screens.
+        assert_eq!(page_scroll_bytes(1), b"\x1b[5~".to_vec());
+        assert_eq!(page_scroll_bytes(3), b"\x1b[5~".to_vec());
+        assert_eq!(page_scroll_bytes(-1), b"\x1b[6~".to_vec());
+        assert_eq!(page_scroll_bytes(-9), b"\x1b[6~".to_vec());
+    }
+
+    #[test]
+    fn mouse_wheel_bytes_sgr_and_legacy() {
+        // Wheel up (older content) = button 64; SGR form is 1-based col;row.
+        assert_eq!(mouse_wheel_bytes(1, 4, 9, true), b"\x1b[<64;5;10M".to_vec());
+        // Wheel down = button 65.
+        assert_eq!(mouse_wheel_bytes(-1, 0, 0, true), b"\x1b[<65;1;1M".to_vec());
+        // Multiple notches → one event each.
+        assert_eq!(mouse_wheel_bytes(2, 0, 0, true), b"\x1b[<64;1;1M\x1b[<64;1;1M".to_vec());
+        // Legacy X10: ESC [ M, then 32+code, 32+col, 32+row (all 1-based).
+        assert_eq!(
+            mouse_wheel_bytes(1, 0, 0, false),
+            vec![0x1b, b'[', b'M', 32 + 64, 33, 33]
+        );
+        // Coordinates clamp to the 223-cell ceiling the legacy byte can hold.
+        assert_eq!(
+            mouse_wheel_bytes(-1, 999, 999, false),
+            vec![0x1b, b'[', b'M', 32 + 65, 255, 255]
+        );
+    }
+
+    #[test]
     fn first_prompt_cleanup_is_ctrl_l_for_shells_only() {
         // Shell tabs get Ctrl-L (form feed) to clear-and-redraw a clean first
         // prompt — NOT `\r`, which would run an empty command + stack a second
@@ -3156,6 +3381,7 @@ mod tests {
             visible_lines: 24,
             history_size,
             ring_len,
+            alt_screen: false,
             lines: Vec::new(),
         }
     }
@@ -3166,12 +3392,35 @@ mod tests {
     #[test]
     fn cached_frame_stationary_and_resize() {
         let f = frame(0, 100, 7);
-        assert_eq!(f.shift_for(0, 80, 24, 100, 7), Some(0));
+        assert_eq!(f.shift_for(0, 80, 24, 100, 7, false), Some(0));
         // Same window, output arrived in place (TUI redraw): still
         // index-stable; the damage rows handle the changed content.
-        assert_eq!(f.shift_for(0, 80, 24, 100, 9), Some(0));
-        assert_eq!(f.shift_for(0, 100, 24, 100, 7), None, "cols change (resize)");
-        assert_eq!(f.shift_for(0, 80, 50, 100, 7), None, "lines change (resize)");
+        assert_eq!(f.shift_for(0, 80, 24, 100, 9, false), Some(0));
+        assert_eq!(f.shift_for(0, 100, 24, 100, 7, false), None, "cols change (resize)");
+        assert_eq!(f.shift_for(0, 80, 50, 100, 7, false), None, "lines change (resize)");
+    }
+
+    /// A primary↔alt screen toggle (Claude Code fullscreen, vim, less) swaps
+    /// in a whole different grid, but the alt screen's 0/0 offset+history
+    /// matches a fresh primary frame — reuse would serve the OTHER screen's
+    /// rows and repaint only the damaged bottom over a stale top. Both
+    /// directions must rebuild; same-screen still reuses.
+    #[test]
+    fn cached_frame_alt_screen_switch_rebuilds() {
+        let primary = frame(0, 0, 7); // primary, 0/0 — indistinguishable from alt
+        assert_eq!(
+            primary.shift_for(0, 80, 24, 0, 7, true),
+            None,
+            "primary→alt must rebuild"
+        );
+        let mut alt = frame(0, 0, 7);
+        alt.alt_screen = true;
+        assert_eq!(alt.shift_for(0, 80, 24, 0, 7, false), None, "alt→primary must rebuild");
+        assert_eq!(
+            alt.shift_for(0, 80, 24, 0, 7, true),
+            Some(0),
+            "same alt screen still reuses"
+        );
     }
 
     /// Guards the stale-bg-bleed fix, now in shift form: when output
@@ -3184,9 +3433,9 @@ mod tests {
     #[test]
     fn cached_frame_stream_scroll_rebuilds() {
         let f = frame(0, 100, 7);
-        assert_eq!(f.shift_for(0, 80, 24, 101, 8), None, "history grew + output");
-        assert_eq!(f.shift_for(0, 80, 24, 0, 8), None, "\\x1b[3J history clear");
-        assert_eq!(f.shift_for(5, 80, 24, 100, 8), None, "user scroll during flood");
+        assert_eq!(f.shift_for(0, 80, 24, 101, 8, false), None, "history grew + output");
+        assert_eq!(f.shift_for(0, 80, 24, 0, 8, false), None, "\\x1b[3J history clear");
+        assert_eq!(f.shift_for(5, 80, 24, 100, 8, false), None, "user scroll during flood");
     }
 
     /// A pure user scroll — no PTY bytes since the cache was built —
@@ -3197,12 +3446,15 @@ mod tests {
     fn cached_frame_pure_scroll_shifts() {
         let f = frame(0, 100, 7);
         // Scrolling up 5 lines: content moves DOWN the screen.
-        assert_eq!(f.shift_for(5, 80, 24, 100, 7), Some(-5));
+        assert_eq!(f.shift_for(5, 80, 24, 100, 7, false), Some(-5));
         // And back toward the bottom from offset 5.
-        assert_eq!(frame(5, 100, 7).shift_for(2, 80, 24, 100, 7), Some(3));
+        assert_eq!(frame(5, 100, 7).shift_for(2, 80, 24, 100, 7, false), Some(3));
         // Scrolled all the way with a full 10k scrollback: still a
         // plain shift — history must never be truncated to avoid this.
-        assert_eq!(frame(0, 10_000, 7).shift_for(10_000, 80, 24, 10_000, 7), Some(-10_000));
+        assert_eq!(
+            frame(0, 10_000, 7).shift_for(10_000, 80, 24, 10_000, 7, false),
+            Some(-10_000)
+        );
     }
 
     /// The realignment itself: `None` slots are the rows the cell scan

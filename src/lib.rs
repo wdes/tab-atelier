@@ -1,6 +1,4 @@
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// SPDX-License-Identifier: MPL-2.0
 
 // unwrap_used + expect_used are denied crate-wide (Cargo.toml); tests may panic.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
@@ -20,8 +18,15 @@ pub(crate) mod api_ws;
 pub mod app;
 #[cfg(feature = "gui")]
 pub(crate) mod box_drawing;
+pub mod briefs;
 #[cfg(feature = "catbus")]
 pub(crate) mod catbus_agent;
+pub mod claims;
+pub mod federation;
+pub mod fleet;
+/// Human-readable renderings shared by both editions.
+pub mod fmt;
+pub mod sweep;
 // Shared by both binaries now (GUI applies per-tab cgroup limits too); the
 // module's own `#![cfg(target_os = "linux")]` scopes it to Linux.
 #[cfg(target_os = "linux")]
@@ -37,6 +42,7 @@ pub mod headless;
 pub mod http3;
 pub(crate) mod locale;
 #[cfg(target_os = "linux")]
+pub mod log_ring;
 pub mod net_meter;
 #[cfg(all(target_os = "linux", not(feature = "gui")))]
 pub mod net_nft;
@@ -54,6 +60,7 @@ pub mod remote;
 pub mod schedule;
 #[cfg(feature = "gui")]
 pub(crate) mod screenshot;
+pub mod ssh_agent;
 pub(crate) mod term_export;
 #[cfg(feature = "gui")]
 pub(crate) mod terminal;
@@ -61,6 +68,7 @@ pub(crate) mod terminal;
 pub(crate) mod terminal_utils;
 pub(crate) mod theme;
 pub(crate) mod tracking;
+pub mod transcript_compact;
 #[cfg(all(windows, not(feature = "gui")))]
 pub mod win_service;
 
@@ -203,24 +211,83 @@ pub fn apply_relay_config(change: &crate::api::RelayConfigChange, config_base: &
     if let Some(eg) = change.egress {
         prefs.relay_egress = eg;
     }
+    // Cleared on disk rather than only at runtime: the migration in
+    // docs/proxy.md says to point an old egress box at a proxy, and an
+    // operator who follows it lands here with a relay that cannot work and a
+    // 502 naming a role they thought they had left behind.
+    normalise_relay_config(&mut prefs);
     if !read_only() {
         save_preferences(config_base, &prefs);
     }
     install_relay_config(&prefs);
 }
 
+/// The credential to present to a peer's relay route.
+///
+/// One endpoint entry serves two consumers with different rights: `token` is
+/// the peer's SIDECAR credential (list tabs, type input, move files) and
+/// `relay_token` its RELAY one, which can do nothing but proxy.
+/// There is no fallback between them: presenting the sidecar token to the
+/// relay route would just 401, and trying it anyway turns a clear "you didn't
+/// set --relay-token" into a confusing auth failure at the peer.
+#[must_use]
+pub fn relay_credential(endpoint: &RemoteEndpoint) -> Option<&str> {
+    (!endpoint.relay_token.is_empty()).then_some(endpoint.relay_token.as_str())
+}
+
+/// Resolve the egress/target contradiction in place, reporting whether it had
+/// to.
+///
+/// `relay via <peer>` and `relay egress on` are opposite roles — "forward to
+/// that host" and "I am the host that forwards" — and the request path tests
+/// egress first, so holding both means every call 502s no matter how correct
+/// the endpoint is. A resolvable target is the more specific statement of
+/// intent, so it wins.
+///
+/// Returns `true` when it changed something, which is the caller's cue to
+/// write the corrected preferences back. Repairing this only in memory is not
+/// enough: the file keeps the contradiction, so the next reader that has not
+/// been through here — an older binary, a tool reading preferences.json — sees
+/// `relay_egress: true` and reports an "egress hop" failure on an instance
+/// whose live config says otherwise. That is exactly how this stayed confusing
+/// after it was supposedly fixed.
+pub fn normalise_relay_config(prefs: &mut Preferences) -> bool {
+    let has_target = prefs
+        .relay_endpoint_id
+        .as_deref()
+        .is_some_and(|id| prefs.remote_endpoints.iter().any(|e| e.id == id));
+    if prefs.relay_egress && has_target {
+        prefs.relay_egress = false;
+        return true;
+    }
+    false
+}
+
 /// Resolve + install the relay egress flag and forward target from a loaded
 /// `Preferences`. Called at startup (both editions) and after a relay toggle.
 pub fn install_relay_config(prefs: &Preferences) {
-    set_relay_egress(prefs.relay_egress);
     let target = prefs.relay_endpoint_id.as_deref().and_then(|id| {
         prefs.remote_endpoints.iter().find(|e| e.id == id).map(|e| RelayTarget {
             url: e.url.trim_end_matches('/').to_string(),
-            token: e.token.clone(),
+            token: relay_credential(e).unwrap_or_default().to_string(),
             cf_access_client_id: e.cf_access_client_id.clone(),
             cf_access_client_secret: e.cf_access_client_secret.clone(),
         })
     });
+    // Same mutual exclusion `apply_relay_config` writes, applied again on the
+    // way in — a preferences file written before that rule existed still holds
+    // both, and reading it back faithfully would mean the relay stays broken
+    // until someone runs a command nothing told them to run. A resolved target
+    // is unambiguous evidence of which role this host has.
+    let egress = prefs.relay_egress && target.is_none();
+    if prefs.relay_egress && !egress {
+        log::warn!(
+            "relay: ignoring the stored egress role — this instance relays through {}; \
+             the egress role now belongs to the tab-atelier-proxy package",
+            target.as_ref().map_or("a peer", |t| t.url.as_str()),
+        );
+    }
+    set_relay_egress(egress);
     set_relay_target(target);
 }
 
@@ -244,6 +311,61 @@ pub fn set_tab_env_global(vars: std::collections::BTreeMap<String, String>) {
 #[must_use]
 pub fn tab_env_global() -> std::collections::BTreeMap<String, String> {
     TAB_ENV_GLOBAL.read().map(|g| g.clone()).unwrap_or_default()
+}
+
+/// Per-folder tab styles from the `folder_styles` preference, resolved on
+/// every tab spawn / snapshot. Set once at startup, like the other
+/// preference-backed globals; editing the preference takes effect on the next
+/// daemon start (same contract as `bg-color --global`).
+static FOLDER_STYLES: std::sync::RwLock<std::collections::BTreeMap<String, FolderStyle>> =
+    std::sync::RwLock::new(std::collections::BTreeMap::new());
+
+/// Replace the process's per-folder styles. Called at startup and again by
+/// [`refresh_folder_styles`] whenever the preference file changes.
+pub fn set_folder_styles(styles: std::collections::BTreeMap<String, FolderStyle>) {
+    if let Ok(mut g) = FOLDER_STYLES.write() {
+        *g = styles;
+    }
+}
+
+/// The folder rule that applies to `cwd`, resolved and owned.
+///
+/// Owned rather than borrowed so the caller doesn't hold the lock: callers
+/// resolve once per tick and cache the result on the tab, so painting a frame
+/// never touches this.
+#[must_use]
+pub fn folder_style_of(cwd: Option<&str>) -> FolderStyle {
+    FOLDER_STYLES
+        .read()
+        .ok()
+        .and_then(|g| folder_style_for(&g, cwd).cloned())
+        .unwrap_or_default()
+}
+
+/// mtime of the preference file at the last [`refresh_folder_styles`].
+static FOLDER_STYLES_MTIME: std::sync::Mutex<Option<std::time::SystemTime>> = std::sync::Mutex::new(None);
+
+/// Re-read `folder_styles` when preferences.json changed on disk.
+///
+/// Called from each edition's tick, so `style --folder` lands on a running
+/// desktop instead of waiting for a restart — which, with a few dozen tabs
+/// open, is not a thing anyone wants to do to try a colour. Only the mtime is
+/// stat'd on the common path; the file is parsed solely when it moved.
+pub fn refresh_folder_styles() {
+    let Ok(mtime) = std::fs::metadata(editable_preferences_path()).and_then(|m| m.modified()) else {
+        return;
+    };
+    let mut last = FOLDER_STYLES_MTIME
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if *last == Some(mtime) {
+        return;
+    }
+    *last = Some(mtime);
+    // Released before the parse + the styles write lock — nothing else needs
+    // to wait on the stamp while we read the file.
+    drop(last);
+    set_folder_styles(load_preferences(&platform::config_dir()).folder_styles);
 }
 
 /// User-defined `key=value` pairs from the `clear_env_vars` preference,
@@ -297,15 +419,27 @@ pub fn tab_env_extras(
     m.insert("TAB_ATELIER_API_TOKEN".into(), api_token.to_string());
     // Relay mode: point every claude tab at the local relay listener. `api_url`
     // is the local API base (`http://127.0.0.1:<port>`); the relay route lives
-    // under `/relay/anthropic`. The local API token doubles as the stand-in
-    // `ANTHROPIC_API_KEY` so Claude Code starts in API-key mode and
-    // authenticates to the loopback relay (other local procs can't abuse it).
+    // under `/relay/anthropic`.
+    //
+    // The stand-in `ANTHROPIC_API_KEY` is the RELAY token, not the master one.
+    // An API key is a value tools copy around — into debug output, crash
+    // reports, shared transcripts — and the master token administers every tab
+    // in the instance. The relay token only authenticates to the relay route.
     if relay_mode() {
-        m.insert(
-            "ANTHROPIC_BASE_URL".into(),
-            format!("{}/relay/anthropic", api_url.trim_end_matches('/')),
-        );
-        m.insert("ANTHROPIC_API_KEY".into(), api_token.to_string());
+        let relay_base = format!("{}/relay/anthropic", api_url.trim_end_matches('/'));
+        m.insert("ANTHROPIC_BASE_URL".into(), relay_base.clone());
+        m.insert("ANTHROPIC_API_KEY".into(), relay_token());
+        // The same endpoint for catbus-agent, which reads its own variables
+        // rather than Anthropic's. It resolves `CATBUS_RELAY_URL`/`_TOKEN` first
+        // and, given both, never consults `preferences.json` — which is what
+        // matters here: a tab with its internet disabled has only loopback (the
+        // per-tab ruleset allows `oifname "lo"` for the local API), so the remote
+        // relay a user normally keeps in `preferences.json` is unreachable, and
+        // the agent would fail with a connect error that says nothing about the
+        // cause. Pointing it at the local relay is what lets a catbus agent work
+        // in a tab that cannot reach the internet.
+        m.insert("CATBUS_RELAY_URL".into(), relay_base);
+        m.insert("CATBUS_RELAY_TOKEN".into(), relay_token());
     }
     m
 }
@@ -342,6 +476,30 @@ pub fn apply_telemetry_disable_env<S: std::hash::BuildHasher>(env: &mut std::col
     }
 }
 
+/// Extra environment for a newly created tab.
+///
+/// `api_created` marks a tab the API asked for — an agent's tab from
+/// `dispatch --new` or `tab-atelier add`, rather than one the user opened.
+/// Those get the colour opt-out: an agent's output is read by another program
+/// (`peek`, `output`, a `--wait` poll, the next agent along), and ANSI escapes
+/// there are bytes nobody looks at cluttering a scrollback something else has
+/// to parse. The user's own tabs keep their colours.
+///
+/// `NO_COLOR` is the cross-tool convention (any non-empty value disables
+/// colour); `CLICOLOR=0` covers the BSD-style tools that predate it. Neither
+/// touches `TERM`, so the terminal itself still behaves — unlike the
+/// right-click "Disable colors", which sets `TERM=dumb` and would break an
+/// agent's TUI outright.
+#[must_use]
+pub fn new_tab_env(api_created: bool) -> std::collections::HashMap<String, String> {
+    let mut env = std::collections::HashMap::new();
+    if api_created {
+        env.insert("NO_COLOR".into(), "1".into());
+        env.insert("CLICOLOR".into(), "0".into());
+    }
+    env
+}
+
 /// Per-tab environment extras for the NORMAL (non-cleared) spawn path.
 ///
 /// The colour vars from the tab's own flag, plus the telemetry opt-out;
@@ -356,6 +514,19 @@ pub fn pty_env(colors_enabled: bool) -> std::collections::HashMap<String, String
         env.insert("COLORTERM".into(), "truecolor".into());
     } else {
         env.insert("TERM".into(), "dumb".into());
+        // The standard signal alongside the legacy one. `TERM=dumb` is a claim
+        // about what the terminal *can* do, and using it to mean "policy says no
+        // colour" is a lie that degrades every TUI in the tab — as the note on
+        // [`new_tab_env`] above already observes. `NO_COLOR`/`CLICOLOR` say the
+        // same thing without that cost, and they are what `new_tab_env` sends for
+        // API-created tabs, so all three paths now spell "no colour" the same way.
+        //
+        // `TERM=dumb` is kept rather than replaced, because tools that read
+        // nothing else still depend on it. Moving it to `xterm-256color` would
+        // change what every program in a colours-off tab sees — a separate
+        // decision, with its own trade-off, not taken here.
+        env.insert("NO_COLOR".into(), "1".into());
+        env.insert("CLICOLOR".into(), "0".into());
     }
     // Force the telemetry / feedback-survey opt-out onto every tab.
     apply_telemetry_disable_env(&mut env);
@@ -414,12 +585,16 @@ pub fn minimal_pty_env<S: std::hash::BuildHasher>(
     }
     env.entry("PATH".to_string())
         .or_insert_with(|| CLEAR_ENV_DEFAULT_PATH.to_string());
-    // 2. Colours: identical policy to the inheriting `pty_env` path.
+    // 2. Colours: identical policy to the inheriting `pty_env` path, standard
+    // signal included — see the note there for why `NO_COLOR`/`CLICOLOR` travel
+    // alongside `TERM=dumb`.
     if colors_enabled {
         env.insert("TERM".to_string(), "xterm-256color".to_string());
         env.insert("COLORTERM".to_string(), "truecolor".to_string());
     } else {
         env.insert("TERM".to_string(), "dumb".to_string());
+        env.insert("NO_COLOR".to_string(), "1".to_string());
+        env.insert("CLICOLOR".to_string(), "0".to_string());
     }
     // 3. Telemetry opt-out (tab-atelier privacy default).
     apply_telemetry_disable_env(&mut env);
@@ -519,10 +694,120 @@ pub fn no_internet_command(prog: &str, args: &[String]) -> (String, Vec<String>)
     (BWRAP_BIN.to_string(), out)
 }
 
+/// What a jailed command may see, and where it may write.
+///
+/// Built to express, for one command, what the headless unit expresses for the
+/// whole daemon: an emptied root, the system paths read-only, and a chosen set of
+/// writable trees. See [`jailed_command`] for why that shape and not another.
+#[derive(Debug, Default, Clone)]
+pub struct Jail {
+    /// The only tree the command may modify. Bound read-write.
+    pub worktree: String,
+    /// Paths that must also stay writable, because the command cannot work without
+    /// them: a transcript directory, a state directory, the socket's directory.
+    pub writable: Vec<String>,
+    /// Extra read-only grants, for a tree the command should read and not change.
+    pub readable: Vec<String>,
+}
+
+/// Wrap a command so that only the jailed paths are visible, and only the chosen
+/// ones are writable.
+///
+/// This is the per-command form of the sandbox `tab-atelier-headless.service`
+/// builds for its whole daemon. The unit does it with systemd — `TemporaryFileSystem=/`
+/// to empty the root, `BindReadOnlyPaths=` for the system trees, `BindPaths=` for the
+/// writable ones — because it has to: the service runs with `RestrictNamespaces=true`
+/// and `SystemCallFilter=~@mount`, so **bubblewrap cannot run inside it at all**. Its
+/// `/run` is emptied too and `/run/dbus` is not bound back, so it cannot ask systemd
+/// to make a namespace on its behalf either. The jail has to be made from outside, at
+/// unit level, and it therefore covers the daemon rather than a worktree.
+///
+/// Outside a unit — a desktop user's tab — bubblewrap does work, which is what makes
+/// a *per-worktree* jail possible there. That is what this builds.
+///
+/// The order of the arguments matters and is the whole trick, the same way it is in
+/// the unit: the root is emptied first, then paths are bound back into it. So:
+///
+/// 1. `--tmpfs /` — an empty root. Nothing of the host is visible by default.
+/// 2. `--ro-bind` the system trees a process needs to start: binaries, libraries,
+///    `/etc` for the passwd db, `resolv.conf` and the SSL trust store.
+/// 3. Its own `/tmp`, `/proc` and `/dev`.
+/// 4. **Last**, the worktree and anything else the caller named — so that a
+///    writable grant is never hidden by a mount made after it. This is not
+///    hypothetical: a worktree under `/tmp` (which is where the test suites and the
+///    scenario harness put theirs) was un-writable because `--tmpfs /tmp` ran after
+///    the bind, and a `--tmpfs` on a parent hides everything under it. Found by
+///    running the thing rather than by reading it.
+///
+/// Networking is deliberately **not** part of this. The headless service has no
+/// `--unshare-net`; its per-tab network policy is nftables keyed on the tab's cgroup,
+/// and the same separation is right here — `no_internet_command` composes with this
+/// for the case where a caller wants both. Loopback survives either way, so a tab
+/// with no internet can still reach the app's own relay.
+///
+/// The property that matters most is what is *absent*: no host `$HOME`, no `/srv`, no
+/// `/var`. A file the command was never granted is not restricted — it is not in the
+/// namespace at all, which is a stronger statement than a permission bit, and it is
+/// why confinement composes better than relocating a secret.
+#[must_use]
+pub fn jailed_command(jail: &Jail, prog: &str, args: &[String]) -> (String, Vec<String>) {
+    /// System trees a process needs in order to start at all. `-try` on the ones
+    /// that are absent on some systems (a merged-`/usr` host has no `/lib64`),
+    /// because a missing optional path must not make the jail unusable.
+    const SYSTEM_RO: &[&str] = &["/usr", "/lib", "/lib64", "/bin", "/sbin", "/etc", "/opt"];
+
+    let mut out: Vec<String> = vec!["--tmpfs".to_string(), "/".to_string()];
+    for path in SYSTEM_RO {
+        // The `-try` variant takes the same SRC DEST pair and only differs in
+        // tolerating a missing source.
+        out.push("--ro-bind-try".to_string());
+        out.push((*path).to_string());
+        out.push((*path).to_string());
+    }
+    // The private mounts come before the caller's grants, because a tmpfs on a
+    // parent hides every bind made under it earlier.
+    out.extend(
+        ["--tmpfs", "/tmp", "--proc", "/proc", "--dev", "/dev"]
+            .iter()
+            .map(|s| (*s).to_string()),
+    );
+    if !jail.worktree.is_empty() {
+        out.push("--bind".to_string());
+        out.push(jail.worktree.clone());
+        out.push(jail.worktree.clone());
+    }
+    // Everything the caller named is bound read-only first, then the writable ones
+    // are bound again over the top. bwrap applies binds in order, so the later one
+    // wins — which is what lets a worktree live inside a tree that is otherwise
+    // read-only, and what makes `writable` authoritative if a path is in both.
+    for path in jail.readable.iter().chain(jail.writable.iter()) {
+        out.push("--ro-bind-try".to_string());
+        out.push(path.clone());
+        out.push(path.clone());
+    }
+    for path in &jail.writable {
+        out.push("--bind".to_string());
+        out.push(path.clone());
+        out.push(path.clone());
+    }
+    out.extend(
+        [
+            // The sandbox must not outlive the app that made it, and it must not be
+            // the thing that outlives its own parent.
+            "--die-with-parent",
+            "--",
+            prog,
+        ]
+        .iter()
+        .map(|s| (*s).to_string()),
+    );
+    out.extend(args.iter().cloned());
+    (BWRAP_BIN.to_string(), out)
+}
+
 /// `setpriv` (util-linux) executable name — used to strip Linux
 /// capabilities from a tab's shell subtree.
 const SETPRIV_BIN: &str = "setpriv";
-
 /// True when `setpriv` is on `PATH` (util-linux; essentially always on
 /// Debian). Probed without executing.
 #[must_use]
@@ -680,6 +965,54 @@ pub fn fresh_claude_launch_suffix() -> Vec<String> {
     ]
 }
 
+/// Our own CLI binary name — the two editions ship different ones (the debs
+/// conflict, so each carries only its own on PATH).
+#[must_use]
+pub const fn cli_binary_name() -> &'static str {
+    #[cfg(feature = "gui")]
+    {
+        "tab-atelier"
+    }
+    #[cfg(not(feature = "gui"))]
+    {
+        "tab-atelier-headless"
+    }
+}
+
+/// Is `kind` a **session-less daemon** tab rather than a resumable agent?
+///
+/// That's one of our own CLI subcommands run as a tab — `⛑ brain`, and
+/// whatever watcher a harness registers with `set-status --kind <verb>`.
+///
+/// Charset-gated to a plain lowercase verb so [`build_agent_resume_command`]
+/// can only ever reconstruct OUR binary running one of its own subcommands —
+/// no spaces, no shell metacharacters, and an unknown verb simply exits 2.
+#[must_use]
+pub fn is_daemon_kind(kind: &str) -> bool {
+    // Kinds handled by an EXTERNAL agent CLI must be listed here, or they fall
+    // through to "daemon" — i.e. they would be relaunched as one of our own
+    // subcommands (`tab-atelier codex`), which does not exist. Adding an agent
+    // therefore means two edits: here and in `build_agent_resume_command`.
+    !matches!(kind, "catbus" | "claude" | "codex")
+        && (2..=24).contains(&kind.len())
+        && kind.starts_with(|c: char| c.is_ascii_lowercase())
+        && kind.chars().all(|c| c.is_ascii_lowercase() || c == '-')
+}
+
+/// The restore command for a **session-less daemon tab**: our own binary
+/// running the subcommand named by `kind`.
+///
+/// Only ever called for a tab that declared itself one (`set-status --kind
+/// <verb> --daemon`, persisted as [`TabState::agent_daemon`]) — an
+/// unrecognised `agent_kind` on its own still restores to a plain shell.
+/// The charset gate means the reconstructed command is always OUR binary plus
+/// one subcommand: no spaces, no shell metacharacters, and an unknown verb
+/// simply exits 2.
+#[must_use]
+pub fn daemon_relaunch_command(kind: &str) -> Option<String> {
+    is_daemon_kind(kind).then(|| format!("{} {kind}", cli_binary_name()))
+}
+
 /// Translate a persisted (`agent_kind`, `session_id`, `plan_mode`) into
 /// the shell command to type for auto-resume. Returns None when the
 /// `agent_kind` isn't one we know how to drive.
@@ -691,22 +1024,50 @@ pub fn build_agent_resume_command(kind: &str, session_id: &str, plan: Option<boo
             Some(format!("catbus-agent --resume {session_id}{flag}"))
         }
         "claude" => Some(format!("claude --resume {session_id}")),
+        // Codex resumes through a SUBCOMMAND, not a flag: `codex resume <UUID>`.
+        // The UUID is the one in the rollout filename
+        // (`~/.codex/sessions/<y>/<m>/<d>/rollout-<ts>-<UUID>.jsonl`), also
+        // repeated in its `session_meta` header. Unlike Claude there is no hook
+        // to hand it over, so `scripts/codex-agent.sh` works it out from the
+        // working directory and stamps it over `set-status`.
+        "codex" => Some(format!("codex resume {session_id}")),
         // The ⛑ brain watchdog has no session to resume — it's a standalone
-        // tool that re-attaches to every OTHER tab over the local API. On
-        // restart we just relaunch it. `session_id` is unused. The binary
-        // differs by edition (the two debs conflict, so each ships only its
-        // own name on PATH).
-        "brain" => {
-            #[cfg(feature = "gui")]
-            {
-                Some("tab-atelier brain".to_string())
-            }
-            #[cfg(not(feature = "gui"))]
-            {
-                Some("tab-atelier-headless brain".to_string())
-            }
-        }
+        // tool that re-attaches to every OTHER tab over the local API, so
+        // restore just relaunches it. `session_id` is unused. Brain predates
+        // the `agent_daemon` flag, hence the name here; any other daemon goes
+        // through [`daemon_relaunch_command`].
+        "brain" => daemon_relaunch_command("brain"),
         _ => None,
+    }
+}
+
+/// How a (re)spawn brings an agent tab back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentRelaunch {
+    /// Cleared-env mode can drive the shell command line, so the tab's process
+    /// IS the agent (`… -i -c 'exec claude --resume <id>'`).
+    Exec,
+    /// Otherwise the shell is forked normally and the resume command is typed
+    /// in once it prompts (`pending_agent_resume`).
+    Typed,
+    /// Not an agent tab, or read-only: leave the plain shell alone.
+    None,
+}
+
+/// Decide how a respawn relaunches an agent tab.
+///
+/// Exactly one of exec/typed, never both (that double-launches the session) and
+/// never neither — "neither" is what silently turned a colours or net toggle on
+/// a claude tab into a bare shell. Read-only never resumes: `claude --resume`
+/// against a live session rotates the user's session ids.
+#[must_use]
+pub const fn agent_relaunch_mode(has_session: bool, cleared_env: bool, read_only: bool) -> AgentRelaunch {
+    if !has_session || read_only {
+        AgentRelaunch::None
+    } else if cleared_env {
+        AgentRelaunch::Exec
+    } else {
+        AgentRelaunch::Typed
     }
 }
 
@@ -873,11 +1234,14 @@ pub fn init_gui_file_logging() {
     let Ok(file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) else {
         return;
     };
-    let _ = env_logger::Builder::new()
+    let mut builder = env_logger::Builder::new();
+    builder
         .parse_filters(&filter)
         .format_timestamp_millis()
-        .target(env_logger::Target::Pipe(Box::new(file)))
-        .try_init();
+        .target(env_logger::Target::Pipe(Box::new(file)));
+    let logger = builder.build();
+    let level = logger.filter();
+    log_ring::install(logger, level);
 }
 
 /// The effective GUI log filter: `TAB_ATELIER_LOG` env, then `RUST_LOG`
@@ -967,6 +1331,26 @@ pub fn try_acquire_single_instance_lock() -> bool {
     true
 }
 
+const fn default_cooldown_days() -> u32 {
+    30
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's skip_serializing_if passes by reference"
+)]
+const fn is_default_cooldown(v: &u32) -> bool {
+    *v == 30
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's skip_serializing_if passes by reference"
+)]
+const fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct TabState {
     /// Stable per-tab UUID. Used by the local API
@@ -979,6 +1363,12 @@ pub struct TabState {
     pub id: String,
     pub name: String,
     pub cwd: Option<String>,
+    /// Unix-millis of the last time this tab was genuinely used — desktop
+    /// focus, or an explicit web-viewer focus event. Drives the MRU (Ctrl+P /
+    /// mobile) ordering; persisted so the ordering survives a restart. Old
+    /// tabs.json files without it load as `None` and re-seed on first focus.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_used_at: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1006,7 +1396,8 @@ pub struct TabState {
     pub agent_session_id: Option<String>,
     /// Durable — which agent CLI owns the persisted `agent_session_id`.
     /// Known values: "catbus" (catbus-agent), "claude" (official
-    /// Claude Code CLI). Free-form string for future agents.
+    /// Claude Code CLI), "codex" (the `codex` CLI, resumed via
+    /// `codex resume <uuid>`). Free-form string for future agents.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_kind: Option<String>,
     /// Durable — whether the agent was in plan / read-only mode at
@@ -1014,11 +1405,30 @@ pub struct TabState {
     /// brings the tab back into the same mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_plan_mode: Option<bool>,
+    /// Durable — this tab IS a session-less daemon (`set-status --kind <verb>
+    /// --daemon`): one of our own subcommands run as a tab, like `⛑ brain`.
+    /// Restore relaunches it via [`daemon_relaunch_command`] instead of
+    /// dropping to a shell. Set by the daemon itself at startup, so an
+    /// unrecognised `agent_kind` alone never becomes a command line.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub agent_daemon: bool,
     /// Per-tab env vars injected into this tab's PTY (`env set --tab <id>`),
     /// layered ON TOP of the global `tab_env` (per-tab wins). Applied on the
     /// next spawn/respawn of the tab.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub tab_env: std::collections::BTreeMap<String, String>,
+
+    /// Free-form durable labels set from inside the tab
+    /// (`tab-atelier set-meta <key> <value>`) and surfaced on `/tabs`.
+    ///
+    /// Unlike [`Self::tab_env`] it never reaches the PTY and is never masked:
+    /// it's labelling, not configuration — a role, a project phase, a
+    /// harness's own bookkeeping. We assign no meaning to any key; that's the
+    /// point, so an orchestration layer can carry its vocabulary without us
+    /// growing a field per idea. Bounded by [`META_MAX_KEYS`] /
+    /// [`META_KEY_MAX`] / [`META_VALUE_MAX`].
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub meta: std::collections::BTreeMap<String, String>,
 
     /// Fixed grid size the tab is PINNED to (`tab-atelier resize <tab> --cols N
     /// --rows M`), overriding window-driven sizing so a web viewer isn't
@@ -1076,6 +1486,10 @@ pub struct TabState {
     /// <hex>` (CLI). Skipped from JSON when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bg_color: Option<String>,
+    /// Per-tab badge override — a short tag drawn on the tab. `None` ⇒ the
+    /// tab shows its folder rule's badge, if any. See [`effective_tab_badge`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub badge: Option<String>,
 
     /// Off-hours auto-lock. When set, the schedule's `(rule, tz)`
     /// pair feeds [`crate::schedule::effective_locked`] alongside the
@@ -1096,6 +1510,28 @@ pub struct TabState {
     /// delegated cgroup. Skipped from JSON when fully unset.
     #[serde(default, skip_serializing_if = "TabResourceLimits::is_empty")]
     pub limits: TabResourceLimits,
+
+    /// Per-tab ssh-agent. `Some(_)` = the daemon owns a dedicated
+    /// `ssh-agent` for this tab and injects its `SSH_AUTH_SOCK` at spawn;
+    /// `None` = the tab inherits the ambient environment (today's
+    /// behaviour). Toggled via `tab-atelier-headless ssh-agent <tab>` /
+    /// `POST /tabs/by-id/{uuid}/ssh-agent`; applied on (re)spawn. Persisted
+    /// so the agent is re-provisioned on boot. Skipped from JSON when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_agent: Option<SshAgentConfig>,
+}
+
+/// Per-tab ssh-agent configuration (see [`TabState::ssh_agent`]).
+///
+/// Presence enables a dedicated agent; [`Self::key`] optionally names a
+/// passphrase-less private key the daemon auto-loads at spawn. Encrypted
+/// keys are the user's job to `ssh-add` inside the tab.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SshAgentConfig {
+    /// Passphrase-less private key to `ssh-add` at spawn. `None` = start an
+    /// empty agent and let the user load keys themselves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
 }
 
 /// Optional resource ceilings for a tab's process tree.
@@ -1245,16 +1681,355 @@ pub fn system_total_ram_bytes() -> Option<u64> {
 /// black; legible foreground contrast on most monitors.
 pub const DEFAULT_TAB_BG_COLOR: &str = "#002451";
 
-/// Resolve the effective background color for a tab: per-tab override
-/// → global pref → Tomorrow Night Blue.
+/// Cap on how many [`TabState::meta`] keys one tab can carry. Small on
+/// purpose: this is labelling, not storage — anything bigger belongs in a
+/// file the agent owns.
+pub const META_MAX_KEYS: usize = 16;
+/// Cap on a meta key's length.
+pub const META_KEY_MAX: usize = 32;
+/// Cap on a meta value's length, in chars.
+pub const META_VALUE_MAX: usize = 256;
+
+/// Validate one `set-meta` pair, returning the normalised `(key, value)`.
+///
+/// Keys are lower-cased and restricted to `[a-z0-9_-]` so they stay usable as
+/// JSON object keys and as header/CSS-safe identifiers downstream; values are
+/// trimmed of control characters (they'd corrupt a header line or a log) and
+/// length-capped. An empty value is rejected — a key is deleted by sending a
+/// null value on the wire, not by blanking it.
+///
+/// # Errors
+/// A human-readable message naming the rule that failed.
+pub fn sanitize_meta(key: &str, value: &str) -> Result<(String, String), String> {
+    let key = key.trim().to_ascii_lowercase();
+    if key.is_empty() || key.len() > META_KEY_MAX {
+        return Err(format!("meta key must be 1..={META_KEY_MAX} chars"));
+    }
+    if !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        return Err("meta key allows only [a-z0-9_-]".to_string());
+    }
+    let value: String = value.trim().chars().filter(|c| !c.is_control()).collect();
+    if value.is_empty() {
+        return Err("meta value is empty — pass --clear to remove the key".to_string());
+    }
+    if value.chars().count() > META_VALUE_MAX {
+        return Err(format!("meta value must be at most {META_VALUE_MAX} chars"));
+    }
+    Ok((key, value))
+}
+
+/// Apply one validated meta change: `Some(v)` sets, `None` removes.
+///
+/// Refuses to grow past [`META_MAX_KEYS`] (updating an existing key always
+/// works), so the persisted map stays bounded whatever the API allowed.
+pub fn apply_meta_change(map: &mut std::collections::BTreeMap<String, String>, key: &str, value: Option<String>) {
+    match value {
+        Some(v) if map.len() < META_MAX_KEYS || map.contains_key(key) => {
+            map.insert(key.to_string(), v);
+        }
+        Some(_) => {}
+        None => {
+            map.remove(key);
+        }
+    }
+}
+
+/// Visual identity attached to a project directory.
+///
+/// Every tab whose cwd is inside it picks these up. Because a new tab inherits
+/// the active tab's cwd, this is also what makes a project's colour survive
+/// Ctrl+Shift+T — no settings are copied from tab to tab, they're re-derived
+/// from the folder.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FolderStyle {
+    /// `#RRGGBB` background for tabs in this folder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+    /// Short label shown on the tab (a project tag, an emoji).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub badge: Option<String>,
+}
+
+/// Cap on a badge's length, in chars — it shares the tab strip with the name.
+pub const BADGE_MAX: usize = 6;
+
+/// Validate a badge: trimmed, control characters stripped, length-capped.
+///
+/// # Errors
+/// A human-readable message when it's empty or too long.
+pub fn sanitize_badge(badge: &str) -> Result<String, String> {
+    let badge: String = badge.trim().chars().filter(|c| !c.is_control()).collect();
+    if badge.is_empty() {
+        return Err("badge is empty — pass `clear` to remove it".to_string());
+    }
+    if badge.chars().count() > BADGE_MAX {
+        return Err(format!("badge must be at most {BADGE_MAX} chars"));
+    }
+    Ok(badge)
+}
+
+/// The folder rule that applies to `cwd`: the longest configured path that is
+/// `cwd` itself or one of its ancestors. `None` when no rule matches.
+///
+/// Longest-match so a rule on a sub-project (`~/Dev/app/frontend`) refines the
+/// one on its parent (`~/Dev/app`) instead of fighting it.
 #[must_use]
-pub fn effective_tab_bg<'a>(per_tab: Option<&'a str>, global: Option<&'a str>) -> &'a str {
-    per_tab.or(global).unwrap_or(DEFAULT_TAB_BG_COLOR)
+pub fn folder_style_for<'a>(
+    styles: &'a std::collections::BTreeMap<String, FolderStyle>,
+    cwd: Option<&str>,
+) -> Option<&'a FolderStyle> {
+    let cwd = cwd?.trim_end_matches('/');
+    styles
+        .iter()
+        .filter(|(dir, _)| {
+            let dir = dir.trim_end_matches('/');
+            cwd == dir || (!dir.is_empty() && cwd.starts_with(dir) && cwd.as_bytes().get(dir.len()) == Some(&b'/'))
+        })
+        .max_by_key(|(dir, _)| dir.trim_end_matches('/').len())
+        .map(|(_, style)| style)
+}
+
+/// Shown in a stats row whose value the sampler hasn't produced yet.
+pub const STAT_PENDING: &str = "—";
+
+/// A stats row's value, or [`STAT_PENDING`] while it is unknown.
+///
+/// Rows in the right-click menu must exist from the moment it opens, even
+/// empty. The power sampler fills in a second or two later, and a row that
+/// appears then re-lays out an ALREADY-OPEN menu — which, because the menu can
+/// open upward, slides every item under the cursor: a click aimed at "Copy"
+/// lands on "Copy all".
+#[must_use]
+pub fn stat_value(value: Option<String>) -> String {
+    value
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| STAT_PENDING.to_string())
+}
+
+/// Build the right-click menu's stats rows: one per entry, always.
+///
+/// A row whose value isn't known yet shows [`STAT_PENDING`] rather than being
+/// omitted. The count must depend only on the build's features — never on the
+/// data — because the menu is rebuilt every frame while it is open (that's how
+/// the numbers stay live), and it can open upward: a row appearing when the
+/// sampler answers slides every item above it under a stationary cursor, so a
+/// click meant for one entry lands on the next.
+#[must_use]
+pub fn stats_rows(entries: &[(&str, Option<String>)]) -> Vec<String> {
+    entries
+        .iter()
+        .map(|(label, value)| format!("{label}: {}", stat_value(value.clone())))
+        .collect()
+}
+
+/// An overlay layer that swallows window input while it is up.
+///
+/// Every one of these blocks both the Ctrl+P switcher and the right-click
+/// context menu (see `AppState::render`'s menu gate), so a layer left open by
+/// accident reads as "the mouse and the keyboard stopped working".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Overlay {
+    ContextMenu,
+    TabSwitcher,
+    Renaming,
+    HotkeyPicker,
+    Qr,
+    CloseConfirm,
+    ExitConfirm,
+    Preferences,
+}
+
+/// Which overlay layers are currently up.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OverlayState {
+    pub context_menu: bool,
+    pub tab_switcher: bool,
+    pub renaming: bool,
+    pub hotkey_picker: bool,
+    pub qr: bool,
+    pub close_confirm: bool,
+    pub exit_confirm: bool,
+    pub preferences: bool,
+}
+
+/// The layer a root-level Escape should dismiss, or `None` when nothing is up
+/// (Escape then belongs to the tab, where vim and friends want it).
+///
+/// Ordered outermost-visually-first — the transient menu before the modal
+/// behind it — so one press closes exactly one layer and a user digging out of
+/// a stuck state gets there predictably.
+#[must_use]
+pub const fn escape_dismisses(s: OverlayState) -> Option<Overlay> {
+    if s.context_menu {
+        Some(Overlay::ContextMenu)
+    } else if s.tab_switcher {
+        Some(Overlay::TabSwitcher)
+    } else if s.renaming {
+        Some(Overlay::Renaming)
+    } else if s.hotkey_picker {
+        Some(Overlay::HotkeyPicker)
+    } else if s.qr {
+        Some(Overlay::Qr)
+    } else if s.close_confirm {
+        Some(Overlay::CloseConfirm)
+    } else if s.exit_confirm {
+        Some(Overlay::ExitConfirm)
+    } else if s.preferences {
+        Some(Overlay::Preferences)
+    } else {
+        None
+    }
+}
+
+/// A keyboard chord the WINDOW handles, rather than the tab's PTY.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppChord {
+    /// Ctrl+P — the MRU tab switcher.
+    TabSwitcher,
+    /// Ctrl+Shift+T — new tab after the current one.
+    NewTab,
+    /// Ctrl+Shift+C — copy the selection.
+    Copy,
+    /// Ctrl+Shift+V — paste.
+    Paste,
+    /// Alt+Tab — next tab.
+    NextTab,
+}
+
+/// Match a keystroke to an app chord, or `None` to let the PTY have it.
+///
+/// Both sides of the dispatch consult this: the terminal view swallows (or
+/// acts on) a keystroke that maps to a chord, so the shell never sees `^P`,
+/// and the root handler acts once the event bubbles. Two hand-written
+/// conditions could drift apart — and a chord the terminal swallowed but the
+/// root ignored is a key that silently does nothing.
+///
+/// The key name is matched **case-insensitively**: with `CapsLock` on, or on a
+/// layout that reports the shifted keysym, the same physical chord arrives as
+/// `"P"`, and an exact `"p"` comparison drops it on the floor.
+#[must_use]
+pub fn app_chord(key: &str, ctrl: bool, shift: bool, alt: bool) -> Option<AppChord> {
+    let is = |name: &str| key.eq_ignore_ascii_case(name);
+    match (ctrl, shift, alt) {
+        (true, false, false) if is("p") => Some(AppChord::TabSwitcher),
+        (true, true, false) if is("t") => Some(AppChord::NewTab),
+        (true, true, false) if is("c") => Some(AppChord::Copy),
+        (true, true, false) if is("v") => Some(AppChord::Paste),
+        (false, _, true) if is("tab") => Some(AppChord::NextTab),
+        _ => None,
+    }
+}
+
+/// Resolve the effective background color for a tab: per-tab override
+/// → folder rule → global pref → Tomorrow Night Blue.
+#[must_use]
+pub fn effective_tab_bg<'a>(per_tab: Option<&'a str>, folder: Option<&'a str>, global: Option<&'a str>) -> &'a str {
+    per_tab.or(folder).or(global).unwrap_or(DEFAULT_TAB_BG_COLOR)
+}
+
+/// Resolve the effective badge for a tab: per-tab override → folder rule.
+/// `None` ⇒ the tab shows no badge.
+#[must_use]
+pub fn effective_tab_badge<'a>(per_tab: Option<&'a str>, folder: Option<&'a str>) -> Option<&'a str> {
+    per_tab.or(folder)
+}
+
+/// The tab's *explicit* tint — per-tab override, else its folder rule.
+///
+/// Unlike [`effective_tab_bg`] this never falls back to a default: `None`
+/// means "never styled", which is what the desktop needs in order to leave the
+/// theme's background alone.
+#[must_use]
+pub fn effective_tab_tint<'a>(per_tab: Option<&'a str>, folder: Option<&'a str>) -> Option<&'a str> {
+    per_tab.or(folder)
+}
+
+/// Parse `#RRGGBB` into a packed `0xRRGGBB`. `None` for anything else — the
+/// same shape the API validator accepts, so a stored colour always renders.
+#[must_use]
+pub fn parse_hex_rgb(s: &str) -> Option<u32> {
+    let hex = s.strip_prefix('#')?;
+    if hex.len() != 6 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    u32::from_str_radix(hex, 16).ok()
 }
 
 #[must_use]
 pub fn default_tab_id() -> String {
     uuid::Uuid::new_v4().to_string()
+}
+
+/// Path of the relay token — the credential a relayed claude tab presents to
+/// `/relay/anthropic/*`, kept apart from the master `api.token`.
+#[must_use]
+pub fn relay_token_path() -> PathBuf {
+    state_dir(&platform::state_base_dir()).join("relay.token")
+}
+
+/// The relay token, minted on first use and persisted 0600.
+///
+/// Relay mode puts this in every claude tab's `ANTHROPIC_API_KEY`. That value
+/// leaks far more easily than a deliberate credential — an agent dumping its
+/// environment, a `--debug` transcript, a crash report — so it must not be the
+/// master token, which administers every tab. This one does exactly one thing:
+/// authenticate to this instance's Anthropic relay. It cannot list tabs, read
+/// output, inject input or rotate anything.
+///
+/// Cached per process; the file is the durable copy, so restarts keep the same
+/// value and a remote configured with it keeps working.
+#[must_use]
+pub fn relay_token() -> String {
+    static CACHED: OnceLock<String> = OnceLock::new();
+    CACHED.get_or_init(|| read_or_mint_token(&relay_token_path())).clone()
+}
+
+/// Path of the sidecar token — what a peer's `remote attach` / `put` / `get`
+/// authenticates with, kept apart from the master `api.token`.
+#[must_use]
+pub fn remote_token_path() -> PathBuf {
+    state_dir(&platform::state_base_dir()).join("remote.token")
+}
+
+/// The sidecar token, minted on first use and persisted 0600.
+///
+/// A peer driving tabs here needs to list them, mirror their output, type into
+/// them and move files — not to rotate this instance's credentials, read its
+/// logs, reconfigure its relay or dump its env. Handing out the master token
+/// for a sidecar link grants all of that to the other machine, permanently and
+/// invisibly; this one is scoped to the tab operations the sidecar actually
+/// performs (see the gate in `api::handle_connection`).
+///
+/// Same shape as [`relay_token`]: cached per process, file is the durable
+/// copy, delete it to rotate.
+#[must_use]
+pub fn remote_token() -> String {
+    static CACHED: OnceLock<String> = OnceLock::new();
+    CACHED.get_or_init(|| read_or_mint_token(&remote_token_path())).clone()
+}
+
+/// Read a persisted token file, or mint + persist one owner-only.
+fn read_or_mint_token(path: &std::path::Path) -> String {
+    if let Ok(existing) = std::fs::read_to_string(path) {
+        let existing = existing.trim().to_string();
+        if !existing.is_empty() {
+            return existing;
+        }
+    }
+    let minted = mint_share_token();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if std::fs::write(path, &minted).is_ok() {
+        // Owner-only, same as api.token — a world-readable token would hand
+        // every local user the capability it carries.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+    minted
 }
 
 /// 16 random bytes hex-encoded — used for per-tab share secrets.
@@ -1277,6 +2052,7 @@ impl Default for TabState {
             id: default_tab_id(),
             name: String::new(),
             cwd: None,
+            last_used_at: None,
             output: None,
             uptime_secs: None,
             energy_wh: None,
@@ -1286,7 +2062,9 @@ impl Default for TabState {
             agent_session_id: None,
             agent_kind: None,
             agent_plan_mode: None,
+            agent_daemon: false,
             tab_env: std::collections::BTreeMap::new(),
+            meta: std::collections::BTreeMap::new(),
             pinned_cols: None,
             pinned_rows: None,
             share_token_rw: String::new(),
@@ -1297,8 +2075,10 @@ impl Default for TabState {
             net_allow_domains: Vec::new(),
             net_allow_cidrs: Vec::new(),
             bg_color: None,
+            badge: None,
             schedule: None,
             limits: TabResourceLimits::default(),
+            ssh_agent: None,
         }
     }
 }
@@ -1371,6 +2151,22 @@ pub fn unix_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
+/// Whole seconds since the unix epoch, now.
+///
+/// The second half of the pair with [`unix_millis`]. A clock before 1970
+/// reads as 0 rather than panicking: nothing here is worth aborting a
+/// terminal emulator over, and a zero timestamp is visibly wrong wherever it
+/// surfaces.
+///
+/// Not to be confused with `agent_probe::secs_since_epoch`, which converts a
+/// `SystemTime` someone hands it — this one reads the clock.
+#[must_use]
+pub fn unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// How long after the last PTY output a tab's LED stays green ("working").
@@ -1993,6 +2789,29 @@ pub fn load_wakatime_key(config_base: &std::path::Path) -> Option<String> {
 
 #[derive(Serialize, Deserialize, Default)]
 pub struct Preferences {
+    /// Minutes between automatic fleet sweeps (announce from sources, then
+    /// gossip). `0` — the default — means never: an instance that was not
+    /// asked to manage itself must not start doing so after an upgrade.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub fleet_sweep_minutes: u32,
+    /// Commands whose stdout is `id<TAB>title` lines. Any generator of work.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fleet_sweep_sources: Vec<String>,
+    /// Optional LCOV report for the built-in coverage source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fleet_sweep_lcov: Option<String>,
+    /// Repository root stripped from that report's paths, so task ids are the
+    /// same in every checkout. The daemon runs from wherever it was started,
+    /// so this cannot be inferred from its cwd.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fleet_sweep_root: Option<String>,
+    /// Whether a sweep also gossips with the configured remotes.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fleet_sweep_gossip: bool,
+    /// Days a finished task stays off the board before a sweep may re-announce
+    /// it. Clamped to at least one day.
+    #[serde(default = "default_cooldown_days", skip_serializing_if = "is_default_cooldown")]
+    pub fleet_sweep_cooldown_days: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lang: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2087,6 +2906,11 @@ pub struct Preferences {
     /// on the eyes than pure black.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tab_bg_color: Option<String>,
+    /// Per-project visual identity: absolute path → colour/badge for every tab
+    /// whose cwd is inside it. Mirrored into [`crate::FOLDER_STYLES`] at
+    /// startup; a per-tab override still wins. See [`folder_style_for`].
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub folder_styles: std::collections::BTreeMap<String, FolderStyle>,
 
     /// Default network allowlist applied to **newly created** tabs
     /// (presets / domains / CIDRs). Empty ⇒ new tabs start unrestricted.
@@ -2205,7 +3029,15 @@ pub struct RemoteEndpoint {
     /// required).
     pub url: String,
     /// Bearer token. Mirrors the remote's `~/.local/state/tab-atelier/api.token`.
+    /// Full API access: the sidecar (`remote attach` / `put` / `get`) needs it
+    /// to list tabs, send input and move files.
     pub token: String,
+    /// Bearer token for the Anthropic relay hop only, mirroring the remote's
+    /// `relay.token`. Separate from [`Self::token`] because the relay route
+    /// refuses the master token by design — see [`relay_credential`]. Empty
+    /// when the endpoint isn't used for relaying.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub relay_token: String,
     /// Hex SHA-256 of the remote's TLS cert (TOFU-pinned).
     pub cert_sha256: String,
     /// When true, the GUI connects to this endpoint at startup
@@ -2344,6 +3176,12 @@ fn parse_https_host_port(url: &str) -> Result<(String, u16), String> {
         (authority.to_string(), "443")
     };
     let port = port.parse::<u16>().map_err(|e| format!("bad port {port:?}: {e}"))?;
+    // An empty host parses fine and then fails much later, inside the TLS
+    // handshake, as something unrelated-looking. This is used to pin a
+    // certificate to a machine; "no machine" is not an answer.
+    if host.is_empty() {
+        return Err(format!("no host in {url:?}"));
+    }
     Ok((host, port))
 }
 
@@ -2834,6 +3672,24 @@ pub fn keycode_label(keycode: u8) -> String {
         .map_or_else(|| format!("Key {keycode}"), |e| e.label.to_string())
 }
 
+/// The `preferences.json` a CLI verb should edit in place: the user's file,
+/// else the system one when only that exists.
+///
+/// Resolves the same way [`load_preferences`] reads, so an edit lands in the
+/// file the daemon will actually load. Note it is [`platform::config_dir`] —
+/// `config_base_dir()` is the *state* root (`~/.local`), and writing
+/// preferences there silently has no effect.
+#[must_use]
+pub fn editable_preferences_path() -> std::path::PathBuf {
+    let user = config_dir(&platform::config_dir()).join("preferences.json");
+    let system = std::path::PathBuf::from(SYSTEM_PREFERENCES_PATH);
+    if !user.exists() && system.exists() {
+        system
+    } else {
+        user
+    }
+}
+
 #[must_use]
 pub fn load_preferences(config_base: &std::path::Path) -> Preferences {
     let user_path = config_dir(config_base).join("preferences.json");
@@ -3229,6 +4085,228 @@ pub fn file_path_for_open(path: &str) -> &str {
 mod tests {
     use super::*;
 
+    /// Serialises the tests that touch the process-global relay state.
+    ///
+    /// `set_relay_egress` / `set_relay_target` are globals by design — every
+    /// tab's env is built from them — so two tests writing them at once would
+    /// read each other's values.
+    static RELAY_STATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A preferences file holding one endpoint, plus whatever relay state the
+    /// caller wants to start from.
+    fn relay_prefs(egress: bool, endpoint_id: Option<&str>) -> (tempfile::TempDir, Preferences) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let prefs = Preferences {
+            remote_endpoints: vec![RemoteEndpoint {
+                id: "ep-1111".to_owned(),
+                label: "proxy".to_owned(),
+                url: "https://proxy.example.org".to_owned(),
+                token: String::new(),
+                relay_token: "tap_secret".to_owned(),
+                ..RemoteEndpoint::default()
+            }],
+            relay_egress: egress,
+            relay_endpoint_id: endpoint_id.map(str::to_owned),
+            ..Preferences::default()
+        };
+        save_preferences(dir.path(), &prefs);
+        (dir, prefs)
+    }
+
+    #[test]
+    fn picking_a_relay_target_clears_the_egress_role_on_disk() {
+        let _guard = RELAY_STATE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // The state an old egress box is in when it follows docs/proxy.md and
+        // points itself at a proxy.
+        let (dir, _) = relay_prefs(true, None);
+
+        apply_relay_config(
+            &crate::api::RelayConfigChange {
+                endpoint: Some("proxy".to_owned()),
+                egress: None,
+            },
+            dir.path(),
+        );
+
+        let saved = load_preferences(dir.path());
+        assert_eq!(
+            saved.relay_endpoint_id.as_deref(),
+            Some("ep-1111"),
+            "the label must resolve to the stable id"
+        );
+        assert!(
+            !saved.relay_egress,
+            "egress must be cleared: holding both makes every relay call 502 \
+             regardless of how correct the endpoint is"
+        );
+        // And the runtime agrees with what was written.
+        assert!(!relay_egress());
+        assert_eq!(
+            relay_target().map(|t| t.url),
+            Some("https://proxy.example.org".to_owned())
+        );
+    }
+
+    #[test]
+    fn clearing_the_target_leaves_the_egress_role_alone() {
+        let _guard = RELAY_STATE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // The rule is "a target wins over egress", not "a target change
+        // clears egress" — `relay via ""` removes the target, so there is no
+        // conflict left to resolve and the flag is the operator's again.
+        let (dir, _) = relay_prefs(true, Some("ep-1111"));
+
+        apply_relay_config(
+            &crate::api::RelayConfigChange {
+                endpoint: Some(String::new()),
+                egress: None,
+            },
+            dir.path(),
+        );
+
+        let saved = load_preferences(dir.path());
+        assert_eq!(saved.relay_endpoint_id, None, "the target is gone");
+        assert!(saved.relay_egress, "with no target there is nothing to conflict with");
+    }
+
+    #[test]
+    fn asking_for_egress_while_a_target_is_set_still_resolves_to_the_target() {
+        let _guard = RELAY_STATE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // `relay egress on` on a box that already relays through a proxy.
+        // Writing the flag is honoured on disk only if it can mean anything;
+        // here it cannot, so the install resolves it away rather than leaving
+        // a config that answers 502 to everything.
+        let (dir, _) = relay_prefs(false, Some("ep-1111"));
+
+        apply_relay_config(
+            &crate::api::RelayConfigChange {
+                endpoint: None,
+                egress: Some(true),
+            },
+            dir.path(),
+        );
+
+        assert!(
+            !relay_egress(),
+            "a resolvable target means this host forwards, whatever the flag says"
+        );
+        assert!(relay_target().is_some());
+    }
+
+    #[test]
+    fn the_startup_repair_is_written_back_not_just_applied_in_memory() {
+        let _guard = RELAY_STATE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // The bug this exists for: `relay status` reported egress:false while
+        // preferences.json still said true, because the repair only ever
+        // happened in memory. Anything that read the file afterwards — an
+        // older binary, another tool — found the contradiction still there and
+        // reported an "egress hop" failure nobody could locate.
+        let (dir, _) = relay_prefs(true, Some("ep-1111"));
+        assert!(
+            load_preferences(dir.path()).relay_egress,
+            "the fixture must start in the broken state"
+        );
+
+        let mut prefs = load_preferences(dir.path());
+        assert!(normalise_relay_config(&mut prefs), "it had something to repair");
+        save_preferences(dir.path(), &prefs);
+
+        assert!(
+            !load_preferences(dir.path()).relay_egress,
+            "the correction must survive being read back"
+        );
+        // And it is idempotent: a second pass has nothing to do, so startup
+        // does not rewrite preferences.json on every launch.
+        let mut again = load_preferences(dir.path());
+        assert!(!normalise_relay_config(&mut again), "nothing left to repair");
+    }
+
+    #[test]
+    fn normalise_leaves_a_config_that_is_not_contradictory_alone() {
+        let _guard = RELAY_STATE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Egress with no target is a legitimate role, not a mistake.
+        let mut egress_only = Preferences {
+            relay_egress: true,
+            ..Preferences::default()
+        };
+        assert!(!normalise_relay_config(&mut egress_only));
+        assert!(egress_only.relay_egress, "egress alone must survive");
+
+        // An endpoint id that resolves to nothing is not a target either.
+        let mut dangling = Preferences {
+            relay_egress: true,
+            relay_endpoint_id: Some("no-such-endpoint".to_owned()),
+            ..Preferences::default()
+        };
+        assert!(!normalise_relay_config(&mut dangling));
+        assert!(dangling.relay_egress, "a target that does not resolve cannot win");
+    }
+
+    #[test]
+    fn a_preferences_file_holding_both_repairs_itself_at_startup() {
+        let _guard = RELAY_STATE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Written before the rule existed: nothing will call
+        // `apply_relay_config` on this box until someone runs a command, and
+        // until then every relay call 502s. Reading it back faithfully would
+        // mean staying broken for a reason nobody can see.
+        let prefs = Preferences {
+            remote_endpoints: vec![RemoteEndpoint {
+                id: "ep-1111".to_owned(),
+                label: "proxy".to_owned(),
+                url: "https://proxy.example.org/".to_owned(),
+                relay_token: "tap_secret".to_owned(),
+                ..RemoteEndpoint::default()
+            }],
+            relay_egress: true,
+            relay_endpoint_id: Some("ep-1111".to_owned()),
+            ..Preferences::default()
+        };
+
+        install_relay_config(&prefs);
+
+        assert!(!relay_egress(), "target wins");
+        let target = relay_target().expect("a target was configured");
+        assert_eq!(target.url, "https://proxy.example.org", "the trailing slash is trimmed");
+        assert_eq!(target.token, "tap_secret", "the RELAY credential, not the sidecar one");
+    }
+
+    #[test]
+    fn the_egress_role_survives_when_there_is_no_target_to_prefer() {
+        let _guard = RELAY_STATE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // The mutual exclusion must not become "egress never works". With no
+        // endpoint id, and with one that resolves to nothing, the flag is the
+        // only statement of intent there is.
+        for endpoint_id in [None, Some("no-such-endpoint")] {
+            let prefs = Preferences {
+                relay_egress: true,
+                relay_endpoint_id: endpoint_id.map(str::to_owned),
+                ..Preferences::default()
+            };
+            install_relay_config(&prefs);
+            assert!(
+                relay_egress(),
+                "egress must hold when {endpoint_id:?} resolves to no target"
+            );
+            assert!(relay_target().is_none());
+        }
+        // Leave the global as the rest of the suite expects to find it.
+        set_relay_egress(false);
+        set_relay_target(None);
+    }
+
     #[test]
     fn version_line_carries_name_version_and_nonempty_build_hash() {
         let v = version_line("tab-atelier");
@@ -3314,6 +4392,450 @@ mod tests {
     }
 
     #[test]
+    fn a_respawned_agent_tab_is_always_relaunched_exactly_one_way() {
+        use AgentRelaunch::{Exec, None as NoRelaunch, Typed};
+        // The bug this encodes: a colours / net toggle re-forked the shell and
+        // did NEITHER, so an agent tab came back as a bare shell.
+        assert_eq!(agent_relaunch_mode(true, true, false), Exec);
+        assert_eq!(agent_relaunch_mode(true, false, false), Typed);
+        // Doing both would double-launch the session, so the two are exclusive
+        // by construction — one enum, not two independent flags.
+        assert_ne!(
+            agent_relaunch_mode(true, true, false),
+            agent_relaunch_mode(true, false, false)
+        );
+        // A plain shell tab stays a plain shell.
+        assert_eq!(agent_relaunch_mode(false, true, false), NoRelaunch);
+        assert_eq!(agent_relaunch_mode(false, false, false), NoRelaunch);
+        // Read-only never resumes, whatever the env mode.
+        assert_eq!(agent_relaunch_mode(true, true, true), NoRelaunch);
+        assert_eq!(agent_relaunch_mode(true, false, true), NoRelaunch);
+    }
+
+    #[test]
+    fn a_flagged_daemon_relaunches_as_our_own_subcommand() {
+        // A harness registers its watcher with `set-status --kind <verb>
+        // --daemon`; restore relaunches it the way it relaunches brain, with
+        // no match arm per creature.
+        assert_eq!(
+            daemon_relaunch_command("aligator").unwrap(),
+            format!("{} aligator", cli_binary_name())
+        );
+        // The FLAG elects a daemon — an unrecognised kind on its own still
+        // restores to a plain shell, so a stray `set-status --kind foo` can
+        // never become a command line at restore.
+        assert!(build_agent_resume_command("aligator", "", None).is_none());
+        assert!(build_agent_resume_command("bash", "x", None).is_none());
+        // Session agents keep their own resume shape, and are never daemons.
+        assert_eq!(
+            build_agent_resume_command("claude", "sess-1", None).unwrap(),
+            "claude --resume sess-1"
+        );
+        // Codex resumes through a subcommand, not a flag — the shape differs
+        // from Claude's and is easy to get wrong.
+        assert_eq!(
+            build_agent_resume_command("codex", "01a0b392-2f3b", None).unwrap(),
+            "codex resume 01a0b392-2f3b"
+        );
+        assert!(!is_daemon_kind("codex"));
+        assert!(!is_daemon_kind("claude") && !is_daemon_kind("catbus"));
+        // Even flagged, anything that isn't a plain lowercase verb is refused:
+        // the relaunch is always OUR binary plus one subcommand, leaving no
+        // room for an argument, a separator or a substitution.
+        for bad in ["rm -rf /", "brain;reboot", "Brain", "$(id)", "b", &"x".repeat(25)] {
+            assert!(!is_daemon_kind(bad), "{bad} must not be a daemon kind");
+            assert!(daemon_relaunch_command(bad).is_none());
+        }
+    }
+
+    #[test]
+    fn the_stats_block_has_the_same_rows_whatever_the_data_says() {
+        // The bug this encodes, twice over: rows used to be pushed only when a
+        // value existed, so the menu grew as the sampler answered — and since
+        // it can open upward, the item under the cursor changed mid-click.
+        let labels = ["CPU", "Power", "Memory", "Connections"];
+        let full: Vec<(&str, Option<String>)> = labels.iter().map(|l| (*l, Some("12".to_string()))).collect();
+        let empty: Vec<(&str, Option<String>)> = labels.iter().map(|l| (*l, None)).collect();
+        let mixed: Vec<(&str, Option<String>)> = vec![
+            ("CPU", Some("3.4%".into())),
+            ("Power", None),
+            ("Memory", Some("41 MB".into())),
+            ("Connections", None),
+        ];
+        assert_eq!(stats_rows(&full).len(), labels.len());
+        assert_eq!(stats_rows(&empty).len(), labels.len(), "no data is still every row");
+        assert_eq!(stats_rows(&mixed).len(), labels.len());
+        // Labels keep their order and their position, so the Nth row is always
+        // the same reading.
+        assert_eq!(stats_rows(&mixed)[0], "CPU: 3.4%");
+        assert_eq!(stats_rows(&mixed)[1], format!("Power: {STAT_PENDING}"));
+        assert_eq!(stats_rows(&mixed)[3], format!("Connections: {STAT_PENDING}"));
+        assert!(stats_rows(&[]).is_empty());
+    }
+
+    #[test]
+    fn a_peer_presents_only_its_relay_token_never_a_substitute() {
+        // One endpoint entry feeds two consumers with different rights: the
+        // sidecar token lists tabs, types input and moves files; the relay hop
+        // must present the relay-only one. Neither stands in for the other.
+        let mut ep = RemoteEndpoint {
+            id: "id".into(),
+            label: "box".into(),
+            url: "https://box:7891".into(),
+            token: "SIDECAR".into(),
+            ..RemoteEndpoint::default()
+        };
+        // No relay token configured → nothing to present. Falling back to the
+        // sidecar token would turn "you didn't set --relay-token" into an auth
+        // failure at the peer, which is much harder to read.
+        assert_eq!(relay_credential(&ep), None);
+        ep.relay_token = "RELAY".into();
+        assert_eq!(
+            relay_credential(&ep),
+            Some("RELAY"),
+            "the relay hop uses the relay token"
+        );
+        assert_eq!(ep.token, "SIDECAR", "and the sidecar's credential is untouched");
+        ep.relay_token = String::new();
+        assert_eq!(relay_credential(&ep), None);
+    }
+
+    #[test]
+    fn the_relay_stand_in_key_is_never_the_master_token() {
+        // Relay mode puts a value in ANTHROPIC_API_KEY, which tools copy into
+        // debug output and transcripts far more readily than a deliberate
+        // credential. It must not be the token that administers every tab.
+        let mut extra = std::collections::BTreeMap::new();
+        extra.insert("KEEP".to_string(), "1".to_string());
+        let env = tab_env_extras("tab-1", "http://127.0.0.1:7890", "MASTER-TOKEN", &extra);
+        // The API token is still exported — that's the deliberate one, used by
+        // set-status and the teamwork verbs from inside the tab.
+        assert_eq!(
+            env.get("TAB_ATELIER_API_TOKEN").map(String::as_str),
+            Some("MASTER-TOKEN")
+        );
+        if let Some(key) = env.get("ANTHROPIC_API_KEY") {
+            assert_ne!(key, "MASTER-TOKEN", "the stand-in key must not be the master token");
+            assert_eq!(key, &relay_token());
+        }
+        // The relay token is stable across calls, so a peer configured with it
+        // keeps working; and it is not the master.
+        assert_eq!(relay_token(), relay_token());
+        assert!(!relay_token().is_empty());
+        assert_ne!(relay_token(), "MASTER-TOKEN");
+    }
+
+    #[test]
+    fn relay_mode_points_catbus_at_the_local_relay() {
+        // A tab with its internet disabled reaches loopback and nothing else, so
+        // the remote relay a user keeps in `preferences.json` is unreachable from
+        // inside it. catbus resolves `CATBUS_RELAY_URL`/`_TOKEN` ahead of
+        // preferences, so these two are what let an agent run in such a tab.
+        let was = relay_mode();
+        set_relay_mode(true);
+        let extra = std::collections::BTreeMap::new();
+        let env = tab_env_extras("tab-1", "http://127.0.0.1:7890", "MASTER-TOKEN", &extra);
+
+        // The trailing path is deliberately part of the value: catbus accepts a
+        // bare origin too, but matching what ANTHROPIC_BASE_URL gets means the two
+        // agents in a tab are pointed at the same route by the same string.
+        assert_eq!(
+            env.get("CATBUS_RELAY_URL").map(String::as_str),
+            Some("http://127.0.0.1:7890/relay/anthropic"),
+            "the agent must be pointed at the local relay, not the public one"
+        );
+        assert_eq!(
+            env.get("CATBUS_RELAY_TOKEN").map(String::as_str),
+            Some(relay_token().as_str()),
+            "and it authenticates with the relay token, never the master one"
+        );
+        assert_ne!(
+            env.get("CATBUS_RELAY_TOKEN").map(String::as_str),
+            Some("MASTER-TOKEN"),
+            "the master token administers every tab and must not be handed to an agent"
+        );
+
+        set_relay_mode(was);
+    }
+
+    #[test]
+    fn a_pending_stat_still_occupies_its_row() {
+        // The row has to be there before the sampler answers, or the menu
+        // changes height while it is open and the click lands on the wrong
+        // item. An empty string counts as "not yet" for the same reason —
+        // `watts_label` returns "" when RAPL has no reading.
+        assert_eq!(stat_value(Some("12.5%".into())), "12.5%");
+        assert_eq!(stat_value(None), STAT_PENDING);
+        assert_eq!(stat_value(Some(String::new())), STAT_PENDING);
+        assert_eq!(stat_value(Some("   ".into())), STAT_PENDING);
+        assert!(!STAT_PENDING.is_empty(), "the placeholder must render as a row");
+    }
+
+    #[test]
+    fn escape_digs_out_of_one_layer_at_a_time() {
+        use Overlay::{ContextMenu, Preferences, Renaming, TabSwitcher};
+        // Nothing open: Escape belongs to the tab. Swallowing it here would
+        // break vim's insert mode in every tab.
+        assert_eq!(escape_dismisses(OverlayState::default()), None);
+        // The case that prompted this: a stray double-click on a tab starts a
+        // rename, which gates BOTH Ctrl+P and the context menu — so the whole
+        // window looks dead with no visible cause. Escape must get out of it.
+        let renaming = OverlayState {
+            renaming: true,
+            ..OverlayState::default()
+        };
+        assert_eq!(escape_dismisses(renaming), Some(Renaming));
+        // One press, one layer: the menu goes before what it sits on.
+        let stacked = OverlayState {
+            context_menu: true,
+            renaming: true,
+            preferences: true,
+            ..OverlayState::default()
+        };
+        assert_eq!(escape_dismisses(stacked), Some(ContextMenu));
+        let after_menu = OverlayState {
+            context_menu: false,
+            ..stacked
+        };
+        assert_eq!(escape_dismisses(after_menu), Some(Renaming));
+        assert_eq!(
+            escape_dismisses(OverlayState {
+                renaming: false,
+                ..after_menu
+            }),
+            Some(Preferences)
+        );
+        // Every layer is reachable on its own, so none can strand the window.
+        for (state, want) in [
+            (
+                OverlayState {
+                    tab_switcher: true,
+                    ..OverlayState::default()
+                },
+                TabSwitcher,
+            ),
+            (
+                OverlayState {
+                    hotkey_picker: true,
+                    ..OverlayState::default()
+                },
+                Overlay::HotkeyPicker,
+            ),
+            (
+                OverlayState {
+                    qr: true,
+                    ..OverlayState::default()
+                },
+                Overlay::Qr,
+            ),
+            (
+                OverlayState {
+                    close_confirm: true,
+                    ..OverlayState::default()
+                },
+                Overlay::CloseConfirm,
+            ),
+            (
+                OverlayState {
+                    exit_confirm: true,
+                    ..OverlayState::default()
+                },
+                Overlay::ExitConfirm,
+            ),
+            (
+                OverlayState {
+                    preferences: true,
+                    ..OverlayState::default()
+                },
+                Preferences,
+            ),
+        ] {
+            assert_eq!(escape_dismisses(state), Some(want));
+        }
+    }
+
+    #[test]
+    fn app_chords_survive_capslock_and_stay_off_the_ptys_keys() {
+        use AppChord::{Copy, NewTab, NextTab, Paste, TabSwitcher};
+        // The regression: an exact "p" comparison drops the chord when the
+        // keysym arrives uppercase (CapsLock, or a layout's shifted level),
+        // and Ctrl+P silently stops opening the switcher.
+        assert_eq!(app_chord("p", true, false, false), Some(TabSwitcher));
+        assert_eq!(app_chord("P", true, false, false), Some(TabSwitcher));
+        assert_eq!(app_chord("t", true, true, false), Some(NewTab));
+        assert_eq!(app_chord("T", true, true, false), Some(NewTab));
+        assert_eq!(app_chord("c", true, true, false), Some(Copy));
+        assert_eq!(app_chord("v", true, true, false), Some(Paste));
+        assert_eq!(app_chord("tab", false, false, true), Some(NextTab));
+        assert_eq!(
+            app_chord("TAB", false, true, true),
+            Some(NextTab),
+            "shift is ignored here"
+        );
+
+        // Everything else belongs to the PTY. In particular a bare letter and
+        // the wrong modifier set must reach the shell untouched — swallowing
+        // them here would make the key do nothing at all.
+        assert_eq!(app_chord("p", false, false, false), None);
+        assert_eq!(
+            app_chord("p", true, true, false),
+            None,
+            "Ctrl+Shift+P is not the switcher"
+        );
+        assert_eq!(
+            app_chord("p", true, false, true),
+            None,
+            "Ctrl+Alt+P is not the switcher"
+        );
+        assert_eq!(app_chord("t", true, false, false), None, "Ctrl+T is the shell's");
+        assert_eq!(
+            app_chord("c", true, false, false),
+            None,
+            "Ctrl+C must interrupt, not copy"
+        );
+        assert_eq!(app_chord("v", true, false, false), None);
+        assert_eq!(app_chord("tab", false, false, false), None, "plain Tab completes");
+        assert_eq!(app_chord("tab", true, false, false), None);
+        assert_eq!(app_chord("", true, false, false), None);
+    }
+
+    #[test]
+    fn folder_styles_can_be_replaced_while_running() {
+        // The bug this encodes: the rules lived in a OnceLock, so editing a
+        // rule silently no-op'd until the app was restarted — with dozens of
+        // tabs open, nobody restarts to try a colour.
+        let rule = |color: &str| {
+            let mut m = std::collections::BTreeMap::new();
+            m.insert(
+                "/tmp/ta-style-test".to_string(),
+                FolderStyle {
+                    color: Some(color.to_string()),
+                    badge: Some("T".into()),
+                },
+            );
+            m
+        };
+        set_folder_styles(rule("#111111"));
+        assert_eq!(
+            folder_style_of(Some("/tmp/ta-style-test/sub")).color.as_deref(),
+            Some("#111111")
+        );
+        set_folder_styles(rule("#222222"));
+        assert_eq!(
+            folder_style_of(Some("/tmp/ta-style-test/sub")).color.as_deref(),
+            Some("#222222"),
+            "a re-set must win — a OnceLock would have kept the first"
+        );
+        // An unruled path resolves to the empty style, not the last rule.
+        assert_eq!(folder_style_of(Some("/tmp/elsewhere")), FolderStyle::default());
+        set_folder_styles(std::collections::BTreeMap::new());
+    }
+
+    #[test]
+    fn folder_rules_resolve_by_longest_match() {
+        let mut styles = std::collections::BTreeMap::new();
+        styles.insert(
+            "/home/w/Dev/app".to_string(),
+            FolderStyle {
+                color: Some("#111111".into()),
+                badge: Some("APP".into()),
+            },
+        );
+        styles.insert(
+            "/home/w/Dev/app/frontend".to_string(),
+            FolderStyle {
+                color: Some("#222222".into()),
+                badge: None,
+            },
+        );
+        let style_of = |cwd| folder_style_for(&styles, Some(cwd));
+        // The rule applies to the folder itself and everything under it.
+        assert_eq!(style_of("/home/w/Dev/app").unwrap().color.as_deref(), Some("#111111"));
+        assert_eq!(
+            style_of("/home/w/Dev/app/src/deep").unwrap().color.as_deref(),
+            Some("#111111")
+        );
+        // A sub-project refines its parent instead of fighting it.
+        assert_eq!(
+            style_of("/home/w/Dev/app/frontend/src").unwrap().color.as_deref(),
+            Some("#222222")
+        );
+        // Prefix match must respect path components: `app-legacy` is NOT `app`.
+        assert!(style_of("/home/w/Dev/app-legacy").is_none());
+        assert!(style_of("/home/w/Dev").is_none());
+        assert!(folder_style_for(&styles, None).is_none());
+    }
+
+    #[test]
+    fn tab_style_resolves_per_tab_then_folder_then_global() {
+        // Background always resolves to something paintable …
+        assert_eq!(
+            effective_tab_bg(Some("#aaa111"), Some("#bbb222"), Some("#ccc333")),
+            "#aaa111"
+        );
+        assert_eq!(effective_tab_bg(None, Some("#bbb222"), Some("#ccc333")), "#bbb222");
+        assert_eq!(effective_tab_bg(None, None, Some("#ccc333")), "#ccc333");
+        assert_eq!(effective_tab_bg(None, None, None), DEFAULT_TAB_BG_COLOR);
+        // … while the desktop tint stays None until something styles the tab,
+        // so an unstyled tab keeps the theme's background.
+        assert_eq!(effective_tab_tint(None, Some("#bbb222")), Some("#bbb222"));
+        assert_eq!(effective_tab_tint(Some("#aaa111"), Some("#bbb222")), Some("#aaa111"));
+        assert_eq!(effective_tab_tint(None, None), None);
+        assert_eq!(effective_tab_badge(None, Some("APP")), Some("APP"));
+        assert_eq!(effective_tab_badge(Some("ME"), Some("APP")), Some("ME"));
+        assert_eq!(effective_tab_badge(None, None), None);
+    }
+
+    #[test]
+    fn badges_and_colors_are_validated() {
+        assert_eq!(sanitize_badge("  KAL "), Ok("KAL".to_string()));
+        assert_eq!(sanitize_badge("a\r\nb"), Ok("ab".to_string()));
+        assert!(sanitize_badge("   ").is_err());
+        assert!(sanitize_badge(&"x".repeat(BADGE_MAX + 1)).is_err());
+        assert!(sanitize_badge("🐊").is_ok(), "an emoji is one char");
+        assert_eq!(parse_hex_rgb("#7a1f2b"), Some(0x7a_1f_2b));
+        assert_eq!(parse_hex_rgb("#FFFFFF"), Some(0xff_ff_ff));
+        for bad in ["7a1f2b", "#7a1f2", "#7a1f2bb", "#gggggg", "", "#"] {
+            assert!(parse_hex_rgb(bad).is_none(), "{bad} must not parse");
+        }
+    }
+
+    #[test]
+    fn meta_keys_are_normalised_and_bounded() {
+        assert_eq!(
+            sanitize_meta(" Role ", "  reviewer  ").unwrap(),
+            ("role".to_string(), "reviewer".to_string())
+        );
+        // Control characters would corrupt a header line or a log — stripped.
+        assert_eq!(sanitize_meta("k", "a\r\nb").unwrap().1, "ab");
+        assert!(sanitize_meta("", "v").is_err());
+        assert!(sanitize_meta("has space", "v").is_err());
+        assert!(sanitize_meta("k", "   ").is_err(), "empty value → use --clear");
+        assert!(sanitize_meta(&"k".repeat(META_KEY_MAX + 1), "v").is_err());
+        assert!(sanitize_meta("k", &"v".repeat(META_VALUE_MAX + 1)).is_err());
+        assert!(sanitize_meta("k", &"é".repeat(META_VALUE_MAX)).is_ok(), "cap is chars");
+    }
+
+    #[test]
+    fn meta_map_stays_bounded_whatever_the_api_allowed() {
+        let mut map = std::collections::BTreeMap::new();
+        for i in 0..META_MAX_KEYS {
+            apply_meta_change(&mut map, &format!("k{i}"), Some("v".into()));
+        }
+        assert_eq!(map.len(), META_MAX_KEYS);
+        // A new key on a full map is dropped, so tabs.json can't grow without
+        // bound even if a racing writer slipped past the API's check.
+        apply_meta_change(&mut map, "overflow", Some("v".into()));
+        assert_eq!(map.len(), META_MAX_KEYS);
+        assert!(!map.contains_key("overflow"));
+        // Updating an existing key always works, and None removes.
+        apply_meta_change(&mut map, "k0", Some("v2".into()));
+        assert_eq!(map.get("k0").map(String::as_str), Some("v2"));
+        apply_meta_change(&mut map, "k0", None);
+        assert_eq!(map.len(), META_MAX_KEYS - 1);
+    }
+
+    #[test]
     fn wrap_exec_command_prefixes_tracer_when_present() {
         // No tracer, no frames, no title → the plain suffix's exec line.
         assert_eq!(
@@ -3387,6 +4909,160 @@ mod tests {
             &args[sep + 1..],
             &["/bin/bash".to_string(), "-l".to_string()],
             "real cmd after --"
+        );
+    }
+
+    #[test]
+    fn jailed_command_empties_the_root_before_binding_anything() {
+        // Order is the mechanism, not a detail: binds land on whatever is there
+        // when they run, so the empty root has to come first or the host stays
+        // visible underneath.
+        let jail = Jail {
+            worktree: "/srv/work".into(),
+            ..Jail::default()
+        };
+        let (prog, args) = jailed_command(&jail, "/bin/bash", &[]);
+        assert_eq!(prog, "bwrap");
+        assert_eq!(args[0], "--tmpfs", "the first argument must empty the root");
+        assert_eq!(args[1], "/");
+        let first_bind = args
+            .iter()
+            .position(|a| a.starts_with("--bind") || a.starts_with("--ro-bind"))
+            .expect("some bind");
+        assert!(first_bind > 1, "the root must be emptied before any bind");
+    }
+
+    #[test]
+    fn jailed_command_makes_only_the_named_trees_writable() {
+        let jail = Jail {
+            worktree: "/srv/work".into(),
+            writable: vec!["/home/u/.claude/projects/-srv-work".into()],
+            readable: vec!["/srv/read-only".into()],
+        };
+        let (_, args) = jailed_command(&jail, "catbus-agent", &["--cwd".into(), "/srv/work".into()]);
+
+        // Read-write binds: the worktree and the named writable, and nothing else.
+        let rw: Vec<&String> = args
+            .iter()
+            .enumerate()
+            .filter(|(i, a)| *a == "--bind" && args.get(i + 1).is_some())
+            .map(|(i, _)| &args[i + 1])
+            .collect();
+        assert_eq!(
+            rw,
+            vec![
+                &"/srv/work".to_string(),
+                &"/home/u/.claude/projects/-srv-work".to_string()
+            ],
+            "only the worktree and the explicitly writable paths may be modified"
+        );
+
+        // A named read-only grant is bound, and read-only.
+        let ro_pairs: Vec<(&String, &String)> = args
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| *a == "--ro-bind-try")
+            .filter_map(|(i, _)| Some((args.get(i + 1)?, args.get(i + 2)?)))
+            .collect();
+        assert!(
+            ro_pairs.iter().any(|(src, _)| *src == "/srv/read-only"),
+            "a readable grant should be bound read-only: {ro_pairs:?}"
+        );
+        assert!(
+            ro_pairs.iter().any(|(src, _)| *src == "/usr"),
+            "the system trees must stay readable or nothing starts: {ro_pairs:?}"
+        );
+    }
+
+    /// The property the jail exists for: a host path that was never granted is not
+    /// *restricted*, it is **absent**. A permission bit can be argued with; a file
+    /// that is not in the namespace cannot be read at all.
+    #[test]
+    fn jailed_command_does_not_grant_the_host_home_or_var() {
+        let jail = Jail {
+            worktree: "/srv/work".into(),
+            ..Jail::default()
+        };
+        let (_, args) = jailed_command(&jail, "/bin/bash", &[]);
+        let joined = args.join(" ");
+        for forbidden in ["/home", "/root", "/var", "/mnt", "/media", "/run/user"] {
+            assert!(
+                !joined.contains(forbidden),
+                "{forbidden} must not be bound into the jail: {joined}"
+            );
+        }
+        // A `~/.config` credential is out of reach by construction — which is why
+        // confinement is the answer here rather than moving the file.
+        assert!(!joined.contains(".config"), "{joined}");
+    }
+
+    /// Networking stays separate, so this composes with `no_internet_command`
+    /// rather than duplicating it. The headless service makes the same split: its
+    /// jail is filesystem-only and its network policy is nftables.
+    #[test]
+    fn jailed_command_leaves_the_network_alone() {
+        let jail = Jail {
+            worktree: "/srv/work".into(),
+            ..Jail::default()
+        };
+        let (_, args) = jailed_command(&jail, "/bin/bash", &[]);
+        assert!(
+            !args.iter().any(|a| a == "--unshare-net"),
+            "the filesystem jail must not decide about the network: {args:?}"
+        );
+    }
+
+    /// A writable grant must not be hidden by a mount made after it.
+    ///
+    /// This is a bug that was found by running the thing: with `--tmpfs /tmp` after
+    /// the worktree bind, a worktree under `/tmp` — which is where the test suites
+    /// and the scenario harness put theirs — came out un-writable, because a
+    /// `--tmpfs` on a parent hides every bind beneath it. The symptom was
+    /// `bash: /tmp/.../from-inside.txt: No such file or directory` from inside a
+    /// jail that looked correctly built.
+    #[test]
+    fn jailed_command_binds_the_worktree_after_the_private_mounts() {
+        let jail = Jail {
+            worktree: "/tmp/a-worktree".into(),
+            writable: vec!["/tmp/a-worktree/state".into()],
+            ..Jail::default()
+        };
+        let (_, args) = jailed_command(&jail, "/bin/bash", &[]);
+
+        let tmpfs_tmp = args
+            .windows(2)
+            .position(|w| w[0] == "--tmpfs" && w[1] == "/tmp")
+            .expect("the jail has its own /tmp");
+        let worktree = args
+            .windows(3)
+            .position(|w| w[0] == "--bind" && w[1] == "/tmp/a-worktree")
+            .expect("the worktree is bound");
+        assert!(
+            worktree > tmpfs_tmp,
+            "the worktree bind must come after `--tmpfs /tmp`, or it is hidden"
+        );
+
+        // And the last bind of all is the worktree's, so nothing re-hides it.
+        let last_bind = args.iter().rposition(|a| a == "--bind").expect("some bind");
+        assert_eq!(
+            args[last_bind + 1],
+            "/tmp/a-worktree/state",
+            "the final writable grant must be the last binding action"
+        );
+    }
+
+    #[test]
+    fn jailed_command_keeps_the_real_command_after_the_separator() {
+        let jail = Jail {
+            worktree: "/srv/work".into(),
+            ..Jail::default()
+        };
+        let (_, args) = jailed_command(&jail, "catbus-agent", &["--once".into()]);
+        let sep = args.iter().position(|a| a == "--").expect("has -- separator");
+        assert_eq!(
+            &args[sep + 1..],
+            &["catbus-agent".to_string(), "--once".to_string()],
+            "the wrapped command keeps its own arguments"
         );
     }
 
@@ -3619,6 +5295,37 @@ mod tests {
             !env.contains_key("COLORTERM"),
             "no truecolor advertised when colours are off"
         );
+        // The standard signal, and the one a client is expected to read. Without
+        // it a colours-off tab only said `TERM=dumb`, which is a claim about
+        // capability rather than policy — so a program that honours `NO_COLOR`
+        // (and not `TERM`) kept emitting escapes. That was the reported bug: a
+        // catbus tab with colours switched off still showing ANSI.
+        assert_eq!(
+            env.get("NO_COLOR").map(String::as_str),
+            Some("1"),
+            "colours off must set NO_COLOR, not only TERM"
+        );
+        assert_eq!(env.get("CLICOLOR").map(String::as_str), Some("0"));
+    }
+
+    #[test]
+    fn minimal_pty_env_advertises_no_colour_opt_out_when_colours_are_on() {
+        // The other direction, so the assertions above cannot be satisfied by
+        // setting the opt-out unconditionally — which would strip colour from
+        // every tab including the ones the user left coloured.
+        let env = minimal_pty_env(
+            true,
+            &std::collections::BTreeMap::new(),
+            &std::collections::HashMap::new(),
+        );
+        assert!(
+            !env.contains_key("NO_COLOR"),
+            "a coloured tab must not opt out: {env:?}"
+        );
+        assert!(
+            !env.contains_key("CLICOLOR"),
+            "a coloured tab must not opt out: {env:?}"
+        );
     }
 
     #[test]
@@ -3759,6 +5466,24 @@ mod tests {
         assert_eq!(restored.tabs[1].name, "Build");
         assert_eq!(restored.tabs[1].cwd, None);
         assert_eq!(restored.active, 1);
+    }
+
+    #[test]
+    fn tab_state_persists_last_used_at() {
+        // last_used_at must round-trip through tabs.json so the MRU (Ctrl+P /
+        // mobile) ordering survives a restart — the "persist on reboot" bug.
+        let ts = TabState {
+            name: "Agent".into(),
+            last_used_at: Some(1_788_000_000_000),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&ts).unwrap();
+        assert!(json.contains("last_used_at"), "field must serialize: {json}");
+        let back: TabState = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.last_used_at, Some(1_788_000_000_000));
+        // An older tabs.json without the field loads as None (re-seeds on focus).
+        let legacy: TabState = serde_json::from_str(r#"{"id":"x","name":"Old","cwd":null}"#).unwrap();
+        assert_eq!(legacy.last_used_at, None);
     }
 
     #[test]
@@ -4613,6 +6338,7 @@ mod tests {
                     autoconnect: true,
                     cf_access_client_id: "svc.access".into(),
                     cf_access_client_secret: "s3cr3t".into(),
+                    relay_token: "relay-only".into(),
                 },
                 RemoteEndpoint {
                     id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".into(),
@@ -4668,5 +6394,530 @@ mod state_writer_tests {
         );
         // A second flush with an empty queue returns immediately.
         w.flush();
+    }
+
+    #[test]
+    fn the_tab_led_stays_dark_until_there_is_something_to_say() {
+        use crate::{AgentState, TabLed, compute_tab_led};
+        // Nothing attached, nothing running: no LED at all. A dot on every
+        // idle tab is a dot that means nothing.
+        assert_eq!(compute_tab_led(None, false, false, false, false, false, false), None);
+        // A session attached to a live agent is worth showing even with no
+        // reported state.
+        assert_eq!(
+            compute_tab_led(None, true, false, true, false, false, false),
+            Some(TabLed::Idle)
+        );
+        // Output moving means working, even if the agent never reported a state
+        // — some tools write without calling set-status.
+        assert_eq!(
+            compute_tab_led(None, true, false, true, false, false, true),
+            Some(TabLed::Working)
+        );
+        assert_eq!(
+            compute_tab_led(Some(AgentState::Thinking), true, false, true, false, false, false),
+            Some(TabLed::Working)
+        );
+    }
+
+    #[test]
+    fn a_dead_agent_outranks_every_other_led_state() {
+        use crate::{AgentState, TabLed, compute_tab_led};
+        // Attached, not alive, not the brain, and a full sweep has confirmed
+        // it: that is a corpse, and it must win over any stale reported state.
+        let dead = compute_tab_led(Some(AgentState::Thinking), true, false, false, true, false, true);
+        assert_eq!(dead, Some(TabLed::Dead));
+        // Without the full sweep we do not yet know it is dead — reporting a
+        // corpse on incomplete information would cry wolf on every startup.
+        assert_ne!(
+            compute_tab_led(Some(AgentState::Thinking), true, false, false, false, false, true),
+            Some(TabLed::Dead)
+        );
+        // The brain is exempt: it has no session of its own to lose.
+        assert_ne!(
+            compute_tab_led(None, true, true, false, true, false, false),
+            Some(TabLed::Dead)
+        );
+    }
+
+    #[test]
+    fn error_beats_working_and_unreviewed_is_the_quietest_signal() {
+        use crate::{AgentState, TabLed, compute_tab_led};
+        // An error must not be hidden by output still trickling out.
+        assert_eq!(
+            compute_tab_led(Some(AgentState::Error), true, false, true, false, false, true),
+            Some(TabLed::Error)
+        );
+        // Finished, with work nobody has looked at: visible, but the calmest
+        // colour — it is a reminder, not an alarm.
+        assert_eq!(
+            compute_tab_led(None, true, false, true, false, true, false),
+            Some(TabLed::Unreviewed)
+        );
+        // Unreviewed work keeps the LED alive even after the agent exits, so
+        // the result is not lost when the process is.
+        assert_eq!(
+            compute_tab_led(None, true, false, false, false, true, false),
+            Some(TabLed::Unreviewed)
+        );
+    }
+
+    #[test]
+    fn the_local_client_url_keeps_only_the_port() {
+        use crate::api_url_for_local_clients;
+        // A tab's own tools must reach the daemon on loopback whatever the
+        // daemon bound: 0.0.0.0 is a bind spec, not an address to call.
+        assert_eq!(api_url_for_local_clients("0.0.0.0:7890"), "http://127.0.0.1:7890");
+        assert_eq!(api_url_for_local_clients("127.0.0.1:7899"), "http://127.0.0.1:7899");
+        assert_eq!(api_url_for_local_clients("[::]:7890"), "http://127.0.0.1:7890");
+        // Junk falls back to the default port rather than producing a URL
+        // nothing can connect to.
+        let fallback = format!("http://127.0.0.1:{}", crate::DEFAULT_API_PORT);
+        assert_eq!(api_url_for_local_clients("nonsense"), fallback);
+        assert_eq!(api_url_for_local_clients(""), fallback);
+    }
+
+    #[test]
+    fn a_share_token_is_long_enough_to_be_unguessable_and_never_repeats() {
+        use std::collections::HashSet;
+        let mut seen = HashSet::new();
+        for _ in 0..64 {
+            let t = crate::mint_share_token();
+            // 32 hex chars = 128 bits. Short tokens are the whole risk here:
+            // a share link is a bearer credential on a URL.
+            assert_eq!(t.len(), 32, "{t}");
+            assert!(t.chars().all(|c| c.is_ascii_hexdigit()), "{t}");
+            assert!(seen.insert(t), "mint_share_token repeated a value");
+        }
+    }
+
+    #[test]
+    fn a_token_file_is_minted_once_and_then_reused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("some.token");
+        let first = crate::read_or_mint_token(&path);
+        assert_eq!(first.len(), 32);
+        // Stability is the point: a token that changed on every read would
+        // invalidate every link and every configured peer on each call.
+        assert_eq!(crate::read_or_mint_token(&path), first);
+        assert_eq!(std::fs::read_to_string(&path).unwrap().trim(), first);
+        // Whitespace around a hand-edited token is tolerated rather than
+        // producing a credential with a newline in it.
+        std::fs::write(&path, "  padded-token  \n").unwrap();
+        assert_eq!(crate::read_or_mint_token(&path), "padded-token");
+        // An empty file is re-minted rather than returned as an empty token,
+        // which would authenticate nobody and be very confusing.
+        std::fs::write(&path, "\n").unwrap();
+        let reminted = crate::read_or_mint_token(&path);
+        assert_eq!(reminted.len(), 32);
+    }
+
+    #[test]
+    fn an_https_endpoint_splits_into_host_and_port() {
+        use crate::parse_https_host_port;
+        assert_eq!(
+            parse_https_host_port("https://build-box:7891").unwrap(),
+            ("build-box".to_string(), 7891)
+        );
+        // No port means the HTTPS default, not a parse failure.
+        assert_eq!(
+            parse_https_host_port("https://example.com").unwrap(),
+            ("example.com".to_string(), 443)
+        );
+        // A path must not end up in the hostname.
+        assert_eq!(
+            parse_https_host_port("https://host:8443/tabs?x=1").unwrap(),
+            ("host".to_string(), 8443)
+        );
+        // Plain http is refused: this is used to pin a TLS certificate, and
+        // silently accepting an unencrypted URL would pin nothing.
+        assert!(parse_https_host_port("http://host:80").is_err());
+        assert!(parse_https_host_port("host:443").is_err());
+        assert!(parse_https_host_port("https://").is_err());
+    }
+
+    #[test]
+    fn the_pty_env_carries_colour_only_when_colours_are_on() {
+        let on = crate::pty_env(true);
+        // A terminal that claims colour support and then strips it makes
+        // every agent's output unreadable, so this is worth pinning.
+        assert_eq!(on.get("TERM").map(String::as_str), Some("xterm-256color"));
+        assert_eq!(on.get("COLORTERM").map(String::as_str), Some("truecolor"));
+        assert!(!on.contains_key("NO_COLOR"), "a coloured tab must not opt out: {on:?}");
+        assert!(!on.contains_key("CLICOLOR"), "a coloured tab must not opt out: {on:?}");
+
+        let off = crate::pty_env(false);
+        assert!(
+            !off.contains_key("COLORTERM"),
+            "colours off must not advertise truecolor"
+        );
+        // TERM is always set: an empty TERM breaks ncurses programs outright.
+        assert!(off.contains_key("TERM"), "TERM must always be set");
+        // And the standard opt-out travels with it. `TERM=dumb` alone is a
+        // capability claim, so a client reading only `NO_COLOR` saw nothing and
+        // kept emitting escapes — the reported bug. Both spawn paths must agree.
+        assert_eq!(
+            off.get("NO_COLOR").map(String::as_str),
+            Some("1"),
+            "colours off must set NO_COLOR, not only TERM"
+        );
+        assert_eq!(off.get("CLICOLOR").map(String::as_str), Some("0"));
+    }
+
+    #[test]
+    fn the_wakatime_key_is_read_from_zeds_settings_or_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        // No zed config at all is the common case and must not be an error.
+        assert!(crate::load_wakatime_key(dir.path()).is_none());
+        let zed = dir.path().join("zed");
+        std::fs::create_dir_all(&zed).unwrap();
+        let settings = zed.join("settings.json");
+        // Malformed JSON must not panic — this file is edited by hand.
+        std::fs::write(&settings, "{ not json").unwrap();
+        assert!(crate::load_wakatime_key(dir.path()).is_none());
+        // Present but without the key.
+        std::fs::write(&settings, r#"{"theme":"One Dark"}"#).unwrap();
+        assert!(crate::load_wakatime_key(dir.path()).is_none());
+        // The real shape.
+        std::fs::write(&settings, r#"{"wakatime": {"settings": {"api-key": "waka_secret"}}}"#).unwrap();
+        assert_eq!(crate::load_wakatime_key(dir.path()).as_deref(), Some("waka_secret"));
+    }
+
+    #[test]
+    fn signalling_a_process_group_refuses_the_pids_that_would_hit_everything() {
+        // pid 0 means "my own process group" and pid 1 is init. Passing either
+        // to killpg would take down the daemon or the machine, so both are
+        // refused before any signal is sent. There is no way to observe "did
+        // not signal" other than that this returns without killing the test
+        // runner — which is the assertion.
+        crate::kill_tab_pgroup(0);
+        crate::kill_tab_pgroup(1);
+        // A pid that cannot exist is a no-op rather than an error.
+        crate::kill_tab_pgroup(u32::MAX);
+    }
+
+    #[test]
+    fn the_persisted_log_filter_round_trips_and_clears() {
+        // Set, read back, clear — the sequence `tab-atelier log` performs.
+        // A filter that survived a "clear" would keep a debug build's noise
+        // on forever with no way to see why.
+        // RUST_LOG wins over the file, so a developer running with it set
+        // would see the env value here rather than what we just wrote.
+        if std::env::var("RUST_LOG").is_ok() {
+            return;
+        }
+        // This writes the developer's real filter file, so put back whatever
+        // was there — a test that silently clears someone's debug filter is a
+        // test that costs an afternoon.
+        let previous = crate::resolve_log_filter();
+        crate::set_persisted_log_filter(Some("tab_atelier=debug")).expect("set");
+        assert_eq!(crate::resolve_log_filter().as_deref(), Some("tab_atelier=debug"));
+        crate::set_persisted_log_filter(None).expect("clear");
+        assert!(crate::resolve_log_filter().is_none());
+        if let Some(prev) = previous {
+            crate::set_persisted_log_filter(Some(&prev)).expect("restore");
+        }
+    }
+
+    #[test]
+    fn an_api_created_tab_gets_the_colour_opt_out_and_a_users_tab_does_not() {
+        // Regression: agent tabs must launch with colour off. Their output is
+        // read by programs (`peek`, `output`, `--wait`), where ANSI escapes
+        // are noise something else has to parse.
+        let agent = crate::new_tab_env(true);
+        assert_eq!(agent.get("NO_COLOR").map(String::as_str), Some("1"));
+        assert_eq!(agent.get("CLICOLOR").map(String::as_str), Some("0"));
+        // NO_COLOR is honoured by ANY non-empty value, so an empty string here
+        // would silently mean "colours on".
+        assert!(!agent.get("NO_COLOR").is_some_and(String::is_empty));
+        // It must not reach for TERM: `TERM=dumb` is the right-click "Disable
+        // colors" behaviour and would break an agent's TUI outright.
+        assert!(!agent.contains_key("TERM"), "{agent:?}");
+
+        // A tab the user opened is untouched — their colours are theirs.
+        let user = crate::new_tab_env(false);
+        assert!(user.is_empty(), "{user:?}");
+    }
+
+    #[test]
+    fn a_font_size_from_preferences_wins_and_is_bounded_by_the_dialog() {
+        // The setting is a real preference: `preferences.json` beats zed and
+        // fontconfig. A test run that writes it (as one of ours did, silently
+        // changing the developer's font) is a bug in the test, not a feature.
+        let dir = tempfile::tempdir().unwrap();
+        let mut prefs = crate::Preferences::default();
+        assert!(prefs.font_size.is_none(), "unset by default — the user's choice");
+        prefs.font_size = Some(17.5);
+        assert!((crate::resolve_font_config(dir.path(), &prefs).size - 17.5).abs() < f32::EPSILON);
+        // A nonsense size is ignored rather than producing an unusable window.
+        prefs.font_size = Some(0.0);
+        assert!(crate::resolve_font_config(dir.path(), &prefs).size > 0.0);
+        prefs.font_size = Some(-4.0);
+        assert!(crate::resolve_font_config(dir.path(), &prefs).size > 0.0);
+        // The dialog's stepper clamps to the same useful range: below ~6 the
+        // window is unreadable, above ~72 one glyph fills the tab.
+        for (input, want) in [
+            (5.0_f32, 6.0_f32),
+            (6.0, 6.0),
+            (14.0, 14.0),
+            (72.0, 72.0),
+            (900.0, 72.0),
+        ] {
+            assert!((input.clamp(6.0, 72.0) - want).abs() < f32::EPSILON, "{input}");
+        }
+    }
+
+    /// The packaging list and the deb's asset table must agree.
+    ///
+    /// The Arch package shipped README + openapi and silently fell behind when
+    /// the deb gained the handbook, because the two were maintained by hand in
+    /// different files. `packaging/docs.list` is now the source; the Arch
+    /// PKGBUILD reads it directly and this asserts the deb does too.
+    #[test]
+    fn docs_shipped_by_every_packaging_stay_in_sync() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let list = std::fs::read_to_string(root.join("packaging/docs.list")).expect("packaging/docs.list");
+        let wanted: Vec<&str> = list
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .collect();
+        assert!(!wanted.is_empty(), "the list is empty — did the format change?");
+
+        let cargo = std::fs::read_to_string(root.join("Cargo.toml")).expect("Cargo.toml");
+        for doc in &wanted {
+            // Every listed doc must exist…
+            assert!(
+                root.join(doc).is_file(),
+                "packaging/docs.list names a missing file: {doc}"
+            );
+            // …and be installed by BOTH debs, or the package ships less than
+            // the list claims.
+            for pkg in ["/usr/share/doc/tab-atelier/", "/usr/share/doc/tab-atelier-headless/"] {
+                let entry = format!("[\"{doc}\", \"{pkg}\"");
+                assert!(
+                    cargo.contains(&entry),
+                    "Cargo.toml is missing a deb asset for {doc} -> {pkg}\n\
+                     add: [\"{doc}\", \"{pkg}\", \"644\"],"
+                );
+            }
+        }
+
+        // The Arch packaging must go through the script rather than listing
+        // docs by hand again — that is how it drifted in the first place.
+        for pkgbuild in ["packaging/arch/PKGBUILD", "packaging/arch/PKGBUILD.git"] {
+            let body = std::fs::read_to_string(root.join(pkgbuild)).expect(pkgbuild);
+            assert!(
+                body.contains("install-docs.sh"),
+                "{pkgbuild} installs docs by hand; call scripts/install-docs.sh"
+            );
+        }
+    }
+
+    /// The Android app carries the same version as the desktop it talks to.
+    ///
+    /// They were 0.1.0 and 0.5.0-dev: a bug report from the phone named a
+    /// version that had never existed on the desktop side. `versionCode` is a
+    /// separate concern — an int that only has to increase — and lives in
+    /// `scripts/android-version.sh`.
+    #[test]
+    fn the_android_app_version_tracks_the_workspace() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let package_version = |body: &str| -> Option<String> {
+            let mut in_package = false;
+            for line in body.lines() {
+                if line.starts_with('[') {
+                    in_package = line.trim() == "[package]";
+                } else if in_package && line.starts_with("version = ") {
+                    return line.split('"').nth(1).map(ToOwned::to_owned);
+                }
+            }
+            None
+        };
+        let ours = package_version(&std::fs::read_to_string(root.join("Cargo.toml")).expect("Cargo.toml"))
+            .expect("workspace version");
+        let android = std::fs::read_to_string(root.join("android/ta-remote/Cargo.toml")).expect("android manifest");
+        assert_eq!(
+            package_version(&android).as_deref(),
+            Some(ours.as_str()),
+            "android/ta-remote is out of step — run scripts/android-version.sh --write"
+        );
+    }
+
+    /// The APK is skipped when the app did not change — but never on a tag.
+    ///
+    /// The cheap way to write this rule is `on.push.paths`, and it is wrong in
+    /// a way that only shows up at release time: GitHub evaluates path filters
+    /// against the commits in a push, and a tag points at a commit that was
+    /// already pushed. No commits, no match, no APK for the release — while
+    /// every other artifact builds fine and CI stays green.
+    #[test]
+    fn the_apk_is_skipped_only_when_the_app_is_untouched() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let script = root.join("scripts/apk-needed.sh");
+
+        let decide = |files: &str| -> String {
+            use std::io::Write as _;
+            let mut child = std::process::Command::new(&script)
+                .args(["--files", "-"])
+                .current_dir(root)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("run scripts/apk-needed.sh");
+            child
+                .stdin
+                .take()
+                .expect("stdin")
+                .write_all(files.as_bytes())
+                .expect("write file list");
+            let out = child.wait_with_output().expect("collect output");
+            String::from_utf8_lossy(&out.stdout).trim().to_owned()
+        };
+
+        // Untouched app → skip. This is the whole point of the gate.
+        assert_eq!(decide("src/app.rs\nsrc/api.rs\n"), "false");
+        assert_eq!(decide("README.md\ndocs/fleet-playbook.md\n"), "false");
+        assert_eq!(decide(""), "false");
+        // Touched, in any of the ways that reach the artifact.
+        assert_eq!(decide("android/ta-remote/src/lib.rs\n"), "true");
+        assert_eq!(
+            decide("android/ta-remote/Cargo.toml\n"),
+            "true",
+            "a version bump must rebuild"
+        );
+        assert_eq!(decide(".github/workflows/android-apk.yml\n"), "true");
+        // One app file in a big desktop push is still a rebuild.
+        assert_eq!(decide("src/app.rs\nandroid/ta-remote/Cargo.lock\n"), "true");
+
+        // A tag builds whatever the diff says.
+        let tag = std::process::Command::new(&script)
+            .current_dir(root)
+            .env("GITHUB_REF", "refs/tags/v9.9.9")
+            .env("GITHUB_EVENT_NAME", "push")
+            .output()
+            .expect("run scripts/apk-needed.sh for a tag");
+        assert_eq!(
+            String::from_utf8_lossy(&tag.stdout).trim(),
+            "true",
+            "a release tag must build the APK — that is the case `on.push.paths` gets wrong"
+        );
+
+        // And the workflow actually consults it.
+        let wf = std::fs::read_to_string(root.join(".github/workflows/android-apk.yml")).expect("workflow");
+        assert!(wf.contains("scripts/apk-needed.sh"), "the gate script is not wired up");
+        assert!(
+            wf.contains("needs.changes.outputs.build == 'true'"),
+            "the apk job does not honour the gate"
+        );
+        assert!(
+            !wf.contains("paths:"),
+            "a `paths:` filter here would skip release builds — use the gate job"
+        );
+    }
+
+    /// A snapshot .deb must sort below the release it is heading towards, and
+    /// above the one before it.
+    ///
+    /// The whole point of `scripts/deb-version.sh` is dpkg's ordering, and
+    /// ordering breaks silently: a wrong version does not fail the build, it
+    /// just quietly stops upgrading on the machines that already have the
+    /// package. Two failures this pins down, both of which we shipped or
+    /// nearly shipped:
+    ///
+    ///  * the date field must carry the TIME, not just the day. The Debian
+    ///    wiki writes `~git{YYYYMMDD}.{hash}` assuming one build a night; we
+    ///    build on every push, and the hash cannot break the tie because dpkg
+    ///    compares it as text (`0de5678` < `abc1234`, whatever the clock says).
+    ///  * the smoke-test deb must sort below the published one for the same
+    ///    commit, so a stray artifact cannot shadow the real build.
+    ///
+    /// It also checks the new suffix outranks the `~nightly{YYYYMMDD}.{HHMMSS}`
+    /// one it grew out of — 14 digits against 8, compared numerically — since
+    /// that is what let the sha be added without asking anyone to downgrade.
+    #[test]
+    fn snapshot_deb_versions_sort_the_way_apt_needs() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let script = root.join("scripts/deb-version.sh");
+
+        // Both invocations are pinned to ONE instant. The script stamps from
+        // the clock, so two calls that straddle a second tick produce a smoke
+        // build NEWER than the nightly and invert the very ordering being
+        // asserted — an intermittent failure that says nothing about the code.
+        // SOURCE_DATE_EPOCH is the script's own reproducibility knob.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs())
+            .to_string();
+        let run = |args: &[&str]| -> String {
+            let out = std::process::Command::new(&script)
+                .args(args)
+                .current_dir(root)
+                .env("SOURCE_DATE_EPOCH", &now)
+                .output()
+                .expect("run scripts/deb-version.sh");
+            assert!(out.status.success(), "deb-version.sh {args:?} failed");
+            String::from_utf8_lossy(&out.stdout).trim().to_owned()
+        };
+
+        let nightly = run(&[]);
+        let smoke = run(&["--revision", "0ci"]);
+        // 0.5.0~nightly20260907072252.04cb329-1
+        let (base, rest) = nightly.split_once("~nightly").expect("a ~nightly snapshot version");
+        let (stamp, tail) = rest.split_once('.').expect("date.hash");
+        assert_eq!(stamp.len(), 14, "the date field must be YYYYMMDDHHMMSS, got {stamp}");
+        assert!(
+            stamp.chars().all(|c| c.is_ascii_digit()),
+            "date field not numeric: {stamp}"
+        );
+        let (hash, revision) = tail.split_once('-').expect("hash-revision");
+        assert_eq!(hash.len(), 7, "short sha should be 7 chars, got {hash}");
+        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()), "not a sha: {hash}");
+        assert_eq!(revision, "1");
+        assert!(
+            !base.contains('-'),
+            "a `-` in the upstream part would read as a revision"
+        );
+        assert_eq!(
+            run(&["--base"]),
+            base,
+            "--base must agree with the version it derives from"
+        );
+
+        // dpkg is the authority on ordering, so ask it rather than
+        // reimplementing its comparison. Absent on a non-Debian dev box.
+        if std::process::Command::new("dpkg").arg("--version").output().is_err() {
+            eprintln!("dpkg absent — skipping the ordering half");
+            return;
+        }
+        let ordered = |a: &str, rel: &str, b: &str| {
+            let ok = std::process::Command::new("dpkg")
+                .args(["--compare-versions", a, rel, b])
+                .status()
+                .expect("dpkg --compare-versions")
+                .success();
+            assert!(ok, "dpkg says NOT ({a} {rel} {b})");
+        };
+
+        let release = format!("{base}-1");
+        ordered(&nightly, "lt", &release); // steps up onto stable when it lands
+        ordered(&nightly, "lt", &format!("{base}~pre1-1")); // and below a release candidate
+        ordered(&smoke, "lt", &nightly); // the throwaway never shadows the real one
+        ordered(&format!("{base}~nightly20260907070700.abc1234-1"), "lt", &nightly);
+
+        // Two pushes in one day, in the order they happened: the earlier one
+        // has the alphabetically LARGER hash, so only the time saves us.
+        ordered(
+            &format!("{base}~nightly20260907070700.abc1234-1"),
+            "lt",
+            &format!("{base}~nightly20260907071500.0de5678-1"),
+        );
+
+        // The suffix this one grew out of, still in the published pool. A
+        // 14-digit stamp beats an 8-digit one numerically, which is the whole
+        // reason the sha could be added without stranding an installed
+        // machine on a version apt would refuse to move off.
+        ordered(&format!("{base}~nightly20260907.090151-1"), "lt", &nightly);
     }
 }

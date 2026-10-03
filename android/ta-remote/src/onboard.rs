@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+
 //! Parsing of the `taremote://onboard?url=...&token=...` deep link.
 
 /// Parsed contents of a `taremote://onboard?…` deep link. `url` + `token` are

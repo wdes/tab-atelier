@@ -1,6 +1,4 @@
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// SPDX-License-Identifier: MPL-2.0
 
 //! Headless tab-atelier entry point.
 //!
@@ -51,6 +49,11 @@ const TICK_IDLE: Duration = Duration::from_millis(250);
 /// How long after the last API/WS activity the fast tick stays armed
 /// (covers think-pauses between keystrokes).
 const TICK_HOT: Duration = Duration::from_secs(2);
+/// Grace window on shutdown between SIGTERM-ing a tab's subtree and the hard
+/// SIGKILL — lets `claude` finish flushing `~/.claude.json` before it's killed
+/// (an interrupted write is what corrupted the file on restart). We exit as
+/// soon as every cgroup is empty, so this is only the cap for a hung agent.
+const SHUTDOWN_KILL_GRACE: Duration = Duration::from_secs(5);
 
 // Shared with the GUI — see `crate::tab_env_extras`,
 // `crate::api_url_for_local_clients`, and
@@ -109,8 +112,14 @@ struct HeadlessTab {
     agent_session_id: Option<Arc<str>>,
     agent_kind: Option<Arc<str>>,
     agent_plan_mode: Option<bool>,
+    /// Mirrors `TabState::agent_daemon` — this tab is a session-less daemon.
+    agent_daemon: bool,
+    /// Per-tab badge override; mirrors `TabState::badge`.
+    badge: Option<String>,
     /// Per-tab env vars (`env set --tab <id>`); mirrors `TabState::tab_env`.
     tab_env: std::collections::BTreeMap<String, String>,
+    /// Free-form durable labels (`set-meta`); mirrors `TabState::meta`.
+    meta: std::collections::BTreeMap<String, String>,
     /// Pinned fixed grid size (`tab-atelier resize`); `None` = spawn default.
     /// Persisted to tabs.json so the size survives a restart.
     pinned_cols: Option<u16>,
@@ -130,6 +139,10 @@ struct HeadlessTab {
     /// Persisted; applied on (re)spawn by installing per-tab nftables rules
     /// (CIDRs) before the shell starts. Empty ⇒ not in allowlist mode.
     net_allow: crate::net_policy::AllowConfig,
+    /// Per-tab ssh-agent config (`Some` ⇒ the daemon owns a dedicated agent
+    /// for this tab). Persisted; applied on (re)spawn by injecting the agent's
+    /// `SSH_AUTH_SOCK` before the shell starts. `None` = inherit the ambient env.
+    ssh_agent: Option<crate::SshAgentConfig>,
     /// Per-tab gating DNS resolver, alive while a DOMAIN allowlist tab runs.
     /// Drop-guard (its `Drop` stops the resolver) + source of the
     /// DNS-entries view. `None` outside domain-allowlist mode.
@@ -442,7 +455,7 @@ fn spawn_pty_tab(
     name: String,
     cwd: Option<PathBuf>,
     colors_enabled: bool,
-    extra_env: HashMap<String, String>,
+    mut extra_env: HashMap<String, String>,
     prior_uptime_secs: f64,
     energy_wh: f64,
     saved_output_hash: u32,
@@ -460,7 +473,17 @@ fn spawn_pty_tab(
     pty_rows: usize,
     net_disabled: bool,
     net_allow: crate::net_policy::AllowConfig,
+    ssh_agent: Option<crate::SshAgentConfig>,
 ) -> Option<HeadlessTab> {
+    // Per-tab ssh-agent: `ensure` is idempotent, so a respawn reuses the same
+    // agent (keys stay loaded). `SSH_AUTH_SOCK` can only enter a process at
+    // spawn, so this is where it must be injected — into `extra_env`, which
+    // both the cleared-env and inherited-env branches below carry through.
+    if let Some(cfg) = &ssh_agent
+        && let Some(sock) = crate::ssh_agent::ensure(&id, cfg.key.as_deref())
+    {
+        extra_env.insert("SSH_AUTH_SOCK".into(), sock.to_string_lossy().into_owned());
+    }
     let ws = WindowSize {
         num_lines: pty_rows as u16,
         num_cols: pty_cols as u16,
@@ -666,6 +689,10 @@ fn spawn_pty_tab(
     // would double-launch.
     let pending_agent_resume = match (&agent_kind, &agent_session_id) {
         _ if agent_direct.is_some() || crate::read_only() => None,
+        // A session-less daemon has nothing to resume — just relaunch it. The
+        // GUI already did this for brain; headless didn't, so a restarted
+        // daemon tab came back as a bare shell.
+        (Some(kind), None) => build_agent_resume_command(kind, "", agent_plan_mode),
         (Some(kind), Some(sid)) => build_agent_resume_command(kind, sid, agent_plan_mode),
         _ => None,
     };
@@ -702,6 +729,9 @@ fn spawn_pty_tab(
         last_known_cwd: cwd,
         last_known_cwd_string,
         tab_env,
+        agent_daemon: false,
+        badge: None,
+        meta: std::collections::BTreeMap::new(),
         agent_state: None,
         agent_session_id: agent_session_id.map(Arc::from),
         agent_kind: agent_kind.map(Arc::from),
@@ -719,6 +749,7 @@ fn spawn_pty_tab(
         bg_color,
         net_disabled,
         net_allow,
+        ssh_agent,
         #[cfg(target_os = "linux")]
         net_resolver,
         connections: 0,
@@ -755,21 +786,28 @@ pub fn run() -> std::io::Result<()> {
     // Honour the persisted `tab-atelier log …` filter as a fallback to
     // the env vars, so the CLI toggle works for the daemon too (records
     // still go to stderr/journald here, not a file). Env still wins.
+    // Wrapped in the log ring either way, so `GET /logs` and `tab-atelier
+    // logs` can tail a running daemon that was started with no filter at all.
+    let mut builder = env_logger::Builder::new();
     match crate::resolve_log_filter() {
         Some(filter) => {
-            let _ = env_logger::Builder::new().parse_filters(&filter).try_init();
+            builder.parse_filters(&filter);
         }
-        None => env_logger::init(),
+        None => {
+            builder.parse_default_env();
+        }
     }
+    let logger = builder.build();
+    let level = logger.filter();
+    crate::log_ring::install(logger, level);
 
-    if std::env::args().any(|a| a == "-V" || a == "--version") {
-        println!("{}", crate::version_line("tab-atelier-headless"));
-        return Ok(());
-    }
-
+    // `-V` / `--version` are answered by clap in `cli::dispatch`, which runs
+    // before this function does — the sniff that used to be here was dead code,
+    // and printed a second version format that disagreed with clap's. See
+    // `cli::help_tests::nothing_outside_clap_parses_the_command_line`.
     info!("starting {}", crate::version_line("tab-atelier-headless"));
 
-    let prefs = load_preferences(&platform::config_dir());
+    let mut prefs = load_preferences(&platform::config_dir());
     // Default allowlist for NEW tabs (the seed tab + API-created ones).
     // Restored tabs keep their own persisted config.
     let default_net_allow = prefs.default_allow_config();
@@ -784,8 +822,24 @@ pub fn run() -> std::io::Result<()> {
     if crate::relay_mode() || prefs.relay_mode {
         crate::set_relay_mode(true);
     }
+    // Repair a preferences file that holds both roles, and WRITE IT BACK.
+    // Correcting this only in memory leaves the contradiction on disk, where
+    // the next reader finds it again — which is why an instance could report
+    // `egress: false` from `relay status` while preferences.json still said
+    // true, and an "egress hop" 401 kept coming back from somewhere nobody
+    // could point at.
+    if crate::normalise_relay_config(&mut prefs) {
+        log::warn!(
+            "relay: preferences held both the egress role and a relay target; \
+             the target wins — clearing the egress flag on disk"
+        );
+        if !crate::read_only() {
+            crate::save_preferences(&crate::platform::config_dir(), &prefs);
+        }
+    }
     crate::install_relay_config(&prefs);
     crate::set_tab_env_global(prefs.tab_env.clone());
+    crate::set_folder_styles(prefs.folder_styles.clone());
 
     // Latch the cleared-env opt-in for every tab spawn this process does.
     if prefs.clear_env.unwrap_or(false) {
@@ -890,10 +944,29 @@ pub fn run() -> std::io::Result<()> {
                 spawn_rows,
                 ts.net_disabled,
                 ts.allow_config(),
+                ts.ssh_agent.clone(),
             ) {
                 t.limits = ts.limits.clone();
+                t.meta = ts.meta.clone();
+                t.agent_daemon = ts.agent_daemon;
+                t.badge.clone_from(&ts.badge);
+                // A flagged daemon tab relaunches its own subcommand, whatever
+                // the kind — that's how a harness's watcher survives a restart
+                // without us knowing its name.
+                if ts.agent_daemon
+                    && !crate::read_only()
+                    && let Some(kind) = ts.agent_kind.as_deref()
+                    && let Some(cmd) = crate::daemon_relaunch_command(kind)
+                {
+                    t.pending_restore = None;
+                    t.pending_agent_resume = Some(cmd);
+                }
                 t.pinned_cols = ts.pinned_cols;
                 t.pinned_rows = ts.pinned_rows;
+                // Restore the persisted MRU stamp so Ctrl+P / mobile ordering
+                // survives a daemon restart (the active tab re-stamps to now
+                // via activate() below, which is correct — it IS in use).
+                t.last_used_at = ts.last_used_at;
                 #[cfg(target_os = "linux")]
                 crate::cgroup::apply(
                     &t.id,
@@ -939,6 +1012,7 @@ pub fn run() -> std::io::Result<()> {
             pty_rows,
             false,
             default_net_allow.clone(),
+            None,
         ) {
             // Fresh default tab — no per-tab overrides, so just the
             // global default ceilings.
@@ -968,6 +1042,7 @@ pub fn run() -> std::io::Result<()> {
         pending_lock_changes: Vec::new(),
         pending_net_changes: Vec::new(),
         pending_net_allow_changes: Vec::new(),
+        pending_ssh_agent_changes: Vec::new(),
         pending_bg_color_changes: Vec::new(),
         pending_context_changes: Vec::new(),
         pending_token_rotations: Vec::new(),
@@ -980,6 +1055,8 @@ pub fn run() -> std::io::Result<()> {
         pending_claude_only: None,
         pending_relay_mode: None,
         pending_env_changes: Vec::new(),
+        pending_meta_changes: Vec::new(),
+        pending_badge_changes: Vec::new(),
         pending_relay_config: None,
         pending_renames: Vec::new(),
         pending_status_updates: Vec::new(),
@@ -990,6 +1067,8 @@ pub fn run() -> std::io::Result<()> {
     }));
     info!("API server starting on {api_addr} (TLS {api_tls_addr})");
     api::start_api_server(api_state.clone(), api_token.clone(), read_only, api_addr);
+    // Off unless `fleet_sweep_minutes` says otherwise.
+    crate::sweep::spawn_if_configured(read_only);
     api::start_api_server_tls(
         api_state.clone(),
         api_token.clone(),
@@ -1112,14 +1191,30 @@ pub fn run() -> std::io::Result<()> {
                 &mut last_state_hash,
                 true,
             );
+            // Graceful teardown. SIGHUP the PTY + SIGTERM the whole subtree, let
+            // agents flush and exit, THEN hard-SIGKILL survivors. An immediate
+            // `cgroup.kill` (SIGKILL) here used to catch `claude` mid-write to
+            // `~/.claude.json` and truncate it ("sometimes corrupt on restart");
+            // the grace window lets it finish. We still SIGKILL leftovers so a
+            // claude that ignores SIGTERM can't orphan and make the next start
+            // resume a duplicate.
             for tab in &tabs {
-                tab.shutdown();
-                // Kill the whole tree, not just SIGHUP the PTY — otherwise a
-                // claude that ignores SIGHUP orphans and the NEXT start
-                // resumes a duplicate. (systemd's cgroup kill covers a clean
-                // stop; this covers non-systemd runs + belt-and-suspenders.)
+                tab.shutdown(); // SIGHUP via PTY close
                 #[cfg(target_os = "linux")]
-                crate::cgroup::kill_tab(&tab.id);
+                crate::cgroup::terminate_tab(&tab.id); // SIGTERM the subtree
+            }
+            #[cfg(target_os = "linux")]
+            {
+                // Exit as soon as every tab's cgroup is empty; capped so a hung
+                // agent can't stall the stop (systemd's TimeoutStopSec, default
+                // 90s, comfortably covers this).
+                let deadline = std::time::Instant::now() + SHUTDOWN_KILL_GRACE;
+                while std::time::Instant::now() < deadline && tabs.iter().any(|t| crate::cgroup::tab_has_procs(&t.id)) {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                for tab in &tabs {
+                    crate::cgroup::kill_tab(&tab.id); // SIGKILL survivors + rmdir
+                }
             }
             return Ok(());
         }
@@ -1311,14 +1406,14 @@ fn refresh_snapshot(
             tab.led_last_ring = ring_len;
             tab.last_output_at = Some(Instant::now());
         }
-        // Fold in the ring's viewer-attach timestamp: a viewer (browser
-        // share-link / mobile remote) opening the tab stamped it at connect
-        // time, so this records the open reliably even if the view already
-        // closed — a polled viewer_count edge would have missed it. Monotonic:
-        // only advances last_used_at, never rewinds.
-        let attached = tab.viewer_attached_at.load(std::sync::atomic::Ordering::Relaxed);
-        if attached > tab.last_used_at.unwrap_or(0) {
-            tab.last_used_at = Some(attached);
+        // Fold in the ring's viewer-focus timestamp: a viewer (browser
+        // share-link / mobile remote) stamps this when the user FOCUSES the tab
+        // (an explicit `TAG_FOCUS` frame — not a bare connect/reconnect), so
+        // mobile focus reliably records "used now" even if the view closes
+        // before the next tick. Monotonic: only advances, never rewinds.
+        let focused = tab.viewer_attached_at.load(std::sync::atomic::Ordering::Relaxed);
+        if focused > tab.last_used_at.unwrap_or(0) {
+            tab.last_used_at = Some(focused);
         }
         let agent_led = {
             #[cfg(feature = "catbus")]
@@ -1341,6 +1436,7 @@ fn refresh_snapshot(
                 recent_output,
             )
         };
+        let folder = crate::folder_style_of(tab.last_known_cwd_string.as_deref());
         api_tabs.push(api::SnapshotTab {
             id: tab.id.clone(),
             name: tab.name.clone(),
@@ -1358,7 +1454,8 @@ fn refresh_snapshot(
             share_token_ro: tab.share_token_ro.clone(),
             locked: tab.locked,
             schedule: tab.schedule.clone(),
-            bg_color: crate::effective_tab_bg(tab.bg_color.as_deref(), Some(global_bg)).into(),
+            bg_color: crate::effective_tab_bg(tab.bg_color.as_deref(), folder.color.as_deref(), Some(global_bg)).into(),
+            badge: crate::effective_tab_badge(tab.badge.as_deref(), folder.badge.as_deref()).map(Into::into),
             context: tab.context.clone(),
             shell_pid: tab.pid,
             agent_state: tab.agent_state.clone(),
@@ -1379,6 +1476,8 @@ fn refresh_snapshot(
             // sidecar cache yet) — headless reports None here.
             resident_memory_bytes: crate::agent_probe::sample_tree(tab.pid).map(|s| s.rss_kb.saturating_mul(1024)),
             tokens: None,
+            tab_env: tab.tab_env.clone(),
+            meta: tab.meta.clone(),
         });
     }
     let mut snapshot = api_state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1574,10 +1673,12 @@ fn persist(
             id: tab.id.to_string(),
             name: tab.name.to_string(),
             cwd: tab.last_known_cwd_string.as_deref().map(str::to_string),
+            last_used_at: tab.last_used_at,
             colors_enabled: tab.colors_enabled,
             agent_session_id: tab.agent_session_id.as_deref().map(str::to_string),
             agent_kind: tab.agent_kind.as_deref().map(str::to_string),
             agent_plan_mode: tab.agent_plan_mode,
+            agent_daemon: tab.agent_daemon,
             tab_env: tab.tab_env.clone(),
             pinned_cols: tab.pinned_cols,
             pinned_rows: tab.pinned_rows,
@@ -1590,7 +1691,10 @@ fn persist(
             net_allow_cidrs: tab.net_allow.cidrs.clone(),
             schedule: tab.schedule.clone(),
             bg_color: tab.bg_color.clone(),
+            badge: tab.badge.clone(),
             limits: tab.limits.clone(),
+            ssh_agent: tab.ssh_agent.clone(),
+            meta: tab.meta.clone(),
             ..TabState::default()
         })
         .collect();
@@ -1792,6 +1896,10 @@ fn respawn_tab_net(
     let schedule = tabs[idx].schedule.clone();
     let bg = tabs[idx].bg_color.clone();
     let tab_env = tabs[idx].tab_env.clone();
+    // The ssh-agent drain sets `tabs[idx].ssh_agent` before calling us, so this
+    // picks up the new config; `ensure` is idempotent so an unrelated respawn
+    // (net toggle) reuses the same agent.
+    let ssh_agent = tabs[idx].ssh_agent.clone();
     tabs[idx].shutdown();
     if let Some(mut t) = spawn_pty_tab(
         id,
@@ -1816,6 +1924,7 @@ fn respawn_tab_net(
         pty_rows,
         net_disabled,
         net_allow,
+        ssh_agent,
     ) {
         #[cfg(target_os = "linux")]
         crate::cgroup::apply(&t.id, t.pid, default_limits);
@@ -1841,6 +1950,9 @@ fn drain_pending(
     default_limits: &mut crate::TabResourceLimits,
     default_net_allow: &crate::net_policy::AllowConfig,
 ) -> bool {
+    // Pick up an edited `style --folder` rule without a restart (see the GUI's
+    // `persist`): a stat per tick, parsed only when the file moved.
+    crate::refresh_folder_styles();
     let mut s = api_state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut closes: Vec<usize> = s.pending_closes.drain(..).collect();
     let activate = s.pending_activate.take();
@@ -1851,7 +1963,10 @@ fn drain_pending(
     let net_changes: Vec<(String, bool)> = s.pending_net_changes.drain(..).collect();
     let net_allow_changes: Vec<(String, crate::net_policy::AllowConfig)> =
         s.pending_net_allow_changes.drain(..).collect();
+    let ssh_agent_changes: Vec<(String, Option<crate::SshAgentConfig>)> =
+        s.pending_ssh_agent_changes.drain(..).collect();
     let bg_color_changes: Vec<(String, Option<String>)> = s.pending_bg_color_changes.drain(..).collect();
+    let badge_changes: Vec<(String, Option<String>)> = s.pending_badge_changes.drain(..).collect();
     let context_changes: Vec<(String, Option<String>)> = s.pending_context_changes.drain(..).collect();
     let token_rotations: Vec<String> = s.pending_token_rotations.drain(..).collect();
     let schedule_changes: Vec<(String, Option<crate::schedule::TabSchedule>)> =
@@ -1863,6 +1978,7 @@ fn drain_pending(
     let relay_mode_change: Option<bool> = s.pending_relay_mode.take();
     let relay_config_change = s.pending_relay_config.take();
     let env_changes: Vec<crate::api::EnvChange> = s.pending_env_changes.drain(..).collect();
+    let meta_changes: Vec<crate::api::MetaChange> = s.pending_meta_changes.drain(..).collect();
     let new_tabs = std::mem::take(&mut s.pending_new_tabs);
     let new_tab_cwds: std::collections::VecDeque<std::path::PathBuf> = std::mem::take(&mut s.pending_new_tab_cwds);
     drop(s);
@@ -1876,6 +1992,7 @@ fn drain_pending(
         && lock_changes.is_empty()
         && net_changes.is_empty()
         && net_allow_changes.is_empty()
+        && ssh_agent_changes.is_empty()
         && bg_color_changes.is_empty()
         && context_changes.is_empty()
         && token_rotations.is_empty()
@@ -1949,6 +2066,34 @@ fn drain_pending(
             );
         }
     }
+    // Per-tab ssh-agent set/clear: update the durable field, then respawn so
+    // the new `SSH_AUTH_SOCK` (or its absence) reaches the shell. We reap the
+    // old agent first for BOTH enable and disable: on disable it would else
+    // leak until process exit; on (re-)enable it means an explicit key change
+    // (`ssh-agent <tab> --key B`) starts a fresh agent with B rather than
+    // silently reusing the old one — `ensure` is idempotent, so without this
+    // the new key would never load. (The net-toggle respawn path does NOT
+    // teardown, so manually-loaded keys survive an unrelated respawn.)
+    for (tab_id, config) in ssh_agent_changes {
+        if let Some(idx) = tabs.iter().position(|t| *t.id == tab_id) {
+            crate::ssh_agent::teardown(&tab_id);
+            tabs[idx].ssh_agent = config;
+            let disabled = tabs[idx].net_disabled;
+            let allow = tabs[idx].net_allow.clone();
+            respawn_tab_net(
+                tabs,
+                idx,
+                *active,
+                disabled,
+                allow,
+                api_url_for_pty,
+                api_token,
+                pty_cols,
+                pty_rows,
+                default_limits,
+            );
+        }
+    }
     // Revoke per-tab share tokens (the snapshot was already cleared by
     // the endpoint); persists the cleared state into tabs.json below.
     for tab_id in token_rotations {
@@ -1961,6 +2106,11 @@ fn drain_pending(
     for (tab_id, color) in bg_color_changes {
         if let Some(t) = tabs.iter_mut().find(|t| *t.id == tab_id) {
             t.bg_color = color;
+        }
+    }
+    for (tab_id, badge) in badge_changes {
+        if let Some(t) = tabs.iter_mut().find(|t| *t.id == tab_id) {
+            t.badge = badge;
         }
     }
     // …and the per-tab agent context.
@@ -2091,20 +2241,32 @@ fn drain_pending(
         }
     }
 
+    // Free-form durable labels (`set-meta`) onto the runtime tab — persisted
+    // on the next tick like every other durable field.
+    for ch in meta_changes {
+        if let Some(t) = tabs.iter_mut().find(|t| *t.id == ch.tab_id) {
+            crate::apply_meta_change(&mut t.meta, &ch.key, ch.value);
+        }
+    }
+
     // Status updates: write transient + durable agent fields.
     for upd in status_updates {
         let Some(tab) = tabs.iter_mut().find(|t| *t.id == upd.tab_id) else {
             continue;
         };
-        if upd.label.as_deref() == Some("__clear__") {
+        if upd.wipe_attachment {
             tab.agent_state = None;
             tab.agent_session_id = None;
             tab.agent_kind = None;
             tab.agent_plan_mode = None;
         } else {
-            tab.agent_state = Some(AgentStateSnapshot {
-                state: upd.state,
-                label: upd.label,
+            // `state: None` (the wire's "idle") takes the indicator down;
+            // the metadata below applies either way, so an update that
+            // names its session parks the LED and still leaves the tab
+            // resumable — which is what codex's wrapper does on exit.
+            tab.agent_state = upd.state.map(|state| AgentStateSnapshot {
+                state,
+                label: upd.label.clone(),
                 updated_at: Instant::now(),
             });
             if upd.session_id.is_some() {
@@ -2115,6 +2277,9 @@ fn drain_pending(
             }
             if upd.plan_mode.is_some() {
                 tab.agent_plan_mode = upd.plan_mode;
+            }
+            if let Some(d) = upd.daemon {
+                tab.agent_daemon = d;
             }
         }
     }
@@ -2269,6 +2434,8 @@ fn drain_pending(
                 crate::cgroup::kill_tab(&tabs[idx].id);
                 crate::net_nft::teardown(&tabs[idx].id);
             }
+            // Reap the tab's dedicated ssh-agent, if any (no-op otherwise).
+            crate::ssh_agent::teardown(&tabs[idx].id);
             tabs.remove(idx);
             if *active >= tabs.len() {
                 *active = tabs.len() - 1;
@@ -2311,9 +2478,12 @@ fn drain_pending(
             }
         });
         let id = default_tab_id();
-        let env = tab_env_extras(&id, api_url_for_pty, api_token, &std::collections::BTreeMap::new());
+        let mut env = tab_env_extras(&id, api_url_for_pty, api_token, &std::collections::BTreeMap::new());
+        // Every tab here came from the API — an agent's, not the user's — so
+        // it launches with colour output off. See `new_tab_env`.
+        env.extend(crate::new_tab_env(true));
         let name = format!("Terminal {}", tabs.len());
-        if let Some(mut t) = spawn_pty_tab(
+        if let Some(t) = spawn_pty_tab(
             id,
             name,
             cwd,
@@ -2336,6 +2506,7 @@ fn drain_pending(
             pty_rows,
             false,
             default_net_allow.clone(),
+            None,
         ) {
             // API-created tab — global default ceilings (no per-tab
             // overrides exist until one is set).
@@ -2343,12 +2514,12 @@ fn drain_pending(
             crate::cgroup::apply(&t.id, t.pid, default_limits);
             #[cfg(not(target_os = "linux"))]
             let _ = default_limits;
-            if *active < tabs.len() {
-                tabs[*active].deactivate();
-            }
-            t.activate();
+            // API-created tabs (an agent's `dispatch --new`, `tab-atelier
+            // add`) do NOT become active: a fleet spawning workers must not
+            // move the user's selection, and the GUI's matching path leaves
+            // focus alone for the same reason. An explicit `activate` still
+            // works if a caller really wants the switch.
             tabs.push(t);
-            *active = tabs.len() - 1;
         }
     }
     did_work

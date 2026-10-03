@@ -1,6 +1,4 @@
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// SPDX-License-Identifier: MPL-2.0
 
 // The palette (`Theme`, `ThemeName`) compiles in both builds; the
 // `*_hsla` adapters that actually need gpui are gated behind `gui`.
@@ -95,6 +93,7 @@ impl CursorStyle {
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct Theme {
     pub term_fg: u32,
     pub term_bg: u32,
@@ -109,6 +108,23 @@ pub struct Theme {
     pub accent: u32,
     pub accent_hover: u32,
     pub danger: u32,
+}
+
+impl Theme {
+    /// This theme with its terminal background swapped for a per-tab tint.
+    ///
+    /// Every path that resolves "the default background" — the base fill, a
+    /// cell painted with `NamedColor::Background` / index 257, an inverse
+    /// cell, and the OSC 11 reply an app reads to pick its own colours — must
+    /// go through the SAME value, or a tinted tab gets the theme's colour back
+    /// in whichever path was missed.
+    #[must_use]
+    pub const fn with_term_bg(mut self, rgb: Option<u32>) -> Self {
+        if let Some(c) = rgb {
+            self.term_bg = c;
+        }
+        self
+    }
 }
 
 #[cfg(feature = "gui")]

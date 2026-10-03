@@ -1,6 +1,4 @@
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// SPDX-License-Identifier: MPL-2.0
 
 use std::fmt::Write as _;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -10,7 +8,33 @@ use serde::Serialize;
 
 use log::{debug, error, info};
 
-use crate::tracking::USER_AGENT;
+mod assets;
+mod blackboard_route;
+#[cfg(feature = "catbus")]
+mod catbus;
+mod claims_route;
+mod claude_only;
+mod env;
+mod files;
+mod fleet_route;
+mod input;
+mod limits;
+mod lock;
+mod meta;
+mod net;
+mod outbox;
+mod output;
+mod relay;
+mod rename;
+mod resize;
+mod schedule;
+mod ssh_agent;
+mod status;
+mod tab_props;
+mod tabs;
+mod tokens;
+mod usage;
+mod view;
 
 const VIEWER_HTML: &str = include_str!("../assets/web-viewer.html");
 
@@ -21,6 +45,11 @@ const VIEWER_HTML: &str = include_str!("../assets/web-viewer.html");
 /// `/assets/xterm-X.Y.Z.{js,css}` URLs that bypass token auth.
 const VENDOR_XTERM_JS: &str = include_str!("../assets/vendor/xterm-6.0.0/xterm.js");
 const VENDOR_XTERM_CSS: &str = include_str!("../assets/vendor/xterm-6.0.0/xterm.css");
+/// Vendored Unicode 11 width provider (self-contained port of
+/// `@xterm/addon-unicode11` at the xterm 6.0.0 tag). Loaded by the viewer so
+/// emoji count as 2 cells like the desktop terminal — without it xterm's
+/// default Unicode 6 tables clip every emoji to half a cell (columns desync).
+const VENDOR_XTERM_UNICODE11_JS: &str = include_str!("../assets/vendor/xterm-6.0.0/addon-unicode11.js");
 
 /// `xterm.js` ends with a `//# sourceMappingURL=xterm.js.map` pointer,
 /// but we don't ship the `.map` (and it isn't on the no-auth asset
@@ -107,6 +136,49 @@ pub const BUILD_HASH: &str = env!("BUILD_HASH");
 
 /// Parse the tab segment between `/tabs/` and a suffix into either
 /// a numeric index or a UUID. Returns `(idx, key_for_html)` after
+/// Is this request one a sidecar peer may make with the remote token?
+///
+/// The sidecar mirrors tabs and drives them: list, read output, type input,
+/// move files through the sandboxed inbox/outbox, and the tab-level commands
+/// its protocol exposes (activate / rename / close). Everything else — token
+/// rotation, relay config, env, limits, ssh-agent, the log ring — stays
+/// master-only, so a peer link can't quietly become full control.
+///
+/// Typing into a tab is already arbitrary code execution there, so allowing
+/// close/rename alongside it is no escalation; reading this instance's secrets
+/// or re-pointing its relay would be.
+fn sidecar_route(method: &str, path: &str) -> bool {
+    if path == "/tabs" {
+        return method == "GET" || method == "POST";
+    }
+    // Gossip: a peer daemon reads our blackboard and offers us its own. Both
+    // directions are safe to expose because the log is a grow-only set —
+    // merging is a union, so a peer can add entries but can never remove,
+    // rewrite or reorder ours. Claims are deliberately NOT here: a lease is
+    // host-local mutual exclusion, and honouring a remote host's claim would
+    // mean trusting its clock.
+    if path == "/blackboard" {
+        return method == "GET" || method == "POST";
+    }
+    let Some(rest) = path.strip_prefix("/tabs/") else {
+        return false;
+    };
+    // `/tabs/<idx>` on its own — close.
+    if !rest.contains('/') {
+        return method == "DELETE";
+    }
+    // A download is `/tabs/<id>/outbox/<name>`, so check the section before
+    // falling back to the trailing segment.
+    if rest.contains("/outbox/") || rest.contains("/inbox/") {
+        return method == "GET";
+    }
+    match rest.rsplit('/').next().unwrap_or("") {
+        "output" | "stream" | "outbox" | "inbox" => method == "GET",
+        "input" | "files" | "activate" | "rename" => method == "POST",
+        _ => false,
+    }
+}
+
 /// resolution against the snapshot: the index is what every internal
 /// path uses; the key is the string the share URL carries (numeric
 /// or `by-id/UUID`) so the HTML viewer rewrites every subrequest with
@@ -197,6 +269,16 @@ struct TabInfo {
     /// PR/task it's on. Omitted when unset.
     #[serde(skip_serializing_if = "Option::is_none")]
     context: Option<String>,
+    /// Free-form durable labels the tab set for itself via `set-meta`. We
+    /// assign no meaning to the keys — an orchestration layer carries its own
+    /// vocabulary here (role, phase, whatever) without us growing a field per
+    /// idea. Omitted when empty.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    meta: std::collections::BTreeMap<String, String>,
+    /// Short tag drawn on the tab (per-tab override or the folder rule for its
+    /// cwd). Omitted when the tab has none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    badge: Option<String>,
     /// Number of WS viewers (browser share-link / `remote attach`)
     /// currently watching this tab. Omitted when zero.
     #[serde(skip_serializing_if = "is_zero")]
@@ -233,6 +315,16 @@ struct TabInfo {
     /// non-agent tabs so existing consumers don't see a new field.
     #[serde(skip_serializing_if = "Option::is_none")]
     tokens: Option<crate::TokenUsage>,
+    /// CRC-32 of the tab's current output — the same value `/output` returns
+    /// as `X-Output-Crc`. Lets a poller learn in ONE request which tabs moved:
+    /// `brain` watches every Claude tab for a frozen screen and otherwise
+    /// re-fetches each tab's whole grid every tick just to discover that
+    /// nothing changed. Compare with the previous listing; fetch `/output`
+    /// only where it differs.
+    output_crc: u32,
+    /// Byte length behind `output_crc`. Pairs with it for the conditional
+    /// `/output?since=&crc=` form, and separates "empty" from "unchanged".
+    output_len: u64,
 }
 
 /// One DNS-entries-view row for the `/tabs` response.
@@ -358,6 +450,10 @@ pub struct SnapshotTab {
     /// viewer via `X-Tab-Bg` on /output + `__TAB_BG__` template
     /// substitution on /view.
     pub bg_color: std::sync::Arc<str>,
+    /// Effective badge (per-tab override or folder rule; `None` ⇒ none), the
+    /// short tag the desktop draws on the tab. Surfaced on `/tabs` so the
+    /// mobile remote and the CLI list render the same identity.
+    pub badge: Option<std::sync::Arc<str>>,
     /// Free-text context an in-tab agent set for itself via
     /// `tab-atelier set-context "…"` — e.g. the PR/issue it's working
     /// on. Surfaced on `/tabs` and as a hover tooltip on the GUI tab
@@ -436,6 +532,13 @@ pub struct SnapshotTab {
     /// catbus-agent `tokens.json` sidecar. `None` for non-agent tabs (or
     /// builds without `catbus`). Surfaced as `tokens: {input, output}`.
     pub tokens: Option<crate::TokenUsage>,
+    /// Per-tab env overrides (`env set --tab <id>`), mirrored from the runtime
+    /// tab so `GET /tabs/<id>/env` (the CLI `env list --tab`) can report them
+    /// without reading tabs.json off disk. Empty ⇒ no per-tab overrides.
+    pub tab_env: std::collections::BTreeMap<String, String>,
+    /// Free-form durable labels (`set-meta`), mirrored from the runtime tab so
+    /// `/tabs` can serve them. Empty ⇒ none set.
+    pub meta: std::collections::BTreeMap<String, String>,
 }
 
 impl crate::schedule::LockState for SnapshotTab {
@@ -447,6 +550,14 @@ impl crate::schedule::LockState for SnapshotTab {
     }
 }
 
+/// The `label` that means "forget this tab's agent attachment", not
+/// "display this text": Claude Code's `SessionEnd` hook sends it so the
+/// grey *session attached* dot doesn't outlive the session. Kept as a
+/// wire value (rather than a fourth `state`) so that hooks written
+/// against older builds keep working, and used only by callers that
+/// mean it — a bare `state: "idle"` just parks the indicator.
+pub const WIPE_LABEL: &str = "__clear__";
+
 /// A status update queued by `POST /tabs/by-id/{id}/status` — drained
 /// by the main loop, which writes both the transient `agent_state`
 /// snapshot and the durable `agent_session_id` / `agent_kind` /
@@ -454,11 +565,19 @@ impl crate::schedule::LockState for SnapshotTab {
 #[derive(Clone, Debug)]
 pub struct PendingStatusUpdate {
     pub tab_id: String,
-    pub state: crate::AgentState,
+    /// `None` = take the indicator down (the wire's `"idle"`). The
+    /// metadata fields below are applied either way, so an update that
+    /// names its session can park the indicator *and* stay resumable.
+    pub state: Option<crate::AgentState>,
     pub label: Option<String>,
     pub session_id: Option<String>,
     pub agent_kind: Option<String>,
     pub plan_mode: Option<bool>,
+    /// `--daemon`: this tab is a session-less daemon to relaunch on restart.
+    pub daemon: Option<bool>,
+    /// Drop the durable attachment as well (see [`WIPE_LABEL`]). The
+    /// metadata fields above are ignored when this is set.
+    pub wipe_attachment: bool,
 }
 
 /// A queued relay-config change (the CLI `relay via <ep>` / `relay egress`).
@@ -479,6 +598,15 @@ pub struct EnvChange {
     pub tab: Option<String>,
     pub set: std::collections::BTreeMap<String, String>,
     pub unset: Vec<String>,
+}
+
+/// One `POST /tabs/by-id/{id}/meta` change, drained by the main loop onto the
+/// tab's [`crate::TabState::meta`]. `value: None` removes the key.
+#[derive(Clone, Debug)]
+pub struct MetaChange {
+    pub tab_id: String,
+    pub key: String,
+    pub value: Option<String>,
 }
 
 pub struct TabSnapshot {
@@ -522,6 +650,14 @@ pub struct TabSnapshot {
     /// returns 501 and never pushes here — hence unread in the `gui` build.
     #[cfg_attr(feature = "gui", allow(dead_code))]
     pub pending_net_allow_changes: Vec<(String, crate::net_policy::AllowConfig)>,
+    /// (`tab_id`, ssh-agent-config-or-None) queued by
+    /// `POST /tabs/by-id/{id}/ssh-agent`. Drained by the headless main loop,
+    /// which sets the config on the `HeadlessTab` and respawns the PTY so the
+    /// new `SSH_AUTH_SOCK` (or its absence) takes effect; `None` reaps the
+    /// agent. Headless-only — the GUI spawn path isn't wired, so its route
+    /// returns 501 and never pushes here (unread in the `gui` build).
+    #[cfg_attr(feature = "gui", allow(dead_code))]
+    pub pending_ssh_agent_changes: Vec<(String, Option<crate::SshAgentConfig>)>,
     /// (`tab_id`, color-or-None) queued by `POST /tabs/by-id/{id}/bg-color`.
     /// `None` clears the per-tab override → tab falls back to the
     /// global default. Same drain shape as `pending_lock_changes`.
@@ -578,6 +714,12 @@ pub struct TabSnapshot {
     /// `POST /tabs/by-id/<id>/env` (per-tab). Drained by the owner, which merges
     /// them into the global/per-tab map, persists, and respawns if asked.
     pub pending_env_changes: Vec<EnvChange>,
+    /// Meta-label changes queued by `POST /tabs/by-id/<id>/meta`, drained onto
+    /// the tab's durable `meta` map by the owner.
+    pub pending_meta_changes: Vec<MetaChange>,
+    /// (tab id, badge) queued by `POST /tabs/by-id/<id>/badge`; `None` clears
+    /// the per-tab override so the tab falls back to its folder rule.
+    pub pending_badge_changes: Vec<(String, Option<String>)>,
     /// Relay endpoint/egress change queued by `POST /relay-config`.
     pub pending_relay_config: Option<RelayConfigChange>,
     /// (tab index, new name) pairs queued by `POST /tabs/{idx}/rename`.
@@ -694,6 +836,23 @@ fn write_new_file_no_symlink(path: &std::path::Path, bytes: &[u8]) -> std::io::R
 /// `{state_base}/tab-atelier/api.token` with mode 600. Persisting the
 /// token means already-paired mobile clients keep working across
 /// desktop restarts instead of falling out to 401 every time.
+/// Record the loopback URL this instance actually bound, next to its
+/// `api.token`, so CLI verbs can find a daemon that isn't on the default port.
+///
+/// Discovery used to assume `127.0.0.1:7890`. Move `api_addr` and every verb
+/// then sends a valid token to whatever else is on 7890 — answered by a 401
+/// that looks like a credential problem and isn't. The bound port is the
+/// daemon's to publish, and it's the *real* one (post-fallback), which is why
+/// this is written from the listener rather than from the configured spec.
+pub fn record_bound_url(port: u16) {
+    let dir = crate::platform::state_base_dir().join(crate::APP_DIR);
+    if std::fs::create_dir_all(&dir).is_ok() {
+        // Best-effort, like the token write: a read-only home must not stop
+        // the server from serving.
+        let _ = std::fs::write(dir.join("api.url"), format!("http://127.0.0.1:{port}"));
+    }
+}
+
 pub fn load_or_generate_token() -> String {
     let dir = crate::platform::state_base_dir().join(crate::APP_DIR);
     let path = dir.join("api.token");
@@ -1088,8 +1247,13 @@ pub fn count_files_tree(dir: &std::path::Path) -> usize {
     n
 }
 
+/// Smallest body worth compressing. Shared with `respond_with_etag_precomputed`
+/// so it can tell which representation it is about to send without paying for
+/// the compression first.
+const GZIP_MIN_BODY: usize = 4096;
+
 fn maybe_gzip(bytes: &[u8], accept_gzip: bool) -> Option<Vec<u8>> {
-    const MIN_BODY: usize = 4096;
+    const MIN_BODY: usize = GZIP_MIN_BODY;
     if !accept_gzip || bytes.len() < MIN_BODY {
         return None;
     }
@@ -1232,12 +1396,26 @@ fn respond_with_etag_precomputed<W: Write>(
     extra_headers: &str,
     etag: Option<String>,
 ) {
-    let etag = etag.unwrap_or_else(|| etag_for(body));
+    let base_etag = etag.unwrap_or_else(|| etag_for(body));
+    // One ETag per REPRESENTATION, not per resource. The gzipped and identity
+    // bodies are different bytes, so sharing a tag lets a shared cache hand a
+    // stored gzip response to a client that never asked for one — and a client
+    // revalidating an identity copy could be told 304 for a gzip it does not
+    // have. `will_gzip` mirrors `maybe_gzip`'s rule so this decision costs no
+    // compression on a conditional request that is about to 304.
+    let will_gzip = accept_gzip && body.len() >= GZIP_MIN_BODY;
+    let etag = if will_gzip {
+        format!("{base_etag}-gz")
+    } else {
+        base_etag
+    };
+    // Any cache in the path must key on the encoding for the same reason.
+    let vary = "Vary: Accept-Encoding\r\n";
     if status == 200 && if_none_match.is_some_and(|v| v == etag) {
         // Content is byte-identical to what the client already has.
         let _ = write!(
             stream,
-            "HTTP/1.1 304 Not Modified\r\nETag: \"{etag}\"\r\n{ROBOTS_TAG}{extra_headers}\r\n"
+            "HTTP/1.1 304 Not Modified\r\nETag: \"{etag}\"\r\n{vary}{ROBOTS_TAG}{extra_headers}\r\n"
         );
         return;
     }
@@ -1254,14 +1432,14 @@ fn respond_with_etag_precomputed<W: Write>(
     if let Some(gz) = maybe_gzip(body, accept_gzip) {
         let _ = write!(
             stream,
-            "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Encoding: gzip\r\nETag: \"{etag}\"\r\n{ROBOTS_TAG}{extra_headers}Content-Length: {}\r\n\r\n",
+            "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Encoding: gzip\r\nETag: \"{etag}\"\r\n{vary}{ROBOTS_TAG}{extra_headers}Content-Length: {}\r\n\r\n",
             gz.len()
         );
         let _ = stream.write_all(&gz);
     } else {
         let _ = write!(
             stream,
-            "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nETag: \"{etag}\"\r\n{ROBOTS_TAG}{extra_headers}Content-Length: {}\r\n\r\n",
+            "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nETag: \"{etag}\"\r\n{vary}{ROBOTS_TAG}{extra_headers}Content-Length: {}\r\n\r\n",
             body.len()
         );
         let _ = stream.write_all(body);
@@ -1285,6 +1463,26 @@ fn respond_json<W: Write>(stream: &mut W, status: u16, body: &str) {
     let _ = write!(
         stream,
         "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\n{ROBOTS_TAG}Content-Length: {}\r\n\r\n{}",
+        body.len(),
+        body
+    );
+}
+
+/// Like [`respond_json`], plus `Access-Control-Allow-Origin: *`.
+///
+/// Used only for `/fleet`, and only for requests that arrived on loopback, so
+/// a local dashboard can be a plain `file://` page instead of an asset served
+/// by the daemon — which is the point: fetching the viewer's fonts and scripts
+/// from a busy daemon is exactly what is slow when the box is loaded.
+///
+/// The route still requires the token; CORS only decides whether a browser
+/// lets a page READ the reply. A page that already has the token has already
+/// won, and a non-loopback caller gets no header at all.
+fn respond_json_cors<W: Write>(stream: &mut W, status: u16, body: &str) {
+    let _ = write!(
+        stream,
+        "HTTP/1.1 {} OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\n{ROBOTS_TAG}Content-Length: {}\r\n\r\n{}",
+        status,
         body.len(),
         body
     );
@@ -1373,7 +1571,13 @@ fn html_escape(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
-fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnapshot>>, _token: &str, read_only: bool) {
+fn handle_connection<S: Read + Write>(
+    stream: &mut S,
+    state: &Arc<Mutex<TabSnapshot>>,
+    _token: &str,
+    read_only: bool,
+    from_loopback: bool,
+) {
     // Owned BufReader around the stream itself — `try_clone` was only used
     // to dodge the read/write borrow on TcpStream, but it doesn't exist on
     // rustls::Stream. Buffering on `&mut S` works for both, and the read
@@ -1469,7 +1673,13 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
     // by some reverse proxies / Cloudflare Tunnel normalisation)
     // still matches the `ends_with("/view")` route arms below.
     // `/` itself is preserved so the root keeps working.
-    let path = if path.len() > 1 && path.ends_with('/') {
+    // Remembered, not just stripped: the browser resolves the page's relative
+    // asset URLs against the path IT requested, so `/tabs/0/view/` sits one
+    // directory deeper than `/tabs/0/view` and needs one more `../`. Matching
+    // the route without carrying this made every asset 404 behind a proxy that
+    // normalises trailing slashes.
+    let had_trailing_slash = path.len() > 1 && path.ends_with('/');
+    let path = if had_trailing_slash {
         path.trim_end_matches('/').to_string()
     } else {
         path
@@ -1519,114 +1729,16 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
     // browser (without the token in their session cookies) can
     // still load the JS that fetches /stream with the token from
     // the URL.
-    // OpenAPI spec — public so tooling (Swagger UI, codegen) can fetch it
-    // without a token. Read from the installed /usr/share/doc copy.
-    if (method.as_str(), path.as_str()) == ("GET", "/openapi.yaml") {
-        let spec = openapi_spec();
-        respond_with_etag(
-            stream,
-            200,
-            "application/yaml; charset=utf-8",
-            spec.as_bytes(),
-            accept_gzip,
-            if_none_match.as_deref(),
-            "Cache-Control: no-cache\r\n",
-        );
+    // Public static assets (spec, catalog, viewer JS/CSS/font, icons) are
+    // served before the auth gate — a favicon / spec fetch never needs a token.
+    if assets::try_serve(
+        stream,
+        method.as_str(),
+        path.as_str(),
+        accept_gzip,
+        if_none_match.as_deref(),
+    ) {
         return;
-    }
-    // RFC 9727 API Catalog at the IANA-registered well-known URI. Returns
-    // an RFC 9264 linkset pointing to the OpenAPI description via the RFC
-    // 8631 `service-desc` relation, so generic API tooling can discover
-    // the spec from the host root. Public (no token).
-    if (method.as_str(), path.as_str()) == ("GET", "/.well-known/api-catalog") {
-        let body = r#"{"linkset":[{"anchor":"/.well-known/api-catalog","service-desc":[{"href":"/openapi.yaml","type":"application/yaml","title":"tab-atelier local API (OpenAPI 3.1)"}]}]}"#;
-        let _ = write!(
-            stream,
-            "HTTP/1.1 200 OK\r\nContent-Type: application/linkset+json\r\n{ROBOTS_TAG}Cache-Control: no-cache\r\nContent-Length: {}\r\n\r\n{body}",
-            body.len(),
-        );
-        return;
-    }
-    if let (
-        "GET",
-        "/assets/xterm-6.0.0.js"
-        | "/assets/xterm-6.0.0.css"
-        | "/assets/main.js"
-        | "/assets/main.css"
-        | "/assets/term-symbols.woff2",
-    ) = (method.as_str(), path.as_str())
-    {
-        let (body, ctype): (&[u8], &str) = match path.as_str() {
-            "/assets/xterm-6.0.0.js" => (
-                VENDOR_XTERM_JS_SERVED.as_bytes(),
-                "application/javascript; charset=utf-8",
-            ),
-            "/assets/xterm-6.0.0.css" => (VENDOR_XTERM_CSS.as_bytes(), "text/css; charset=utf-8"),
-            "/assets/main.js" => (MAIN_JS.as_bytes(), "application/javascript; charset=utf-8"),
-            "/assets/term-symbols.woff2" => (VENDOR_TERM_SYMBOLS_WOFF2, "font/woff2"),
-            _ => (MAIN_CSS.as_bytes(), "text/css; charset=utf-8"),
-        };
-        // Cache aggressively. xterm-*.{js,css} are version-pinned
-        // in the URL path; main.{js,css} get a `?version=<hash>`
-        // query string from the viewer HTML. Either way, a new
-        // deb publishes new content under a new effective cache
-        // key — `immutable` is safe.
-        respond_with_etag(
-            stream,
-            200,
-            ctype,
-            body,
-            accept_gzip,
-            if_none_match.as_deref(),
-            "Cache-Control: public, max-age=31536000, immutable\r\n",
-        );
-        return;
-    }
-
-    // Site icons + web metadata. Public (no token) — a favicon/robots request
-    // must never 401. Served at the origin root so the browser's automatic
-    // `/favicon.ico` / `/apple-touch-icon.png` / `/robots.txt` fetches hit us;
-    // the viewer HTML also declares them via `__ASSET_PREFIX__` for sub-path
-    // reverse-proxy mounts.
-    if method.as_str() == "GET" {
-        let icon: Option<(&[u8], &str, &str)> = match path.as_str() {
-            "/favicon.ico" => Some((FAVICON_ICO, "image/x-icon", "public, max-age=604800")),
-            "/favicon.svg" => Some((
-                FAVICON_SVG.as_bytes(),
-                "image/svg+xml; charset=utf-8",
-                "public, max-age=604800",
-            )),
-            "/favicon-16x16.png" => Some((FAVICON_PNG_16, "image/png", "public, max-age=604800")),
-            "/favicon-32x32.png" => Some((FAVICON_PNG_32, "image/png", "public, max-age=604800")),
-            "/apple-touch-icon.png" | "/apple-touch-icon-precomposed.png" => {
-                Some((APPLE_TOUCH_ICON, "image/png", "public, max-age=604800"))
-            }
-            "/icon-192.png" => Some((ICON_PNG_192, "image/png", "public, max-age=604800")),
-            "/icon-512.png" => Some((ICON_PNG_512, "image/png", "public, max-age=604800")),
-            "/site.webmanifest" => Some((
-                SITE_WEBMANIFEST.as_bytes(),
-                "application/manifest+json; charset=utf-8",
-                "public, max-age=86400",
-            )),
-            "/robots.txt" => Some((
-                ROBOTS_TXT.as_bytes(),
-                "text/plain; charset=utf-8",
-                "public, max-age=86400",
-            )),
-            _ => None,
-        };
-        if let Some((body, ctype, cache)) = icon {
-            respond_with_etag(
-                stream,
-                200,
-                ctype,
-                body,
-                accept_gzip,
-                if_none_match.as_deref(),
-                &format!("Cache-Control: {cache}\r\n"),
-            );
-            return;
-        }
     }
 
     let provided_token = auth_token.or(query_token);
@@ -1665,7 +1777,21 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
         }
         ok
     };
-    if !is_master {
+    // A sidecar peer (`remote attach` / `put` / `get` from another machine)
+    // authenticates with THIS instance's remote token, scoped to the tab
+    // operations it performs (see `sidecar_route`). It deliberately cannot
+    // rotate credentials, read the log ring, reconfigure the relay or dump the
+    // env — handing a peer the master token would grant all of that, for as
+    // long as it holds it.
+    let is_remote_peer = !is_master
+        && provided_token
+            .as_deref()
+            .is_some_and(|p| constant_time_eq(p.as_bytes(), crate::remote_token().as_bytes()))
+        && sidecar_route(&method, &path);
+    if is_remote_peer {
+        state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).touch();
+    }
+    if !is_master && !is_remote_peer {
         let allowed = if let Some(p) = provided_token.as_deref()
             && let Some(rest) = path.strip_prefix("/tabs/by-id/")
             && let Some((uuid, action)) = rest.split_once('/')
@@ -1747,952 +1873,93 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
 
     match (method.as_str(), path.as_str()) {
         ("GET", "/" | "/tabs") => {
-            let mut state = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(body) = state.cached_response.clone() {
-                drop(state);
-                respond_with_etag(
-                    stream,
-                    200,
-                    "application/json",
-                    body.as_bytes(),
-                    accept_gzip,
-                    if_none_match.as_deref(),
-                    "",
-                );
-                return;
-            }
-            let tabs: Vec<TabInfo> = state
-                .tabs
-                .iter()
-                .enumerate()
-                .map(|(i, t)| TabInfo {
-                    index: i,
-                    id: t.id.to_string(),
-                    name: t.name.to_string(),
-                    cwd: t.cwd.as_deref().map(str::to_string),
-                    active: i == state.active,
-                    // The cached output now ships ANSI SGR escapes for
-                    // remote-side colouring, but the tab-list preview is
-                    // rendered as plain Text — strip them first so the
-                    // ESC byte and `[…m` payload don't show up as junk.
-                    preview: strip_ansi(t.output.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("")),
-                    uptime_secs: t.uptime_secs,
-                    #[cfg(feature = "energy")]
-                    cpu_percent: state.power.get(i).map_or(0.0, |p| p.cpu_percent),
-                    #[cfg(feature = "energy")]
-                    watts: state.power.get(i).and_then(|p| p.watts),
-                    agent_state: t.agent_state.as_ref().map(|s| match s.state {
-                        crate::AgentState::Thinking => "thinking",
-                        crate::AgentState::Waiting => "waiting",
-                        crate::AgentState::Error => "error",
-                    }),
-                    agent_kind: t.agent_kind.as_deref().map(str::to_string),
-                    led: t.agent_led.map(crate::TabLed::slug),
-                    last_used_at: t.last_used_at,
-                    agent_session_id: t.agent_session_id.as_deref().map(str::to_string),
-                    viewers: t.viewers,
-                    locked: crate::schedule::LockState::effective_locked(t),
-                    lock_reason: crate::schedule::LockState::lock_reason(t),
-                    schedule_rule: t.schedule.as_ref().map(|s| s.rule.clone()),
-                    schedule_tz: t.schedule.as_ref().map(|s| s.tz.clone()),
-                    context: t.context.as_deref().map(str::to_string),
-                    net_disabled: t.net_disabled,
-                    connections: t.connections,
-                    tx_bytes: t.tx_bytes,
-                    tx_denied_bytes: t.tx_denied_bytes,
-                    net_allow_presets: t.net_allow.presets.iter().map(|p| p.id().to_string()).collect(),
-                    net_allow_domains: t.net_allow.domains.clone(),
-                    net_allow_cidrs: t.net_allow.cidrs.clone(),
-                    dns: t
-                        .dns_entries
-                        .iter()
-                        .map(|(domain, allowed, ips)| DnsEntryInfo {
-                            domain: domain.clone(),
-                            allowed: *allowed,
-                            ips: ips.clone(),
-                        })
-                        .collect(),
-                    resident_memory_bytes: t.resident_memory_bytes,
-                    tokens: t.tokens,
-                })
-                .collect();
-            #[cfg(feature = "energy")]
-            let host = HostInfo {
-                battery_percent: state.battery_percent,
-                // Sum each tab's watts to give a host-wide draw figure;
-                // tabs without a reading contribute zero, which is the
-                // honest answer for any not-yet-sampled process.
-                watts: {
-                    let total: f64 = state.power.iter().filter_map(|p| p.watts).sum();
-                    if total > 0.0 { Some(total) } else { None }
-                },
-            };
-            #[cfg(not(feature = "energy"))]
-            let host = HostInfo::default();
-            let resp = ApiResponse {
-                app: USER_AGENT,
-                host,
-                tabs,
-            };
-            let body: std::sync::Arc<str> = serde_json::to_string_pretty(&resp).unwrap_or_default().into();
-            state.cached_response = Some(body.clone());
-            drop(state);
-            respond_with_etag(
-                stream,
-                200,
-                "application/json",
-                body.as_bytes(),
-                accept_gzip,
-                if_none_match.as_deref(),
-                "",
-            );
+            tabs::list(stream, state, accept_gzip, if_none_match.as_deref());
         }
         // Lean per-tab consumption projection for a dashboard poller — the
         // same live numbers as `/tabs` but WITHOUT the heavy `output` /
         // `raw_output` scrollback dumps, so it's cheap to poll ~1 s. Same
         // auth gate as `/tabs` (checked upstream of this match).
-        ("GET", "/tabs/usage") => {
-            #[derive(Serialize)]
-            struct UsageTab {
-                id: String,
-                name: String,
-                #[serde(skip_serializing_if = "Option::is_none")]
-                resident_memory_bytes: Option<u64>,
-                #[serde(skip_serializing_if = "Option::is_none")]
-                tokens: Option<crate::TokenUsage>,
-                cpu_percent: f64,
-                connections: usize,
-                tx_bytes: u64,
-            }
-            let state = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            // CPU% is sampled by the `energy` feature (`state.power`, parallel to
-            // `state.tabs` by index); 0.0 when the binary was built without it.
-            // Isolated to this closure so the usage projection below stays
-            // feature-agnostic — the endpoint's shape doesn't depend on `energy`.
-            #[cfg(feature = "energy")]
-            let cpu_of = |i: usize| state.power.get(i).map_or(0.0, |p| p.cpu_percent);
-            #[cfg(not(feature = "energy"))]
-            let cpu_of = |_i: usize| 0.0_f64;
-            let usage: Vec<UsageTab> = state
-                .tabs
-                .iter()
-                .enumerate()
-                .map(|(i, t)| UsageTab {
-                    id: t.id.to_string(),
-                    name: t.name.to_string(),
-                    resident_memory_bytes: t.resident_memory_bytes,
-                    tokens: t.tokens,
-                    cpu_percent: cpu_of(i),
-                    connections: t.connections,
-                    tx_bytes: t.tx_bytes,
-                })
-                .collect();
-            let body = serde_json::to_string_pretty(&usage).unwrap_or_default();
-            drop(state);
-            respond_with_etag(
-                stream,
-                200,
-                "application/json",
-                body.as_bytes(),
-                accept_gzip,
-                if_none_match.as_deref(),
-                "",
-            );
-        }
+        ("GET", "/tabs/usage") => usage::run(stream, state, accept_gzip, if_none_match.as_deref()),
         #[cfg(feature = "catbus")]
         ("GET", p) if p.starts_with("/tabs/") && p.ends_with("/catbus") => {
-            // Lightweight metadata endpoint — "does this tab have a
-            // detectable agent session (Claude Code TUI or
-            // catbus-agent), and if so, which file is the transcript
-            // living in?". 404 when no candidate process is found
-            // under the tab's shell. Accepts both `/tabs/<idx>/catbus`
-            // and `/tabs/by-id/<uuid>/catbus` — the UUID is the stable
-            // handle (index drifts as tabs open/close), so API clients
-            // can address a catbus session by its tab UUID directly.
-            let Some((key_raw, is_uuid)) = parse_tab_key(p, "/catbus") else {
-                error_json(stream, 404, "invalid tab key");
-                return;
-            };
-            let snap = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let Some(idx) = resolve_tab_idx(&snap, key_raw, is_uuid) else {
-                error_json(stream, 404, "tab not found");
-                return;
-            };
-            let Some(t) = snap.tabs.get(idx) else {
-                error_json(stream, 404, "tab index out of range");
-                return;
-            };
-            let pid = t.shell_pid;
-            drop(snap);
-            match crate::catbus_agent::find_session(pid) {
-                Some(session) => {
-                    let body = serde_json::to_string(&serde_json::json!({
-                        "session_id": session.session_id,
-                        "agent_pid": session.agent_pid,
-                        "cwd": session.cwd.to_string_lossy(),
-                        "file": session.file_path.to_string_lossy(),
-                    }))
-                    .unwrap_or_default();
-                    respond_json(stream, 200, &body);
-                }
-                None => error_json(stream, 404, "no agent session under this tab"),
-            }
+            catbus::session(stream, state, p);
         }
         #[cfg(feature = "catbus")]
         ("POST", p) if p.starts_with("/tabs/") && p.ends_with("/catbus/message") => {
-            // Forward a user prompt to the tab's catbus-agent over
-            // its UNIX socket. Sync — we block here until the agent
-            // produces a `done` frame or errors out. The mobile
-            // client picks up the appended assistant turn via the
-            // existing GET messages endpoint on its next poll.
-            let Some((key_raw, is_uuid)) = parse_tab_key(p, "/catbus/message") else {
-                error_json(stream, 404, "invalid tab key");
-                return;
-            };
-            let snap = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let Some(idx) = resolve_tab_idx(&snap, key_raw, is_uuid) else {
-                error_json(stream, 404, "tab not found");
-                return;
-            };
-            let Some(t) = snap.tabs.get(idx) else {
-                error_json(stream, 404, "tab index out of range");
-                return;
-            };
-            let pid = t.shell_pid;
-            drop(snap);
-            let Some(session) = crate::catbus_agent::find_session(pid) else {
-                error_json(stream, 404, "no agent session under this tab");
-                return;
-            };
-            let socket_path = session.file_path.with_extension("sock");
-            // Body is `{"text":"…"}` — JSON keeps the door open for
-            // future fields (plan-mode toggle, model override, …).
-            let req: serde_json::Value = match serde_json::from_slice(&body_bytes) {
-                Ok(v) => v,
-                Err(e) => {
-                    error_json(stream, 400, &format!("invalid JSON body: {e}"));
-                    return;
-                }
-            };
-            let Some(text) = req.get("text").and_then(|v| v.as_str()) else {
-                error_json(stream, 400, "missing `text` field");
-                return;
-            };
-            match crate::catbus_agent::send_prompt_to_socket(&socket_path, text) {
-                Ok(reply) => {
-                    let body = serde_json::to_string(&serde_json::json!({
-                        "session_id": session.session_id,
-                        "reply": reply,
-                    }))
-                    .unwrap_or_default();
-                    respond_json(stream, 200, &body);
-                }
-                Err(e) => error_json(stream, 502, &format!("agent socket: {e}")),
-            }
+            catbus::message(stream, state, p, &body_bytes);
         }
         #[cfg(feature = "catbus")]
         ("GET", p) if p.starts_with("/tabs/") && p.ends_with("/catbus/messages") => {
-            // Parsed conversation. Skips meta entries (permission
-            // mode, file snapshots). Returns the full message list;
-            // the mobile remote diffs on its end. `?since=N` lets a
-            // client skip the first N messages once incremental
-            // updates land.
-            let Some((key_raw, is_uuid)) = parse_tab_key(p, "/catbus/messages") else {
-                error_json(stream, 404, "invalid tab key");
-                return;
-            };
-            let snap = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let Some(idx) = resolve_tab_idx(&snap, key_raw, is_uuid) else {
-                error_json(stream, 404, "tab not found");
-                return;
-            };
-            let Some(t) = snap.tabs.get(idx) else {
-                error_json(stream, 404, "tab index out of range");
-                return;
-            };
-            let pid = t.shell_pid;
-            drop(snap);
-            let Some(session) = crate::catbus_agent::find_session(pid) else {
-                error_json(stream, 404, "no agent session under this tab");
-                return;
-            };
-            let since = query_since.unwrap_or(0);
-            let tail = crate::catbus_agent::parse_messages_since(&session.file_path, since);
-            // parse_messages_since walks the full file and only keeps
-            // entries from index `since` onward, so the absolute total
-            // is `since + tail.len()`. Same value the client used to see
-            // from `all.len()`, without the all-into-memory hop.
-            let total = since.saturating_add(tail.len());
-            let body = serde_json::to_string(&serde_json::json!({
-                "session_id": session.session_id,
-                "total": total,
-                "messages": tail,
-            }))
-            .unwrap_or_default();
-            respond_json(stream, 200, &body);
+            catbus::messages(stream, state, p, query_since);
         }
         ("GET", p) if p.starts_with("/tabs/") && p.ends_with("/view") => {
-            let Some((key_raw, is_uuid)) = parse_tab_key(p, "/view") else {
-                error_json(stream, 404, "invalid tab key");
-                return;
-            };
-            let state_g = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let Some(idx) = resolve_tab_idx(&state_g, key_raw, is_uuid) else {
-                drop(state_g);
-                error_json(stream, 404, "tab not found");
-                return;
-            };
-            let t = &state_g.tabs[idx];
-            let tab_name = t.name.clone();
-            let tab_bg = if t.bg_color.is_empty() {
-                crate::DEFAULT_TAB_BG_COLOR.to_string()
-            } else {
-                t.bg_color.to_string()
-            };
-            drop(state_g);
-            let key_for_html = if is_uuid {
-                format!("by-id/{key_raw}")
-            } else {
-                key_raw.to_string()
-            };
-            // Relative hop from the viewer document back to the mount
-            // root so `<prefix>/assets/...` references resolve under any
-            // reverse-proxy prefix (the proxy strips the prefix before
-            // the request reaches us, so absolute `/assets/...` URLs
-            // bypass it and 404). The document lives at
-            // `<prefix>/tabs/{key}/view`; its directory is
-            // `<prefix>/tabs/{key}/`, so one `../` per path segment in
-            // `tabs/{key}` climbs back to `<prefix>/`:
-            //   - `/tabs/0/view`            → `../../`
-            //   - `/tabs/by-id/<uuid>/view` → `../../../`
-            let asset_depth = 1 + key_for_html.split('/').filter(|s| !s.is_empty()).count();
-            let asset_prefix = "../".repeat(asset_depth);
-            // The tab name lands in two distinct contexts: inside
-            // <title> (HTML-escape) and inside a JS string literal
-            // (JSON-encode — handles quotes, backslashes, newlines,
-            // and any future weirdness in one go). Using two
-            // substitution markers keeps each context safe.
-            let html_name = tab_name
-                .replace('&', "&amp;")
-                .replace('<', "&lt;")
-                .replace('>', "&gt;")
-                .replace('"', "&quot;");
-            // serde_json::to_string yields a quoted JS-safe string
-            // literal; strip the surrounding quotes so the template
-            // can wrap it in its own quotes.
-            //
-            // serde_json escapes quotes/backslashes/control chars but
-            // NOT `<`, `>`, or `&` — and the HTML parser ends the
-            // inline <script> element on the literal byte sequence
-            // `</script>` regardless of JS string context. Since the
-            // viewer's CSP allows 'unsafe-inline', an unescaped
-            // `</script><script>…` tab name would break out and run.
-            // Re-escape those three as JS `\uXXXX` so the value stays a
-            // valid string literal that can never terminate the script
-            // element. (`__TAB_NAME_HTML__` above is separately escaped
-            // for its <title> context.)
-            let js_name = serde_json::to_string(&tab_name)
-                .unwrap_or_else(|_| "\"\"".into())
-                .trim_matches('"')
-                .replace('<', "\\u003c")
-                .replace('>', "\\u003e")
-                .replace('&', "\\u0026");
-            // Validate that bg_color looks like #RRGGBB before
-            // inlining into HTML / CSS (defense against a malformed
-            // value in tabs.json or someone POSTing junk into the
-            // bg-color endpoint). Fall back to the default on
-            // anything sketchy.
-            let safe_bg: &str = if is_safe_hex_color(&tab_bg) {
-                &tab_bg
-            } else {
-                crate::DEFAULT_TAB_BG_COLOR
-            };
-            let html = VIEWER_HTML
-                .replace("__ASSET_PREFIX__", &asset_prefix)
-                .replace("__TAB_KEY__", &key_for_html)
-                .replace("__TAB_NAME_HTML__", &html_name)
-                .replace("__TAB_NAME_JS__", &js_name)
-                .replace("__TAB_BG__", safe_bg)
-                .replace("__BUILD_HASH__", BUILD_HASH);
-            // Tell browsers (and any intervening CDN) not to cache
-            // the viewer HTML — we ship JS fixes in the deb and
-            // users would otherwise see a stale banner / poll loop
-            // until a hard reload.
-            respond_with_etag(
+            view::run(
                 stream,
-                200,
-                "text/html; charset=utf-8",
-                html.as_bytes(),
+                state,
+                p,
                 accept_gzip,
                 if_none_match.as_deref(),
-                // Cache headers + clickjacking guards. CSP locks the
-                // page to its own origin for everything (no inline
-                // scripts despite the template subs — they live in a
-                // pinned `<script>` set up to read `window.TAB`, no
-                // user-controlled JS). X-Frame-Options blocks iframe
-                // embedding of share links into phishing pages.
-                "Cache-Control: no-store, no-cache, must-revalidate\r\n\
-                 Pragma: no-cache\r\n\
-                 X-Frame-Options: DENY\r\n\
-                 Content-Security-Policy: default-src 'none'; script-src 'self' 'unsafe-inline'; \
-                 style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; \
-                 connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'\r\n\
-                 Referrer-Policy: no-referrer\r\n",
+                had_trailing_slash,
             );
         }
         ("GET", p) if p.starts_with("/tabs/") && p.ends_with("/output") => {
-            let Some((key_raw, is_uuid)) = parse_tab_key(p, "/output") else {
-                error_json(stream, 404, "invalid tab key");
-                return;
-            };
-            let state = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let Some(idx) = resolve_tab_idx(&state, key_raw, is_uuid) else {
-                drop(state);
-                error_json(stream, 404, "tab not found");
-                return;
-            };
-            let Some(t) = state.tabs.get(idx) else {
-                drop(state);
-                error_json(stream, 404, "tab index out of range");
-                return;
-            };
-
-            // Three response modes, picked in this order:
-            //   1. ?since=N&crc=HHHHHHHH  — append-only patching. Server
-            //      checks CRC32 of its own first N bytes; on match we
-            //      ship only [N..]. Mismatch (cleared screen, alt-screen
-            //      swap, scrollback ring-shifted) falls through to a
-            //      full body.
-            //   2. ?lines=N  — tail by line count (the existing behaviour).
-            //   3. neither   — full scrollback.
-            //
-            // Mode 1 is what turns a noisy LAN poll into a few-byte delta
-            // for the steady-state append case (>99% of the time, a tab
-            // is just appending output).
-            // Use raw_output (row-by-row, no WRAPLINE join) so xterm.js
-            // can reproduce the server's layout exactly when it's
-            // resized to the same cols/rows. The mobile remote keeps
-            // talking to /tabs (which returns the joined `output`).
-            // Clone the Arc handle (refcount bump) + the small fields,
-            // then drop the global snapshot lock BEFORE the CRC passes
-            // and suffix search below — they walk up to hundreds of KB
-            // per poll and used to run entirely under the mutex every
-            // other API user (and every WS keystroke) needs.
-            let (payload, total_crc): (std::sync::Arc<str>, u32) = if t.raw_output.is_empty() {
-                (t.output.clone(), t.output_crc)
-            } else {
-                (t.raw_output.clone(), t.raw_output_crc)
-            };
-            let full_cursor = t.cursor;
-            let pty_cols = t.cols;
-            let pty_rows = t.rows;
-            let raw_cursor = t.raw_cursor;
-            let bg_color = t.bg_color.clone();
-            let schedule = t.schedule.clone();
-            let lock_reason = crate::schedule::LockState::lock_reason(t);
-            let locked = crate::schedule::LockState::effective_locked(t);
-            // Agent indicator surfaced to the share-link viewer so the
-            // browser tab title can mirror what the desktop GUI shows
-            // (\u{1f9e0} Thinking / ⌛ Waiting / ❗ Error). Strictly
-            // additive: omitted when no agent is attached.
-            let (agent_state_str, agent_label) = t.agent_state.as_ref().map_or((None, None), |s| {
-                let key = match s.state {
-                    crate::AgentState::Thinking => "thinking",
-                    crate::AgentState::Waiting => "waiting",
-                    crate::AgentState::Error => "error",
-                };
-                (Some(key), s.label.clone())
-            });
-            drop(state);
-
-            let total_len = payload.len();
-
-            // Every response mode ships a suffix of `payload`, so track
-            // just the start offset — the body is sliced out of the
-            // shared Arc at respond time, no per-request copy.
-            let (cursor, start_offset) = match (query_since, query_crc) {
-                (Some(n), Some(client_crc)) if n <= total_len => {
-                    // Steady state (>99% of polls): the client is fully
-                    // caught up, so its prefix IS the whole payload and
-                    // the cached total CRC answers without a hash pass.
-                    let prefix_crc = if n == total_len {
-                        total_crc
-                    } else {
-                        crate::crc32(&payload.as_bytes()[..n])
-                    };
-                    if prefix_crc == client_crc {
-                        // The client's history is still a real prefix of
-                        // ours. Ship the suffix only — cursor row is
-                        // relative to the full buffer, the client knows
-                        // how to add its own line count.
-                        (full_cursor, n)
-                    } else {
-                        (full_cursor, 0)
-                    }
-                }
-                _ => match query_lines {
-                    Some(n) if n > 0 => {
-                        let total_lines = payload.lines().count();
-                        let drop_count = total_lines.saturating_sub(n);
-                        if drop_count == 0 {
-                            (full_cursor, 0)
-                        } else {
-                            let mut offset = 0;
-                            for _ in 0..drop_count {
-                                if let Some(nl) = payload[offset..].find('\n') {
-                                    offset += nl + 1;
-                                } else {
-                                    offset = payload.len();
-                                    break;
-                                }
-                            }
-                            let cur = full_cursor.and_then(|(r, c)| {
-                                if r >= drop_count {
-                                    Some((r - drop_count, c))
-                                } else {
-                                    None
-                                }
-                            });
-                            (cur, offset)
-                        }
-                    }
-                    _ => (full_cursor, 0),
-                },
-            };
-
-            let mut extra = String::new();
-            if let Some((row, col)) = cursor {
-                let _ = write!(extra, "X-Cursor-Row: {row}\r\nX-Cursor-Col: {col}\r\n");
-            }
-            let _ = write!(
-                extra,
-                "X-Output-Length: {total_len}\r\nX-Output-Crc: {total_crc:08x}\r\nX-Output-Start: {start_offset}\r\nX-Output-Cols: {pty_cols}\r\nX-Output-Rows: {pty_rows}\r\n"
-            );
-            // Cursor position in raw-output coords — the viewer
-            // reapplies it after each write so xterm.js puts its
-            // blink at the server's real cursor (otherwise the
-            // cursor sits at the end of the last written byte =
-            // bottom-right corner of the dump, never where the user
-            // is actually typing).
-            if let Some((row, col)) = raw_cursor {
-                let _ = write!(extra, "X-Raw-Cursor-Row: {row}\r\nX-Raw-Cursor-Col: {col}\r\n");
-            }
-            // Effective background color (per-tab override OR global
-            // default, resolved server-side). The JS reads this on
-            // every poll and updates theme.background mid-session.
-            // Re-validate before echoing into a header line — input
-            // validation should already have rejected anything weird,
-            // but the round-trip through TabSnapshot is enough of a
-            // surface that we don't want a hypothetical bypass to
-            // turn into a header-injection vector.
-            if is_safe_hex_color(&bg_color) {
-                let _ = write!(extra, "X-Tab-Bg: {bg_color}\r\n");
-            }
-            if locked {
-                let _ = write!(extra, "X-Tab-Locked: 1\r\n");
-                if let Some(r) = lock_reason {
-                    let _ = write!(extra, "X-Tab-Locked-Reason: {r}\r\n");
-                }
-            }
-            if let Some(s) = schedule.as_ref() {
-                write_schedule_headers(&mut extra, s);
-            }
-            if let Some(state_str) = agent_state_str {
-                let _ = write!(extra, "X-Agent-State: {state_str}\r\n");
-                // Label can be any UTF-8 reported via `set-status
-                // --label`. Percent-encode every non-ASCII byte +
-                // CRLF / `%` so the wire stays strict-ASCII and the
-                // viewer can `decodeURIComponent` it back. Cap at
-                // 256 chars before encoding.
-                if let Some(label) = agent_label {
-                    let truncated: String = label.chars().take(256).collect();
-                    let mut encoded = String::with_capacity(truncated.len());
-                    for byte in truncated.bytes() {
-                        if matches!(byte, 0x20..=0x7e) && byte != b'%' && byte != b'\r' && byte != b'\n' {
-                            encoded.push(byte as char);
-                        } else {
-                            let _ = write!(encoded, "%{byte:02X}");
-                        }
-                    }
-                    if !encoded.is_empty() {
-                        let _ = write!(extra, "X-Agent-Label: {encoded}\r\n");
-                    }
-                }
-            }
-            // Pass `None` for if_none_match — /output is a live
-            // polling endpoint whose live state lives in headers
-            // (X-Tab-Locked, X-Agent-State, X-Outbox-Count, …).
-            // Returning 304 on an idle poll (when the body's CRC
-            // hasn't changed) ships those headers via the 304's
-            // header block, but browsers vary on whether fetch()
-            // exposes 304 headers — Chrome / Safari sometimes serve
-            // the cached 200's header set instead, which means a
-            // mid-session unlock / agent-state flip wouldn't reach
-            // the JS until a full page reload. Force 200 so every
-            // poll carries fresh headers in a fresh response.
-            respond_with_etag_precomputed(
-                stream,
-                200,
-                "text/plain; charset=utf-8",
-                payload[start_offset..].as_bytes(),
-                accept_gzip,
-                None,
-                &extra,
-                // Full-body response ⇒ the cached total CRC IS the etag;
-                // a delta ships a small suffix, hashed cheaply as usual.
-                (start_offset == 0).then(|| format!("{total_crc:08x}")),
-            );
+            output::run(stream, state, p, query_since, query_crc, query_lines, accept_gzip);
         }
         ("DELETE", p)
             if p.starts_with("/tabs/")
                 && (!p[6..].contains('/') || (p[6..].starts_with("by-id/") && p[6..].matches('/').count() == 1)) =>
         {
-            // Accepts `/tabs/<idx>` and `/tabs/by-id/<uuid>` — the UUID is
-            // the stable handle (index drifts as tabs open/close).
-            let Some((key_raw, is_uuid)) = parse_tab_key(p, "") else {
-                error_json(stream, 404, "invalid tab key");
-                return;
-            };
-            let mut state = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let Some(idx) = resolve_tab_idx(&state, key_raw, is_uuid) else {
-                drop(state);
-                error_json(stream, 404, "tab not found");
-                return;
-            };
-            info!("API: closing tab {idx}");
-            state.pending_closes.push(idx);
-            drop(state);
-            let body = serde_json::to_string(&serde_json::json!({"closed": idx})).unwrap_or_default();
-            respond_json(stream, 200, &body);
+            tabs::close(stream, state, p);
         }
         ("POST", "/tabs") => {
-            // Optional JSON body: `{"cwd": "<path>"}` opens the tab
-            // rooted at that path instead of inheriting from the
-            // active tab. Missing or invalid body → falls back to the
-            // legacy inherit-cwd behaviour.
-            let cwd_hint: Option<std::path::PathBuf> = if body_bytes.is_empty() {
-                None
-            } else {
-                serde_json::from_slice::<serde_json::Value>(&body_bytes)
-                    .ok()
-                    .and_then(|v| {
-                        v.get("cwd")
-                            .and_then(serde_json::Value::as_str)
-                            .map(std::path::PathBuf::from)
-                    })
-            };
-            let mut state = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            info!(
-                "API: queueing new tab creation (cwd: {})",
-                cwd_hint.as_ref().map_or("inherit", |p| p.to_str().unwrap_or("?"))
-            );
-            state.pending_new_tabs += 1;
-            if let Some(cwd) = cwd_hint {
-                state.pending_new_tab_cwds.push_back(cwd);
+            tabs::create(stream, state, &body_bytes);
+        }
+        ("POST", "/limits/default") => limits::set_default(stream, state, &body_bytes),
+        ("POST", "/claude-only") => claude_only::set(stream, state, &body_bytes),
+        ("POST", "/relay-mode") => relay::mode(stream, state, &body_bytes),
+        ("GET", "/relay-config") => relay::config_get(stream),
+        ("POST", "/relay-config") => relay::config_set(stream, state, &body_bytes),
+        ("GET", "/logs") => {
+            // Loopback only. The ring holds whatever the daemon logged — tab
+            // names, cwds, endpoint labels, error strings — and the API binds
+            // 0.0.0.0 in the default config, so holding the master token from
+            // another host must not be enough to read it. The peer address is
+            // the gate; `X-Forwarded-For` is deliberately NOT consulted, since
+            // a proxy on this host would then let anyone forge it.
+            if !from_loopback {
+                error_json(stream, 403, "logs are readable from 127.0.0.1 only");
+                return;
             }
-            drop(state);
-            let body = serde_json::to_string(&serde_json::json!({"queued": "new"})).unwrap_or_default();
+            let n = query_lines.unwrap_or(200).min(crate::log_ring::CAPACITY);
+            let body = serde_json::json!({ "lines": crate::log_ring::tail(n) }).to_string();
             respond_json(stream, 200, &body);
         }
-        ("POST", "/limits/default") => {
-            // Set or clear the GLOBAL default resource limits (the CLI
-            // `limit --all`). Same JSON body as the per-tab route. The owner
-            // updates its live `default_tab_limits`, persists preferences.json,
-            // and re-applies the cgroup to every tab (tabs without their own
-            // override + all future tabs pick it up with no restart).
-            let parsed: serde_json::Value = match serde_json::from_slice(&body_bytes) {
-                Ok(v) => v,
-                Err(e) => {
-                    error_json(stream, 400, &format!("invalid JSON body: {e}"));
-                    return;
-                }
-            };
-            let clear = parsed
-                .get("clear")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false);
-            let over = crate::TabResourceLimits {
-                memory_max: parsed.get("memory_max").and_then(|v| v.as_str()).map(str::to_owned),
-                cpu_quota_percent: parsed
-                    .get("cpu_quota_percent")
-                    .and_then(serde_json::Value::as_u64)
-                    .and_then(|n| u32::try_from(n).ok()),
-                tasks_max: parsed.get("tasks_max").and_then(serde_json::Value::as_u64),
-            };
-            if !clear && over.is_empty() {
-                error_json(
-                    stream,
-                    400,
-                    "provide memory_max / cpu_quota_percent / tasks_max, or clear:true",
-                );
-                return;
-            }
-            if !over.memory_max_valid() {
-                error_json(
-                    stream,
-                    400,
-                    "memory_max must be a byte count or K/M/G/T value (e.g. \"8G\")",
-                );
-                return;
-            }
-            let mut snap = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            snap.pending_default_limits = Some((over, clear));
-            drop(snap);
-            respond_json(stream, 200, r#"{"queued":"default-limits"}"#);
-        }
-        ("POST", "/claude-only") => {
-            // Toggle forced Claude-only mode live (the CLI `claude-only on|off`).
-            // Body: {"on": true|false}. The owner mirrors it onto CLAUDE_ONLY +
-            // its struct field and persists, so new tabs launch claude (auto
-            // mode) or a shell with no restart.
-            let parsed: serde_json::Value = match serde_json::from_slice(&body_bytes) {
-                Ok(v) => v,
-                Err(e) => {
-                    error_json(stream, 400, &format!("invalid JSON body: {e}"));
-                    return;
-                }
-            };
-            let Some(on) = parsed.get("on").and_then(serde_json::Value::as_bool) else {
-                error_json(stream, 400, r#"provide {"on": true|false}"#);
-                return;
-            };
-            let mut snap = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            snap.pending_claude_only = Some(on);
-            drop(snap);
-            respond_json(stream, 200, r#"{"queued":"claude-only"}"#);
-        }
-        ("POST", "/relay-mode") => {
-            // Toggle relay mode live (the CLI `relay on|off`). Body:
-            // {"on": true|false}. The owner mirrors it onto RELAY_MODE + its
-            // struct field and persists; claude tabs spawned after route their
-            // Anthropic calls through the configured remote.
-            let parsed: serde_json::Value = match serde_json::from_slice(&body_bytes) {
-                Ok(v) => v,
-                Err(e) => {
-                    error_json(stream, 400, &format!("invalid JSON body: {e}"));
-                    return;
-                }
-            };
-            let Some(on) = parsed.get("on").and_then(serde_json::Value::as_bool) else {
-                error_json(stream, 400, r#"provide {"on": true|false}"#);
-                return;
-            };
-            let mut snap = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            snap.pending_relay_mode = Some(on);
-            drop(snap);
-            respond_json(stream, 200, r#"{"queued":"relay-mode"}"#);
-        }
-        ("GET", "/relay-config") => {
-            // Current relay config (the CLI `relay status`).
-            let (egress, target) = (crate::relay_egress(), crate::relay_target());
-            let body = serde_json::json!({
-                "mode": crate::relay_mode(),
-                "egress": egress,
-                "target": target.map(|t| t.url),
-            })
-            .to_string();
+        ("GET", "/claims") => {
+            let now = crate::unix_millis();
+            let claims = crate::claims::with_registry(|r| r.active(now));
+            let body = serde_json::json!({ "claims": claims, "now_ms": now }).to_string();
             respond_json(stream, 200, &body);
         }
-        ("POST", "/relay-config") => {
-            // Set the relay endpoint and/or egress role (`relay via` / `relay
-            // egress`). Body: {"endpoint":"<label|id|"">","egress":bool} — any
-            // subset. The owner resolves the endpoint, persists, and re-installs.
-            let parsed: serde_json::Value = match serde_json::from_slice(&body_bytes) {
-                Ok(v) => v,
-                Err(e) => {
-                    error_json(stream, 400, &format!("invalid JSON body: {e}"));
-                    return;
-                }
-            };
-            let change = RelayConfigChange {
-                endpoint: parsed.get("endpoint").and_then(|v| v.as_str()).map(str::to_owned),
-                egress: parsed.get("egress").and_then(serde_json::Value::as_bool),
-            };
-            let mut snap = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            snap.pending_relay_config = Some(change);
-            drop(snap);
-            respond_json(stream, 200, r#"{"queued":"relay-config"}"#);
-        }
-        ("GET", "/env") => {
-            // The current GLOBAL tab-env map (the CLI `env list`).
-            let map = crate::tab_env_global();
-            match serde_json::to_string(&map) {
-                Ok(j) => respond_json(stream, 200, &j),
-                Err(e) => error_json(stream, 500, &format!("serialize: {e}")),
-            }
-        }
-        ("POST", "/env") => {
-            // Global env change (`env set/unset --global`). Body:
-            // {"set":{"K":"V"},"unset":["K"],"respawn":bool}.
-            match parse_env_body(&body_bytes) {
-                Ok(change) => {
-                    let mut snap = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                    snap.pending_env_changes.push(change);
-                    drop(snap);
-                    respond_json(stream, 200, r#"{"queued":"env"}"#);
-                }
-                Err(e) => error_json(stream, 400, &e),
-            }
-        }
-        ("POST", p) if p.starts_with("/tabs/") && p.ends_with("/env") => {
-            // Per-tab env change (`env set/unset --tab <id>`).
-            let Some((key_raw, is_uuid)) = parse_tab_key(p, "/env") else {
-                error_json(stream, 404, "missing tab id");
-                return;
-            };
-            let parsed = parse_env_body(&body_bytes);
-            let mut snap = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let Some(idx) = resolve_tab_idx(&snap, key_raw, is_uuid) else {
-                drop(snap);
-                error_json(stream, 404, "tab not found");
-                return;
-            };
-            let id = snap.tabs[idx].id.to_string();
-            match parsed {
-                Ok(mut change) => {
-                    change.tab = Some(id);
-                    snap.pending_env_changes.push(change);
-                    drop(snap);
-                    respond_json(stream, 200, r#"{"queued":"env"}"#);
-                }
-                Err(e) => {
-                    drop(snap);
-                    error_json(stream, 400, &e);
-                }
-            }
+        ("POST", "/claims") => claims_route::grant(stream, &body_bytes),
+        ("POST", "/claims/release") => claims_route::release(stream, &body_bytes),
+        ("GET", "/fleet") => fleet_route::get(stream, state, from_loopback),
+        ("GET", "/blackboard") => blackboard_route::list(stream, query_since),
+        ("POST", "/blackboard") => blackboard_route::merge(stream, &body_bytes),
+        ("GET", "/env") => env::list_global(stream),
+        ("GET", p) if p.starts_with("/tabs/") && p.ends_with("/env") => env::list_tab(stream, state, p),
+        ("POST", "/env") => env::set_global(stream, state, &body_bytes),
+        ("POST", p) if p.starts_with("/tabs/") && p.ends_with("/env") => env::set_tab(stream, state, p, &body_bytes),
+        ("POST", p) if p.starts_with("/tabs/") && p.ends_with("/meta") => {
+            meta::set(stream, state, p, &body_bytes);
         }
         ("POST", p) if p.starts_with("/tabs/") && p.ends_with("/resize") => {
-            // Pin (or clear) a tab's fixed grid size (the CLI `resize`). Body:
-            // {"cols":N,"rows":M} pins to that size (both >= 2 / >= 1), or
-            // {"clear":true} un-pins it back to window-driven sizing. Accepts
-            // /tabs/by-id/<uuid>/resize and /tabs/<idx>/resize.
-            let Some((key_raw, is_uuid)) = parse_tab_key(p, "/resize") else {
-                error_json(stream, 404, "missing tab id");
-                return;
-            };
-            let parsed: serde_json::Value = match serde_json::from_slice(&body_bytes) {
-                Ok(v) => v,
-                Err(e) => {
-                    error_json(stream, 400, &format!("invalid JSON body: {e}"));
-                    return;
-                }
-            };
-            let clear = parsed
-                .get("clear")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false);
-            let dims = if clear {
-                None
-            } else {
-                let cols = parsed
-                    .get("cols")
-                    .and_then(serde_json::Value::as_u64)
-                    .and_then(|n| u16::try_from(n).ok());
-                let rows = parsed
-                    .get("rows")
-                    .and_then(serde_json::Value::as_u64)
-                    .and_then(|n| u16::try_from(n).ok());
-                match (cols, rows) {
-                    (Some(c), Some(r)) if c >= 2 && r >= 1 => Some((c, r)),
-                    _ => {
-                        error_json(stream, 400, "provide cols (>=2) and rows (>=1), or clear:true");
-                        return;
-                    }
-                }
-            };
-            let mut snap = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let Some(idx) = resolve_tab_idx(&snap, key_raw, is_uuid) else {
-                drop(snap);
-                error_json(stream, 404, "tab not found");
-                return;
-            };
-            let id = snap.tabs[idx].id.to_string();
-            snap.pending_resizes.push((id, dims));
-            drop(snap);
-            respond_json(stream, 200, r#"{"queued":"resize"}"#);
+            resize::run(stream, state, p, &body_bytes);
         }
         ("POST", p) if p.starts_with("/tabs/") && p.ends_with("/limits") => {
-            // Set or clear per-tab resource limits on a live tab. Body (all
-            // fields optional): {"memory_max":"8G","cpu_quota_percent":250,
-            // "tasks_max":512} sets those axes; {"clear":true} lifts every
-            // limit back to unlimited. Accepts both /tabs/by-id/<uuid>/limits
-            // and /tabs/<idx>/limits, mirroring the /catbus routes.
-            let Some((key_raw, is_uuid)) = parse_tab_key(p, "/limits") else {
-                error_json(stream, 404, "missing tab id");
-                return;
-            };
-            let parsed: serde_json::Value = match serde_json::from_slice(&body_bytes) {
-                Ok(v) => v,
-                Err(e) => {
-                    error_json(stream, 400, &format!("invalid JSON body: {e}"));
-                    return;
-                }
-            };
-            let clear = parsed
-                .get("clear")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false);
-            let over = crate::TabResourceLimits {
-                memory_max: parsed.get("memory_max").and_then(|v| v.as_str()).map(str::to_owned),
-                cpu_quota_percent: parsed
-                    .get("cpu_quota_percent")
-                    .and_then(serde_json::Value::as_u64)
-                    .and_then(|n| u32::try_from(n).ok()),
-                tasks_max: parsed.get("tasks_max").and_then(serde_json::Value::as_u64),
-            };
-            if !clear && over.is_empty() {
-                error_json(
-                    stream,
-                    400,
-                    "provide memory_max / cpu_quota_percent / tasks_max, or clear:true",
-                );
-                return;
-            }
-            if !over.memory_max_valid() {
-                error_json(
-                    stream,
-                    400,
-                    "memory_max must be a byte count or K/M/G/T value (e.g. \"8G\")",
-                );
-                return;
-            }
-            let mut snap = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let Some(idx) = resolve_tab_idx(&snap, key_raw, is_uuid) else {
-                drop(snap);
-                error_json(stream, 404, "tab not found");
-                return;
-            };
-            let id = snap.tabs[idx].id.to_string();
-            snap.pending_limit_changes.push((id, over, clear));
-            drop(snap);
-            respond_json(stream, 200, r#"{"queued":"limits"}"#);
+            limits::set_tab(stream, state, p, &body_bytes);
         }
         ("POST", p) if p.starts_with("/tabs/") && p.ends_with("/rename") => {
-            let idx_str = &p["/tabs/".len()..p.len() - "/rename".len()];
-            if let Ok(idx) = idx_str.parse::<usize>() {
-                let body = &body_bytes;
-                let new_name = serde_json::from_slice::<serde_json::Value>(body).map_or_else(
-                    |_| String::from_utf8_lossy(body).trim().to_string(),
-                    |v| v.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string(),
-                );
-                if new_name.is_empty() {
-                    error_json(stream, 400, "missing or empty name");
-                    return;
-                }
-                let mut state = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                if idx < state.tabs.len() {
-                    info!("API: renaming tab {idx} to {new_name}");
-                    state.pending_renames.push((idx, new_name.clone()));
-                    drop(state);
-                    let body = serde_json::to_string(&serde_json::json!({"renamed": idx, "name": new_name}))
-                        .unwrap_or_default();
-                    respond_json(stream, 200, &body);
-                } else {
-                    error_json(stream, 404, "tab index out of range");
-                }
-            } else {
-                error_json(stream, 404, "invalid tab index");
-            }
+            rename::run(stream, state, p, &body_bytes);
         }
         // (Old `POST /tabs/<idx>/activate` route removed — that was
         // the Android ta-remote app's "tap a tab in the list to make
@@ -2700,307 +1967,33 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
         // `TAG_ACTIVATE` covers the same intent for the web viewer
         // and no CLI subcommand depends on it.)
         ("POST", p) if p.starts_with("/tabs/by-id/") && p.ends_with("/status") => {
-            // Per-tab agent state hook. Looked up by stable UUID
-            // (`_TAB_ID` env var) rather than position, so a rename
-            // doesn't break the mapping.
-            let tab_id = &p["/tabs/by-id/".len()..p.len() - "/status".len()];
-            if tab_id.is_empty() {
-                error_json(stream, 404, "missing tab id");
-                return;
-            }
-            let parsed: serde_json::Value = match serde_json::from_slice(&body_bytes) {
-                Ok(v) => v,
-                Err(e) => {
-                    error_json(stream, 400, &format!("invalid JSON body: {e}"));
-                    return;
-                }
-            };
-            let Some(state_str) = parsed.get("state").and_then(|v| v.as_str()) else {
-                error_json(stream, 400, "missing `state` field");
-                return;
-            };
-            let agent_state = match state_str {
-                "thinking" => crate::AgentState::Thinking,
-                "waiting" => crate::AgentState::Waiting,
-                "error" => crate::AgentState::Error,
-                "idle" => {
-                    // "idle" = clear the indicator. Queue an Error-shaped
-                    // marker the loop interprets as "wipe"; simpler than
-                    // adding a fourth enum variant just for the wire.
-                    let mut snap = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let Some(t) = snap.tabs.iter().find(|t| &*t.id == tab_id) else {
-                        drop(snap);
-                        error_json(stream, 404, "tab not found");
-                        return;
-                    };
-                    let id = t.id.clone();
-                    snap.pending_status_updates.push(PendingStatusUpdate {
-                        tab_id: id.to_string(),
-                        state: crate::AgentState::Thinking, // ignored — clear flag below
-                        label: Some("__clear__".into()),
-                        session_id: None,
-                        agent_kind: None,
-                        plan_mode: None,
-                    });
-                    drop(snap);
-                    respond_json(stream, 200, r#"{"cleared":true}"#);
-                    return;
-                }
-                _ => {
-                    error_json(stream, 400, "invalid state (idle/thinking/waiting/error)");
-                    return;
-                }
-            };
-            let label = parsed
-                .get("label")
-                .and_then(|v| v.as_str())
-                .map(std::string::ToString::to_string);
-            let session_id = parsed
-                .get("sessionId")
-                .and_then(|v| v.as_str())
-                .map(std::string::ToString::to_string);
-            let agent_kind = parsed
-                .get("agentKind")
-                .and_then(|v| v.as_str())
-                .map(std::string::ToString::to_string);
-            let plan_mode = parsed.get("planMode").and_then(serde_json::Value::as_bool);
-            let mut snap = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let Some(t) = snap.tabs.iter().find(|t| &*t.id == tab_id) else {
-                drop(snap);
-                error_json(stream, 404, "tab not found");
-                return;
-            };
-            let id = t.id.clone();
-            info!(
-                "API: set-status tab={id} state={state_str} session={} kind={}",
-                session_id.as_deref().unwrap_or("-"),
-                agent_kind.as_deref().unwrap_or("-")
-            );
-            snap.pending_status_updates.push(PendingStatusUpdate {
-                tab_id: id.to_string(),
-                state: agent_state,
-                label,
-                session_id,
-                agent_kind,
-                plan_mode,
-            });
-            drop(snap);
-            respond_json(stream, 200, r#"{"ok":true}"#);
+            status::run(stream, state, p, &body_bytes);
         }
         ("POST", p) if p.starts_with("/tabs/") && p.ends_with("/files") => {
-            // Upload file body into the tab's `cwd/inbox/<name>`.
-            // `?name=<basename>` is required and is sanitised to a
-            // path-component (no `..`, no separators) so a malicious
-            // remote can't write outside `inbox/`. Accepts both
-            // `/tabs/<idx>/files` and `/tabs/by-id/<uuid>/files`
-            // forms; share-token auth (rw only) was vetted upstream.
-            // Per-token concurrency cap: refuse with 429 when N
-            // uploads are already in flight from this same token, so
-            // one share recipient can't queue dozens of concurrent
-            // 100 MiB POSTs and amplify memory pressure (audit #3).
-            let upload_token = provided_token.as_deref().unwrap_or("");
-            let _slot = match UploadSlot::try_acquire(upload_token) {
-                Ok(s) => s,
-                Err(n) => {
-                    error_json(
-                        stream,
-                        429,
-                        &format!(
-                            "too many concurrent uploads from this token ({n} already in flight; cap {UPLOAD_MAX_INFLIGHT_PER_TOKEN})"
-                        ),
-                    );
-                    return;
-                }
-            };
-            let Some((key_raw, is_uuid)) = parse_tab_key(p, "/files") else {
-                error_json(stream, 404, "invalid tab key");
-                return;
-            };
-            let snap = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let Some(idx) = resolve_tab_idx(&snap, key_raw, is_uuid) else {
-                drop(snap);
-                error_json(stream, 404, "tab not found");
-                return;
-            };
-            let Some(t) = snap.tabs.get(idx) else {
-                drop(snap);
-                error_json(stream, 404, "tab index out of range");
-                return;
-            };
-            // Refuse uploads to a locked tab — same policy as POST
-            // /input. Lock means "this tab is read-only right now";
-            // a share recipient shouldn't be able to drop files
-            // into the agent's inbox while the operator has paused
-            // the session. `effective_locked()` covers BOTH the
-            // manual flag and the off-hours schedule.
-            if crate::schedule::LockState::effective_locked(t) {
-                drop(snap);
-                error_json(stream, 423, "tab is locked");
-                return;
-            }
-            let cwd = t.cwd.clone();
-            drop(snap);
-            let Some(cwd) = cwd else {
-                error_json(stream, 400, "tab has no known cwd");
-                return;
-            };
-            let Some(name) = query_name.as_deref().and_then(sanitize_basename) else {
-                error_json(stream, 400, "missing or invalid ?name=<basename>");
-                return;
-            };
-            // Hard cap. The Content-Length pre-check already 413'd
-            // anything bigger (see UPLOAD_MAX_BYTES below), so this
-            // is the post-read safety net for `Transfer-Encoding:
-            // chunked` requests we can't size in advance.
-            if body_bytes.len() > UPLOAD_MAX_BYTES {
-                error_json(stream, 413, &format!("upload exceeds {UPLOAD_MAX_BYTES_MIB} MiB limit"));
-                return;
-            }
-            let inbox = std::path::Path::new(&*cwd).join("inbox");
-            if let Err(e) = std::fs::create_dir_all(&inbox) {
-                error_json(stream, 500, &format!("mkdir inbox: {e}"));
-                return;
-            }
-            // Sandbox guard (parity with the GET /files download path,
-            // which funnels through resolve_sandbox_path). The upload
-            // path used to `std::fs::write` straight into `cwd/inbox`
-            // with no symlink check, so a symlinked `inbox` (or a
-            // symlink planted at the destination) could redirect the
-            // write to an arbitrary file. Canonicalise and confirm the
-            // resolved inbox is a real directory *inside* the tab's cwd
-            // whose final component is still `inbox`.
-            let resolved = std::path::Path::new(&*cwd)
-                .canonicalize()
-                .ok()
-                .zip(inbox.canonicalize().ok());
-            let Some((cwd_canon, inbox_canon)) = resolved else {
-                error_json(stream, 404, "inbox path unreadable");
-                return;
-            };
-            if !inbox_canon.starts_with(&cwd_canon) || inbox_canon.file_name() != Some(std::ffi::OsStr::new("inbox")) {
-                error_json(stream, 403, "inbox escapes the tab's cwd");
-                return;
-            }
-            // Atomic write: stage to <name>.tmp then rename. A reader
-            // walking inbox/ never sees a half-written file. `create_new`
-            // (O_EXCL) refuses to create *through* a symlink, so a
-            // pre-planted symlink at the staging name can't redirect the
-            // write — we drop any stale entry (incl. a symlink) first so
-            // the exclusive create lands fresh.
-            let dest = inbox_canon.join(&name);
-            let staging = inbox_canon.join(format!(".{name}.tmp"));
-            if let Err(e) = write_new_file_no_symlink(&staging, &body_bytes) {
-                error_json(stream, 500, &format!("write inbox/.{name}.tmp: {e}"));
-                return;
-            }
-            // rename() replaces the destination entry itself (it does
-            // not follow a symlink at `dest`), so the rename can't be
-            // redirected either.
-            if let Err(e) = std::fs::rename(&staging, &dest) {
-                let _ = std::fs::remove_file(&staging);
-                error_json(stream, 500, &format!("rename into inbox/{name}: {e}"));
-                return;
-            }
-            info!("API: stored {} bytes in {}", body_bytes.len(), dest.display());
-            let body = serde_json::to_string(&serde_json::json!({
-                "path": dest.to_string_lossy(),
-                "relpath": format!("inbox/{name}"),
-                "bytes": body_bytes.len(),
-            }))
-            .unwrap_or_default();
-            respond_json(stream, 201, &body);
+            files::upload(
+                stream,
+                state,
+                p,
+                &body_bytes,
+                provided_token.as_deref(),
+                query_name.as_deref(),
+            );
         }
         ("GET", p) if p.starts_with("/tabs/") && p.ends_with("/files") => {
-            // Download a file from the tab's sandbox. `?path=…` must
-            // resolve inside one of `FILE_SANDBOX_DIRS` (currently
-            // `inbox/` + `outbox/`) of the tab's cwd — anything
-            // else is rejected before any filesystem access. See
-            // `resolve_sandbox_path` for the full check.
-            let Some((key_raw, is_uuid)) = parse_tab_key(p, "/files") else {
-                error_json(stream, 404, "invalid tab key");
-                return;
-            };
-            let snap = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let Some(idx) = resolve_tab_idx(&snap, key_raw, is_uuid) else {
-                drop(snap);
-                error_json(stream, 404, "tab not found");
-                return;
-            };
-            let Some(t) = snap.tabs.get(idx) else {
-                drop(snap);
-                error_json(stream, 404, "tab index out of range");
-                return;
-            };
-            let cwd = t.cwd.clone();
-            drop(snap);
-            let Some(cwd) = cwd else {
-                error_json(stream, 400, "tab has no known cwd");
-                return;
-            };
-            let Some(raw_path) = query_path.as_deref() else {
-                error_json(stream, 400, "missing ?path=<relative-path>");
-                return;
-            };
-            let canonical = match resolve_sandbox_path(&cwd, raw_path) {
-                Ok(p) => p,
-                Err((status, msg)) => {
-                    error_json(stream, status, &msg);
-                    return;
-                }
-            };
-            // Defense in depth against a component being swapped for a
-            // symlink in the window between resolve_sandbox_path's
-            // canonicalize and the read below: confirm the final entry
-            // is still a regular file (not a symlink/dir/fifo) via an
-            // lstat that does NOT follow links. Narrows the TOCTOU and
-            // avoids reading through a freshly-planted symlink.
-            let Ok(meta) = std::fs::symlink_metadata(&canonical) else {
-                error_json(stream, 404, "file not found");
-                return;
-            };
-            if !meta.file_type().is_file() {
-                error_json(stream, 403, "not a regular file");
-                return;
-            }
-            // Generic message — do not echo the absolute server path /
-            // OS error back to a remote share-link holder.
-            let Ok(bytes) = std::fs::read(&canonical) else {
-                error_json(stream, 404, "file not found");
-                return;
-            };
-            let display_name = canonical.file_name().and_then(|s| s.to_str()).unwrap_or("download");
-            info!("API: served {} bytes from {}", bytes.len(), canonical.display());
-            // See DOWNLOAD_GZIP_MAX — no gzip for big binary downloads.
-            let accept_gzip = accept_gzip && bytes.len() <= DOWNLOAD_GZIP_MAX;
-            // RFC 5987 `filename*=UTF-8''…` so accented / non-ASCII
-            // names ("Frédéric.txt") survive transit; the ASCII
-            // fallback `filename="…"` is also included for legacy
-            // user-agents.
-            let mut percent: String = String::with_capacity(display_name.len());
-            for byte in display_name.bytes() {
-                if matches!(byte, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~') {
-                    percent.push(byte as char);
-                } else {
-                    use std::fmt::Write as _;
-                    let _ = write!(&mut percent, "%{byte:02X}");
-                }
-            }
-            let ascii_fallback: String = display_name
-                .chars()
-                .filter(|c| c.is_ascii() && *c != '"' && *c != '\\')
-                .collect();
-            let disposition = format!(
-                "Content-Disposition: attachment; filename=\"{ascii_fallback}\"; filename*=UTF-8''{percent}\r\nX-Content-Type-Options: nosniff\r\n"
-            );
-            respond_with_etag(
+            files::download(
                 stream,
-                200,
-                "application/octet-stream",
-                &bytes,
+                state,
+                p,
+                query_path.as_deref(),
                 accept_gzip,
                 if_none_match.as_deref(),
-                &disposition,
             );
+        }
+        // A named download: `/tabs/<key>/outbox/<name>`. The name is in the
+        // path so the browser's fallback filename is already correct when an
+        // `<a download>` is ignored (it is, cross-origin).
+        ("GET", p) if p.starts_with("/tabs/") && p.contains("/outbox/") => {
+            files::download_by_path(stream, state, p, accept_gzip, if_none_match.as_deref());
         }
         // List `outbox/` or `inbox/` contents so the viewer can
         // render the download / sent-files panels. The panel header
@@ -3008,435 +2001,36 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
         // Claude / their agent ("read inbox/foo.txt"). RO + RW
         // share-tokens both allowed, master token always allowed.
         ("GET", p) if p.starts_with("/tabs/") && (p.ends_with("/outbox") || p.ends_with("/inbox")) => {
-            let dirname = if p.ends_with("/outbox") { "outbox" } else { "inbox" };
-            let suffix = if dirname == "outbox" { "/outbox" } else { "/inbox" };
-            let Some((key_raw, is_uuid)) = parse_tab_key(p, suffix) else {
-                error_json(stream, 404, "invalid tab key");
-                return;
-            };
-            let snap = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let Some(idx) = resolve_tab_idx(&snap, key_raw, is_uuid) else {
-                drop(snap);
-                error_json(stream, 404, "tab not found");
-                return;
-            };
-            let Some(t) = snap.tabs.get(idx) else {
-                drop(snap);
-                error_json(stream, 404, "tab index out of range");
-                return;
-            };
-            let cwd = t.cwd.clone();
-            drop(snap);
-            let Some(cwd) = cwd else {
-                respond_json(stream, 200, r#"{"files":[],"dir":""}"#);
-                return;
-            };
-            let dir_path = std::path::Path::new(&*cwd).join(dirname);
-            // Walk the whole subtree (not just the top level) so files the
-            // agent tucked into subfolders show up — the viewer renders
-            // them in tree mode. Each file carries a `path` relative to
-            // `dir_path`; downloads resolve it against `<dir>/<path>`.
-            let mut files: Vec<serde_json::Value> = Vec::new();
-            collect_files_tree(&dir_path, "", 0, &mut files);
-            // Stable order (by relative path) so folders group together and
-            // the viewer's diff (new-file toast) is predictable across polls.
-            files.sort_by(|a, b| a["path"].as_str().unwrap_or("").cmp(b["path"].as_str().unwrap_or("")));
-            let body = serde_json::to_string(&serde_json::json!({
-                "files": files,
-                "dir": dir_path.to_string_lossy(),
-            }))
-            .unwrap_or_default();
-            respond_json(stream, 200, &body);
+            outbox::list(stream, state, p);
         }
         ("POST", p) if p.starts_with("/tabs/by-id/") && p.ends_with("/lock") => {
-            // Flip the per-tab lock from the CLI / API. Master token
-            // only (share-token gate above does not allow `/lock`).
-            // ?on=1/0 takes precedence; absent → toggle.
-            let inner = &p["/tabs/by-id/".len()..p.len() - "/lock".len()];
-            // Pull `?on=` from the original path. `path` here is the
-            // already-stripped form; the original is `raw_path` but
-            // it's already been moved by this point — re-derive from
-            // the body for the body-driven form, or accept the URL
-            // form by looking at the request line earlier captures.
-            // Simplest: accept `{"on": true|false}` in the JSON body.
-            let on_body: Option<bool> = if body_bytes.is_empty() {
-                None
-            } else {
-                serde_json::from_slice::<serde_json::Value>(&body_bytes)
-                    .ok()
-                    .and_then(|v| v.get("on").and_then(serde_json::Value::as_bool))
-            };
-            let mut state = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let Some(idx) = state.tabs.iter().position(|t| &*t.id == inner) else {
-                drop(state);
-                error_json(stream, 404, "tab not found");
-                return;
-            };
-            let tab_id = state.tabs[idx].id.to_string();
-            let current_locked = state.tabs[idx].locked;
-            let new_val = on_body.unwrap_or(!current_locked);
-            // Manual unlock OUTSIDE the schedule's open windows is
-            // refused — the schedule is the boundary, not a polite
-            // suggestion. The user can still lock during open hours
-            // (manual lock beats schedule open). If they want to
-            // unlock outside hours, they remove the schedule first.
-            //
-            // Probe the post-unlock state — pass `false` to the
-            // helper to simulate "what would the lock_reason be
-            // after the unlock?" If the answer is still
-            // schedule-driven, refuse. Routes through the same
-            // `lock_reason` helper as every other gate so a future
-            // change to the rule is automatically picked up here.
-            if !new_val && crate::schedule::lock_reason(false, state.tabs[idx].schedule.as_ref()) == Some("schedule") {
-                drop(state);
-                error_json(stream, 423, "schedule is closed");
-                return;
-            }
-            state.tabs[idx].locked = new_val;
-            state.pending_lock_changes.push((tab_id, new_val));
-            drop(state);
-            let body = serde_json::to_string(&serde_json::json!({"locked": new_val})).unwrap_or_default();
-            respond_json(stream, 200, &body);
+            lock::run(stream, state, p, &body_bytes);
         }
         ("POST", p) if p.starts_with("/tabs/by-id/") && p.ends_with("/net") => {
-            // Turn the tab's internet off / on (bubblewrap net-namespace
-            // jail). Master token only (share-token gate above does not
-            // allow `/net`). Body `{"disabled": true|false}`; absent →
-            // toggle. The shell respawns to apply, so the change isn't
-            // instantaneous — the runtime tab picks it up next tick.
-            let inner = &p["/tabs/by-id/".len()..p.len() - "/net".len()];
-            let disabled_body: Option<bool> = if body_bytes.is_empty() {
-                None
-            } else {
-                serde_json::from_slice::<serde_json::Value>(&body_bytes)
-                    .ok()
-                    .and_then(|v| v.get("disabled").and_then(serde_json::Value::as_bool))
-            };
-            let mut state = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let Some(idx) = state.tabs.iter().position(|t| &*t.id == inner) else {
-                drop(state);
-                error_json(stream, 404, "tab not found");
-                return;
-            };
-            let tab_id = state.tabs[idx].id.to_string();
-            let new_val = disabled_body.unwrap_or(!state.tabs[idx].net_disabled);
-            // Refuse turning net OFF when bubblewrap isn't installed —
-            // there's no way to build the netns jail, and silently
-            // leaving the net on would be a lie. Turning net back ON is
-            // always allowed (no bwrap needed to un-jail).
-            if new_val && !crate::bwrap_available() {
-                drop(state);
-                error_json(stream, 412, "bubblewrap (bwrap) is not installed");
-                return;
-            }
-            state.tabs[idx].net_disabled = new_val;
-            state.pending_net_changes.push((tab_id, new_val));
-            drop(state);
-            let body = serde_json::to_string(&serde_json::json!({"net_disabled": new_val})).unwrap_or_default();
-            respond_json(stream, 200, &body);
+            net::set(stream, state, p, &body_bytes);
         }
         ("POST", p) if p.starts_with("/tabs/by-id/") && p.ends_with("/net-allow") => {
-            // Put the tab into allowlist mode (or clear it). Master token
-            // only. Body: `{"presets":[...],"domains":[...],"cidrs":[...]}`;
-            // an empty/absent set clears allowlist mode (back to On). A
-            // non-empty set also clears net-off (mutually exclusive). The
-            // shell respawns to apply, so it's not instantaneous.
-            //
-            // Per-tab allowlisting is enforced by nftables + a DNS pre-resolver
-            // that need CAP_NET_ADMIN — a headless-daemon capability. The
-            // unprivileged desktop GUI can't install them and doesn't drain
-            // `pending_net_allow_changes`, so accepting the request would
-            // enforce NOTHING while reporting success (a security-relevant
-            // false positive). Refuse with 501 on the GUI instead. Full airgap
-            // (net-off/net-on) is unprivileged and works on both editions.
-            #[cfg(feature = "gui")]
-            error_json(
-                stream,
-                501,
-                "per-tab allowlist (net-allow) requires the headless daemon (nftables / CAP_NET_ADMIN); \
-                 the desktop GUI supports only full airgap via net-off / net-on",
-            );
-            #[cfg(not(feature = "gui"))]
-            {
-                let inner = &p["/tabs/by-id/".len()..p.len() - "/net-allow".len()];
-                let val: serde_json::Value = if body_bytes.is_empty() {
-                    serde_json::json!({})
-                } else {
-                    let Ok(v) = serde_json::from_slice(&body_bytes) else {
-                        error_json(stream, 400, "invalid JSON body");
-                        return;
-                    };
-                    v
-                };
-                let str_array = |key: &str| -> Vec<String> {
-                    val.get(key)
-                        .and_then(serde_json::Value::as_array)
-                        .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
-                        .unwrap_or_default()
-                };
-                // Validate presets + CIDRs up front so a typo is a clear 400
-                // rather than a silently-dropped rule.
-                let mut presets = Vec::new();
-                for id in str_array("presets") {
-                    let Some(p) = crate::net_policy::Preset::from_id(&id) else {
-                        error_json(stream, 400, &format!("unknown preset: {id}"));
-                        return;
-                    };
-                    presets.push(p);
-                }
-                let domains = str_array("domains");
-                let cidrs = str_array("cidrs");
-                for c in &cidrs {
-                    if crate::net_policy::Cidr::parse(c).is_none() {
-                        error_json(stream, 400, &format!("invalid CIDR: {c}"));
-                        return;
-                    }
-                }
-                let config = crate::net_policy::AllowConfig {
-                    presets,
-                    domains,
-                    cidrs,
-                };
-                let mut state = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                let Some(idx) = state.tabs.iter().position(|t| &*t.id == inner) else {
-                    drop(state);
-                    error_json(stream, 404, "tab not found");
-                    return;
-                };
-                let tab_id = state.tabs[idx].id.to_string();
-                // A non-empty allowlist clears full-airgap (mutually exclusive).
-                if !config.is_empty() {
-                    state.tabs[idx].net_disabled = false;
-                }
-                let active = !config.is_empty();
-                state.pending_net_allow_changes.push((tab_id, config));
-                drop(state);
-                let body = serde_json::to_string(&serde_json::json!({"allowlist_active": active})).unwrap_or_default();
-                respond_json(stream, 200, &body);
-            }
+            net::allow(stream, state, p, &body_bytes);
+        }
+        ("POST", p) if p.starts_with("/tabs/by-id/") && p.ends_with("/ssh-agent") => {
+            ssh_agent::set(stream, state, p, &body_bytes);
         }
         ("POST", p) if p.starts_with("/tabs/by-id/") && p.ends_with("/schedule") => {
-            // Set or clear the off-hours auto-lock schedule. Master
-            // token only — same gate as /lock and /bg-color (the
-            // share-token route table refuses everything past
-            // /output|/stream|/input|/files).
-            //
-            // Body: `{"rule": "Mo-Fr 09:00-18:00", "tz": "Europe/Paris"}`
-            // to set; `{"rule": null}` or `{}` to clear (tab goes
-            // back to 24/7 unless still manually locked).
-            //
-            // Validation runs through `TabSchedule::new`, which
-            // rejects empty fields, unknown tzs, and unparseable
-            // rules. We surface the parser's own error string so the
-            // CLI / GUI can show the user exactly what failed.
-            #[derive(serde::Deserialize)]
-            struct Body {
-                rule: Option<String>,
-                tz: Option<String>,
-            }
-            let inner = &p["/tabs/by-id/".len()..p.len() - "/schedule".len()];
-            let parsed: Option<Body> = if body_bytes.is_empty() {
-                Some(Body { rule: None, tz: None })
-            } else {
-                serde_json::from_slice::<Body>(&body_bytes).ok()
-            };
-            let Some(body) = parsed else {
-                error_json(stream, 400, "invalid JSON body");
-                return;
-            };
-            let schedule_opt: Option<crate::schedule::TabSchedule> = match (body.rule.as_deref(), body.tz.as_deref()) {
-                (None | Some(""), _) => None,
-                (Some(rule), Some(tz)) => match crate::schedule::TabSchedule::new(rule, tz) {
-                    Ok(s) => Some(s),
-                    Err(e) => {
-                        error_json(stream, 400, &format!("{e}"));
-                        return;
-                    }
-                },
-                (Some(_), None) => {
-                    error_json(stream, 400, "tz is required when rule is set");
-                    return;
-                }
-            };
-            let mut state = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let Some(idx) = state.tabs.iter().position(|t| &*t.id == inner) else {
-                drop(state);
-                error_json(stream, 404, "tab not found");
-                return;
-            };
-            let tab_id = state.tabs[idx].id.to_string();
-            // Mirror immediately in the snapshot so the next /output
-            // poll already returns the new locked state via
-            // `effective_locked`; persist tick mirrors onto the runtime
-            // Tab on the next 100 ms tick.
-            state.tabs[idx].schedule.clone_from(&schedule_opt);
-            state.pending_schedule_changes.push((tab_id, schedule_opt.clone()));
-            drop(state);
-            let body = schedule_opt.as_ref().map_or_else(
-                || serde_json::json!({"rule": serde_json::Value::Null}),
-                |s| serde_json::json!({"rule": s.rule, "tz": s.tz}),
-            );
-            respond_json(stream, 200, &body.to_string());
+            schedule::run(stream, state, p, &body_bytes);
         }
-        ("POST", "/tabs/rotate-tokens") => {
-            // Revoke every tab's per-tab share tokens so all outstanding
-            // share links 401. Cleared on the snapshot immediately
-            // (instant effect) and queued so the owner loop clears the
-            // runtime Tab + persists; a fresh token is minted on the next
-            // "Remote control" / `share-link`. Master token only — this
-            // path isn't in the share-token allowlist, so a share token
-            // never authorises here.
-            let mut state = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let mut revoked = 0usize;
-            for t in &mut state.tabs {
-                if t.share_token_rw.is_empty() && t.share_token_ro.is_empty() {
-                    continue;
-                }
-                t.share_token_rw = "".into();
-                t.share_token_ro = "".into();
-                revoked += 1;
-            }
-            let ids: Vec<String> = state.tabs.iter().map(|t| t.id.to_string()).collect();
-            state.pending_token_rotations.extend(ids);
-            state.invalidate_tabs();
-            drop(state);
-            respond_json(stream, 200, &format!(r#"{{"revoked":{revoked}}}"#));
-        }
-        ("POST", "/master-token/reset") => {
-            // Hot-swap the master API token: generate a fresh one, persist
-            // it to api.token (so `tab-atelier token` and saved configs
-            // re-read it), and publish it onto the snapshot the auth gate
-            // validates against. Every link / client carrying the OLD
-            // master token 401s on its next request. Master token only
-            // (this path isn't in the share-token allowlist).
-            let new = generate_token();
-            let dir = crate::platform::state_base_dir().join(crate::APP_DIR);
-            let _ = std::fs::create_dir_all(&dir);
-            if let Err(e) = write_private_file(&dir.join("api.token"), new.as_bytes()) {
-                error_json(stream, 500, &format!("could not persist token: {e}"));
-                return;
-            }
-            state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .master_token
-                .clone_from(&new);
-            respond_json(stream, 200, &format!(r#"{{"token":"{new}"}}"#));
-        }
+        ("POST", "/tabs/rotate-tokens") => tokens::rotate(stream, state),
+        ("POST", "/master-token/reset") => tokens::reset_master(stream, state),
         ("POST", p) if p.starts_with("/tabs/by-id/") && p.ends_with("/bg-color") => {
-            // Set or clear the per-tab background color override.
-            // Master token only. Body: {"color": "#RRGGBB"} to set,
-            // {"color": null} to clear (tab falls back to global
-            // default). Validates the hex before accepting.
-            let inner = &p["/tabs/by-id/".len()..p.len() - "/bg-color".len()];
-            let parsed: Option<Option<String>> = if body_bytes.is_empty() {
-                None
-            } else {
-                serde_json::from_slice::<serde_json::Value>(&body_bytes)
-                    .ok()
-                    .and_then(|v| {
-                        let c = v.get("color")?;
-                        if c.is_null() {
-                            Some(None)
-                        } else {
-                            c.as_str().map(|s| Some(s.to_string()))
-                        }
-                    })
-            };
-            let Some(color_opt) = parsed else {
-                error_json(stream, 400, "missing {\"color\": \"#RRGGBB\"} or {\"color\": null}");
-                return;
-            };
-            // Validate hex if Some.
-            if let Some(ref c) = color_opt
-                && (c.len() != 7 || !c.starts_with('#') || !c[1..].chars().all(|x| x.is_ascii_hexdigit()))
-            {
-                error_json(stream, 400, "color must be #RRGGBB");
-                return;
-            }
-            let mut state = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let Some(idx) = state.tabs.iter().position(|t| &*t.id == inner) else {
-                drop(state);
-                error_json(stream, 404, "tab not found");
-                return;
-            };
-            let tab_id = state.tabs[idx].id.to_string();
-            // Reflect immediately in the snapshot so the next /output
-            // poll already returns the new color; persist tick syncs
-            // the runtime Tab on the next 100 ms tick.
-            state.tabs[idx].bg_color = color_opt.as_deref().unwrap_or_default().into();
-            state.pending_bg_color_changes.push((tab_id, color_opt.clone()));
-            drop(state);
-            let body = serde_json::to_string(&serde_json::json!({
-                "color": color_opt
-            }))
-            .unwrap_or_default();
-            respond_json(stream, 200, &body);
+            tab_props::bg_color(stream, state, p, &body_bytes);
+        }
+        ("POST", p) if p.starts_with("/tabs/by-id/") && p.ends_with("/badge") => {
+            tab_props::badge(stream, state, p, &body_bytes);
         }
         ("POST", p) if p.starts_with("/tabs/by-id/") && p.ends_with("/context") => {
-            // Set or clear this tab's free-text context (the PR/task an
-            // in-tab agent is working on). Body: {"context":"…"} to set,
-            // {"context":null} or empty body to clear. RW token only.
-            let inner = &p["/tabs/by-id/".len()..p.len() - "/context".len()];
-            let context_opt: Option<String> = if body_bytes.is_empty() {
-                None
-            } else {
-                serde_json::from_slice::<serde_json::Value>(&body_bytes)
-                    .ok()
-                    .and_then(|v| v.get("context").cloned())
-                    .and_then(|c| {
-                        if c.is_null() {
-                            None
-                        } else {
-                            c.as_str().map(str::to_owned)
-                        }
-                    })
-            };
-            // Cap length so a runaway agent can't bloat the snapshot /
-            // tooltip; trim whitespace-only to a clear.
-            let context_opt = context_opt
-                .map(|s| s.chars().take(2000).collect::<String>())
-                .filter(|s| !s.trim().is_empty());
-            let mut state = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let Some(idx) = state.tabs.iter().position(|t| &*t.id == inner) else {
-                drop(state);
-                error_json(stream, 404, "tab not found");
-                return;
-            };
-            let tab_id = state.tabs[idx].id.to_string();
-            state.tabs[idx].context = context_opt.as_deref().map(std::sync::Arc::from);
-            state.pending_context_changes.push((tab_id, context_opt.clone()));
-            drop(state);
-            let body = serde_json::to_string(&serde_json::json!({ "context": context_opt })).unwrap_or_default();
-            respond_json(stream, 200, &body);
+            tab_props::context(stream, state, p, &body_bytes);
         }
         ("POST", p) if p.starts_with("/tabs/") && p.ends_with("/input") => {
-            let Some((key_raw, is_uuid)) = parse_tab_key(p, "/input") else {
-                error_json(stream, 404, "invalid tab key");
-                return;
-            };
-            let mut state = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(idx) = resolve_tab_idx(&state, key_raw, is_uuid) {
-                // Refuse every write source — master token, share tokens, all
-                // routes — when the tab is locked. `effective_locked()`
-                // is the single source of truth: it covers BOTH the
-                // user-toggled manual lock AND the off-hours schedule,
-                // so a new gate can't accidentally honour only one.
-                if crate::schedule::LockState::effective_locked(&state.tabs[idx]) {
-                    drop(state);
-                    error_json(stream, 403, "tab is locked");
-                    return;
-                }
-                info!("API: sending {} bytes of input to tab {idx}", body_bytes.len());
-                let n = body_bytes.len();
-                state.pending_input.push((idx, body_bytes));
-                drop(state);
-                let resp = serde_json::to_string(&serde_json::json!({"sent": n})).unwrap_or_default();
-                respond_json(stream, 200, &resp);
-            } else {
-                drop(state);
-                error_json(stream, 404, "tab not found");
-            }
+            input::run(stream, state, p, body_bytes);
         }
         (_, "/" | "/tabs") => {
             error_json(stream, 405, "method not allowed");
@@ -3581,6 +2175,7 @@ async fn handle_hyper_request(
     state: Arc<Mutex<TabSnapshot>>,
     token: String,
     read_only: bool,
+    from_loopback: bool,
 ) -> Result<Response<RespBody>, Infallible> {
     let path = req.uri().path().to_string();
     // Intercept WS upgrade BEFORE we collect the body into the sync
@@ -3622,7 +2217,7 @@ async fn handle_hyper_request(
             input: std::io::Read::chain(std::io::Cursor::new(head), std::io::Cursor::new(body)),
             output: Vec::with_capacity(1024),
         };
-        handle_connection(&mut adapter, &state, &token, read_only);
+        handle_connection(&mut adapter, &state, &token, read_only, from_loopback);
         adapter.output
     })
     .await
@@ -3630,28 +2225,25 @@ async fn handle_hyper_request(
     Ok(parse_h1_response(resp).map(BodyExt::boxed))
 }
 
-/// Parse an env-change body: `{"set":{"K":"V"},"unset":["K"],"respawn":bool}`.
-/// Returns an [`EnvChange`] with `tab: None`; the caller sets the tab.
-fn parse_env_body(body: &[u8]) -> Result<EnvChange, String> {
-    let v: serde_json::Value = serde_json::from_slice(body).map_err(|e| format!("invalid JSON body: {e}"))?;
-    let set = v
-        .get("set")
-        .and_then(serde_json::Value::as_object)
-        .map(|o| {
-            o.iter()
-                .filter_map(|(k, val)| val.as_str().map(|s| (k.clone(), s.to_owned())))
-                .collect()
-        })
-        .unwrap_or_default();
-    let unset = v
-        .get("unset")
-        .and_then(serde_json::Value::as_array)
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect())
-        .unwrap_or_default();
-    Ok(EnvChange { tab: None, set, unset })
+/// A small buffered relay response (errors / 401s), boxed to match [`RespBody`].
+/// Claude Code's reachability probe: `HEAD`/`GET {base}/api/hello`, sent with
+/// NO credential at all — it runs before the client has one to present. A 401
+/// there reads as "this endpoint is broken" and the whole relay looks dead,
+/// even though the real `/v1/messages` calls would authenticate fine.
+///
+/// Answered locally and unauthenticated: no upstream call, no token touched,
+/// and it discloses nothing that completing the TCP handshake hasn't already.
+/// Deliberately an exact path match — an unauthenticated branch is security
+/// surface, so it stays one probe wide.
+fn relay_hello(head_only: bool) -> Response<RespBody> {
+    let body = if head_only { "" } else { "{}" };
+    Response::builder()
+        .status(200)
+        .header("content-type", "application/json")
+        .body(Full::new(Bytes::from(body)).boxed())
+        .unwrap_or_else(|_| Response::new(Full::new(Bytes::new()).boxed()))
 }
 
-/// A small buffered relay response (errors / 401s), boxed to match [`RespBody`].
 fn relay_status(code: u16, msg: &str) -> Response<RespBody> {
     Response::builder()
         .status(code)
@@ -3666,9 +2258,10 @@ fn relay_status(code: u16, msg: &str) -> Response<RespBody> {
 /// sync path can't). Role is config-driven: the **egress** instance forwards to
 /// `api.anthropic.com` injecting the remote's Claude OAuth token (see
 /// [`crate::relay`]); otherwise the **local** instance forwards to the
-/// configured remote's `/relay/anthropic/*`. Auth: the local hop presents the
-/// stand-in `x-api-key`, the egress hop a `Bearer` — both must equal this
-/// instance's master token.
+/// configured remote's `/relay/anthropic/*`. Auth: this instance's relay token
+/// in either `x-api-key` (what a claude client sends) or `Authorization:
+/// Bearer` (what our forwarding hop sends) — the role doesn't change which
+/// header is accepted.
 async fn handle_relay(req: Request<Incoming>, master_token: &str) -> Response<RespBody> {
     let method = req.method().clone();
     let full = req.uri().path();
@@ -3676,23 +2269,70 @@ async fn handle_relay(req: Request<Incoming>, master_token: &str) -> Response<Re
     let sub_pq = req.uri().query().map_or_else(|| sub.clone(), |q| format!("{sub}?{q}"));
     let egress = crate::relay_egress();
 
-    // Auth against this instance's master token (constant-time).
-    let provided = if egress {
-        req.headers()
-            .get(hyper::header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
-            .unwrap_or("")
-            .to_owned()
-    } else {
-        req.headers()
-            .get("x-api-key")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_owned()
-    };
-    if !constant_time_eq(provided.as_bytes(), master_token.as_bytes()) {
-        return relay_status(401, "relay: unauthorized");
+    // Reachability probe first: it carries no credential by design, so it has
+    // to be answered before the auth gate or the client concludes the relay is
+    // unusable and never gets as far as an authenticated call.
+    if sub == "/api/hello" && matches!(method, hyper::Method::HEAD | hyper::Method::GET) {
+        return relay_hello(method == hyper::Method::HEAD);
+    }
+
+    // Auth against this instance's relay token (constant-time), from EITHER
+    // header, whatever the role.
+    //
+    // These used to be role-dependent — Bearer on an egress instance, x-api-key
+    // on a local hop — because a claude client speaks x-api-key and our own
+    // forwarding hop speaks Bearer. That made the header a second, undocumented
+    // thing to get right: a claude pointed straight at an egress box, or an
+    // operator running the README's smoke test there, sends x-api-key, gets an
+    // empty credential and a 401 that says nothing about the real problem. The
+    // token is the same secret either way, so which envelope carries it buys
+    // nothing.
+    // Captured before the body is consumed: whatever the client opted into
+    // travels with the request, on both hops.
+    let client_beta = req
+        .headers()
+        .get("anthropic-beta")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let provided = req
+        .headers()
+        .get("x-api-key")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned)
+        .or_else(|| {
+            req.headers()
+                .get(hyper::header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.strip_prefix("Bearer "))
+                .map(str::to_owned)
+        })
+        .unwrap_or_default();
+    // The relay token is the ONLY credential for this route. It authenticates
+    // the relay and nothing else, so the value sitting in a claude tab's
+    // ANTHROPIC_API_KEY cannot administer the instance if it leaks — which is
+    // the entire point, and is why the master token is not a second way in.
+    if !constant_time_eq(provided.as_bytes(), crate::relay_token().as_bytes()) {
+        // A bare "unauthorized" leaves the operator guessing which hop, which
+        // route and which credential was wrong — the whole point of the relay
+        // is that two machines and three tokens are involved. Say what we can
+        // without printing anyone's secret: the hop, the path, the header the
+        // client used, and whether what it sent was the master token (the most
+        // common mistake, since that IS what older builds wanted here).
+        let looks_like_master =
+            !master_token.is_empty() && constant_time_eq(provided.as_bytes(), master_token.as_bytes());
+        let hop = if egress { "egress" } else { "local" };
+        let diagnosis = if provided.is_empty() {
+            "no credential presented"
+        } else if looks_like_master {
+            "presented the MASTER token — the relay takes `tab-atelier relay token` only"
+        } else {
+            "credential did not match this instance's relay token"
+        };
+        log::warn!(
+            "relay: 401 on {method} /relay/anthropic{sub} ({hop} hop, {len} chars presented): {diagnosis}",
+            len = provided.chars().count(),
+        );
+        return relay_status(401, &format!("relay: unauthorized ({hop} hop: {diagnosis})"));
     }
 
     let content_type = req
@@ -3717,15 +2357,36 @@ async fn handle_relay(req: Request<Incoming>, master_token: &str) -> Response<Re
     tokio::task::spawn_blocking(move || {
         let agent = crate::relay::relay_agent();
         let (url, bearer, cf) = if egress {
-            let token = match crate::relay::oauth_access_token() {
-                Ok(t) => t,
-                Err(e) => {
-                    let _ = meta_tx.send(Err(format!("egress oauth: {e}")));
-                    return;
-                }
-            };
-            (format!("{}{sub_pq}", crate::relay::upstream()), token, None)
+            // The egress role moved out to the `tab-atelier-proxy` package.
+            //
+            // It authenticated an entire fleet with ONE shared token, which
+            // cannot say who spent the quota and cannot be taken away from one
+            // machine without re-keying every other. The replacement has an
+            // account per person and a key each. It is also a server, and this
+            // is a terminal emulator — running it here meant installing X11 and
+            // gpui on a box that wanted neither.
+            //
+            // Refused loudly rather than quietly forwarding: a relay that keeps
+            // half-working after its credential model changed is worse than one
+            // that says what to install.
+            let _ = meta_tx.send(Err(
+                "the egress role is now the `tab-atelier-proxy` package — install it there, \
+                 `tab-atelier-proxy add <first> <last> <email>` for a key, then point this \
+                 instance at it with `relay via`. See docs/proxy.md"
+                    .to_owned(),
+            ));
+            return;
         } else if let Some(t) = target {
+            // Without a relay token for the peer there is nothing to present,
+            // and forwarding an empty Bearer just turns a local misconfig into
+            // a 401 from the other machine — the hardest kind to diagnose.
+            if t.token.is_empty() {
+                let _ = meta_tx.send(Err(format!(
+                    "no relay token for {} — run `tab-atelier relay token` there, then                      `remote add … --relay-token <it>` here",
+                    t.url
+                )));
+                return;
+            }
             let cf = (!t.cf_access_client_id.is_empty())
                 .then(|| (t.cf_access_client_id.clone(), t.cf_access_client_secret.clone()));
             (format!("{}/relay/anthropic{sub_pq}", t.url), t.token, cf)
@@ -3742,9 +2403,17 @@ async fn handle_relay(req: Request<Incoming>, master_token: &str) -> Response<Re
         ];
         if egress {
             hdrs.push(("anthropic-version", crate::relay::ANTHROPIC_VERSION.to_owned()));
-            hdrs.push(("anthropic-beta", crate::relay::ANTHROPIC_BETA.to_owned()));
+            hdrs.push((
+                "anthropic-beta",
+                crate::relay::merge_beta(client_beta.as_deref(), crate::relay::ANTHROPIC_BETA),
+            ));
         } else {
             hdrs.push(("Accept", "application/json".to_owned()));
+            // The local hop is a pipe: the egress needs the client's flags to
+            // merge, and it can't see them if we drop them here.
+            if let Some(beta) = client_beta.clone() {
+                hdrs.push(("anthropic-beta", beta));
+            }
             if let Some((id, sec)) = cf {
                 hdrs.push(("CF-Access-Client-Id", id));
                 hdrs.push(("CF-Access-Client-Secret", sec));
@@ -3815,11 +2484,17 @@ async fn handle_relay(req: Request<Incoming>, master_token: &str) -> Response<Re
 /// Pick the right hyper connection driver for the negotiated ALPN.
 /// Called from both the plain (no ALPN, default to h1) and TLS
 /// (ALPN-negotiated) listener paths.
-async fn serve_connection<I>(io: I, h2: bool, state: Arc<Mutex<TabSnapshot>>, token: String, read_only: bool)
-where
+async fn serve_connection<I>(
+    io: I,
+    h2: bool,
+    state: Arc<Mutex<TabSnapshot>>,
+    token: String,
+    read_only: bool,
+    from_loopback: bool,
+) where
     I: hyper::rt::Read + hyper::rt::Write + Send + Unpin + 'static,
 {
-    let svc = service_fn(move |req| handle_hyper_request(req, state.clone(), token.clone(), read_only));
+    let svc = service_fn(move |req| handle_hyper_request(req, state.clone(), token.clone(), read_only, from_loopback));
     if h2 {
         let _ = h2_conn::Builder::new(TokioExecutor::new())
             .serve_connection(io, svc)
@@ -3885,6 +2560,9 @@ pub fn start_api_server(state: Arc<Mutex<TabSnapshot>>, token: String, read_only
             let listener = match TokioListener::bind(&bind).await {
                 Ok(l) => {
                     info!("API: listening on {bind} (HTTP/1.1)");
+                    if let Ok(addr) = l.local_addr() {
+                        record_bound_url(addr.port());
+                    }
                     l
                 }
                 Err(e) => {
@@ -3897,13 +2575,14 @@ pub fn start_api_server(state: Arc<Mutex<TabSnapshot>>, token: String, read_only
             loop {
                 tokio::select! {
                     res = listener.accept() => {
-                        let Ok((stream, _)) = res else { continue };
+                        let Ok((stream, peer)) = res else { continue };
+                        let loopback = peer.ip().is_loopback();
                         let state = state.clone();
                         let token = token.clone();
                         tokio::spawn(async move {
                             // Plain HTTP: no ALPN, HTTP/1.1 with
                             // keep-alive. HTTP/2 only over TLS.
-                            serve_connection(TokioIo::new(stream), false, state, token, read_only).await;
+                            serve_connection(TokioIo::new(stream), false, state, token, read_only, loopback).await;
                         });
                     }
                     () = shutdown.notified() => {
@@ -4030,7 +2709,8 @@ pub fn start_api_server_tls(
             loop {
                 tokio::select! {
                     res = listener.accept() => {
-                        let Ok((stream, _)) = res else { continue };
+                        let Ok((stream, peer)) = res else { continue };
+                        let loopback = peer.ip().is_loopback();
                         let acceptor = acceptor.clone();
                         let state = state.clone();
                         let token = token.clone();
@@ -4046,7 +2726,7 @@ pub fn start_api_server_tls(
                             // protocol so hyper uses the right framing.
                             let alpn = tls.get_ref().1.alpn_protocol().map(<[u8]>::to_vec);
                             let is_h2 = alpn.as_deref() == Some(b"h2");
-                            serve_connection(TokioIo::new(tls), is_h2, state, token, read_only).await;
+                            serve_connection(TokioIo::new(tls), is_h2, state, token, read_only, loopback).await;
                         });
                     }
                     () = shutdown.notified() => {
@@ -4291,7 +2971,55 @@ pub fn test_snapshot_tab(id: &str, name: &str) -> SnapshotTab {
         dns_entries: Vec::new(),
         resident_memory_bytes: None,
         tokens: None,
+        tab_env: std::collections::BTreeMap::new(),
+        meta: std::collections::BTreeMap::new(),
+        badge: None,
     }
+}
+
+/// Spawn the real API server on an ephemeral port over `state`, returning the
+/// port once it is accepting. Test-only: it lets the CLI verb tests drive the
+/// actual HTTP paths (`share_link`, `remote`, …) instead of mocking them.
+#[cfg(test)]
+pub fn spawn_test_server(state: &std::sync::Arc<std::sync::Mutex<TabSnapshot>>, read_only: bool) -> u16 {
+    // Hand a pre-bound std listener to a fresh tokio runtime so the caller
+    // knows the port without racing a rebind; the channel makes "accepting"
+    // observable so a request can't beat the loop.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let port = listener.local_addr().expect("addr").port();
+    let token = state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .master_token
+        .clone();
+    let s = state.clone();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(async move {
+            let listener = tokio::net::TcpListener::from_std(listener).expect("from_std");
+            let _ = ready_tx.send(());
+            loop {
+                let Ok((stream, peer)) = listener.accept().await else {
+                    continue;
+                };
+                let loopback = peer.ip().is_loopback();
+                let state = s.clone();
+                let token = token.clone();
+                tokio::spawn(async move {
+                    serve_connection(TokioIo::new(stream), false, state, token, read_only, loopback).await;
+                });
+            }
+        });
+    });
+    ready_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("server ready");
+    port
 }
 
 #[cfg(test)]
@@ -4309,6 +3037,7 @@ pub fn test_snapshot(tabs: Vec<SnapshotTab>) -> TabSnapshot {
         pending_lock_changes: vec![],
         pending_net_changes: vec![],
         pending_net_allow_changes: vec![],
+        pending_ssh_agent_changes: vec![],
         pending_bg_color_changes: vec![],
         pending_context_changes: vec![],
         pending_token_rotations: vec![],
@@ -4321,6 +3050,8 @@ pub fn test_snapshot(tabs: Vec<SnapshotTab>) -> TabSnapshot {
         pending_claude_only: None,
         pending_relay_mode: None,
         pending_env_changes: Vec::new(),
+        pending_meta_changes: Vec::new(),
+        pending_badge_changes: Vec::new(),
         pending_relay_config: None,
         pending_renames: vec![],
         pending_status_updates: vec![],
@@ -4337,6 +3068,52 @@ mod tests {
     use super::*;
     use std::io::Read;
     use std::net::TcpStream;
+
+    /// The viewer's paste handler must leave TEXT paste alone.
+    ///
+    /// Pasting an image into the web viewer did nothing, because a clipboard
+    /// screenshot carries no text for xterm's hidden textarea to receive.
+    /// Uploading it to `inbox/` fixes that — but the tempting shape of the fix,
+    /// handling every paste, would take text paste away from xterm and break
+    /// the common case to fix the rare one. The early return on "no files" is
+    /// the whole safety property, so it is what this pins.
+    #[test]
+    fn the_viewer_only_intercepts_a_paste_that_carries_files() {
+        let js = MAIN_JS;
+        let at = js
+            .find("addEventListener(\"paste\"")
+            .expect("the viewer no longer handles paste at all");
+        let handler = &js[at..(at + 400).min(js.len())];
+        assert!(
+            handler.contains("clipboardData?.files"),
+            "the paste handler must look at clipboardData.files"
+        );
+        // The bail-out has to come BEFORE preventDefault, or a text paste is
+        // swallowed on its way to xterm.
+        let bail = handler.find("if (!files.length) return");
+        let prevent = handler.find("preventDefault");
+        assert!(
+            matches!((bail, prevent), (Some(b), Some(p)) if b < p),
+            "a paste with no files must return before preventDefault, or plain text paste stops working:\n{handler}"
+        );
+    }
+
+    /// Two pasted screenshots must not collide.
+    ///
+    /// Every clipboard image arrives called `image.png`, and `inbox/` is keyed
+    /// by name, so uploading them verbatim means each paste overwrites the one
+    /// before it — silently, since the upload itself succeeds.
+    #[test]
+    fn pasted_clipboard_images_get_a_unique_name() {
+        assert!(
+            MAIN_JS.contains("function pastedName"),
+            "the generic-name rename is gone; pasted images will overwrite each other in inbox/"
+        );
+        assert!(
+            MAIN_JS.contains("uploadFiles(files, { rename: true })"),
+            "paste must ask for the rename — drag-drop deliberately does not"
+        );
+    }
 
     /// A `TabInfo` with every field at its empty/default so a test can
     /// override just the two consumption fields (issue #28, S1/S2).
@@ -4363,6 +3140,10 @@ mod tests {
             last_used_at: None,
             agent_session_id: None,
             context: None,
+            meta: std::collections::BTreeMap::new(),
+            badge: None,
+            output_crc: 0,
+            output_len: 0,
             viewers: 0,
             net_disabled: false,
             connections: 0,
@@ -4577,13 +3358,6 @@ mod tests {
     }
 
     fn spawn_server_with_read_only(read_only: bool) -> (u16, Arc<Mutex<TabSnapshot>>, String) {
-        // Hand a pre-bound std listener to a fresh tokio runtime so
-        // the test can know the port without racing with rebind.
-        // A oneshot channel signals "listener is accepting" so the
-        // caller can't connect before the loop starts.
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let port = listener.local_addr().unwrap().port();
         let state = test_state();
         let token = "test-secret-token".to_string();
         // Auth validates against the snapshot's master_token (live-swappable).
@@ -4591,30 +3365,7 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .master_token = token.clone();
-        let s = state.clone();
-        let t = token.clone();
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            rt.block_on(async move {
-                let listener = tokio::net::TcpListener::from_std(listener).unwrap();
-                let _ = ready_tx.send(());
-                loop {
-                    let Ok((stream, _)) = listener.accept().await else {
-                        continue;
-                    };
-                    let state = s.clone();
-                    let token = t.clone();
-                    tokio::spawn(async move {
-                        serve_connection(TokioIo::new(stream), false, state, token, read_only).await;
-                    });
-                }
-            });
-        });
-        ready_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        let port = super::spawn_test_server(&state, read_only);
         (port, state, token)
     }
 
@@ -4634,6 +3385,15 @@ mod tests {
             return out;
         }
         req.to_string()
+    }
+
+    /// The header block of a response, as text. Safe on a binary body.
+    fn head_of(resp: &[u8]) -> String {
+        let end = resp
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .map_or(resp.len(), |i| i + 4);
+        String::from_utf8_lossy(&resp[..end]).into_owned()
     }
 
     fn request(port: u16, req: &str) -> String {
@@ -4692,97 +3452,749 @@ mod tests {
         String::from_utf8_lossy(&buf).into_owned()
     }
 
-    /// End-to-end: a client POST through the EGRESS relay is forwarded to a
-    /// mock "Anthropic", streaming the SSE response back, with the stand-in
-    /// auth swapped for the remote's Claude OAuth token. Mocks the real Claude
-    /// API (mirrors `catbus-agent/tests/openai_mock.rs`).
+    /// The egress role is retired here, and says where it went.
+    ///
+    /// The forwarding it used to do — inject the host's Claude OAuth token and
+    /// stream the SSE back — now lives in the `tab-atelier-proxy` crate, whose
+    /// `tests/forwarding.rs` covers it end to end against a mock Anthropic,
+    /// plus the thing this crate never could: that ONE caller's key can be
+    /// revoked without touching anyone else's.
+    ///
+    /// What is checked here is that the retirement is loud. A relay that
+    /// silently stopped injecting a credential would answer 401s from upstream
+    /// and look like an Anthropic outage.
     #[test]
-    fn relay_egress_streams_sse_and_injects_oauth() {
-        use std::io::{Read, Write};
+    fn the_egress_role_points_at_the_proxy_package_instead_of_half_working() {
         let _guard = RELAY_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-        // Fixture credentials: a far-future access token so no network refresh.
-        let dir = tempfile::tempdir().unwrap();
-        let creds = dir.path().join("creds.json");
-        std::fs::write(
-            &creds,
-            r#"{"claudeAiOauth":{"accessToken":"oat-fixture-xyz","refreshToken":"ort-x","expiresAt":9999999999999,"scopes":["user:inference"]}}"#,
-        )
-        .unwrap();
-
-        // Mock upstream Anthropic: capture the Authorization header, then stream
-        // two SSE frames with a gap and close (connection-close framing).
-        let mock = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let mock_port = mock.local_addr().unwrap().port();
-        let (seen_tx, seen_rx) = std::sync::mpsc::channel::<String>();
-        std::thread::spawn(move || {
-            if let Ok((mut sock, _)) = mock.accept() {
-                sock.set_read_timeout(Some(std::time::Duration::from_secs(2))).ok();
-                let mut buf = Vec::new();
-                let mut tmp = [0u8; 1024];
-                while let Ok(n) = sock.read(&mut tmp) {
-                    if n == 0 {
-                        break;
-                    }
-                    buf.extend_from_slice(&tmp[..n]);
-                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-                        break;
-                    }
-                }
-                let head = String::from_utf8_lossy(&buf);
-                let auth = head
-                    .lines()
-                    .find(|l| l.to_ascii_lowercase().starts_with("authorization:"))
-                    .unwrap_or("")
-                    .to_owned();
-                let _ = seen_tx.send(auth);
-                let _ =
-                    sock.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n");
-                let _ = sock.write_all(b"data: {\"type\":\"message_start\"}\n\n");
-                let _ = sock.flush();
-                std::thread::sleep(std::time::Duration::from_millis(40));
-                let _ = sock.write_all(b"data: [DONE]\n\n");
-                let _ = sock.flush();
-            }
-        });
-
-        // Configure the egress role + point it at the mock + fixture creds.
-        crate::relay::set_credentials_path(Some(creds));
-        crate::relay::set_upstream(Some(format!("http://127.0.0.1:{mock_port}")));
         crate::set_relay_egress(true);
-
-        let (port, _state, token) = spawn_server();
+        let (port, _state, _master) = spawn_server();
+        let token = crate::relay_token();
         let payload = "{}";
-        let req = format!(
-            "POST /relay/anthropic/v1/messages HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
-            payload.len()
+        let resp = request(
+            port,
+            &format!(
+                "POST /relay/anthropic/v1/messages HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
+                payload.len()
+            ),
         );
-        let resp = request(port, &req);
-
-        // Restore globals so parallel/later tests aren't affected.
         crate::set_relay_egress(false);
-        crate::relay::set_upstream(None);
-        crate::relay::set_credentials_path(None);
 
-        assert_eq!(status_code(&resp), 200, "resp: {resp}");
-        assert!(resp.contains("data:"), "expected streamed SSE, got: {resp}");
-        assert!(resp.contains("[DONE]"), "expected final SSE frame, got: {resp}");
-        let seen = seen_rx
-            .recv_timeout(std::time::Duration::from_secs(2))
-            .unwrap_or_default();
+        assert_eq!(status_code(&resp), 502, "resp: {resp}");
         assert!(
-            seen.contains("oat-fixture-xyz"),
-            "egress must inject the Claude OAuth token; upstream saw: {seen}"
+            resp.contains("tab-atelier-proxy"),
+            "the error must name the package that replaced this role: {resp}"
         );
         assert!(
-            !seen.contains(token.as_str()),
-            "the stand-in relay token must never reach Anthropic; saw: {seen}"
+            resp.contains("docs/proxy.md"),
+            "and where to read about the migration: {resp}"
         );
     }
 
     /// End-to-end: a client POST through the LOCAL relay is forwarded to the
+    #[test]
+    fn the_relay_route_takes_the_relay_token_not_just_the_master() {
+        let _guard = RELAY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (port, _state, master) = spawn_server();
+        let relay = crate::relay_token();
+        assert_ne!(relay, master, "the relay credential is its own token");
+
+        let payload = r#"{"model":"m","max_tokens":1,"messages":[]}"#;
+        let call = |key: &str| {
+            request(
+                port,
+                &format!(
+                    "POST /relay/anthropic/v1/messages HTTP/1.1\r\nHost: x\r\nx-api-key: {key}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
+                    payload.len(),
+                ),
+            )
+        };
+        // A token that is neither is refused — the route is not open.
+        assert_eq!(status_code(&call("not-a-token")), 401);
+        assert_eq!(status_code(&call("")), 401);
+        // The relay token authenticates. No relay target is configured here,
+        // so it gets as far as the forward attempt and fails there — what
+        // matters is that it is NOT 401.
+        assert_ne!(status_code(&call(&relay)), 401, "relay token authenticates");
+        // The master token is NOT a second way in: it administers every tab,
+        // and the point of the split is that the relay credential can't.
+        assert_eq!(status_code(&call(&master)), 401, "master is not a relay credential");
+    }
+
+    #[test]
+    fn the_tab_listing_carries_the_output_crc() {
+        // One request tells a poller which tabs moved. Without it `brain`
+        // re-fetched every tab's whole grid each tick just to discover that
+        // nothing had — ~1.4 MiB per sweep on a 63-tab fleet.
+        let (port, state, token) = spawn_server();
+        let resp = request(
+            port,
+            &format!("GET /tabs HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n"),
+        );
+        let listing = body(&resp);
+        let parsed: serde_json::Value = serde_json::from_str(listing).expect("json");
+        let tab = &parsed["tabs"][0];
+        let crc = tab["output_crc"].as_u64().expect("output_crc present");
+        let len = tab["output_len"].as_u64().expect("output_len present");
+        assert!(len > 0, "the fixture tab has output");
+        // It matches what /output reports, so a client can move between the
+        // two without re-deriving anything.
+        let out = request(
+            port,
+            &format!("GET /tabs/0/output HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n"),
+        );
+        assert!(
+            out.to_lowercase().contains(&format!("x-output-crc: {crc:08x}")),
+            "listing CRC must equal the /output header: {crc:08x}"
+        );
+        // And it tracks the content: change the output, the CRC changes.
+        // Set both forms: the listing mirrors /output, which prefers
+        // `raw_output` when the tab has one.
+        let mut s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let fresh = "something else entirely";
+        s.tabs[0].output = fresh.into();
+        s.tabs[0].output_crc = crate::crc32(fresh.as_bytes());
+        s.tabs[0].raw_output = fresh.into();
+        s.tabs[0].raw_output_crc = crate::crc32(fresh.as_bytes());
+        // `/tabs` serves `cached_response` when set; the owner clears it on
+        // every snapshot rebuild, so a test mutating the snapshot must too.
+        s.cached_response = None;
+        drop(s);
+        let resp = request(
+            port,
+            &format!("GET /tabs HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n"),
+        );
+        let listing = body(&resp);
+        let parsed: serde_json::Value = serde_json::from_str(listing).expect("json");
+        assert_ne!(
+            parsed["tabs"][0]["output_crc"].as_u64(),
+            Some(crc),
+            "CRC follows the content"
+        );
+    }
+
+    #[test]
+    fn the_sidecar_token_is_scoped_to_what_a_sidecar_does() {
+        // A peer driving tabs here gets a credential for exactly that. Handing
+        // it the master token instead would also grant credential rotation,
+        // the log ring, relay config and the env — permanently and invisibly.
+        let allowed = [
+            ("GET", "/tabs"),
+            ("POST", "/tabs"),
+            ("DELETE", "/tabs/2"),
+            ("GET", "/tabs/by-id/tab-a/output"),
+            ("GET", "/tabs/2/output"),
+            ("POST", "/tabs/by-id/tab-a/input"),
+            ("POST", "/tabs/2/rename"),
+            ("POST", "/tabs/2/activate"),
+            ("POST", "/tabs/by-id/tab-a/files"),
+            ("GET", "/tabs/by-id/tab-a/outbox"),
+            ("GET", "/tabs/by-id/tab-a/outbox/report.md"),
+            // Gossip: a peer daemon exchanges blackboard entries with us. Safe
+            // to expose because the merge is a set union — a peer can add
+            // entries but cannot remove, rewrite or reorder ours.
+            ("GET", "/blackboard"),
+            ("POST", "/blackboard"),
+        ];
+        for (m, p) in allowed {
+            assert!(sidecar_route(m, p), "{m} {p} is part of driving a tab");
+        }
+        let refused = [
+            // Leases are host-local mutual exclusion: honouring a remote's
+            // claim would mean trusting its clock, so a sidecar cannot take
+            // one out on this host.
+            ("GET", "/claims"),
+            ("POST", "/claims"),
+            ("POST", "/claims/release"),
+            ("POST", "/master-token/reset"),
+            ("POST", "/tabs/rotate-tokens"),
+            ("GET", "/logs"),
+            ("GET", "/env"),
+            ("POST", "/env"),
+            ("GET", "/tabs/by-id/tab-a/env"),
+            ("POST", "/relay-mode"),
+            ("GET", "/relay-config"),
+            ("POST", "/relay-config"),
+            ("POST", "/tabs/by-id/tab-a/ssh-agent"),
+            ("POST", "/tabs/by-id/tab-a/net-allow"),
+            ("POST", "/tabs/by-id/tab-a/limits"),
+            ("POST", "/tabs/by-id/tab-a/meta"),
+            ("GET", "/preferences"),
+            ("DELETE", "/tabs/by-id/tab-a/output"),
+            ("POST", "/tabs/by-id/tab-a/output"),
+        ];
+        for (m, p) in refused {
+            assert!(!sidecar_route(m, p), "{m} {p} must stay master-only");
+        }
+    }
+
+    #[test]
+    fn a_sidecar_peer_authenticates_with_the_remote_token() {
+        let (port, _state, master) = spawn_server();
+        let remote = crate::remote_token();
+        assert_ne!(remote, master, "the sidecar credential is its own token");
+        let get = |path: &str, token: &str| {
+            request(
+                port,
+                &format!("GET {path} HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n"),
+            )
+        };
+        // In scope: it can mirror the fleet.
+        assert_eq!(status_code(&get("/tabs", &remote)), 200);
+        assert_eq!(status_code(&get("/tabs/by-id/tab-a/output", &remote)), 200);
+        // Out of scope: the same token buys nothing else.
+        assert_eq!(status_code(&get("/env", &remote)), 401, "env stays master-only");
+        // The master still does everything, and a wrong token still nothing.
+        assert_eq!(status_code(&get("/env", &master)), 200);
+        assert_eq!(status_code(&get("/tabs", "nope")), 401);
+    }
+
+    #[test]
+    fn either_header_carries_the_relay_token_in_either_role() {
+        // The header used to depend on the role: Bearer on an egress instance,
+        // x-api-key on a local hop. A claude pointed straight at an egress box
+        // sends x-api-key — its native header — and got a 401 that had nothing
+        // to do with its token being right. Same for the README smoke test.
+        let _guard = RELAY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (port, _state, _master) = spawn_server();
+        let relay = crate::relay_token();
+        let payload = "{}";
+        let call = |header: String| {
+            request(
+                port,
+                &format!(
+                    "POST /relay/anthropic/v1/messages HTTP/1.1\r\nHost: x\r\n{header}Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
+                    payload.len(),
+                ),
+            )
+        };
+        for egress in [false, true] {
+            crate::set_relay_egress(egress);
+            for header in [
+                format!("x-api-key: {relay}\r\n"),
+                format!("Authorization: Bearer {relay}\r\n"),
+            ] {
+                let resp = call(header.clone());
+                assert_ne!(
+                    status_code(&resp),
+                    401,
+                    "egress={egress} must accept {}",
+                    header.split(':').next().unwrap_or(""),
+                );
+            }
+            // A wrong credential is still refused in both roles.
+            assert_eq!(status_code(&call("x-api-key: nope\r\n".into())), 401);
+        }
+        crate::set_relay_egress(false);
+    }
+
+    #[test]
+    fn a_relay_401_says_which_hop_and_why() {
+        // Two machines and three tokens are involved, so "unauthorized" alone
+        // leaves an operator with no idea which side rejected what.
+        let _guard = RELAY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (port, _state, master) = spawn_server();
+        let payload = "{}";
+        let call = |header: &str| {
+            request(
+                port,
+                &format!(
+                    "POST /relay/anthropic/v1/messages HTTP/1.1\r\nHost: x\r\n{header}Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
+                    payload.len(),
+                ),
+            )
+        };
+        // Presenting the master token is the likely mistake — older builds
+        // wanted exactly that here — so the body names it rather than leaving
+        // the operator to guess.
+        let resp = call(&format!("x-api-key: {master}\r\n"));
+        assert_eq!(status_code(&resp), 401);
+        assert!(resp.contains("MASTER"), "names the mistake: {resp}");
+        // No credential at all reads differently from a wrong one.
+        let resp = call("");
+        assert_eq!(status_code(&resp), 401);
+        assert!(resp.contains("no credential"), "{resp}");
+        // A wrong value says so without echoing it back.
+        let resp = call("x-api-key: some-other-token\r\n");
+        assert_eq!(status_code(&resp), 401);
+        assert!(resp.contains("did not match"), "{resp}");
+        assert!(!resp.contains("some-other-token"), "never echo the credential: {resp}");
+        // Every message names the hop, since the two ends fail differently.
+        assert!(resp.contains("local hop"), "{resp}");
+    }
+
+    /// The one lock every board-redirecting test shares (defined in
+    /// `cli::team`), so the API tests cannot race the CLI ones.
+    use crate::cli::team::BOARD_TEST_LOCK;
+
+    #[test]
+    fn a_missing_or_unwritable_cert_path_is_reported_before_the_server_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        let ok = dir.path().join("new.pem");
+        // A path that does not exist yet is fine — we are about to create it.
+        super::ensure_writable(&ok).expect("a fresh path is writable");
+        std::fs::write(&ok, b"x").unwrap();
+        super::ensure_writable(&ok).expect("an existing writable file is fine");
+        // A directory where a file should be must fail HERE, not halfway
+        // through writing a certificate.
+        let as_dir = dir.path().join("adir");
+        std::fs::create_dir(&as_dir).unwrap();
+        assert!(super::ensure_writable(&as_dir).is_err());
+        // A path whose parent does not exist cannot be created either.
+        assert!(super::ensure_writable(&dir.path().join("no/such/dir/f.pem")).is_err());
+    }
+
+    #[test]
+    fn an_external_cert_pair_is_loaded_or_refused_with_a_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let crt = dir.path().join("server.crt");
+        let key = dir.path().join("server.key");
+        // Nothing there at all.
+        assert!(super::load_external_cert(&crt, &key).is_err());
+        // Real, self-consistent PEM: generate one the same way the daemon
+        // does, so the test proves the loader accepts what we emit.
+        let generated = super::load_or_generate_cert(None).expect("self-signed");
+        let (chain, der_key) = generated;
+        assert!(!chain.is_empty(), "a generated chain must contain the leaf");
+        assert!(!der_key.is_empty());
+
+        // Garbage in the files is refused rather than half-loaded into a
+        // server that then fails every handshake.
+        std::fs::write(&crt, b"not a certificate").unwrap();
+        std::fs::write(&key, b"not a key").unwrap();
+        assert!(super::load_external_cert(&crt, &key).is_err());
+        // A cert with no key is equally useless.
+        std::fs::write(&crt, b"-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n").unwrap();
+        std::fs::write(&key, b"").unwrap();
+        assert!(super::load_external_cert(&crt, &key).is_err());
+    }
+
+    #[test]
+    fn a_client_ca_bundle_needs_at_least_one_usable_certificate() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = dir.path().join("ca.pem");
+        // Empty or junk bundles must be an error: silently trusting nobody
+        // would present as "every client is rejected" much later.
+        std::fs::write(&ca, b"").unwrap();
+        assert!(super::load_client_ca(&ca).is_err());
+        std::fs::write(&ca, b"garbage\n").unwrap();
+        assert!(super::load_client_ca(&ca).is_err());
+        assert!(super::load_client_ca(&dir.path().join("absent.pem")).is_err());
+    }
+
+    #[test]
+    fn schedule_headers_describe_the_lock_without_breaking_the_response() {
+        let schedule = crate::schedule::TabSchedule {
+            rule: "Mo-Fr 09:00-18:00".into(),
+            tz: "Europe/Paris".into(),
+        };
+        let mut extra = String::new();
+        super::write_schedule_headers(&mut extra, &schedule);
+        // A viewer shows the reason and the next change, so both have to be
+        // present…
+        assert!(extra.contains("X-Tab-Schedule"), "{extra}");
+        // …and every header line must be CRLF-terminated, or the rest of the
+        // response is swallowed into a malformed header block.
+        assert!(extra.ends_with("\r\n"), "{extra:?}");
+        for line in extra.split("\r\n").filter(|l| !l.is_empty()) {
+            assert!(line.contains(':'), "not a header: {line:?}");
+            assert!(!line.contains('\n'), "embedded newline: {line:?}");
+        }
+    }
+
+    #[test]
+    fn assets_revalidate_with_304_and_vary_per_encoding() {
+        let (port, _state, _token) = spawn_server();
+        // Assets are public: a viewer in a fresh browser must be able to load
+        // the JS before it has a token.
+        let get = |extra: &str| request(port, &format!("GET /assets/main.js HTTP/1.1\r\nHost: x\r\n{extra}\r\n"));
+        let first = get("");
+        assert_eq!(status_code(&first), 200, "RESP: {first}");
+        let low = first.to_ascii_lowercase();
+        // Long-lived + immutable is what lets a warm app skip the request
+        // entirely between tab opens.
+        assert!(
+            low.contains("cache-control: public, max-age=31536000, immutable"),
+            "{first}"
+        );
+        // And Vary, because the gzip and identity bodies are different bytes:
+        // without it a shared cache can hand a stored gzip response to a
+        // client that never asked for one.
+        assert!(low.contains("vary: accept-encoding"), "{first}");
+
+        // The ETag it just gave us must produce a 304, which is the whole
+        // point on a mobile client reopening tab after tab.
+        let etag = first
+            .split("\r\n")
+            .find_map(|l| {
+                l.to_ascii_lowercase()
+                    .starts_with("etag:")
+                    .then(|| l.split_once(':').map(|(_, v)| v.trim().to_owned()).unwrap_or_default())
+            })
+            .unwrap_or_default();
+        assert!(!etag.is_empty(), "no ETag on the identity response: {first}");
+        let again = get(&format!("If-None-Match: {etag}\r\n"));
+        assert_eq!(status_code(&again), 304, "{again}");
+        assert!(again.to_ascii_lowercase().contains("vary: accept-encoding"), "{again}");
+
+        // The gzip representation gets its OWN tag, so an identity copy can
+        // never be revalidated into a gzip body (or the reverse).
+        let gz = head_of(&request_bytes(
+            port,
+            "GET /assets/main.js HTTP/1.1\r\nHost: x\r\nAccept-Encoding: gzip\r\n\r\n",
+        ));
+        let gz_etag = gz
+            .split("\r\n")
+            .find_map(|l| {
+                l.to_ascii_lowercase()
+                    .starts_with("etag:")
+                    .then(|| l.split_once(':').map(|(_, v)| v.trim().to_owned()).unwrap_or_default())
+            })
+            .unwrap_or_default();
+        assert!(!gz_etag.is_empty(), "no ETag on the gzip response: {gz}");
+        assert_ne!(gz_etag, etag, "gzip and identity must not share an ETag");
+        // Cross-representation revalidation must NOT 304.
+        assert_eq!(status_code(&get(&format!("If-None-Match: {gz_etag}\r\n"))), 200);
+    }
+
+    #[test]
+    fn an_outbox_symlinked_out_of_the_cwd_lists_nothing() {
+        // Found by the security pass: `read_dir` follows a symlink given as
+        // the path, so `outbox -> /` (which anything running in the tab can
+        // create) turned the listing into a filesystem browser for anyone with
+        // a read-only share token. Downloads were never exposed —
+        // `resolve_sandbox_path` canonicalises — but every name, size and
+        // mtime on the host was.
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        std::fs::write(elsewhere.path().join("secret.txt"), b"x").unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), dir.path().join("outbox")).unwrap();
+
+        let mut tab = test_snapshot_tab("tab-a", "shell");
+        tab.cwd = Some(dir.path().to_string_lossy().into_owned().into());
+        let state = std::sync::Arc::new(std::sync::Mutex::new(test_snapshot(vec![tab])));
+        state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .master_token = "test-secret-token".into();
+        let port = spawn_test_server(&state, false);
+        let listing = request(
+            port,
+            "GET /tabs/by-id/tab-a/outbox HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer test-secret-token\r\n\r\n",
+        );
+        assert_eq!(status_code(&listing), 200, "{listing}");
+        assert!(!listing.contains("secret.txt"), "listed through the symlink: {listing}");
+        assert!(listing.contains("\"files\":[]"), "{listing}");
+
+        // A real directory in the right place still lists.
+        std::fs::remove_file(dir.path().join("outbox")).unwrap();
+        std::fs::create_dir(dir.path().join("outbox")).unwrap();
+        std::fs::write(dir.path().join("outbox").join("report.md"), b"y").unwrap();
+        let ok = request(
+            port,
+            "GET /tabs/by-id/tab-a/outbox HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer test-secret-token\r\n\r\n",
+        );
+        assert!(ok.contains("report.md"), "a real outbox must still list: {ok}");
+    }
+
+    #[test]
+    fn an_outbox_download_is_named_by_its_url_not_by_a_query_parameter() {
+        // The bug: the viewer linked to `…/files?path=outbox/x.md`, whose last
+        // URL segment is `files`. An `<a download>` only applies same-origin,
+        // so once the page and the API differ the browser ignored it and saved
+        // `files.bin` — the segment plus an extension guessed from the content
+        // type. Addressing the file by path leaves nothing to guess.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("outbox")).unwrap();
+        std::fs::write(dir.path().join("outbox").join("report final.md"), b"# hi\n").unwrap();
+
+        let mut tab = test_snapshot_tab("tab-a", "shell");
+        tab.cwd = Some(dir.path().to_string_lossy().into_owned().into());
+        let state = std::sync::Arc::new(std::sync::Mutex::new(test_snapshot(vec![tab])));
+        state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .master_token = "test-secret-token".into();
+        let port = spawn_test_server(&state, false);
+        let get = |path: &str| {
+            request(
+                port,
+                &format!("GET {path} HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer test-secret-token\r\n\r\n"),
+            )
+        };
+
+        // A space in the name must survive percent-encoding in the path.
+        let resp = get("/tabs/by-id/tab-a/outbox/report%20final.md");
+        assert_eq!(status_code(&resp), 200, "{resp}");
+        assert!(resp.contains("# hi"), "the body should be the file: {resp}");
+        // Content-Disposition still names it, so both mechanisms agree.
+        assert!(
+            resp.to_ascii_lowercase().contains("filename=\"report final.md\""),
+            "{resp}"
+        );
+
+        // The sandbox check is the same one the query form uses: a traversal
+        // must be refused, not resolved.
+        let escape = get("/tabs/by-id/tab-a/outbox/..%2F..%2Fetc%2Fpasswd");
+        assert_ne!(status_code(&escape), 200, "traversal was served: {escape}");
+        // A file that is not there is a 404, not an empty 200.
+        assert_ne!(status_code(&get("/tabs/by-id/tab-a/outbox/nope.md")), 200);
+        // And it is still behind the token.
+        let unauth = request(
+            port,
+            "GET /tabs/by-id/tab-a/outbox/report%20final.md HTTP/1.1\r\nHost: x\r\n\r\n",
+        );
+        assert_eq!(status_code(&unauth), 401, "{unauth}");
+    }
+
+    #[test]
+    fn the_fleet_route_renders_who_is_working_on_what() {
+        let _guard = BOARD_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (port, _state, token) = spawn_server();
+        let dir = tempfile::tempdir().unwrap();
+        crate::cli::team::set_blackboard_path(Some(dir.path().join("blackboard.jsonl")));
+        crate::claims::set_registry_path(Some(dir.path().join("claims.json")));
+        crate::claims::reset_for_test();
+
+        let post = |path: &str, body: &str| {
+            request(
+                port,
+                &format!(
+                    "POST {path} HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                ),
+            )
+        };
+        // A task announced and awarded, with a live lease behind it.
+        post(
+            "/blackboard",
+            r#"{"entries":[
+                {"ts":10,"msg":"raise coverage","id":"e1","kind":"announce","task":"cov:x","from":"backlog","origin":"host-a"},
+                {"ts":11,"msg":"","id":"e2","kind":"award","task":"cov:x","from":"agent-1","to":"agent-1"}
+            ]}"#,
+        );
+        post("/claims", r#"{"key":"task:cov:x","holder":"agent-1","ttl_ms":60000}"#);
+
+        let body = request(
+            port,
+            &format!("GET /fleet HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {token}\r\n\r\n"),
+        );
+        assert_eq!(status_code(&body), 200, "{body}");
+        let json = body.split("\r\n\r\n").nth(1).unwrap_or("");
+        let g: crate::fleet::Graph = serde_json::from_str(json).expect("graph json");
+
+        let works: Vec<&crate::fleet::Edge> = g.edges.iter().filter(|e| e.kind == "works_on").collect();
+        assert_eq!(works.len(), 1, "one agent working: {:?}", g.edges);
+        assert_eq!(works[0].from, "agent:agent-1");
+        assert_eq!(works[0].to, "task:cov:x");
+        assert_eq!(works[0].leased, Some(true), "the live lease should back the award");
+        assert!(works[0].expires_in_ms.is_some_and(|ms| ms > 0));
+        // The task's home travelled with the entry, so a viewer can group by
+        // machine without asking anyone.
+        assert!(
+            g.edges.iter().any(|e| e.kind == "home" && e.to == "host:host-a"),
+            "{:?}",
+            g.edges
+        );
+        assert!(g.nodes.iter().any(|n| n.kind == "task" && n.id == "task:cov:x"));
+        // A local `file://` dashboard has origin `null`, so the browser only
+        // lets it READ this if the reply says so. The test server's peer is
+        // loopback, so the header must be here.
+        assert!(
+            body.to_ascii_lowercase().contains("access-control-allow-origin: *"),
+            "the fleet route must be readable by a local page: {body}"
+        );
+        // The token still gates it — CORS decides who may read the answer,
+        // not who may ask.
+        let unauth = request(port, "GET /fleet HTTP/1.1\r\nHost: x\r\n\r\n");
+        assert_eq!(status_code(&unauth), 401, "{unauth}");
+        // The working agent is a node even though it has no tab on this host —
+        // in a federated fleet most agents are somewhere else, and omitting
+        // them would draw work assigned to nobody.
+        let agent = g
+            .nodes
+            .iter()
+            .find(|n| n.id == "agent:agent-1")
+            .expect("the working agent should be a node");
+        assert_eq!(agent.kind, "agent");
+        assert!(
+            g.nodes.iter().any(|n| n.kind == "host"),
+            "a graph always has at least the host it came from"
+        );
+
+        crate::claims::reset_for_test();
+        crate::claims::set_registry_path(None);
+        crate::cli::team::set_blackboard_path(None);
+    }
+
+    #[test]
+    fn the_blackboard_route_merges_a_peers_entries_idempotently() {
+        let _guard = BOARD_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (port, _state, token) = spawn_server();
+        let dir = tempfile::tempdir().unwrap();
+        crate::cli::team::set_blackboard_path(Some(dir.path().join("blackboard.jsonl")));
+
+        let post = |body: &str| {
+            request(
+                port,
+                &format!(
+                    "POST /blackboard HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                ),
+            )
+        };
+        let batch = r#"{"entries":[
+            {"ts":10,"msg":"raise coverage","id":"peer-1","kind":"announce","task":"cov:src/api.rs","from":"backlog"},
+            {"ts":11,"msg":"","id":"peer-2","kind":"bid","task":"cov:src/api.rs","from":"agent-x","cost":40}
+        ]}"#;
+        let first = post(batch);
+        assert_eq!(status_code(&first), 200, "{first}");
+        assert!(first.contains("\"merged\":2"), "{first}");
+
+        // Idempotent: the same batch again is a union with itself. This is
+        // what lets gossip run on a timer, in both directions, without
+        // duplicating the board.
+        let again = post(batch);
+        assert!(
+            again.contains("\"merged\":0"),
+            "replaying a batch must add nothing: {again}"
+        );
+
+        // And what we hold is now readable by a peer.
+        let listed = request(
+            port,
+            &format!("GET /blackboard HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {token}\r\n\r\n"),
+        );
+        assert!(listed.contains("cov:src/api.rs"), "{listed}");
+        assert!(listed.contains("\"next\":2"), "{listed}");
+        // `since` lets a puller resume rather than re-fetching everything.
+        let tail = request(
+            port,
+            &format!("GET /blackboard?since=2 HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {token}\r\n\r\n"),
+        );
+        assert!(tail.contains("\"entries\":[]"), "{tail}");
+
+        // Entries carrying no id can't be de-duplicated, so they are dropped
+        // rather than accumulating a new copy on every exchange.
+        let anonymous = post(r#"{"entries":[{"ts":12,"msg":"no id","kind":"announce","task":"t"}]}"#);
+        assert!(anonymous.contains("\"merged\":0"), "{anonymous}");
+        assert_eq!(status_code(&post(r#"{"nope":[]}"#)), 400);
+
+        crate::cli::team::set_blackboard_path(None);
+    }
+
+    #[test]
+    fn the_claims_route_grants_one_holder_and_names_the_other() {
+        let _guard = BOARD_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (port, _state, token) = spawn_server();
+        // Hermetic: a test run must never touch the developer's real lease
+        // table, and two tests sharing one would race.
+        let dir = tempfile::tempdir().unwrap();
+        crate::claims::set_registry_path(Some(dir.path().join("claims.json")));
+        crate::claims::reset_for_test();
+        let post = |path: &str, body: &str| {
+            request(
+                port,
+                &format!(
+                    "POST {path} HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                ),
+            )
+        };
+        let key = "task:cov-api-route-test";
+        let first = post(
+            "/claims",
+            &format!(r#"{{"key":"{key}","holder":"agent-a","ttl_ms":60000}}"#),
+        );
+        assert_eq!(status_code(&first), 200, "{first}");
+        assert!(first.contains("\"granted\":true"), "{first}");
+        assert!(first.contains("\"fence\""), "a grant must carry a fence: {first}");
+
+        // The second agent is refused AND told who holds it, so it can pick
+        // other work instead of spinning on this key.
+        let second = post(
+            "/claims",
+            &format!(r#"{{"key":"{key}","holder":"agent-b","ttl_ms":60000}}"#),
+        );
+        assert_eq!(status_code(&second), 409, "{second}");
+        assert!(second.contains("agent-a"), "409 must name the holder: {second}");
+
+        // Renewal by the holder is idempotent, not a conflict.
+        let renew = post(
+            "/claims",
+            &format!(r#"{{"key":"{key}","holder":"agent-a","ttl_ms":60000}}"#),
+        );
+        assert_eq!(status_code(&renew), 200, "{renew}");
+
+        // A non-holder releasing is a no-op, not a theft.
+        let steal = post("/claims/release", &format!(r#"{{"key":"{key}","holder":"agent-b"}}"#));
+        assert_eq!(status_code(&steal), 200, "{steal}");
+        assert!(steal.contains("\"released\":false"), "{steal}");
+
+        let listed = request(
+            port,
+            &format!("GET /claims HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {token}\r\n\r\n"),
+        );
+        assert!(listed.contains(key), "the live lease should be listed: {listed}");
+
+        // The holder may, and then the key is free for the next agent.
+        let released = post("/claims/release", &format!(r#"{{"key":"{key}","holder":"agent-a"}}"#));
+        assert!(released.contains("\"released\":true"), "{released}");
+        let now_free = post(
+            "/claims",
+            &format!(r#"{{"key":"{key}","holder":"agent-b","ttl_ms":60000}}"#),
+        );
+        assert_eq!(status_code(&now_free), 200, "{now_free}");
+
+        // Malformed input is refused rather than granting a nameless lease.
+        assert_eq!(status_code(&post("/claims", r#"{"key":"k"}"#)), 400);
+        assert_eq!(status_code(&post("/claims", r#"{"key":"","holder":"a"}"#)), 400);
+        crate::claims::reset_for_test();
+        crate::claims::set_registry_path(None);
+    }
+
+    #[test]
+    fn the_relay_health_probe_answers_without_a_credential() {
+        let _guard = RELAY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (port, _state, _master) = spawn_server();
+        // Claude Code probes reachability before it has a credential to send —
+        // observed on the wire as a bare HEAD with no x-api-key. 401ing it
+        // makes the client treat the whole relay as unusable.
+        for verb in ["HEAD", "GET"] {
+            let resp = request(
+                port,
+                &format!("{verb} /relay/anthropic/api/hello HTTP/1.1\r\nHost: x\r\n\r\n"),
+            );
+            assert_eq!(status_code(&resp), 200, "{verb} /api/hello must not need auth");
+        }
+        // The exemption is exactly one path: everything else still 401s
+        // without the relay token, including near-misses.
+        for path in [
+            "/relay/anthropic/api/hello/../v1/messages",
+            "/relay/anthropic/api/hellox",
+            "/relay/anthropic/v1/messages",
+            "/relay/anthropic/",
+        ] {
+            let resp = request(port, &format!("GET {path} HTTP/1.1\r\nHost: x\r\n\r\n"));
+            assert_eq!(status_code(&resp), 401, "{path} still needs the relay token");
+        }
+    }
+
     /// configured remote's `/relay/anthropic/*` with the remote's Bearer token,
     /// preserving the sub-path and streaming the response back.
     #[test]
@@ -4822,11 +4234,12 @@ mod tests {
             cf_access_client_secret: String::new(),
         }));
 
-        let (port, _state, master) = spawn_server();
+        let (port, _state, _master) = spawn_server();
+        let relay = crate::relay_token();
         let payload = "{}";
         // Claude presents the stand-in x-api-key (== the local master token).
         let req = format!(
-            "POST /relay/anthropic/v1/messages HTTP/1.1\r\nHost: x\r\nx-api-key: {master}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
+            "POST /relay/anthropic/v1/messages HTTP/1.1\r\nHost: x\r\nx-api-key: {relay}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
             payload.len()
         );
         let resp = request(port, &req);
@@ -4845,6 +4258,67 @@ mod tests {
         assert!(
             auth.contains("remote-tok-123"),
             "local hop must forward with the remote endpoint's token; saw: {auth}"
+        );
+    }
+
+    /// The relay must be transparent to the upstream's status: a real upstream
+    /// error (429/500/529 …) is streamed through with its status + body, NOT
+    /// collapsed into an opaque synthetic 502 (`http_status_as_error(false)`).
+    /// Regression for the "502 relay: upstream: http status: 529" report, where
+    /// an overloaded Anthropic became an unactionable 502 with no Retry-After.
+    #[test]
+    fn relay_passes_upstream_error_status_through() {
+        use std::io::Write;
+        let _guard = RELAY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // Mock "remote": reply 529 Overloaded with an explanatory JSON body.
+        let mock = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mock_port = mock.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = mock.accept() {
+                let _ = read_head(&mut sock);
+                let body = br#"{"type":"error","error":{"type":"overloaded_error"}}"#;
+                let _ = sock.write_all(
+                    format!(
+                        "HTTP/1.1 529 Overloaded\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .as_bytes(),
+                );
+                let _ = sock.write_all(body);
+                let _ = sock.flush();
+            }
+        });
+
+        crate::set_relay_egress(false);
+        crate::set_relay_target(Some(crate::RelayTarget {
+            url: format!("http://127.0.0.1:{mock_port}"),
+            token: "remote-tok-123".to_owned(),
+            cf_access_client_id: String::new(),
+            cf_access_client_secret: String::new(),
+        }));
+
+        let (port, _state, _master) = spawn_server();
+        let relay = crate::relay_token();
+        let payload = "{}";
+        let req = format!(
+            "POST /relay/anthropic/v1/messages HTTP/1.1\r\nHost: x\r\nx-api-key: {relay}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
+            payload.len()
+        );
+        let resp = request(port, &req);
+
+        crate::set_relay_target(None);
+
+        assert_eq!(
+            status_code(&resp),
+            529,
+            "upstream status must pass through, got: {resp}"
+        );
+        assert!(
+            resp.contains("overloaded_error"),
+            "upstream error body must pass through, got: {resp}"
         );
     }
 
@@ -5042,6 +4516,180 @@ mod tests {
         assert_eq!(pending, vec![(0_usize, "renamed".into())]);
     }
 
+    /// A `Read + Write` that replays a canned request and captures the reply,
+    /// so `handle_connection` can be driven with an arbitrary `from_loopback`
+    /// — a real socket to the test server is always 127.0.0.1.
+    struct FakeStream {
+        input: std::io::Cursor<Vec<u8>>,
+        output: Vec<u8>,
+    }
+
+    impl std::io::Read for FakeStream {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.input.read(buf)
+        }
+    }
+
+    impl Write for FakeStream {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.output.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn serve_once(req: &str, from_loopback: bool) -> String {
+        let state = test_state();
+        state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .master_token = "test-secret-token".into();
+        let mut fake = FakeStream {
+            input: std::io::Cursor::new(req.as_bytes().to_vec()),
+            output: Vec::new(),
+        };
+        handle_connection(&mut fake, &state, "test-secret-token", false, from_loopback);
+        String::from_utf8_lossy(&fake.output).into_owned()
+    }
+
+    #[test]
+    fn logs_are_readable_from_loopback_only() {
+        let _guard = crate::log_ring::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::log_ring::clear();
+        crate::log_ring::push(crate::log_ring::Line {
+            ts_ms: 42,
+            level: "WARN",
+            target: "test".into(),
+            msg: "a recorded line".into(),
+        });
+        let req = "GET /logs HTTP/1.1\r\nAuthorization: Bearer test-secret-token\r\n\r\n";
+
+        // From 127.0.0.1: the ring comes back.
+        let resp = serve_once(req, true);
+        assert_eq!(status_code(&resp), 200, "loopback reads the ring");
+        assert!(resp.contains("a recorded line"), "body carries the record: {resp}");
+
+        // From anywhere else: refused even WITH the master token, because the
+        // API binds 0.0.0.0 and these records name tabs, cwds and errors.
+        let resp = serve_once(req, false);
+        assert_eq!(status_code(&resp), 403, "remote peer refused");
+        assert!(!resp.contains("a recorded line"), "and told nothing: {resp}");
+
+        // The token still gates it on loopback — being local is a second
+        // requirement, not a replacement for auth.
+        let resp = serve_once("GET /logs HTTP/1.1\r\n\r\n", true);
+        assert_eq!(status_code(&resp), 401, "loopback still needs the token");
+        crate::log_ring::clear();
+    }
+
+    #[test]
+    fn logs_honours_the_lines_cap() {
+        let _guard = crate::log_ring::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::log_ring::clear();
+        for i in 0..10 {
+            crate::log_ring::push(crate::log_ring::Line {
+                ts_ms: i,
+                level: "INFO",
+                target: "test".into(),
+                msg: format!("line-{i}"),
+            });
+        }
+        let req = |q: &str| format!("GET /logs{q} HTTP/1.1\r\nAuthorization: Bearer test-secret-token\r\n\r\n");
+        // ?lines=N returns the newest N …
+        let resp = serve_once(&req("?lines=2"), true);
+        assert!(resp.contains("line-9") && resp.contains("line-8"));
+        assert!(!resp.contains("line-7"), "older lines excluded: {resp}");
+        // … and an absurd count is clamped to the ring rather than refused.
+        let resp = serve_once(&req("?lines=999999"), true);
+        assert_eq!(status_code(&resp), 200);
+        assert!(resp.contains("line-0"));
+        crate::log_ring::clear();
+    }
+
+    #[test]
+    fn openapi_documents_the_logs_route() {
+        // The contract is what a client reads before calling; a route that
+        // exists but isn't declared is invisible to them.
+        assert!(OPENAPI_YAML.contains("/logs:"), "openapi.yaml declares /logs");
+        assert!(
+            OPENAPI_YAML.contains("127.0.0.1"),
+            "and says it is loopback-only, which is the surprising part"
+        );
+    }
+
+    #[test]
+    fn set_meta_queues_a_set_then_a_clear() {
+        let (port, state, token) = spawn_server();
+        let post = |body: &str| {
+            request(
+                port,
+                &format!(
+                    "POST /tabs/by-id/tab-a/meta HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len(),
+                ),
+            )
+        };
+        assert_eq!(status_code(&post(r#"{"key":"Role","value":" reviewer "}"#)), 200);
+        let last = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pending_meta_changes
+            .last()
+            .cloned()
+            .expect("queued");
+        // Key lower-cased, value trimmed — normalisation happens server-side.
+        assert_eq!((last.key.as_str(), last.value.as_deref()), ("role", Some("reviewer")));
+        // A null value is the delete form.
+        assert_eq!(status_code(&post(r#"{"key":"role","value":null}"#)), 200);
+        let last = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pending_meta_changes
+            .last()
+            .cloned()
+            .expect("queued");
+        assert_eq!((last.key.as_str(), last.value), ("role", None));
+        // A key outside [a-z0-9_-] is refused before it reaches the queue.
+        assert_eq!(status_code(&post(r#"{"key":"role!","value":"x"}"#)), 400);
+        assert_eq!(
+            state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pending_meta_changes
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn set_meta_refuses_to_grow_past_the_key_cap() {
+        let (port, state, token) = spawn_server();
+        let mut s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        for i in 0..crate::META_MAX_KEYS {
+            s.tabs[0].meta.insert(format!("k{i}"), "v".into());
+        }
+        drop(s);
+        let post = |body: &str| {
+            request(
+                port,
+                &format!(
+                    "POST /tabs/by-id/tab-a/meta HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len(),
+                ),
+            )
+        };
+        // A NEW key on a full map is refused …
+        assert_eq!(status_code(&post(r#"{"key":"extra","value":"v"}"#)), 400);
+        // … while updating one that's already there still works.
+        assert_eq!(status_code(&post(r#"{"key":"k0","value":"v2"}"#)), 200);
+    }
+
     #[test]
     fn set_context_sets_and_clears() {
         let (port, state, token) = spawn_server();
@@ -5225,6 +4873,69 @@ mod tests {
     }
 
     #[test]
+    fn relay_config_and_mode_round_trip() {
+        // The relay-LLM CONTROL routes must RESPOND, not merely compile:
+        // GET reads the live config, POST queues a change onto the owner.
+        // Nothing else covered these — the other relay tests hit the
+        // /anthropic egress proxy, a different code path (anti-built≠wired).
+        let (port, state, master) = spawn_server();
+
+        // GET /relay-config → 200 with the {mode,egress,target} shape.
+        let resp = request(
+            port,
+            &format!("GET /relay-config HTTP/1.1\r\nAuthorization: Bearer {master}\r\n\r\n"),
+        );
+        assert_eq!(status_code(&resp), 200, "relay config readable");
+        assert!(
+            resp.contains("\"mode\"") && resp.contains("\"egress\"") && resp.contains("\"target\""),
+            "config JSON shape: {resp}"
+        );
+
+        // POST /relay-mode {"on":true} → 200 queued + mirrored onto the snapshot.
+        let body = r#"{"on":true}"#;
+        let resp = request(
+            port,
+            &format!(
+                "POST /relay-mode HTTP/1.1\r\nAuthorization: Bearer {master}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len(),
+            ),
+        );
+        assert_eq!(status_code(&resp), 200);
+        assert!(resp.contains("\"queued\""), "mode toggle queued");
+        assert_eq!(
+            state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pending_relay_mode,
+            Some(true),
+            "relay mode change queued onto the owner",
+        );
+
+        // POST /relay-config {"endpoint":"","egress":false} → 200 queued.
+        let body = r#"{"endpoint":"","egress":false}"#;
+        let resp = request(
+            port,
+            &format!(
+                "POST /relay-config HTTP/1.1\r\nAuthorization: Bearer {master}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len(),
+            ),
+        );
+        assert_eq!(status_code(&resp), 200);
+        assert!(
+            state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pending_relay_config
+                .is_some(),
+            "relay config change queued onto the owner",
+        );
+
+        // Master-only: the control routes aren't in the share-token allowlist.
+        let resp = request(port, "GET /relay-config HTTP/1.1\r\n\r\n");
+        assert_eq!(status_code(&resp), 401, "relay config is master-only");
+    }
+
+    #[test]
     fn openapi_spec_served_publicly() {
         let (port, _, _) = spawn_server();
         // No token — the spec is public so tooling can fetch it.
@@ -5242,6 +4953,23 @@ mod tests {
             resp.contains("/tabs/rotate-tokens") && resp.contains("/master-token/reset"),
             "documents token endpoints"
         );
+    }
+
+    #[test]
+    fn openapi_embedded_documents_all_control_routes() {
+        // Assert on the EMBEDDED spec (source of truth for the shipped
+        // build), not the HTTP-served copy: openapi_spec() prefers an
+        // installed /usr/share/doc/*/openapi.yaml when present, so the
+        // served copy on a dev box with an old package is stale. This
+        // guards that every control route we wire has a contract entry.
+        for route in [
+            "/tabs/rotate-tokens",
+            "/master-token/reset",
+            "/relay-mode",
+            "/relay-config",
+        ] {
+            assert!(OPENAPI_YAML.contains(route), "openapi.yaml documents {route}");
+        }
     }
 
     #[test]
@@ -5459,6 +5187,149 @@ mod tests {
             queued.is_empty(),
             "GUI must not queue an allowlist change it can't apply"
         );
+    }
+
+    // ssh-agent is a headless-daemon feature (the GUI spawn path isn't wired).
+    #[cfg(not(feature = "gui"))]
+    #[test]
+    fn ssh_agent_endpoint_enable_returns_state_and_queues() {
+        let (port, state, token) = spawn_server();
+        let body_in = r#"{"enabled":true,"key":"/var/lib/tab-atelier/id_ed25519"}"#;
+        let resp = request(
+            port,
+            &format!(
+                "POST /tabs/by-id/tab-a/ssh-agent HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\n\r\n{body_in}",
+                body_in.len(),
+            ),
+        );
+        assert_eq!(status_code(&resp), 200);
+        assert!(body(&resp).contains("\"ssh_agent\":true"), "body: {}", body(&resp));
+        let queued = {
+            let s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            s.pending_ssh_agent_changes.clone()
+        };
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].0, "tab-a");
+        assert_eq!(
+            queued[0].1.as_ref().and_then(|c| c.key.as_deref()),
+            Some("/var/lib/tab-atelier/id_ed25519")
+        );
+    }
+
+    // Disabling queues a `None` config — the drain reaps the agent and respawns.
+    #[cfg(not(feature = "gui"))]
+    #[test]
+    fn ssh_agent_endpoint_disable_queues_none() {
+        let (port, state, token) = spawn_server();
+        let body_in = r#"{"enabled":false}"#;
+        let resp = request(
+            port,
+            &format!(
+                "POST /tabs/by-id/tab-a/ssh-agent HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\n\r\n{body_in}",
+                body_in.len(),
+            ),
+        );
+        assert_eq!(status_code(&resp), 200);
+        assert!(body(&resp).contains("\"ssh_agent\":false"), "body: {}", body(&resp));
+        let queued = {
+            let s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            s.pending_ssh_agent_changes.clone()
+        };
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].0, "tab-a");
+        assert!(queued[0].1.is_none(), "disable must queue None (reap)");
+    }
+
+    #[cfg(not(feature = "gui"))]
+    #[test]
+    fn ssh_agent_endpoint_unknown_tab_404() {
+        let (port, _state, token) = spawn_server();
+        let body_in = r#"{"enabled":true}"#;
+        let resp = request(
+            port,
+            &format!(
+                "POST /tabs/by-id/does-not-exist/ssh-agent HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\n\r\n{body_in}",
+                body_in.len(),
+            ),
+        );
+        assert_eq!(status_code(&resp), 404);
+    }
+
+    // The GUI edition can't manage per-tab agents, so it refuses with 501 and
+    // queues nothing rather than faking success.
+    #[cfg(feature = "gui")]
+    #[test]
+    fn ssh_agent_endpoint_refused_on_gui() {
+        let (port, state, token) = spawn_server();
+        let body_in = r#"{"enabled":true}"#;
+        let resp = request(
+            port,
+            &format!(
+                "POST /tabs/by-id/tab-a/ssh-agent HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\n\r\n{body_in}",
+                body_in.len(),
+            ),
+        );
+        assert_eq!(status_code(&resp), 501, "GUI must refuse ssh-agent, not fake success");
+        let queued = {
+            let s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            s.pending_ssh_agent_changes.clone()
+        };
+        assert!(queued.is_empty(), "GUI must not queue a change it can't apply");
+    }
+
+    #[test]
+    fn env_list_per_tab_masks_secrets_but_shows_flags() {
+        let (port, state, token) = spawn_server();
+        {
+            let mut s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            s.tabs[0].tab_env.insert("API_KEY".into(), "s3cret".into());
+            s.tabs[0].tab_env.insert("DEBUG".into(), "1".into());
+            s.tabs[0].tab_env.insert("VERBOSE".into(), "true".into());
+            s.tabs[0].tab_env.insert("QUIET".into(), "FALSE".into());
+        }
+        let resp = request(
+            port,
+            &format!("GET /tabs/by-id/tab-a/env HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n"),
+        );
+        assert_eq!(status_code(&resp), 200);
+        let b = body(&resp);
+        // Secret masked; boolean-ish flags (incl. case-insensitive true/false)
+        // pass through; the raw secret never appears.
+        assert!(b.contains(r#""API_KEY":"******""#), "secret must be masked: {b}");
+        assert!(b.contains(r#""DEBUG":"1""#), "flag shown: {b}");
+        assert!(b.contains(r#""VERBOSE":"true""#), "flag shown: {b}");
+        assert!(b.contains(r#""QUIET":"FALSE""#), "case-insensitive flag shown: {b}");
+        assert!(!b.contains("s3cret"), "value must not leak: {b}");
+    }
+
+    #[test]
+    fn env_list_global_masks_secrets_but_shows_flags() {
+        let (port, _state, token) = spawn_server();
+        // Apply directly to the global map (the POST only queues a drain that
+        // runs in the main loop, absent from this test harness).
+        let mut g = std::collections::BTreeMap::new();
+        g.insert("GLOBAL_SECRET".to_string(), "hunter2".to_string());
+        g.insert("FEATURE_X".to_string(), "0".to_string());
+        crate::set_tab_env_global(g);
+        let resp = request(
+            port,
+            &format!("GET /env HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n"),
+        );
+        assert_eq!(status_code(&resp), 200);
+        let b = body(&resp);
+        assert!(b.contains(r#""GLOBAL_SECRET":"******""#), "secret masked: {b}");
+        assert!(b.contains(r#""FEATURE_X":"0""#), "flag shown: {b}");
+        assert!(!b.contains("hunter2"), "value must not leak: {b}");
+    }
+
+    #[test]
+    fn env_list_per_tab_unknown_tab_404() {
+        let (port, _state, token) = spawn_server();
+        let resp = request(
+            port,
+            &format!("GET /tabs/by-id/does-not-exist/env HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n"),
+        );
+        assert_eq!(status_code(&resp), 404);
     }
 
     #[test]
@@ -6028,6 +5899,7 @@ mod tests {
                 "assets/xterm-6.0.0.css",
                 "assets/main.css?version=",
                 "assets/xterm-6.0.0.js",
+                "assets/xterm-unicode11-6.0.0.js",
                 "assets/main.js?version=",
             ] {
                 let want = format!("{want_prefix}{asset}");
@@ -6126,6 +5998,19 @@ mod tests {
         assert!(
             std::str::from_utf8(&b).unwrap_or("").contains("xterm.js"),
             "css body must reference xterm.js in its banner"
+        );
+
+        // Unicode 11 addon — same unauthenticated, immutable-cache contract.
+        let raw = request_bytes(port, "GET /assets/xterm-unicode11-6.0.0.js HTTP/1.1\r\n\r\n");
+        let (h, b) = split_response(&raw);
+        assert!(h.starts_with("HTTP/1.1 200"), "got: {h}");
+        assert_eq!(
+            header_value(&h, "content-type"),
+            Some("application/javascript; charset=utf-8"),
+        );
+        assert!(
+            std::str::from_utf8(&b).unwrap_or("").contains("Unicode11Addon"),
+            "unicode11 body must expose the Unicode11Addon global"
         );
     }
 
@@ -6664,6 +6549,41 @@ mod tests {
     }
 
     #[test]
+    fn status_carries_the_daemon_flag() {
+        // `set-status --kind <verb> --daemon` is how a session-less daemon
+        // (brain and whatever a harness adds) elects itself for relaunch at
+        // restart. Without the flag the kind alone must not carry that meaning.
+        let (port, state, token) = spawn_server();
+        let post = |body: &str| {
+            request(
+                port,
+                &format!(
+                    "POST /tabs/by-id/tab-a/status HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len(),
+                ),
+            )
+        };
+        assert_eq!(
+            status_code(&post(r#"{"state":"thinking","agentKind":"aligator","daemon":true}"#)),
+            200
+        );
+        let s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let upd = s.pending_status_updates.last().unwrap();
+        let (kind, daemon) = (upd.agent_kind.clone(), upd.daemon);
+        drop(s);
+        assert_eq!(kind.as_deref(), Some("aligator"));
+        assert_eq!(daemon, Some(true));
+        assert_eq!(
+            status_code(&post(r#"{"state":"thinking","agentKind":"aligator"}"#)),
+            200
+        );
+        let s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let daemon = s.pending_status_updates.last().unwrap().daemon;
+        drop(s);
+        assert_eq!(daemon, None, "absent flag leaves the tab's setting untouched");
+    }
+
+    #[test]
     fn status_updates_queue_and_idle_clears() {
         let (port, state, token) = spawn_server();
         let set = r#"{"state":"thinking","label":"building","sessionId":"sess-9","agentKind":"claude"}"#;
@@ -6677,33 +6597,115 @@ mod tests {
         assert_eq!(status_code(&resp), 200);
         let s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let upd = s.pending_status_updates.last().unwrap();
-        let (tab_id, agent_state, label, session_id, agent_kind) = (
+        let (tab_id, agent_state, label, session_id, agent_kind, wipe) = (
             upd.tab_id.clone(),
             upd.state,
             upd.label.clone(),
             upd.session_id.clone(),
             upd.agent_kind.clone(),
+            upd.wipe_attachment,
         );
         drop(s);
         assert_eq!(tab_id, "tab-a");
-        assert_eq!(agent_state, crate::AgentState::Thinking);
+        assert_eq!(agent_state, Some(crate::AgentState::Thinking));
         assert_eq!(label.as_deref(), Some("building"));
         assert_eq!(session_id.as_deref(), Some("sess-9"));
         assert_eq!(agent_kind.as_deref(), Some("claude"));
-        // "idle" ⇒ the wipe marker.
-        let idle = r#"{"state":"idle"}"#;
+        assert!(!wipe, "a plain state update must never detach the session");
+    }
+
+    #[test]
+    fn idle_parks_the_indicator_and_still_attaches_the_session() {
+        // The distinction that matters for agents with no hook: `idle` must be
+        // able to say "no longer thinking" AND "this is the session to resume",
+        // in one call. Only the `__clear__` label detaches.
+        let (port, state, token) = spawn_server();
+        let post = |body: &str| {
+            status_code(&request(
+                port,
+                &format!(
+                    "POST /tabs/by-id/tab-a/status HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len(),
+                ),
+            ))
+        };
+        assert_eq!(
+            post(r#"{"state":"idle","sessionId":"codex-1","agentKind":"codex","label":"done"}"#),
+            200
+        );
+        let (state_now, label, session_id, kind, wipe) = {
+            let locked = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let upd = locked.pending_status_updates.last().unwrap();
+            let out = (
+                upd.state,
+                upd.label.clone(),
+                upd.session_id.clone(),
+                upd.agent_kind.clone(),
+                upd.wipe_attachment,
+            );
+            // Let the guard go before asserting, so nothing is held while the test runs on.
+            drop(locked);
+            out
+        };
+        assert_eq!(state_now, None, "idle takes the indicator down");
+        assert_eq!(label, None, "a parked indicator has nothing to render a label on");
+        assert_eq!(session_id.as_deref(), Some("codex-1"), "still resumable");
+        assert_eq!(kind.as_deref(), Some("codex"));
+        assert!(!wipe);
+
+        // A bare idle carries nothing, so it must not claim a session either.
+        assert_eq!(post(r#"{"state":"idle"}"#), 200);
+        let (state_now, session_id, kind, wipe) = {
+            let locked = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let upd = locked.pending_status_updates.last().unwrap();
+            let out = (
+                upd.state,
+                upd.session_id.clone(),
+                upd.agent_kind.clone(),
+                upd.wipe_attachment,
+            );
+            drop(locked);
+            out
+        };
+        assert_eq!(state_now, None);
+        assert_eq!(session_id, None);
+        assert_eq!(kind, None);
+        assert!(!wipe);
+    }
+
+    #[test]
+    fn clear_label_detaches_instead_of_rendering() {
+        // Claude Code's SessionEnd hook sends `{"state":"idle","label":"__clear__"}`
+        // and means "forget the attachment", not "show this text" — so the label
+        // must never survive as display text.
+        let (port, state, token) = spawn_server();
+        let payload = r#"{"state":"idle","label":"__clear__","sessionId":"gone","agentKind":"claude"}"#;
         let resp = request(
             port,
             &format!(
-                "POST /tabs/by-id/tab-a/status HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\n\r\n{idle}",
-                idle.len(),
+                "POST /tabs/by-id/tab-a/status HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\n\r\n{payload}",
+                payload.len(),
             ),
         );
         assert_eq!(status_code(&resp), 200);
-        let label = {
-            let s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            s.pending_status_updates.last().unwrap().label.clone()
+        assert!(body(&resp).contains(r#""cleared":true"#));
+        let (wipe, label, session_id, kind, state_now) = {
+            let locked = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let upd = locked.pending_status_updates.last().unwrap();
+            let out = (
+                upd.wipe_attachment,
+                upd.label.clone(),
+                upd.session_id.clone(),
+                upd.agent_kind.clone(),
+                upd.state,
+            );
+            drop(locked);
+            out
         };
-        assert_eq!(label.as_deref(), Some("__clear__"));
+        assert!(wipe);
+        assert_eq!(label, None, "the sentinel is a verb, not text");
+        assert_eq!(session_id, None);
+        assert_eq!(kind, None);
+        assert_eq!(state_now, None, "and the indicator comes down");
     }
 }

@@ -1,6 +1,4 @@
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// SPDX-License-Identifier: MPL-2.0
 
 #![cfg(feature = "gui")]
 
@@ -32,7 +30,7 @@ use gpui::{
     App, AppContext, Application, AsyncApp, ClickEvent, ClipboardItem, Context, Div, ElementId, Entity, FocusHandle,
     Focusable, Hsla, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, ParentElement, Pixels,
     Point, Render, Rgba, SharedString, Stateful, StatefulInteractiveElement, Styled, WeakEntity, Window,
-    WindowBackgroundAppearance, WindowHandle, WindowOptions, div, px, relative, rgba,
+    WindowBackgroundAppearance, WindowHandle, WindowOptions, div, px, rgba,
 };
 use log::{debug, error, info, warn};
 
@@ -179,10 +177,14 @@ struct Tab {
     /// at last save. Restored along with the session so the tab
     /// comes back in the same mode.
     agent_plan_mode: Option<bool>,
+    /// Mirrors `TabState::agent_daemon` — this tab is a session-less daemon.
+    agent_daemon: bool,
     /// Per-tab env vars (`env set --tab <id>`), injected on this tab's spawn.
     /// Mirrors `TabState::tab_env`.
     #[allow(clippy::struct_field_names)] // consistent name across TabState/HeadlessTab
     tab_env: std::collections::BTreeMap<String, String>,
+    /// Free-form durable labels (`set-meta`); mirrors `TabState::meta`.
+    meta: std::collections::BTreeMap<String, String>,
     /// Per-tab share secrets. Minted lazily by the right-click
     /// share-link menu and persisted to tabs.json so URLs survive
     /// restarts. Empty until first share.
@@ -210,6 +212,16 @@ struct Tab {
     /// the global `Preferences::tab_bg_color`, which itself falls
     /// back to Tomorrow Night Blue.
     bg_color: Option<String>,
+    /// Per-tab badge override; mirrors `TabState::badge`.
+    badge: Option<String>,
+    /// Tint last pushed into the view, so the resolve loop only touches the
+    /// terminal when the project colour actually changed (a `cd` into another
+    /// project, or an edited rule).
+    applied_tint: std::cell::Cell<Option<u32>>,
+    /// Badge resolved for this tab (own override, else its folder rule),
+    /// refreshed on the persist tick. Cached so the tab strip renders from a
+    /// field instead of resolving a rule per tab per frame.
+    resolved_badge: Option<std::sync::Arc<str>>,
     /// Free-text context the in-tab agent set via `set-context` (e.g.
     /// the PR/task it's on). Shown as a hover tooltip on the tab name.
     /// In-memory; set via the API + drained from the snapshot.
@@ -266,7 +278,10 @@ impl Tab {
             prior_uptime: std::time::Duration::from_secs_f64(ts.uptime_secs.unwrap_or(0.0)),
             active_duration: std::time::Duration::ZERO,
             last_activated: activated.then(std::time::Instant::now),
-            last_used_at: activated.then(crate::unix_millis),
+            // Restore the persisted MRU stamp so Ctrl+P ordering survives a
+            // restart; a fresh tab (no persisted value) falls back to "now" if
+            // it boots active, else stays unstamped until first focus.
+            last_used_at: ts.last_used_at.or_else(|| activated.then(crate::unix_millis)),
             // Boots un-flagged (grey): it only goes blue once its
             // agent WORKS while you're not looking. Restoring a tab
             // isn't "new work", so it must not flash blue on restart.
@@ -300,12 +315,17 @@ impl Tab {
             agent_session_id: ts.agent_session_id.as_deref().map(std::sync::Arc::from),
             agent_kind: ts.agent_kind.as_deref().map(std::sync::Arc::from),
             agent_plan_mode: ts.agent_plan_mode,
+            agent_daemon: ts.agent_daemon,
             tab_env: ts.tab_env.clone(),
+            meta: ts.meta.clone(),
             share_token_rw: ts.share_token_rw.as_str().into(),
             share_token_ro: ts.share_token_ro.as_str().into(),
             locked: ts.locked,
             schedule: ts.schedule.clone(),
             bg_color: ts.bg_color.clone(),
+            badge: ts.badge.clone(),
+            applied_tint: std::cell::Cell::new(None),
+            resolved_badge: None,
             context: None,
             last_pushed_locked: None,
             pending_agent_resume,
@@ -353,6 +373,13 @@ impl Tab {
     fn flush_pending_agent_resume(&mut self, cx: &mut gpui::App) {
         if let Some(cmd) = self.pending_agent_resume.take() {
             let view = self.view.read(cx);
+            // Wipe the local render NOW (grid + scrollback + frame cache) so the
+            // restored previous-session output is gone before the agent resumes
+            // and paints — otherwise its fresh UI lands over the stale frame and
+            // only the rows it redraws look right. The shell-side
+            // `AGENT_LAUNCH_CLEAR` below still runs, but it only takes effect
+            // once the shell executes it; this makes the screen clean instantly.
+            view.wipe_output();
             view.send_input_bytes(vec![0x15]); // Ctrl-U
             // Clear the grid first so the previous run's tail (e.g. the
             // `claude --resume …` exit line) doesn't linger under the resumed
@@ -446,9 +473,14 @@ struct TabSwitcher {
     /// Tab indices in most-recently-visited order (the current active tab is
     /// excluded — you're already on it), captured when the modal opens.
     order: Vec<usize>,
-    /// Highlighted row into `order`. Starts at 0 (the previous tab) so a bare
-    /// Ctrl+P → Enter jumps straight back to where you just were.
+    /// Highlighted row into the *filtered* order (see
+    /// [`AppState::switcher_filtered`]). Starts at 0 (the previous tab) so a
+    /// bare Ctrl+P → Enter jumps straight back to where you just were; reset to
+    /// 0 whenever `query` changes.
     selected: usize,
+    /// Live filter text — type to narrow the list by tab name (case-insensitive
+    /// substring, SQL `LIKE '%query%'`). Empty ⇒ show the whole MRU order.
+    query: String,
 }
 
 /// Everything `render_qr_modal` needs, computed once when the modal opens
@@ -583,6 +615,19 @@ impl OutputSaver {
 struct AppState {
     tabs: Vec<Tab>,
     active: usize,
+    /// A tab became active from a path with no `Window` in hand, so its
+    /// keyboard focus is still owed.
+    ///
+    /// `persist` (the API's "activate this tab") and `close_tab` (an agent
+    /// closing its own tab) both move `active` off a timer tick, where there is
+    /// no `Window` to call `.focus()` with. Without this the tab paints, the
+    /// mouse wheel still reaches it — scrolling is delivered by hit-test, not
+    /// focus — and every keystroke goes somewhere else: "only scroll works, not
+    /// typing", with app shortcuts dead too because focus sits on a stale view.
+    ///
+    /// `render` has a `Window`, so it settles the debt on the next frame. Same
+    /// trick as the `pending_new_tabs` drain below it.
+    refocus_active: bool,
     context_menu: Option<ContextMenu>,
     /// The desktop screen-mate pet — all its state + rendering lives in
     /// [`crate::pet::PetOverlay`]; summoned/dismissed from the background menu.
@@ -825,7 +870,7 @@ impl AppState {
         let pref_api_tls_addr_focus = cx.focus_handle();
         let pref_share_url_base_focus = cx.focus_handle();
         let pref_default_mem_focus = cx.focus_handle();
-        let prefs = load_preferences(&platform::config_dir());
+        let mut prefs = load_preferences(&platform::config_dir());
         // Per-tab cgroup ceilings (Linux). Cloned before `prefs` fields
         // are moved below; layered under each tab's own limits at spawn.
         #[cfg(target_os = "linux")]
@@ -866,6 +911,21 @@ impl AppState {
         // from the preference so `env set --global` values apply from boot.
         let relay_mode = crate::relay_mode() || prefs.relay_mode;
         crate::set_relay_mode(relay_mode);
+        // Repair a preferences file that holds both roles, and WRITE IT BACK.
+        // Correcting this only in memory leaves the contradiction on disk, where
+        // the next reader finds it again — which is why an instance could report
+        // `egress: false` from `relay status` while preferences.json still said
+        // true, and an "egress hop" 401 kept coming back from somewhere nobody
+        // could point at.
+        if crate::normalise_relay_config(&mut prefs) {
+            log::warn!(
+                "relay: preferences held both the egress role and a relay target; \
+                 the target wins — clearing the egress flag on disk"
+            );
+            if !crate::read_only() {
+                crate::save_preferences(&crate::platform::config_dir(), &prefs);
+            }
+        }
         crate::install_relay_config(&prefs);
         crate::set_tab_env_global(prefs.tab_env.clone());
         let opacity = prefs.opacity.unwrap_or(0xb8);
@@ -918,6 +978,9 @@ impl AppState {
                 let ce = code_editor.clone();
                 let colors = ts.colors_enabled;
                 let env = tab_env_extras(&ts.id, &api_url_for_pty, &api_token, &ts.tab_env);
+                // Kept for the net-off respawn below, which re-forks the shell
+                // and needs the same env the view is built with.
+                let env_for_respawn = ts.net_disabled.then(|| env.clone());
                 // Launch the agent directly (exec) when we can drive the
                 // shell command (cleared-env mode); otherwise fall back to
                 // typing the resume in (`pending_agent_resume` below).
@@ -991,9 +1054,13 @@ impl AppState {
                 // installed, so a persisted net-off tab doesn't boot
                 // into a dead shell on a host without bubblewrap.
                 if ts.net_disabled && crate::bwrap_available() {
+                    let relaunch = agent_launch.clone();
+                    let env = env_for_respawn.unwrap_or_default();
                     view.update(cx, |v, _| {
                         v.set_net_disabled(true);
-                        v.respawn(cwd.as_deref());
+                        // Same inputs the view was just built with — otherwise
+                        // the jailed re-fork loses the API env and the agent.
+                        v.respawn(cwd.as_deref(), &env, relaunch);
                     });
                 }
                 // Auto-resume: if this tab had an agent session and kind
@@ -1004,8 +1071,10 @@ impl AppState {
                     None
                 } else {
                     match (ts.agent_kind.as_deref(), ts.agent_session_id.as_deref()) {
-                        // Brain has no session — it re-attaches over the API.
-                        // Relaunch it whenever the tab is flagged as one.
+                        // A daemon tab has no session — it re-attaches over the
+                        // API — so relaunch its own subcommand. `brain` predates
+                        // the flag and stays recognised by kind alone.
+                        (Some(kind), _) if ts.agent_daemon => crate::daemon_relaunch_command(kind),
                         (Some("brain"), _) => build_agent_resume_command("brain", "", ts.agent_plan_mode),
                         (Some(kind), Some(sid)) => build_agent_resume_command(kind, sid, ts.agent_plan_mode),
                         _ => None,
@@ -1271,6 +1340,19 @@ impl AppState {
                                 break;
                             }
                         }
+                        // Anything in a tab that asked for the clipboard (OSC 52) is
+                        // handed to gpui here, because this is the UI thread and the
+                        // parser callback that received the request is not. Collected
+                        // first, then written: `write_to_clipboard` borrows `cx`, so
+                        // doing it inside the loop over `app.tabs` would not borrow-check.
+                        let asked: Vec<String> = app
+                            .tabs
+                            .iter()
+                            .filter_map(|tab| tab.view.read(cx).take_clipboard())
+                            .collect();
+                        for text in asked {
+                            cx.write_to_clipboard(ClipboardItem::new_string(text));
+                        }
                     }) else {
                         break;
                     };
@@ -1345,6 +1427,7 @@ impl AppState {
             prefs.api_tls_client_ca_path.clone().map(std::path::PathBuf::from);
         let share_url_base = prefs.share_url_base.unwrap_or_default();
         let tab_bg_global = prefs.tab_bg_color;
+        crate::set_folder_styles(prefs.folder_styles.clone());
         let remote_endpoints = prefs.remote_endpoints;
         info!("API server starting on {api_addr} (TLS {api_tls_addr})");
         let activity_signal = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -1365,6 +1448,7 @@ impl AppState {
             pending_lock_changes: Vec::new(),
             pending_net_changes: Vec::new(),
             pending_net_allow_changes: Vec::new(),
+            pending_ssh_agent_changes: Vec::new(),
             pending_bg_color_changes: Vec::new(),
             pending_context_changes: Vec::new(),
             pending_token_rotations: Vec::new(),
@@ -1377,6 +1461,8 @@ impl AppState {
             pending_claude_only: None,
             pending_relay_mode: None,
             pending_env_changes: Vec::new(),
+            pending_meta_changes: Vec::new(),
+            pending_badge_changes: Vec::new(),
             pending_relay_config: None,
             pending_renames: Vec::new(),
             pending_status_updates: Vec::new(),
@@ -1387,6 +1473,8 @@ impl AppState {
         }));
         let api_read_only = crate::read_only();
         api::start_api_server(api_state.clone(), api_token.clone(), api_read_only, api_addr.clone());
+        // Off unless `fleet_sweep_minutes` says otherwise.
+        crate::sweep::spawn_if_configured(api_read_only);
         api::start_api_server_tls(
             api_state.clone(),
             api_token.clone(),
@@ -1434,9 +1522,35 @@ impl AppState {
             );
         }
 
+        // The window can be re-shown or re-focused by the OS/compositor, not
+        // just by our Guake hotkey — e.g. you drove the active tab from the
+        // phone (web viewer) with the desktop backgrounded, then tab/click
+        // back to it. The reveal handler only fires on the hotkey, and gpui
+        // can keep a hidden window "fresh" enough that render()'s 2 s
+        // full-rebuild backstop doesn't fire, so the desktop would repaint the
+        // frame from when we last left it (stale — the grid advanced on the
+        // phone but the damage-reuse path never saw it). Void the active tab's
+        // render caches every time the window GAINS focus so the first frame
+        // rebuilds every row from the live grid.
+        cx.observe_window_activation(window, |app, window, cx| {
+            if !window.is_window_active() {
+                return;
+            }
+            let view = app.tabs.get(app.active).map(|t| t.view.clone());
+            if let Some(view) = view {
+                view.update(cx, |v, vcx| {
+                    v.release_render_caches();
+                    vcx.notify();
+                });
+            }
+        })
+        .detach();
+
         Self {
             tabs,
             active,
+            // The boot path focuses the active tab itself, with a Window.
+            refocus_active: false,
             context_menu: None,
             #[cfg(feature = "pets")]
             pet: crate::pet::PetOverlay::default(),
@@ -1671,11 +1785,16 @@ impl AppState {
         self.insert_tab(self.tabs.len(), None, window, cx);
     }
 
-    /// Like `add_tab` but with an explicit cwd hint from the API
-    /// (`POST /tabs` with `{cwd: ...}`). Falls back to the existing
-    /// inherit-from-active behaviour when the path doesn't exist.
-    fn add_tab_in(&mut self, cwd: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
-        self.insert_tab(self.tabs.len(), Some(cwd), window, cx);
+    /// A tab the API asked for (`POST /tabs` with `{cwd: ...}`): appended
+    /// without stealing focus, and with colour output turned off.
+    ///
+    /// A fleet spawning four workers must not yank the window away from
+    /// whoever is typing. And an agent's output is read by a program, not a
+    /// person: ANSI colour in it is bytes nobody looks at, in a scrollback
+    /// another agent may have to read back.
+    fn add_tab_in_background(&mut self, cwd: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let at = self.tabs.len();
+        self.insert_tab_inner(at, Some(cwd), false, window, cx);
     }
 
     fn add_tab_after_current(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1683,24 +1802,44 @@ impl AppState {
     }
 
     fn insert_tab(&mut self, at: usize, hint: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
+        self.insert_tab_inner(at, hint, true, window, cx);
+    }
+
+    /// `focus` false leaves the active tab where it is and marks the new tab
+    /// [`Tab::plain`].
+    fn insert_tab_inner(
+        &mut self,
+        at: usize,
+        hint: Option<PathBuf>,
+        focus: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let cwd = hint.filter(|p| p.is_dir()).or_else(|| {
             let pid = self.tabs[self.active].view.read(cx).pid();
             platform::process_cwd(pid).or_else(|| self.tabs[self.active].last_known_cwd.clone())
         });
         let grid = Self::grid_size(window, &self.font_config);
-        self.tabs[self.active].deactivate();
+        // Only the tab we are leaving gets deactivated; a background insert
+        // leaves the user's tab active and its timer running.
+        if focus {
+            self.tabs[self.active].deactivate();
+        }
         let fc = self.font_config.clone();
         let br = self.browser.clone();
         let ce = self.code_editor.clone();
         let tn = self.theme_name;
         let cs = self.cursor_style;
         let new_id = crate::default_tab_id();
-        let env = tab_env_extras(
+        let mut env = tab_env_extras(
             &new_id,
             &api_url_for_local_clients(&self.api_addr),
             &self.api_token,
             &std::collections::BTreeMap::new(),
         );
+        // `focus` false means the API asked for this tab, so it launches with
+        // colour output off — see `new_tab_env`.
+        env.extend(crate::new_tab_env(!focus));
         // Claude-only mode: a fresh tab launches `claude` in `auto` permission
         // mode instead of a plain shell. Under cleared-env we can `exec`
         // it directly via the shell suffix; otherwise we type the command into
@@ -1743,11 +1882,19 @@ impl AppState {
             ..TabState::default()
         };
         self.tabs
-            .insert(idx, Tab::from_state(view, &seed, cwd, None, pending_claude, true));
-        self.active = idx;
+            .insert(idx, Tab::from_state(view, &seed, cwd, None, pending_claude, focus));
+        if focus {
+            self.active = idx;
+        } else if idx <= self.active {
+            // Inserting before the active tab shifts its index; without this
+            // the selection silently jumps to a neighbour.
+            self.active += 1;
+        }
         #[cfg(target_os = "linux")]
         self.apply_tab_limits(idx, cx);
-        self.tabs[self.active].view.read(cx).focus_handle(cx).focus(window);
+        if focus {
+            self.tabs[self.active].view.read(cx).focus_handle(cx).focus(window);
+        }
         cx.notify();
     }
 
@@ -1796,6 +1943,11 @@ impl AppState {
         if was_active {
             self.tabs[self.active].activate();
             self.tabs[self.active].flush_pending_restore(cx);
+            // Closing the active tab hands the keyboard to its neighbour. The
+            // GUI callers focus it themselves (they hold a Window); the API
+            // one — an agent closing its own tab when it finishes — does not,
+            // and left the surviving tab unfocused. Harmless to ask twice.
+            self.refocus_active = true;
         }
         self.context_menu = None;
         cx.notify();
@@ -1822,6 +1974,16 @@ impl AppState {
     }
 
     fn persist(&mut self, cx: &mut Context<Self>) {
+        // Pick up an edited `style --folder` rule without a restart; a stat per
+        // tick, parsed only when the file moved.
+        crate::refresh_folder_styles();
+        // An open context menu shows live numbers (cpu, memory, uptime), and
+        // they're only as fresh as the last frame — so keep asking for frames
+        // while it is up. Same 2 s cadence as the sampler that feeds them;
+        // nothing repaints for an idle window otherwise.
+        if self.context_menu.is_some() {
+            cx.notify();
+        }
         if self.visible {
             let tab = &mut self.tabs[self.active];
             let idle = tab
@@ -1927,12 +2089,15 @@ impl AppState {
                     id: tab.id.to_string(),
                     name: tab.name.to_string(),
                     cwd,
+                    last_used_at: tab.last_used_at,
                     colors_enabled: tab.view.read(cx).colors_enabled(),
                     net_disabled: tab.view.read(cx).net_disabled(),
                     agent_session_id: tab.agent_session_id.as_deref().map(str::to_string),
                     agent_kind: tab.agent_kind.as_deref().map(str::to_string),
                     agent_plan_mode: tab.agent_plan_mode,
+                    agent_daemon: tab.agent_daemon,
                     tab_env: tab.tab_env.clone(),
+                    meta: tab.meta.clone(),
                     pinned_cols: tab.pinned_cols,
                     pinned_rows: tab.pinned_rows,
                     share_token_rw: tab.share_token_rw.to_string(),
@@ -1940,6 +2105,7 @@ impl AppState {
                     locked: tab.locked,
                     schedule: tab.schedule.clone(),
                     bg_color: tab.bg_color.clone(),
+                    badge: tab.badge.clone(),
                     limits: tab.limits.clone(),
                     ..TabState::default()
                 }
@@ -2012,19 +2178,46 @@ impl AppState {
             let Some(grid) = tab.snap_cache.clone() else {
                 continue;
             };
-            let bg_color = crate::effective_tab_bg(tab.bg_color.as_deref(), self.tab_bg_global.as_deref()).into();
+            let folder = crate::folder_style_of(tab.last_known_cwd_string.as_deref());
+            let bg_color = crate::effective_tab_bg(
+                tab.bg_color.as_deref(),
+                folder.color.as_deref(),
+                self.tab_bg_global.as_deref(),
+            )
+            .into();
+            let badge: Option<std::sync::Arc<str>> =
+                crate::effective_tab_badge(tab.badge.as_deref(), folder.badge.as_deref()).map(Into::into);
+            tab.resolved_badge.clone_from(&badge);
+            // Paint the project tint into the terminal itself, once per change
+            // — a tab that `cd`s into another project, or an edited rule, is
+            // re-derived here.
+            let tint = crate::effective_tab_tint(tab.bg_color.as_deref(), folder.color.as_deref())
+                .and_then(crate::parse_hex_rgb);
+            if tab.applied_tint.get() != tint {
+                tab.applied_tint.set(tint);
+                tab.view.update(cx, |v, vcx| {
+                    v.set_bg_override(tint);
+                    vcx.notify();
+                });
+            }
+            // Claude Code's fullscreen transcript scrolls by page, so tell the
+            // view to translate the wheel into PgUp/PgDn for this tab.
+            tab.view
+                .read(cx)
+                .set_alt_scroll_pages(tab.agent_kind.as_deref() == Some("claude"));
             // Per-tab RSS (#28 S1/S5): one /proc-subtree walk at the 2 s persist
             // cadence, cached on the tab for the tab-bar gauge and mirrored to
             // the snapshot below.
             let rss_bytes = crate::agent_probe::sample_tree(shell_pid).map(|s| s.rss_kb.saturating_mul(1024));
             tab.rss_bytes.set(rss_bytes);
-            // Fold in the ring's viewer-attach timestamp: a viewer (browser /
-            // mobile remote) opening the tab stamped it at connect time, so the
-            // open is recorded reliably even if the view already closed — a
-            // polled viewer_count edge missed those. Monotonic: only advances.
-            let attached = pty_ring.lock().map_or(0, |r| r.viewer_attached_at_millis());
-            if attached > tab.last_used_at.unwrap_or(0) {
-                tab.last_used_at = Some(attached);
+            // Fold in the ring's viewer-focus timestamp: a viewer (browser /
+            // mobile remote) stamps this on an explicit `TAG_FOCUS` frame (the
+            // user focused the tab) — NOT on a bare connect/reconnect — so
+            // mobile focus records "used now" without a background reconnect
+            // floating the tab up the MRU. Monotonic: only advances.
+            let focused = pty_ring.lock().map_or(0, |r| r.viewer_attached_at_millis());
+            if focused > tab.last_used_at.unwrap_or(0) {
+                tab.last_used_at = Some(focused);
             }
             api_tabs.push(api::SnapshotTab {
                 id: tab.id.clone(),
@@ -2046,6 +2239,7 @@ impl AppState {
                 locked: ts.locked,
                 schedule: ts.schedule.clone(),
                 bg_color,
+                badge,
                 context: tab.context.clone(),
                 shell_pid,
                 agent_state: tab.agent_state.clone(),
@@ -2100,6 +2294,8 @@ impl AppState {
                 tokens: tab.tokens_last_saved.get(),
                 #[cfg(not(feature = "catbus"))]
                 tokens: None,
+                tab_env: tab.tab_env.clone(),
+                meta: tab.meta.clone(),
             });
         }
 
@@ -2290,6 +2486,7 @@ impl AppState {
             let lock_changes: Vec<(String, bool)> = snapshot.pending_lock_changes.drain(..).collect();
             let net_changes: Vec<(String, bool)> = snapshot.pending_net_changes.drain(..).collect();
             let bg_color_changes: Vec<(String, Option<String>)> = snapshot.pending_bg_color_changes.drain(..).collect();
+            let badge_changes: Vec<(String, Option<String>)> = snapshot.pending_badge_changes.drain(..).collect();
             let context_changes: Vec<(String, Option<String>)> = snapshot.pending_context_changes.drain(..).collect();
             let token_rotations: Vec<String> = snapshot.pending_token_rotations.drain(..).collect();
             let schedule_changes: Vec<(String, Option<crate::schedule::TabSchedule>)> =
@@ -2302,6 +2499,7 @@ impl AppState {
             let relay_mode_change: Option<bool> = snapshot.pending_relay_mode.take();
             let relay_config_change = snapshot.pending_relay_config.take();
             let env_changes: Vec<crate::api::EnvChange> = snapshot.pending_env_changes.drain(..).collect();
+            let meta_changes: Vec<crate::api::MetaChange> = snapshot.pending_meta_changes.drain(..).collect();
             drop(snapshot);
             // Relay-mode toggle from the CLI/API (`relay on|off`).
             if let Some(on) = relay_mode_change {
@@ -2340,6 +2538,13 @@ impl AppState {
                     }
                 }
             }
+            // Free-form durable labels (`set-meta`) onto the runtime Tab —
+            // persisted on the next tick like every other durable field.
+            for ch in meta_changes {
+                if let Some(tab) = self.tabs.iter_mut().find(|t| *t.id == ch.tab_id) {
+                    crate::apply_meta_change(&mut tab.meta, &ch.key, ch.value);
+                }
+            }
             // Forced Claude-only toggle from the CLI/API (`claude-only on|off`).
             // Mirror onto the struct field + global (read by `insert_tab`) and
             // persist, so the change survives a restart like the menu toggle.
@@ -2375,17 +2580,29 @@ impl AppState {
             // than `respawn_tab_with_history`; refocus isn't needed for a
             // background toggle.
             for (tab_id, disabled) in net_changes {
-                if let Some(tab) = self.tabs.iter_mut().find(|t| *t.id == tab_id) {
-                    let cwd = platform::process_cwd(tab.view.read(cx).pid()).or_else(|| std::env::current_dir().ok());
-                    tab.view.update(cx, |v, _| {
-                        v.set_net_disabled(disabled);
-                        v.respawn(cwd.as_deref());
-                    });
+                let Some(idx) = self.tabs.iter().position(|t| *t.id == tab_id) else {
+                    continue;
+                };
+                let cwd =
+                    platform::process_cwd(self.tabs[idx].view.read(cx).pid()).or_else(|| std::env::current_dir().ok());
+                let (env, agent_launch) = self.respawn_inputs(idx);
+                let relaunch = agent_launch.clone();
+                self.tabs[idx].view.update(cx, |v, _| {
+                    v.set_net_disabled(disabled);
+                    v.respawn(cwd.as_deref(), &env, relaunch);
+                });
+                if agent_launch.is_none() {
+                    self.queue_typed_resume(idx);
                 }
             }
             for (tab_id, color) in bg_color_changes {
                 if let Some(tab) = self.tabs.iter_mut().find(|t| *t.id == tab_id) {
                     tab.bg_color = color;
+                }
+            }
+            for (tab_id, badge) in badge_changes {
+                if let Some(tab) = self.tabs.iter_mut().find(|t| *t.id == tab_id) {
+                    tab.badge = badge;
                 }
             }
             // Revoke per-tab share tokens on the runtime Tab so the
@@ -2484,20 +2701,20 @@ impl AppState {
                 let Some(tab) = self.tabs.iter_mut().find(|t| *t.id == upd.tab_id) else {
                     continue;
                 };
-                // "__clear__" sentinel from a POST with state=idle.
-                // Wipes BOTH the transient state and the durable
-                // session attachment, so the LED actually disappears
-                // on Claude Code's SessionEnd hook (otherwise the
-                // grey "session attached" dot would stick around).
-                if upd.label.as_deref() == Some("__clear__") {
+                if upd.wipe_attachment {
                     tab.agent_state = None;
                     tab.agent_session_id = None;
                     tab.agent_kind = None;
                     tab.agent_plan_mode = None;
                 } else {
-                    tab.agent_state = Some(crate::AgentStateSnapshot {
-                        state: upd.state,
-                        label: upd.label,
+                    // `state: None` (the wire's "idle") takes the indicator
+                    // down. The metadata below still applies either way, so
+                    // an update that names its session parks the LED *and*
+                    // leaves the tab resumable — which is what codex's
+                    // wrapper does on exit.
+                    tab.agent_state = upd.state.map(|state| crate::AgentStateSnapshot {
+                        state,
+                        label: upd.label.clone(),
                         updated_at: std::time::Instant::now(),
                     });
                     if upd.session_id.is_some() {
@@ -2508,6 +2725,9 @@ impl AppState {
                     }
                     if upd.plan_mode.is_some() {
                         tab.agent_plan_mode = upd.plan_mode;
+                    }
+                    if let Some(d) = upd.daemon {
+                        tab.agent_daemon = d;
                     }
                 }
             }
@@ -2695,6 +2915,10 @@ impl AppState {
                 self.active = idx;
                 self.tabs[idx].activate();
                 self.tabs[idx].flush_pending_restore(cx);
+                // No Window on a persist tick — render focuses it next frame.
+                // Skipping this is what left an API-activated tab scrollable
+                // but deaf to the keyboard.
+                self.refocus_active = true;
                 cx.notify();
             }
             for (idx, bytes) in inputs {
@@ -2750,29 +2974,9 @@ impl AppState {
         let ce = self.code_editor.clone();
         let tn = self.theme_name;
         let cs = self.cursor_style;
-        let env = tab_env_extras(
-            &self.tabs[idx].id,
-            &api_url_for_local_clients(&self.api_addr),
-            &self.api_token,
-            &self.tabs[idx].tab_env,
-        );
         // Respawning an agent tab → relaunch the agent directly (exec), same as
-        // a restore, so it comes back as claude rather than a bare shell. Never
-        // in read-only mode — see the restore path: resuming a live session
-        // corrupts the user's session ids.
-        let agent_launch = if crate::clear_env() && !crate::read_only() {
-            match (&self.tabs[idx].agent_kind, &self.tabs[idx].agent_session_id) {
-                (Some(k), Some(s)) => {
-                    // Name the agent process after the tab (see the restore path).
-                    let title =
-                        crate::shell_supports_exec_a(&crate::clear_env_shell_path()).then_some(&*self.tabs[idx].name);
-                    crate::agent_launch_shell_suffix_instrumented(k, s, self.tabs[idx].agent_plan_mode, title)
-                }
-                _ => None,
-            }
-        } else {
-            None
-        };
+        // a restore, so it comes back as claude rather than a bare shell.
+        let (env, agent_launch) = self.respawn_inputs(idx);
         let view = cx.new(|cx| {
             let mut tv = TerminalView::new_with_colors_and_env(
                 cwd.as_deref(),
@@ -2861,19 +3065,61 @@ impl AppState {
                 self.respawn_tab(idx, window, cx);
                 // clear-env respawn already exec's the agent; otherwise queue the
                 // typed `--resume` so the agent comes back in the fresh shell too.
-                if !crate::clear_env() {
-                    let kind = self.tabs[idx].agent_kind.as_deref().map(str::to_string);
-                    let sid = self.tabs[idx].agent_session_id.as_deref().map(str::to_string);
-                    let plan = self.tabs[idx].agent_plan_mode;
-                    if let (Some(k), Some(s)) = (kind, sid) {
-                        self.tabs[idx].pending_agent_resume = crate::build_agent_resume_command(&k, &s, plan);
-                    }
-                }
+                self.queue_typed_resume(idx);
             }
         }
         #[cfg(not(feature = "catbus"))]
         {
             let _ = (window, cx);
+        }
+    }
+
+    /// The per-tab PTY inputs any (re)spawn needs so the tab comes back as
+    /// itself: the API env the in-tab CLI and the Claude hooks read, and — under
+    /// cleared env — the `exec <agent> --resume …` suffix. Without the second
+    /// one a respawned agent tab drops to a bare shell; without the first, a
+    /// relaunched agent's hooks silently no-op. Never resumes in read-only mode
+    /// (see the restore path: it would rotate the user's session ids).
+    fn respawn_inputs(&self, idx: usize) -> (std::collections::HashMap<String, String>, Option<Vec<String>>) {
+        let tab = &self.tabs[idx];
+        let env = tab_env_extras(
+            &tab.id,
+            &api_url_for_local_clients(&self.api_addr),
+            &self.api_token,
+            &tab.tab_env,
+        );
+        let session = tab.agent_kind.as_deref().zip(tab.agent_session_id.as_deref());
+        let agent_launch = match crate::agent_relaunch_mode(session.is_some(), crate::clear_env(), crate::read_only()) {
+            crate::AgentRelaunch::Exec => session.and_then(|(k, s)| {
+                // Name the agent process after the tab (see the restore path).
+                let title = crate::shell_supports_exec_a(&crate::clear_env_shell_path()).then_some(&*tab.name);
+                crate::agent_launch_shell_suffix_instrumented(k, s, tab.agent_plan_mode, title)
+            }),
+            crate::AgentRelaunch::Typed | crate::AgentRelaunch::None => None,
+        };
+        (env, agent_launch)
+    }
+
+    /// The typed resume for a respawn that couldn't exec the agent (non-cleared
+    /// env). Queued on the tab and sent by [`Tab::flush_pending_agent_resume`]
+    /// once the fresh shell prints its prompt.
+    fn queue_typed_resume(&mut self, idx: usize) {
+        let (kind, sid, plan) = {
+            let tab = &self.tabs[idx];
+            (
+                tab.agent_kind.as_deref().map(str::to_string),
+                tab.agent_session_id.as_deref().map(str::to_string),
+                tab.agent_plan_mode,
+            )
+        };
+        let has_session = kind.is_some() && sid.is_some();
+        if crate::agent_relaunch_mode(has_session, crate::clear_env(), crate::read_only())
+            != crate::AgentRelaunch::Typed
+        {
+            return;
+        }
+        if let (Some(k), Some(s)) = (kind, sid) {
+            self.tabs[idx].pending_agent_resume = crate::build_agent_resume_command(&k, &s, plan);
         }
     }
 
@@ -2883,9 +3129,15 @@ impl AppState {
         }
         let old_pid = self.tabs[idx].view.read(cx).pid();
         let cwd = platform::process_cwd(old_pid).or_else(|| Some(std::env::current_dir().unwrap_or_default()));
+        // A colours / net toggle re-forks the shell; an agent tab must come back
+        // as its agent, not as a bare shell.
+        let (env, agent_launch) = self.respawn_inputs(idx);
         self.tabs[idx].view.update(cx, |view, _| {
-            view.respawn(cwd.as_deref());
+            view.respawn(cwd.as_deref(), &env, agent_launch.clone());
         });
+        if agent_launch.is_none() {
+            self.queue_typed_resume(idx);
+        }
         #[cfg(target_os = "linux")]
         self.apply_tab_limits(idx, cx);
         self.tabs[idx].created_at = std::time::Instant::now();
@@ -2956,18 +3208,22 @@ impl AppState {
                     id: tab.id.to_string(),
                     name: tab.name.to_string(),
                     cwd,
+                    last_used_at: tab.last_used_at,
                     colors_enabled: tab.view.read(cx).colors_enabled(),
                     net_disabled: tab.view.read(cx).net_disabled(),
                     agent_session_id: tab.agent_session_id.as_deref().map(str::to_string),
                     agent_kind: tab.agent_kind.as_deref().map(str::to_string),
                     agent_plan_mode: tab.agent_plan_mode,
+                    agent_daemon: tab.agent_daemon,
                     tab_env: tab.tab_env.clone(),
+                    meta: tab.meta.clone(),
                     pinned_cols: tab.pinned_cols,
                     pinned_rows: tab.pinned_rows,
                     share_token_rw: tab.share_token_rw.to_string(),
                     share_token_ro: tab.share_token_ro.to_string(),
                     locked: tab.locked,
                     bg_color: tab.bg_color.clone(),
+                    badge: tab.badge.clone(),
                     limits: tab.limits.clone(),
                     ..TabState::default()
                 }
@@ -3240,6 +3496,20 @@ impl AppState {
             #[cfg(feature = "energy")]
             let power_label = watts.get(i).map(power::TabPower::label).unwrap_or_default();
 
+            // Project identity, resolved on the persist tick (see `persist`) so
+            // a frame never resolves a rule per tab.
+            let badge_chip = tab.resolved_badge.clone().map(|text| {
+                let tint = tab.applied_tint.get();
+                div()
+                    .flex_none()
+                    .px(px(4.0))
+                    .mr(px(5.0))
+                    .rounded_sm()
+                    .text_size(px(10.0))
+                    .bg(tint.map_or(tab_border, |c| Hsla::from(gpui::rgb(c))))
+                    .child(text.to_string())
+            });
+
             let drag_name = tab.name.clone();
             let tab_el = div()
                 .id(ElementId::Name(self.tab_el_ids[i].clone()))
@@ -3358,6 +3628,7 @@ impl AppState {
                     this.move_tab(dragged.idx, i, window, cx);
                 }))
                 .when_some(agent_led, ParentElement::child)
+                .when_some(badge_chip, ParentElement::child)
                 .child(if self.screenshot_censor {
                     // Solid opaque bar over the name — an irreversible redaction
                     // (the text is never drawn), not a reversible blur.
@@ -3699,26 +3970,57 @@ impl AppState {
             // half-typed input, then `catbus-agent\n` runs it. No exec —
             // the shell stays alive underneath, so exiting catbus returns
             // the user to their session.
-            container = container.child(
-                div()
-                    .id("menu-catbus")
-                    .px(px(12.0))
-                    .py(px(4.0))
-                    .cursor_pointer()
-                    .hover(|s| s.bg(menu_hover))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
-                            this.tabs[idx]
-                                .view
-                                .read(cx)
-                                .send_input_bytes(b"\x15catbus-agent\n".to_vec());
-                            this.context_menu = None;
-                            cx.notify();
-                        }),
-                    )
-                    .child("\u{1f408}\u{fe0f}\u{1f68c}\u{fe0f} Catbus"),
-            );
+            //
+            // Not offered while an agent is already serving this tab. Clicking it
+            // would type the command regardless, and the new agent would either be
+            // refused by its own start-up guard or — worse, before that guard
+            // existed — bind over the running agent's socket and leave two agents
+            // appending to one transcript. The liveness is the same `agent_pid`
+            // the status dot uses, so the menu and the dot cannot disagree.
+            //
+            // With the `catbus` feature off the sweep never runs, so `agent_pid`
+            // is always None and nothing is known; the item stays offered, which
+            // is what it did before. Same caveat the dot takes.
+            #[cfg(feature = "catbus")]
+            let agent_serving_this_tab =
+                self.tabs[idx].agent_kind.is_some() && self.tabs[idx].agent_pid.get().is_some();
+            #[cfg(not(feature = "catbus"))]
+            let agent_serving_this_tab = false;
+
+            container = if agent_serving_this_tab {
+                // Dimmed rather than hidden: an item that disappears reads as a
+                // bug, and the operator's actual question is "why can't I start
+                // one here", which the label answers.
+                container.child(
+                    div()
+                        .id("menu-catbus-busy")
+                        .px(px(12.0))
+                        .py(px(4.0))
+                        .text_color(th.fg_muted_hsla())
+                        .child("\u{1f408}\u{fe0f}\u{1f68c}\u{fe0f} Catbus — an agent already runs here"),
+                )
+            } else {
+                container.child(
+                    div()
+                        .id("menu-catbus")
+                        .px(px(12.0))
+                        .py(px(4.0))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(menu_hover))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
+                                this.tabs[idx]
+                                    .view
+                                    .read(cx)
+                                    .send_input_bytes(b"\x15catbus-agent\n".to_vec());
+                                this.context_menu = None;
+                                cx.notify();
+                            }),
+                        )
+                        .child("\u{1f408}\u{fe0f}\u{1f68c}\u{fe0f} Catbus"),
+                )
+            };
 
             // ⛑ Brain — same pattern as Catbus: Ctrl-U + the command +
             // newline, takes over the current tab. Inside the brain
@@ -3753,7 +4055,7 @@ impl AppState {
                             cx.notify();
                         }),
                     )
-                    .child("\u{26d1}\u{fe0f} Brain"),
+                    .child(format!("\u{26d1}\u{fe0f} {}", self.t().brain)),
             );
 
             // 🐊 Aligator (PoC #35) — same take-over-the-tab pattern as Brain.
@@ -3900,7 +4202,12 @@ impl AppState {
             let elapsed = self.tabs[stats_idx].uptime();
             let t = self.t();
 
-            let mut stats_lines: Vec<String> = Vec::new();
+            // (label, value) pairs — one row each, ALWAYS, with the value
+            // absent while the sampler hasn't answered. `crate::stats_rows`
+            // renders the placeholder; see its doc for why the COUNT must not
+            // depend on the data. Values are recomputed every frame, so the
+            // numbers stay live while the menu is open.
+            let mut entries: Vec<(&str, Option<String>)> = Vec::new();
 
             #[cfg(feature = "energy")]
             {
@@ -3910,42 +4217,52 @@ impl AppState {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .get(stats_idx)
                     .cloned();
-                if let Some(ref p) = power_info {
-                    if p.cpu_percent >= 0.1 {
-                        stats_lines.push(format!("{}: {}", t.cpu, p.cpu_label()));
-                    }
-                    let wl = p.watts_label();
-                    if !wl.is_empty() {
-                        stats_lines.push(format!("{}: {wl}", t.power));
-                    }
-                }
+                entries.push((
+                    t.cpu,
+                    power_info
+                        .as_ref()
+                        .filter(|p| p.cpu_percent >= 0.1)
+                        .map(super::power::TabPower::cpu_label),
+                ));
+                entries.push((t.power, power_info.as_ref().map(super::power::TabPower::watts_label)));
                 let wh = self.tabs[stats_idx].energy_wh;
-                if wh > 0.0 {
-                    if wh >= 1.0 {
-                        stats_lines.push(format!("{}: {wh:.1} Wh", t.energy));
-                    } else {
-                        stats_lines.push(format!("{}: {:.0} mWh", t.energy, wh * 1000.0));
-                    }
-                }
+                entries.push((
+                    t.energy,
+                    (wh > 0.0).then(|| {
+                        if wh >= 1.0 {
+                            format!("{wh:.1} Wh")
+                        } else {
+                            format!("{:.0} mWh", wh * 1000.0)
+                        }
+                    }),
+                ));
             }
-            stats_lines.push(format!("{}: {}", t.uptime, format_duration(elapsed)));
+            entries.push((t.uptime, Some(crate::fmt::duration(elapsed))));
             // How long since this tab was last the foreground tab. The active
             // tab reads ~0 (refreshed every sweep); background tabs age.
-            if let Some(seen) = self.tabs[stats_idx].last_focused_at {
-                stats_lines.push(format!("{}: {}", t.last_seen, format_duration(seen.elapsed())));
-            }
+            entries.push((
+                t.last_seen,
+                self.tabs[stats_idx]
+                    .last_focused_at
+                    .map(|seen| crate::fmt::duration(seen.elapsed())),
+            ));
             // Per-tab consumption (issue #28): resident memory of the shell
-            // subtree + last agent token totals. Sampled once here, on popup
-            // open — not per frame. GUI renders memory in MB.
+            // subtree + last agent token totals, re-read per frame so they
+            // track while the menu is up. GUI renders memory in MB.
             let shell_pid = self.tabs[stats_idx].view.read(cx).pid();
-            if let Some(sample) = crate::agent_probe::sample_tree(shell_pid) {
-                let mb = sample.rss_kb as f64 / 1024.0;
-                stats_lines.push(format!("{}: {mb:.0} MB", t.memory));
-            }
+            entries.push((
+                t.memory,
+                crate::agent_probe::sample_tree(shell_pid)
+                    .map(|sample| format!("{:.0} MB", sample.rss_kb as f64 / 1024.0)),
+            ));
             #[cfg(feature = "catbus")]
-            if let Some(usage) = self.tabs[stats_idx].tokens_last_saved.get() {
-                stats_lines.push(format!("{}: {} in / {} out", t.tokens, usage.input, usage.output));
-            }
+            entries.push((
+                t.tokens,
+                self.tabs[stats_idx]
+                    .tokens_last_saved
+                    .get()
+                    .map(|usage| format!("{} in / {} out", usage.input, usage.output)),
+            ));
             let conns = self
                 .tab_connections
                 .lock()
@@ -3953,9 +4270,8 @@ impl AppState {
                 .get(&*self.tabs[stats_idx].id)
                 .copied()
                 .unwrap_or(0);
-            if conns > 0 {
-                stats_lines.push(format!("{}: {conns}", t.connections));
-            }
+            entries.push((t.connections, Some(conns.to_string())));
+            let stats_lines = crate::stats_rows(&entries);
 
             if !stats_lines.is_empty() {
                 if has_tab_section {
@@ -4340,7 +4656,7 @@ impl AppState {
                             cx.notify();
                         }),
                     )
-                    .child("🐾 Summon a pet"),
+                    .child(format!("🐾 {}", self.t().summon_pet)),
             );
             if self.pet.count() > 0 {
                 container = container.child(
@@ -4358,7 +4674,7 @@ impl AppState {
                                 cx.notify();
                             }),
                         )
-                        .child("🐾 Dismiss all pets"),
+                        .child(format!("🐾 {}", self.t().dismiss_pets)),
                 );
             }
         }
@@ -4525,23 +4841,110 @@ impl AppState {
     /// Ctrl+P → Enter jumps straight back. No-op with fewer than two tabs.
     fn open_tab_switcher(&mut self, cx: &mut Context<Self>) {
         // Need something to switch to, and don't stack over another modal.
-        if self.tabs.len() < 2
-            || self.show_preferences
-            || self.show_hotkey_picker
-            || self.show_qr
-            || self.renaming.is_some()
-            || self.exit_confirm.is_some()
-            || self.close_confirm.is_some()
-        {
+        let blocked = if self.tabs.len() < 2 {
+            Some("fewer than two tabs")
+        } else if self.show_preferences {
+            Some("preferences open")
+        } else if self.show_hotkey_picker {
+            Some("hotkey picker open")
+        } else if self.show_qr {
+            Some("QR modal open")
+        } else if self.renaming.is_some() {
+            Some("renaming a tab")
+        } else if self.exit_confirm.is_some() {
+            Some("exit confirm open")
+        } else if self.close_confirm.is_some() {
+            Some("close confirm open")
+        } else {
+            None
+        };
+        if let Some(why) = blocked {
+            // Silent refusals here read as "Ctrl+P is broken"; say which state
+            // ate it so the next report names the blocker.
+            warn!("Ctrl+P declined: {why}");
             return;
         }
-        let keys: Vec<Option<std::time::Instant>> = self.tabs.iter().map(|t| t.last_focused_at).collect();
+        // Order by `last_used_at` (the same field the mobile remote sorts by)
+        // so desktop Ctrl+P and the phone agree — and so a tab opened on the
+        // phone (viewer attach bumps last_used_at) floats up here too.
+        let keys: Vec<Option<u64>> = self.tabs.iter().map(|t| t.last_used_at).collect();
         let order = mru_tab_order(self.active, &keys);
-        self.tab_switcher = Some(TabSwitcher { order, selected: 0 });
+        self.tab_switcher = Some(TabSwitcher {
+            order,
+            selected: 0,
+            query: String::new(),
+        });
         cx.notify();
     }
 
+    /// Indices from the switcher's captured MRU order whose tab name matches the
+    /// current filter — a case-insensitive substring match (the SQL `LIKE
+    /// '%query%'` equivalent). An empty query returns the full order. Returns
+    /// empty when the switcher is closed.
+    fn switcher_filtered(&self) -> Vec<usize> {
+        let Some(sw) = self.tab_switcher.as_ref() else {
+            return Vec::new();
+        };
+        if sw.query.is_empty() {
+            return sw.order.clone();
+        }
+        let q = sw.query.to_lowercase();
+        sw.order
+            .iter()
+            .copied()
+            .filter(|&idx| self.tabs.get(idx).is_some_and(|t| t.name.to_lowercase().contains(&q)))
+            .collect()
+    }
+
     /// Close the switcher without switching, returning focus to the terminal.
+    /// Everything currently swallowing window input, for [`crate::escape_dismisses`].
+    const fn overlay_state(&self) -> crate::OverlayState {
+        crate::OverlayState {
+            context_menu: self.context_menu.is_some(),
+            tab_switcher: self.tab_switcher.is_some(),
+            renaming: self.renaming.is_some(),
+            hotkey_picker: self.show_hotkey_picker,
+            qr: self.show_qr,
+            close_confirm: self.close_confirm.is_some(),
+            exit_confirm: self.exit_confirm.is_some(),
+            preferences: self.show_preferences,
+        }
+    }
+
+    /// Close one overlay layer and hand focus back to the tab.
+    ///
+    /// The layers each have their own dismiss path (a button, a modal-local
+    /// Escape handler that only fires while that modal holds focus); this is
+    /// the one that always works, so a layer opened by accident — a stray
+    /// double-click starting a rename, say — can't leave the window looking
+    /// dead, with Ctrl+P declined and the context menu gated off.
+    fn dismiss_overlay(&mut self, layer: crate::Overlay, window: &mut Window, cx: &mut Context<Self>) {
+        match layer {
+            crate::Overlay::ContextMenu => self.context_menu = None,
+            crate::Overlay::TabSwitcher => {
+                self.close_tab_switcher(window, cx);
+                return;
+            }
+            crate::Overlay::Renaming => {
+                self.renaming = None;
+                self.rename_select_all = false;
+            }
+            crate::Overlay::HotkeyPicker => {
+                self.show_hotkey_picker = false;
+                // The picker parks the global hotkey grab while it listens.
+                if let Some(ref handle) = self.hotkey_handle {
+                    handle.resume();
+                }
+            }
+            crate::Overlay::Qr => self.show_qr = false,
+            crate::Overlay::CloseConfirm => self.close_confirm = None,
+            crate::Overlay::ExitConfirm => self.exit_confirm = None,
+            crate::Overlay::Preferences => self.show_preferences = false,
+        }
+        self.tabs[self.active].view.read(cx).focus_handle(cx).focus(window);
+        cx.notify();
+    }
+
     fn close_tab_switcher(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.tab_switcher = None;
         self.tabs[self.active].view.read(cx).focus_handle(cx).focus(window);
@@ -4558,16 +4961,62 @@ impl AppState {
         let hover_bg = th.selection_hsla();
         let muted = th.border_hsla();
 
+        let filtered = self.switcher_filtered();
+        // Input box showing the live filter. gpui has no native text field, so
+        // this is a styled div echoing `sw.query` (with a caret) or a hint.
+        let query_row = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
+            .mt(px(8.0))
+            .px(px(10.0))
+            .py(px(6.0))
+            .rounded(px(4.0))
+            .bg(hover_bg)
+            .border_1()
+            .border_color(dialog_border)
+            .child(
+                div()
+                    .flex_none()
+                    .text_size(px(12.0))
+                    .text_color(muted)
+                    .child("\u{1f50d}"),
+            )
+            .child(if sw.query.is_empty() {
+                div()
+                    .text_color(muted)
+                    .text_size(px(13.0))
+                    .child(self.t().switcher_filter_placeholder)
+            } else {
+                div().text_color(dialog_fg).child(format!("{}\u{258c}", sw.query))
+            });
+
         let mut list = div().flex().flex_col().gap(px(2.0)).mt(px(10.0));
-        for (row, &idx) in sw.order.iter().enumerate() {
+        if filtered.is_empty() {
+            list = list.child(
+                div()
+                    .px(px(12.0))
+                    .py(px(6.0))
+                    .text_size(px(13.0))
+                    .text_color(muted)
+                    .child(self.t().switcher_no_matches),
+            );
+        }
+        for (row, &idx) in filtered.iter().enumerate() {
             if idx >= self.tabs.len() {
                 continue;
             }
             let tab = &self.tabs[idx];
             let name = tab.name.clone();
-            let ago = tab.last_focused_at.map_or_else(
+            // "… ago" from the same last_used_at that drives the order, so the
+            // label can't disagree with the row's position.
+            let ago = tab.last_used_at.map_or_else(
                 || "never".to_string(),
-                |t| format!("{} ago", format_duration(t.elapsed())),
+                |ms| {
+                    let elapsed = std::time::Duration::from_millis(crate::unix_millis().saturating_sub(ms));
+                    format!("{} ago", crate::fmt::duration(elapsed))
+                },
             );
             let selected = row == sw.selected;
             list = list.child(
@@ -4635,11 +5084,12 @@ impl AppState {
                         .overflow_hidden()
                         .text_color(dialog_fg)
                         .text_size(px(14.0))
-                        .child(div().text_size(px(13.0)).text_color(muted).child("Recent tabs"))
+                        .child(div().text_size(px(13.0)).text_color(muted).child(self.t().switcher_recent))
+                        .child(query_row)
                         .child(list)
                         .child(
                             div().mt(px(10.0)).text_size(px(11.0)).text_color(muted).child(
-                                "\u{2191}\u{2193} select \u{b7} Ctrl+P cycle \u{b7} Enter open \u{b7} Esc cancel",
+                                "\u{2191}\u{2193} select \u{b7} type to filter \u{b7} Ctrl+P cycle \u{b7} Enter open \u{b7} Esc cancel",
                             ),
                         ),
                 ),
@@ -5006,7 +5456,7 @@ impl AppState {
                                 .flex()
                                 .flex_col()
                                 .gap(px(2.0))
-                                .child(div().text_color(dialog_fg).child("Also reachable at:"));
+                                .child(div().text_color(dialog_fg).child(self.t().also_reachable_at));
                             for ip in ips.iter().skip(1) {
                                 list = list.child(div().text_color(link_fg).child(format!(
                                     "http://{ip}:{}",
@@ -5044,12 +5494,6 @@ impl AppState {
             return None;
         }
 
-        let overlay_bg = Hsla::from(Rgba {
-            r: 0.0,
-            g: 0.0,
-            b: 0.0,
-            a: 0.5,
-        });
         let th = self.th();
         let modal_bg = th.surface_hsla();
         let modal_fg = th.fg_hsla();
@@ -5140,6 +5584,42 @@ impl AppState {
             );
         }
         opacity_slider = opacity_slider.child(track).child(format!("{opacity_pct}%"));
+
+        // Font size. It was settable only through `tab-atelier set-font` and a
+        // restart, which meant the one visual setting people actually reach for
+        // was the one not in the settings dialog. A stepper rather than a
+        // slider: the useful range is ~20 values, and a wrong click here
+        // reflows every tab.
+        let mut font_size_row = div().flex().flex_row().items_center().gap(px(8.0)).mt(px(8.0));
+        for (id, label, delta) in [("pref-font-smaller", "−", -1.0_f32), ("pref-font-bigger", "+", 1.0)] {
+            font_size_row = font_size_row.child(
+                div()
+                    .id(id)
+                    .px(px(10.0))
+                    .py(px(2.0))
+                    .rounded(px(3.0))
+                    .cursor_pointer()
+                    .bg(option_bg)
+                    .hover(|s| s.bg(btn_hover))
+                    .child(label)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
+                            // Clamped: a zero or negative size is an unusable
+                            // window, and past ~72 one glyph fills the tab.
+                            let size = (this.font_config.size + delta).clamp(6.0, 72.0);
+                            this.font_config.size = size;
+                            // Apply to the tabs that already exist, not just
+                            // the next one opened.
+                            for tab in &this.tabs {
+                                tab.view.update(cx, |v, _| v.set_font_size(size));
+                            }
+                            cx.notify();
+                        }),
+                    ),
+            );
+        }
+        font_size_row = font_size_row.child(format!("{:.0} px", self.font_config.size));
 
         let mut hotkey_list = div().flex().flex_col().gap(px(4.0)).mt(px(8.0));
         for &kc in &self.hotkeys {
@@ -5476,7 +5956,7 @@ impl AppState {
                 }),
             )
             .when(default_mem_text.is_empty(), |el| {
-                el.child(div().text_color(placeholder_fg).child("unlimited (e.g. 8G)"))
+                el.child(div().text_color(placeholder_fg).child(self.t().memory_unlimited_hint))
             })
             .when(!default_mem_text.is_empty(), |el| {
                 el.child(default_mem_text)
@@ -5529,46 +6009,44 @@ impl AppState {
                     .child(div().w(px(1.0)).h(px(16.0)).bg(cursor_color))
             });
 
+        // Rendered as a full-screen page that REPLACES the terminal area +
+        // tab bar (see `render`), not an overlay stacked on top of them.
+        // The old modal overlay let every click fall through to the live UI
+        // underneath — gpui dispatches mouse events to all hit elements
+        // unless propagation is stopped — so clicking in the dialog could
+        // drag/switch tabs behind it and the terminal's click-to-focus
+        // handler yanked focus out of the text inputs on every click.
+        // With the terminal and tab bar out of the tree entirely there is
+        // nothing underneath to mis-click or steal focus.
         Some(
             div()
-                .id("preferences-overlay")
-                .absolute()
-                .top(px(0.0))
-                .left(px(0.0))
-                .size_full()
-                // Swallow ALL mouse input so a click on the dimmed area can't
-                // fall through to the tab strip's on_click underneath (which
-                // was activating whatever tab sat below the cursor when the
-                // dialog was dismissed). The empty handlers below don't stop
-                // propagation on their own; occlude does.
-                .occlude()
+                .id("preferences-screen")
+                .w_full()
+                .min_h(px(0.0))
+                .flex_grow()
                 .flex()
-                .items_center()
-                .justify_center()
-                .bg(overlay_bg)
-                .on_mouse_down(MouseButton::Left, |_ev: &MouseDownEvent, _window, _cx| {})
-                .on_mouse_down(MouseButton::Right, |_ev: &MouseDownEvent, _window, _cx| {})
+                .flex_col()
+                .bg(modal_bg)
+                .text_color(modal_fg)
+                .text_size(px(14.0))
                 .child(
                     div()
-                        .id("preferences-box")
-                        .bg(modal_bg)
-                        .text_color(modal_fg)
-                        .border_1()
+                        .px(px(24.0))
+                        .pt(px(16.0))
+                        .pb(px(12.0))
+                        .border_b_1()
                         .border_color(modal_border)
-                        .rounded(px(6.0))
-                        .p(px(24.0))
-                        // Two-column body: wide enough to fit both columns on a
-                        // normal screen (halving the height so it fits short
-                        // screens), capped to 95% width on narrow ones. The
-                        // 90%-height cap + vertical scroll is the fallback when
-                        // even two columns are taller than the viewport.
-                        .w(px(860.0))
-                        .max_w(relative(0.95))
-                        .max_h(relative(0.9))
+                        .text_size(px(16.0))
+                        .child(t.preferences),
+                )
+                .child(
+                    div()
+                        .id("preferences-scroll")
+                        .flex_grow()
+                        .min_h(px(0.0))
                         .overflow_y_scroll()
-                        .text_size(px(14.0))
-                        .on_mouse_down(MouseButton::Left, |_ev: &MouseDownEvent, _window, _cx| {})
-                        .child(div().text_size(px(16.0)).mb(px(16.0)).child(t.preferences))
+                        .px(px(24.0))
+                        .py(px(16.0))
                         .child(
                             div()
                                 .flex()
@@ -5581,8 +6059,9 @@ impl AppState {
                                         .flex_1()
                                         .gap(px(16.0))
                                         .child(div().child(t.theme).child(theme_options))
-                                        .child(div().child("Cursor").child(cursor_options))
+                                        .child(div().child(self.t().cursor).child(cursor_options))
                                         .child(div().child(t.opacity).child(opacity_slider))
+                                        .child(div().child(t.font_size).child(font_size_row))
                                         .child(div().child(t.toggle_hotkeys).child(hotkey_list))
                                         .child(div().child(t.language).child(lang_options))
                                         .child(div().child(t.browser).child(browser_input)),
@@ -5599,202 +6078,211 @@ impl AppState {
                                         .child(div().child(t.share_url_base).child(share_url_base_input))
                                         .child(div().child(t.default_tab_ram).child(default_mem_input)),
                                 ),
-                        )
+                        ),
+                )
+                .child(
+                    div()
+                        .px(px(24.0))
+                        .py(px(12.0))
+                        .border_t_1()
+                        .border_color(modal_border)
+                        .flex()
+                        .flex_row()
+                        .justify_end()
+                        .gap(px(8.0))
                         .child(
                             div()
-                                .mt(px(20.0))
-                                .flex()
-                                .flex_row()
-                                .justify_end()
-                                .gap(px(8.0))
-                                .child(
-                                    div()
-                                        .id("pref-cancel")
-                                        .px(px(14.0))
-                                        .py(px(6.0))
-                                        .bg(option_bg)
-                                        .rounded(px(3.0))
-                                        .cursor_pointer()
-                                        .hover(|s| s.bg(btn_hover))
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
-                                                if this.show_hotkey_picker
-                                                    && let Some(ref handle) = this.hotkey_handle
-                                                {
-                                                    handle.resume();
-                                                }
-                                                this.show_preferences = false;
-                                                this.show_hotkey_picker = false;
-                                                cx.notify();
-                                            }),
-                                        )
-                                        .child(t.cancel),
+                                .id("pref-cancel")
+                                .px(px(14.0))
+                                .py(px(6.0))
+                                .bg(option_bg)
+                                .rounded(px(3.0))
+                                .cursor_pointer()
+                                .hover(|s| s.bg(btn_hover))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _ev: &MouseDownEvent, window, cx| {
+                                        if this.show_hotkey_picker
+                                            && let Some(ref handle) = this.hotkey_handle
+                                        {
+                                            handle.resume();
+                                        }
+                                        this.show_preferences = false;
+                                        this.show_hotkey_picker = false;
+                                        this.tabs[this.active].view.read(cx).focus_handle(cx).focus(window);
+                                        cx.notify();
+                                    }),
                                 )
-                                .child({
-                                    let ro = crate::read_only();
-                                    let mut btn = div()
-                                        .id("pref-save")
-                                        .px(px(14.0))
-                                        .py(px(6.0))
-                                        .bg(btn_bg)
-                                        .rounded(px(3.0))
-                                        .child(t.save);
-                                    if ro {
-                                        btn = btn.opacity(0.4);
-                                    } else {
-                                        btn = btn.cursor_pointer().hover(|s| s.bg(btn_hover)).on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
-                                                let lang_str = match this.lang {
-                                                    Lang::En => "en",
-                                                    Lang::Fr => "fr",
-                                                };
-                                                let browser = if this.pref_browser_text.is_empty() {
-                                                    None
-                                                } else {
-                                                    Some(this.pref_browser_text.clone())
-                                                };
-                                                let editor = if this.pref_editor_text.is_empty() {
-                                                    None
-                                                } else {
-                                                    Some(this.pref_editor_text.clone())
-                                                };
-                                                (*this.browser.borrow_mut()).clone_from(&browser);
-                                                (*this.code_editor.borrow_mut()).clone_from(&editor);
-                                                // Validate each addr:port field
-                                                // via `SocketAddr::parse`. Anything
-                                                // that fails is kept as-is in the
-                                                // edit buffer but not persisted —
-                                                // the previous good value sticks.
-                                                let parsed_api =
-                                                    this.pref_api_addr_text.parse::<std::net::SocketAddr>().ok();
-                                                if parsed_api.is_some() {
-                                                    this.api_addr.clone_from(&this.pref_api_addr_text);
-                                                }
-                                                let parsed_tls =
-                                                    this.pref_api_tls_addr_text.parse::<std::net::SocketAddr>().ok();
-                                                if parsed_tls.is_some() {
-                                                    this.api_tls_addr.clone_from(&this.pref_api_tls_addr_text);
-                                                }
-                                                // share_url_base is a free-form URL; accept whatever
-                                                // the user typed (trimmed), empty means "use LAN URL".
-                                                this.share_url_base = this.pref_share_url_base_text.trim().to_string();
-                                                let share_url_base = if this.share_url_base.is_empty() {
-                                                    None
-                                                } else {
-                                                    Some(this.share_url_base.clone())
-                                                };
-                                                // Global "max RAM per tab" default. Empty = unlimited;
-                                                // otherwise must parse as a byte count (e.g. "8G") to be
-                                                // accepted — an unparseable entry keeps the prior value.
-                                                let mem_in = this.pref_default_mem_text.trim().to_string();
-                                                let mem_valid = !mem_in.is_empty()
-                                                    && crate::TabResourceLimits {
-                                                        memory_max: Some(mem_in.clone()),
-                                                        ..Default::default()
-                                                    }
-                                                    .memory_max_bytes()
-                                                    .is_some();
-                                                if mem_in.is_empty() {
-                                                    this.default_tab_mem_max = None;
-                                                } else if mem_valid {
-                                                    this.default_tab_mem_max = Some(mem_in);
-                                                }
-                                                // Reflect it immediately for the gauge + new-tab spawns.
-                                                #[cfg(target_os = "linux")]
-                                                {
-                                                    this.default_limits.memory_max = this.default_tab_mem_max.clone();
-                                                }
-                                                let default_mem_max = this.default_tab_mem_max.clone();
-                                                let on_disk_prefs = load_preferences(&platform::config_dir());
-                                                save_preferences(
-                                                    &platform::config_dir(),
-                                                    &Preferences {
-                                                        // Font lives in preferences.json (or zed /
-                                                        // fontconfig); the GUI dialog doesn't edit it,
-                                                        // so carry the on-disk values through rather
-                                                        // than wiping them on save.
-                                                        font_family: on_disk_prefs.font_family,
-                                                        font_size: on_disk_prefs.font_size,
-                                                        lang: Some(lang_str.into()),
-                                                        theme: Some(this.theme_name.id().into()),
-                                                        cursor_style: Some(this.cursor_style.id().into()),
-                                                        opacity: Some(this.opacity),
-                                                        // Menu-toggled, not in this dialog — carry the
-                                                        // on-disk value through so saving prefs doesn't
-                                                        // wipe the gauge setting.
-                                                        show_tab_gauge: this.show_tab_gauge,
-                                                        // Menu-toggled (right-click), not in this dialog —
-                                                        // carry it through so saving prefs doesn't drop it.
-                                                        claude_only: this.claude_only,
-                                                        // Relay + env are set via CLI/menu with
-                                                        // their own persist paths — carry the
-                                                        // on-disk values so the dialog save
-                                                        // doesn't clobber them.
-                                                        relay_mode: this.relay_mode,
-                                                        relay_endpoint_id: on_disk_prefs.relay_endpoint_id,
-                                                        relay_egress: on_disk_prefs.relay_egress,
-                                                        tab_env: on_disk_prefs.tab_env,
-                                                        hotkeys: this.hotkeys.clone(),
-                                                        browser,
-                                                        code_editor: editor,
-                                                        api_addr: Some(this.api_addr.clone()),
-                                                        api_tls_addr: Some(this.api_tls_addr.clone()),
-                                                        // Same "advanced field, not in the GUI dialog"
-                                                        // treatment as pty_cols / clear_env: the dialog
-                                                        // doesn't surface a cert/key picker, so leaving
-                                                        // these at None on save would silently wipe the
-                                                        // operator's Cloudflare Origin cert path. The
-                                                        // GUI never edits them.
-                                                        api_tls_cert_path: None,
-                                                        api_tls_key_path: None,
-                                                        api_tls_client_ca_path: None,
-                                                        share_url_base,
-                                                        remote_endpoints: this.remote_endpoints.clone(),
-                                                        // Headless-only fields the GUI never edits;
-                                                        // preserve whatever was on disk by leaving
-                                                        // them at the Default (None). The headless
-                                                        // CLI (`ports --pty-cols N`) writes them
-                                                        // directly into the JSON.
-                                                        pty_cols: None,
-                                                        pty_rows: None,
-                                                        tab_bg_color: this.tab_bg_global.clone(),
-                                                        // Headless-only: default allowlist for new
-                                                        // tabs, set via the CLI. Preserve on-disk.
-                                                        default_net_allow_presets: on_disk_prefs
-                                                            .default_net_allow_presets,
-                                                        default_net_allow_domains: on_disk_prefs
-                                                            .default_net_allow_domains,
-                                                        default_net_allow_cidrs: on_disk_prefs.default_net_allow_cidrs,
-                                                        // The GUI dialog edits only the RAM cap
-                                                        // (memory_max); the CPU/tasks axes are headless-
-                                                        // only, so carry them through from disk rather
-                                                        // than resetting the whole struct to Default
-                                                        // (which silently wiped a CLI-set cpu/tasks cap).
-                                                        default_tab_limits: crate::TabResourceLimits {
-                                                            memory_max: default_mem_max,
-                                                            cpu_quota_percent: on_disk_prefs
-                                                                .default_tab_limits
-                                                                .cpu_quota_percent,
-                                                            tasks_max: on_disk_prefs.default_tab_limits.tasks_max,
-                                                        },
-                                                        clear_env: None,
-                                                        clear_env_vars: std::collections::BTreeMap::new(),
-                                                    },
-                                                );
-                                                if let Some(ref handle) = this.hotkey_handle {
-                                                    handle.update_keys(&this.hotkeys);
-                                                }
-                                                this.show_preferences = false;
-                                                this.show_hotkey_picker = false;
-                                                cx.notify();
-                                            }),
+                                .child(t.cancel),
+                        )
+                        .child({
+                            let ro = crate::read_only();
+                            let mut btn = div()
+                                .id("pref-save")
+                                .px(px(14.0))
+                                .py(px(6.0))
+                                .bg(btn_bg)
+                                .rounded(px(3.0))
+                                .child(t.save);
+                            if ro {
+                                btn = btn.opacity(0.4);
+                            } else {
+                                btn = btn.cursor_pointer().hover(|s| s.bg(btn_hover)).on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _ev: &MouseDownEvent, window, cx| {
+                                        let lang_str = match this.lang {
+                                            Lang::En => "en",
+                                            Lang::Fr => "fr",
+                                        };
+                                        let browser = if this.pref_browser_text.is_empty() {
+                                            None
+                                        } else {
+                                            Some(this.pref_browser_text.clone())
+                                        };
+                                        let editor = if this.pref_editor_text.is_empty() {
+                                            None
+                                        } else {
+                                            Some(this.pref_editor_text.clone())
+                                        };
+                                        (*this.browser.borrow_mut()).clone_from(&browser);
+                                        (*this.code_editor.borrow_mut()).clone_from(&editor);
+                                        // Validate each addr:port field
+                                        // via `SocketAddr::parse`. Anything
+                                        // that fails is kept as-is in the
+                                        // edit buffer but not persisted —
+                                        // the previous good value sticks.
+                                        let parsed_api = this.pref_api_addr_text.parse::<std::net::SocketAddr>().ok();
+                                        if parsed_api.is_some() {
+                                            this.api_addr.clone_from(&this.pref_api_addr_text);
+                                        }
+                                        let parsed_tls =
+                                            this.pref_api_tls_addr_text.parse::<std::net::SocketAddr>().ok();
+                                        if parsed_tls.is_some() {
+                                            this.api_tls_addr.clone_from(&this.pref_api_tls_addr_text);
+                                        }
+                                        // share_url_base is a free-form URL; accept whatever
+                                        // the user typed (trimmed), empty means "use LAN URL".
+                                        this.share_url_base = this.pref_share_url_base_text.trim().to_string();
+                                        let share_url_base = if this.share_url_base.is_empty() {
+                                            None
+                                        } else {
+                                            Some(this.share_url_base.clone())
+                                        };
+                                        // Global "max RAM per tab" default. Empty = unlimited;
+                                        // otherwise must parse as a byte count (e.g. "8G") to be
+                                        // accepted — an unparseable entry keeps the prior value.
+                                        let mem_in = this.pref_default_mem_text.trim().to_string();
+                                        let mem_valid = !mem_in.is_empty()
+                                            && crate::TabResourceLimits {
+                                                memory_max: Some(mem_in.clone()),
+                                                ..Default::default()
+                                            }
+                                            .memory_max_bytes()
+                                            .is_some();
+                                        if mem_in.is_empty() {
+                                            this.default_tab_mem_max = None;
+                                        } else if mem_valid {
+                                            this.default_tab_mem_max = Some(mem_in);
+                                        }
+                                        // Reflect it immediately for the gauge + new-tab spawns.
+                                        #[cfg(target_os = "linux")]
+                                        {
+                                            this.default_limits.memory_max = this.default_tab_mem_max.clone();
+                                        }
+                                        let default_mem_max = this.default_tab_mem_max.clone();
+                                        let on_disk_prefs = load_preferences(&platform::config_dir());
+                                        save_preferences(
+                                            &platform::config_dir(),
+                                            &Preferences {
+                                                // Font lives in preferences.json (or zed /
+                                                // fontconfig); the GUI dialog doesn't edit it,
+                                                // so carry the on-disk values through rather
+                                                // than wiping them on save.
+                                                font_family: on_disk_prefs.font_family,
+                                                font_size: Some(this.font_config.size),
+                                                // Same reason: the fleet-sweep settings are
+                                                // file-only, and saving from this dialog must
+                                                // not silently stop a configured sweep.
+                                                fleet_sweep_minutes: on_disk_prefs.fleet_sweep_minutes,
+                                                fleet_sweep_sources: on_disk_prefs.fleet_sweep_sources,
+                                                fleet_sweep_lcov: on_disk_prefs.fleet_sweep_lcov,
+                                                fleet_sweep_root: on_disk_prefs.fleet_sweep_root,
+                                                fleet_sweep_gossip: on_disk_prefs.fleet_sweep_gossip,
+                                                fleet_sweep_cooldown_days: on_disk_prefs.fleet_sweep_cooldown_days,
+                                                lang: Some(lang_str.into()),
+                                                theme: Some(this.theme_name.id().into()),
+                                                cursor_style: Some(this.cursor_style.id().into()),
+                                                opacity: Some(this.opacity),
+                                                // Menu-toggled, not in this dialog — carry the
+                                                // on-disk value through so saving prefs doesn't
+                                                // wipe the gauge setting.
+                                                show_tab_gauge: this.show_tab_gauge,
+                                                // Menu-toggled / headless-only knobs the dialog
+                                                // doesn't surface — carry the live or on-disk
+                                                // value through so a GUI save doesn't wipe them.
+                                                claude_only: this.claude_only,
+                                                relay_mode: this.relay_mode,
+                                                relay_endpoint_id: on_disk_prefs.relay_endpoint_id,
+                                                relay_egress: on_disk_prefs.relay_egress,
+                                                tab_env: on_disk_prefs.tab_env,
+                                                hotkeys: this.hotkeys.clone(),
+                                                browser,
+                                                code_editor: editor,
+                                                api_addr: Some(this.api_addr.clone()),
+                                                api_tls_addr: Some(this.api_tls_addr.clone()),
+                                                // Same "advanced field, not in the GUI dialog"
+                                                // treatment as pty_cols / clear_env: the dialog
+                                                // doesn't surface a cert/key picker, so leaving
+                                                // these at None on save would silently wipe the
+                                                // operator's Cloudflare Origin cert path. The
+                                                // GUI never edits them.
+                                                api_tls_cert_path: None,
+                                                api_tls_key_path: None,
+                                                api_tls_client_ca_path: None,
+                                                share_url_base,
+                                                remote_endpoints: this.remote_endpoints.clone(),
+                                                // Headless-only fields the GUI never edits;
+                                                // preserve whatever was on disk by leaving
+                                                // them at the Default (None). The headless
+                                                // CLI (`ports --pty-cols N`) writes them
+                                                // directly into the JSON.
+                                                pty_cols: None,
+                                                pty_rows: None,
+                                                tab_bg_color: this.tab_bg_global.clone(),
+                                                folder_styles: on_disk_prefs.folder_styles,
+                                                // Headless-only: default allowlist for new
+                                                // tabs, set via the CLI. Preserve on-disk.
+                                                default_net_allow_presets: on_disk_prefs.default_net_allow_presets,
+                                                default_net_allow_domains: on_disk_prefs.default_net_allow_domains,
+                                                default_net_allow_cidrs: on_disk_prefs.default_net_allow_cidrs,
+                                                // The GUI dialog edits only the RAM cap
+                                                // (memory_max); the CPU/tasks axes are headless-
+                                                // only, so carry them through from disk rather
+                                                // than resetting the whole struct to Default
+                                                // (which silently wiped a CLI-set cpu/tasks cap).
+                                                default_tab_limits: crate::TabResourceLimits {
+                                                    memory_max: default_mem_max,
+                                                    cpu_quota_percent: on_disk_prefs
+                                                        .default_tab_limits
+                                                        .cpu_quota_percent,
+                                                    tasks_max: on_disk_prefs.default_tab_limits.tasks_max,
+                                                },
+                                                clear_env: None,
+                                                clear_env_vars: std::collections::BTreeMap::new(),
+                                            },
                                         );
-                                    }
-                                    btn
-                                }),
-                        ),
+                                        if let Some(ref handle) = this.hotkey_handle {
+                                            handle.update_keys(&this.hotkeys);
+                                        }
+                                        this.show_preferences = false;
+                                        this.show_hotkey_picker = false;
+                                        this.tabs[this.active].view.read(cx).focus_handle(cx).focus(window);
+                                        cx.notify();
+                                    }),
+                                );
+                            }
+                            btn
+                        }),
                 ),
         )
     }
@@ -5837,9 +6325,10 @@ impl AppState {
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
-                        // Swallow the dismiss click so it doesn't also land on
-                        // whatever control sits under the overlay (a theme row,
-                        // a hotkey "×", Save/Cancel).
+                        // Swallow the click: without this it also lands on
+                        // whatever sits underneath; now that the prefs page
+                        // fills the screen, that's always a live control
+                        // (Save/Cancel, a theme row, a hotkey "×").
                         cx.stop_propagation();
                         this.show_hotkey_picker = false;
                         if let Some(ref handle) = this.hotkey_handle {
@@ -5862,8 +6351,8 @@ impl AppState {
                         .min_w(px(260.0))
                         .text_size(px(14.0))
                         // stop_propagation (not a no-op) so a click inside the
-                        // box doesn't reach the overlay's dismiss handler behind
-                        // it and close the picker.
+                        // box doesn't reach the overlay's dismiss handler
+                        // behind it and close the picker.
                         .on_mouse_down(MouseButton::Left, |_ev: &MouseDownEvent, _window, cx| {
                             cx.stop_propagation();
                         })
@@ -5944,10 +6433,13 @@ impl Render for AppState {
         };
         let mut cwd_iter = new_tab_cwds.into_iter();
         for _ in 0..new_tab_count {
-            match cwd_iter.next() {
-                Some(cwd) => self.add_tab_in(cwd, window, cx),
-                None => self.add_tab(window, cx),
-            }
+            // API-created: these come from `dispatch --new` / `tab-atelier
+            // add`, so they appear without stealing focus or a colour.
+            let cwd = cwd_iter
+                .next()
+                .or_else(|| self.tabs.get(self.active).and_then(|t| t.last_known_cwd.clone()))
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+            self.add_tab_in_background(cwd, window, cx);
         }
         // No tab to show yet (transient empty state / future async boot): the
         // reusable centered screen stands in rather than indexing a missing tab.
@@ -5958,6 +6450,12 @@ impl Render for AppState {
         // was still a skeleton (e.g. the user switched to a not-yet-warmed tab
         // before the boot loader reached it). No-op once spawned.
         self.tabs[self.active].view.update(cx, |v, _| v.ensure_spawned());
+        // Pay off any focus owed by a window-less path (API activate, an agent
+        // closing its own tab). Done after the emptiness guard above so the
+        // index is known good.
+        if std::mem::take(&mut self.refocus_active) {
+            self.tabs[self.active].view.read(cx).focus_handle(cx).focus(window);
+        }
         // Only push the title when it changed — gpui does no diffing, so an
         // unconditional call here meant a format! + X11 property write on
         // every frame (30-60 fps while the terminal streams) for a string
@@ -5976,8 +6474,13 @@ impl Render for AppState {
         #[cfg(not(feature = "energy"))]
         let battery: Option<u8> = None;
         // Per-tab ledges for the pet are collected inside `render_tab_bar` by
-        // measuring canvases (see `pet_ledges`).
-        let tab_bar = self.render_tab_bar(battery, window, cx);
+        // measuring canvases (see `pet_ledges`). Skipped while the
+        // preferences screen is up — it replaces the tab bar entirely.
+        let tab_bar = if self.show_preferences {
+            None
+        } else {
+            Some(self.render_tab_bar(battery, window, cx))
+        };
         let context_menu = if self.renaming.is_none()
             && self.exit_confirm.is_none()
             && self.close_confirm.is_none()
@@ -6003,28 +6506,28 @@ impl Render for AppState {
         if self.tab_switcher.is_some() {
             self.tab_switcher_focus.focus(window);
         }
-        // When the prefs modal is open, force focus onto one of its
-        // inputs every render. Without this, the terminal's focus
-        // handle (or whatever held focus before the modal opened)
-        // keeps receiving KeyDownEvents and typing leaks into the
-        // PTY behind the modal. The per-input on_mouse_down handlers
-        // still cover switching between inputs — if focus is already
-        // on a prefs input, we leave it; we only redirect to
-        // api_addr when focus drifted outside the modal entirely.
+        // While the preferences screen is up, keep focus anchored on one
+        // of its inputs. The terminal isn't rendered then, but whatever
+        // held focus before opening (or a dropped focus handle) would
+        // otherwise leave typing going nowhere. The per-input
+        // on_mouse_down handlers still cover switching between inputs —
+        // if focus is already on a prefs input, we leave it; we only
+        // redirect to api_addr when focus drifted outside the screen.
         //
         // EXCEPTION: when the hotkey picker is layered on top of the
-        // prefs modal, the picker has its own focus handle (anchored
-        // at line ~3700 above). Forcing api_addr focus here would
-        // yank focus back from the picker every frame and the user
-        // could never bind a key combo — keystrokes would just hop
-        // between the picker's window and api_addr at 60 Hz.
-        // Anchoring is the picker's job while it's open.
+        // prefs screen, the picker has its own focus handle (anchored
+        // just above). Forcing api_addr focus here would yank focus
+        // back from the picker every frame and the user could never
+        // bind a key combo — keystrokes would just hop between the
+        // picker's window and api_addr at 60 Hz. Anchoring is the
+        // picker's job while it's open.
         if self.show_preferences && !self.show_hotkey_picker {
             let already_in_prefs = self.pref_api_addr_focus.is_focused(window)
                 || self.pref_api_tls_addr_focus.is_focused(window)
                 || self.pref_share_url_base_focus.is_focused(window)
                 || self.pref_browser_focus.is_focused(window)
-                || self.pref_editor_focus.is_focused(window);
+                || self.pref_editor_focus.is_focused(window)
+                || self.pref_default_mem_focus.is_focused(window);
             if !already_in_prefs {
                 self.pref_api_addr_focus.focus(window);
             }
@@ -6062,13 +6565,30 @@ impl Render for AppState {
             .flex_col()
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
                 let ks = &ev.keystroke;
+                // Escape always digs out of the topmost overlay. Each layer
+                // has its own dismiss path, but those only fire while that
+                // layer holds focus — and every layer gates Ctrl+P and the
+                // context menu, so one stuck layer looks like a dead window.
+                if ks.key.eq_ignore_ascii_case("escape")
+                    && let Some(layer) = crate::escape_dismisses(this.overlay_state())
+                {
+                    this.dismiss_overlay(layer, window, cx);
+                    return;
+                }
                 // Ctrl+P MRU tab switcher. While it's open the modal holds
                 // focus (so the terminal gets no keys); these arrive here by
                 // bubbling. Handle every switcher key and return so nothing
                 // below (alt+tab / ctrl+shift+t) also fires.
                 if this.tab_switcher.is_some() {
-                    let len = this.tab_switcher.as_ref().map_or(0, |s| s.order.len());
-                    match ks.key.as_str() {
+                    // Bounds / selection track the FILTERED list, not the full
+                    // captured order, so ↑↓/Enter/cycle operate on what's shown.
+                    let filtered = this.switcher_filtered();
+                    let len = filtered.len();
+                    // Lower-cased for the same reason as `app_chord`: under
+                    // CapsLock the keysym arrives as "P" and the cycle arm
+                    // would miss, leaving the modal open and unresponsive.
+                    let key = ks.key.to_ascii_lowercase();
+                    match key.as_str() {
                         "escape" => this.close_tab_switcher(window, cx),
                         "up" => {
                             if let Some(s) = this.tab_switcher.as_mut() {
@@ -6084,83 +6604,121 @@ impl Render for AppState {
                             }
                             cx.notify();
                         }
-                        // Tapping Ctrl+P again cycles the highlight downward.
-                        "p" if ks.modifiers.control && len > 0 => {
-                            if let Some(s) = this.tab_switcher.as_mut() {
+                        // Tapping Ctrl+P again cycles the highlight downward —
+                        // or dismisses a switcher with nothing to show, which
+                        // would otherwise swallow every later Ctrl+P.
+                        "p" if ks.modifiers.control => {
+                            if len == 0 {
+                                this.close_tab_switcher(window, cx);
+                            } else if let Some(s) = this.tab_switcher.as_mut() {
                                 s.selected = (s.selected + 1) % len;
+                                cx.notify();
                             }
-                            cx.notify();
                         }
                         "enter" => {
-                            let pick = this
-                                .tab_switcher
-                                .as_ref()
-                                .and_then(|s| s.order.get(s.selected).copied());
+                            let pick = filtered
+                                .get(this.tab_switcher.as_ref().map_or(0, |s| s.selected))
+                                .copied();
                             this.tab_switcher = None;
                             match pick {
                                 Some(idx) => this.select_tab(idx, window, cx),
                                 None => this.close_tab_switcher(window, cx),
                             }
                         }
-                        _ => {}
+                        "backspace" => {
+                            if let Some(s) = this.tab_switcher.as_mut() {
+                                s.query.pop();
+                                s.selected = 0;
+                            }
+                            cx.notify();
+                        }
+                        // Any printable character narrows the filter. `key_char`
+                        // is None for the arrows/enter/ctrl-chords above, so a
+                        // bare Ctrl+P cycles rather than typing 'p'.
+                        _ => {
+                            if let Some(ch) = ks.key_char.as_ref().filter(|c| !c.is_empty() && !ks.modifiers.control)
+                                && let Some(s) = this.tab_switcher.as_mut()
+                            {
+                                s.query.push_str(ch);
+                                s.selected = 0;
+                                cx.notify();
+                            }
+                        }
                     }
                     return;
                 }
-                if ks.modifiers.control && !ks.modifiers.shift && !ks.modifiers.alt && ks.key.as_str() == "p" {
-                    this.open_tab_switcher(cx);
+                // The preferences screen replaces the terminal + tab bar, so
+                // tab shortcuts bubbling up from its inputs would mutate tabs
+                // invisibly (Ctrl+Shift+T spawning one, Alt+Tab switching);
+                // the keyboard variant of the old click-through bug.
+                if this.show_preferences {
                     return;
                 }
-                if ks.modifiers.control && ks.modifiers.shift && ks.key.as_str() == "t" {
-                    this.add_tab_after_current(window, cx);
-                    return;
+                // Same table the terminal swallows on, so the two can't drift.
+                match crate::app_chord(&ks.key, ks.modifiers.control, ks.modifiers.shift, ks.modifiers.alt) {
+                    Some(crate::AppChord::TabSwitcher) => this.open_tab_switcher(cx),
+                    Some(crate::AppChord::NewTab) => this.add_tab_after_current(window, cx),
+                    Some(crate::AppChord::NextTab) => {
+                        let next = (this.active + 1) % this.tabs.len();
+                        this.select_tab(next, window, cx);
+                    }
+                    // Copy/Paste are handled in the terminal view, where the
+                    // selection lives; nothing to do once they bubble.
+                    Some(crate::AppChord::Copy | crate::AppChord::Paste) | None => {}
                 }
-                if ks.modifiers.alt && ks.key.as_str() == "tab" {
-                    let next = (this.active + 1) % this.tabs.len();
-                    this.select_tab(next, window, cx);
-                }
-            }))
-            .child(
-                div()
-                    .id("terminal-area")
-                    .relative()
-                    // Take full width but DON'T claim full height — the
-                    // tab bar below uses flex-wrap to grow to 2/3 rows
-                    // (32 px each) and needs space to expand into. With
-                    // `size_full()` here the terminal-area pinned itself
-                    // to 100% of parent height and the tab bar's 3rd row
-                    // overflowed (only ~3/4 visible). `flex_grow()` is
-                    // enough to absorb whatever the tab bar doesn't use.
-                    .w_full()
-                    .min_h(px(0.0))
-                    .flex_grow()
-                    .on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(|this, ev: &MouseDownEvent, _window, cx| {
-                            // Grab the link under the cursor (if the right-click
-                            // landed on a detected URL/path) so the menu can offer
-                            // "Copy path (link)". The hover cell tracks the mouse,
-                            // so it already points at the clicked cell.
-                            let link = this.tabs[this.active].view.read(cx).hovered_url();
-                            this.context_menu = Some(ContextMenu {
-                                kind: MenuKind::Background,
-                                position: ev.position,
-                                open_upward: false,
-                                link,
-                            });
-                            cx.notify();
+            }));
+
+        // The preferences screen REPLACES the terminal area + tab bar
+        // rather than overlaying them: with the old modal, clicks fell
+        // through to the tab bar (dragging/switching tabs) and the
+        // terminal's click-to-focus stole focus from the text inputs.
+        if let Some(prefs) = self.render_preferences(cx) {
+            root = root.child(prefs);
+        } else {
+            root = root
+                .child(
+                    div()
+                        .id("terminal-area")
+                        .relative()
+                        // Take full width but DON'T claim full height — the
+                        // tab bar below uses flex-wrap to grow to 2/3 rows
+                        // (32 px each) and needs space to expand into. With
+                        // `size_full()` here the terminal-area pinned itself
+                        // to 100% of parent height and the tab bar's 3rd row
+                        // overflowed (only ~3/4 visible). `flex_grow()` is
+                        // enough to absorb whatever the tab bar doesn't use.
+                        .w_full()
+                        .min_h(px(0.0))
+                        .flex_grow()
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(|this, ev: &MouseDownEvent, _window, cx| {
+                                // Grab the link under the cursor (if the right-click
+                                // landed on a detected URL/path) so the menu can offer
+                                // "Copy path (link)". The hover cell tracks the mouse,
+                                // so it already points at the clicked cell.
+                                let link = this.tabs[this.active].view.read(cx).hovered_url();
+                                this.context_menu = Some(ContextMenu {
+                                    kind: MenuKind::Background,
+                                    position: ev.position,
+                                    open_upward: false,
+                                    link,
+                                });
+                                cx.notify();
+                            }),
+                        )
+                        .child(active_terminal)
+                        // Low-battery red wash, anchored to `terminal-area`
+                        // (hence the `.relative()` above) so it covers the
+                        // terminal but leaves the tab bar's blink untouched.
+                        // Non-interactive → mouse events pass through to the
+                        // terminal below.
+                        .when_some(battery_tint, |area, tint| {
+                            area.child(div().absolute().top(px(0.0)).left(px(0.0)).size_full().bg(tint))
                         }),
-                    )
-                    .child(active_terminal)
-                    // Low-battery red wash, anchored to `terminal-area`
-                    // (hence the `.relative()` above) so it covers the
-                    // terminal but leaves the tab bar's blink untouched.
-                    // Non-interactive → mouse events pass through to the
-                    // terminal below.
-                    .when_some(battery_tint, |area, tint| {
-                        area.child(div().absolute().top(px(0.0)).left(px(0.0)).size_full().bg(tint))
-                    }),
-            )
-            .child(tab_bar);
+                )
+                .children(tab_bar);
+        }
 
         if let Some(menu) = context_menu {
             root = root
@@ -6203,10 +6761,6 @@ impl Render for AppState {
 
         if let Some(qr) = self.render_qr_modal(cx) {
             root = root.child(qr);
-        }
-
-        if let Some(prefs) = self.render_preferences(cx) {
-            root = root.child(prefs);
         }
 
         if let Some(picker) = self.render_hotkey_picker(cx) {
@@ -6356,69 +6910,6 @@ fn mru_tab_order<T: Ord>(active: usize, last_focused: &[Option<T>]) -> Vec<usize
     order
 }
 
-fn format_duration(d: std::time::Duration) -> String {
-    let secs = d.as_secs();
-    if secs < 60 {
-        format!("{secs}s")
-    } else if secs < 3600 {
-        format!("{}m {}s", secs / 60, secs % 60)
-    } else {
-        let h = secs / 3600;
-        let m = (secs % 3600) / 60;
-        format!("{h}h {m}m")
-    }
-}
-
-fn run_check() {
-    println!("tab-atelier v{} --check", env!("CARGO_PKG_VERSION"));
-
-    let libs: &[(&str, &str)] = &[
-        ("libfreetype.so.6", "libfreetype6"),
-        ("libxkbcommon.so.0", "libxkbcommon0"),
-        ("libxkbcommon-x11.so.0", "libxkbcommon-x11-0"),
-        ("libxcb.so.1", "libxcb1"),
-        ("libxcb-xkb.so.1", "libxcb-xkb1"),
-    ];
-    let mut ok = true;
-    let mut missing = Vec::new();
-    for (lib, pkg) in libs {
-        print!("  {lib:<30}");
-        let found = std::path::Path::new("/usr/lib/x86_64-linux-gnu").join(lib).exists()
-            || std::path::Path::new("/usr/lib64").join(lib).exists()
-            || std::path::Path::new("/usr/lib").join(lib).exists();
-        if found {
-            println!("ok");
-        } else {
-            println!("MISSING  (apt install {pkg})");
-            missing.push(*pkg);
-            ok = false;
-        }
-    }
-
-    print!("  /dev/ptmx (pty support) ..... ");
-    if std::path::Path::new("/dev/ptmx").exists() {
-        println!("ok");
-    } else {
-        println!("MISSING");
-        ok = false;
-    }
-
-    let state_dir = platform::state_base_dir();
-    print!("  state dir ................... ");
-    println!("{}", state_dir.display());
-
-    let config_dir = platform::config_dir();
-    print!("  config dir .................. ");
-    println!("{}", config_dir.display());
-
-    if ok {
-        println!("all checks passed");
-    } else {
-        println!("\nTo fix, run:\n  sudo apt install {}", missing.join(" "));
-        std::process::exit(1);
-    }
-}
-
 /// Launch the gpui application. Blocks until the window closes.
 ///
 /// # Panics
@@ -6432,16 +6923,10 @@ pub fn run() {
     // file logger is installed.
     crate::init_gui_file_logging();
 
-    let args: Vec<String> = std::env::args().collect();
-    if args.iter().any(|a| a == "--check") {
-        run_check();
-        return;
-    }
-    if args.iter().any(|a| a == "-V" || a == "--version") {
-        println!("tab-atelier v{}", env!("CARGO_PKG_VERSION"));
-        return;
-    }
-
+    // `--check` and `--version` are handled by the clap front end in
+    // `cli::dispatch`, which both editions run before this. Scanning
+    // `env::args` for them here — as this used to — was a second parser that
+    // clap could not see, and it silently disagreed with clap's help.
     info!("starting Tab Atelier v{}", env!("CARGO_PKG_VERSION"));
 
     // Reap agent processes leaked by a prior (unclean) run before we
@@ -6570,6 +7055,53 @@ fn spawn_hotkey_listener(keycodes: &[u8], window_handle: WindowHandle<AppState>,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every path that makes a different tab active must also hand it the
+    /// keyboard — directly if it holds a `Window`, or by owing it via
+    /// `refocus_active` if it does not.
+    ///
+    /// Forgetting the second half is invisible in review and nearly invisible
+    /// in use: the tab paints, and the mouse wheel still reaches it, because
+    /// scroll is delivered by hit-test rather than focus. Only typing is dead.
+    /// That is how the API's activate path and an agent closing its own tab
+    /// both shipped broken — two timer-driven callers with no `Window` in hand.
+    ///
+    /// So this reads the source rather than the behaviour: a GUI focus bug
+    /// cannot be reproduced here without launching the app, but the invariant
+    /// that would have caught it is a local, checkable property.
+    #[test]
+    fn every_activation_path_hands_over_the_keyboard() {
+        let src = include_str!("app.rs");
+        let lines: Vec<&str> = src.lines().collect();
+        // The assignment that switches tabs. `active += 1` / `-= 1` are index
+        // fix-ups after an insert or remove, not activations, and are excluded.
+        let activations = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.trim_start().starts_with("self.active = ") && !l.contains("if self.active"));
+
+        let mut checked = 0;
+        for (i, line) in activations {
+            // The follow-up is a handful of lines away at most: focus(window)
+            // right there, or the debt recorded for render() to settle.
+            let settled = lines[i..(i + 25).min(lines.len())]
+                .iter()
+                .any(|l| l.contains(".focus(window)") || l.contains("refocus_active = true"));
+            assert!(
+                settled,
+                "src/app.rs:{} makes another tab active but never gives it keyboard focus:\n  {}\n\
+                 Call `.focus(window)` if you hold a Window, else set `self.refocus_active = true` \
+                 and render() will do it on the next frame.",
+                i + 1,
+                line.trim()
+            );
+            checked += 1;
+        }
+        assert!(
+            checked >= 4,
+            "only found {checked} activation sites — the pattern moved, so this test is no longer looking at anything"
+        );
+    }
 
     fn test_view(cx: &mut gpui::TestAppContext) -> Entity<TerminalView> {
         let window = cx.add_window(|window, cx| {
@@ -6803,27 +7335,6 @@ mod tests {
         // grid rather than 0 lines / <2 cols.
         let (cols, lines) = grid_dims(5.0, 10.0, 8.0, 16.0).expect("some");
         assert!(cols >= 2 && lines >= 1);
-    }
-
-    #[test]
-    fn format_duration_seconds() {
-        assert_eq!(format_duration(std::time::Duration::from_secs(0)), "0s");
-        assert_eq!(format_duration(std::time::Duration::from_secs(45)), "45s");
-        assert_eq!(format_duration(std::time::Duration::from_secs(59)), "59s");
-    }
-
-    #[test]
-    fn format_duration_minutes() {
-        assert_eq!(format_duration(std::time::Duration::from_mins(1)), "1m 0s");
-        assert_eq!(format_duration(std::time::Duration::from_secs(125)), "2m 5s");
-        assert_eq!(format_duration(std::time::Duration::from_secs(3599)), "59m 59s");
-    }
-
-    #[test]
-    fn format_duration_hours() {
-        assert_eq!(format_duration(std::time::Duration::from_hours(1)), "1h 0m");
-        assert_eq!(format_duration(std::time::Duration::from_mins(121)), "2h 1m");
-        assert_eq!(format_duration(std::time::Duration::from_hours(24)), "24h 0m");
     }
 
     #[test]

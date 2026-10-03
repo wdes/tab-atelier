@@ -1,6 +1,4 @@
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// SPDX-License-Identifier: MPL-2.0
 
 //! `tab-atelier remote attach <label-or-id> <tab>` — interactive
 //! mirror of one remote tab into the current local terminal.
@@ -34,16 +32,7 @@ use crate::remote::{Client, RemoteCommand, RemoteEvent};
 
 const READ_TICK: Duration = Duration::from_millis(50);
 
-pub fn run(args: &[String]) -> i32 {
-    let Some(key) = args.first() else {
-        eprintln!("usage: tab-atelier remote attach <label-or-id> <tab-name-or-id|#idx>");
-        return 2;
-    };
-    let Some(tab_arg) = args.get(1) else {
-        eprintln!("usage: tab-atelier remote attach <label-or-id> <tab-name-or-id|#idx>");
-        return 2;
-    };
-
+pub fn run(key: &str, tab_arg: &str) -> i32 {
     let endpoint = match resolver::endpoint(key) {
         Ok(e) => e,
         Err(e) => {

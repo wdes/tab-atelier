@@ -23,15 +23,38 @@ env:
     RUST_VERSION: "1.95.0"
 
 jobs:
+    # android/ta-remote is deliberately outside the desktop workspace — its own
+    # [workspace], its own lockfile, no path dependency on the desktop crate —
+    # so nothing under src/ can change the APK. Every push to main was
+    # rebuilding and re-signing a bit-identical artifact.
+    #
+    # This is a job rather than `on.push.paths` because a path filter is
+    # evaluated against the commits in the push, and a tag points at a commit
+    # that was already pushed: no commits, no match, and every RELEASE build
+    # silently skipped. See scripts/apk-needed.sh.
+    changes:
+        name: Did the app change?
+        runs-on: ubuntu-latest
+        outputs:
+            build: ${{ steps.decide.outputs.build }}
+        steps:
+            - uses: actions/checkout@v7
+            - id: decide
+              env:
+                  GH_TOKEN: ${{ github.token }}
+                  GITHUB_EVENT_BEFORE: ${{ github.event.before }}
+              run: echo "build=$(scripts/apk-needed.sh)" >> "$GITHUB_OUTPUT"
+
     apk:
         name: Build signed release APK
+        needs: changes
         runs-on: ubuntu-latest
         # The signing keystore + password live in this environment's secrets
         # (set via `gh secret set --env android-app`), so the APK is signed with
         # the real release key without committing it.
         environment: android-app
         # Skip doc-only / chore commits that opt out, matching apt-publish.
-        if: ${{ !contains(github.event.head_commit.message, '[skip apk]') }}
+        if: ${{ needs.changes.outputs.build == 'true' && !contains(github.event.head_commit.message, '[skip apk]') }}
         steps:
             - uses: actions/checkout@v7
 
