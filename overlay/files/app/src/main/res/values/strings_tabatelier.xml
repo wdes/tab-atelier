@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+	Strings this fork adds, kept in their own file rather than appended to
+	upstream's values/strings.xml.
+
+	Adding to overlay/files/ means it is copied in verbatim: this file is never
+	part of a patch, so adding a string is a line here and nothing to rebase when
+	upstream edits its own strings. Android's resource merger combines every file
+	under res/values/, so a resource does not care which file declares it.
+
+	What CANNOT live here is replacing an upstream string. Two files in the same
+	source set declaring the same name is a duplicate-resource error, not an
+	override, so the few upstream strings we rewrite (app_name, app_desc,
+	app_copyright and the help links) stay in patches/0002 beside their originals.
+
+	The `tabatelier_` and `hostpref_token*` prefixes exist to keep this file
+	conflict-free: a name upstream later adds would otherwise collide and break
+	the build.
+-->
+<resources>
+	<!-- Host editor: the tab-atelier server's API token. -->
+	<string name="hostpref_token_title">API token</string>
+	<string name="hostpref_token_unchanged">API token (unchanged)</string>
+	<string name="hostpref_token_summary">Bearer token sent to the tab-atelier daemon.</string>
+	<string name="hostpref_clear_token">Clear saved token</string>
+
+	<!-- Host list: one tab-atelier server's tabs, below its row. -->
+	<string name="tabatelier_refresh_tabs">Refresh tabs</string>
+	<string name="tabatelier_tabs_loading">Loading tabs…</string>
+	<string name="tabatelier_tabs_empty">No tabs</string>
+	<string name="tabatelier_tabs_error">Could not reach this server: %1$s</string>
+	<string name="tabatelier_tab_active">active</string>
+	<string name="tabatelier_tab_locked">Locked</string>
+
+	<!-- Shown when a tab is tapped before the terminal stage exists, so the tap
+	     explains itself instead of looking like a failure. -->
+	<string name="tabatelier_transport_not_yet">tab-atelier terminals arrive in a later stage.</string>
+</resources>
