@@ -46,4 +46,10 @@
 	<!-- Shown when a tab is tapped before the terminal stage exists, so the tap
 	     explains itself instead of looking like a failure. -->
 	<string name="tabatelier_transport_not_yet">tab-atelier terminals arrive in a later stage.</string>
+
+	<!-- Opening a tab's session. Each of these is a session that could not start
+	     for a reason the user can act on, so they say what to do rather than
+	     only what went wrong. -->
+	<string name="tabatelier_url_missing">This server has no address yet. Open it in the host editor and enter its URL, for example https://host:8443</string>
+	<string name="tabatelier_tab_not_chosen">No tab was chosen for this session. Open one from the host list.</string>
 </resources>

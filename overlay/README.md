@@ -172,15 +172,37 @@ OkHttp interceptor so stage 2's WebSocket carries it too. That is for the
 daemon's logs — the daemon does not branch on it — and it matches the retired
 Slint client's string for continuity.
 
-**Tapping a tab does nothing yet.** The WebSocket terminal is the next stage;
-until it lands, the row says so rather than failing silently.
+**Tapping a tab opens it.** The session is the daemon's own WebSocket protocol,
+not SSH: one tag byte then the payload, with keystrokes out, output in (gzipped
+output inflated with `GZIPInputStream` — gzip, not a raw deflate stream), the
+terminal size reported, and a "focused" frame as the session opens, which is what
+makes the daemon stamp the tab's `last_used_at`. So using a tab is what moves it
+up the list the list sorts by.
+
+Two details worth not rediscovering:
+
+- **Resize is a no-op in the daemon's v1.** A tab is a terminal on a real screen
+  and the workstation wins, so a phone renders a tab's output at the
+  workstation's width, with the workstation's wrapping. The frame is sent anyway:
+  it costs nothing and works the day the daemon honours it.
+- **The size frame is JSON**, `{"cols":N,"rows":M}`, not the two big-endian
+  shorts the tag suggests.
+
+Which tab to open cannot ride on the host row — a row is the daemon, not one of
+its tabs, and a WebSocket cannot be asked for a tab once it is open. So the id
+travels from the tap through the console route's optional `?tab=` argument and is
+*consumed* by the transport (taken, not read), so a later session cannot inherit
+the previous one's tab.
 
 ## Current state
 
 The app is a working ConnectBot under our package id, plus the tab-atelier type:
-servers can be added, their tabs are listed and ordered by last use, and a tab
-opens no session yet. Nothing upstream is removed — SSH, telnet, mosh and the
-local shell all still work, and `remove.txt` is empty. A future milestone may
-retire the transports that have no use here, but only if that is wanted: the
+servers can be added, their tabs are listed and ordered by last use, and tapping
+one opens that tab's terminal. Nothing upstream is removed — SSH, telnet, mosh
+and the local shell all still work, and `remove.txt` is empty. A future milestone
+may retire the transports that have no use here, but only if that is wanted: the
 additive shape is what keeps an upstream sync to a pin bump.
+
+Not yet exercised on a device: the session path is compile- and unit-tested
+only, and has never run against a real daemon.
 
