@@ -1,8 +1,8 @@
 [workspace]
-members = ["crates/catbus-agent", "crates/claude-api", "crates/tab-atelier-briefs", "crates/tab-atelier-proxy"]
-# tab-atelier-proxy is deliberately NOT a default member: it is a server that
-# runs on a different machine, ships as its own .deb, and building the desktop
-# should not build it. `cargo build -p tab-atelier-proxy` when you want it.
+members = ["crates/catbus-agent", "crates/claude-api", "crates/tab-atelier-briefs", "crates/tab-atelier-proxy", "crates/tab-atelier-kiosk"]
+# tab-atelier-proxy and tab-atelier-kiosk are deliberately NOT default members: they are
+# servers shipped as separate .debs, and building the desktop should not build them.
+# `cargo build -p <server-crate>` when you want one.
 default-members = [".", "crates/catbus-agent", "crates/claude-api", "crates/tab-atelier-briefs"]
 
 # Release codegen tuned for the hot VT-parse / grid-update loop. Cargo's

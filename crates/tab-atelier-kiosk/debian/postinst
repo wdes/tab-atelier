@@ -1,0 +1,24 @@
+#!/bin/sh
+# SPDX-License-Identifier: MPL-2.0
+# Create the unprivileged service identity; its private state directory is
+# managed separately below and systemd recreates it with the configured mode.
+set -e
+case "$1" in
+    configure)
+        if ! getent passwd tab-atelier-kiosk >/dev/null; then
+            adduser --system --group --no-create-home \
+                    --home /var/lib/tab-atelier-kiosk \
+                    --shell /usr/sbin/nologin \
+                    --gecos "tab-atelier kiosk" \
+                    tab-atelier-kiosk >/dev/null
+        fi
+        install -d -o tab-atelier-kiosk -g tab-atelier-kiosk -m 0700 /var/lib/tab-atelier-kiosk
+        # First install remains stopped for operator configuration; upgrades
+        # restart the running service so its process uses the newly installed binary.
+        if [ -n "$2" ] && [ -d /run/systemd/system ]; then
+            deb-systemd-invoke restart 'tab-atelier-kiosk.service' >/dev/null || true
+        fi
+        ;;
+esac
+#DEBHELPER#
+exit 0

@@ -1,0 +1,53 @@
+[Unit]
+Description=tab-atelier web Kiosk
+Documentation=https://github.com/wdes/tab-atelier
+After=network.target
+
+[Service]
+Type=simple
+User=tab-atelier-kiosk
+Group=tab-atelier-kiosk
+StateDirectory=tab-atelier-kiosk
+StateDirectoryMode=0700
+ExecStart=/usr/bin/tab-atelier-kiosk serve --listen 127.0.0.1:7901
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=10s
+
+# The scaffold only serves HTTP on loopback; unlike the proxy it has no upstream
+# egress, credentials, or TLS-terminator assumption, so network-online is unnecessary.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictSUIDSGID=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateUsers=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RemoveIPC=yes
+KeyringMode=private
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+UMask=0077
+
+# Serving loopback HTTP needs TCP; AF_UNIX remains available for host NSS lookups.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@clock @cpu-emulation @debug @module @mount @obsolete @privileged @raw-io @reboot @resources @swap @keyring @pkey
+SystemCallFilter=~capset setuid setgid setgroups setresuid setresgid setreuid setregid setfsuid setfsgid
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

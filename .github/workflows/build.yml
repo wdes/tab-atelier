@@ -169,6 +169,7 @@ jobs:
                   cargo deb -p tab-atelier --locked --deb-version "$DEB_VERSION" --dbgsym --compress-debug-symbols=zlib
                   cargo deb -p tab-atelier --variant headless --locked --deb-version "$DEB_VERSION" --dbgsym --compress-debug-symbols=zlib
                   cargo deb -p tab-atelier-proxy --locked --deb-version "$DEB_VERSION" --dbgsym --compress-debug-symbols=zlib
+                  cargo deb -p tab-atelier-kiosk --locked --deb-version "$DEB_VERSION" --dbgsym --compress-debug-symbols=zlib
                   ls -la target/debian/
             - name: Upload .deb packages
               id: upload-deb
