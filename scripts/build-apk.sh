@@ -86,6 +86,11 @@ fi
 # so the About screen of a hand-built APK is not a different kind of "unknown".
 APP_BUILD_COMMIT="${APP_BUILD_COMMIT:-$(git -C "$root" rev-parse --short HEAD 2>/dev/null || true)}"
 [[ -n "$APP_BUILD_COMMIT" ]] && args+=("-PbuildCommit=$APP_BUILD_COMMIT")
+# The upstream half of the fork, for the About screen. Read from the submodule
+# checkout rather than passed in, so it is correct locally and in CI (which
+# checks the pin out) with nothing to remember.
+APP_UPSTREAM_COMMIT="${APP_UPSTREAM_COMMIT:-$(git -C "$upstream" rev-parse --short HEAD 2>/dev/null || true)}"
+[[ -n "$APP_UPSTREAM_COMMIT" ]] && args+=("-PupstreamCommit=$APP_UPSTREAM_COMMIT")
 
 cd "$upstream"
 ./gradlew --no-daemon -Dorg.gradle.jvmargs="-Xmx2g -XX:MaxMetaspaceSize=1g" \
