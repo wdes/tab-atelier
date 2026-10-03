@@ -446,6 +446,61 @@ pub enum Commands {
         args: Vec<String>,
     },
 
+    /// Agent card — hard-wired specialty (persisted, hook-immune).
+    SetSpecialty {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// Agent card — the orchestrator this tab serves (a tab UUID or `free`).
+    SetOrchestrator {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// Agent card — this tab's current objective.
+    SetObjective {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// Agent card — APPEND one phrase to the bounded current-task permalog.
+    SetCurrentTask {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// Agent card — toggle supervision-rounds status (`true`/`false`).
+    SetRoundsActive {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// Agent card — declare the `.md` conventions (comma-separated).
+    SetConventions {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// Agent card — APPEND one evaluation record (JSON) to the bounded ring.
+    SetEvaluation {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// Agent card — bump a tab's usage counter + stamp last-used.
+    BumpUsage {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// Mark a predecessor tab's re-home progress (`rehome-tab.sh`).
+    SetRehomeStatus {
+        /// Passed straight through to `cli::set_rehome::run`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
     /// Tail the running daemon's log (`GET /logs`, loopback callers only).
     ///
     /// Distinct from `log <filter>`, which configures what the NEXT start
@@ -457,10 +512,6 @@ pub enum Commands {
     },
 
     /// Agent card — hard-wired specialty (persisted, hook-immune).
-    SetSpecialty {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
-    },
 
     /// Post work to the shared blackboard: `announce <task-id> <title>`.
     ///
@@ -475,10 +526,6 @@ pub enum Commands {
     },
 
     /// Agent card — the orchestrator this tab serves (a tab UUID or `free`).
-    SetOrchestrator {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
-    },
 
     /// Offer to do an announced task: `bid <task-id> --cost <n>` (lower wins).
     Bid {
@@ -488,10 +535,6 @@ pub enum Commands {
     },
 
     /// Agent card — this tab's current objective.
-    SetObjective {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
-    },
 
     /// Hand a task to a bidder: `award <task-id> --to <agent>`.
     Award {
@@ -501,10 +544,6 @@ pub enum Commands {
     },
 
     /// Agent card — APPEND one phrase to the bounded current-task permalog.
-    SetCurrentTask {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
-    },
 
     /// Lease the best open task for this agent: `take [--ttl <s>]`.
     ///
@@ -519,10 +558,6 @@ pub enum Commands {
     },
 
     /// Agent card — toggle supervision-rounds status (`true`/`false`).
-    SetRoundsActive {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
-    },
 
     /// Report a task finished: `done <task-id> [--fail] [result…]`.
     ///
@@ -535,10 +570,6 @@ pub enum Commands {
     },
 
     /// Agent card — declare the `.md` conventions (comma-separated).
-    SetConventions {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
-    },
 
     /// Block until named tasks finish: `wait <task-id>… [--timeout <s>]`.
     ///
@@ -553,10 +584,6 @@ pub enum Commands {
     },
 
     /// Agent card — APPEND one evaluation record (JSON) to the bounded ring.
-    SetEvaluation {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
-    },
 
     /// Show the blackboard folded into tasks: `tasks [--all]`.
     Tasks {
@@ -566,10 +593,6 @@ pub enum Commands {
     },
 
     /// Agent card — bump a tab's usage counter + stamp last-used.
-    BumpUsage {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
-    },
 
     /// What a Claude session starting here would be told: `brief [--cwd <dir>]`.
     ///
@@ -584,11 +607,6 @@ pub enum Commands {
     },
 
     /// Mark a predecessor tab's re-home progress (`rehome-tab.sh`).
-    SetRehomeStatus {
-        /// Passed straight through to `cli::set_rehome::run`.
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
-    },
 
     /// Who is working on what: `fleet [--json]`.
     ///

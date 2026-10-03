@@ -234,6 +234,9 @@ pub fn dispatch(name: &str, rest: &[String]) -> Option<i32> {
         "claude-hook" => claude_hook::run(rest),
         // Orchestration / teamwork.
         "dispatch" => delegate::run(rest),
+        // Skill-lifecycle: the retired-agent catalogue + spawn-from-skill/card.
+        "catalog" => super::catalog::run(rest),
+        "spawn" => super::catalog::spawn_run(rest),
         "remote" => remote::run(rest),
         "brain" => brain::run(rest),
         // task primitive (#11): typed queue with an atomic claim.
@@ -339,7 +342,10 @@ mod tests {
                     continue;
                 }
                 // This module is where the reading is SUPPOSED to happen.
-                if path.file_name().is_some_and(|f| f == "client.rs") {
+                if path
+                    .file_name()
+                    .is_some_and(|f| matches!(f.to_str(), Some("client.rs" | "tab_field.rs")))
+                {
                     continue;
                 }
                 let Ok(src) = std::fs::read_to_string(&path) else {
