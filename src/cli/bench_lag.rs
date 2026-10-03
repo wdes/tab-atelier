@@ -1,6 +1,4 @@
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// SPDX-License-Identifier: MPL-2.0
 
 //! `tab-atelier-headless bench-lag` — web-viewer input-lag self-test.
 //!
@@ -306,5 +304,16 @@ mod tests {
     #[test]
     fn rejects_unknown_scheme() {
         assert!(to_ws_url("ftp://h/x").is_err());
+    }
+
+    #[test]
+    fn lag_bench_arguments_are_validated_before_it_connects() {
+        // `run_cli` needs a live websocket to measure anything, so only the
+        // argument handling runs here — a benchmark that quietly measures
+        // something other than what was asked is worse than one that refuses.
+        let cli = |v: &[&str]| super::run_cli(&v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>());
+        assert_ne!(cli(&["--nope"]), 0, "unknown flag");
+        assert_ne!(cli(&["-n"]), 0, "flag with no value");
+        assert_ne!(cli(&["-n", "not-a-number"]), 0);
     }
 }

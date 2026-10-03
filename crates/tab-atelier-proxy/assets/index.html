@@ -1,0 +1,1187 @@
+<!doctype html>
+<!--
+  SPDX-License-Identifier: MPL-2.0
+
+  Account management for tab-atelier-proxy.
+
+  Everything is local: Vue and Bootstrap are served from vendor/ by the proxy
+  itself, with no CDN. A credential proxy is exactly the kind of thing that
+  runs on a locked-down network, and an admin UI that only works with outbound
+  internet would be useless there — quite apart from handing a third party a
+  script tag on the page where the admin token is typed.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="referrer" content="no-referrer" />
+    <title>tab-atelier-proxy — accounts</title>
+    <link rel="stylesheet" href="vendor/bootstrap.min.css" />
+    <style>
+      /* Chart roles as custom properties, so light and dark are chosen from
+         the same ramps in ONE place and the SVG is written against roles
+         rather than hex. Both palettes were run through the validator; dark is
+         its own steps for the dark surface, not an automatic flip. */
+      .ta-viz {
+        --surface-1: #fcfcfb;
+        --text-secondary: #52514e;
+        --text-muted: #85837b;
+        --grid: #e6e5e0;
+        --series-1: #2a78d6;
+        --series-2: #eb6834;
+        --danger: #c0392b;
+        /* One hue per account, in a FIXED order — the ordering is the
+           colourblind-safety mechanism, not decoration, so slots are assigned
+           by a stable list and never by size. See `callsByUser` in app.ts. */
+        --cat-1: #2a78d6;
+        --cat-2: #eb6834;
+        --cat-3: #1baf7a;
+        --cat-4: #eda100;
+        --cat-5: #e87ba4;
+        --cat-6: #008300;
+        --cat-7: #4a3aa7;
+        --cat-8: #e34948;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root:where(:not([data-bs-theme="light"])) .ta-viz {
+          --surface-1: #1a1a19;
+          --text-secondary: #c3c2b7;
+          --text-muted: #8f8e85;
+          --grid: #33322f;
+          --series-1: #3987e5;
+          --series-2: #d95926;
+          --danger: #e06c5b;
+          /* Dark is its own steps from the same ramps, not an automatic flip:
+             the light steps fall outside the dark lightness band. */
+          --cat-1: #3987e5;
+          --cat-2: #d95926;
+          --cat-3: #199e70;
+          --cat-4: #c98500;
+          --cat-5: #d55181;
+          --cat-6: #008300;
+          --cat-7: #9085e9;
+          --cat-8: #e66767;
+        }
+      }
+      :root[data-bs-theme="dark"] .ta-viz {
+        --surface-1: #1a1a19;
+        --text-secondary: #c3c2b7;
+        --text-muted: #8f8e85;
+        --grid: #33322f;
+        --series-1: #3987e5;
+        --series-2: #d95926;
+        --danger: #e06c5b;
+        --cat-1: #3987e5;
+        --cat-2: #d95926;
+        --cat-3: #199e70;
+        --cat-4: #c98500;
+        --cat-5: #d55181;
+        --cat-6: #008300;
+        --cat-7: #9085e9;
+        --cat-8: #e66767;
+      }
+      .ta-chart { position: relative; }
+      .ta-chart svg { width: 100%; height: auto; display: block; }
+      /* Recessive: the data is the ink, the scaffolding is not. */
+      .ta-grid line { stroke: var(--grid); stroke-width: 1; }
+      .ta-grid text, .ta-axis text { fill: var(--text-muted); font-size: 11px; }
+      .ta-line-1 { fill: none; stroke: var(--series-1); stroke-width: 2; stroke-linejoin: round; }
+      .ta-area-1 { fill: var(--series-1); opacity: 0.14; }
+      .ta-dot-1 { fill: var(--series-1); stroke: var(--surface-1); stroke-width: 2; }
+      /* The weekly window: present, readable, and plainly not the headline.
+         Thinner and dashed rather than merely faded — a low-opacity line of
+         the same weight reads as "the same series, badly drawn", and opacity
+         alone disappears entirely in forced-colors mode. */
+      .ta-line-2-bg {
+        fill: none; stroke: var(--series-2); stroke-width: 1.5;
+        stroke-dasharray: 5 4; stroke-linejoin: round; opacity: .75;
+      }
+      .ta-dot-2 { fill: var(--series-2); stroke: var(--surface-1); stroke-width: 2; }
+      /* Window boundaries are annotation, not data: muted ink, hairline, and
+         behind everything, so they divide the plot without competing with it. */
+      .ta-reset line { stroke: var(--text-muted); stroke-width: 1; stroke-dasharray: 2 4; opacity: .55; }
+      .ta-key-rule {
+        background: repeating-linear-gradient(0deg, var(--text-muted) 0 2px, transparent 2px 6px);
+      }
+      /* One line per account. Thinner than the single-series line because
+         eight of them overlap, and no area fill: stacked-looking bands would
+         read as a total, and these are alternatives, not parts. */
+      .ta-line-user { fill: none; stroke-width: 1.6; stroke-linejoin: round; opacity: .9; }
+      /* Panel titles in the small-multiple tokens chart. Muted ink, like the
+         axis labels: they name the panel, they are not the data. */
+      .ta-panel-title { fill: var(--text-secondary); font-size: 11px; font-weight: 600; }
+      .ta-bar-1 { fill: var(--series-1); }
+      .ta-bar-2 { fill: var(--series-2); }
+      .ta-threshold line { stroke: var(--danger); stroke-width: 1; stroke-dasharray: 4 3; opacity: .7; }
+      .ta-threshold text { fill: var(--danger); font-size: 10px; }
+      .ta-hero { font-size: 2rem; line-height: 1.1; }
+      .ta-crosshair { stroke: var(--text-muted); stroke-width: 1; stroke-dasharray: 3 3; }
+      .ta-tip {
+        position: absolute; top: 8px; transform: translateX(-50%);
+        background: var(--surface-1); color: var(--text-secondary);
+        border: 1px solid var(--grid); border-radius: 6px;
+        padding: 6px 10px; font-size: 12px; pointer-events: none; white-space: nowrap;
+        box-shadow: 0 2px 8px rgb(0 0 0 / 0.12);
+      }
+      .ta-tip-h { font-weight: 600; margin-bottom: 2px; }
+      .ta-tip-err { color: var(--danger); }
+      .ta-tip-sub { color: var(--text-muted); }
+      /* Identity is never colour alone: every key sits beside its label. */
+      .ta-key { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 6px; }
+      .ta-bg-1 { background: var(--series-1); }
+      .ta-bg-2 { background: var(--series-2); }
+      /* The legend key repeats the dash, so the swatch matches the mark it
+         stands for instead of only its hue. */
+      .ta-key-dash {
+        background: repeating-linear-gradient(90deg, var(--series-2) 0 3px, transparent 3px 5px);
+      }
+      /* The tool-policy editor. Hand-rolled rather than Bootstrap's modal: the
+         vendored bundle is CSS-only, so `Modal` does not exist, and the whole
+         behaviour needed is "sit on top, close on backdrop click". */
+      .ta-modal-backdrop {
+        position: fixed; inset: 0; z-index: 1050;
+        background: rgb(0 0 0 / .5);
+        display: flex; align-items: flex-start; justify-content: center;
+        padding: 4vh 1rem; overflow-y: auto;
+      }
+      .ta-modal { width: 100%; max-width: 46rem; }
+
+      /* JSON body colouring. The selectors are the token classes the viewer
+         hands back, so if the palette changes these must change with it.
+         Wrapped in `:root:not([data-bs-theme=dark])` so a dark theme, when one
+         arrives, inherits whatever plain `pre` colour it sets rather than dark
+         ink on a dark panel. */
+      :root:not([data-bs-theme=dark]) .ta-j-key { color: #0a58ca; }
+      :root:not([data-bs-theme=dark]) .ta-j-str { color: #146c43; }
+      :root:not([data-bs-theme=dark]) .ta-j-num { color: #a61e4d; }
+      :root:not([data-bs-theme=dark]) .ta-j-lit { color: #b02a37; }
+    </style>
+  </head>
+  <body class="bg-body-tertiary">
+    <!-- Full width: the account table has seven columns and the charts read
+         better wide. A 60rem cap left two thirds of a laptop screen empty. -->
+    <div id="app" class="container-fluid px-4 py-4">
+      <!-- Sign in ------------------------------------------------------->
+      <div v-if="!authed" class="card shadow-sm mx-auto" style="max-width: 30rem">
+        <div class="card-body">
+          <h1 class="h5 card-title">tab-atelier-proxy</h1>
+          <p class="text-body-secondary small">
+            Paste the admin token. On the proxy host:
+            <code>tab-atelier-proxy admin-token</code>
+          </p>
+          <!-- `off`, which is the least-bad of a bad set. MDN is explicit that
+               `off` "will not prevent a password manager from asking the user
+               if they would like to save username and password information" —
+               and a `tap_` token in a synchronised vault is a relay credential
+               in a synchronised vault.
+
+               The values that look stronger are worse here. `new-password`
+               marks the field as a signup password, so Chromium offers to
+               GENERATE one — it invents a value and stores it for a field whose
+               whole purpose is to receive a token the operator already has.
+               `current-password` marks it as the site's stored login, which is
+               an outright invitation to fill and to save.
+
+               So this is best-effort, not airtight. Nothing in the attribute
+               vocabulary reliably stops a password manager; the only certain
+               way is to not use a password field at all, which would leave the
+               token unmasked in Firefox, where the CSS that replaces the
+               masking is unsupported. A token visible on screen is the lesser
+               problem, and a generated one saved to a vault is the greater. -->
+          <form autocomplete="off" @submit.prevent="signIn">
+            <input
+              v-model="token"
+              type="password"
+              class="form-control font-monospace"
+              placeholder="tap_…"
+              autocomplete="off"
+              autofocus
+            />
+            <div v-if="error" class="alert alert-danger mt-3 mb-0 py-2 small">{{ error }}</div>
+            <button class="btn btn-primary w-100 mt-3" :disabled="busy">
+              {{ busy ? 'Checking…' : 'Sign in' }}
+            </button>
+          </form>
+        </div>
+      </div>
+
+      <!-- Accounts ------------------------------------------------------>
+      <!-- No wrapper element, and deliberately not a bare template either.
+           This markup IS the root template — `createApp(AdminApp).mount("#app")`
+           compiles whatever sits in here — and at the root a wrapper of that
+           kind renders as an EMPTY element with its children dropped: the app
+           still mounts, every fetch still succeeds, and the page is blank. The
+           sections below are the root's children directly, which Vue renders as
+           a fragment.
+
+           The tag is not written with angle brackets anywhere in this comment
+           on purpose. The structural test counts literal tags, and one inside a
+           comment reads as an unclosed element. -->
+      <section v-if="authed">
+        <div class="d-flex align-items-center mb-3">
+          <h1 class="h4 mb-0 flex-grow-1">Accounts</h1>
+          <button class="btn btn-sm btn-outline-secondary" @click="signOut">Sign out</button>
+        </div>
+
+        <div v-if="error" class="alert alert-danger py-2 small">{{ error }}</div>
+
+        <!--
+          Plan pressure: the shared subscription, reported by Anthropic.
+
+          The whole block is gated on the same "is the subscription usable"
+          answer the router uses, so a provider switched off — by hand, or for
+          want of its credential file — takes the panel with it. Reporting on a
+          plan the proxy has decided not to spend would be a figure with no
+          referent.
+        -->
+        <div class="ta-viz mb-4" v-if="planAvailable">
+          <div class="card shadow-sm mb-3" v-if="pressure">
+            <div class="card-body">
+              <div class="d-flex align-items-start mb-2">
+                <div class="flex-grow-1">
+                  <h2 class="h6 mb-1">
+                    Plan pressure
+                    <span class="text-body-secondary fw-normal">· the shared subscription</span>
+                  </h2>
+                  <!--
+                    The number is what Anthropic calls `utilization`: the share
+                    of the window CONSUMED, so bigger is worse. Unlabelled it
+                    read as "percent of the plan", which is exactly as likely
+                    to be understood as the remaining share — the opposite,
+                    and a reason to relax when the plan is nearly gone.
+                  -->
+                  <div class="ta-hero" :class="planClass">
+                    <template v-if="planUtil != null">{{ Math.round(planUtil * 100) }}%</template>
+                    <template v-else>—</template>
+                    <span class="fs-6 text-body-secondary">used</span>
+                  </div>
+                  <!-- Status is never colour alone: it is spelled out. -->
+                  <div class="small" :class="planClass">{{ planState }}</div>
+                </div>
+                <div class="text-end small text-body-secondary">
+                  <div v-if="weeklyUtil != null" :class="weeklyClass">
+                    <span class="ta-key ta-key-dash ta-bg-2"></span>weekly
+                    {{ Math.round(weeklyUtil * 100) }}% used
+                  </div>
+                  <!--
+                    Upstream's own claim, marked as a claim. `seven_day.resets_at`
+                    is the tail of a rolling window — when the oldest tokens age
+                    out — so it reads about a week ahead and slides forward daily.
+                    It is NOT when fresh allocation arrives, and people have
+                    planned work around it and been wrong.
+                  -->
+                  <div v-if="plan.latest && plan.latest.seven_day_resets"
+                       :title="'Upstream reports this as the weekly window rolling over: ' + whenLocal(plan.latest.seven_day_resets) + '. It describes the oldest tokens ageing out, not a fresh allocation.'">
+                    upstream says {{ untilLocal(plan.latest.seven_day_resets) }}
+                  </div>
+                  <!-- What we actually watched it do. -->
+                  <div v-if="plan.weekly_last_drop"
+                       :title="'Observed: the weekly counter fell from ' + Math.round(plan.weekly_last_drop.from * 100) + '% to ' + Math.round(plan.weekly_last_drop.to * 100) + '% at ' + whenLocal(plan.weekly_last_drop.ts)">
+                    last actually reset {{ untilLocal(plan.weekly_last_drop.ts) }}
+                  </div>
+                  <div v-if="plan.latest && plan.latest.five_hour_resets"
+                       :title="whenLocal(plan.latest.five_hour_resets)">
+                    session resets {{ untilLocal(plan.latest.five_hour_resets) }}
+                  </div>
+                  <div v-if="sched.backoff_for">backing off {{ sched.backoff_for }}s</div>
+                  <div v-if="sched.rejected">{{ sched.rejected }} queued out</div>
+                </div>
+                <busy-button class="ms-3" :busy="pressureBusy" label="Refresh"
+                             busy-label="Refreshing…" @click="reloadPressure"></busy-button>
+              </div>
+              <!--
+                The monitor's own health, stated rather than left to be
+                inferred from a chart that stops. A failed poll produces a
+                sample with no numbers, so the series simply ends — for ten
+                hours, in the case this was written for, while the page went
+                on showing the last figure it had seen as if it were current.
+              -->
+              <div v-if="monitorBroken" class="alert alert-warning py-2 small mb-3" role="status">
+                <strong>The plan monitor is not reporting.</strong>
+                {{ monitorProblem }}.
+                <template v-if="planHealth.last_error">
+                  Last error: <code>{{ planHealth.last_error }}</code>.
+                </template>
+                <template v-if="String(planHealth.last_error || '').includes('invalid_grant')">
+                  The proxy's stored Claude credentials need importing again.
+                </template>
+                Anything plotted below this point is history, not the plan right now.
+              </div>
+              <pressure-chart v-if="planSeries.length > 1" :points="planSeries" :threshold="degradeAbove"></pressure-chart>
+              <p v-else class="small text-body-secondary mb-0">
+                Collecting samples — the proxy polls the plan every five minutes.
+              </p>
+            </div>
+          </div>
+        </div>
+
+        <!-- Dashboard ------------------------------------------------->
+        <div class="ta-viz mb-4">
+          <div class="row g-2 mb-3">
+            <div class="col-6 col-lg-3" v-for="tile in tiles" :key="tile.label">
+              <div class="card shadow-sm h-100">
+                <div class="card-body py-2">
+                  <div class="text-body-secondary small">{{ tile.label }}</div>
+                  <div class="fs-4">{{ tile.value }}</div>
+                  <div class="text-body-secondary" style="font-size: .75rem">{{ tile.sub }}</div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="card shadow-sm mb-3">
+            <div class="card-body">
+              <div class="d-flex align-items-center mb-1">
+                <h2 class="h6 mb-0 flex-grow-1">
+                  API calls per hour
+                  <span class="text-body-secondary fw-normal">· {{ scopeLabel }}</span>
+                </h2>
+                <select autocomplete="off" v-model="usageWindow" @change="loadUsage" class="form-select form-select-sm w-auto">
+                  <!--
+                    The values are `usage::Window` tokens and must stay in sync
+                    with `Window::TOKENS`; the labels are prose and may not.
+                    `tests/web_assets.rs` reads this block and asserts every
+                    value parses, so a token renamed on one side fails the
+                    build rather than 400ing a dropdown at runtime.
+
+                    One entry per DISTINCT window. 48h is 2 d and 1 w is 7 d,
+                    and `Window::parse` accepts either spelling — but offering
+                    both would put two rows in this list that draw the same
+                    graph, which reads as a bug in the data.
+                  -->
+                  <option value="week">This week</option>
+                  <option value="24h">Last 24 h</option>
+                  <option value="2d">Last 2 d</option>
+                  <option value="3d">Last 3 d</option>
+                  <option value="4d">Last 4 d</option>
+                  <option value="5d">Last 5 d</option>
+                  <option value="6d">Last 6 d</option>
+                  <option value="7d">Last 7 d</option>
+                  <option value="30d">Last 30 d</option>
+                </select>
+                <busy-button class="ms-2" :busy="usageBusy" label="Refresh"
+                             busy-label="Refreshing…" @click="reloadUsage"></busy-button>
+              </div>
+              <calls-chart :points="series" :by-user="callsByUser"></calls-chart>
+            </div>
+          </div>
+
+          <div class="card shadow-sm mb-3">
+            <div class="card-body">
+              <div class="d-flex align-items-baseline mb-1">
+                <h2 class="h6 mb-0 flex-grow-1">
+                  {{ unitName }} per hour
+                  <span class="text-body-secondary fw-normal">· {{ scopeLabel }}</span>
+                </h2>
+                <select class="form-select form-select-sm w-auto me-2" v-model="unit"
+                        aria-label="What the chart counts">
+                  <option v-for="u in tokenUnits" :key="u.id" :value="u.id">{{ u.label }}</option>
+                </select>
+                <!-- Two series, so a legend is always shown. -->
+                <span class="small text-body-secondary">
+                  <span class="ta-key ta-bg-1"></span>input
+                  <span class="ta-key ta-bg-2 ms-3"></span>output
+                </span>
+                <!-- Same series, and so the same fetch, as the card above. A
+                     second button is not a second load: the thing being
+                     refreshed is the chart in front of you. -->
+                <busy-button class="ms-3" :busy="usageBusy" label="Refresh"
+                             busy-label="Refreshing…" @click="reloadUsage"></busy-button>
+              </div>
+              <tokens-chart :points="series" :unit="unit"></tokens-chart>
+              <div class="small text-body-secondary mt-1">{{ unitNote }}</div>
+            </div>
+          </div>
+
+          <div class="d-flex align-items-center mb-3" v-if="focus">
+            <button class="btn btn-sm btn-outline-secondary" @click="focus = null">
+              ← back to everyone
+            </button>
+          </div>
+        </div>
+
+        <!-- A key exists in readable form exactly once. Say so plainly, and
+             make it easy to copy, or it gets lost the moment this closes. -->
+        <div v-if="freshKey" class="alert alert-success">
+          <div class="fw-semibold">Key {{ freshKey.name }} for {{ freshKey.who }}</div>
+          <div class="input-group my-2">
+            <input autocomplete="off" class="form-control font-monospace" :value="freshKey.key" readonly />
+            <button class="btn btn-outline-success" @click="copy(freshKey.key)">
+              {{ copied ? 'Copied' : 'Copy' }}
+            </button>
+          </div>
+          <div class="small mb-0">
+            Shown once — the proxy keeps only a hash. If it is lost, rotate for a new one.
+
+            <!-- The key is substituted, not left as <key>. A placeholder in a
+                 block that is shown exactly once means retyping a 68-character
+                 secret by hand, and the copy button below is the only thing
+                 standing between that and a typo. -->
+            <div class="mt-2 fw-semibold">Route a whole tab-atelier through the proxy</div>
+            <div class="input-group input-group-sm my-1">
+              <textarea autocomplete="off" class="form-control font-monospace" rows="3" readonly>{{ relayRecipe }}</textarea>
+              <button class="btn btn-outline-success" @click="copy(relayRecipe)">
+                {{ copied ? 'Copied' : 'Copy' }}
+              </button>
+            </div>
+            <div class="text-muted">Claude tabs opened <em>after</em> this route through the proxy — existing ones keep the environment they were started with.</div>
+
+            <!-- The other half of the question people actually ask. A tab that
+                 already sets ANTHROPIC_BASE_URL itself never consults
+                 tab-atelier's relay config, so the commands above do nothing
+                 for it and it fails in a way that looks like a broken proxy. -->
+            <div class="mt-3 fw-semibold">Or point one tab (or any tool) straight here</div>
+            <div class="input-group input-group-sm my-1">
+              <textarea autocomplete="off" class="form-control font-monospace" rows="2" readonly>{{ envRecipe }}</textarea>
+              <button class="btn btn-outline-success" @click="copy(envRecipe)">
+                {{ copied ? 'Copied' : 'Copy' }}
+              </button>
+            </div>
+            <div class="text-muted">Needs no tab-atelier at all. Use this when a tab sets <code>ANTHROPIC_BASE_URL</code> of its own — that setting wins over relay mode, so it must name the proxy itself.</div>
+          </div>
+          <button class="btn btn-sm btn-success mt-2" @click="freshKey = null">Done</button>
+        </div>
+
+        <!-- Providers: where requests can go ---------------------------->
+        <div class="card shadow-sm mb-4">
+          <div class="card-body">
+            <div class="d-flex align-items-start">
+              <div class="flex-grow-1">
+                <h2 class="h6 card-title mb-1">Providers</h2>
+                <p class="small text-body-secondary mb-0">
+                  Somewhere else requests can go. Every provider must speak the
+                  <strong>Anthropic Messages API</strong> — that is what Claude Code speaks, and
+                  nothing is translated, so tool use, caching and thinking pass through untouched.
+                  DeepSeek's endpoint for this is <code>/anthropic</code>, not its bare host.
+                </p>
+              </div>
+              <busy-button class="ms-3" :busy="providersBusy" label="Refresh"
+                           busy-label="Loading…" @click="loadProviders"></busy-button>
+            </div>
+
+            <div v-if="providers" class="mt-3">
+              <table class="table table-sm align-middle mb-3">
+                <thead>
+                  <tr class="text-body-secondary">
+                    <th>On</th><th>Provider</th><th>Endpoint</th><th>Models</th>
+                    <th class="text-center">Key</th>
+                    <th class="text-end">Pref</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="p in providers.providers" :key="p.id">
+                    <td class="small">
+                      <!-- A checkbox, not a badge with a hidden action. An
+                           operator taking a provider out of service is doing
+                           it because something is wrong, and should not have
+                           to find that out from a CLI. -->
+                      <input class="form-check-input me-2" type="checkbox" autocomplete="off"
+                             :checked="p.enabled" :disabled="busy"
+                             :title="p.enabled
+                               ? 'Requests can go here. Untick to take it out of service.'
+                               : 'No request routes here. Tick to put it back.'"
+                             @change="setProviderEnabled(p, $event.target.checked)" />
+                      {{ p.id }}
+                      <!-- Peak is the provider's own schedule, so it is shown
+                           per provider and changes with the clock. -->
+                      <div v-if="p.peak && p.peak_now" class="text-warning" style="font-size:.75rem">
+                        peak pricing now (×{{ p.peak.multiplier_percent / 100 }}){{ peakUntil(p) }}
+                      </div>
+                    </td>
+                    <td class="small font-monospace text-truncate" style="max-width: 20rem">{{ p.base_url }}</td>
+                    <td class="small">
+                      <div v-for="m in p.models" :key="m.id" :class="m.deprecated ? 'text-body-secondary text-decoration-line-through' : ''"
+                           :title="m.note || ''">
+                        {{ m.id }}
+                        <span class="text-body-secondary">· {{ m.class }} · {{ m.cost_now }}</span>
+                        <span class="text-body-secondary ms-1" v-if="priceLabel(m)" :title="'Cache hit, input, output — per 1M tokens, off peak. Peak hours multiply all three.'">{{ priceLabel(m) }}</span>
+                      </div>
+                    </td>
+                    <td class="text-center small">
+                      <!-- What "key" even means depends on the auth kind, so
+                           the column says which kind it is rather than
+                           flattening three things into one word. -->
+                      <span v-if="p.auth === 'claude_oauth'" class="text-body-secondary"
+                            title="The proxy host's own Claude login, refreshed by the egress.">login</span>
+                      <span v-else-if="p.auth === 'api_key_env'" class="text-body-secondary"
+                            title="Read from the service's environment at request time.">env var</span>
+                      <span v-else-if="p.ready" class="text-success">set</span>
+                      <span v-else class="text-danger">missing</span>
+                    </td>
+                    <td class="text-end small">{{ p.preference }}</td>
+                    <td class="text-end text-nowrap">
+                      <!-- Disabled, not hidden: a missing button reads as a
+                           page that has not loaded. The title says what to do
+                           instead, and the server refuses the same request —
+                           a disabled control is a hint, not a control. -->
+                      <button class="btn btn-sm btn-outline-secondary me-1"
+                              :disabled="p.auth !== 'api_key_file'"
+                              :title="p.auth === 'claude_oauth'
+                                ? 'Uses the proxy host\'s own Claude login. Re-import it with: tab-atelier-proxy import-credentials'
+                                : p.auth === 'api_key_env'
+                                  ? 'Read from the service environment — set the variable there and restart.'
+                                  : 'Set or rotate this provider\'s API key.'"
+                              @click="setKey(p)">Key</button>
+                      <button class="btn btn-sm btn-outline-danger" @click="removeProvider(p)">Remove</button>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+
+              <div class="small text-body-secondary mb-1">Add</div>
+              <div class="d-flex flex-wrap gap-2">
+                <button v-for="pr in providers.presets" :key="pr.id" class="btn btn-sm btn-outline-primary"
+                        @click="addPreset(pr)">
+                  {{ pr.configured ? 'Add another ' + pr.label : pr.label }}
+                  <span class="text-body-secondary fw-normal" style="font-size:.75rem">{{ pr.base_url }}</span>
+                </button>
+                <span class="small text-body-secondary align-self-center">
+                  A preset comes with its models and prices; paste the key after adding.
+                  Adding the same preset twice makes two separate entries, each with its own key —
+                  pin one account to each to split traffic.
+                </span>
+              </div>
+
+              <!-- Mappings: one global table, applied before routing. -->
+              <hr class="my-4" />
+              <h3 class="h6">Model mapping</h3>
+              <p class="small text-body-secondary">
+                When someone asks for the name on the left, use the one on the right.
+                It reaches across providers (<code>claude-opus-5 → deepseek-flash</code>) and
+                within one (<code>claude-opus-5 → claude-sonnet-5</code>, a deliberate downgrade).
+                A mapping names a model, not a lock: if the destination is unreachable, normal
+                routing still applies.
+              </p>
+              <table v-if="providers.mappings.length" class="table table-sm align-middle">
+                <tbody>
+                  <tr v-for="m in providers.mappings" :key="m.from">
+                    <td class="small font-monospace">{{ m.from }}</td>
+                    <td class="text-body-secondary">→</td>
+                    <td class="small font-monospace">{{ m.to }}</td>
+                    <td class="small text-body-secondary">{{ m.note || '' }}</td>
+                    <td class="text-end">
+                      <button class="btn btn-sm btn-outline-danger" @click="removeMapping(m)">Remove</button>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+              <form class="row g-2 align-items-end" @submit.prevent="addMapping">
+                <div class="col-sm-4">
+                  <label class="form-label small mb-1" for="ta-mapping-from">Asked for</label>
+                  <select id="ta-mapping-from" v-model="newMapping.from" class="form-select form-select-sm font-monospace"
+                          required :disabled="!mappingModelChoices.length">
+                    <option value="" disabled>{{ mappingModelChoices.length ? 'Select a model' : 'No models available' }}</option>
+                    <option v-for="model in mappingModelChoices" :key="`from-${model}`" :value="model">{{ model }}</option>
+                  </select>
+                </div>
+                <div class="col-sm-4">
+                  <label class="form-label small mb-1" for="ta-mapping-to">Use instead</label>
+                  <select id="ta-mapping-to" v-model="newMapping.to" class="form-select form-select-sm font-monospace"
+                          required :disabled="!mappingModelChoices.length">
+                    <option value="" disabled>{{ mappingModelChoices.length ? 'Select a model' : 'No models available' }}</option>
+                    <option v-for="model in mappingModelChoices" :key="`to-${model}`" :value="model">{{ model }}</option>
+                  </select>
+                </div>
+                <div class="col-sm-2">
+                  <label class="form-label small mb-1">Note</label>
+                  <input v-model="newMapping.note" class="form-control form-control-sm" autocomplete="off" />
+                </div>
+                <div class="col-sm-2">
+                  <button class="btn btn-sm btn-primary w-100">Map</button>
+                </div>
+              </form>
+            </div>
+            <div v-else class="small text-body-secondary mt-3">
+              Loading…
+            </div>
+          </div>
+        </div>
+
+        <!-- Inspection ------------------------------------------------->
+        <div class="card shadow-sm mb-4">
+          <div class="card-body">
+            <div class="d-flex align-items-start">
+              <div class="flex-grow-1">
+                <h2 class="h6 card-title mb-1">Inspect requests</h2>
+                <p class="small text-body-secondary mb-0">
+                  Records the JSON actually sent to Anthropic — after routing rewrites the model and
+                  the beta flags are merged. Captures contain <strong>prompts</strong>. Credentials
+                  are stripped; the rest is not. Recording stops by itself.
+                </p>
+              </div>
+              <div class="text-end ms-3">
+                <busy-button v-if="!inspect" :busy="inspectBusy" label="Open"
+                             busy-label="Opening…" @click="loadInspect"></busy-button>
+                <template v-else>
+                  <!-- Armed state is stated in words, not by a coloured dot:
+                       "is it still recording" is the question this panel has to
+                       answer at a glance. -->
+                  <div v-if="inspect.armed" class="small text-warning fw-semibold mb-1">
+                    recording · stops {{ untilLocal(inspect.armed_until * 1000) }}
+                  </div>
+                  <div v-else class="small text-body-secondary mb-1">not recording</div>
+                  <!-- A capture lands when the call FINISHES, so this panel
+                       is always one request behind. Without a refresh the
+                       thing you just did is the one thing not shown. -->
+                  <busy-button class="me-1" :busy="inspectBusy" label="Refresh"
+                               busy-label="Loading…" @click="loadInspect"></busy-button>
+                  <button class="btn btn-sm btn-outline-primary me-1" @click="armInspect">
+                    {{ inspect.armed ? 'Extend' : 'Record' }}
+                  </button>
+                  <!-- "Stop" only means something while it is recording;
+                       with nothing armed this is a plain delete of what was
+                       kept. -->
+                  <button class="btn btn-sm btn-outline-danger" :disabled="!inspect.armed && !inspect.captures.length"
+                          @click="stopInspect">
+                    {{ inspect.armed ? 'Stop & delete' : 'Delete' }}
+                  </button>
+                </template>
+              </div>
+            </div>
+
+            <div v-if="inspect && inspect.captures.length" class="table-responsive mt-3">
+              <!-- Striped: six columns of small monospace, read down a column
+                   to compare one call against the next. The banding is what
+                   keeps the eye on a row across that width. -->
+              <table class="table table-sm table-striped align-middle mb-0">
+                <thead>
+                  <tr class="text-body-secondary">
+                    <th>When</th><th>Who</th><th>Model</th><th class="text-end">Tokens</th>
+                    <th>Compaction</th>
+                    <th class="text-end">Status</th><th></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="(c, i) in inspect.captures.slice().reverse()" :key="'cap'+i">
+                    <td class="small text-nowrap">{{ whenLocal(c.ts) }}</td>
+                    <td class="small">{{ c.account_email }}</td>
+                    <td class="small">
+                      <span v-if="c.kind === 'classifier'"
+                            class="badge text-bg-secondary me-1"
+                            title="Claude Code's auto-mode permission classifier — a separate call per gated action, not part of the conversation">auto-mode</span>
+                      <span v-if="c.server_tool"
+                            class="badge text-bg-info me-1"
+                            :title="'The model asked for a server-side ' + serverToolLabel(c) + ', and this is the call that runs it. Not a turn you or the model spent on the conversation.'">{{ serverToolLabel(c) }}</span>
+                      <span class="font-monospace">{{ c.model || '—' }}</span>
+                    </td>
+                    <td class="small text-end text-nowrap">{{ tokenSummary(c) }}</td>
+                    <!-- Blank when no level was in force: "off" and "on but
+                         saved nothing" are different states, and the detail
+                         title distinguishes them. -->
+                    <td class="small text-nowrap" :title="compactionDetail(c)">
+                      <span v-if="c.compaction" class="text-body-secondary">
+                        −{{ Math.round((1 - c.compaction.bytes_after / c.compaction.bytes_before) * 100) }}%
+                        <span class="text-body-secondary" style="font-size:.75rem">{{ c.compaction.level }}</span>
+                      </span>
+                    </td>
+                    <td class="small text-end" :class="c.status && c.status >= 400 ? 'text-danger' : ''">
+                      {{ c.status || '—' }}
+                    </td>
+                    <td class="text-end">
+                      <button class="btn btn-sm btn-outline-secondary" @click="inspectOpen = c">JSON</button>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <div v-else-if="inspect" class="small text-body-secondary mt-3">
+              Nothing captured. Press <em>Record</em>, then make a request through the proxy.
+            </div>
+
+            <!-- The body itself, expanded in place rather than in a modal: it
+                 is the thing being read, so it gets the width. -->
+            <div v-if="inspectOpen" class="mt-3 border rounded p-3">
+              <div class="d-flex align-items-start mb-2">
+                <div class="flex-grow-1 small">
+                  <div class="fw-semibold">
+                    {{ inspectOpen.method }} {{ inspectOpen.path }}
+                    <span v-if="inspectOpen.kind === 'classifier'"
+                          class="badge text-bg-secondary ms-1">auto-mode classifier</span>
+                  </div>
+                  <div class="text-body-secondary">
+                    <!-- Said out loud here, where the request can be read: one
+                         of these is emitted per gated action and its input is
+                         the whole transcript, so a row is not the same unit of
+                         work as a conversation turn. -->
+                    <div v-if="inspectOpen.kind === 'classifier'">
+                      The auto-mode permission classifier, not the conversation. Claude Code
+                      makes one of these per gated action; the transcript is embedded in its
+                      single user turn and its reply is a parsed verdict.
+                    </div>
+                    {{ whenLocal(inspectOpen.ts) }} · {{ inspectOpen.account_email }} ·
+                    via {{ inspectOpen.provider }}
+                    <span v-if="inspectOpen.status"> · HTTP {{ inspectOpen.status }}</span>
+                    <span v-if="inspectOpen.tokens"> · {{ tokenSummary(inspectOpen) }}</span>
+                    <div v-if="inspectOpen.server_tool" class="text-body-secondary">
+                      this call is a server-side
+                      <code>{{ serverToolLabel(inspectOpen) }}</code> —
+                      the conversation asked for a search and Claude Code made
+                      this call to run it, so its tokens are the search's, not a turn's.
+                    </div>
+                    <div v-if="inspectOpen.compaction" class="text-body-secondary">
+                      {{ compactionSummary(inspectOpen) }} — {{ compactionDetail(inspectOpen) }}
+                    </div>
+                    <!-- Unauthenticated, and labelled as such where it is read:
+                         a valid key can put any string here, so this explains
+                         and groups, and never decides anything. -->
+                    <div v-if="inspectOpen.client" class="text-body-secondary">
+                      session <code>{{ shortHash(inspectOpen.client.session_id) }}</code>
+                      <span v-if="inspectOpen.client.device_id">
+                        · device <code>{{ shortHash(inspectOpen.client.device_id) }}</code>
+                      </span>
+                      <span v-if="inspectOpen.client.account_uuid">
+                        · client account <code>{{ shortHash(inspectOpen.client.account_uuid) }}</code>
+                      </span>
+                    </div>
+                    <!-- What arrived, beside what it resolved to. This is the
+                         row that answers "which IP is it really using": the
+                         peer, the headers as received, and the result, so a
+                         header the proxy ignored is visible as ignored. -->
+                    <div v-if="inspectOpen.origin" class="text-body-secondary">
+                      from <code>{{ inspectOpen.origin.client_ip }}</code>
+                      <span v-if="inspectOpen.origin.client_ip !== inspectOpen.origin.peer">
+                        (socket peer <code>{{ inspectOpen.origin.peer }}</code>)</span>
+                      <span v-if="inspectOpen.origin.x_real_ip">
+                        · X-Real-IP <code>{{ inspectOpen.origin.x_real_ip }}</code></span>
+                      <span v-if="inspectOpen.origin.x_forwarded_for">
+                        · XFF <code>{{ inspectOpen.origin.x_forwarded_for }}</code></span>
+                      <span v-if="!inspectOpen.origin.peer_trusted"
+                            class="badge text-bg-warning ms-1"
+                            title="The socket peer is not a trusted hop, so forwarding headers from it were ignored.">
+                        untrusted hop — headers ignored
+                      </span>
+                    </div>
+                  </div>
+                </div>
+                <button class="btn btn-sm btn-outline-secondary ms-2" @click="copy(inspectOpen.request_body)">
+                  {{ copied ? 'Copied' : 'Copy JSON' }}
+                </button>
+                <button class="btn-close ms-2" aria-label="Close" @click="inspectOpen = null"></button>
+              </div>
+              <!-- Only reachable for a request larger than the 4 MB cap, which
+                   no ordinary call comes near. Said plainly, because a clipped
+                   body is not JSON and the next thing anyone does is paste it
+                   into a parser. -->
+              <div v-if="inspectOpen.request_truncated" class="alert alert-warning py-1 px-2 small">
+                Larger than the 4 MB capture cap, so this is the head and tail
+                joined. Already the body sent upstream is idle for inspection; a
+                capture this large means the request really is that big.
+              </div>
+              <div class="small text-body-secondary mb-1">Headers</div>
+              <!-- Two columns rather than one joined blob: these are name and
+                   value pairs, and aligned columns are what let an operator
+                   scan for the single header they came to check. Values wrap
+                   instead of scrolling, so a long token cannot push the table
+                   sideways and hide the names. -->
+              <table class="table table-sm small mb-2">
+                <tbody>
+                  <tr v-for="h in inspectOpen.request_headers" :key="h[0]">
+                    <th class="text-body-secondary fw-normal text-nowrap align-top" style="width: 1%">{{ h[0] }}</th>
+                    <td class="font-monospace text-break align-top">{{ h[1] }}</td>
+                  </tr>
+                </tbody>
+              </table>
+              <div class="d-flex justify-content-between align-items-center mb-1">
+                <div class="small text-body-secondary">Body</div>
+                <!-- Copies the pretty form — the same string the viewer cuts
+                     into coloured runs below, so what lands on the clipboard is
+                     what is on screen. -->
+                <button class="btn btn-sm btn-outline-secondary" @click="copy(prettyJson(inspectOpen.request_body))">
+                  {{ copied ? 'Copied' : 'Copy JSON' }}
+                </button>
+              </div>
+              <!-- Runs, interpolated, never `v-html`. The body is written by
+                   whoever holds an API key, and this viewer is where a
+                   prompt-injection payload would be on display; interpolation
+                   escapes it, `v-html` would execute a `<img onerror=…>`
+                   sitting in a system prompt. -->
+              <pre class="small bg-body-tertiary p-2 rounded mb-0" style="max-height: 30rem; overflow:auto"><span v-for="t in jsonTokens(inspectOpen.request_body)" :class="t.cls">{{ t.text }}</span></pre>
+
+              <!-- The other half of the call. Captured apart from the request
+                   because they fail to different places: a 400 says the request
+                   was rejected, an empty reply says the model answered with
+                   nothing, and only this side distinguishes them. -->
+              <template v-if="inspectOpen.response_excerpt">
+                <div class="d-flex justify-content-between align-items-center mb-1 mt-3">
+                  <div class="small text-body-secondary">
+                    Reply
+                    <span v-if="inspectOpen.response_truncated" class="badge text-bg-warning ms-1"
+                          title="Only the head of the reply was kept.">truncated</span>
+                  </div>
+                  <button class="btn btn-sm btn-outline-secondary" @click="copy(inspectOpen.response_excerpt)">
+                    {{ copied ? 'Copied' : 'Copy' }}
+                  </button>
+                </div>
+                <!-- Verbatim, not run through the JSON tokenizer: an SSE reply
+                     is not one JSON document, and half a stream would render as
+                     a parse error rather than as the events it is. -->
+                <pre class="small bg-body-tertiary p-2 rounded mb-0" style="max-height: 30rem; overflow:auto">{{ inspectOpen.response_excerpt }}</pre>
+              </template>
+            </div>
+          </div>
+        </div>
+
+        <div class="card shadow-sm mb-4">
+          <div class="card-body">
+            <h2 class="h6 card-title">Add someone</h2>
+            <form autocomplete="off" class="row g-2 align-items-end" @submit.prevent="add">
+              <div class="col-sm-3">
+                <label class="form-label small mb-1">First name</label>
+                <input autocomplete="off" v-model="form.first_name" class="form-control form-control-sm" required />
+              </div>
+              <div class="col-sm-3">
+                <label class="form-label small mb-1">Last name</label>
+                <input autocomplete="off" v-model="form.last_name" class="form-control form-control-sm" required />
+              </div>
+              <div class="col-sm-4">
+                <label class="form-label small mb-1">Email</label>
+                <input autocomplete="off" v-model="form.email" type="email" class="form-control form-control-sm" required />
+              </div>
+              <div class="col-sm-2">
+                <button class="btn btn-sm btn-primary w-100" :disabled="busy">Add</button>
+              </div>
+            </form>
+          </div>
+        </div>
+
+        <div class="card shadow-sm">
+          <table class="table table-hover align-middle mb-0">
+            <thead>
+              <tr class="small text-body-secondary">
+                <th>Name</th>
+                <th>Email</th>
+                <th>Status</th>
+                <th class="text-center">Priority</th>
+                <th>Keys · last used</th>
+                <th class="text-end">Tokens (7 d) · calls · avg/call</th>
+                <th>Routed to</th>
+                <th>Model</th>
+                <th>Compaction</th>
+                <th class="text-end">Key</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="u in users" :key="u.id" :class="{ 'opacity-50': u.disabled }">
+                <td>{{ u.first_name }} {{ u.last_name }}</td>
+                <td class="font-monospace small">{{ u.email }}</td>
+                <td>
+                  <span v-if="u.disabled" class="badge text-bg-secondary">disabled</span>
+                  <span v-else-if="!u.has_key" class="badge text-bg-warning">no key</span>
+                  <span v-else class="badge text-bg-success">active</span>
+                </td>
+                <td class="text-center">
+                  <select autocomplete="off"
+                    class="form-select form-select-sm mx-auto"
+                    style="width: 7.5rem"
+                    :value="u.weight"
+                    @change="setWeight(u, $event.target.value)"
+                    :disabled="busy"
+                  >
+                    <option v-for="t in tiersFor(u)" :key="t.weight" :value="t.weight">{{ t.label }}</option>
+                  </select>
+                  <!-- The number means nothing on its own; the share it works
+                       out to is the thing being decided. -->
+                  <div class="text-body-secondary" style="font-size:.75rem">
+                    {{ shareOf(u) }}
+                  </div>
+                </td>
+                <td class="small text-body-secondary" style="min-width: 18rem">
+                  <!-- One row per key. The dates and the address belong to the
+                       KEY: "last used from here" says nothing when three keys
+                       share an account. -->
+                  <div v-for="k in (u.keys || [])" :key="k.id" class="mb-2">
+                    <div class="d-flex align-items-baseline gap-2">
+                      <span class="font-monospace" :class="k.disabled ? 'text-decoration-line-through' : ''">
+                        {{ k.name }}
+                      </span>
+                      <span v-if="!k.first_used_at" class="fst-italic">never used</span>
+                      <span v-else>
+                        {{ ago(k.last_used_at) }}
+                        <span v-if="k.last_used_ip" class="font-monospace">· {{ k.last_used_ip }}</span>
+                      </span>
+                      <span class="ms-auto text-nowrap">
+                        <a href="#" @click.prevent="toggleKey(u, k)" class="text-decoration-none">
+                          {{ k.disabled ? 'enable' : 'disable' }}
+                        </a>
+                        <a href="#" @click.prevent="removeKey(u, k)" class="text-danger text-decoration-none ms-2">
+                          delete
+                        </a>
+                      </span>
+                    </div>
+                    <!-- The tabs this key has been used from, newest first. A
+                         session id identifies one Claude Code tab; the device id
+                         is the machine it runs on, so several sessions sharing a
+                         device is one machine with several tabs open. Opaque to
+                         us and shown truncated here — the full values are in the
+                         tooltip, because matching one against a Claude Code log
+                         or the inspect panel needs the whole thing. -->
+                    <div v-for="s in keySessions(k)"
+                      :key="s.session_id"
+                      class="ms-3 font-monospace text-body-secondary"
+                      style="font-size:.72rem"
+                      :title="sessionTitle(s)"
+                    >
+                      {{ sessionLabel(s) }}
+                    </div>
+                  </div>
+                  <div v-if="!(u.keys || []).length" class="fst-italic">no keys</div>
+                  <!-- Every tab this person has, across all their keys. Only
+                       shown when it adds something: with a single key it would
+                       be the list just above, repeated. -->
+                  <div v-if="(u.keys || []).length > 1" class="mt-2 pt-1 border-top">
+                    <div class="text-body-secondary" style="font-size:.7rem">all tabs</div>
+                    <div v-for="s in userSessions(u)"
+                      :key="'u' + s.session_id"
+                      class="ms-3 font-monospace text-body-secondary"
+                      style="font-size:.72rem"
+                      :title="sessionTitle(s)"
+                    >
+                      {{ sessionLabel(s) }}
+                    </div>
+                  </div>
+                  <a href="#" @click.prevent="addKey(u)" class="text-decoration-none" style="font-size:.75rem">
+                    + add a key
+                  </a>
+                </td>
+                <td class="text-end small">
+                  <a href="#" @click.prevent="focus = u.id" class="text-decoration-none">
+                    {{ fmt(usageOf(u.id).last_7d.tokens.total) }}
+                  </a>
+                  <div class="text-body-secondary" style="font-size:.75rem">
+                    {{ usageOf(u.id).last_7d.calls }} calls
+                  </div>
+                  <!-- The per-call average is the comparable number: a total
+                       says who was busy, this says who is expensive per turn,
+                       which is what distinguishes a heavy user from one
+                       dragging a huge context through every request. -->
+                  <div class="text-body-secondary" style="font-size:.75rem"
+                       :title="'Mean tokens per call over 7 days — input + output + cache'">
+                    {{ avgPerCall(u.id) }}
+                  </div>
+                </td>
+                <td class="small">
+                  <!-- Where this person's work is allowed to go. Blank means
+                       normal routing — the proxy picks. A value here is
+                       enforced, not preferred: an account pinned to a provider
+                       that is out of capacity gets a 503 rather than a quiet
+                       fall back to whatever the operator was keeping it off. -->
+                  <select class="form-select form-select-sm" autocomplete="off"
+                          :value="u.provider || ''"
+                          @change="setUserProvider(u, $event.target.value)">
+                    <option value="">any provider</option>
+                    <option v-for="p in (providers ? providers.providers : [])" :key="p.id" :value="p.id">
+                      {{ p.id }}
+                    </option>
+                  </select>
+                </td>
+                <td class="small">
+                  <!-- The model pin, which is what actually decides the hop:
+                       a model id resolves to the provider serving it, so this
+                       outranks the provider select to its left. Blank means the
+                       caller's own model is honoured.
+
+                       On the OpenAI wire a model cannot take tools and
+                       reasoning at once — a request with function tools must
+                       force reasoning off — so the list carries two entries per
+                       such model. The value is `model#flavour`. The flavour is
+                       not stored separately — it IS the tool mode, since on
+                       this wire whether tools may ride along is exactly
+                       whether reasoning is on. So each choice has to move the
+                       mode: "reasoning" sets `none`, and "tools" has to clear
+                       that `none` back to `all`, or the select would snap back
+                       to the label it was already showing. Both directions are
+                       in setUserModel.
+                       See modelChoices and setUserModel. -->
+                  <select class="form-select form-select-sm" autocomplete="off"
+                          style="min-width: 15rem"
+                          :value="userModelValue(u)"
+                          :disabled="busy"
+                          @change="setUserModel(u, $event.target.value)">
+                    <option value="">caller's model</option>
+                    <option v-for="m in modelChoices" :key="m.value" :value="m.value">
+                      {{ m.label }}
+                    </option>
+                  </select>
+                </td>
+                <td>
+                  <!-- Per PERSON, not per provider. The operator reasoning
+                       about compaction is looking at a person ("this account
+                       is dragging a context it stopped needing"), and routing
+                       picks the hop per request — so a level filed under a
+                       provider silently means something else the moment that
+                       provider stops being where the traffic goes.
+
+                       The hop still gets a say: compacting through the
+                       subscription invalidates the cache breakpoints that are
+                       the only reason it is affordable. That refusal lives on
+                       the provider and is raised by the server against every
+                       destination this account could actually reach, so it is
+                       reported here rather than pre-computed into an option
+                       list that would have to guess which hop is live. -->
+                  <select autocomplete="off"
+                    class="form-select form-select-sm"
+                    style="min-width: 13rem"
+                    :value="u.compact"
+                    @change="setUserCompact(u, $event.target.value)"
+                    :disabled="busy">
+                    <option v-for="c in (providers ? providers.compact_levels : [])"
+                            :key="c.value" :value="c.value">{{ c.label }}</option>
+                  </select>
+                </td>
+                <td class="text-end">
+                  <!-- gap-2 rather than bare adjacency: three destructive-ish
+                       actions touching each other is how the wrong one gets
+                       clicked. flex-wrap so they stack instead of overflowing
+                       the cell on a narrow window. -->
+                  <div class="d-inline-flex flex-wrap gap-2 justify-content-end">
+                    <button class="btn btn-sm btn-outline-secondary" @click="editTools(u)" :disabled="busy">
+                      Tools<span v-if="toolsBadge(u) !== 'default'"
+                                 class="badge text-bg-secondary ms-1">{{ toolsBadge(u) }}</span>
+                    </button>
+                    <button
+                      class="btn btn-sm btn-outline-secondary"
+                      @click="setDisabled(u, !u.disabled)"
+                      :disabled="busy"
+                    >
+                      {{ u.disabled ? 'Enable' : 'Disable' }}
+                    </button>
+                    <button class="btn btn-sm btn-outline-danger" @click="remove(u)" :disabled="busy">
+                      Delete
+                    </button>
+                  </div>
+                </td>
+              </tr>
+              <tr v-if="!users.length">
+                <td colspan="5" class="text-center text-body-secondary py-4">
+                  No accounts yet.
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="card shadow-sm mt-4">
+          <div class="card-body">
+            <h2 class="h6 card-title">Give an agent its own usage</h2>
+            <p class="small text-body-secondary mb-2">
+              This route reports the statistics of whoever's key calls it — hand it to an
+              agent along with that person's key and it answers for them, and only them.
+              No account id to pass, and nothing to see about anybody else.
+            </p>
+            <div class="input-group input-group-sm mb-2">
+              <input autocomplete="off" class="form-control font-monospace" :value="meUrl" readonly />
+              <button class="btn btn-outline-secondary" @click="copy(meUrl)">
+                {{ copied ? 'Copied' : 'Copy' }}
+              </button>
+            </div>
+            <pre class="small text-body-secondary mb-0">curl -H "x-api-key: $ANTHROPIC_API_KEY" {{ meUrl }}</pre>
+          </div>
+        </div>
+
+        <p class="text-body-secondary small mt-3">
+          A key opens the Anthropic path and its own usage, and nothing else — it cannot
+          reach this page. Disabling keeps the account and its history; deleting forgets both.
+        </p>
+        <p class="text-body-secondary small">
+          <strong>Priority</strong> only decides who waits when the plan is busy. With
+          capacity to spare everyone is served regardless, so raising someone costs the
+          others nothing until it is actually contended — and an idle account's share goes
+          to whoever is working, never unused. Everyone is Normal unless changed; raising
+          one person is how you lower the rest.
+        </p>
+
+        <!-- The tool policy editor. A modal rather than a row of inline
+             controls: the refusals are about the COMBINATION of fields (a name
+             in both disable and allow, a definition with no name), so the set
+             has to be saveable in one go — and a row that only commits on blur
+             is a row that commits half-finished policies as you tab through. -->
+        <div v-if="tools" class="ta-modal-backdrop" @click.self="tools = null">
+          <div class="card shadow ta-modal">
+            <div class="card-body">
+              <h2 class="h5 card-title mb-1">Tools for {{ tools.id }}</h2>
+              <p class="small text-body-secondary">
+                What this account's requests are allowed to carry. Applied to the
+                <strong>tools</strong> array on the way upstream — the request is otherwise
+                untouched, and an account left on <em>every tool</em> is not rewritten at all.
+              </p>
+
+              <label class="form-label small fw-semibold" for="ta-tools-mode">Mode</label>
+              <select id="ta-tools-mode" class="form-select form-select-sm mb-1" v-model="tools.mode">
+                <option value="all">Every tool — send the client's array as it stands</option>
+                <option value="referenced">Every tool — legacy alias of the above</option>
+                <option value="allow">Only the names listed below</option>
+                <option value="none">Only the names listed below — legacy alias of the above</option>
+              </select>
+              <p class="small text-body-secondary mb-3">
+                <strong>Only the names listed below</strong> keeps exactly those, plus every
+                tool the conversation already references. The second half is not a preference:
+                a <code>tool_use</code> naming a tool with no definition is rejected outright,
+                which would fail the turn rather than shrink it. Both are answered from the
+                whole transcript, never from a window — a tool that comes and goes as history
+                slides re-bills the entire prompt cache on the turn it returns.
+              </p>
+
+              <label class="form-label small fw-semibold" for="ta-tools-allow">Allowed names</label>
+              <textarea id="ta-tools-allow" rows="2" class="form-control form-control-sm font-monospace mb-1"
+                        v-model="tools.allow"
+                        :disabled="tools.mode !== 'allow' && tools.mode !== 'none'"
+                        placeholder="Read, Glob, Grep"></textarea>
+              <p class="small text-body-secondary mb-3">
+                Used by the <strong>allow</strong> and <strong>none</strong> modes above.
+                Ignored by the two that send everything.
+              </p>
+
+              <label class="form-label small fw-semibold" for="ta-tools-disable">Never send</label>
+              <textarea id="ta-tools-disable" rows="2" class="form-control form-control-sm font-monospace mb-1"
+                        v-model="tools.disable"
+                        placeholder="WebFetch"></textarea>
+              <p class="small text-body-secondary mb-3">
+                Removed whatever else says otherwise — except from a conversation already
+                using them, which falls back to the rule above.
+              </p>
+
+              <label class="form-label small fw-semibold" for="ta-tools-add">Add definitions</label>
+              <textarea id="ta-tools-add" rows="5" class="form-control form-control-sm font-monospace mb-1"
+                        v-model="tools.add"
+                        placeholder='[{"name": "deploy", "description": "…", "input_schema": {"type": "object"}}]'></textarea>
+              <p class="small text-body-secondary mb-3">
+                A JSON array, in the API's own tool shape. To <em>override</em> a tool the
+                client already sends, add your definition here and put its name in
+                <strong>never send</strong> — the client's copy is dropped and yours is
+                substituted. A definition with no name, or one that collides with a built-in
+                the proxy must keep, is refused rather than guessed at.
+              </p>
+
+              <label class="form-label small fw-semibold" for="ta-tools-rewrite">Rewrite descriptions</label>
+              <textarea id="ta-tools-rewrite" rows="4" class="form-control form-control-sm font-monospace mb-1"
+                        v-model="tools.rewrite"
+                        placeholder="WebSearch dates&#10;Bash curl -> fetch"></textarea>
+              <p class="small text-body-secondary mb-0">
+                One rule per line: a tool name, then <code>dates</code>, <code>provider</code>,
+                or a <code>find -&gt; replace</code> pair. Rewrites touch the description only —
+                a tool is never added or removed here. <code>dates</code> drops the sentences that
+                pin a current date; <code>provider</code> prunes the ones naming a rival's
+                product. Lines starting with <code>#</code> are ignored, and a line that is not
+                one of the three forms is refused rather than dropped.
+              </p>
+
+              <div class="d-flex gap-2 justify-content-end">
+                <button class="btn btn-sm btn-outline-secondary" @click="tools = null" :disabled="busy">
+                  Cancel
+                </button>
+                <button class="btn btn-sm btn-primary" @click="saveTools()" :disabled="busy">
+                  Save
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <script src="vendor/vue.global.prod.js"></script>
+    <script src="api.js"></script>
+    <script src="charts.js"></script>
+    <script src="app.js"></script>
+  </body>
+</html>

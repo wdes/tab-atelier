@@ -1,0 +1,407 @@
+<!-- SPDX-License-Identifier: MPL-2.0 -->
+
+# Proxy-side tool policy
+
+The proxy already rewrites `model` and can compact `messages[]`. `tools[]` is
+the third part of the request and the one nobody reads. In a measured Claude
+Code request it is **56,905 B — 19 % of a 306 KB body** — and **4,361 B of it
+was ever called**.
+
+This is the same chokepoint, the same per-account config, and the same
+`serde_json::Value` the routing decision already paid to parse. What is
+different is the failure mode. A compaction bug makes a turn expensive. A tool
+policy bug makes a turn **fail**, on one provider and not the other, which is
+the worst shape a proxy defect can take.
+
+It is also the one pass that can *introduce* a `tools[]` where there was none:
+the referenced union on a body with no `tools` key resolves to `ALWAYS_KEPT`
+alone. So the first requirement below is not an optimisation.
+
+## Two families of tool
+
+A Claude Code request carries two kinds of tool, and they are not distinguished
+anywhere in the schema. The work tools let the model act on the code:
+
+| | |
+|---|---|
+| `Bash` `Read` `Edit` `Write` `NotebookEdit` `WebSearch` | 6 tools, **8,426 B** |
+
+The harness tools let the model drive Claude Code itself — they exist because
+of how the client is built, not because of what the user is doing:
+
+| | |
+|---|---|
+| `Agent` `ListAgents` `SendMessage` `Workflow` `EnterPlanMode` `ExitPlanMode` `EnterWorktree` `ExitWorktree` `TaskStop` `TaskOutput` `ScheduleWakeup` `CronCreate` `CronList` `CronDelete` `AskUserQuestion` `ReportFindings` `Skill` | 17 tools, **48,479 B** |
+
+**85 % of the tool payload describes the harness, not the work.** The giveaway
+is the ratio of prose to schema — a work tool describes a capability and needs
+parameters to say how; a harness tool describes a protocol the model is already
+inside:
+
+| tool | description | schema | ratio |
+|---|---|---|---|
+| `EnterPlanMode` | 4,011 B | 119 B | **34:1** |
+| `EnterWorktree` | 3,220 B | 687 B | 4.7:1 |
+| `CronCreate` | 2,924 B | 958 B | 3:1 |
+| `SendMessage` | 3,386 B | 1,291 B | 2.6:1 |
+| `Bash` | 2,725 B | 1,038 B | 2.6:1 |
+| `NotebookEdit` | 623 B | 943 B | 0.66:1 |
+
+`EnterPlanMode` is four kilobytes of prose wrapped around one parameter. That
+ratio is computable per request, so "is this a system tool" does not need a
+hand-maintained list that goes stale every time the client ships — which it
+does often: `Workflow`, `ScheduleWakeup` and `EnterWorktree` are all recent
+arrivals, and each is ~3 KB.
+
+In the measured session **21 of 23 tools were never called**; the history is
+32 × `Bash` and 11 × `Read`. Even among the work tools, four of six were dead.
+
+## `tools[]` is ahead of every breakpoint
+
+The client's own `cache_control` markers, in render order:
+
+```
+tools       0 breakpoints
+system[1]   breakpoint      "You are Claude Code, Anthropic's official CLI for Claude."
+system[2]   breakpoint      the injected environment blob — cwd, git status, date
+messages[76] breakpoint     the last message, so the whole history is inside it
+```
+
+There is no breakpoint in `tools[]`, so **every tool sits ahead of all of
+them.** One byte changed in a tool description invalidates the entire 77,507
+token prefix, where the same byte changed in the tail invalidates nothing. That
+single fact decides the cost of each verb below, and it is why a tool policy
+should be a deliberate act rather than something that happens to be on.
+
+## The three verbs
+
+| verb | safe when | buys | costs |
+|---|---|---|---|
+| **disable** | the name appears in no `tool_use` in `messages[]` | 52,544 B / 13,048 tok — **16.8 %** of the body | one cache re-warm |
+| **whitelist** | always — it is a default policy | the same, and it fails *closed* for tools that do not exist yet | the same |
+| **rewrite** | always, **including tools that are called** | prefix *stability*, and text that is true on this provider | nothing, when deterministic |
+
+`rewrite` is the only one of the three that is safe on a tool the model is
+mid-conversation with: it keeps the name and the parameter shape, so the
+`tool_use` blocks already in the history still resolve.
+
+**And the saving is smaller than the bytes suggest.** Cached input bills at
+roughly a tenth of a miss, so 16.8 % off the body is 1.68 % off a full-price
+request per turn. Measured against the one-time re-warm that editing the front
+of the prefix costs:
+
+| removed | tokens | per turn, at cache price | turns to break even |
+|---|---|---|---|
+| one tool, e.g. `NotebookEdit` (1,623 B) | ~390 | 0.05 % | **~1,700** |
+| the 21 never-called tools (52,544 B) | 13,048 | 1.68 % | **~54** |
+
+So the unit of decision is the **batch, not the tool**. Deleting one tool is
+never worth the cache it costs; deleting twenty-one pays back over the course
+of a long session and profits after it.
+
+## Whitelist, not denylist
+
+`docs/proxy.md` already argues this for forwarded headers, and the same
+sentence applies verbatim: *an allowlist rather than a denylist, because a
+denylist forgets.*
+
+Claude Code ships new harness tools constantly. Every one of them is kilobytes
+of prose about a protocol, and a denylist forwards each one by default until
+somebody notices and adds it. An allowlist does not know about them either —
+it just fails closed instead of open.
+
+**The consequence for a client's own tools.** Fail-closed applies to anything
+not in the list, including tools a *first-party* client sends. `catbus-agent`
+gained `FileTree`, and a whitelist that predates it strips it before the model
+sees it: the client puts three tools on the wire, the model is told it has two,
+and it reports the missing one as unavailable rather than erroring — so the
+symptom is an agent that guesses filenames with `Read` and never says why. When
+a client adds a tool, add it here too. `FileTree` belongs beside `Read` and
+`Write` for the no-shell agent (`--tools-config minimal`).
+
+That failure mode is worth naming precisely because it is *quiet*: nothing 4xxs,
+both providers agree, and the only evidence is the agent's behaviour. If an
+agent claims a tool is missing, check this list before the client.
+
+## The referenced union
+
+Every mode keeps the tools whose name appears in a `tool_use` block anywhere in
+`messages[]`, in addition to whatever its own rule says. On the measured body
+that is `Bash` and `Read` — 4,361 B in, 52,544 B out.
+
+This is a correctness rule first: a `tool_use` naming a tool with no definition
+is rejected by the provider, so the union is what stops a policy from failing a
+turn it was meant to shrink. Two properties make it safe as an optimisation too:
+
+- **It is monotone within a conversation.** History only grows, so a tool that
+  is referenced stays referenced. The set can never oscillate and re-warm
+  repeatedly, which is the failure a time- or size-based rule would have.
+- **The scan covers the whole transcript, never a window.** This matters more
+  than it looks, and it was wrong for a while. `tools[]` is the first key in the
+  body, so *any* edit to it discards the prompt cache for the system prompt and
+  every message behind it — see the measured table below. A bounded window makes
+  the set **slide**: a tool used 30 messages ago leaves `tools[]`, and on the
+  turn it is referenced again the whole prefix re-bills at fifty times the hit
+  rate. The union is read off the entire transcript precisely so it can only
+  grow.
+
+**A policy that keeps only the union cannot bootstrap.** A tool absent from
+`tools[]` can never be called, so it can never become referenced, so a fresh
+session would send nothing. `all` is the default for that reason, and
+`ALWAYS_KEPT` is unconditional so that even the narrowest policy keeps one way
+in.
+
+`referenced` is now an alias for `all`. It was the mode that pruned to the
+union, which only made sense while the union had a window; with the scan fixed
+there is nothing left for it to remove that the union does not already keep.
+
+## The rewrite case: WebSearch
+
+One tool in this payload is not merely large, it is **mutable**, and it is in
+the worst place for it. Its description reads:
+
+```
+Search the web. Returns result blocks with titles and URLs. US-only.
+
+- The current month is September 2026 — use this when searching for recent information.
+- `allowed_domains` / `blocked_domains` filter results.
+- After answering from results, end with a "Sources:" list of the URLs you used
+  as markdown links.
+```
+
+Three sentences, three different problems:
+
+1. **The month is a duplicate.** Claude Code already injects the live date into
+   `system[2]`, as `# currentDate / Today's date is 2026-09-10`. The model
+   loses nothing if the tool description drops it — it is the same fact, one
+   section earlier, and this copy is **ahead of every cache breakpoint while
+   that one is not.** On the first request of each month the whole prefix is
+   invalidated for every session, on every machine, to deliver information the
+   request already carries.
+2. **"US-only" becomes false on a reroute.** It describes Anthropic's search
+   backend and travels unchanged to a provider that is not Anthropic. It does
+   not break anything; it is the proxy putting provider-specific text into a
+   provider-neutral request.
+3. **The `Sources:` line is a rendering convention**, not a property of the
+   tool — the same category as `Agent` and `ListAgents` describing the harness
+   to the model running inside it.
+
+The rewrite drops the date and the provider claim and keeps the instruction:
+
+```
+Search the web. Returns result blocks with titles and URLs.
+
+- `allowed_domains` / `blocked_domains` filter results.
+- Prefer recent sources when the question is time-sensitive; put the period in
+  the query rather than assuming it.
+- After answering from results, end with a "Sources:" list of the URLs you used
+  as markdown links.
+```
+
+This is the verb worth having even where the others are not. `disable` trades
+bytes for a cache re-warm. `rewrite` makes the prefix *stop changing*, which is
+the larger prize — and on the Anthropic hop, where the cache is everything,
+taking volatility out of `tools[]` is the only one of the three that can pay.
+
+## What must never change
+
+Verified on the measured body, and the first of these is not a heuristic:
+
+- **A `tool_use` name that survives in the history must resolve in `tools[]`.**
+  43 `tool_use` blocks in the history, naming `Bash` and `Read`. Dropping either
+  from `tools[]` while keeping the history is a request the API can refuse.
+- **The scan runs against `messages[]`, never against the operator's list.**
+  The policy is a preference; the history is the fact.
+- **A body with no `tools` key is not a candidate for the pass at all.** This
+  is the classifier case, and it is the reason this policy is exempt from it:
+  a body carrying no `tools[]` is not a request that chose its tools, and
+  the referenced union would *add* them. Concretely, the auto-mode permission
+  classifier is one such body — a judge written to emit a single parsed tag,
+  which must not be handed a toolkit. See
+  [`proxy-classifier.md`](proxy-classifier.md). Hard-coding the classifier
+  check here would be the wrong shape; the rule is the missing key.
+
+### The trap: the two providers disagree
+
+Anthropic validates that a historical `tool_use` name appears in `tools[]`.
+**DeepSeek's Anthropic-compatible endpoint does not** — probed directly: a body
+with `Read` removed from `tools[]` while `Read` is called throughout the
+history answered `200` with a tool call, `stop_reason: tool_use`.
+
+That asymmetry is the danger. A scan that is too eager works perfectly on the
+second provider and returns a 400 on the subscription — a defect that appears
+only when routing moves, which is the one moment nobody is watching. The
+default is `all`, and `disable` is a decision, not a fallback.
+
+## The control
+
+Per-**account**, beside `compact`, in `users.json` — the same reasoning that put
+compaction there. The operator editing this is looking at a person; routing picks
+the hop per request, so a policy filed under a provider silently comes to mean
+something else the moment that provider stops being where the traffic goes.
+
+```json
+{
+  "id": "u_…",
+  "compact": "tools_thinking",
+  "tools": {
+    "mode": "referenced",
+    "disable": ["WebSearch"],
+    "allow": [],
+    "add": [
+      { "name": "ListAgents", "description": "…", "input_schema": { "type": "object" } }
+    ]
+  }
+}
+```
+
+`mode` is `all` (default) | `referenced` | `allow` | `none`. `allow` carries its
+own list in the same object. `disable` is checked after the mode, so it wins over
+`all` — but never over the referenced-union rule below, which is what keeps a
+disabled tool that the history already calls.
+
+`allow` is an *ordering* instruction as well as a filter: under `mode: allow` the
+survivors are emitted in the list's order, and under `mode: none` they keep the
+client's. The same list under the two modes can therefore put the same tools on
+the wire in a different order, and `tools[]` leads the body, so they are not
+interchangeable when the client's order is what the cache keys on. `none` is the
+spelling to reach for when nobody is thinking about order and the list is only
+meant to bound the surface.
+
+`add` is the override: a definition injected when the client did not send one.
+Redefining a name the client *did* send is refused per request rather than
+applied, because silently replacing the definition a session is mid-way through
+is how a working tool turns into a mysteriously broken one. Names are matched
+loosely (case-insensitively) so `Bash` and `bash` cannot both be live.
+
+**`rewrite` is the third verb.** It is a fixed, *named* normalisation of a tool's
+description rather than a free-text replacement, so that `providers.json` stays
+readable and cannot smuggle prompt injection. It is the most valuable of the
+three on the Anthropic hop, because a description that stops changing is a prefix
+that stops changing — a date restated inside a description poisons the cache for
+every request that follows it, which no amount of tool pruning fixes.
+
+The rules live under the tool name they apply to:
+
+```json
+"rewrite": { "WebSearch": ["dates"] }
+```
+
+Three normalisations are defined. `dates` drops the sentences that pin a current
+date; `provider` prunes the ones naming a rival's product, from a fixed list of
+claims this code knows how to recognise. Both are named because a rule that is
+*chosen* can be audited, and a description that merely looks normalised cannot.
+The third is `{"replaced": {"find": "...", "replace": "..."}}`, a literal
+substring swap — no regex, so there is no pattern language to get wrong, and
+`Bash curl -> fetch` is the whole of it. Replacement is global within the
+description.
+
+Rewrites touch the description only. A tool is never added, removed, or renamed
+by this verb, which is why it does not interact with the referenced-union
+safety rule at all.
+
+Two things it deliberately does not do. It does not clear the cache: a rewritten
+description still carries the client's `cache_control` marks, and that is correct,
+because the marks are still on the tools they were put on — an in-place edit moves
+no array element, so nothing has been invalidated. And it does not renumber:
+array *position* is what prefix caching is sensitive to, and rewriting a string
+does not move anything.
+
+An empty `find` is refused at validation, since it would match at every position.
+A rule whose `find` does not occur is not an error: the client is free to send a
+description this proxy has never seen, and refusing the request over a rule that
+had nothing to do would turn a cache optimisation into an outage.
+
+The write is whole-object (`POST /api/users/<id>/tools`), not field-at-a-time:
+`allow` means nothing apart from the mode that reads it, and `mode: allow` with
+no list is `none` under another name. Partial writes are the only way to leave a
+half-applied policy behind, so there are none. The body is the policy object
+itself — the same shape as the `tools` value stored in `users.json`, without the
+enclosing key. A `{"tools": …}` envelope is accepted too, so a client that
+mirrors the stored shape still works.
+
+### The two guards the field names invite you to get wrong
+
+**`mode: none` is not a tool-removal switch.** It removes what the *client*
+offers; it does not remove what `add` injects, and a body carrying no `tools[]`
+at all still gets its additions. `disable: ["Bash"]` is how you remove one tool
+by name. The two are easy to reach for interchangeably and only one of them is
+right for any given intent.
+
+**A policy for `add` with an empty `name` is refused at the API**, not silently
+stored. An empty name matches nothing and can never match anything, so a policy
+holding one is a typo that would be inert forever — the exact failure the
+`Refusal` report exists to surface, caught one layer earlier where it can still
+be reported to the person who made it.
+
+
+## The honest limits
+
+**An `add` definition is a promise the operator makes.** A name the client never
+sends is a tool the model can call and nothing can answer — the proxy does not
+execute tools, it only describes them. `add` is for restoring a tool the client
+stopped shipping, or for a tool the client's own config cannot express; it is not
+a way to give the model capabilities the harness will not perform.
+
+**A narrow policy cannot bootstrap.** A mode that keeps only the union is the
+right default for a session in progress and the wrong one at turn one, and there
+is no way to tell the two apart from a single body: a session that starts that
+way has referenced nothing, so it gets only `ToolSearch` (kept unconditionally)
+until the client sends real `tools[]`, which Claude Code does on its first turn.
+On a client that does not, a narrow policy has no way in and the union never
+starts; `add` is what makes that configuration work. This is why `all` is the
+default rather than the narrow mode.
+
+**The prefix argument is no longer inferred — it was measured, and it holds.**
+That this endpoint caches a real Claude Code prefix was already measured; whether
+editing `tools[]` at the front keeps the rest of the prefix or discards it was
+listed here as unprobed. It was probed against the live relay on 2026-09-15, and
+it discards it — completely. Interleaved requests in one session, with the entire
+message history byte-identical and our compaction stubs present throughout, read
+as follows:
+
+| request | `tools[]` | input | cache read |
+|---|---|---|---|
+| `13:18:10` | Bash, Edit, Write | 15,108 | **125,312** |
+| `13:18:23` | Bash, Edit | 139,970 | **2,688** |
+| `13:18:41` | Bash, Edit | 11,535 | **131,456** |
+| `13:18:49` | Bash | 140,984 | **2,432** |
+
+One definition leaving the array turns a 131k-token cache read into a 2.4k one
+and re-bills the whole prompt at the miss rate: 139,970 uncached tokens where
+15,108 were needed on that turn, and 140,984 against 11,535 on the next. The
+two definitions removed were 640 and 967 bytes — roughly 160 and 241 tokens —
+and between them they cost **254,311 tokens billed at the miss rate** in one
+conversation. The provider does cache the whole of the achievable prefix, not a
+fraction of it: measured as the longest common prefix against every earlier body
+in the session — not against the immediately preceding one — `cache_read` tracks
+that prefix at a ratio of 0.99–1.03 on the warm requests above, and 0.02 on the
+two that collapsed. (The few percent of spread is the error in estimating tokens
+from bytes, not provider behaviour.) Caching was working. What was not working
+was the *set*: it was read from a 24-message
+window, so on the turn a tool fell out of that window the request re-bought
+everything — measured across 25 requests covering 4.5 minutes of the relay's
+traffic, the two requests whose set shrank in that window account for 280,954 of
+its 731,892 uncached tokens: **38% of all uncached input, from 8% of the
+requests**, at an overall sample hit rate of 86.8%.
+
+Not every edit to the array is fatal, and it is worth being precise about which
+ones are. One record in the same sample grew its set instead of shrinking it and
+still read 117,632 tokens from cache at 86%. What decides is where the change
+lands: definitions before the edit stay cached, and everything from the edit
+onward — including the whole message history if the edit is early — is re-bought.
+The window made that edit *early*, on a set the conversation had already paid
+for.
+
+The consequence for any policy above is a budget, not a preference: editing
+`tools[]` costs the entire prefix, so a mode may only change it when it will not
+change again. Every rule that can drop a client tool is now answered from the
+whole transcript, where the answer can only grow.
+
+Worth noting that the client already expects this to be survivable: its request
+carries `anthropic-beta: mid-conversation-tool-changes-2026-07-01`, which is
+exactly the capability of changing tools partway through a conversation without
+re-buying the prefix. Whatever honours that beta — on this endpoint, as measured
+above, nothing does — a proxy deciding to edit `tools[]` is relying on a feature
+it has not confirmed is present. The measurement is the confirmation, and it
+came back negative.

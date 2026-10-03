@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MPL-2.0
 # Profile-Guided Optimization build for the headless binary.
 #
 # PGO gives the compiler a real execution profile so it can lay out the

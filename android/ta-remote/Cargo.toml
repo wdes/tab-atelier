@@ -6,7 +6,7 @@
 
 [package]
 name = "ta-remote"
-version = "0.1.0"
+version = "0.5.0-dev"
 edition = "2024"
 publish = false
 
@@ -65,10 +65,21 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 slint-build = "1"
 
 [package.metadata.android]
+# Underscore, NOT a hyphen: the project is "tab-atelier", but an Android
+# package name / applicationId can't contain hyphens — each dotted segment
+# must match [a-zA-Z][a-zA-Z0-9_]* — so the hyphen becomes an underscore.
+# This is the app's identity: changing it makes a fresh install, not an
+# upgrade, for anyone who already has ta-remote. Keep it in sync with the
+# FilePickerActivity name below.
 package = "fr.wdes.tab_atelier"
 build_targets = ["aarch64-linux-android"]
 apk_name = "ta-remote"
 resources = "res"
+# Raw APK assets (aapt -A). Holds adi-registration.properties, the Google
+# "App Developer Identity" ownership token: it must ship inside a release APK
+# signed with our key (fingerprint above) and be uploaded to verify we own
+# the fr.wdes.tab_atelier package.
+assets = "assets"
 # Sources for the in-app WebView host (fullscreen WebView with the
 # SSL bypass that lets us reach a self-signed origin cert). cargo-apk2
 # compiles every *.java under this tree into classes.dex.
@@ -81,6 +92,12 @@ target_sdk_version = 33
 [package.metadata.android.signing.release]
 path = "release.keystore"
 keystore_password = "tar3mote"
+# Release signing certificate fingerprints (alias "ta-remote",
+# CN=William Desportes, valid 2026-05-16 → 2053-10-01). Needed for Play
+# Console, App Links / Digital Asset Links (assetlinks.json), and any API
+# consoles that key on the signing cert:
+#   SHA-256: D8:EE:6B:25:59:9F:1D:73:12:5F:F6:CD:1D:55:58:15:D8:64:CA:33:B8:6C:22:64:2E:0B:A6:BD:AA:52:20:CA
+#   SHA-1:   24:1F:6A:A1:FA:A1:95:2F:E1:73:04:C8:83:B4:86:94:64:95:B5:EA
 
 [[package.metadata.android.uses_permission]]
 name = "android.permission.INTERNET"

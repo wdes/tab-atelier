@@ -42,23 +42,77 @@ jobs:
               uses: dtolnay/rust-toolchain@stable
             - name: Cache cargo artifacts
               uses: Swatinem/rust-cache@v2
-            - name: Build .deb packages
+              with:
+                  # Shared with build.yml / apt-publish.yml — see build.yml.
+                  shared-key: linux-x64
+                  # Restore-only, same reason as apt-publish.yml: build.yml
+                  # compiles the superset and owns the save.
+                  save-if: false
+            - name: Check the tag matches Cargo.toml
               run: |
-                  cargo install cargo-deb
-                  cargo deb -p tab-atelier --locked
-                  cargo deb -p tab-atelier --variant headless --locked
-            - name: Attest .deb
+                  # The binary reports the Cargo version and the .deb reports
+                  # this tag. If they disagree the release ships a package
+                  # whose `--version` contradicts its own name — and nothing
+                  # else in the pipeline notices. So notice here.
+                  TAG="${GITHUB_REF#refs/tags/v}"
+                  CARGO=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+                  if [ "$TAG" != "$CARGO" ]; then
+                      echo "::error::tag v$TAG but Cargo.toml says $CARGO — bump the version before tagging"
+                      exit 1
+                  fi
+            - name: Install cargo-deb
+              # Prebuilt and version-pinned. The pin matters most here: the
+              # tool that assembles an attested, immutable release should be
+              # a known version, not whatever was latest at tag time.
+              uses: taiki-e/install-action@v2
+              with:
+                  tool: cargo-deb@3.2.0
+            - name: Build .deb packages
+              # The DWARF the .ddeb carries. Set here rather than in
+              # Cargo.toml so arch-pkg — which ships no debug symbols at all
+              # — is not taxed for them; see the note in the release profile.
+              #
+              # A tag gets the full level, deliberately. apt-publish builds
+              # the same packages per-commit and sets `line-tables-only`
+              # there to save ~131 s a run; a release is built once and is
+              # the artifact someone actually debugs an install with, so it
+              # keeps the variable and type detail that level drops. The two
+              # channels differ on purpose — do not "unify" them.
+              env:
+                  CARGO_PROFILE_RELEASE_DEBUG: "2"
+              run: |
+                  # Same script as the nightly channel, so a release and a
+                  # snapshot cannot disagree about how a version is spelled.
+                  DEB_VERSION="$(scripts/deb-version.sh)"
+                  echo "→ building $DEB_VERSION"
+                  # --dbgsym is Debian's convention: the shipped .deb stays
+                  # stripped and the DWARF goes into a separate
+                  # tab-atelier-dbgsym_*.ddeb beside it. zlib rather than
+                  # zstd because cargo-deb's help notes zlib round-trips
+                  # through Rust's backtraces and zstd may not. The DWARF
+                  # comes from CARGO_PROFILE_RELEASE_DEBUG above.
+                  DBGSYM=(--dbgsym --compress-debug-symbols=zlib)
+                  cargo deb -p tab-atelier --locked --deb-version "$DEB_VERSION" "${DBGSYM[@]}"
+                  cargo deb -p tab-atelier --variant headless --locked --deb-version "$DEB_VERSION" "${DBGSYM[@]}"
+            - name: Attest .deb + .ddeb
               uses: actions/attest-build-provenance@v4
               with:
-                  subject-path: target/debian/*.deb
-            - name: Upload .deb artifact
+                  # Both: a -dbgsym.ddeb is a shipped release asset too, so
+                  # provenance should cover every artifact a user downloads.
+                  subject-path: |
+                      target/debian/*.deb
+                      target/debian/*.ddeb
+            - name: Upload .deb + .ddeb artifact
               uses: actions/upload-artifact@v7
               with:
                   name: tab-atelier-deb
-                  path: target/debian/*.deb
-                  # Two .deb files (GUI + headless); upload-artifact's
-                  # `archive: false` requires exactly one. Default
-                  # `archive: true` bundles them into the artifact zip.
+                  path: |
+                      target/debian/*.deb
+                      target/debian/*.ddeb
+                  # Three .deb files (GUI + headless + proxy) plus their
+                  # symbol packages; upload-artifact's `archive: false`
+                  # requires exactly one. Default `archive: true` bundles
+                  # them into the artifact zip.
 
     release:
         name: Create draft release
@@ -75,4 +129,6 @@ jobs:
               with:
                   draft: true
                   generate_release_notes: true
-                  files: "*.deb"
+                  files: |
+                      *.deb
+                      *.ddeb

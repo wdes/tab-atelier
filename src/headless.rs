@@ -1,6 +1,4 @@
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// SPDX-License-Identifier: MPL-2.0
 
 //! Headless tab-atelier entry point.
 //!
@@ -818,21 +816,28 @@ pub fn run() -> std::io::Result<()> {
     // Honour the persisted `tab-atelier log …` filter as a fallback to
     // the env vars, so the CLI toggle works for the daemon too (records
     // still go to stderr/journald here, not a file). Env still wins.
+    // Wrapped in the log ring either way, so `GET /logs` and `tab-atelier
+    // logs` can tail a running daemon that was started with no filter at all.
+    let mut builder = env_logger::Builder::new();
     match crate::resolve_log_filter() {
         Some(filter) => {
-            let _ = env_logger::Builder::new().parse_filters(&filter).try_init();
+            builder.parse_filters(&filter);
         }
-        None => env_logger::init(),
+        None => {
+            builder.parse_default_env();
+        }
     }
+    let logger = builder.build();
+    let level = logger.filter();
+    crate::log_ring::install(logger, level);
 
-    if std::env::args().any(|a| a == "-V" || a == "--version") {
-        println!("{}", crate::version_line("tab-atelier-headless"));
-        return Ok(());
-    }
-
+    // `-V` / `--version` are answered by clap in `cli::dispatch`, which runs
+    // before this function does — the sniff that used to be here was dead code,
+    // and printed a second version format that disagreed with clap's. See
+    // `cli::help_tests::nothing_outside_clap_parses_the_command_line`.
     info!("starting {}", crate::version_line("tab-atelier-headless"));
 
-    let prefs = load_preferences(&platform::config_dir());
+    let mut prefs = load_preferences(&platform::config_dir());
     // Default allowlist for NEW tabs (the seed tab + API-created ones).
     // Restored tabs keep their own persisted config.
     let default_net_allow = prefs.default_allow_config();
@@ -846,6 +851,21 @@ pub fn run() -> std::io::Result<()> {
     // global), so OR it in. `relay_egress` is read where the relay route runs.
     if crate::relay_mode() || prefs.relay_mode {
         crate::set_relay_mode(true);
+    }
+    // Repair a preferences file that holds both roles, and WRITE IT BACK.
+    // Correcting this only in memory leaves the contradiction on disk, where
+    // the next reader finds it again — which is why an instance could report
+    // `egress: false` from `relay status` while preferences.json still said
+    // true, and an "egress hop" 401 kept coming back from somewhere nobody
+    // could point at.
+    if crate::normalise_relay_config(&mut prefs) {
+        log::warn!(
+            "relay: preferences held both the egress role and a relay target; \
+             the target wins — clearing the egress flag on disk"
+        );
+        if !crate::read_only() {
+            crate::save_preferences(&crate::platform::config_dir(), &prefs);
+        }
     }
     crate::install_relay_config(&prefs);
     crate::set_tab_env_global(prefs.tab_env.clone());
@@ -1095,6 +1115,8 @@ pub fn run() -> std::io::Result<()> {
     }));
     info!("API server starting on {api_addr} (TLS {api_tls_addr})");
     api::start_api_server(api_state.clone(), api_token.clone(), read_only, api_addr);
+    // Off unless `fleet_sweep_minutes` says otherwise.
+    crate::sweep::spawn_if_configured(read_only);
     api::start_api_server_tls(
         api_state.clone(),
         api_token.clone(),
@@ -2351,15 +2373,19 @@ fn drain_pending(
         let Some(tab) = tabs.iter_mut().find(|t| *t.id == upd.tab_id) else {
             continue;
         };
-        if upd.label.as_deref() == Some("__clear__") {
+        if upd.wipe_attachment {
             tab.agent_state = None;
             tab.agent_session_id = None;
             tab.agent_kind = None;
             tab.agent_plan_mode = None;
         } else {
-            tab.agent_state = Some(AgentStateSnapshot {
-                state: upd.state,
-                label: upd.label,
+            // `state: None` (the wire's "idle") takes the indicator down;
+            // the metadata below applies either way, so an update that
+            // names its session parks the LED and still leaves the tab
+            // resumable — which is what codex's wrapper does on exit.
+            tab.agent_state = upd.state.map(|state| AgentStateSnapshot {
+                state,
+                label: upd.label.clone(),
                 updated_at: Instant::now(),
             });
             if upd.session_id.is_some() {
@@ -2571,9 +2597,12 @@ fn drain_pending(
             }
         });
         let id = default_tab_id();
-        let env = tab_env_extras(&id, api_url_for_pty, api_token, &std::collections::BTreeMap::new());
+        let mut env = tab_env_extras(&id, api_url_for_pty, api_token, &std::collections::BTreeMap::new());
+        // Every tab here came from the API — an agent's, not the user's — so
+        // it launches with colour output off. See `new_tab_env`.
+        env.extend(crate::new_tab_env(true));
         let name = format!("Terminal {}", tabs.len());
-        if let Some(mut t) = spawn_pty_tab(
+        if let Some(t) = spawn_pty_tab(
             id,
             name,
             cwd,
@@ -2604,12 +2633,12 @@ fn drain_pending(
             crate::cgroup::apply(&t.id, t.pid, default_limits);
             #[cfg(not(target_os = "linux"))]
             let _ = default_limits;
-            if *active < tabs.len() {
-                tabs[*active].deactivate();
-            }
-            t.activate();
+            // API-created tabs (an agent's `dispatch --new`, `tab-atelier
+            // add`) do NOT become active: a fleet spawning workers must not
+            // move the user's selection, and the GUI's matching path leaves
+            // focus alone for the same reason. An explicit `activate` still
+            // works if a caller really wants the switch.
             tabs.push(t);
-            *active = tabs.len() - 1;
         }
     }
     did_work

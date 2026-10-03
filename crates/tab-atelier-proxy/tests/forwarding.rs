@@ -1,0 +1,1106 @@
+// SPDX-License-Identifier: MPL-2.0
+
+//! End-to-end: a user key in, the proxy's own Claude credential out.
+//!
+//! Ported from the desktop crate's `relay_egress_streams_sse_and_injects_oauth`
+//! when the egress role moved here, and extended with the assertion that
+//! matters most now that there are many keys instead of one: the caller's key
+//! must not travel upstream.
+
+use std::io::{Read, Write};
+use std::sync::{Arc, Mutex};
+
+/// These tests set PROCESS-WIDE egress state (the credentials path, the
+/// upstream override), so they cannot run at the same time. Cargo runs tests
+/// in one binary on parallel threads by default, which without this makes them
+/// clobber each other's fixtures in a way that looks like a proxy bug.
+static EGRESS: Mutex<()> = Mutex::new(());
+
+use tab_atelier_proxy::provider::{Auth, Class, Model, Provider, Registry, Wire};
+use tab_atelier_proxy::server::{State, serve_on};
+use tab_atelier_proxy::{account, egress, qos, tools, usage, users::Store};
+
+/// A mock Anthropic that records what it was sent, then streams two SSE frames
+/// with a gap between them and closes.
+///
+/// The gap is the point: it proves the response is streamed rather than
+/// buffered to completion first, which is what a long generation depends on.
+fn mock_upstream() -> (u16, std::sync::mpsc::Receiver<String>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock");
+    let port = listener.local_addr().expect("addr").port();
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        if let Ok((mut sock, _)) = listener.accept() {
+            let _ = sock.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 1024];
+            while let Ok(n) = sock.read(&mut tmp) {
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let _ = tx.send(String::from_utf8_lossy(&buf).into_owned());
+            let _ = sock.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n");
+            let _ = sock.write_all(b"data: {\"type\":\"message_start\"}\n\n");
+            let _ = sock.flush();
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            let _ = sock.write_all(b"data: [DONE]\n\n");
+            let _ = sock.flush();
+        }
+    });
+    (port, rx)
+}
+
+/// Start the proxy on a free port, and wait until it answers.
+///
+/// Rocket binds inside `launch`, so it cannot be handed a listener the way the
+/// old hand-written accept loop could. Probing for a free port and then waiting
+/// for the socket to accept closes that gap and a second one besides: the old
+/// version spawned the server and connected immediately, which passed only
+/// because the bind happened to win the race.
+fn boot(rt: &tokio::runtime::Runtime, state: Arc<State>) -> u16 {
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("probe a free port")
+        .local_addr()
+        .expect("addr")
+        .port();
+    rt.spawn(async move {
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+        let _ = serve_on(addr, state).await;
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    panic!("the proxy never started on port {port}");
+}
+
+fn scratch(name: &str) -> std::path::PathBuf {
+    let p = std::env::temp_dir().join(format!("ta-proxy-it-{name}-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&p).expect("mkdir");
+    p
+}
+
+/// Send a raw request and read the whole response.
+fn request(port: u16, req: &str) -> String {
+    let mut sock = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    let _ = sock.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+    sock.write_all(req.as_bytes()).expect("write");
+    let mut out = Vec::new();
+    let mut tmp = [0u8; 4096];
+    while let Ok(n) = sock.read(&mut tmp) {
+        if n == 0 {
+            break;
+        }
+        out.extend_from_slice(&tmp[..n]);
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+#[test]
+fn a_users_key_is_exchanged_for_the_proxys_claude_token() {
+    let _serial = EGRESS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (upstream_port, seen_rx) = mock_upstream();
+
+    // A far-future expiry, so the egress uses the token as-is and the test
+    // makes no network call of its own.
+    let dir = scratch("creds");
+    let creds = dir.join("creds.json");
+    std::fs::write(
+        &creds,
+        r#"{"claudeAiOauth":{"accessToken":"oat-fixture-xyz","refreshToken":"ort-x","expiresAt":9999999999999,"scopes":["user:inference"]}}"#,
+    )
+    .expect("write creds");
+    egress::set_credentials_path(Some(creds));
+    egress::set_upstream(Some(format!("http://127.0.0.1:{upstream_port}")));
+
+    let mut store = Store::load(dir.join("users.json")).expect("store");
+    let ada = store.add("Ada", "Lovelace", "ada@example.org").expect("add");
+    // Accounts start with no keys — one is minted per place it is used.
+    let (_k, key) = store.add_key(&ada.email, "laptop").expect("key");
+
+    let state = Arc::new(State {
+        store: Mutex::new(store),
+        usage: Mutex::new(usage::Store::load(dir.join("usage"))),
+        sched: Mutex::new(qos::Sched::new()),
+        account: Mutex::new(account::Monitor::load(&dir)),
+        inspect: Mutex::new(tab_atelier_proxy::inspect::Store::load(std::env::temp_dir())),
+        wake: tokio::sync::Notify::new(),
+        registry: Mutex::new(tab_atelier_proxy::provider::Registry::default()),
+        registry_path: std::env::temp_dir().join("ta-proxy-providers-test.json"),
+        provider_backoff: Mutex::new(std::collections::BTreeMap::new()),
+        admin_token: "tap_admin_not_valid_here".to_owned(),
+        web_root: None,
+    });
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let port = boot(&rt, Arc::clone(&state));
+
+    let payload = "{}";
+    let resp = request(
+        port,
+        &format!(
+            "POST /relay/anthropic/v1/messages HTTP/1.1\r\nHost: x\r\nx-api-key: {key}\r\n\
+             Content-Type: application/json\r\nanthropic-beta: context-management-2025-06-27\r\n\
+             User-Agent: claude-cli/2.1.266 (external, cli)\r\nx-app: cli\r\n\
+             x-claude-code-session-id: fdb378a6-aab8-4cd3-ba82-82c9a7248507\r\n\
+             x-stainless-lang: js\r\nanthropic-dangerous-direct-browser-access: true\r\n\
+             Cookie: session=secret-for-a-different-hop\r\n\
+             Content-Length: {}\r\n\r\n{payload}",
+            payload.len()
+        ),
+    );
+
+    assert!(resp.starts_with("HTTP/1.1 200"), "resp: {resp}");
+    assert!(resp.contains("data:"), "expected streamed SSE, got: {resp}");
+    assert!(resp.contains("[DONE]"), "expected the final SSE frame, got: {resp}");
+
+    let seen = seen_rx
+        .recv_timeout(std::time::Duration::from_secs(3))
+        .expect("upstream saw a request");
+    assert!(
+        seen.contains("oat-fixture-xyz"),
+        "the proxy must present its own Claude token upstream; upstream saw: {seen}"
+    );
+    // The whole reason a user key is not an Anthropic key: it stops at the
+    // proxy. If it were forwarded, revoking an account would not stop anything
+    // and the key would be replayable against Anthropic directly.
+    assert!(
+        !seen.contains(&key),
+        "the caller's key must NOT reach upstream; upstream saw: {seen}"
+    );
+    // The client's own beta flag has to survive, or a body field gated behind
+    // it is rejected upstream as an unknown input.
+    assert!(
+        seen.contains("context-management-2025-06-27"),
+        "the client's anthropic-beta must be merged, not replaced; upstream saw: {seen}"
+    );
+    assert!(
+        seen.contains("oauth-2025-04-20"),
+        "the OAuth beta flags are mandatory upstream; upstream saw: {seen}"
+    );
+    // The client on the far side IS Claude Code, and Anthropic's OAuth path is
+    // for Claude Code. The proxy used to rebuild the request from scratch,
+    // which replaced that fingerprint with its own name and dropped the
+    // session id — so every proxied call looked like an unknown client and no
+    // support question about a session could be traced through.
+    for expected in [
+        "claude-cli/2.1.266",
+        "x-app: cli",
+        "fdb378a6-aab8-4cd3-ba82-82c9a7248507",
+        // Enumerated by the SDK version rather than by us, so the prefix is
+        // what keeps the allowlist from going stale on the client's upgrade.
+        "x-stainless-lang",
+        "anthropic-dangerous-direct-browser-access",
+    ] {
+        assert!(
+            seen.contains(expected),
+            "the client's Claude Code identity must reach upstream, missing {expected}; upstream saw: {seen}"
+        );
+    }
+    assert!(
+        !seen.contains("tab-atelier-proxy/"),
+        "the proxy must not overwrite the client's User-Agent; upstream saw: {seen}"
+    );
+    // The forwarding list is an allowlist precisely so that a credential for a
+    // different hop is not handed to Anthropic by accident.
+    assert!(
+        !seen.contains("secret-for-a-different-hop"),
+        "a cookie is for another hop and must never be forwarded; upstream saw: {seen}"
+    );
+
+    egress::set_upstream(None);
+    egress::set_credentials_path(None);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_revoked_key_stops_working_without_reaching_upstream() {
+    let _serial = EGRESS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (upstream_port, seen_rx) = mock_upstream();
+    let dir = scratch("revoked");
+    egress::set_upstream(Some(format!("http://127.0.0.1:{upstream_port}")));
+
+    let mut store = Store::load(dir.join("users.json")).expect("store");
+    let a = store.add("Ada", "Lovelace", "ada@example.org").expect("add");
+    // Accounts start with no keys — one is minted per place it is used.
+    let (_k, key) = store.add_key(&a.email, "laptop").expect("key");
+    store.set_disabled("ada@example.org", true).expect("disable");
+
+    let state = Arc::new(State {
+        store: Mutex::new(store),
+        usage: Mutex::new(usage::Store::load(dir.join("usage"))),
+        sched: Mutex::new(qos::Sched::new()),
+        account: Mutex::new(account::Monitor::load(&dir)),
+        inspect: Mutex::new(tab_atelier_proxy::inspect::Store::load(std::env::temp_dir())),
+        wake: tokio::sync::Notify::new(),
+        registry: Mutex::new(tab_atelier_proxy::provider::Registry::default()),
+        registry_path: std::env::temp_dir().join("ta-proxy-providers-test.json"),
+        provider_backoff: Mutex::new(std::collections::BTreeMap::new()),
+        admin_token: "tap_admin".to_owned(),
+        web_root: None,
+    });
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let port = boot(&rt, state);
+
+    let resp = request(
+        port,
+        &format!(
+            "POST /relay/anthropic/v1/messages HTTP/1.1\r\nHost: x\r\nx-api-key: {key}\r\nContent-Length: 0\r\n\r\n"
+        ),
+    );
+    assert!(resp.starts_with("HTTP/1.1 401"), "resp: {resp}");
+    // Refused at the door: a disabled account must not cost the proxy an
+    // upstream call, or revoking someone still burns quota.
+    assert!(
+        seen_rx.recv_timeout(std::time::Duration::from_millis(300)).is_err(),
+        "a refused request must never reach upstream"
+    );
+
+    egress::set_upstream(None);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A provider that answers on `port` with one balanced model, for the tests
+/// that care about WHERE traffic went rather than what it looked like.
+///
+/// Credentialed by file, not by `claude_oauth`. A second provider holding the
+/// proxy's own Claude login is refused outright — that would send the
+/// subscription's token to whatever host the entry names — so a stub standing
+/// in for "another Anthropic-compatible provider" carries its own key, which
+/// is what such a provider really has.
+fn stub_provider(id: &str, port: u16, preference: i32, key_path: &std::path::Path) -> Provider {
+    Provider {
+        id: id.to_owned(),
+        wire: Wire::Anthropic,
+        base_url: format!("http://127.0.0.1:{port}"),
+        auth: Auth::ApiKeyFile {
+            path: key_path.display().to_string(),
+        },
+        preference,
+        enabled: true,
+        peak: None,
+        models: vec![Model {
+            id: format!("{id}-balanced"),
+            class: Class::Balanced,
+            relative_cost: 5,
+            price: None,
+            deprecated: false,
+            note: None,
+        }],
+    }
+}
+
+/// The headline claim, end to end: when one provider refuses, the work moves
+/// to another instead of stopping or getting worse.
+#[test]
+fn a_429_moves_the_next_request_to_another_provider() {
+    let _serial = EGRESS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Two upstreams. The first refuses with 429; the second answers.
+    let (refuser, refuser_seen) = mock_status(429, "{\"error\":\"rate limited\"}");
+    let (backup, backup_seen) = mock_status(200, "{\"usage\":{\"input_tokens\":3,\"output_tokens\":4}}");
+
+    let dir = scratch("reroute");
+    let creds = dir.join("creds.json");
+    std::fs::write(
+        &creds,
+        r#"{"claudeAiOauth":{"accessToken":"oat-fixture","refreshToken":"r","expiresAt":9999999999999,"scopes":[]}}"#,
+    )
+    .expect("write creds");
+    egress::set_credentials_path(Some(creds));
+
+    let stub_key = dir.join("stub.key");
+    std::fs::write(&stub_key, "sk-stub-provider").expect("write stub key");
+    let registry = Registry {
+        mappings: vec![],
+        providers: vec![
+            stub_provider("primary", refuser, 0, &stub_key),
+            stub_provider("backup", backup, 1, &stub_key),
+        ],
+    };
+
+    let mut store = Store::load(dir.join("users.json")).expect("store");
+    let a = store.add("Ada", "Lovelace", "ada@example.org").expect("add");
+    // Accounts start with no keys — one is minted per place it is used.
+    let (_k, key) = store.add_key(&a.email, "laptop").expect("key");
+    let state = Arc::new(State {
+        store: Mutex::new(store),
+        usage: Mutex::new(usage::Store::load(dir.join("usage"))),
+        sched: Mutex::new(qos::Sched::new()),
+        account: Mutex::new(account::Monitor::load(&dir)),
+        inspect: Mutex::new(tab_atelier_proxy::inspect::Store::load(std::env::temp_dir())),
+        wake: tokio::sync::Notify::new(),
+        registry: Mutex::new(registry),
+        registry_path: dir.join("providers.json"),
+        provider_backoff: Mutex::new(std::collections::BTreeMap::new()),
+        admin_token: "tap_admin".to_owned(),
+        web_root: None,
+    });
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let port = boot(&rt, state);
+
+    let call = || {
+        let payload = r#"{"model":"primary-balanced","max_tokens":1,"messages":[]}"#;
+        request(
+            port,
+            &format!(
+                "POST /relay/anthropic/v1/messages HTTP/1.1\r\nHost: x\r\nx-api-key: {key}\r\n\
+                 Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
+                payload.len()
+            ),
+        )
+    };
+
+    // First call goes to the preferred provider and is refused. The 429 is
+    // passed through rather than hidden — the client is entitled to it.
+    let first = call();
+    assert!(first.contains("429"), "first response: {first}");
+    assert!(first.contains("x-tab-atelier-proxy-route: primary/"), "{first}");
+    assert!(
+        refuser_seen.recv_timeout(std::time::Duration::from_secs(3)).is_ok(),
+        "the primary should have been tried"
+    );
+
+    // The refusal is remembered, so the NEXT call goes elsewhere. This is the
+    // whole point: one provider's limit is not every provider's.
+    let second = call();
+    assert!(
+        second.contains("x-tab-atelier-proxy-route: backup/backup-balanced"),
+        "the second call should have moved to the backup: {second}"
+    );
+    assert!(second.starts_with("HTTP/1.1 200"), "{second}");
+    assert!(
+        backup_seen.recv_timeout(std::time::Duration::from_secs(3)).is_ok(),
+        "the backup should have served it"
+    );
+
+    egress::set_credentials_path(None);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Read a whole request — head plus the body its content-length declares.
+///
+/// Replying and closing after only the head turns the still-arriving body into
+/// a connection reset, which surfaces as a 502 from the proxy and looks like a
+/// proxy bug. (The same mistake was just fixed in tab-atelier's own test
+/// server, in claude/fix-cli-edition-tests.)
+fn drain_request(sock: &mut std::net::TcpStream) -> String {
+    let mut req = Vec::new();
+    let mut tmp = [0u8; 2048];
+    let mut need: Option<usize> = None;
+    loop {
+        match sock.read(&mut tmp) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => req.extend_from_slice(&tmp[..n]),
+        }
+        if need.is_none()
+            && let Some(pos) = req.windows(4).position(|w| w == b"\r\n\r\n")
+        {
+            let len = String::from_utf8_lossy(&req[..pos])
+                .lines()
+                .find_map(|l| {
+                    let (k, v) = l.split_once(':')?;
+                    k.eq_ignore_ascii_case("content-length")
+                        .then(|| v.trim().parse::<usize>().ok())?
+                })
+                .unwrap_or(0);
+            need = Some(pos + 4 + len);
+        }
+        if need.is_some_and(|n| req.len() >= n) {
+            break;
+        }
+    }
+    String::from_utf8_lossy(&req).into_owned()
+}
+
+/// A mock upstream that always answers with one status and body, reporting
+/// each request it saw.
+fn mock_status(status: u16, body: &'static str) -> (u16, std::sync::mpsc::Receiver<String>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock");
+    let port = listener.local_addr().expect("addr").port();
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut sock) = stream else { break };
+            let _ = sock.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+            let req = drain_request(&mut sock);
+            let _ = tx.send(req);
+            let _ = write!(
+                sock,
+                "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = sock.flush();
+        }
+    });
+    (port, rx)
+}
+
+/// Compaction reaches the wire, and only on the provider that asked for it.
+///
+/// The unit tests prove the pass is correct in isolation. This proves it is
+/// WIRED — that `shape_and_admit` looks the level up on the chosen provider and
+/// the bytes that leave are the compacted ones. A pass that is never called is
+/// the failure mode a unit test cannot see.
+#[test]
+fn compaction_reaches_upstream_and_only_where_it_is_configured() {
+    let _serial = EGRESS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (upstream, seen) = mock_status(200, "{\"usage\":{\"input_tokens\":3,\"output_tokens\":4}}");
+    let dir = scratch("compact");
+    let stub_key = dir.join("stub.key");
+    std::fs::write(&stub_key, "sk-stub-provider").expect("write stub key");
+
+    let mut provider = stub_provider("primary", upstream, 0, &stub_key);
+    // Balanced, and named for the class the fixture asks for.
+    provider.models = vec![Model {
+        id: "primary-balanced".to_owned(),
+        class: Class::Balanced,
+        relative_cost: 5,
+        price: None,
+        deprecated: false,
+        note: None,
+    }];
+
+    let mut store = Store::load(dir.join("users.json")).expect("store");
+    let a = store.add("Ada", "Lovelace", "ada@example.org").expect("add");
+    // On the ACCOUNT, not the provider. The level is per person: routing picks
+    // the hop per request, so one filed under a provider would quietly mean
+    // something else the moment traffic stopped going there.
+    store
+        .set_compact(&a.id, tab_atelier_proxy::compact::Compact::ToolsThinking)
+        .expect("set");
+    let (_k, key) = store.add_key(&a.email, "laptop").expect("key");
+    let state = Arc::new(State {
+        store: Mutex::new(store),
+        usage: Mutex::new(usage::Store::load(dir.join("usage"))),
+        sched: Mutex::new(qos::Sched::new()),
+        account: Mutex::new(account::Monitor::load(&dir)),
+        inspect: Mutex::new(tab_atelier_proxy::inspect::Store::load(std::env::temp_dir())),
+        wake: tokio::sync::Notify::new(),
+        registry: Mutex::new(Registry {
+            mappings: vec![],
+            providers: vec![provider],
+        }),
+        registry_path: dir.join("providers.json"),
+        provider_backoff: Mutex::new(std::collections::BTreeMap::new()),
+        admin_token: "tap_admin".to_owned(),
+        web_root: None,
+    });
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let port = boot(&rt, state);
+
+    // Ten tool-result turns, so six survive the window and four are elided —
+    // the same shape the unit fixture uses.
+    //
+    // The payloads clear `compact::ELIDE_ABOVE_BYTES` on purpose: the four stale
+    // results are 320 KB against a 256 KiB floor, so elision engages. At the
+    // 1,000 bytes this used to send, the pass now declines the body and every
+    // assertion below fails on a request that was deliberately never over any
+    // budget — which is the behaviour the floor exists to produce, just not what
+    // this test is for.
+    let mut messages = Vec::new();
+    for i in 0..10 {
+        messages.push(format!(
+            r#"{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"call_{i:02}","content":"{}"}}]}}"#,
+            "r".repeat(80_000)
+        ));
+        messages.push(format!(
+            r#"{{"role":"assistant","content":[{{"type":"thinking","thinking":"{}","signature":"s{i:02}"}},{{"type":"tool_use","id":"call_{i:02}","name":"Bash","input":{{}}}}]}}"#,
+            "t".repeat(300)
+        ));
+    }
+    let payload = format!(
+        r#"{{"model":"primary-balanced","max_tokens":1,"system":[{{"type":"text","text":"sys"}}],"tools":[{{"name":"Bash","input_schema":{{"type":"object"}}}}],"messages":[{}]}}"#,
+        messages.join(",")
+    );
+    let sent = payload.len();
+    let resp = request(
+        port,
+        &format!(
+            "POST /relay/anthropic/v1/messages HTTP/1.1\r\nHost: x\r\nx-api-key: {key}\r\n\
+             Content-Type: application/json\r\nContent-Length: {sent}\r\n\r\n{payload}"
+        ),
+    );
+    assert!(resp.starts_with("HTTP/1.1 200"), "resp: {resp}");
+
+    let seen = seen
+        .recv_timeout(std::time::Duration::from_secs(3))
+        .expect("upstream saw the request");
+    // Upstream's view: the body after the proxy was done with it.
+    let (_, body) = seen.split_once("\r\n\r\n").expect("headers and body");
+    assert!(
+        body.len() < sent,
+        "the body should have shrunk upstream: {sent} → {}",
+        body.len()
+    );
+    assert!(body.contains("[elided:"), "no stub upstream");
+    let elided = body.matches("[elided:").count();
+    assert_eq!(elided, 4, "tool results elided (want 4): {elided}");
+    let kept_thinking = body.matches(r#""type":"thinking""#).count();
+    assert_eq!(kept_thinking, 6, "thinking blocks kept (want 6): {kept_thinking}");
+    // The pairing survives the trip, which is the invariant that matters.
+    assert_eq!(
+        body.matches(r#""type":"tool_use""#).count(),
+        body.matches(r#""type":"tool_result""#).count(),
+        "tool_use and tool_result must still pair: {body:.400}"
+    );
+    // And the cache root is untouched — compared as a VALUE, not as bytes.
+    // Re-serializing through `serde_json::Value` sorts object keys, so a
+    // byte-wise assertion here would be testing the map implementation rather
+    // than whether the tool schema survived. (It also means the proxy only
+    // preserves the original bytes when it changes nothing at all, which is
+    // why `shape_body` returns early in that case.)
+    let got: serde_json::Value = serde_json::from_str(body).expect("upstream body is JSON");
+    let want: serde_json::Value = serde_json::from_str(&payload).expect("payload is JSON");
+    for field in ["tools", "system"] {
+        assert_eq!(got[field], want[field], "{field} must survive the pass");
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Why the auto-mode permission classifier is routed, compacted and booked
+/// differently from the conversation it guards.
+#[test]
+fn the_auto_mode_classifier_is_not_retargeted_by_a_mapping() {
+    let _serial = EGRESS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (upstream, seen) = mock_status(200, "{\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}");
+    let dir = scratch("classifier");
+    let stub_key = dir.join("stub.key");
+    std::fs::write(&stub_key, "sk-stub-provider").expect("write stub key");
+
+    // One provider, serving both names. Both a mapping and the class ladder
+    // would happily send the classifier here; what is asserted is the NAME it
+    // is sent under, which is the difference between a destination chosen for
+    // work and one chosen for the gate that guards work.
+    let mut provider = stub_provider("primary", upstream, 0, &stub_key);
+    provider.models = vec![
+        Model {
+            id: "primary-heavy".to_owned(),
+            class: Class::Heavy,
+            relative_cost: 50,
+            price: None,
+            deprecated: false,
+            note: None,
+        },
+        Model {
+            id: "primary-balanced".to_owned(),
+            class: Class::Balanced,
+            relative_cost: 5,
+            price: None,
+            deprecated: false,
+            note: None,
+        },
+    ];
+
+    let mut store = Store::load(dir.join("users.json")).expect("store");
+    let a = store.add("Ada", "Lovelace", "ada@example.org").expect("add");
+    // Compaction ON for this account, so its absence upstream is the
+    // exemption rather than an unconfigured pass.
+    store
+        .set_compact(&a.id, tab_atelier_proxy::compact::Compact::All)
+        .expect("set");
+    let (_k, key) = store.add_key(&a.email, "laptop").expect("key");
+    let state = Arc::new(State {
+        store: Mutex::new(store),
+        usage: Mutex::new(usage::Store::load(dir.join("usage"))),
+        sched: Mutex::new(qos::Sched::new()),
+        account: Mutex::new(account::Monitor::load(&dir)),
+        inspect: Mutex::new(tab_atelier_proxy::inspect::Store::load(std::env::temp_dir())),
+        wake: tokio::sync::Notify::new(),
+        registry: Mutex::new(Registry {
+            // Every heavy request is rewritten to the balanced name. An
+            // operator who wrote this meant the CONVERSATION; they did not say
+            // "let the balanced model adjudicate whether `rm -rf` is safe".
+            mappings: vec![tab_atelier_proxy::provider::Mapping {
+                from: "claude-opus-5".to_owned(),
+                to: "primary-balanced".to_owned(),
+                note: None,
+            }],
+            providers: vec![provider],
+        }),
+        registry_path: dir.join("providers.json"),
+        provider_backoff: Mutex::new(std::collections::BTreeMap::new()),
+        admin_token: "tap_admin".to_owned(),
+        web_root: None,
+    });
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let port = boot(&rt, state);
+
+    // The classifier exactly as Claude Code sends it, cut down to the parts
+    // that decide routing and compaction. The transcript is a STRING inside the
+    // single user turn — not `tool_result` blocks — which is the whole reason
+    // the current elision pass would find nothing to do here.
+    let classifier = r#"{"model":"claude-opus-5","max_tokens":64,"stop_sequences":["</severity>"],"thinking":{"type":"disabled"},"system":[{"type":"text","text":"You are a security monitor for autonomous AI coding agents."}],"messages":[{"role":"user","content":"<transcript>Bash: rm -rf /tmp/scratch</transcript>\n<cc_automode_permissions>Bash</cc_automode_permissions>"}]}"#;
+    let resp = request(
+        port,
+        &format!(
+            "POST /relay/anthropic/v1/messages HTTP/1.1\r\nHost: x\r\nx-api-key: {key}\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{classifier}",
+            classifier.len()
+        ),
+    );
+    assert!(resp.starts_with("HTTP/1.1 200"), "resp: {resp}");
+
+    let seen = seen
+        .recv_timeout(std::time::Duration::from_secs(3))
+        .expect("upstream saw the request");
+    let (_, body) = seen.split_once("\r\n\r\n").expect("headers and body");
+    let got: serde_json::Value = serde_json::from_str(body).expect("upstream body is JSON");
+
+    // The name the caller asked for, not the mapped one.
+    assert_eq!(
+        got["model"], "primary-heavy",
+        "the classifier must not be retargeted by a mapping: {body}"
+    );
+    // And it was not compacted, though this account compacts everything else.
+    assert_eq!(
+        got["messages"],
+        serde_json::from_str::<serde_json::Value>(classifier).expect("json")["messages"]
+    );
+    // The field the live probe proved is load-bearing: without it the verdict
+    // comes back empty and auto mode reads as unable to decide.
+    assert_eq!(
+        got["thinking"]["type"], "disabled",
+        "thinking must pass through untouched"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The regression this pins: `admit` gated EVERY request on the
+/// subscription's budget, so a plan that was maxed out returned "the shared
+/// quota is saturated; retry in Ns" for traffic bound somewhere else. The only
+/// way to get that traffic moving was to disable the subscription, which is
+/// the opposite of the point — the plan was not what the request was spending.
+#[test]
+fn a_saturated_subscription_does_not_gate_a_provider_that_bills_separately() {
+    let _serial = EGRESS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (upstream, seen) = mock_status(200, "{\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}");
+    let dir = scratch("sched-scope");
+    let stub_key = dir.join("stub.key");
+    std::fs::write(&stub_key, "sk-stub").expect("write stub key");
+
+    // DeepSeek only: the subscription is not configured at all, which is the
+    // shape of a deployment that has moved a profile off it.
+    let state = state_with(
+        vec![stub_provider("deepseek", upstream, 10, &stub_key)],
+        &dir,
+        sched_spent(),
+    );
+
+    let key = first_key(&state);
+    let rt = serve(&state);
+    let port = rt.port;
+
+    let payload = r#"{"model":"claude-sonnet-5","max_tokens":1,"messages":[{"role":"user","content":"x"}]}"#;
+    let resp = request(
+        port,
+        &format!(
+            "POST /relay/anthropic/v1/messages HTTP/1.1\r\nHost: x\r\nx-api-key: {key}\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
+            payload.len()
+        ),
+    );
+
+    assert!(
+        !resp.contains("429"),
+        "a provider that bills separately must not inherit the subscription's backoff: {resp}"
+    );
+    assert!(resp.starts_with("HTTP/1.1 200"), "resp: {resp}");
+    let seen = seen
+        .recv_timeout(std::time::Duration::from_secs(3))
+        .expect("upstream saw it");
+    assert!(!seen.contains("retry-after"), "a borrowed Retry-After leaked: {seen}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A scheduler that has been told the plan is exhausted and is backing off —
+/// the exact state the reported 429 came from.
+fn sched_spent() -> qos::Sched {
+    // The REAL clock. An earlier version passed 0, which proved nothing: a
+    // 172-second backoff established at the unix epoch is long expired, so the
+    // request sailed through an open gate and the assertion passed against
+    // code that was still wrong.
+    let now = tab_atelier_proxy::server::now_ms();
+    let mut sched = qos::Sched::new();
+    sched.observe(Some(0), Some(3600), now);
+    sched.on_429(Some(172), now);
+    sched
+}
+
+/// The other direction: a far end's 429 must not put the SUBSCRIPTION on hold.
+///
+/// `observe_upstream` used to feed every provider's answers into the scheduler,
+/// so a provider refusing traffic paused requests bound for Anthropic — which
+/// had capacity, and was being billed for the privilege of waiting.
+///
+/// The upstream answers a long `retry-after` rather than the bare 429 the other
+/// mock sends: `on_429(None, …)` defaults to a five-second backoff, and this
+/// test's own request cycle takes about that long, so a default would expire
+/// before the assertion and the test would pass against broken code.
+#[test]
+fn a_providers_429_does_not_pause_the_subscription() {
+    let _serial = EGRESS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (upstream, _seen) = mock_429(300);
+    let dir = scratch("sched-reverse");
+    let stub_key = dir.join("stub.key");
+    std::fs::write(&stub_key, "sk-stub").expect("write stub key");
+
+    let state = state_with(
+        vec![stub_provider("deepseek", upstream, 10, &stub_key)],
+        &dir,
+        qos::Sched::new(),
+    );
+
+    let key = first_key(&state);
+    let rt = serve(&state);
+
+    let payload = r#"{"model":"claude-sonnet-5","max_tokens":1,"messages":[{"role":"user","content":"x"}]}"#;
+    let resp = request(
+        rt.port,
+        &format!(
+            "POST /relay/anthropic/v1/messages HTTP/1.1\r\nHost: x\r\nx-api-key: {key}\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
+            payload.len()
+        ),
+    );
+    // The provider's own 429 is passed through — that part is correct, and is
+    // the whole point of a transparent relay.
+    assert!(
+        resp.contains("429"),
+        "the far end's 429 should reach the client: {resp}"
+    );
+
+    // …and the scheduler, which measures the subscription, must be untouched.
+    let snap = {
+        let sched = state.sched.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        sched.snapshot(tab_atelier_proxy::server::now_ms())
+    };
+    assert_eq!(
+        snap.backoff_for, 0,
+        "a provider's 429 must not set the SUBSCRIPTION's backoff: {snap:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A mock upstream that refuses with a stated `retry-after`, so a backoff it
+/// causes cannot quietly expire while the test finishes.
+fn mock_429(retry_after_secs: u64) -> (u16, std::sync::mpsc::Receiver<String>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock");
+    let port = listener.local_addr().expect("addr").port();
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut sock) = stream else { break };
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 1024];
+            while let Ok(n) = sock.read(&mut tmp) {
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let _ = tx.send(String::from_utf8_lossy(&buf).into_owned());
+            let body = "{\"error\":{\"type\":\"rate_limit_error\",\"message\":\"slow down\"}}";
+            let _ = sock.write_all(
+                format!(
+                    "HTTP/1.1 429 Too Many Requests\r\ncontent-type: application/json\r\n\
+                     retry-after: {retry_after_secs}\r\nconnection: close\r\n\
+                     content-length: {}\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            );
+            let _ = sock.flush();
+        }
+    });
+    (port, rx)
+}
+
+/// A `State` with one account and the given providers, for the scheduler tests.
+fn state_with(providers: Vec<Provider>, dir: &std::path::Path, sched: qos::Sched) -> Arc<State> {
+    let mut store = Store::load(dir.join("users.json")).expect("store");
+    let a = store.add("Ada", "Lovelace", "ada@example.org").expect("add");
+    let (_k, key) = store.add_key(&a.email, "laptop").expect("key");
+    LEAKED_KEYS.with(|k| k.borrow_mut().insert(a.email.clone(), key));
+    Arc::new(State {
+        store: Mutex::new(store),
+        usage: Mutex::new(usage::Store::load(dir.join("usage"))),
+        sched: Mutex::new(sched),
+        account: Mutex::new(account::Monitor::load(dir)),
+        inspect: Mutex::new(tab_atelier_proxy::inspect::Store::load(std::env::temp_dir())),
+        wake: tokio::sync::Notify::new(),
+        registry: Mutex::new(Registry {
+            mappings: vec![],
+            providers,
+        }),
+        registry_path: dir.join("providers.json"),
+        provider_backoff: Mutex::new(std::collections::BTreeMap::new()),
+        admin_token: "tap_admin".to_owned(),
+        web_root: None,
+    })
+}
+
+/// Serve `state` on an ephemeral port. The runtime is leaked deliberately: the
+/// server task must outlive the caller's scope for the request to be answered.
+fn serve(state: &Arc<State>) -> Leaked {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let port = boot(&rt, Arc::clone(state));
+    std::mem::forget(rt);
+    Leaked { port }
+}
+
+struct Leaked {
+    port: u16,
+}
+
+/// The first account's only key, read back out of the store.
+fn first_key(state: &Arc<State>) -> String {
+    // Keys are stored hashed, so the test mints its own and hands the same
+    // string on — see `state_with`, which must therefore return it. Kept as a
+    // separate lookup so the tests read the same way.
+    let store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let a = store.accounts().first().expect("an account").clone();
+    drop(store);
+    LEAKED_KEYS.with(|k| {
+        k.borrow_mut()
+            .remove(&a.email)
+            .unwrap_or_else(|| panic!("no key was recorded for {}", a.email))
+    })
+}
+
+thread_local! {
+    /// The plaintext of each account's key, keyed by email.
+    ///
+    /// A `Store` keeps only hashes, by design — a key is shown once and never
+    /// again. So a test that needs to present one has to keep its own copy,
+    /// which is what [`state_with`] does here.
+    static LEAKED_KEYS: std::cell::RefCell<std::collections::HashMap<String, String>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// A tool the proxy answers itself is resolved here, not asked of the far end.
+///
+/// The declaration never leaves: the far end has no such `type` and refuses the
+/// whole body over it (which is how the `ou_est_charlie` incident produced a
+/// 400 on every request of a session). What the upstream sees instead is the
+/// data as an aside on the caller's last turn, so the model reads the question
+/// and then the data.
+///
+/// The aside is not a fabricated call-and-result. It used to be, and that is
+/// what a later bug report was: `DeepSeek`'s Anthropic endpoint rejects a
+/// thinking-mode assistant turn that carries no `thinking` block, and an
+/// assistant turn invented here carried none — so every request with a local
+/// tool in the policy was a 400.
+#[test]
+fn a_local_tool_is_resolved_by_the_proxy_and_never_asked_upstream() {
+    let _serial = EGRESS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (upstream, seen) = mock_status(200, "{\"usage\":{\"input_tokens\":3,\"output_tokens\":4}}");
+    let dir = scratch("localtool");
+    let stub_key = dir.join("stub.key");
+    std::fs::write(&stub_key, "sk-stub-provider").expect("write stub key");
+    let provider = stub_provider("primary", upstream, 0, &stub_key);
+
+    let mut store = Store::load(dir.join("users.json")).expect("store");
+    let a = store.add("Ada", "Lovelace", "ada@example.org").expect("add");
+    // Opting in is declaring the name, exactly as for any other injected tool.
+    let declared = serde_json::json!({
+        "type": "cloudflare_ips_20260913",
+        "name": "cloudflare_ips",
+    });
+    store
+        .set_tools(
+            &a.id,
+            tools::Policy {
+                add: vec![declared],
+                ..tools::Policy::default()
+            },
+        )
+        .expect("set tools");
+    let (_k, key) = store.add_key(&a.email, "laptop").expect("key");
+    let state = Arc::new(State {
+        store: Mutex::new(store),
+        usage: Mutex::new(usage::Store::load(dir.join("usage"))),
+        sched: Mutex::new(qos::Sched::new()),
+        account: Mutex::new(account::Monitor::load(&dir)),
+        inspect: Mutex::new(tab_atelier_proxy::inspect::Store::load(std::env::temp_dir())),
+        wake: tokio::sync::Notify::new(),
+        registry: Mutex::new(Registry {
+            mappings: vec![],
+            providers: vec![provider],
+        }),
+        registry_path: dir.join("providers.json"),
+        provider_backoff: Mutex::new(std::collections::BTreeMap::new()),
+        admin_token: "tap_admin".to_owned(),
+        web_root: None,
+    });
+    let served = serve(&state);
+
+    let payload = r#"{"model":"primary-balanced","max_tokens":16,"tools":[{"name":"Bash","input_schema":{"type":"object"}}],"messages":[{"role":"user","content":"the cloudflare ranges?"}]}"#;
+    let resp = request(
+        served.port,
+        &format!(
+            "POST /relay/anthropic/v1/messages HTTP/1.1\r\nHost: x\r\nx-api-key: {key}\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
+            payload.len()
+        ),
+    );
+    assert!(resp.starts_with("HTTP/1.1 200"), "resp: {resp}");
+
+    let seen = seen
+        .recv_timeout(std::time::Duration::from_secs(3))
+        .expect("upstream saw the request");
+    let (_, body) = seen.split_once("\r\n\r\n").expect("headers and body");
+    let got: serde_json::Value = serde_json::from_str(body).expect("upstream body is JSON");
+
+    // The declaration is gone, and the client's own tool is untouched.
+    let text = got.to_string();
+    assert!(
+        !text.contains("cloudflare_ips_20260913"),
+        "the typed declaration must not be forwarded: {text:.400}"
+    );
+    assert!(
+        got["tools"]
+            .as_array()
+            .is_some_and(|t| t.iter().any(|t| t["name"] == "Bash")),
+        "the client's own tool survives: {text:.400}"
+    );
+
+    // The data rides on the caller's own turn. No exchange is fabricated, and
+    // in particular no assistant turn: one invented here would have to carry a
+    // thinking block for DeepSeek's thinking mode, and there is none to carry.
+    let messages = got["messages"].as_array().expect("messages");
+    assert_eq!(messages.len(), 1, "no message is invented: {text:.400}");
+    let last = messages.last().expect("the caller's turn");
+    assert_eq!(last["role"], "user");
+    let blocks = last["content"].as_array().expect("blocks");
+    assert_eq!(blocks[0]["type"], "text");
+    assert_eq!(blocks[0]["text"], "the cloudflare ranges?");
+    assert_eq!(blocks[1]["type"], "text");
+    assert!(
+        blocks[1]["text"].as_str().is_some_and(|t| t.contains("cloudflare_ips")),
+        "the data is the aside: {text:.400}"
+    );
+    assert!(
+        !text.contains("\"tool_use\""),
+        "the model is never told it acted: {text:.400}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A non-Anthropic upstream is told who is calling.
+///
+/// The Anthropic hop has to keep the client's Claude Code identity, so that
+/// one sends the client's User-Agent. Every other wire used to go out with no
+/// User-Agent at all — the header builder returned before reaching it — which
+/// is both a fingerprinting tell and a thing some providers reject. This
+/// proves the header is actually WIRED onto the outgoing request, not merely
+/// constructed.
+#[test]
+fn an_openai_upstream_receives_a_user_agent() {
+    let _serial = EGRESS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (upstream, seen) = mock_status(200, "{\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":4}}");
+
+    let dir = scratch("openai-ua");
+    let creds = dir.join("creds.json");
+    std::fs::write(
+        &creds,
+        r#"{"claudeAiOauth":{"accessToken":"oat-fixture","refreshToken":"r","expiresAt":9999999999999,"scopes":[]}}"#,
+    )
+    .expect("write creds");
+    egress::set_credentials_path(Some(creds));
+
+    let stub_key = dir.join("stub.key");
+    std::fs::write(&stub_key, "sk-stub-provider").expect("write stub key");
+    // Same shape as `stub_provider`, but speaking the OpenAI wire.
+    let mut provider = stub_provider("oai", upstream, 0, &stub_key);
+    provider.wire = Wire::Openai;
+    let registry = Registry {
+        mappings: vec![],
+        providers: vec![provider],
+    };
+
+    let mut store = Store::load(dir.join("users.json")).expect("store");
+    let a = store.add("Ada", "Lovelace", "ada@example.org").expect("add");
+    let (_k, key) = store.add_key(&a.email, "laptop").expect("key");
+    let state = Arc::new(State {
+        store: Mutex::new(store),
+        usage: Mutex::new(usage::Store::load(dir.join("usage"))),
+        sched: Mutex::new(qos::Sched::new()),
+        account: Mutex::new(account::Monitor::load(&dir)),
+        inspect: Mutex::new(tab_atelier_proxy::inspect::Store::load(std::env::temp_dir())),
+        wake: tokio::sync::Notify::new(),
+        registry: Mutex::new(registry),
+        registry_path: dir.join("providers.json"),
+        provider_backoff: Mutex::new(std::collections::BTreeMap::new()),
+        admin_token: "tap_admin".to_owned(),
+        web_root: None,
+    });
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let port = boot(&rt, state);
+
+    let payload = r#"{"model":"oai-balanced","max_tokens":1,"messages":[]}"#;
+    let response = request(
+        port,
+        &format!(
+            "POST /relay/anthropic/v1/messages HTTP/1.1\r\nHost: x\r\nx-api-key: {key}\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
+            payload.len()
+        ),
+    );
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+
+    let sent = seen
+        .recv_timeout(std::time::Duration::from_secs(3))
+        .expect("upstream request");
+    let lower = sent.to_ascii_lowercase();
+    assert!(
+        lower.contains("user-agent: tab-atelier-proxy/"),
+        "no User-Agent sent: {sent}"
+    );
+    // The provider's own key, and never the caller's.
+    assert!(lower.contains("authorization: bearer sk-stub-provider"), "{sent}");
+    assert!(!sent.contains(&key), "the caller's key must not travel: {sent}");
+
+    egress::set_credentials_path(None);
+    let _ = std::fs::remove_dir_all(&dir);
+}

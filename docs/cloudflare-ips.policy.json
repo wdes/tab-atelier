@@ -1,0 +1,8 @@
+{
+  "mode": "all",
+  "add": [
+    {
+      "name": "cloudflare_ips"
+    }
+  ]
+}

@@ -1,0 +1,804 @@
+"use strict";
+// SPDX-License-Identifier: MPL-2.0
+//
+// Two chart components, hand-rolled in SVG.
+//
+// SOURCE. The file the proxy serves is ../assets/charts.js, compiled from
+// here — edit this one, and see web/README.md.
+//
+// No chart library on purpose. Pulling in a charting bundle would mean
+// vendoring several hundred KB more third-party JavaScript into the page where
+// the admin token is typed — to draw a line and some bars.
+//
+// Colours come from CSS custom properties (see the <style> block in
+// index.html), not from hex literals here, so light and dark are chosen from
+// the same ramps in one place. The pair in use — blue #2a78d6 / orange #eb6834
+// in light, #3987e5 / #d95926 in dark — was checked with the palette validator
+// in both modes: lightness band, chroma floor, CVD separation (ΔE 24.7 protan
+// worst case), normal-vision separation and contrast all pass.
+(function () {
+    "use strict";
+    const PAD = { top: 10, right: 10, bottom: 22, left: 48 };
+    const W = 720;
+    const H = 200;
+    // ── Units for the token chart ───────────────────────────────────────────────
+    //
+    // The token chart counts tokens. The toggle in its header asks two different
+    // questions about them, and the answers are not the same kind of thing.
+    //
+    // Energy (`Wh`, `gCO₂e`) is a published ESTIMATE extrapolated from a per-prompt
+    // figure, so the source is carried into the UI wherever a converted value
+    // appears and a conversion never touches a provider's own token numbers.
+    //
+    // Money (`$`) is a RECORD rather than an estimate. The server writes the amount
+    // beside the tokens as it serves them, so a bar is what the hour was charged —
+    // not a rate applied to a count after the fact, which would drift every time the
+    // price list changed and silently re-price history. Where no amount was
+    // recorded, the bar is absent rather than estimated; `moneyNote` says so.
+    /** What the token chart's y-axis and totals are expressed in. */
+    const TOKEN_UNITS = ["tokens", "wh", "gco2", "usd"];
+    const UNIT_LABEL = {
+        tokens: "tokens",
+        wh: "Wh",
+        gco2: "gCO₂e",
+        usd: "$",
+    };
+    /** The same labels as an ordered list, for the `<select>` in the header. */
+    const UNIT_OPTIONS = TOKEN_UNITS.map((id) => ({ id, label: UNIT_LABEL[id] }));
+    // Energy per token. Google's May 2025 Gemini inference disclosure puts a median
+    // text prompt at 0.24 Wh of datacenter energy and 0.03 gCO₂e of emissions — per
+    // PROMPT. The median prompt's token count is not published, so these are that
+    // measurement divided by 1,000 tokens: a round working assumption, not a
+    // measured per-token figure. Read every converted value as an order of
+    // magnitude, and show SOURCE_ENERGY beside it.
+    const WH_PER_TOKEN = 0.00024;
+    const SOURCE_ENERGY = {
+        value: "0.24 Wh and 0.03 gCO₂e",
+        unit: "per median Gemini text prompt",
+        source: "Google, “Measuring the environmental impact of AI inference”, May 2025",
+    };
+    /** The full caveat, shown verbatim beside every converted figure. */
+    function energyNote() {
+        return (`Estimated from token counts using ${SOURCE_ENERGY.value} ${SOURCE_ENERGY.unit} ` +
+            `(${SOURCE_ENERGY.source}). The prompt's token count is not published, so ` +
+            `1,000 tokens is assumed — read these as an order of magnitude.`);
+    }
+    /** Multiplier from Wh to each energy unit: Wh→gCO₂e is a ratio within Google's
+     *  own figures (0.03 g per 0.24 Wh). */
+    const ENERGY_SCALE = {
+        wh: 1,
+        gco2: 0.03 / 0.24,
+    };
+    // Published list prices, per 1M tokens. DeepSeek's are the ones the repo
+    // already records (provider.rs, beside `relative_cost`), and Flash is the model
+    // every account here is served by, so they are the rates the figures are built
+    // from rather than a second opinion about them.
+    const SOURCE_PRICE = {
+        value: "$0.003 cached input · $0.15 uncached input · $0.60 output, per 1M tokens",
+        unit: "DeepSeek Flash list price, off-peak",
+    };
+    /** The full caveat, shown verbatim wherever a money figure appears. */
+    function moneyNote() {
+        return (`What each hour was charged, recorded by the server as the tokens were used ` +
+            `and stored beside them. It is a record, not a re-estimate: it does not move ` +
+            `when the price list changes, and it cannot be recomputed into a different ` +
+            `answer later. The hours were priced at the rates in force when each call was ` +
+            `made — ${SOURCE_PRICE.unit}, ${SOURCE_PRICE.value} — with the peak window ` +
+            `applied to the hour it covers. Hours recorded before amounts were stored ` +
+            `carry no amount and are drawn as gaps rather than filled with today's ` +
+            `prices, which would be a figure about the price list rather than about the ` +
+            `traffic.`);
+    }
+    /** Convert a token count into `unit`; `tokens` passes straight through. */
+    /**
+     * The magnitude each panel shows for a bucket, before unit scaling.
+     *
+     * Money is not a rescaling of a token count: it prices three classes at three
+     * rates, so it arrives from the server already computed. Tokens and energy are
+     * raw counts that `convertTokens` scales afterwards. Keeping the branch here
+     * means the chart, the page header and the tiles all ask the same function
+     * which quantity they are plotting.
+     */
+    function rawValues(b, unit) {
+        return unit === "usd" ? [b.cost_in_micro ?? 0, b.cost_out_micro ?? 0] : [b.input, b.output];
+    }
+    /**
+     * The largest value the chart will draw from these buckets, in `unit`.
+     *
+     * Converted, not raw, because the caller uses it to name the axis — and the
+     * step below it (`unitStep`) already converted, so taking the raw field here
+     * would let the two disagree.
+     */
+    function chartTop(buckets, unit) {
+        let top = 0;
+        for (const b of buckets) {
+            const [i, o] = rawValues(b, unit);
+            top = Math.max(top, convertTokens(i, unit), convertTokens(o, unit));
+        }
+        return top;
+    }
+    function convertTokens(tokens, unit) {
+        const scale = ENERGY_SCALE[unit];
+        return scale === undefined ? tokens : tokens * WH_PER_TOKEN * scale;
+    }
+    // `usd` is deliberately absent from `ENERGY_SCALE`, so it falls through above
+    // unchanged — and that is the point rather than an oversight. Money is priced on
+    // the server and arrives already in micro-USD, because it is piecewise over
+    // three token classes at three rates and no single multiplier of one token count
+    // can recover it. Every other unit here *is* such a multiplier; money is the one
+    // that has already been converted, so converting it again would be wrong.
+    /** A compact count for a chart axis, where `1.2k` beats five digits. */
+    function fmtCount(n) {
+        if (n >= 1e9)
+            return `${(n / 1e9).toFixed(1)}B`;
+        if (n >= 1e6)
+            return `${(n / 1e6).toFixed(1)}M`;
+        if (n >= 1e3)
+            return `${(n / 1e3).toFixed(1)}k`;
+        // Converted values land here as fractions where a raw count never does, and
+        // `0.00001` is noise on an axis rather than information.
+        if (!Number.isInteger(n))
+            return n < 1 ? n.toFixed(2) : n.toFixed(1);
+        return String(n);
+    }
+    /**
+     * How each unit steps up, largest first. Spelled out per unit rather than
+     * derived from the SI rules, because the prefix belongs to the *unit*
+     * (`566.8 kWh`, never `566.8k Wh`). `t` is the metric tonne (1e6 g), the
+     * step above `kgCO₂e`.
+     */
+    const UNIT_STEPS = {
+        wh: [[1e9, "GWh"], [1e6, "MWh"], [1e3, "kWh"]],
+        gco2: [[1e6, "tCO₂e"], [1e3, "kgCO₂e"]],
+        // `usd` is absent on purpose. Stepping is what moves the prefix off the
+        // figures and onto the axis name (`566.8` beneath `kWh`), and money cannot
+        // afford that: the same chart writes `$0.900` in its tooltip and in its panel
+        // totals, so an axis of bare `600` under an `m$` heading contradicts both.
+        // `m$` and `µ$` are not anyone's notation for dollars either. Money keeps its
+        // symbol on every figure instead — `money()` below, reached by `fmt` in
+        // `TokensChart`, which is also where the resolution a step used to provide is
+        // preserved.
+    };
+    /** Micro-USD as currency, with the symbol leading: `$25.90`, `$0.0312`. */
+    function money(micro) {
+        const dollars = micro / 1e6;
+        // Decimals follow the magnitude: cents for a real sum, more only when the
+        // whole figure is smaller than one — an hourly cost of $0.004 printed as
+        // `$0.00` is indistinguishable from an hour that cost nothing. The lowest
+        // band carries that argument past the cent: a priced hour is routinely a
+        // fraction of a cent, and six places resolve a micro-dollar, so `$0.000030`
+        // still reads as spent. That is the resolution the `µ$` unit step used to
+        // supply, folded into the figure rather than into the axis name. The zero
+        // line takes cents instead, since a tick at `$0.000000` is noise about money
+        // rather than the absence of it.
+        const places = dollars === 0 ? 2 : dollars >= 1 ? 2 : dollars >= 0.01 ? 3 : dollars >= 0.0001 ? 4 : 6;
+        return `$${dollars.toFixed(places)}`;
+    }
+    /** A quantity with its unit, magnitude folded into the unit: `566.8 kWh`. */
+    function withUnit(n, unit) {
+        if (unit === "tokens")
+            return `${fmtCount(n)} tokens`;
+        // The one unit whose symbol leads rather than trails, because `25.9 $` reads
+        // as a different figure than `$25.90` — and only this one is a currency.
+        if (unit === "usd")
+            return money(n);
+        const u = unit;
+        const step = UNIT_STEPS[u]?.find(([m]) => Math.abs(n) >= m);
+        return step === undefined
+            ? `${fmtCount(n)} ${UNIT_LABEL[u] ?? unit}`
+            : `${fmtCount(n / step[0])} ${step[1]}`;
+    }
+    /** `v` rounded up to one significant figure — the top of a chart's axis. */
+    function niceNumber(v) {
+        if (v <= 0)
+            return 1;
+        const mag = 10 ** Math.floor(Math.log10(v));
+        return Math.ceil(v / mag) * mag;
+    }
+    /**
+     * The unit a chart prints for a series whose tallest bucket is `max`, in `unit`.
+     *
+     * `max` arrives already converted, matching `unitStep`, which picks the tick
+     * steps from the same converted quantity. The two must agree or the ticks read
+     * `566.8` under a `Wh` heading; converting in one and not the other is the way
+     * that happens. Callers convert, this function only names.
+     */
+    function unitSuffix(max, unit) {
+        const label = UNIT_LABEL[unit] ?? UNIT_LABEL.tokens;
+        const steps = UNIT_STEPS[unit];
+        if (!steps)
+            return label;
+        const top = Math.abs(niceNumber(max));
+        return steps.find(([m]) => top >= m)?.[1] ?? label;
+    }
+    // tooltip. Hover is not optional decoration — an hourly series is unreadable
+    // without a way to ask "which hour is that, exactly".
+    const hoverable = Vue.defineComponent({
+        // Declared here because the mixin uses it: `onMove` maps a pixel to an index
+        // in this array, and `xOf` divides by its length. A mixin that silently
+        // assumed a host property would be a runtime crash waiting for the one host
+        // that forgot.
+        props: { points: { type: Array, required: true } },
+        data() {
+            return { hover: -1 };
+        },
+        computed: {
+            plotW() {
+                return W - PAD.left - PAD.right;
+            },
+            plotH() {
+                return H - PAD.top - PAD.bottom;
+            },
+            // `hover` is an index into a prop the parent swaps wholesale — a new hour
+            // bucket, a changed focus, refreshed usage. Between that swap and the next
+            // mousemove the old index can point past the end of the new array, and
+            // every `points[hover].…` below would dereference undefined. Gate on this,
+            // never on `hover >= 0` alone.
+            hovering() {
+                return this.hover >= 0 && this.hover < this.points.length;
+            },
+        },
+        methods: {
+            onMove(e) {
+                // Bound only to the <svg>, which is what makes this cast safe.
+                const svg = e.currentTarget;
+                const r = svg.getBoundingClientRect();
+                // Client px → viewBox units, so hit-testing is right at any width.
+                const x = ((e.clientX - r.left) / r.width) * W - PAD.left;
+                const i = Math.floor((x / this.plotW) * this.points.length);
+                this.hover = i >= 0 && i < this.points.length ? i : -1;
+            },
+            onLeave() {
+                this.hover = -1;
+            },
+            xOf(i) {
+                return PAD.left + (this.plotW * (i + 0.5)) / this.points.length;
+            },
+            // Tooltip flips to the left of the cursor near the right edge so it never
+            // hangs off the card.
+            tipStyle(i) {
+                const frac = (this.xOf(i) / W) * 100;
+                return frac > 62 ? { right: `${100 - frac}%` } : { left: `${frac}%` };
+            },
+            hourLabel(ts) {
+                const d = new Date(ts * 1000);
+                return d.toLocaleString([], { month: "short", day: "numeric", hour: "2-digit" });
+            },
+            fmt(n) {
+                return fmtCount(n);
+            },
+            // A rounded top on a "nice" number, so gridlines land on values a person
+            // would have chosen.
+            niceMax(v) {
+                return niceNumber(v);
+            },
+            ticks(max) {
+                return [0, 0.5, 1].map((f) => Math.round(max * f));
+            },
+        },
+    });
+    // Roughly six x labels, whatever the window length. Computed rather than
+    // filtered inline: in Vue 3 `v-if` is evaluated BEFORE `v-for`, so a
+    // `v-for`+`v-if` pair on one element cannot see the loop variable at all.
+    const xLabels = Vue.defineComponent({
+        props: { points: { type: Array, required: true } },
+        computed: {
+            labels() {
+                const step = Math.max(1, Math.ceil(this.points.length / 6));
+                return this.points.map((p, i) => ({ p, i })).filter(({ i }) => i % step === 0);
+            },
+        },
+    });
+    // ── API calls over time ─────────────────────────────────────────────
+    // One series, so there is no legend: the title names it. Area under a 2px
+    // line — the shape over time is the question, and the fill makes an idle
+    // stretch read as idle rather than as missing data.
+    const CallsChart = Vue.defineComponent({
+        mixins: [hoverable, xLabels],
+        props: {
+            points: { type: Array, required: true },
+            /**
+             * One series per account, when nobody is selected. Empty means the caller
+             * has drilled into one account, and the single-series rendering below is
+             * used instead.
+             *
+             * The colour slot arrives WITH the series rather than being chosen here:
+             * slots must be stable across a filter change, and a chart that assigned
+             * them by size would recolour every line the moment the busiest account
+             * changed. See `callsByUser` in app.ts.
+             */
+            byUser: { type: Array, default: () => [] },
+        },
+        computed: {
+            // The mixins declare `points` as the union they can plot, and Vue
+            // merges their props ahead of this component's. `pts` undoes that
+            // widening once, here, rather than casting at every use.
+            pts() {
+                return this.points;
+            },
+            users() {
+                return this.byUser;
+            },
+            multi() {
+                return this.users.length > 0;
+            },
+            // The series themselves, WITHOUT their path strings. `peak` needs the
+            // points to size the axis, and a path is drawn against that axis — so
+            // building `d` here would close the loop peak → series → yOf → max → peak
+            // and recurse until the stack goes. The split is not tidiness; it is what
+            // breaks the cycle.
+            seriesList() {
+                return this.users.map((s) => ({
+                    key: s.id,
+                    name: s.name,
+                    slot: s.slot,
+                    points: s.points,
+                }));
+            },
+            // Every series, laid out against the same x positions as `pts`. The caller
+            // builds them on the same hour grid, so index alignment is guaranteed
+            // rather than hoped for.
+            seriesPaths() {
+                return this.seriesList.map((s) => ({
+                    ...s,
+                    d: s.points.map((p, i) => `${i ? "L" : "M"}${this.xOf(i)},${this.yOf(p.calls)}`).join(" "),
+                }));
+            },
+            peak() {
+                if (!this.multi)
+                    return Math.max(1, ...this.pts.map((p) => p.calls));
+                // Across every series: one y-scale for all of them, or the lines would
+                // be compared on axes that do not agree. From `seriesList`, not from the
+                // paths — see above.
+                const all = this.seriesList.flatMap((s) => s.points.map((p) => p.calls));
+                return Math.max(1, ...all);
+            },
+            max() {
+                return this.niceMax(this.peak);
+            },
+            yOf() {
+                return (v) => PAD.top + this.plotH * (1 - v / this.max);
+            },
+            line() {
+                return this.pts.map((p, i) => `${i ? "L" : "M"}${this.xOf(i)},${this.yOf(p.calls)}`).join(" ");
+            },
+            area() {
+                if (!this.points.length)
+                    return "";
+                const base = PAD.top + this.plotH;
+                return `${this.line} L${this.xOf(this.points.length - 1)},${base} L${this.xOf(0)},${base} Z`;
+            },
+            // Who was calling at the hovered hour, busiest first — the question the
+            // summed single line cannot answer.
+            hoverRows() {
+                if (this.hover < 0)
+                    return [];
+                return this.seriesPaths
+                    .map((s) => {
+                    const b = s.points[this.hover];
+                    return { name: s.name, slot: s.slot, calls: b?.calls ?? 0, errors: b?.errors ?? 0 };
+                })
+                    .filter((r) => r.calls > 0)
+                    .sort((a, b) => b.calls - a.calls);
+            },
+        },
+        methods: {
+            // The categorical hue for a slot, or muted ink for the folded "Other" —
+            // which is a group, not an entity, and should not read as one more person.
+            stroke(slot) {
+                return slot >= 0 && slot < 8 ? `var(--cat-${slot + 1})` : "var(--text-muted)";
+            },
+        },
+        template: `
+    <div class="ta-chart">
+      <svg :viewBox="'0 0 ' + ${W} + ' ' + ${H}" @mousemove="onMove" @mouseleave="onLeave" role="img"
+           aria-label="API calls per hour">
+        <g class="ta-grid">
+          <line v-for="t in ticks(max)" :key="'g'+t"
+                :x1="${PAD.left}" :x2="${W - PAD.right}" :y1="yOf(t)" :y2="yOf(t)" />
+          <text v-for="t in ticks(max)" :key="'l'+t" :x="${PAD.left - 8}" :y="yOf(t) + 4"
+                text-anchor="end">{{ fmt(t) }}</text>
+        </g>
+        <g v-if="hovering">
+          <line class="ta-crosshair" :x1="xOf(hover)" :x2="xOf(hover)" :y1="${PAD.top}" :y2="${H - PAD.bottom}" />
+        </g>
+        <!-- One series per account, or the single summed one when focused. -->
+        <template v-if="multi">
+          <path v-for="s in seriesPaths" :key="s.key" :d="s.d" class="ta-line-user"
+                :stroke="stroke(s.slot)" />
+        </template>
+        <template v-else>
+          <path :d="area" class="ta-area-1" />
+          <path :d="line" class="ta-line-1" />
+        </template>
+        <g v-if="hovering">
+          <template v-if="multi">
+            <circle v-for="s in seriesPaths" :key="'d'+s.key"
+                    :cx="xOf(hover)" :cy="yOf(s.points[hover]?.calls ?? 0)" r="3.5"
+                    :fill="stroke(s.slot)" />
+          </template>
+          <circle v-else :cx="xOf(hover)" :cy="yOf(points[hover].calls)" r="5" class="ta-dot-1" />
+        </g>
+        <g class="ta-axis">
+          <text v-for="l in labels" :key="'x'+l.i"
+                :x="xOf(l.i)" :y="${H - 6}" text-anchor="middle">{{ hourLabel(l.p.hour) }}</text>
+        </g>
+      </svg>
+      <!-- A legend is not optional at two or more series: identity must never
+           rest on hue alone. It also discharges the light-mode contrast warning
+           on three of these slots, which obliges visible labels. -->
+      <div v-if="multi" class="small text-body-secondary mt-1">
+        <span v-for="s in seriesPaths" :key="'k'+s.key" class="me-3 text-nowrap">
+          <span class="ta-key" :style="{ background: stroke(s.slot) }"></span>{{ s.name }}
+        </span>
+      </div>
+      <div v-if="hovering" class="ta-tip" :style="tipStyle(hover)">
+        <div class="ta-tip-h">{{ hourLabel(points[hover].hour) }}</div>
+        <template v-if="multi">
+          <div v-for="r in hoverRows" :key="r.name">
+            <span class="ta-key" :style="{ background: stroke(r.slot) }"></span>{{ r.name }}
+            <span class="ta-tip-sub">{{ r.calls }}</span>
+          </div>
+          <div v-if="!hoverRows.length" class="ta-tip-sub">no calls</div>
+        </template>
+        <template v-else>
+          <div><span class="ta-key ta-bg-1"></span>{{ points[hover].calls }} calls</div>
+          <div v-if="points[hover].errors" class="ta-tip-err">{{ points[hover].errors }} failed</div>
+        </template>
+      </div>
+    </div>`,
+    });
+    // ── Tokens over time ────────────────────────────────────────────────
+    // Two series, so a legend is always present. Stacked bars rather than two
+    // lines: input and output sum to something meaningful (what the hour cost),
+    // which a pair of lines would not show. 2px surface gap between the segments
+    // and a 4px rounded top on the data-end.
+    /**
+     * Input and output tokens per hour, as two panels with their OWN scales.
+     *
+     * This was a stacked bar on one axis, and it could not do its job. Output is
+     * routinely a rounding error beside input — 11k against 440k — so an output
+     * band two per cent tall is a sliver, and the SHAPE of the output series, which
+     * is the thing worth watching, was invisible.
+     *
+     * One scale cannot fix that and a second y-axis on the same plot would be
+     * worse: two scales drawn over one grid invite reading a crossing as a
+     * relationship. So the panels are separated instead — the classic small
+     * multiple. Each carries its own total in its title, so the magnitude
+     * relationship is STATED rather than implied by a shared axis.
+     *
+     * Stacking was also the wrong idea for these two series independently: input
+     * and output are not parts of a whole, they are two different things measured
+     * in the same unit.
+     */
+    const TokensChart = Vue.defineComponent({
+        mixins: [hoverable, xLabels],
+        props: {
+            points: { type: Array, required: true },
+            // Set by the header's toggle. The energy units rescale the numbers without
+            // changing the bars' shape — Wh and gCO₂e are a linear factor apart from
+            // tokens, so the picture is the same one relabelled. Money is NOT that: it
+            // weights the same hour by which class the tokens were, and three classes
+            // 50x apart price to a different shape than their sum. So `usd` moves the
+            // bars too, via `valIn`/`valOut` below.
+            unit: { type: String, default: "tokens" },
+        },
+        computed: {
+            // The mixins declare `points` as the union they can plot, and Vue
+            // merges their props ahead of this component's. `pts` undoes that
+            // widening once, here, rather than casting at every use.
+            pts() {
+                return this.points;
+            },
+            // Two panels, the gap between them, and the x axis they share.
+            gap() {
+                return 18;
+            },
+            panelH() {
+                return (this.plotH - this.gap) / 2;
+            },
+            maxIn() {
+                return this.niceMax(Math.max(1, ...this.pts.map((p) => this.valIn(p))));
+            },
+            maxOut() {
+                return this.niceMax(Math.max(1, ...this.pts.map((p) => this.valOut(p))));
+            },
+            // The window's totals, for the panel titles: with separate scales these
+            // numbers are the only place the ratio between the two survives.
+            totalIn() {
+                return this.pts.reduce((a, p) => a + this.valIn(p), 0);
+            },
+            totalOut() {
+                return this.pts.reduce((a, p) => a + this.valOut(p), 0);
+            },
+            barW() {
+                // 2px of surface between neighbours, and never a sliver.
+                return Math.max(1, this.plotW / this.points.length - 2);
+            },
+            // One step for the whole chart. Choosing per-value would label ticks on the
+            // same axis "900 kWh" and "1.2 MWh"; the tallest value picks, every tick
+            // obeys, and the axis name carries the prefix the numbers dropped.
+            unitStep() {
+                const top = Math.max(this.maxIn, this.maxOut);
+                return UNIT_STEPS[this.unit]?.find(([m]) => Math.abs(convertTokens(top, this.unit)) >= m);
+            },
+            unitName() {
+                // From the converted magnitude, like `unitStep` above — the axis heading
+                // and the tick steps have to be chosen from the same quantity, or the
+                // ticks read `566.8` under a `Wh` heading.
+                //
+                // Money made this worth saying out loud rather than leaving implicit:
+                // `convertTokens` is the identity for `usd`, so a caller passing the raw
+                // micro-USD field and one passing a converted figure would agree today
+                // and diverge the moment the scale changed. `rawValues` and this
+                // conversion are the contract: values arrive in the unit's base unit,
+                // `convertTokens` puts them in the unit the axis prints.
+                return unitSuffix(convertTokens(Math.max(this.maxIn, this.maxOut), this.unit), this.unit);
+            },
+        },
+        methods: {
+            // Overrides the mixin's: every number this chart prints is a token count
+            // until `unit` says otherwise, so converting here keeps the axis, the panel
+            // totals and the tooltip on one unit without each call site knowing. The
+            // magnitude moves into the axis name, so `566.8` + `kWh` — never `566.8k`
+            // + `Wh`, which reads as a different number.
+            //
+            // Money is the exception, and it is handled here rather than in `unitName`
+            // so the heading and the figures cannot drift apart: with no unit steps the
+            // axis name falls back to a bare `$`, and `fmtCount` would then round a real
+            // hour to `0.00`. `money()` keeps the symbol on every figure instead.
+            fmt(n) {
+                if (this.unit === "usd")
+                    return money(n);
+                const v = convertTokens(n, this.unit);
+                const step = this.unitStep;
+                return step === undefined ? fmtCount(v) : fmtCount(v / step[0]);
+            },
+            // The tooltip prints a figure, not a position on an axis, so it cannot lean
+            // on the axis name for its unit the way tick labels do — `0.03 in` is not a
+            // price. That is the choice `fmt` already makes, money included; asking it
+            // rather than repeating the decision is what keeps a figure from being the
+            // one call site somebody forgets to teach about a unit.
+            tip(n) {
+                return this.fmt(n);
+            },
+            // The panel totals label themselves rather than borrowing the axis name:
+            // a window total can sit a step above the tallest single hour. Money writes
+            // itself as `$25.90`, where `25.90 $` would be a different layout and a
+            // different rounding.
+            amt(n) {
+                return this.unit === "usd" ? money(n) : withUnit(convertTokens(n, this.unit), this.unit);
+            },
+            // What a bar actually plots. The switch between token counts and money has
+            // to happen HERE, at the point a value is named, because the two are not the
+            // same quantity on different scales: `input` counts tokens, while
+            // `cost_in_micro` prices three classes at three rates. Every read of a
+            // panel's magnitude goes through these two, so the choice is made once.
+            valIn(p) {
+                return rawValues(p, this.unit)[0];
+            },
+            valOut(p) {
+                return rawValues(p, this.unit)[1];
+            },
+            // The two scales, kept as separate functions rather than one parameterised
+            // by a panel index — mixing them up would silently plot output against
+            // input's axis, which is the bug this whole change exists to avoid.
+            yIn(v) {
+                return PAD.top + this.panelH * (1 - v / this.maxIn);
+            },
+            yOut(v) {
+                return PAD.top + this.panelH + this.gap + (1 - v / this.maxOut) * this.panelH;
+            },
+            // A bar is read from ITS panel's baseline, so the height is the difference
+            // between the baseline and the value on that panel's own scale.
+            bar(i, v, bottom, y) {
+                const top = y(v);
+                return { x: this.xOf(i) - this.barW / 2, y: top, width: this.barW, height: Math.max(0, bottom - top) };
+            },
+            barIn(i, v) {
+                return this.bar(i, v, PAD.top + this.panelH, (n) => this.yIn(n));
+            },
+            barOut(i, v) {
+                return this.bar(i, v, PAD.top + this.panelH + this.gap + this.panelH, (n) => this.yOut(n));
+            },
+        },
+        template: `
+    <div class="ta-chart">
+      <svg :viewBox="'0 0 ' + ${W} + ' ' + ${H}" @mousemove="onMove" @mouseleave="onLeave" role="img"
+           :aria-label="'Input and output ' + unitName + ' per hour, on separate scales'">
+        <!-- Input -->
+        <g class="ta-grid">
+          <line v-for="t in ticks(maxIn)" :key="'gi'+t"
+                :x1="${PAD.left}" :x2="${W - PAD.right}" :y1="yIn(t)" :y2="yIn(t)" />
+          <text v-for="t in ticks(maxIn)" :key="'li'+t" :x="${PAD.left - 8}" :y="yIn(t) + 4"
+                text-anchor="end">{{ fmt(t) }}</text>
+        </g>
+        <text class="ta-panel-title" :x="${PAD.left + 4}" :y="${PAD.top + 10}">
+          <tspan class="ta-key ta-bg-1"></tspan>input · {{ amt(totalIn) }}
+        </text>
+        <g v-for="(p, i) in pts" :key="'bi'+i">
+          <rect v-if="valIn(p)" v-bind="barIn(i, valIn(p))" class="ta-bar-1" rx="4" />
+        </g>
+
+        <!-- Output, on its own scale: the point of the split. -->
+        <g class="ta-grid">
+          <line v-for="t in ticks(maxOut)" :key="'go'+t"
+                :x1="${PAD.left}" :x2="${W - PAD.right}" :y1="yOut(t)" :y2="yOut(t)" />
+          <text v-for="t in ticks(maxOut)" :key="'lo'+t" :x="${PAD.left - 8}" :y="yOut(t) + 4"
+                text-anchor="end">{{ fmt(t) }}</text>
+        </g>
+        <text class="ta-panel-title" :x="${PAD.left + 4}" :y="yOut(maxOut) + 10">
+          <tspan class="ta-key ta-bg-2"></tspan>output · {{ amt(totalOut) }}
+        </text>
+        <g v-for="(p, i) in pts" :key="'bo'+i">
+          <rect v-if="valOut(p)" v-bind="barOut(i, valOut(p))" class="ta-bar-2" rx="4" />
+        </g>
+
+        <!-- One crosshair across both, because the x axis is shared. -->
+        <line v-if="hovering" class="ta-crosshair" :x1="xOf(hover)" :x2="xOf(hover)"
+              :y1="${PAD.top}" :y2="${H - PAD.bottom}" />
+        <g class="ta-axis">
+          <text v-for="l in labels" :key="'x'+l.i"
+                :x="xOf(l.i)" :y="${H - 6}" text-anchor="middle">{{ hourLabel(l.p.hour) }}</text>
+        </g>
+      </svg>
+      <div v-if="hovering" class="ta-tip" :style="tipStyle(hover)">
+        <div class="ta-tip-h">{{ hourLabel(points[hover].hour) }}</div>
+        <div><span class="ta-key ta-bg-1"></span>{{ tip(valIn(points[hover])) }} in</div>
+        <div><span class="ta-key ta-bg-2"></span>{{ tip(valOut(points[hover])) }} out</div>
+        <div v-if="unit === 'usd'" class="ta-tip-sub">
+          {{ tip(valIn(points[hover]) + valOut(points[hover])) }} this hour
+        </div>
+        <div v-else-if="points[hover].cache_read" class="ta-tip-sub">
+          {{ fmt(points[hover].cache_read) }} cache read
+        </div>
+      </div>
+    </div>`,
+    });
+    // ── Plan pressure over time ─────────────────────────────────────────
+    // One series (utilisation), so no legend — the title names it. The thing that
+    // makes this chart worth drawing is the THRESHOLD rule: a number on its own
+    // does not tell you whether you are about to be degraded, and the distance to
+    // that line is the actual question.
+    // Below this the five-hour window counts as reset. See `sessionResets`.
+    const RESET_EPS = 0.01;
+    const PressureChart = Vue.defineComponent({
+        mixins: [hoverable, xLabels],
+        props: {
+            points: { type: Array, required: true },
+            threshold: { type: Number, default: 0.85 },
+        },
+        computed: {
+            // The mixins declare `points` as the union they can plot, and Vue
+            // merges their props ahead of this component's. `pts` undoes that
+            // widening once, here, rather than casting at every use.
+            pts() {
+                return this.points;
+            },
+            // Always full scale: utilisation is a fraction of a fixed thing, and
+            // rescaling to the data would make 12% look alarming.
+            max() {
+                return 1;
+            },
+            yOf() {
+                return (v) => PAD.top + this.plotH * (1 - Math.min(v, 1) / this.max);
+            },
+            line() {
+                return this.pts
+                    .map((p, i) => `${i ? "L" : "M"}${this.xOf(i)},${this.yOf(p.util ?? 0)}`)
+                    .join(" ");
+            },
+            area() {
+                if (!this.points.length)
+                    return "";
+                const base = PAD.top + this.plotH;
+                return `${this.line} L${this.xOf(this.points.length - 1)},${base} L${this.xOf(0)},${base} Z`;
+            },
+            // The weekly window, drawn behind the five-hour one. Same axis, because
+            // both are a fraction of their OWN window — a second y-scale here would be
+            // the classic dual-axis lie, inviting comparison of two numbers that share
+            // no denominator.
+            //
+            // Gaps are breaks, not zeroes: a failed poll carries no weekly figure, and
+            // joining across it would draw a decline that never happened.
+            weeklySegments() {
+                const out = [];
+                let run = [];
+                this.pts.forEach((p, i) => {
+                    if (p.seven_day == null) {
+                        if (run.length > 1)
+                            out.push(run.join(" "));
+                        run = [];
+                        return;
+                    }
+                    run.push(`${run.length ? "L" : "M"}${this.xOf(i)},${this.yOf(p.seven_day)}`);
+                });
+                if (run.length > 1)
+                    out.push(run.join(" "));
+                return out;
+            },
+            hasWeekly() {
+                return this.pts.some((p) => p.seven_day != null);
+            },
+            // Where the five-hour window rolled over: utilisation fell from above 1%
+            // to at or below it between two readings. Without these the line is one
+            // continuous sawtooth with no way to see where a session window ends and
+            // the next begins — and that window is the unit the limit is enforced in.
+            //
+            // A threshold rather than `=== 0` because the window is only visible
+            // through five-minute polls: the odds of sampling the instant it reads
+            // exactly zero are poor, and a reset caught at 0.4% is still a reset.
+            sessionResets() {
+                const out = [];
+                for (let i = 1; i < this.points.length; i++) {
+                    const before = this.pts[i - 1].util;
+                    const now = this.pts[i].util;
+                    if (before == null || now == null)
+                        continue;
+                    if (before > RESET_EPS && now <= RESET_EPS)
+                        out.push(i);
+                }
+                return out;
+            },
+        },
+        methods: {
+            pct(v) {
+                return `${Math.round((v ?? 0) * 100)}%`;
+            },
+        },
+        template: `
+    <div class="ta-chart">
+      <svg :viewBox="'0 0 ' + ${W} + ' ' + ${H}" @mousemove="onMove" @mouseleave="onLeave" role="img"
+           aria-label="Share of the plan used over time">
+        <g class="ta-grid">
+          <line v-for="t in [0, 0.5, 1]" :key="'g'+t"
+                :x1="${PAD.left}" :x2="${W - PAD.right}" :y1="yOf(t)" :y2="yOf(t)" />
+          <text v-for="t in [0, 0.5, 1]" :key="'l'+t" :x="${PAD.left - 8}" :y="yOf(t) + 4"
+                text-anchor="end">{{ pct(t) }}</text>
+        </g>
+        <!-- Session-window boundaries: annotation, so they sit behind the data. -->
+        <g class="ta-reset">
+          <line v-for="i in sessionResets" :key="'r'+i"
+                :x1="xOf(i)" :x2="xOf(i)" :y1="${PAD.top}" :y2="${H - PAD.bottom}" />
+        </g>
+        <!-- The weekly window, behind the main line and dashed. The dash is a
+             second channel carrying the same identity as the hue, so the two
+             series stay apart in greyscale, in print and for a CVD reader. -->
+        <path v-for="(d, i) in weeklySegments" :key="'w'+i" :d="d" class="ta-line-2-bg" />
+        <path :d="area" class="ta-area-1" />
+        <path :d="line" class="ta-line-1" />
+        <!-- Where fallback begins. Labelled, not just coloured. -->
+        <g class="ta-threshold">
+          <line :x1="${PAD.left}" :x2="${W - PAD.right}" :y1="yOf(threshold)" :y2="yOf(threshold)" />
+          <text :x="${W - PAD.right}" :y="yOf(threshold) - 5" text-anchor="end">
+            fallback above {{ pct(threshold) }}
+          </text>
+        </g>
+        <g v-if="hovering">
+          <line class="ta-crosshair" :x1="xOf(hover)" :x2="xOf(hover)" :y1="${PAD.top}" :y2="${H - PAD.bottom}" />
+          <circle v-if="points[hover].seven_day != null" :cx="xOf(hover)"
+                  :cy="yOf(points[hover].seven_day)" r="4" class="ta-dot-2" />
+          <circle :cx="xOf(hover)" :cy="yOf(points[hover].util ?? 0)" r="5" class="ta-dot-1" />
+        </g>
+        <g class="ta-axis">
+          <text v-for="l in labels" :key="'x'+l.i"
+                :x="xOf(l.i)" :y="${H - 6}" text-anchor="middle">{{ l.p.label }}</text>
+        </g>
+      </svg>
+      <!-- Two series means a legend, always: identity must not rest on hue. -->
+      <div class="small text-body-secondary mt-1">
+        <span class="me-3"><span class="ta-key ta-bg-1"></span>session (5 h)</span>
+        <span v-if="hasWeekly" class="me-3"><span class="ta-key ta-key-dash ta-bg-2"></span>weekly</span>
+        <span v-if="sessionResets.length"><span class="ta-key ta-key-rule"></span>session reset</span>
+      </div>
+      <div v-if="hovering" class="ta-tip" :style="tipStyle(hover)">
+        <div class="ta-tip-h">{{ points[hover].label }}</div>
+        <div><span class="ta-key ta-bg-1"></span>{{ pct(points[hover].util) }} session (5 h)</div>
+        <div v-if="points[hover].seven_day != null">
+          <span class="ta-key ta-key-dash ta-bg-2"></span>{{ pct(points[hover].seven_day) }} weekly
+        </div>
+      </div>
+    </div>`,
+    });
+    window.TaCharts = { CallsChart, TokensChart, PressureChart, UNIT_OPTIONS, convertTokens, fmtCount, withUnit, unitSuffix, energyNote, moneyNote, fmtMoney: money, chartTop };
+})();

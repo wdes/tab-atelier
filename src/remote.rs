@@ -1,6 +1,4 @@
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// SPDX-License-Identifier: MPL-2.0
 
 //! Per-endpoint HTTP polling client for mirroring tabs from a remote
 //! `tab-atelier-headless` instance.
@@ -20,10 +18,13 @@
 //! 3. Drains the command channel between polls and translates each
 //!    into the matching HTTP request.
 //!
-//! TLS uses a custom `ServerCertVerifier` that compares ONLY the
-//! leaf cert's SHA-256 against the endpoint's pinned fingerprint.
-//! Set with the `cert_sha256` field from the Preferences "Pin
-//! certificate" flow.
+//! TLS over `https://` endpoints currently runs with verification
+//! DISABLED — a LAN-trust model, not pinning. `cert_sha256` is
+//! captured at `remote add` time and shown to the user, but nothing
+//! enforces it on the wire yet, because ureq 3 exposes no custom
+//! verifier hook (see the comment at the `disable_verification` call
+//! and its `TODO(phase-3)`). Do not describe this as pinned: a MITM
+//! swap is not refused today.
 //!
 //! No gpui dep — the GUI side (Phase 3) takes [`RemoteEvent::Output`]
 //! payloads and feeds them through `vte::ansi::Processor::advance`
@@ -510,5 +511,226 @@ trait HeaderMapLike {
 impl HeaderMapLike for http::HeaderMap {
     fn get_str(&self, name: &str) -> Option<&str> {
         self.get(name)?.to_str().ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RemoteEndpoint, fetch_tabs};
+
+    /// A one-shot HTTP server that answers the next request with `body`.
+    ///
+    /// The sidecar client had no tests at all — an audit flagged exactly that
+    /// — and its whole job is turning another daemon's JSON into tab
+    /// snapshots. That needs a server, not a mock of our own types.
+    fn serve_once(body: &'static str, status: &'static str) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let handle = std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                // Drain the WHOLE request (head plus declared body) before
+                // answering: the client writes head and body separately, and
+                // replying + closing between the two turns the unread body
+                // into a connection reset that aborts the request mid-send.
+                let mut req = Vec::new();
+                let mut buf = [0u8; 2048];
+                let mut need = None;
+                loop {
+                    match sock.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => req.extend_from_slice(&buf[..n]),
+                    }
+                    if need.is_none()
+                        && let Some(pos) = req.windows(4).position(|w| w == b"\r\n\r\n")
+                    {
+                        let body_len = String::from_utf8_lossy(&req[..pos])
+                            .lines()
+                            .find_map(|l| {
+                                let (k, v) = l.split_once(':')?;
+                                k.eq_ignore_ascii_case("content-length")
+                                    .then(|| v.trim().parse::<usize>().ok())?
+                            })
+                            .unwrap_or(0);
+                        need = Some(pos + 4 + body_len);
+                    }
+                    if need.is_some_and(|n| req.len() >= n) {
+                        break;
+                    }
+                }
+                let _ = write!(
+                    sock,
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.flush();
+            }
+        });
+        (format!("http://127.0.0.1:{port}"), handle)
+    }
+
+    #[test]
+    fn serve_once_survives_a_client_that_hangs_up_mid_request() {
+        // A body cut short by a hangup must end the drain loop (EOF, not
+        // a spin waiting for bytes that never come) and still let the
+        // responder thread exit cleanly.
+        use std::io::Write;
+        let (url, h) = serve_once("{}", "200 OK");
+        let addr = url.strip_prefix("http://").expect("http url").to_string();
+        let mut sock = std::net::TcpStream::connect(addr).expect("connect");
+        sock.write_all(b"POST /x HTTP/1.1\r\ncontent-length: 5\r\n\r\nab")
+            .expect("partial request");
+        drop(sock);
+        h.join().expect("responder exits cleanly");
+    }
+
+    fn endpoint(url: String) -> RemoteEndpoint {
+        RemoteEndpoint {
+            id: "ep-1".into(),
+            label: "peer".into(),
+            url,
+            token: "t".into(),
+            relay_token: String::new(),
+            cert_sha256: String::new(),
+            cf_access_client_id: String::new(),
+            cf_access_client_secret: String::new(),
+            autoconnect: false,
+        }
+    }
+
+    #[test]
+    fn a_peers_tab_list_becomes_snapshots() {
+        let body = r#"{"tabs":[
+            {"id":"uuid-a","index":0,"name":"build","cwd":"/srv/x","active":true,
+             "uptime_secs":12.5,"cpu_percent":3.5,"watts":1.25,
+             "agent_state":"thinking","agent_kind":"claude"},
+            {"id":"uuid-b","index":1,"name":"shell"}
+        ]}"#;
+        let (url, h) = serve_once(body, "200 OK");
+        let tabs = fetch_tabs(&super::build_agent(&endpoint(String::new())), &endpoint(url)).expect("fetch");
+        let _ = h.join();
+        assert_eq!(tabs.len(), 2);
+        assert_eq!(tabs[0].remote_id, "uuid-a");
+        assert_eq!(tabs[0].name, "build");
+        assert_eq!(tabs[0].cwd.as_deref(), Some("/srv/x"));
+        assert!(tabs[0].active_on_remote);
+        assert_eq!(tabs[0].watts, Some(1.25));
+        assert_eq!(tabs[0].agent_state.as_deref(), Some("thinking"));
+        // A sparse row must not sink the whole list: the fields a viewer can
+        // live without default, and the ones it cannot (id) are preserved.
+        assert_eq!(tabs[1].remote_id, "uuid-b");
+        assert_eq!(tabs[1].cwd, None);
+        assert!(!tabs[1].active_on_remote);
+        assert_eq!(tabs[1].watts, None);
+    }
+
+    #[test]
+    fn a_row_with_no_name_is_marked_rather_than_left_blank() {
+        // An unnamed tab renders as "?" — a blank entry in a tab strip is
+        // indistinguishable from a rendering bug.
+        let (url, h) = serve_once(r#"{"tabs":[{"id":"x"}]}"#, "200 OK");
+        let tabs = fetch_tabs(&super::build_agent(&endpoint(String::new())), &endpoint(url)).expect("fetch");
+        let _ = h.join();
+        assert_eq!(tabs[0].name, "?");
+        assert_eq!(tabs[0].remote_index, 0);
+    }
+
+    #[test]
+    fn a_malformed_response_is_an_error_not_an_empty_fleet() {
+        // Each of these used to be indistinguishable from "the peer has no
+        // tabs", which silently empties the user's remote tab strip.
+        for (body, status) in [
+            (r#"{"nope":[]}"#, "200 OK"),
+            ("not json at all", "200 OK"),
+            (r#"{"tabs":{}}"#, "200 OK"),
+            ("", "500 Internal Server Error"),
+        ] {
+            let (url, h) = serve_once(body, status);
+            let got = fetch_tabs(&super::build_agent(&endpoint(String::new())), &endpoint(url));
+            let _ = h.join();
+            assert!(got.is_err(), "expected an error for {status} {body:?}");
+        }
+    }
+
+    #[test]
+    fn an_unreachable_peer_reports_the_failure() {
+        // Port 1 is reserved and nothing listens: the client must surface a
+        // connection error rather than hanging or reporting zero tabs.
+        let got = fetch_tabs(
+            &super::build_agent(&endpoint(String::new())),
+            &endpoint("http://127.0.0.1:1".into()),
+        );
+        assert!(got.is_err());
+        assert!(got.unwrap_err().contains("/tabs"), "the error should name what failed");
+    }
+
+    fn snapshot(id: &str, index: usize) -> super::RemoteTabSnapshot {
+        super::RemoteTabSnapshot {
+            remote_id: id.into(),
+            remote_index: index,
+            name: "t".into(),
+            cwd: None,
+            active_on_remote: false,
+            uptime_secs: 0.0,
+            cpu_percent: 0.0,
+            watts: None,
+            agent_state: None,
+            agent_kind: None,
+        }
+    }
+
+    #[test]
+    fn commands_address_tabs_by_id_not_by_position() {
+        // A remote index shifts whenever another tab closes, so every command
+        // resolves through the durable uuid. Getting this wrong sends
+        // keystrokes to the wrong session — the failure the audit flagged.
+        let (url, h) = serve_once("{}", "200 OK");
+        let ep = endpoint(url);
+        let agent = super::build_agent(&ep);
+        let tabs = vec![snapshot("uuid-a", 0), snapshot("uuid-b", 7)];
+        let cmd = super::RemoteCommand::SendInput {
+            remote_id: "uuid-b".into(),
+            bytes: b"echo hi\n".to_vec(),
+        };
+        // The transport outcome is not what this test is about, and under a
+        // loaded full-suite run the fixture socket can exceed the client's
+        // timeout — asserting `is_ok()` made it flake. What matters is that
+        // resolution FOUND the tab: an unknown id is the failure mode being
+        // guarded against.
+        if let Err(e) = super::run_command(&agent, &ep, &tabs, &cmd) {
+            assert!(!e.contains("no tab with id"), "resolution failed: {e}");
+        }
+        let _ = h.join();
+
+        // An id nothing matches must fail rather than falling back to index 0,
+        // which is somebody else's tab.
+        let (url, h) = serve_once("{}", "200 OK");
+        let ep = endpoint(url);
+        let agent = super::build_agent(&ep);
+        let stray = super::RemoteCommand::SendInput {
+            remote_id: "nope".into(),
+            bytes: b"x".to_vec(),
+        };
+        let err = super::run_command(&agent, &ep, &tabs, &stray).unwrap_err();
+        assert!(err.contains("nope"), "the error should name the id: {err}");
+        // NOT joined: resolution failed before any request, so the responder
+        // is still blocked in accept(). Joining it would hang the suite —
+        // which it did. The thread dies with the process.
+        drop(h);
+    }
+
+    #[test]
+    fn a_rejected_command_is_reported_rather_than_swallowed() {
+        // The remote refusing (423 locked, say) has to reach the caller, or a
+        // viewer silently types into a tab that is ignoring it.
+        let (url, h) = serve_once("locked", "423 Locked");
+        let ep = endpoint(url);
+        let agent = super::build_agent(&ep);
+        let tabs = vec![snapshot("uuid-a", 0)];
+        let cmd = super::RemoteCommand::Close {
+            remote_id: "uuid-a".into(),
+        };
+        assert!(super::run_command(&agent, &ep, &tabs, &cmd).is_err());
+        let _ = h.join();
     }
 }

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
     // __TAB_KEY__ is the route segment after `/tabs/` (numeric idx or
     // `by-id/<uuid>` form). The same value is what every subrequest
     // uses, so the share URL identifies one tab end-to-end.
@@ -18,12 +19,6 @@
     const READ_ONLY = PARAMS.get("ro") === "1";
     const headers = TOKEN ? { Authorization: "Bearer " + TOKEN } : {};
     const status = document.getElementById("status");
-    // Touch device (Android WebView / mobile browser): the JS blob download
-    // (fetch → Blob → object-URL <a>.click) can't save a file there, so outbox
-    // rows fall back to a plain native `<a href download>` navigation that the
-    // WebView's DownloadListener / the browser handles. Desktop keeps the
-    // streamed progress bar.
-    const IS_TOUCH = "ontouchstart" in window || navigator.maxTouchPoints > 0;
 
     // The page lives at `<some-prefix>/tabs/<TAB_KEY>/view`. Resolve
     // siblings (`output`, `input`) as relative paths so a reverse
@@ -313,6 +308,24 @@
           ev.preventDefault();
           return true;
         }
+        // Shift+Enter: a newline in the prompt rather than a submit.
+        //
+        // xterm.js has no binding for this and would send a bare `\r`, which
+        // is indistinguishable from Enter — so the choice has to be encoded
+        // here or not at all. `\x1b[13;2u` is the kitty-protocol form for
+        // Shift+Enter, the same one tab-atelier's `keystroke_to_bytes` emits
+        // when an app asks for it. Returning false suppresses xterm's own
+        // output, so the terminal receives one sequence and not two.
+        //
+        // The server needs no change: frames go to the pty as bytes, and
+        // `ImeDedup` passes anything starting with ESC straight through.
+        const newlineBytes = shiftEnterBytes(ev);
+        if (newlineBytes) {
+          ev.preventDefault();
+          ev.stopPropagation();
+          sendInputBytes(newlineBytes);
+          return false;
+        }
         return true;
       });
     }
@@ -391,7 +404,7 @@
           payload = "\x1b" + payload;
         }
         const enc = new TextEncoder().encode(payload);
-        try { ws.send(encodeFrame(0x01, enc)); } catch {}
+        sendInputBytes(enc);
         if (ctrlSticky) { ctrlSticky = false; }
         if (altSticky) { altSticky = false; }
         renderKbdHeader();
@@ -418,6 +431,10 @@
         // Shift+Tab / back-tab (CSI Z). A soft keyboard can't produce it, and
         // Claude Code uses it to cycle modes — so give mobile a dedicated key.
         { label: "⇧TAB", bytes: "\x1b[Z" },
+        // Shift+Enter: a newline in the prompt rather than a submit. A soft
+        // keyboard cannot send a modified Enter at all, and the kitty-protocol
+        // form is the only encoding that distinguishes it from plain Enter.
+        { label: "⇧⏎", bytes: "\x1b[13;2u" },
         { label: "CTRL", type: "ctrl" },
         { label: "ALT", type: "alt" },
         { icon: "←", bytes: "\x1b[D" },
@@ -554,30 +571,41 @@
     // Upload a single File via XMLHttpRequest (fetch can't surface
     // upload-progress events). Reports percentage in the status bar,
     // pops a toast on success / error.
-    function uploadFile(file) {
+    // `nameOverride` exists for pasted clipboard images, which all arrive
+    // called "image.png" — see `pastedName`.
+    function uploadFile(file, nameOverride) {
+      const name = nameOverride || file.name;
       return new Promise((resolve) => {
         if (file.size > UPLOAD_MAX_BYTES) {
-          toast(`${file.name}: too large (${Math.round(file.size / 1048576)} MiB > 100 MiB limit)`);
-          resolve(false);
+          toast(`${name}: too large (${Math.round(file.size / 1048576)} MiB > 100 MiB limit)`);
+          resolve(null);
           return;
         }
         const xhr = new XMLHttpRequest();
-        const url = `${BASE}files?name=${encodeURIComponent(file.name)}${TOKEN ? "&token=" + encodeURIComponent(TOKEN) : ""}`;
+        const url = `${BASE}files?name=${encodeURIComponent(name)}${TOKEN ? "&token=" + encodeURIComponent(TOKEN) : ""}`;
         xhr.open("POST", url);
         if (TOKEN) xhr.setRequestHeader("Authorization", "Bearer " + TOKEN);
         xhr.setRequestHeader("Content-Type", "application/octet-stream");
         xhr.upload.addEventListener("progress", (e) => {
           if (e.lengthComputable) {
             const pct = Math.round((e.loaded / e.total) * 100);
-            status.textContent = `uploading ${file.name} · ${pct}%`;
+            status.textContent = `uploading ${name} · ${pct}%`;
           }
         });
         xhr.addEventListener("load", () => {
+          // The upload is over, whatever happened, so put the real status back. Nothing else
+          // clears it: the progress handler above writes `uploading … · N%` and the only other
+          // writer is `renderStatus`, which runs on a meta message. So the status line kept the
+          // last progress line — `uploading photo.jpg · 100%` — pinned at the bottom of the
+          // screen after every upload, which is what was reported. Restored here rather than at
+          // the end of the batch so a single-file upload clears it too, and so a batch shows the
+          // real status between files rather than a stale percentage.
+          renderStatus();
           if (xhr.status === 201 || xhr.status === 200) {
             // Parse the server's response for the relative path
             // ("inbox/<name>") and offer it as a click-to-copy
             // toast so the user can paste straight into Claude.
-            let rel = `inbox/${file.name}`;
+            let rel = `inbox/${name}`;
             try {
               const j = JSON.parse(xhr.responseText);
               if (j.relpath) rel = j.relpath;
@@ -585,15 +613,19 @@
             toast(`uploaded → ${rel} · click to copy`, 6000);
             const onClick = () => { copyText(rel, "copied: " + rel); toastEl.removeEventListener("click", onClick); };
             toastEl.addEventListener("click", onClick, { once: true });
-            resolve(true);
+            resolve(rel);
           } else {
             toast(`upload failed (${xhr.status}): ${xhr.responseText.slice(0, 120)}`);
-            resolve(false);
+            resolve(null);
           }
         });
         xhr.addEventListener("error", () => {
+          // A dropped network is the other way an upload ends without a `load`, and it needs the
+          // same restore: an error toast plus a status line reading `uploading … · 47%` forever is
+          // worse than either alone.
+          renderStatus();
           toast(`upload failed: network error`);
-          resolve(false);
+          resolve(null);
         });
         xhr.send(file);
       });
@@ -601,21 +633,39 @@
     // Shared upload path for BOTH drag-drop and the mobile file-picker.
     // Multiple files upload sequentially so the status bar stays a single
     // "uploading X" string instead of racing N progress values.
-    async function uploadFiles(fileList) {
+    // A clipboard is not a filesystem: every screenshot arrives named
+    // "image.png", so uploading pasted images under their own name would have
+    // each paste silently overwrite the previous one in inbox/. Generic names
+    // get a timestamp; a real file copied out of a file manager keeps the name
+    // it came with.
+    function pastedName(file) {
+      if (file.name && !/^image\.[a-z0-9]+$/i.test(file.name)) return file.name;
+      const ext = ((file.type || "").split("/")[1] || "png").replace(/[^a-z0-9]/gi, "") || "png";
+      const t = new Date().toISOString().replace(/[:-]/g, "").replace(/\.\d+Z$/, "").replace("T", "-");
+      return `pasted-${t}.${ext}`;
+    }
+    // Shared upload path for drag-drop, the mobile file-picker AND paste.
+    // Multiple files upload sequentially so the status bar stays a single
+    // "uploading X" string instead of racing N progress values. Returns the
+    // relative paths that landed, so the caller can do something with them.
+    async function uploadFiles(fileList, { rename = false } = {}) {
       // Mirror the server-side refusal: POST /files returns 423 Locked when
       // serverLocked, so give immediate feedback instead of a failed request.
       if (serverLocked) {
         toast("tab is locked — uploads refused");
-        return;
+        return [];
       }
       const files = Array.from(fileList || []);
-      if (!files.length) return;
+      if (!files.length) return [];
+      const landed = [];
       for (const f of files) {
-        await uploadFile(f);
+        const rel = await uploadFile(f, rename ? pastedName(f) : undefined);
+        if (rel) landed.push(rel);
       }
       // Refresh the outbox panel in case a server-side script moves uploads
       // into outbox/ on receipt.
       if (panelKind === "outbox") refreshFiles("outbox");
+      return landed;
     }
     // Drag-drop wiring. dragover/leave maintain the overlay; drop fires the
     // upload. Touch devices can't drag an OS file into a WebView, so the
@@ -643,6 +693,26 @@
         dragDepth = 0;
         document.body.classList.remove("drag-over");
         await uploadFiles(e.dataTransfer?.files);
+      });
+      // Pasting an image did nothing at all, and looked like paste being
+      // broken in general. It isn't: TEXT paste is xterm's own business — its
+      // hidden textarea turns it into `onData` — and must stay that way. But a
+      // screenshot on the clipboard carries no text for that textarea to
+      // receive, so nothing happened and nothing said why.
+      //
+      // A terminal cannot show an image, so the useful reading of "paste an
+      // image here" is the one drag-drop already implements: put the file in
+      // the tab's inbox/ and hand the prompt its path, which is what an agent
+      // in this tab can actually open. The path is inserted at the cursor with
+      // NO newline — paste inserts, it does not submit.
+      document.addEventListener("paste", async (e) => {
+        const files = Array.from(e.clipboardData?.files || []);
+        if (!files.length) return; // plain text — xterm handles it
+        e.preventDefault();
+        const landed = await uploadFiles(files, { rename: true });
+        if (!landed.length) return;
+        const text = landed.join(" ") + " ";
+        sendInputBytes(new TextEncoder().encode(text));
       });
       // Mobile / touch fallback: the hidden <input type=file> opens the
       // system picker (files, Photos, Drive, …); the ⬆-upload toolbar button
@@ -747,11 +817,14 @@
       const meta = `${humanSize(f.size)} · ${new Date(f.mtime * 1000).toISOString().slice(0, 16).replace("T", " ")}`;
       if (kind === "outbox") {
         const a = document.createElement("a");
-        const qpath = encodeURIComponent(`outbox/${relPath}`);
-        a.href = `${BASE}files?path=${qpath}${TOKEN ? "&token=" + encodeURIComponent(TOKEN) : ""}`;
-        // Keep the native download attr so drag-to-desktop and
-        // modifier-clicks still work and it degrades gracefully; a plain
-        // left-click is intercepted below to stream with a progress bar.
+        // The filename is the LAST URL SEGMENT, not a query parameter. An
+        // `<a download>` only applies to same-origin URLs, so as soon as the
+        // page and the API differ (a share link, a tunnel) the browser
+        // ignores the attribute and names the file after the URL — which is
+        // how `…/files?path=…` became `files.bin`. With the name in the path
+        // the fallback is already right, and Content-Disposition agrees.
+        const segs = `outbox/${relPath}`.split("/").map(encodeURIComponent).join("/");
+        a.href = `${BASE}${segs}${TOKEN ? "?token=" + encodeURIComponent(TOKEN) : ""}`;
         a.download = f.name;
         a.draggable = true;
         a.addEventListener("dragstart", (ev) => {
@@ -759,18 +832,11 @@
           ev.dataTransfer.setData("text/uri-list", `file://${absPath}`);
           ev.dataTransfer.effectAllowed = "copyLink";
         });
-        a.innerHTML = `${htmlEscape(f.name)}<div class="meta">${meta}</div>`
-          + `<div class="dl-progress"><div class="dl-bar"></div></div>`;
-        a.addEventListener("click", (ev) => {
-          // Touch: let the native `<a href download>` navigate so the platform
-          // downloader saves it — the JS blob path can't save in a WebView.
-          if (IS_TOUCH) return;
-          // Desktop: let modified clicks (ctrl/cmd/shift/middle) use the native
-          // download; intercept only the plain left-click for the progress bar.
-          if (ev.button !== 0 || ev.ctrlKey || ev.metaKey || ev.shiftKey || ev.altKey) return;
-          ev.preventDefault();
-          downloadFile(a, a.href, f.name, f.size);
-        });
+        a.innerHTML = `${htmlEscape(f.name)}<div class="meta">${meta}</div>`;
+        // No click interception. It is a plain `<a href download>`: the
+        // browser saves it, drag-to-desktop works, modifier-clicks work, and
+        // a WebView's own downloader handles it. The JS blob path that used
+        // to run here bought a progress bar and cost the filename.
         return a;
       }
       // Inbox row: draggable absolute path, click-to-copy. Not a download
@@ -873,63 +939,6 @@
     // and the row is DISABLED until it finishes — no silent wait, no frantic
     // re-clicks kicking off duplicate downloads. `size` is the server-reported
     // byte count, used when the response omits Content-Length.
-    async function downloadFile(row, url, name, size) {
-      if (row.classList.contains("downloading")) return; // already running → disabled
-      row.classList.remove("dl-error");
-      row.classList.add("downloading");
-      const bar = row.querySelector(".dl-bar");
-      const setPct = (p) => { if (bar) bar.style.width = Math.max(0, Math.min(100, p)) + "%"; };
-      setPct(0);
-      try {
-        const resp = await fetch(url, { headers });
-        if (!resp.ok) throw new Error("HTTP " + resp.status);
-        const total = Number(resp.headers.get("content-length")) || Number(size) || 0;
-        if (!resp.body || !resp.body.getReader) {
-          // Browser can't stream the body — fall back to a plain blob (no live %).
-          saveBlob(await resp.blob(), name);
-          setPct(100);
-          return;
-        }
-        const reader = resp.body.getReader();
-        const chunks = [];
-        let received = 0;
-        for (;;) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          chunks.push(value);
-          received += value.length;
-          setPct(total ? (received / total) * 100 : 0);
-        }
-        setPct(100);
-        saveBlob(new Blob(chunks), name);
-      } catch (e) {
-        row.classList.add("dl-error");
-        setPct(100);
-        toast(`download failed: ${e.message || e}`);
-      } finally {
-        // Re-enable shortly after (so the file can be re-fetched) and reset
-        // the bar; the brief delay lets the 100%/error state register visually.
-        setTimeout(() => {
-          row.classList.remove("downloading");
-          row.classList.remove("dl-error");
-          setPct(0);
-        }, 1200);
-      }
-    }
-
-    // Trigger a browser "save as" for an in-memory blob via a throwaway
-    // object-URL anchor (revoked shortly after so we don't leak).
-    function saveBlob(blob, name) {
-      const objUrl = URL.createObjectURL(blob);
-      const tmp = document.createElement("a");
-      tmp.href = objUrl;
-      tmp.download = name;
-      document.body.appendChild(tmp);
-      tmp.click();
-      tmp.remove();
-      setTimeout(() => URL.revokeObjectURL(objUrl), 10000);
-    }
-
     // Monotonic PTY-byte offset we've fed into xterm.js. The server's
     // WebSocket transport. Replaces the previous /stream HTTP polling
     // model: the server PUSHES PTY bytes as soon as they arrive,
@@ -942,6 +951,7 @@
     //   tag 0x03 meta     S→C  JSON state delta
     //   tag 0x04 resize   C→S  JSON {cols, rows}
     //   tag 0x0b focus    C→S  payload-less; user focused the tab (MRU stamp)
+    //   tag 0x0c preview  S→C  UTF-8 ANSI text — quick approximate paint
     //
     // Reconnect: the client tracks `ringOffset` (= total bytes
     // received since session start) and on disconnect reconnects with
@@ -950,8 +960,19 @@
     // ring on bootstrap (alacritty's grid history is wiped by
     // \x1b[3J and never grows when TUIs redraw in-place; the ring is
     // the only source of historical bytes).
+    //
+    // `preview` (0x0c): on a big since=0 bootstrap the server may send
+    // ONE small preview frame first — the last ~2 screens, rendered
+    // server-side from the authoritative grid — so something correct
+    // is visible before the (potentially multi-MB) real replay finishes
+    // transferring and parsing. It does NOT advance `ringOffset` (it's
+    // not counted PTY history). `pendingPreviewReset` marks that the
+    // NEXT real `out`/`out-gz` frame must `term.reset()` first, so the
+    // temporary preview is wiped rather than duplicated by the
+    // authoritative replay that follows it.
 
     let ringOffset = 0;
+    let pendingPreviewReset = false;
     // Serialises `out` frame handling. A gzip `out-gz` (0x0A) frame
     // inflates asynchronously; without a queue a following raw `out`
     // (0x02) frame could overtake the still-inflating one and corrupt
@@ -1167,6 +1188,15 @@
     }
 
     function handleOut(bytes) {
+      // A preview frame painted before this one — wipe it now, before
+      // applying the authoritative replay, so it never persists
+      // alongside (or duplicates) the real content. Unconditional: even
+      // mid-selection/scrolled-up, the reset must happen before anything
+      // else below queues or writes.
+      if (pendingPreviewReset) {
+        pendingPreviewReset = false;
+        term.reset();
+      }
       // Predictive-echo RTT estimate: time from the last keystroke to
       // this (presumed echo) frame. Drives auto-enable/disable so the
       // feature stays off on fast links where it'd only add flicker.
@@ -1237,6 +1267,39 @@
       return out;
     }
 
+    // Send keystrokes to the pty, if there is anything to send them to.
+    //
+    // One path for input bytes: `term.onData`, the mobile key toolbar and the
+    // Shift+Enter handler all go through here, so "is the socket usable" cannot
+    // be forgotten at one of them. A send on a closed socket throws, and
+    // swallowing that silently means a keystroke disappears with no symptom —
+    // so the guard is in one place that is easy to read rather than three that
+    // have to agree.
+    function sendInputBytes(bytes) {
+      if (serverLocked) return;
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      try { ws.send(encodeFrame(0x01, bytes)); } catch { /* link died mid-send */ }
+    }
+
+    // The bytes for a Shift+Enter, or null for any other key.
+    //
+    // A pure function so the decision can be tested without a terminal
+    // (`assets/reconnect.mjs` calls it directly). It has to exist because
+    // xterm.js sends a bare `\r` for Shift+Enter, making it indistinguishable
+    // from Enter — the newline has to be encoded here or not at all.
+    //
+    // `\x1b[13;2u` is the kitty-protocol form: key code 13 (Enter), modifier 2
+    // (shift). It is what tab-atelier's `keystroke_to_bytes` emits when an
+    // application has asked for disambiguated keys, and what crossterm decodes
+    // into `Enter` + SHIFT, which is what the prompt listens for.
+    //
+    // `ev.shiftKey && ev.key === "Enter"` and not `isComposing`: an IME-entered
+    // Enter is a real Enter and should submit.
+    function shiftEnterBytes(ev) {
+      if (!ev || ev.key !== "Enter" || !ev.shiftKey) return null;
+      return Uint8Array.from([0x1b, 0x5b, 0x31, 0x33, 0x3b, 0x32, 0x75]);
+    }
+
     // Tell the server the user FOCUSED this tab (tag 0x0b, payload-less), which
     // is what updates the "last used" / MRU ordering. Sent only when we're
     // actually looking at the tab (page visible), so a background reconnect
@@ -1256,6 +1319,10 @@
     function connect() {
       // Clear any pending reconnect timer — we're connecting now.
       if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+      // Retire whatever we are replacing *before* opening another. An earlier socket left open
+      // stays alive and closes later, and that close used to arrive while the new socket was
+      // working — nulling it and marking the session down. See retireSocket().
+      retireSocket();
       let url;
       try { url = wsUrl(); }
       catch (e) { status.textContent = `bad url · ${e.message || e}`; return; }
@@ -1267,7 +1334,14 @@
         return;
       }
       ws.binaryType = "arraybuffer";
+      // The socket these handlers belong to, captured now: `ws` is reassigned by every later
+      // connect(), so a handler asking "am I still current?" by reading `ws` would always say yes.
+      // Comparing against this constant is what makes a stale event detectable.
+      const sock = ws;
       ws.onopen = () => {
+        // A socket that is no longer current opening is not news: connecting it must not clear the
+        // banner for a session whose own socket is still down, nor reset the backoff.
+        if (ws !== sock) return;
         reconnectAttempt = 0;
         status.textContent = `${TAB_NAME} · connected`;
         document.body.classList.remove("ws-down");
@@ -1276,6 +1350,9 @@
         sendFocus();
       };
       ws.onmessage = (ev) => {
+        // Output from a socket we have already replaced is out of order by definition, and painting
+        // it would interleave two sessions' bytes in one terminal.
+        if (ws !== sock) return;
         if (!(ev.data instanceof ArrayBuffer)) return; // ignore text frames
         const view = new Uint8Array(ev.data);
         if (view.length === 0) return;
@@ -1295,6 +1372,14 @@
           } catch (e) {
             console.warn("bad meta frame:", e);
           }
+        } else if (tag === 0x0c) { // preview — quick approximate paint, NOT counted in ringOffset
+          outChain = outChain
+            .then(() => {
+              const text = new TextDecoder("utf-8", { fatal: false }).decode(payload);
+              term.write(text);
+              pendingPreviewReset = true;
+            })
+            .catch((e) => console.warn("preview:", e));
         }
         // 0x01 in / 0x04 resize / 0x07-0x09 / 0x0b focus are C→S only — ignore.
       };
@@ -1303,6 +1388,13 @@
         // race onclose's reconnect scheduling.
       };
       ws.onclose = (ev) => {
+        // **The bug.** This used to run for *any* socket's close, unconditionally: `ws = null`
+        // clobbered a live connection and the class marked a working session down, with nothing left
+        // to remove it — the live socket's onopen had already fired. The session then looked
+        // disconnected while still receiving output, and input went nowhere, because sends check
+        // `ws`. A close from a socket that is no longer current is not news: we replaced it on
+        // purpose and its own reconnect is already scheduled.
+        if (ws !== sock) return;
         ws = null;
         document.body.classList.add("ws-down");
         const banner = document.getElementById("ws-state-banner");
@@ -1331,9 +1423,28 @@
     }
 
     function scheduleReconnect() {
+      // Clear first. The 1008 branch above assigns `reconnectTimer` directly, so without this a
+      // lock retry and a normal retry could both be pending and both fire, opening two sockets — and
+      // the older one, left open, is what produced the stale close this file now guards against.
+      // One timer, one reconnect.
+      if (reconnectTimer) { clearTimeout(reconnectTimer); }
       reconnectAttempt = Math.min(reconnectAttempt + 1, 6);
       const delayMs = Math.min(1000 * 2 ** (reconnectAttempt - 1), 30000);
       reconnectTimer = setTimeout(connect, delayMs);
+    }
+
+    // Close the socket we are about to replace, detaching its handlers first so its close cannot
+    // reach the state machine at all. Belt to the `ws !== sock` guards' braces: those make a stale
+    // event harmless, this stops the socket existing to produce one.
+    function retireSocket() {
+      const old = ws;
+      if (!old) return;
+      ws = null;
+      old.onopen = null;
+      old.onmessage = null;
+      old.onerror = null;
+      old.onclose = null;
+      try { old.close(); } catch (e) { console.warn("retire:", e); }
     }
 
     if (!READ_ONLY) {
@@ -1349,11 +1460,9 @@
       term.onData(data => {
         // xterm.js's disableStdin should already suppress these, but
         // a tab that locks mid-session may have keypresses already
-        // in flight. Also short-circuit if the socket isn't open.
+        // in flight.
         if (serverLocked) return;
-        if (!ws || ws.readyState !== WebSocket.OPEN) return;
-        const payload = new TextEncoder().encode(data);
-        try { ws.send(encodeFrame(0x01, payload)); } catch { /* swallow */ }
+        sendInputBytes(new TextEncoder().encode(data));
         // Timestamp for the RTT estimate (every key), then optimistically
         // echo it locally if predictions are active.
         predSentAt = performance.now();
