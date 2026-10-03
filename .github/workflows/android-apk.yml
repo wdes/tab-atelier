@@ -44,9 +44,88 @@ jobs:
                   GITHUB_EVENT_BEFORE: ${{ github.event.before }}
               run: echo "build=$(scripts/apk-needed.sh)" >> "$GITHUB_OUTPUT"
 
+    test:
+        name: Unit tests
+        needs: changes
+        runs-on: ubuntu-latest
+        if: ${{ needs.changes.outputs.build == 'true' && !contains(github.event.head_commit.message, '[skip apk]') }}
+        # Same SDK location and NDK as the build job, and for the same reasons:
+        # the overlay pins ndkVersion, and the app module wires
+        # externalNativeBuild into the variant, so the pinned NDK has to exist
+        # for the test task to configure at all — a missing one fails before a
+        # single test runs. The NDK cache key is shared with the build job, so
+        # whichever job runs first populates it and the other restores it.
+        env:
+            ANDROID_HOME: /usr/local/lib/android/sdk
+            ANDROID_NDK_VERSION: "26.1.10909125"
+        steps:
+            - uses: actions/checkout@v7
+              with:
+                  submodules: recursive
+
+            - uses: actions/setup-java@v6
+              with:
+                  distribution: temurin
+                  java-version: '21'
+
+            - uses: android-actions/setup-android@v4
+              with:
+                  packages: platform-tools
+
+            - name: Restore the NDK
+              id: ndk-cache
+              uses: actions/cache/restore@v6
+              with:
+                  path: ${{ env.ANDROID_HOME }}/ndk/${{ env.ANDROID_NDK_VERSION }}
+                  key: android-ndk-${{ env.ANDROID_NDK_VERSION }}-${{ runner.os }}
+
+            - name: Install SDK platform and NDK
+              run: |
+                  yes | sdkmanager --licenses > /dev/null 2>&1 || true
+                  sdkmanager "platforms;android-37.0" "ndk;${ANDROID_NDK_VERSION}"
+
+            - name: Save the NDK
+              if: steps.ndk-cache.outputs.cache-hit != 'true'
+              uses: actions/cache/save@v6
+              with:
+                  path: ${{ env.ANDROID_HOME }}/ndk/${{ env.ANDROID_NDK_VERSION }}
+                  key: android-ndk-${{ env.ANDROID_NDK_VERSION }}-${{ runner.os }}
+
+            - uses: gradle/actions/setup-gradle@v6
+
+            # The tests are upstream's, in the submodule, so the overlay has to
+            # be applied before they run: it is what pins the NDK, and anything
+            # we changed that the tests cover is only present after it applies.
+            - name: Apply the overlay
+              run: scripts/apply-overlay.sh
+
+            # One variant, deliberately. oss is what this workflow ships, and
+            # the debug unit tests are the variant that runs without a device.
+            # Upstream's own CI runs `check` across both flavors; doing that here
+            # would double the runtime to lint code we do not ship.
+            #
+            # Tests that need a live tab-atelier daemon skip themselves: CI has
+            # none, and a test that only passes on one machine is worse than no
+            # test.
+            - name: Unit tests
+              run: |
+                  cd connectbot
+                  ./gradlew --no-daemon :app:testOssDebugUnitTest
+
+            - name: Upload the test report
+              if: failure()
+              uses: actions/upload-artifact@v7
+              with:
+                  name: unit-test-report
+                  path: |
+                      connectbot/app/build/reports/tests/
+                      connectbot/app/build/test-results/
+
     apk:
         name: Build and publish the signed release APK
-        needs: changes
+        # Gated on the tests: a build that fails its own suite should not reach
+        # the website, and /android/ is what people install from.
+        needs: [changes, test]
         runs-on: ubuntu-latest
         # The signing keystore lives in this environment's secrets, so the APK
         # is signed with the real release key without it being in the repo.
