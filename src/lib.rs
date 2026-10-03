@@ -2451,6 +2451,9 @@ const fn is_true(b: &bool) -> bool {
 
 #[derive(Serialize, Deserialize)]
 pub struct SavedState {
+    /// Token minted for the shared dashboard view; empty when sharing is off.
+    #[serde(default)]
+    pub dashboard_share_token: String,
     pub tabs: Vec<TabState>,
     pub active: usize,
     /// `true` when the user had toggled "Windowed mode" (Guake-style drop-down
@@ -2956,6 +2959,10 @@ pub fn load_wakatime_key(config_base: &std::path::Path) -> Option<String> {
 
 #[derive(Serialize, Deserialize, Default)]
 pub struct Preferences {
+    /// Repository → family label. Empty when never configured; `default` so an
+    /// older preferences file still loads rather than failing the whole document.
+    #[serde(default)]
+    pub repo_families: std::collections::BTreeMap<String, String>,
     /// Minutes between automatic fleet sweeps (announce from sources, then
     /// gossip). `0` — the default — means never: an instance that was not
     /// asked to manage itself must not start doing so after an upgrade.
@@ -5600,6 +5607,7 @@ mod tests {
     #[test]
     fn test_tab_state_serialization() {
         let state = SavedState {
+            dashboard_share_token: String::new(),
             tabs: vec![
                 TabState {
                     name: "Terminal".into(),
@@ -5657,6 +5665,7 @@ mod tests {
     fn test_tab_state_colors_enabled_round_trip() {
         // false survives a round-trip; true is omitted from the JSON.
         let state = SavedState {
+            dashboard_share_token: String::new(),
             tabs: vec![TabState {
                 name: "dumb".into(),
                 cwd: None,
@@ -5686,6 +5695,7 @@ mod tests {
     #[test]
     fn test_tab_state_uptime_energy_round_trip() {
         let state = SavedState {
+            dashboard_share_token: String::new(),
             tabs: vec![TabState {
                 name: "T".into(),
                 cwd: None,
@@ -5716,6 +5726,7 @@ mod tests {
     #[test]
     fn test_tab_state_empty_tabs() {
         let state = SavedState {
+            dashboard_share_token: String::new(),
             tabs: vec![],
             active: 0,
             windowed: false,
@@ -5792,6 +5803,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
 
         let mk = |name: &str| SavedState {
+            dashboard_share_token: String::new(),
             tabs: vec![TabState {
                 name: name.into(),
                 cwd: None,
@@ -5835,6 +5847,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&sd);
 
         let good = SavedState {
+            dashboard_share_token: String::new(),
             tabs: vec![TabState {
                 name: "rescued".into(),
                 cwd: None,
@@ -5864,6 +5877,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
 
         let state = SavedState {
+            dashboard_share_token: String::new(),
             tabs: vec![
                 TabState {
                     name: "One".into(),
@@ -5923,6 +5937,7 @@ mod tests {
         save_state(
             &dir,
             &SavedState {
+                dashboard_share_token: String::new(),
                 tabs: vec![mk("one"), mk("two"), mk("three")],
                 active: 0,
                 windowed: false,
@@ -6129,6 +6144,7 @@ mod tests {
         let dir = std::env::temp_dir().join("ta-test-create-dir");
         let _ = std::fs::remove_dir_all(&dir);
         let state = SavedState {
+            dashboard_share_token: String::new(),
             tabs: vec![TabState {
                 name: "T".into(),
                 cwd: None,
@@ -6368,6 +6384,7 @@ mod tests {
         let sd = dir.join(APP_DIR);
         let _ = std::fs::create_dir_all(&sd);
         let state = SavedState {
+            dashboard_share_token: String::new(),
             tabs: vec![TabState {
                 name: "Only".into(),
                 cwd: None,
