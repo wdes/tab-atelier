@@ -1,0 +1,3 @@
+[submodule "connectbot"]
+	path = connectbot
+	url = https://github.com/connectbot/connectbot.git

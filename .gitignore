@@ -1,0 +1,10 @@
+# Build outputs and local machine state. The app is built inside connectbot/,
+# which is a submodule — its own .gitignore covers most of this, but the build
+# also drops files the submodule would otherwise report as untracked.
+connectbot/app/build/
+connectbot/build/
+connectbot/.gradle/
+connectbot/local.properties
+local.properties
+*.apk
+*.aab
