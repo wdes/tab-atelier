@@ -11,6 +11,7 @@
 //! collapses them into one [`Field`] descriptor + [`post`], with the parse
 //! extracted as a PURE, unit-tested [`parse`].
 
+use clap::Parser;
 use std::time::Duration;
 
 /// What a single-field CLI's args resolve to (pure parse result).
@@ -39,41 +40,23 @@ pub struct Parsed {
 /// Returns `Err((2, msg))` on any usage error (dangling `--tab`, unknown flag,
 /// nothing to set).
 pub fn parse(name: &str, args: &[String]) -> Result<Parsed, (i32, String)> {
-    let mut clear = false;
-    let mut help = false;
-    let mut tab: Option<String> = None;
-    let mut parts: Vec<String> = Vec::new();
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--clear" => clear = true,
-            "--tab" => {
-                i += 1;
-                let Some(t) = args.get(i) else {
-                    return Err((2, format!("{name}: --tab expects a tab id")));
-                };
-                tab = Some(t.clone());
-            }
-            "-h" | "--help" => help = true,
-            other if !other.starts_with("--") => parts.push(other.to_string()),
-            other => return Err((2, format!("{name}: unknown argument: {other}"))),
+    let raw = match Raw::try_parse_from(std::iter::once(name.to_owned()).chain(args.iter().cloned())) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == clap::error::ErrorKind::DisplayHelp => {
+            return Ok(Parsed {
+                action: Action::Help,
+                tab: None,
+            });
         }
-        i += 1;
-    }
-
-    if help {
-        return Ok(Parsed {
-            action: Action::Help,
-            tab,
-        });
-    }
-    if clear {
+        Err(err) => return Err((2, err.to_string())),
+    };
+    if raw.clear {
         return Ok(Parsed {
             action: Action::Clear,
-            tab,
+            tab: raw.tab,
         });
     }
-    let value = parts.join(" ").trim().to_string();
+    let value = raw.parts.join(" ").trim().to_string();
     if value.is_empty() {
         return Err((
             2,
@@ -82,8 +65,19 @@ pub fn parse(name: &str, args: &[String]) -> Result<Parsed, (i32, String)> {
     }
     Ok(Parsed {
         action: Action::Set(value),
-        tab,
+        tab: raw.tab,
     })
+}
+
+#[derive(Parser, Debug)]
+#[command(name = "tab-atelier", disable_help_subcommand = true)]
+struct Raw {
+    #[arg(long, value_name = "id")]
+    tab: Option<String>,
+    #[arg(long)]
+    clear: bool,
+    #[arg(value_name = "value")]
+    parts: Vec<String>,
 }
 
 /// One single-field tab CLI, driving [`post`].
@@ -105,13 +99,9 @@ pub struct Field {
 
 /// Read the `(url, token)` env pair, or `None` outside a tab (silent no-op).
 pub(crate) fn api_env() -> Option<(String, String)> {
-    match (
-        std::env::var("TAB_ATELIER_API_URL"),
-        std::env::var("TAB_ATELIER_API_TOKEN"),
-    ) {
-        (Ok(url), Ok(token)) => Some((url, token)),
-        _ => None,
-    }
+    super::client::discover_endpoint()
+        .ok()
+        .map(|endpoint| (endpoint.url, endpoint.token))
 }
 
 /// A 2 s-timeout ureq agent — the one used by every tab CLI.
@@ -230,14 +220,14 @@ mod tests {
     fn parse_rejects_dangling_tab_flag() {
         let (code, msg) = parse("set-x", &["--tab".into()]).unwrap_err();
         assert_eq!(code, 2);
-        assert!(msg.contains("--tab expects"), "{msg}");
+        assert!(msg.contains("--tab"), "{msg}");
     }
 
     #[test]
     fn parse_unknown_flag_errors() {
         let (code, msg) = parse("set-x", &["--bogus".into()]).unwrap_err();
         assert_eq!(code, 2);
-        assert!(msg.contains("unknown argument"), "{msg}");
+        assert!(msg.contains("--bogus"), "{msg}");
     }
 
     #[test]

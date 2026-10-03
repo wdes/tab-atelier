@@ -1,6 +1,4 @@
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// SPDX-License-Identifier: MPL-2.0
 
 //! Desktop "screen mate" pets — eSheep-compatible (the Mini Owl, rainbow sheep,
 //! Blue Ham Ham).
@@ -1019,7 +1017,7 @@ impl PetOverlay {
                 match (self.pets[i].pet.is_grazing(), over) {
                     (false, Some(_)) if self.pets[i].pet.is_walking() => self.pets[i].pet.start_grazing(),
                     (true, Some(gi)) => {
-                        self.grass[gi].amount -= dt_ms / 1000.0 * EAT_RATE;
+                        self.grass[gi].amount = (dt_ms / 1000.0).mul_add(-EAT_RATE, self.grass[gi].amount);
                         if self.grass[gi].amount <= 0.0 {
                             self.grass.remove(gi);
                             self.pets[i].pet.stop_grazing();

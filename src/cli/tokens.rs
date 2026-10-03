@@ -1,6 +1,4 @@
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// SPDX-License-Identifier: MPL-2.0
 
 //! Token-management CLI:
 //!
@@ -47,11 +45,7 @@ pub fn rotate(_args: &[String]) -> i32 {
             return 1;
         }
     };
-    match agent()
-        .post(format!("{}/tabs/rotate-tokens", ep.url))
-        .header("Authorization", &format!("Bearer {}", ep.token))
-        .send_empty()
-    {
+    match crate::cli::client::authed_post(&ep, "/tabs/rotate-tokens").send_empty() {
         Ok(mut resp) => {
             let revoked = resp
                 .body_mut()

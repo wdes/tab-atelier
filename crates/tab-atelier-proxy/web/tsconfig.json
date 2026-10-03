@@ -1,0 +1,32 @@
+{
+  // Sources live here; the compiled output is committed into ../assets/ and is
+  // what the proxy actually serves. Keeping the two apart is not tidiness — an
+  // outDir that contains the rootDir is auto-excluded by tsc, so nesting them
+  // makes the compiler quietly find no inputs at all.
+  //
+  // No bundler, and no modules in the emitted files. The two outputs are plain
+  // <script> tags sharing one global scope, exactly as before: `charts.js`
+  // assigns `window.TaCharts` and `app.js` reads it. Neither .ts file has a
+  // top-level import or export, so tsc treats both as scripts and emits them
+  // unwrapped. Vue's types arrive through a type-level `import("vue")` inside
+  // an ambient .d.ts, which erases completely — the npm package is a
+  // devDependency for typing and is never shipped or loaded.
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "es2022",
+    "lib": ["ES2022", "DOM"],
+    "outDir": "../assets",
+    "rootDir": "src",
+    "strict": true,
+    "noImplicitOverride": true,
+    "noUncheckedIndexedAccess": true,
+    "noFallthroughCasesInSwitch": true,
+    "noImplicitReturns": true,
+    "noUnusedLocals": true,
+    "removeComments": false,
+    "newLine": "lf",
+    "declaration": false,
+    "sourceMap": false
+  },
+  "include": ["src/**/*.ts", "src/**/*.d.ts"]
+}

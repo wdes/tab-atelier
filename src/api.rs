@@ -1,6 +1,4 @@
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// SPDX-License-Identifier: MPL-2.0
 
 use std::fmt::Write as _;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -11,12 +9,15 @@ use serde::Serialize;
 use log::{debug, error, info};
 
 mod assets;
+mod blackboard_route;
 mod cards;
 #[cfg(feature = "catbus")]
 mod catbus;
+mod claims_route;
 mod claude_only;
 mod env;
 mod files;
+mod fleet_route;
 mod input;
 mod limits;
 mod lock;
@@ -137,6 +138,49 @@ pub const BUILD_HASH: &str = env!("BUILD_HASH");
 
 /// Parse the tab segment between `/tabs/` and a suffix into either
 /// a numeric index or a UUID. Returns `(idx, key_for_html)` after
+/// Is this request one a sidecar peer may make with the remote token?
+///
+/// The sidecar mirrors tabs and drives them: list, read output, type input,
+/// move files through the sandboxed inbox/outbox, and the tab-level commands
+/// its protocol exposes (activate / rename / close). Everything else — token
+/// rotation, relay config, env, limits, ssh-agent, the log ring — stays
+/// master-only, so a peer link can't quietly become full control.
+///
+/// Typing into a tab is already arbitrary code execution there, so allowing
+/// close/rename alongside it is no escalation; reading this instance's secrets
+/// or re-pointing its relay would be.
+fn sidecar_route(method: &str, path: &str) -> bool {
+    if path == "/tabs" {
+        return method == "GET" || method == "POST";
+    }
+    // Gossip: a peer daemon reads our blackboard and offers us its own. Both
+    // directions are safe to expose because the log is a grow-only set —
+    // merging is a union, so a peer can add entries but can never remove,
+    // rewrite or reorder ours. Claims are deliberately NOT here: a lease is
+    // host-local mutual exclusion, and honouring a remote host's claim would
+    // mean trusting its clock.
+    if path == "/blackboard" {
+        return method == "GET" || method == "POST";
+    }
+    let Some(rest) = path.strip_prefix("/tabs/") else {
+        return false;
+    };
+    // `/tabs/<idx>` on its own — close.
+    if !rest.contains('/') {
+        return method == "DELETE";
+    }
+    // A download is `/tabs/<id>/outbox/<name>`, so check the section before
+    // falling back to the trailing segment.
+    if rest.contains("/outbox/") || rest.contains("/inbox/") {
+        return method == "GET";
+    }
+    match rest.rsplit('/').next().unwrap_or("") {
+        "output" | "stream" | "outbox" | "inbox" => method == "GET",
+        "input" | "files" | "activate" | "rename" => method == "POST",
+        _ => false,
+    }
+}
+
 /// resolution against the snapshot: the index is what every internal
 /// path uses; the key is the string the share URL carries (numeric
 /// or `by-id/UUID`) so the HTML viewer rewrites every subrequest with
@@ -300,6 +344,16 @@ struct TabInfo {
     rounds_active: Option<crate::RoundsActive>,
     #[serde(rename = "usageCount", skip_serializing_if = "Option::is_none")]
     usage_count: Option<u64>,
+    /// CRC-32 of the tab's current output — the same value `/output` returns
+    /// as `X-Output-Crc`. Lets a poller learn in ONE request which tabs moved:
+    /// `brain` watches every Claude tab for a frozen screen and otherwise
+    /// re-fetches each tab's whole grid every tick just to discover that
+    /// nothing changed. Compare with the previous listing; fetch `/output`
+    /// only where it differs.
+    output_crc: u32,
+    /// Byte length behind `output_crc`. Pairs with it for the conditional
+    /// `/output?since=&crc=` form, and separates "empty" from "unchanged".
+    output_len: u64,
 }
 
 /// One DNS-entries-view row for the `/tabs` response.
@@ -553,6 +607,14 @@ impl crate::schedule::LockState for SnapshotTab {
     }
 }
 
+/// The `label` that means "forget this tab's agent attachment", not
+/// "display this text": Claude Code's `SessionEnd` hook sends it so the
+/// grey *session attached* dot doesn't outlive the session. Kept as a
+/// wire value (rather than a fourth `state`) so that hooks written
+/// against older builds keep working, and used only by callers that
+/// mean it — a bare `state: "idle"` just parks the indicator.
+pub const WIPE_LABEL: &str = "__clear__";
+
 /// A status update queued by `POST /tabs/by-id/{id}/status` — drained
 /// by the main loop, which writes both the transient `agent_state`
 /// snapshot and the durable `agent_session_id` / `agent_kind` /
@@ -560,13 +622,19 @@ impl crate::schedule::LockState for SnapshotTab {
 #[derive(Clone, Debug)]
 pub struct PendingStatusUpdate {
     pub tab_id: String,
-    pub state: crate::AgentState,
+    /// `None` = take the indicator down (the wire's `"idle"`). The
+    /// metadata fields below are applied either way, so an update that
+    /// names its session can park the indicator *and* stay resumable.
+    pub state: Option<crate::AgentState>,
     pub label: Option<String>,
     pub session_id: Option<String>,
     pub agent_kind: Option<String>,
     pub plan_mode: Option<bool>,
     /// `--daemon`: this tab is a session-less daemon to relaunch on restart.
     pub daemon: Option<bool>,
+    /// Drop the durable attachment as well (see [`WIPE_LABEL`]). The
+    /// metadata fields above are ignored when this is set.
+    pub wipe_attachment: bool,
 }
 
 /// A queued relay-config change (the CLI `relay via <ep>` / `relay egress`).
@@ -911,6 +979,23 @@ fn write_new_file_no_symlink(path: &std::path::Path, bytes: &[u8]) -> std::io::R
 /// `{state_base}/tab-atelier/api.token` with mode 600. Persisting the
 /// token means already-paired mobile clients keep working across
 /// desktop restarts instead of falling out to 401 every time.
+/// Record the loopback URL this instance actually bound, next to its
+/// `api.token`, so CLI verbs can find a daemon that isn't on the default port.
+///
+/// Discovery used to assume `127.0.0.1:7890`. Move `api_addr` and every verb
+/// then sends a valid token to whatever else is on 7890 — answered by a 401
+/// that looks like a credential problem and isn't. The bound port is the
+/// daemon's to publish, and it's the *real* one (post-fallback), which is why
+/// this is written from the listener rather than from the configured spec.
+pub fn record_bound_url(port: u16) {
+    let dir = crate::platform::state_base_dir().join(crate::APP_DIR);
+    if std::fs::create_dir_all(&dir).is_ok() {
+        // Best-effort, like the token write: a read-only home must not stop
+        // the server from serving.
+        let _ = std::fs::write(dir.join("api.url"), format!("http://127.0.0.1:{port}"));
+    }
+}
+
 pub fn load_or_generate_token() -> String {
     let dir = crate::platform::state_base_dir().join(crate::APP_DIR);
     let path = dir.join("api.token");
@@ -1305,8 +1390,13 @@ pub fn count_files_tree(dir: &std::path::Path) -> usize {
     n
 }
 
+/// Smallest body worth compressing. Shared with `respond_with_etag_precomputed`
+/// so it can tell which representation it is about to send without paying for
+/// the compression first.
+const GZIP_MIN_BODY: usize = 4096;
+
 fn maybe_gzip(bytes: &[u8], accept_gzip: bool) -> Option<Vec<u8>> {
-    const MIN_BODY: usize = 4096;
+    const MIN_BODY: usize = GZIP_MIN_BODY;
     if !accept_gzip || bytes.len() < MIN_BODY {
         return None;
     }
@@ -1449,12 +1539,26 @@ fn respond_with_etag_precomputed<W: Write>(
     extra_headers: &str,
     etag: Option<String>,
 ) {
-    let etag = etag.unwrap_or_else(|| etag_for(body));
+    let base_etag = etag.unwrap_or_else(|| etag_for(body));
+    // One ETag per REPRESENTATION, not per resource. The gzipped and identity
+    // bodies are different bytes, so sharing a tag lets a shared cache hand a
+    // stored gzip response to a client that never asked for one — and a client
+    // revalidating an identity copy could be told 304 for a gzip it does not
+    // have. `will_gzip` mirrors `maybe_gzip`'s rule so this decision costs no
+    // compression on a conditional request that is about to 304.
+    let will_gzip = accept_gzip && body.len() >= GZIP_MIN_BODY;
+    let etag = if will_gzip {
+        format!("{base_etag}-gz")
+    } else {
+        base_etag
+    };
+    // Any cache in the path must key on the encoding for the same reason.
+    let vary = "Vary: Accept-Encoding\r\n";
     if status == 200 && if_none_match.is_some_and(|v| v == etag) {
         // Content is byte-identical to what the client already has.
         let _ = write!(
             stream,
-            "HTTP/1.1 304 Not Modified\r\nETag: \"{etag}\"\r\n{ROBOTS_TAG}{extra_headers}\r\n"
+            "HTTP/1.1 304 Not Modified\r\nETag: \"{etag}\"\r\n{vary}{ROBOTS_TAG}{extra_headers}\r\n"
         );
         return;
     }
@@ -1471,14 +1575,14 @@ fn respond_with_etag_precomputed<W: Write>(
     if let Some(gz) = maybe_gzip(body, accept_gzip) {
         let _ = write!(
             stream,
-            "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Encoding: gzip\r\nETag: \"{etag}\"\r\n{ROBOTS_TAG}{extra_headers}Content-Length: {}\r\n\r\n",
+            "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Encoding: gzip\r\nETag: \"{etag}\"\r\n{vary}{ROBOTS_TAG}{extra_headers}Content-Length: {}\r\n\r\n",
             gz.len()
         );
         let _ = stream.write_all(&gz);
     } else {
         let _ = write!(
             stream,
-            "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nETag: \"{etag}\"\r\n{ROBOTS_TAG}{extra_headers}Content-Length: {}\r\n\r\n",
+            "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nETag: \"{etag}\"\r\n{vary}{ROBOTS_TAG}{extra_headers}Content-Length: {}\r\n\r\n",
             body.len()
         );
         let _ = stream.write_all(body);
@@ -1502,6 +1606,26 @@ fn respond_json<W: Write>(stream: &mut W, status: u16, body: &str) {
     let _ = write!(
         stream,
         "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\n{ROBOTS_TAG}Content-Length: {}\r\n\r\n{}",
+        body.len(),
+        body
+    );
+}
+
+/// Like [`respond_json`], plus `Access-Control-Allow-Origin: *`.
+///
+/// Used only for `/fleet`, and only for requests that arrived on loopback, so
+/// a local dashboard can be a plain `file://` page instead of an asset served
+/// by the daemon — which is the point: fetching the viewer's fonts and scripts
+/// from a busy daemon is exactly what is slow when the box is loaded.
+///
+/// The route still requires the token; CORS only decides whether a browser
+/// lets a page READ the reply. A page that already has the token has already
+/// won, and a non-loopback caller gets no header at all.
+fn respond_json_cors<W: Write>(stream: &mut W, status: u16, body: &str) {
+    let _ = write!(
+        stream,
+        "HTTP/1.1 {} OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\n{ROBOTS_TAG}Content-Length: {}\r\n\r\n{}",
+        status,
         body.len(),
         body
     );
@@ -1590,7 +1714,13 @@ fn html_escape(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
-fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnapshot>>, _token: &str, read_only: bool) {
+fn handle_connection<S: Read + Write>(
+    stream: &mut S,
+    state: &Arc<Mutex<TabSnapshot>>,
+    _token: &str,
+    read_only: bool,
+    from_loopback: bool,
+) {
     // Owned BufReader around the stream itself — `try_clone` was only used
     // to dodge the read/write borrow on TcpStream, but it doesn't exist on
     // rustls::Stream. Buffering on `&mut S` works for both, and the read
@@ -1686,7 +1816,13 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
     // by some reverse proxies / Cloudflare Tunnel normalisation)
     // still matches the `ends_with("/view")` route arms below.
     // `/` itself is preserved so the root keeps working.
-    let path = if path.len() > 1 && path.ends_with('/') {
+    // Remembered, not just stripped: the browser resolves the page's relative
+    // asset URLs against the path IT requested, so `/tabs/0/view/` sits one
+    // directory deeper than `/tabs/0/view` and needs one more `../`. Matching
+    // the route without carrying this made every asset 404 behind a proxy that
+    // normalises trailing slashes.
+    let had_trailing_slash = path.len() > 1 && path.ends_with('/');
+    let path = if had_trailing_slash {
         path.trim_end_matches('/').to_string()
     } else {
         path
@@ -1784,7 +1920,21 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
         }
         ok
     };
-    if !is_master {
+    // A sidecar peer (`remote attach` / `put` / `get` from another machine)
+    // authenticates with THIS instance's remote token, scoped to the tab
+    // operations it performs (see `sidecar_route`). It deliberately cannot
+    // rotate credentials, read the log ring, reconfigure the relay or dump the
+    // env — handing a peer the master token would grant all of that, for as
+    // long as it holds it.
+    let is_remote_peer = !is_master
+        && provided_token
+            .as_deref()
+            .is_some_and(|p| constant_time_eq(p.as_bytes(), crate::remote_token().as_bytes()))
+        && sidecar_route(&method, &path);
+    if is_remote_peer {
+        state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).touch();
+    }
+    if !is_master && !is_remote_peer {
         let allowed = if let Some(p) = provided_token.as_deref()
             && let Some(rest) = path.strip_prefix("/tabs/by-id/")
             && let Some((uuid, action)) = rest.split_once('/')
@@ -1886,7 +2036,14 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             catbus::messages(stream, state, p, query_since);
         }
         ("GET", p) if p.starts_with("/tabs/") && p.ends_with("/view") => {
-            view::run(stream, state, p, accept_gzip, if_none_match.as_deref());
+            view::run(
+                stream,
+                state,
+                p,
+                accept_gzip,
+                if_none_match.as_deref(),
+                had_trailing_slash,
+            );
         }
         ("GET", p) if p.starts_with("/tabs/") && p.ends_with("/output") => {
             output::run(stream, state, p, query_since, query_crc, query_lines, accept_gzip);
@@ -1905,6 +2062,32 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
         ("POST", "/relay-mode") => relay::mode(stream, state, &body_bytes),
         ("GET", "/relay-config") => relay::config_get(stream),
         ("POST", "/relay-config") => relay::config_set(stream, state, &body_bytes),
+        ("GET", "/logs") => {
+            // Loopback only. The ring holds whatever the daemon logged — tab
+            // names, cwds, endpoint labels, error strings — and the API binds
+            // 0.0.0.0 in the default config, so holding the master token from
+            // another host must not be enough to read it. The peer address is
+            // the gate; `X-Forwarded-For` is deliberately NOT consulted, since
+            // a proxy on this host would then let anyone forge it.
+            if !from_loopback {
+                error_json(stream, 403, "logs are readable from 127.0.0.1 only");
+                return;
+            }
+            let n = query_lines.unwrap_or(200).min(crate::log_ring::CAPACITY);
+            let body = serde_json::json!({ "lines": crate::log_ring::tail(n) }).to_string();
+            respond_json(stream, 200, &body);
+        }
+        ("GET", "/claims") => {
+            let now = crate::unix_millis();
+            let claims = crate::claims::with_registry(|r| r.active(now));
+            let body = serde_json::json!({ "claims": claims, "now_ms": now }).to_string();
+            respond_json(stream, 200, &body);
+        }
+        ("POST", "/claims") => claims_route::grant(stream, &body_bytes),
+        ("POST", "/claims/release") => claims_route::release(stream, &body_bytes),
+        ("GET", "/fleet") => fleet_route::get(stream, state, from_loopback),
+        ("GET", "/blackboard") => blackboard_route::list(stream, query_since),
+        ("POST", "/blackboard") => blackboard_route::merge(stream, &body_bytes),
         ("GET", "/env") => env::list_global(stream),
         ("GET", p) if p.starts_with("/tabs/") && p.ends_with("/env") => env::list_tab(stream, state, p),
         ("POST", "/env") => env::set_global(stream, state, &body_bytes),
@@ -1948,6 +2131,12 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 accept_gzip,
                 if_none_match.as_deref(),
             );
+        }
+        // A named download: `/tabs/<key>/outbox/<name>`. The name is in the
+        // path so the browser's fallback filename is already correct when an
+        // `<a download>` is ignored (it is, cross-origin).
+        ("GET", p) if p.starts_with("/tabs/") && p.contains("/outbox/") => {
+            files::download_by_path(stream, state, p, accept_gzip, if_none_match.as_deref());
         }
         // List `outbox/` or `inbox/` contents so the viewer can
         // render the download / sent-files panels. The panel header
@@ -2173,6 +2362,7 @@ async fn handle_hyper_request(
     state: Arc<Mutex<TabSnapshot>>,
     token: String,
     read_only: bool,
+    from_loopback: bool,
 ) -> Result<Response<RespBody>, Infallible> {
     let path = req.uri().path().to_string();
     // Intercept WS upgrade BEFORE we collect the body into the sync
@@ -2214,7 +2404,7 @@ async fn handle_hyper_request(
             input: std::io::Read::chain(std::io::Cursor::new(head), std::io::Cursor::new(body)),
             output: Vec::with_capacity(1024),
         };
-        handle_connection(&mut adapter, &state, &token, read_only);
+        handle_connection(&mut adapter, &state, &token, read_only, from_loopback);
         adapter.output
     })
     .await
@@ -2223,6 +2413,24 @@ async fn handle_hyper_request(
 }
 
 /// A small buffered relay response (errors / 401s), boxed to match [`RespBody`].
+/// Claude Code's reachability probe: `HEAD`/`GET {base}/api/hello`, sent with
+/// NO credential at all — it runs before the client has one to present. A 401
+/// there reads as "this endpoint is broken" and the whole relay looks dead,
+/// even though the real `/v1/messages` calls would authenticate fine.
+///
+/// Answered locally and unauthenticated: no upstream call, no token touched,
+/// and it discloses nothing that completing the TCP handshake hasn't already.
+/// Deliberately an exact path match — an unauthenticated branch is security
+/// surface, so it stays one probe wide.
+fn relay_hello(head_only: bool) -> Response<RespBody> {
+    let body = if head_only { "" } else { "{}" };
+    Response::builder()
+        .status(200)
+        .header("content-type", "application/json")
+        .body(Full::new(Bytes::from(body)).boxed())
+        .unwrap_or_else(|_| Response::new(Full::new(Bytes::new()).boxed()))
+}
+
 fn relay_status(code: u16, msg: &str) -> Response<RespBody> {
     Response::builder()
         .status(code)
@@ -2237,9 +2445,10 @@ fn relay_status(code: u16, msg: &str) -> Response<RespBody> {
 /// sync path can't). Role is config-driven: the **egress** instance forwards to
 /// `api.anthropic.com` injecting the remote's Claude OAuth token (see
 /// [`crate::relay`]); otherwise the **local** instance forwards to the
-/// configured remote's `/relay/anthropic/*`. Auth: the local hop presents the
-/// stand-in `x-api-key`, the egress hop a `Bearer` — both must equal this
-/// instance's master token.
+/// configured remote's `/relay/anthropic/*`. Auth: this instance's relay token
+/// in either `x-api-key` (what a claude client sends) or `Authorization:
+/// Bearer` (what our forwarding hop sends) — the role doesn't change which
+/// header is accepted.
 async fn handle_relay(req: Request<Incoming>, master_token: &str) -> Response<RespBody> {
     let method = req.method().clone();
     let full = req.uri().path();
@@ -2247,23 +2456,70 @@ async fn handle_relay(req: Request<Incoming>, master_token: &str) -> Response<Re
     let sub_pq = req.uri().query().map_or_else(|| sub.clone(), |q| format!("{sub}?{q}"));
     let egress = crate::relay_egress();
 
-    // Auth against this instance's master token (constant-time).
-    let provided = if egress {
-        req.headers()
-            .get(hyper::header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
-            .unwrap_or("")
-            .to_owned()
-    } else {
-        req.headers()
-            .get("x-api-key")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_owned()
-    };
-    if !constant_time_eq(provided.as_bytes(), master_token.as_bytes()) {
-        return relay_status(401, "relay: unauthorized");
+    // Reachability probe first: it carries no credential by design, so it has
+    // to be answered before the auth gate or the client concludes the relay is
+    // unusable and never gets as far as an authenticated call.
+    if sub == "/api/hello" && matches!(method, hyper::Method::HEAD | hyper::Method::GET) {
+        return relay_hello(method == hyper::Method::HEAD);
+    }
+
+    // Auth against this instance's relay token (constant-time), from EITHER
+    // header, whatever the role.
+    //
+    // These used to be role-dependent — Bearer on an egress instance, x-api-key
+    // on a local hop — because a claude client speaks x-api-key and our own
+    // forwarding hop speaks Bearer. That made the header a second, undocumented
+    // thing to get right: a claude pointed straight at an egress box, or an
+    // operator running the README's smoke test there, sends x-api-key, gets an
+    // empty credential and a 401 that says nothing about the real problem. The
+    // token is the same secret either way, so which envelope carries it buys
+    // nothing.
+    // Captured before the body is consumed: whatever the client opted into
+    // travels with the request, on both hops.
+    let client_beta = req
+        .headers()
+        .get("anthropic-beta")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let provided = req
+        .headers()
+        .get("x-api-key")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned)
+        .or_else(|| {
+            req.headers()
+                .get(hyper::header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.strip_prefix("Bearer "))
+                .map(str::to_owned)
+        })
+        .unwrap_or_default();
+    // The relay token is the ONLY credential for this route. It authenticates
+    // the relay and nothing else, so the value sitting in a claude tab's
+    // ANTHROPIC_API_KEY cannot administer the instance if it leaks — which is
+    // the entire point, and is why the master token is not a second way in.
+    if !constant_time_eq(provided.as_bytes(), crate::relay_token().as_bytes()) {
+        // A bare "unauthorized" leaves the operator guessing which hop, which
+        // route and which credential was wrong — the whole point of the relay
+        // is that two machines and three tokens are involved. Say what we can
+        // without printing anyone's secret: the hop, the path, the header the
+        // client used, and whether what it sent was the master token (the most
+        // common mistake, since that IS what older builds wanted here).
+        let looks_like_master =
+            !master_token.is_empty() && constant_time_eq(provided.as_bytes(), master_token.as_bytes());
+        let hop = if egress { "egress" } else { "local" };
+        let diagnosis = if provided.is_empty() {
+            "no credential presented"
+        } else if looks_like_master {
+            "presented the MASTER token — the relay takes `tab-atelier relay token` only"
+        } else {
+            "credential did not match this instance's relay token"
+        };
+        log::warn!(
+            "relay: 401 on {method} /relay/anthropic{sub} ({hop} hop, {len} chars presented): {diagnosis}",
+            len = provided.chars().count(),
+        );
+        return relay_status(401, &format!("relay: unauthorized ({hop} hop: {diagnosis})"));
     }
 
     let content_type = req
@@ -2288,15 +2544,36 @@ async fn handle_relay(req: Request<Incoming>, master_token: &str) -> Response<Re
     tokio::task::spawn_blocking(move || {
         let agent = crate::relay::relay_agent();
         let (url, bearer, cf) = if egress {
-            let token = match crate::relay::oauth_access_token() {
-                Ok(t) => t,
-                Err(e) => {
-                    let _ = meta_tx.send(Err(format!("egress oauth: {e}")));
-                    return;
-                }
-            };
-            (format!("{}{sub_pq}", crate::relay::upstream()), token, None)
+            // The egress role moved out to the `tab-atelier-proxy` package.
+            //
+            // It authenticated an entire fleet with ONE shared token, which
+            // cannot say who spent the quota and cannot be taken away from one
+            // machine without re-keying every other. The replacement has an
+            // account per person and a key each. It is also a server, and this
+            // is a terminal emulator — running it here meant installing X11 and
+            // gpui on a box that wanted neither.
+            //
+            // Refused loudly rather than quietly forwarding: a relay that keeps
+            // half-working after its credential model changed is worse than one
+            // that says what to install.
+            let _ = meta_tx.send(Err(
+                "the egress role is now the `tab-atelier-proxy` package — install it there, \
+                 `tab-atelier-proxy add <first> <last> <email>` for a key, then point this \
+                 instance at it with `relay via`. See docs/proxy.md"
+                    .to_owned(),
+            ));
+            return;
         } else if let Some(t) = target {
+            // Without a relay token for the peer there is nothing to present,
+            // and forwarding an empty Bearer just turns a local misconfig into
+            // a 401 from the other machine — the hardest kind to diagnose.
+            if t.token.is_empty() {
+                let _ = meta_tx.send(Err(format!(
+                    "no relay token for {} — run `tab-atelier relay token` there, then                      `remote add … --relay-token <it>` here",
+                    t.url
+                )));
+                return;
+            }
             let cf = (!t.cf_access_client_id.is_empty())
                 .then(|| (t.cf_access_client_id.clone(), t.cf_access_client_secret.clone()));
             (format!("{}/relay/anthropic{sub_pq}", t.url), t.token, cf)
@@ -2313,9 +2590,17 @@ async fn handle_relay(req: Request<Incoming>, master_token: &str) -> Response<Re
         ];
         if egress {
             hdrs.push(("anthropic-version", crate::relay::ANTHROPIC_VERSION.to_owned()));
-            hdrs.push(("anthropic-beta", crate::relay::ANTHROPIC_BETA.to_owned()));
+            hdrs.push((
+                "anthropic-beta",
+                crate::relay::merge_beta(client_beta.as_deref(), crate::relay::ANTHROPIC_BETA),
+            ));
         } else {
             hdrs.push(("Accept", "application/json".to_owned()));
+            // The local hop is a pipe: the egress needs the client's flags to
+            // merge, and it can't see them if we drop them here.
+            if let Some(beta) = client_beta.clone() {
+                hdrs.push(("anthropic-beta", beta));
+            }
             if let Some((id, sec)) = cf {
                 hdrs.push(("CF-Access-Client-Id", id));
                 hdrs.push(("CF-Access-Client-Secret", sec));
@@ -2386,11 +2671,17 @@ async fn handle_relay(req: Request<Incoming>, master_token: &str) -> Response<Re
 /// Pick the right hyper connection driver for the negotiated ALPN.
 /// Called from both the plain (no ALPN, default to h1) and TLS
 /// (ALPN-negotiated) listener paths.
-async fn serve_connection<I>(io: I, h2: bool, state: Arc<Mutex<TabSnapshot>>, token: String, read_only: bool)
-where
+async fn serve_connection<I>(
+    io: I,
+    h2: bool,
+    state: Arc<Mutex<TabSnapshot>>,
+    token: String,
+    read_only: bool,
+    from_loopback: bool,
+) where
     I: hyper::rt::Read + hyper::rt::Write + Send + Unpin + 'static,
 {
-    let svc = service_fn(move |req| handle_hyper_request(req, state.clone(), token.clone(), read_only));
+    let svc = service_fn(move |req| handle_hyper_request(req, state.clone(), token.clone(), read_only, from_loopback));
     if h2 {
         let _ = h2_conn::Builder::new(TokioExecutor::new())
             .serve_connection(io, svc)
@@ -2456,6 +2747,9 @@ pub fn start_api_server(state: Arc<Mutex<TabSnapshot>>, token: String, read_only
             let listener = match TokioListener::bind(&bind).await {
                 Ok(l) => {
                     info!("API: listening on {bind} (HTTP/1.1)");
+                    if let Ok(addr) = l.local_addr() {
+                        record_bound_url(addr.port());
+                    }
                     l
                 }
                 Err(e) => {
@@ -2468,13 +2762,14 @@ pub fn start_api_server(state: Arc<Mutex<TabSnapshot>>, token: String, read_only
             loop {
                 tokio::select! {
                     res = listener.accept() => {
-                        let Ok((stream, _)) = res else { continue };
+                        let Ok((stream, peer)) = res else { continue };
+                        let loopback = peer.ip().is_loopback();
                         let state = state.clone();
                         let token = token.clone();
                         tokio::spawn(async move {
                             // Plain HTTP: no ALPN, HTTP/1.1 with
                             // keep-alive. HTTP/2 only over TLS.
-                            serve_connection(TokioIo::new(stream), false, state, token, read_only).await;
+                            serve_connection(TokioIo::new(stream), false, state, token, read_only, loopback).await;
                         });
                     }
                     () = shutdown.notified() => {
@@ -2601,7 +2896,8 @@ pub fn start_api_server_tls(
             loop {
                 tokio::select! {
                     res = listener.accept() => {
-                        let Ok((stream, _)) = res else { continue };
+                        let Ok((stream, peer)) = res else { continue };
+                        let loopback = peer.ip().is_loopback();
                         let acceptor = acceptor.clone();
                         let state = state.clone();
                         let token = token.clone();
@@ -2617,7 +2913,7 @@ pub fn start_api_server_tls(
                             // protocol so hyper uses the right framing.
                             let alpn = tls.get_ref().1.alpn_protocol().map(<[u8]>::to_vec);
                             let is_h2 = alpn.as_deref() == Some(b"h2");
-                            serve_connection(TokioIo::new(tls), is_h2, state, token, read_only).await;
+                            serve_connection(TokioIo::new(tls), is_h2, state, token, read_only, loopback).await;
                         });
                     }
                     () = shutdown.notified() => {
@@ -2879,6 +3175,51 @@ pub fn test_snapshot_tab(id: &str, name: &str) -> SnapshotTab {
     }
 }
 
+/// Spawn the real API server on an ephemeral port over `state`, returning the
+/// port once it is accepting. Test-only: it lets the CLI verb tests drive the
+/// actual HTTP paths (`share_link`, `remote`, …) instead of mocking them.
+#[cfg(test)]
+pub fn spawn_test_server(state: &std::sync::Arc<std::sync::Mutex<TabSnapshot>>, read_only: bool) -> u16 {
+    // Hand a pre-bound std listener to a fresh tokio runtime so the caller
+    // knows the port without racing a rebind; the channel makes "accepting"
+    // observable so a request can't beat the loop.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let port = listener.local_addr().expect("addr").port();
+    let token = state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .master_token
+        .clone();
+    let s = state.clone();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(async move {
+            let listener = tokio::net::TcpListener::from_std(listener).expect("from_std");
+            let _ = ready_tx.send(());
+            loop {
+                let Ok((stream, peer)) = listener.accept().await else {
+                    continue;
+                };
+                let loopback = peer.ip().is_loopback();
+                let state = s.clone();
+                let token = token.clone();
+                tokio::spawn(async move {
+                    serve_connection(TokioIo::new(stream), false, state, token, read_only, loopback).await;
+                });
+            }
+        });
+    });
+    ready_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("server ready");
+    port
+}
+
 #[cfg(test)]
 pub fn test_snapshot(tabs: Vec<SnapshotTab>) -> TabSnapshot {
     TabSnapshot {
@@ -2930,6 +3271,52 @@ mod tests {
     use std::io::Read;
     use std::net::TcpStream;
 
+    /// The viewer's paste handler must leave TEXT paste alone.
+    ///
+    /// Pasting an image into the web viewer did nothing, because a clipboard
+    /// screenshot carries no text for xterm's hidden textarea to receive.
+    /// Uploading it to `inbox/` fixes that — but the tempting shape of the fix,
+    /// handling every paste, would take text paste away from xterm and break
+    /// the common case to fix the rare one. The early return on "no files" is
+    /// the whole safety property, so it is what this pins.
+    #[test]
+    fn the_viewer_only_intercepts_a_paste_that_carries_files() {
+        let js = MAIN_JS;
+        let at = js
+            .find("addEventListener(\"paste\"")
+            .expect("the viewer no longer handles paste at all");
+        let handler = &js[at..(at + 400).min(js.len())];
+        assert!(
+            handler.contains("clipboardData?.files"),
+            "the paste handler must look at clipboardData.files"
+        );
+        // The bail-out has to come BEFORE preventDefault, or a text paste is
+        // swallowed on its way to xterm.
+        let bail = handler.find("if (!files.length) return");
+        let prevent = handler.find("preventDefault");
+        assert!(
+            matches!((bail, prevent), (Some(b), Some(p)) if b < p),
+            "a paste with no files must return before preventDefault, or plain text paste stops working:\n{handler}"
+        );
+    }
+
+    /// Two pasted screenshots must not collide.
+    ///
+    /// Every clipboard image arrives called `image.png`, and `inbox/` is keyed
+    /// by name, so uploading them verbatim means each paste overwrites the one
+    /// before it — silently, since the upload itself succeeds.
+    #[test]
+    fn pasted_clipboard_images_get_a_unique_name() {
+        assert!(
+            MAIN_JS.contains("function pastedName"),
+            "the generic-name rename is gone; pasted images will overwrite each other in inbox/"
+        );
+        assert!(
+            MAIN_JS.contains("uploadFiles(files, { rename: true })"),
+            "paste must ask for the rename — drag-drop deliberately does not"
+        );
+    }
+
     /// A `TabInfo` with every field at its empty/default so a test can
     /// override just the two consumption fields (issue #28, S1/S2).
     fn tab_info_fixture() -> TabInfo {
@@ -2957,6 +3344,8 @@ mod tests {
             context: None,
             meta: std::collections::BTreeMap::new(),
             badge: None,
+            output_crc: 0,
+            output_len: 0,
             viewers: 0,
             net_disabled: false,
             connections: 0,
@@ -3182,13 +3571,6 @@ mod tests {
     }
 
     fn spawn_server_with_read_only(read_only: bool) -> (u16, Arc<Mutex<TabSnapshot>>, String) {
-        // Hand a pre-bound std listener to a fresh tokio runtime so
-        // the test can know the port without racing with rebind.
-        // A oneshot channel signals "listener is accepting" so the
-        // caller can't connect before the loop starts.
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let port = listener.local_addr().unwrap().port();
         let state = test_state();
         let token = "test-secret-token".to_string();
         // Auth validates against the snapshot's master_token (live-swappable).
@@ -3196,30 +3578,7 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .master_token = token.clone();
-        let s = state.clone();
-        let t = token.clone();
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            rt.block_on(async move {
-                let listener = tokio::net::TcpListener::from_std(listener).unwrap();
-                let _ = ready_tx.send(());
-                loop {
-                    let Ok((stream, _)) = listener.accept().await else {
-                        continue;
-                    };
-                    let state = s.clone();
-                    let token = t.clone();
-                    tokio::spawn(async move {
-                        serve_connection(TokioIo::new(stream), false, state, token, read_only).await;
-                    });
-                }
-            });
-        });
-        ready_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        let port = super::spawn_test_server(&state, read_only);
         (port, state, token)
     }
 
@@ -3239,6 +3598,15 @@ mod tests {
             return out;
         }
         req.to_string()
+    }
+
+    /// The header block of a response, as text. Safe on a binary body.
+    fn head_of(resp: &[u8]) -> String {
+        let end = resp
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .map_or(resp.len(), |i| i + 4);
+        String::from_utf8_lossy(&resp[..end]).into_owned()
     }
 
     fn request(port: u16, req: &str) -> String {
@@ -3297,97 +3665,749 @@ mod tests {
         String::from_utf8_lossy(&buf).into_owned()
     }
 
-    /// End-to-end: a client POST through the EGRESS relay is forwarded to a
-    /// mock "Anthropic", streaming the SSE response back, with the stand-in
-    /// auth swapped for the remote's Claude OAuth token. Mocks the real Claude
-    /// API (mirrors `catbus-agent/tests/openai_mock.rs`).
+    /// The egress role is retired here, and says where it went.
+    ///
+    /// The forwarding it used to do — inject the host's Claude OAuth token and
+    /// stream the SSE back — now lives in the `tab-atelier-proxy` crate, whose
+    /// `tests/forwarding.rs` covers it end to end against a mock Anthropic,
+    /// plus the thing this crate never could: that ONE caller's key can be
+    /// revoked without touching anyone else's.
+    ///
+    /// What is checked here is that the retirement is loud. A relay that
+    /// silently stopped injecting a credential would answer 401s from upstream
+    /// and look like an Anthropic outage.
     #[test]
-    fn relay_egress_streams_sse_and_injects_oauth() {
-        use std::io::{Read, Write};
+    fn the_egress_role_points_at_the_proxy_package_instead_of_half_working() {
         let _guard = RELAY_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-        // Fixture credentials: a far-future access token so no network refresh.
-        let dir = tempfile::tempdir().unwrap();
-        let creds = dir.path().join("creds.json");
-        std::fs::write(
-            &creds,
-            r#"{"claudeAiOauth":{"accessToken":"oat-fixture-xyz","refreshToken":"ort-x","expiresAt":9999999999999,"scopes":["user:inference"]}}"#,
-        )
-        .unwrap();
-
-        // Mock upstream Anthropic: capture the Authorization header, then stream
-        // two SSE frames with a gap and close (connection-close framing).
-        let mock = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let mock_port = mock.local_addr().unwrap().port();
-        let (seen_tx, seen_rx) = std::sync::mpsc::channel::<String>();
-        std::thread::spawn(move || {
-            if let Ok((mut sock, _)) = mock.accept() {
-                sock.set_read_timeout(Some(std::time::Duration::from_secs(2))).ok();
-                let mut buf = Vec::new();
-                let mut tmp = [0u8; 1024];
-                while let Ok(n) = sock.read(&mut tmp) {
-                    if n == 0 {
-                        break;
-                    }
-                    buf.extend_from_slice(&tmp[..n]);
-                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-                        break;
-                    }
-                }
-                let head = String::from_utf8_lossy(&buf);
-                let auth = head
-                    .lines()
-                    .find(|l| l.to_ascii_lowercase().starts_with("authorization:"))
-                    .unwrap_or("")
-                    .to_owned();
-                let _ = seen_tx.send(auth);
-                let _ =
-                    sock.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n");
-                let _ = sock.write_all(b"data: {\"type\":\"message_start\"}\n\n");
-                let _ = sock.flush();
-                std::thread::sleep(std::time::Duration::from_millis(40));
-                let _ = sock.write_all(b"data: [DONE]\n\n");
-                let _ = sock.flush();
-            }
-        });
-
-        // Configure the egress role + point it at the mock + fixture creds.
-        crate::relay::set_credentials_path(Some(creds));
-        crate::relay::set_upstream(Some(format!("http://127.0.0.1:{mock_port}")));
         crate::set_relay_egress(true);
-
-        let (port, _state, token) = spawn_server();
+        let (port, _state, _master) = spawn_server();
+        let token = crate::relay_token();
         let payload = "{}";
-        let req = format!(
-            "POST /relay/anthropic/v1/messages HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
-            payload.len()
+        let resp = request(
+            port,
+            &format!(
+                "POST /relay/anthropic/v1/messages HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
+                payload.len()
+            ),
         );
-        let resp = request(port, &req);
-
-        // Restore globals so parallel/later tests aren't affected.
         crate::set_relay_egress(false);
-        crate::relay::set_upstream(None);
-        crate::relay::set_credentials_path(None);
 
-        assert_eq!(status_code(&resp), 200, "resp: {resp}");
-        assert!(resp.contains("data:"), "expected streamed SSE, got: {resp}");
-        assert!(resp.contains("[DONE]"), "expected final SSE frame, got: {resp}");
-        let seen = seen_rx
-            .recv_timeout(std::time::Duration::from_secs(2))
-            .unwrap_or_default();
+        assert_eq!(status_code(&resp), 502, "resp: {resp}");
         assert!(
-            seen.contains("oat-fixture-xyz"),
-            "egress must inject the Claude OAuth token; upstream saw: {seen}"
+            resp.contains("tab-atelier-proxy"),
+            "the error must name the package that replaced this role: {resp}"
         );
         assert!(
-            !seen.contains(token.as_str()),
-            "the stand-in relay token must never reach Anthropic; saw: {seen}"
+            resp.contains("docs/proxy.md"),
+            "and where to read about the migration: {resp}"
         );
     }
 
     /// End-to-end: a client POST through the LOCAL relay is forwarded to the
+    #[test]
+    fn the_relay_route_takes_the_relay_token_not_just_the_master() {
+        let _guard = RELAY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (port, _state, master) = spawn_server();
+        let relay = crate::relay_token();
+        assert_ne!(relay, master, "the relay credential is its own token");
+
+        let payload = r#"{"model":"m","max_tokens":1,"messages":[]}"#;
+        let call = |key: &str| {
+            request(
+                port,
+                &format!(
+                    "POST /relay/anthropic/v1/messages HTTP/1.1\r\nHost: x\r\nx-api-key: {key}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
+                    payload.len(),
+                ),
+            )
+        };
+        // A token that is neither is refused — the route is not open.
+        assert_eq!(status_code(&call("not-a-token")), 401);
+        assert_eq!(status_code(&call("")), 401);
+        // The relay token authenticates. No relay target is configured here,
+        // so it gets as far as the forward attempt and fails there — what
+        // matters is that it is NOT 401.
+        assert_ne!(status_code(&call(&relay)), 401, "relay token authenticates");
+        // The master token is NOT a second way in: it administers every tab,
+        // and the point of the split is that the relay credential can't.
+        assert_eq!(status_code(&call(&master)), 401, "master is not a relay credential");
+    }
+
+    #[test]
+    fn the_tab_listing_carries_the_output_crc() {
+        // One request tells a poller which tabs moved. Without it `brain`
+        // re-fetched every tab's whole grid each tick just to discover that
+        // nothing had — ~1.4 MiB per sweep on a 63-tab fleet.
+        let (port, state, token) = spawn_server();
+        let resp = request(
+            port,
+            &format!("GET /tabs HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n"),
+        );
+        let listing = body(&resp);
+        let parsed: serde_json::Value = serde_json::from_str(listing).expect("json");
+        let tab = &parsed["tabs"][0];
+        let crc = tab["output_crc"].as_u64().expect("output_crc present");
+        let len = tab["output_len"].as_u64().expect("output_len present");
+        assert!(len > 0, "the fixture tab has output");
+        // It matches what /output reports, so a client can move between the
+        // two without re-deriving anything.
+        let out = request(
+            port,
+            &format!("GET /tabs/0/output HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n"),
+        );
+        assert!(
+            out.to_lowercase().contains(&format!("x-output-crc: {crc:08x}")),
+            "listing CRC must equal the /output header: {crc:08x}"
+        );
+        // And it tracks the content: change the output, the CRC changes.
+        // Set both forms: the listing mirrors /output, which prefers
+        // `raw_output` when the tab has one.
+        let mut s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let fresh = "something else entirely";
+        s.tabs[0].output = fresh.into();
+        s.tabs[0].output_crc = crate::crc32(fresh.as_bytes());
+        s.tabs[0].raw_output = fresh.into();
+        s.tabs[0].raw_output_crc = crate::crc32(fresh.as_bytes());
+        // `/tabs` serves `cached_response` when set; the owner clears it on
+        // every snapshot rebuild, so a test mutating the snapshot must too.
+        s.cached_response = None;
+        drop(s);
+        let resp = request(
+            port,
+            &format!("GET /tabs HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n"),
+        );
+        let listing = body(&resp);
+        let parsed: serde_json::Value = serde_json::from_str(listing).expect("json");
+        assert_ne!(
+            parsed["tabs"][0]["output_crc"].as_u64(),
+            Some(crc),
+            "CRC follows the content"
+        );
+    }
+
+    #[test]
+    fn the_sidecar_token_is_scoped_to_what_a_sidecar_does() {
+        // A peer driving tabs here gets a credential for exactly that. Handing
+        // it the master token instead would also grant credential rotation,
+        // the log ring, relay config and the env — permanently and invisibly.
+        let allowed = [
+            ("GET", "/tabs"),
+            ("POST", "/tabs"),
+            ("DELETE", "/tabs/2"),
+            ("GET", "/tabs/by-id/tab-a/output"),
+            ("GET", "/tabs/2/output"),
+            ("POST", "/tabs/by-id/tab-a/input"),
+            ("POST", "/tabs/2/rename"),
+            ("POST", "/tabs/2/activate"),
+            ("POST", "/tabs/by-id/tab-a/files"),
+            ("GET", "/tabs/by-id/tab-a/outbox"),
+            ("GET", "/tabs/by-id/tab-a/outbox/report.md"),
+            // Gossip: a peer daemon exchanges blackboard entries with us. Safe
+            // to expose because the merge is a set union — a peer can add
+            // entries but cannot remove, rewrite or reorder ours.
+            ("GET", "/blackboard"),
+            ("POST", "/blackboard"),
+        ];
+        for (m, p) in allowed {
+            assert!(sidecar_route(m, p), "{m} {p} is part of driving a tab");
+        }
+        let refused = [
+            // Leases are host-local mutual exclusion: honouring a remote's
+            // claim would mean trusting its clock, so a sidecar cannot take
+            // one out on this host.
+            ("GET", "/claims"),
+            ("POST", "/claims"),
+            ("POST", "/claims/release"),
+            ("POST", "/master-token/reset"),
+            ("POST", "/tabs/rotate-tokens"),
+            ("GET", "/logs"),
+            ("GET", "/env"),
+            ("POST", "/env"),
+            ("GET", "/tabs/by-id/tab-a/env"),
+            ("POST", "/relay-mode"),
+            ("GET", "/relay-config"),
+            ("POST", "/relay-config"),
+            ("POST", "/tabs/by-id/tab-a/ssh-agent"),
+            ("POST", "/tabs/by-id/tab-a/net-allow"),
+            ("POST", "/tabs/by-id/tab-a/limits"),
+            ("POST", "/tabs/by-id/tab-a/meta"),
+            ("GET", "/preferences"),
+            ("DELETE", "/tabs/by-id/tab-a/output"),
+            ("POST", "/tabs/by-id/tab-a/output"),
+        ];
+        for (m, p) in refused {
+            assert!(!sidecar_route(m, p), "{m} {p} must stay master-only");
+        }
+    }
+
+    #[test]
+    fn a_sidecar_peer_authenticates_with_the_remote_token() {
+        let (port, _state, master) = spawn_server();
+        let remote = crate::remote_token();
+        assert_ne!(remote, master, "the sidecar credential is its own token");
+        let get = |path: &str, token: &str| {
+            request(
+                port,
+                &format!("GET {path} HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n"),
+            )
+        };
+        // In scope: it can mirror the fleet.
+        assert_eq!(status_code(&get("/tabs", &remote)), 200);
+        assert_eq!(status_code(&get("/tabs/by-id/tab-a/output", &remote)), 200);
+        // Out of scope: the same token buys nothing else.
+        assert_eq!(status_code(&get("/env", &remote)), 401, "env stays master-only");
+        // The master still does everything, and a wrong token still nothing.
+        assert_eq!(status_code(&get("/env", &master)), 200);
+        assert_eq!(status_code(&get("/tabs", "nope")), 401);
+    }
+
+    #[test]
+    fn either_header_carries_the_relay_token_in_either_role() {
+        // The header used to depend on the role: Bearer on an egress instance,
+        // x-api-key on a local hop. A claude pointed straight at an egress box
+        // sends x-api-key — its native header — and got a 401 that had nothing
+        // to do with its token being right. Same for the README smoke test.
+        let _guard = RELAY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (port, _state, _master) = spawn_server();
+        let relay = crate::relay_token();
+        let payload = "{}";
+        let call = |header: String| {
+            request(
+                port,
+                &format!(
+                    "POST /relay/anthropic/v1/messages HTTP/1.1\r\nHost: x\r\n{header}Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
+                    payload.len(),
+                ),
+            )
+        };
+        for egress in [false, true] {
+            crate::set_relay_egress(egress);
+            for header in [
+                format!("x-api-key: {relay}\r\n"),
+                format!("Authorization: Bearer {relay}\r\n"),
+            ] {
+                let resp = call(header.clone());
+                assert_ne!(
+                    status_code(&resp),
+                    401,
+                    "egress={egress} must accept {}",
+                    header.split(':').next().unwrap_or(""),
+                );
+            }
+            // A wrong credential is still refused in both roles.
+            assert_eq!(status_code(&call("x-api-key: nope\r\n".into())), 401);
+        }
+        crate::set_relay_egress(false);
+    }
+
+    #[test]
+    fn a_relay_401_says_which_hop_and_why() {
+        // Two machines and three tokens are involved, so "unauthorized" alone
+        // leaves an operator with no idea which side rejected what.
+        let _guard = RELAY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (port, _state, master) = spawn_server();
+        let payload = "{}";
+        let call = |header: &str| {
+            request(
+                port,
+                &format!(
+                    "POST /relay/anthropic/v1/messages HTTP/1.1\r\nHost: x\r\n{header}Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
+                    payload.len(),
+                ),
+            )
+        };
+        // Presenting the master token is the likely mistake — older builds
+        // wanted exactly that here — so the body names it rather than leaving
+        // the operator to guess.
+        let resp = call(&format!("x-api-key: {master}\r\n"));
+        assert_eq!(status_code(&resp), 401);
+        assert!(resp.contains("MASTER"), "names the mistake: {resp}");
+        // No credential at all reads differently from a wrong one.
+        let resp = call("");
+        assert_eq!(status_code(&resp), 401);
+        assert!(resp.contains("no credential"), "{resp}");
+        // A wrong value says so without echoing it back.
+        let resp = call("x-api-key: some-other-token\r\n");
+        assert_eq!(status_code(&resp), 401);
+        assert!(resp.contains("did not match"), "{resp}");
+        assert!(!resp.contains("some-other-token"), "never echo the credential: {resp}");
+        // Every message names the hop, since the two ends fail differently.
+        assert!(resp.contains("local hop"), "{resp}");
+    }
+
+    /// The one lock every board-redirecting test shares (defined in
+    /// `cli::team`), so the API tests cannot race the CLI ones.
+    use crate::cli::team::BOARD_TEST_LOCK;
+
+    #[test]
+    fn a_missing_or_unwritable_cert_path_is_reported_before_the_server_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        let ok = dir.path().join("new.pem");
+        // A path that does not exist yet is fine — we are about to create it.
+        super::ensure_writable(&ok).expect("a fresh path is writable");
+        std::fs::write(&ok, b"x").unwrap();
+        super::ensure_writable(&ok).expect("an existing writable file is fine");
+        // A directory where a file should be must fail HERE, not halfway
+        // through writing a certificate.
+        let as_dir = dir.path().join("adir");
+        std::fs::create_dir(&as_dir).unwrap();
+        assert!(super::ensure_writable(&as_dir).is_err());
+        // A path whose parent does not exist cannot be created either.
+        assert!(super::ensure_writable(&dir.path().join("no/such/dir/f.pem")).is_err());
+    }
+
+    #[test]
+    fn an_external_cert_pair_is_loaded_or_refused_with_a_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let crt = dir.path().join("server.crt");
+        let key = dir.path().join("server.key");
+        // Nothing there at all.
+        assert!(super::load_external_cert(&crt, &key).is_err());
+        // Real, self-consistent PEM: generate one the same way the daemon
+        // does, so the test proves the loader accepts what we emit.
+        let generated = super::load_or_generate_cert(None).expect("self-signed");
+        let (chain, der_key) = generated;
+        assert!(!chain.is_empty(), "a generated chain must contain the leaf");
+        assert!(!der_key.is_empty());
+
+        // Garbage in the files is refused rather than half-loaded into a
+        // server that then fails every handshake.
+        std::fs::write(&crt, b"not a certificate").unwrap();
+        std::fs::write(&key, b"not a key").unwrap();
+        assert!(super::load_external_cert(&crt, &key).is_err());
+        // A cert with no key is equally useless.
+        std::fs::write(&crt, b"-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n").unwrap();
+        std::fs::write(&key, b"").unwrap();
+        assert!(super::load_external_cert(&crt, &key).is_err());
+    }
+
+    #[test]
+    fn a_client_ca_bundle_needs_at_least_one_usable_certificate() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = dir.path().join("ca.pem");
+        // Empty or junk bundles must be an error: silently trusting nobody
+        // would present as "every client is rejected" much later.
+        std::fs::write(&ca, b"").unwrap();
+        assert!(super::load_client_ca(&ca).is_err());
+        std::fs::write(&ca, b"garbage\n").unwrap();
+        assert!(super::load_client_ca(&ca).is_err());
+        assert!(super::load_client_ca(&dir.path().join("absent.pem")).is_err());
+    }
+
+    #[test]
+    fn schedule_headers_describe_the_lock_without_breaking_the_response() {
+        let schedule = crate::schedule::TabSchedule {
+            rule: "Mo-Fr 09:00-18:00".into(),
+            tz: "Europe/Paris".into(),
+        };
+        let mut extra = String::new();
+        super::write_schedule_headers(&mut extra, &schedule);
+        // A viewer shows the reason and the next change, so both have to be
+        // present…
+        assert!(extra.contains("X-Tab-Schedule"), "{extra}");
+        // …and every header line must be CRLF-terminated, or the rest of the
+        // response is swallowed into a malformed header block.
+        assert!(extra.ends_with("\r\n"), "{extra:?}");
+        for line in extra.split("\r\n").filter(|l| !l.is_empty()) {
+            assert!(line.contains(':'), "not a header: {line:?}");
+            assert!(!line.contains('\n'), "embedded newline: {line:?}");
+        }
+    }
+
+    #[test]
+    fn assets_revalidate_with_304_and_vary_per_encoding() {
+        let (port, _state, _token) = spawn_server();
+        // Assets are public: a viewer in a fresh browser must be able to load
+        // the JS before it has a token.
+        let get = |extra: &str| request(port, &format!("GET /assets/main.js HTTP/1.1\r\nHost: x\r\n{extra}\r\n"));
+        let first = get("");
+        assert_eq!(status_code(&first), 200, "RESP: {first}");
+        let low = first.to_ascii_lowercase();
+        // Long-lived + immutable is what lets a warm app skip the request
+        // entirely between tab opens.
+        assert!(
+            low.contains("cache-control: public, max-age=31536000, immutable"),
+            "{first}"
+        );
+        // And Vary, because the gzip and identity bodies are different bytes:
+        // without it a shared cache can hand a stored gzip response to a
+        // client that never asked for one.
+        assert!(low.contains("vary: accept-encoding"), "{first}");
+
+        // The ETag it just gave us must produce a 304, which is the whole
+        // point on a mobile client reopening tab after tab.
+        let etag = first
+            .split("\r\n")
+            .find_map(|l| {
+                l.to_ascii_lowercase()
+                    .starts_with("etag:")
+                    .then(|| l.split_once(':').map(|(_, v)| v.trim().to_owned()).unwrap_or_default())
+            })
+            .unwrap_or_default();
+        assert!(!etag.is_empty(), "no ETag on the identity response: {first}");
+        let again = get(&format!("If-None-Match: {etag}\r\n"));
+        assert_eq!(status_code(&again), 304, "{again}");
+        assert!(again.to_ascii_lowercase().contains("vary: accept-encoding"), "{again}");
+
+        // The gzip representation gets its OWN tag, so an identity copy can
+        // never be revalidated into a gzip body (or the reverse).
+        let gz = head_of(&request_bytes(
+            port,
+            "GET /assets/main.js HTTP/1.1\r\nHost: x\r\nAccept-Encoding: gzip\r\n\r\n",
+        ));
+        let gz_etag = gz
+            .split("\r\n")
+            .find_map(|l| {
+                l.to_ascii_lowercase()
+                    .starts_with("etag:")
+                    .then(|| l.split_once(':').map(|(_, v)| v.trim().to_owned()).unwrap_or_default())
+            })
+            .unwrap_or_default();
+        assert!(!gz_etag.is_empty(), "no ETag on the gzip response: {gz}");
+        assert_ne!(gz_etag, etag, "gzip and identity must not share an ETag");
+        // Cross-representation revalidation must NOT 304.
+        assert_eq!(status_code(&get(&format!("If-None-Match: {gz_etag}\r\n"))), 200);
+    }
+
+    #[test]
+    fn an_outbox_symlinked_out_of_the_cwd_lists_nothing() {
+        // Found by the security pass: `read_dir` follows a symlink given as
+        // the path, so `outbox -> /` (which anything running in the tab can
+        // create) turned the listing into a filesystem browser for anyone with
+        // a read-only share token. Downloads were never exposed —
+        // `resolve_sandbox_path` canonicalises — but every name, size and
+        // mtime on the host was.
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        std::fs::write(elsewhere.path().join("secret.txt"), b"x").unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), dir.path().join("outbox")).unwrap();
+
+        let mut tab = test_snapshot_tab("tab-a", "shell");
+        tab.cwd = Some(dir.path().to_string_lossy().into_owned().into());
+        let state = std::sync::Arc::new(std::sync::Mutex::new(test_snapshot(vec![tab])));
+        state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .master_token = "test-secret-token".into();
+        let port = spawn_test_server(&state, false);
+        let listing = request(
+            port,
+            "GET /tabs/by-id/tab-a/outbox HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer test-secret-token\r\n\r\n",
+        );
+        assert_eq!(status_code(&listing), 200, "{listing}");
+        assert!(!listing.contains("secret.txt"), "listed through the symlink: {listing}");
+        assert!(listing.contains("\"files\":[]"), "{listing}");
+
+        // A real directory in the right place still lists.
+        std::fs::remove_file(dir.path().join("outbox")).unwrap();
+        std::fs::create_dir(dir.path().join("outbox")).unwrap();
+        std::fs::write(dir.path().join("outbox").join("report.md"), b"y").unwrap();
+        let ok = request(
+            port,
+            "GET /tabs/by-id/tab-a/outbox HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer test-secret-token\r\n\r\n",
+        );
+        assert!(ok.contains("report.md"), "a real outbox must still list: {ok}");
+    }
+
+    #[test]
+    fn an_outbox_download_is_named_by_its_url_not_by_a_query_parameter() {
+        // The bug: the viewer linked to `…/files?path=outbox/x.md`, whose last
+        // URL segment is `files`. An `<a download>` only applies same-origin,
+        // so once the page and the API differ the browser ignored it and saved
+        // `files.bin` — the segment plus an extension guessed from the content
+        // type. Addressing the file by path leaves nothing to guess.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("outbox")).unwrap();
+        std::fs::write(dir.path().join("outbox").join("report final.md"), b"# hi\n").unwrap();
+
+        let mut tab = test_snapshot_tab("tab-a", "shell");
+        tab.cwd = Some(dir.path().to_string_lossy().into_owned().into());
+        let state = std::sync::Arc::new(std::sync::Mutex::new(test_snapshot(vec![tab])));
+        state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .master_token = "test-secret-token".into();
+        let port = spawn_test_server(&state, false);
+        let get = |path: &str| {
+            request(
+                port,
+                &format!("GET {path} HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer test-secret-token\r\n\r\n"),
+            )
+        };
+
+        // A space in the name must survive percent-encoding in the path.
+        let resp = get("/tabs/by-id/tab-a/outbox/report%20final.md");
+        assert_eq!(status_code(&resp), 200, "{resp}");
+        assert!(resp.contains("# hi"), "the body should be the file: {resp}");
+        // Content-Disposition still names it, so both mechanisms agree.
+        assert!(
+            resp.to_ascii_lowercase().contains("filename=\"report final.md\""),
+            "{resp}"
+        );
+
+        // The sandbox check is the same one the query form uses: a traversal
+        // must be refused, not resolved.
+        let escape = get("/tabs/by-id/tab-a/outbox/..%2F..%2Fetc%2Fpasswd");
+        assert_ne!(status_code(&escape), 200, "traversal was served: {escape}");
+        // A file that is not there is a 404, not an empty 200.
+        assert_ne!(status_code(&get("/tabs/by-id/tab-a/outbox/nope.md")), 200);
+        // And it is still behind the token.
+        let unauth = request(
+            port,
+            "GET /tabs/by-id/tab-a/outbox/report%20final.md HTTP/1.1\r\nHost: x\r\n\r\n",
+        );
+        assert_eq!(status_code(&unauth), 401, "{unauth}");
+    }
+
+    #[test]
+    fn the_fleet_route_renders_who_is_working_on_what() {
+        let _guard = BOARD_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (port, _state, token) = spawn_server();
+        let dir = tempfile::tempdir().unwrap();
+        crate::cli::team::set_blackboard_path(Some(dir.path().join("blackboard.jsonl")));
+        crate::claims::set_registry_path(Some(dir.path().join("claims.json")));
+        crate::claims::reset_for_test();
+
+        let post = |path: &str, body: &str| {
+            request(
+                port,
+                &format!(
+                    "POST {path} HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                ),
+            )
+        };
+        // A task announced and awarded, with a live lease behind it.
+        post(
+            "/blackboard",
+            r#"{"entries":[
+                {"ts":10,"msg":"raise coverage","id":"e1","kind":"announce","task":"cov:x","from":"backlog","origin":"host-a"},
+                {"ts":11,"msg":"","id":"e2","kind":"award","task":"cov:x","from":"agent-1","to":"agent-1"}
+            ]}"#,
+        );
+        post("/claims", r#"{"key":"task:cov:x","holder":"agent-1","ttl_ms":60000}"#);
+
+        let body = request(
+            port,
+            &format!("GET /fleet HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {token}\r\n\r\n"),
+        );
+        assert_eq!(status_code(&body), 200, "{body}");
+        let json = body.split("\r\n\r\n").nth(1).unwrap_or("");
+        let g: crate::fleet::Graph = serde_json::from_str(json).expect("graph json");
+
+        let works: Vec<&crate::fleet::Edge> = g.edges.iter().filter(|e| e.kind == "works_on").collect();
+        assert_eq!(works.len(), 1, "one agent working: {:?}", g.edges);
+        assert_eq!(works[0].from, "agent:agent-1");
+        assert_eq!(works[0].to, "task:cov:x");
+        assert_eq!(works[0].leased, Some(true), "the live lease should back the award");
+        assert!(works[0].expires_in_ms.is_some_and(|ms| ms > 0));
+        // The task's home travelled with the entry, so a viewer can group by
+        // machine without asking anyone.
+        assert!(
+            g.edges.iter().any(|e| e.kind == "home" && e.to == "host:host-a"),
+            "{:?}",
+            g.edges
+        );
+        assert!(g.nodes.iter().any(|n| n.kind == "task" && n.id == "task:cov:x"));
+        // A local `file://` dashboard has origin `null`, so the browser only
+        // lets it READ this if the reply says so. The test server's peer is
+        // loopback, so the header must be here.
+        assert!(
+            body.to_ascii_lowercase().contains("access-control-allow-origin: *"),
+            "the fleet route must be readable by a local page: {body}"
+        );
+        // The token still gates it — CORS decides who may read the answer,
+        // not who may ask.
+        let unauth = request(port, "GET /fleet HTTP/1.1\r\nHost: x\r\n\r\n");
+        assert_eq!(status_code(&unauth), 401, "{unauth}");
+        // The working agent is a node even though it has no tab on this host —
+        // in a federated fleet most agents are somewhere else, and omitting
+        // them would draw work assigned to nobody.
+        let agent = g
+            .nodes
+            .iter()
+            .find(|n| n.id == "agent:agent-1")
+            .expect("the working agent should be a node");
+        assert_eq!(agent.kind, "agent");
+        assert!(
+            g.nodes.iter().any(|n| n.kind == "host"),
+            "a graph always has at least the host it came from"
+        );
+
+        crate::claims::reset_for_test();
+        crate::claims::set_registry_path(None);
+        crate::cli::team::set_blackboard_path(None);
+    }
+
+    #[test]
+    fn the_blackboard_route_merges_a_peers_entries_idempotently() {
+        let _guard = BOARD_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (port, _state, token) = spawn_server();
+        let dir = tempfile::tempdir().unwrap();
+        crate::cli::team::set_blackboard_path(Some(dir.path().join("blackboard.jsonl")));
+
+        let post = |body: &str| {
+            request(
+                port,
+                &format!(
+                    "POST /blackboard HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                ),
+            )
+        };
+        let batch = r#"{"entries":[
+            {"ts":10,"msg":"raise coverage","id":"peer-1","kind":"announce","task":"cov:src/api.rs","from":"backlog"},
+            {"ts":11,"msg":"","id":"peer-2","kind":"bid","task":"cov:src/api.rs","from":"agent-x","cost":40}
+        ]}"#;
+        let first = post(batch);
+        assert_eq!(status_code(&first), 200, "{first}");
+        assert!(first.contains("\"merged\":2"), "{first}");
+
+        // Idempotent: the same batch again is a union with itself. This is
+        // what lets gossip run on a timer, in both directions, without
+        // duplicating the board.
+        let again = post(batch);
+        assert!(
+            again.contains("\"merged\":0"),
+            "replaying a batch must add nothing: {again}"
+        );
+
+        // And what we hold is now readable by a peer.
+        let listed = request(
+            port,
+            &format!("GET /blackboard HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {token}\r\n\r\n"),
+        );
+        assert!(listed.contains("cov:src/api.rs"), "{listed}");
+        assert!(listed.contains("\"next\":2"), "{listed}");
+        // `since` lets a puller resume rather than re-fetching everything.
+        let tail = request(
+            port,
+            &format!("GET /blackboard?since=2 HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {token}\r\n\r\n"),
+        );
+        assert!(tail.contains("\"entries\":[]"), "{tail}");
+
+        // Entries carrying no id can't be de-duplicated, so they are dropped
+        // rather than accumulating a new copy on every exchange.
+        let anonymous = post(r#"{"entries":[{"ts":12,"msg":"no id","kind":"announce","task":"t"}]}"#);
+        assert!(anonymous.contains("\"merged\":0"), "{anonymous}");
+        assert_eq!(status_code(&post(r#"{"nope":[]}"#)), 400);
+
+        crate::cli::team::set_blackboard_path(None);
+    }
+
+    #[test]
+    fn the_claims_route_grants_one_holder_and_names_the_other() {
+        let _guard = BOARD_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (port, _state, token) = spawn_server();
+        // Hermetic: a test run must never touch the developer's real lease
+        // table, and two tests sharing one would race.
+        let dir = tempfile::tempdir().unwrap();
+        crate::claims::set_registry_path(Some(dir.path().join("claims.json")));
+        crate::claims::reset_for_test();
+        let post = |path: &str, body: &str| {
+            request(
+                port,
+                &format!(
+                    "POST {path} HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                ),
+            )
+        };
+        let key = "task:cov-api-route-test";
+        let first = post(
+            "/claims",
+            &format!(r#"{{"key":"{key}","holder":"agent-a","ttl_ms":60000}}"#),
+        );
+        assert_eq!(status_code(&first), 200, "{first}");
+        assert!(first.contains("\"granted\":true"), "{first}");
+        assert!(first.contains("\"fence\""), "a grant must carry a fence: {first}");
+
+        // The second agent is refused AND told who holds it, so it can pick
+        // other work instead of spinning on this key.
+        let second = post(
+            "/claims",
+            &format!(r#"{{"key":"{key}","holder":"agent-b","ttl_ms":60000}}"#),
+        );
+        assert_eq!(status_code(&second), 409, "{second}");
+        assert!(second.contains("agent-a"), "409 must name the holder: {second}");
+
+        // Renewal by the holder is idempotent, not a conflict.
+        let renew = post(
+            "/claims",
+            &format!(r#"{{"key":"{key}","holder":"agent-a","ttl_ms":60000}}"#),
+        );
+        assert_eq!(status_code(&renew), 200, "{renew}");
+
+        // A non-holder releasing is a no-op, not a theft.
+        let steal = post("/claims/release", &format!(r#"{{"key":"{key}","holder":"agent-b"}}"#));
+        assert_eq!(status_code(&steal), 200, "{steal}");
+        assert!(steal.contains("\"released\":false"), "{steal}");
+
+        let listed = request(
+            port,
+            &format!("GET /claims HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {token}\r\n\r\n"),
+        );
+        assert!(listed.contains(key), "the live lease should be listed: {listed}");
+
+        // The holder may, and then the key is free for the next agent.
+        let released = post("/claims/release", &format!(r#"{{"key":"{key}","holder":"agent-a"}}"#));
+        assert!(released.contains("\"released\":true"), "{released}");
+        let now_free = post(
+            "/claims",
+            &format!(r#"{{"key":"{key}","holder":"agent-b","ttl_ms":60000}}"#),
+        );
+        assert_eq!(status_code(&now_free), 200, "{now_free}");
+
+        // Malformed input is refused rather than granting a nameless lease.
+        assert_eq!(status_code(&post("/claims", r#"{"key":"k"}"#)), 400);
+        assert_eq!(status_code(&post("/claims", r#"{"key":"","holder":"a"}"#)), 400);
+        crate::claims::reset_for_test();
+        crate::claims::set_registry_path(None);
+    }
+
+    #[test]
+    fn the_relay_health_probe_answers_without_a_credential() {
+        let _guard = RELAY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (port, _state, _master) = spawn_server();
+        // Claude Code probes reachability before it has a credential to send —
+        // observed on the wire as a bare HEAD with no x-api-key. 401ing it
+        // makes the client treat the whole relay as unusable.
+        for verb in ["HEAD", "GET"] {
+            let resp = request(
+                port,
+                &format!("{verb} /relay/anthropic/api/hello HTTP/1.1\r\nHost: x\r\n\r\n"),
+            );
+            assert_eq!(status_code(&resp), 200, "{verb} /api/hello must not need auth");
+        }
+        // The exemption is exactly one path: everything else still 401s
+        // without the relay token, including near-misses.
+        for path in [
+            "/relay/anthropic/api/hello/../v1/messages",
+            "/relay/anthropic/api/hellox",
+            "/relay/anthropic/v1/messages",
+            "/relay/anthropic/",
+        ] {
+            let resp = request(port, &format!("GET {path} HTTP/1.1\r\nHost: x\r\n\r\n"));
+            assert_eq!(status_code(&resp), 401, "{path} still needs the relay token");
+        }
+    }
+
     /// configured remote's `/relay/anthropic/*` with the remote's Bearer token,
     /// preserving the sub-path and streaming the response back.
     #[test]
@@ -3427,11 +4447,12 @@ mod tests {
             cf_access_client_secret: String::new(),
         }));
 
-        let (port, _state, master) = spawn_server();
+        let (port, _state, _master) = spawn_server();
+        let relay = crate::relay_token();
         let payload = "{}";
         // Claude presents the stand-in x-api-key (== the local master token).
         let req = format!(
-            "POST /relay/anthropic/v1/messages HTTP/1.1\r\nHost: x\r\nx-api-key: {master}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
+            "POST /relay/anthropic/v1/messages HTTP/1.1\r\nHost: x\r\nx-api-key: {relay}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
             payload.len()
         );
         let resp = request(port, &req);
@@ -3492,10 +4513,11 @@ mod tests {
             cf_access_client_secret: String::new(),
         }));
 
-        let (port, _state, master) = spawn_server();
+        let (port, _state, _master) = spawn_server();
+        let relay = crate::relay_token();
         let payload = "{}";
         let req = format!(
-            "POST /relay/anthropic/v1/messages HTTP/1.1\r\nHost: x\r\nx-api-key: {master}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
+            "POST /relay/anthropic/v1/messages HTTP/1.1\r\nHost: x\r\nx-api-key: {relay}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
             payload.len()
         );
         let resp = request(port, &req);
@@ -3705,6 +4727,113 @@ mod tests {
             .pending_renames
             .clone();
         assert_eq!(pending, vec![(0_usize, "renamed".into())]);
+    }
+
+    /// A `Read + Write` that replays a canned request and captures the reply,
+    /// so `handle_connection` can be driven with an arbitrary `from_loopback`
+    /// — a real socket to the test server is always 127.0.0.1.
+    struct FakeStream {
+        input: std::io::Cursor<Vec<u8>>,
+        output: Vec<u8>,
+    }
+
+    impl std::io::Read for FakeStream {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.input.read(buf)
+        }
+    }
+
+    impl Write for FakeStream {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.output.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn serve_once(req: &str, from_loopback: bool) -> String {
+        let state = test_state();
+        state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .master_token = "test-secret-token".into();
+        let mut fake = FakeStream {
+            input: std::io::Cursor::new(req.as_bytes().to_vec()),
+            output: Vec::new(),
+        };
+        handle_connection(&mut fake, &state, "test-secret-token", false, from_loopback);
+        String::from_utf8_lossy(&fake.output).into_owned()
+    }
+
+    #[test]
+    fn logs_are_readable_from_loopback_only() {
+        let _guard = crate::log_ring::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::log_ring::clear();
+        crate::log_ring::push(crate::log_ring::Line {
+            ts_ms: 42,
+            level: "WARN",
+            target: "test".into(),
+            msg: "a recorded line".into(),
+        });
+        let req = "GET /logs HTTP/1.1\r\nAuthorization: Bearer test-secret-token\r\n\r\n";
+
+        // From 127.0.0.1: the ring comes back.
+        let resp = serve_once(req, true);
+        assert_eq!(status_code(&resp), 200, "loopback reads the ring");
+        assert!(resp.contains("a recorded line"), "body carries the record: {resp}");
+
+        // From anywhere else: refused even WITH the master token, because the
+        // API binds 0.0.0.0 and these records name tabs, cwds and errors.
+        let resp = serve_once(req, false);
+        assert_eq!(status_code(&resp), 403, "remote peer refused");
+        assert!(!resp.contains("a recorded line"), "and told nothing: {resp}");
+
+        // The token still gates it on loopback — being local is a second
+        // requirement, not a replacement for auth.
+        let resp = serve_once("GET /logs HTTP/1.1\r\n\r\n", true);
+        assert_eq!(status_code(&resp), 401, "loopback still needs the token");
+        crate::log_ring::clear();
+    }
+
+    #[test]
+    fn logs_honours_the_lines_cap() {
+        let _guard = crate::log_ring::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::log_ring::clear();
+        for i in 0..10 {
+            crate::log_ring::push(crate::log_ring::Line {
+                ts_ms: i,
+                level: "INFO",
+                target: "test".into(),
+                msg: format!("line-{i}"),
+            });
+        }
+        let req = |q: &str| format!("GET /logs{q} HTTP/1.1\r\nAuthorization: Bearer test-secret-token\r\n\r\n");
+        // ?lines=N returns the newest N …
+        let resp = serve_once(&req("?lines=2"), true);
+        assert!(resp.contains("line-9") && resp.contains("line-8"));
+        assert!(!resp.contains("line-7"), "older lines excluded: {resp}");
+        // … and an absurd count is clamped to the ring rather than refused.
+        let resp = serve_once(&req("?lines=999999"), true);
+        assert_eq!(status_code(&resp), 200);
+        assert!(resp.contains("line-0"));
+        crate::log_ring::clear();
+    }
+
+    #[test]
+    fn openapi_documents_the_logs_route() {
+        // The contract is what a client reads before calling; a route that
+        // exists but isn't declared is invisible to them.
+        assert!(OPENAPI_YAML.contains("/logs:"), "openapi.yaml declares /logs");
+        assert!(
+            OPENAPI_YAML.contains("127.0.0.1"),
+            "and says it is loopback-only, which is the surprising part"
+        );
     }
 
     #[test]
@@ -4077,6 +5206,69 @@ mod tests {
     }
 
     #[test]
+    fn relay_config_and_mode_round_trip() {
+        // The relay-LLM CONTROL routes must RESPOND, not merely compile:
+        // GET reads the live config, POST queues a change onto the owner.
+        // Nothing else covered these — the other relay tests hit the
+        // /anthropic egress proxy, a different code path (anti-built≠wired).
+        let (port, state, master) = spawn_server();
+
+        // GET /relay-config → 200 with the {mode,egress,target} shape.
+        let resp = request(
+            port,
+            &format!("GET /relay-config HTTP/1.1\r\nAuthorization: Bearer {master}\r\n\r\n"),
+        );
+        assert_eq!(status_code(&resp), 200, "relay config readable");
+        assert!(
+            resp.contains("\"mode\"") && resp.contains("\"egress\"") && resp.contains("\"target\""),
+            "config JSON shape: {resp}"
+        );
+
+        // POST /relay-mode {"on":true} → 200 queued + mirrored onto the snapshot.
+        let body = r#"{"on":true}"#;
+        let resp = request(
+            port,
+            &format!(
+                "POST /relay-mode HTTP/1.1\r\nAuthorization: Bearer {master}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len(),
+            ),
+        );
+        assert_eq!(status_code(&resp), 200);
+        assert!(resp.contains("\"queued\""), "mode toggle queued");
+        assert_eq!(
+            state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pending_relay_mode,
+            Some(true),
+            "relay mode change queued onto the owner",
+        );
+
+        // POST /relay-config {"endpoint":"","egress":false} → 200 queued.
+        let body = r#"{"endpoint":"","egress":false}"#;
+        let resp = request(
+            port,
+            &format!(
+                "POST /relay-config HTTP/1.1\r\nAuthorization: Bearer {master}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len(),
+            ),
+        );
+        assert_eq!(status_code(&resp), 200);
+        assert!(
+            state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pending_relay_config
+                .is_some(),
+            "relay config change queued onto the owner",
+        );
+
+        // Master-only: the control routes aren't in the share-token allowlist.
+        let resp = request(port, "GET /relay-config HTTP/1.1\r\n\r\n");
+        assert_eq!(status_code(&resp), 401, "relay config is master-only");
+    }
+
+    #[test]
     fn openapi_spec_served_publicly() {
         let (port, _, _) = spawn_server();
         // No token — the spec is public so tooling can fetch it.
@@ -4094,6 +5286,23 @@ mod tests {
             resp.contains("/tabs/rotate-tokens") && resp.contains("/master-token/reset"),
             "documents token endpoints"
         );
+    }
+
+    #[test]
+    fn openapi_embedded_documents_all_control_routes() {
+        // Assert on the EMBEDDED spec (source of truth for the shipped
+        // build), not the HTTP-served copy: openapi_spec() prefers an
+        // installed /usr/share/doc/*/openapi.yaml when present, so the
+        // served copy on a dev box with an old package is stale. This
+        // guards that every control route we wire has a contract entry.
+        for route in [
+            "/tabs/rotate-tokens",
+            "/master-token/reset",
+            "/relay-mode",
+            "/relay-config",
+        ] {
+            assert!(OPENAPI_YAML.contains(route), "openapi.yaml documents {route}");
+        }
     }
 
     #[test]
@@ -5721,33 +6930,115 @@ mod tests {
         assert_eq!(status_code(&resp), 200);
         let s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let upd = s.pending_status_updates.last().unwrap();
-        let (tab_id, agent_state, label, session_id, agent_kind) = (
+        let (tab_id, agent_state, label, session_id, agent_kind, wipe) = (
             upd.tab_id.clone(),
             upd.state,
             upd.label.clone(),
             upd.session_id.clone(),
             upd.agent_kind.clone(),
+            upd.wipe_attachment,
         );
         drop(s);
         assert_eq!(tab_id, "tab-a");
-        assert_eq!(agent_state, crate::AgentState::Thinking);
+        assert_eq!(agent_state, Some(crate::AgentState::Thinking));
         assert_eq!(label.as_deref(), Some("building"));
         assert_eq!(session_id.as_deref(), Some("sess-9"));
         assert_eq!(agent_kind.as_deref(), Some("claude"));
-        // "idle" ⇒ the wipe marker.
-        let idle = r#"{"state":"idle"}"#;
+        assert!(!wipe, "a plain state update must never detach the session");
+    }
+
+    #[test]
+    fn idle_parks_the_indicator_and_still_attaches_the_session() {
+        // The distinction that matters for agents with no hook: `idle` must be
+        // able to say "no longer thinking" AND "this is the session to resume",
+        // in one call. Only the `__clear__` label detaches.
+        let (port, state, token) = spawn_server();
+        let post = |body: &str| {
+            status_code(&request(
+                port,
+                &format!(
+                    "POST /tabs/by-id/tab-a/status HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len(),
+                ),
+            ))
+        };
+        assert_eq!(
+            post(r#"{"state":"idle","sessionId":"codex-1","agentKind":"codex","label":"done"}"#),
+            200
+        );
+        let (state_now, label, session_id, kind, wipe) = {
+            let locked = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let upd = locked.pending_status_updates.last().unwrap();
+            let out = (
+                upd.state,
+                upd.label.clone(),
+                upd.session_id.clone(),
+                upd.agent_kind.clone(),
+                upd.wipe_attachment,
+            );
+            // Let the guard go before asserting, so nothing is held while the test runs on.
+            drop(locked);
+            out
+        };
+        assert_eq!(state_now, None, "idle takes the indicator down");
+        assert_eq!(label, None, "a parked indicator has nothing to render a label on");
+        assert_eq!(session_id.as_deref(), Some("codex-1"), "still resumable");
+        assert_eq!(kind.as_deref(), Some("codex"));
+        assert!(!wipe);
+
+        // A bare idle carries nothing, so it must not claim a session either.
+        assert_eq!(post(r#"{"state":"idle"}"#), 200);
+        let (state_now, session_id, kind, wipe) = {
+            let locked = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let upd = locked.pending_status_updates.last().unwrap();
+            let out = (
+                upd.state,
+                upd.session_id.clone(),
+                upd.agent_kind.clone(),
+                upd.wipe_attachment,
+            );
+            drop(locked);
+            out
+        };
+        assert_eq!(state_now, None);
+        assert_eq!(session_id, None);
+        assert_eq!(kind, None);
+        assert!(!wipe);
+    }
+
+    #[test]
+    fn clear_label_detaches_instead_of_rendering() {
+        // Claude Code's SessionEnd hook sends `{"state":"idle","label":"__clear__"}`
+        // and means "forget the attachment", not "show this text" — so the label
+        // must never survive as display text.
+        let (port, state, token) = spawn_server();
+        let payload = r#"{"state":"idle","label":"__clear__","sessionId":"gone","agentKind":"claude"}"#;
         let resp = request(
             port,
             &format!(
-                "POST /tabs/by-id/tab-a/status HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\n\r\n{idle}",
-                idle.len(),
+                "POST /tabs/by-id/tab-a/status HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\n\r\n{payload}",
+                payload.len(),
             ),
         );
         assert_eq!(status_code(&resp), 200);
-        let label = {
-            let s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            s.pending_status_updates.last().unwrap().label.clone()
+        assert!(body(&resp).contains(r#""cleared":true"#));
+        let (wipe, label, session_id, kind, state_now) = {
+            let locked = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let upd = locked.pending_status_updates.last().unwrap();
+            let out = (
+                upd.wipe_attachment,
+                upd.label.clone(),
+                upd.session_id.clone(),
+                upd.agent_kind.clone(),
+                upd.state,
+            );
+            drop(locked);
+            out
         };
-        assert_eq!(label.as_deref(), Some("__clear__"));
+        assert!(wipe);
+        assert_eq!(label, None, "the sentinel is a verb, not text");
+        assert_eq!(session_id, None);
+        assert_eq!(kind, None);
+        assert_eq!(state_now, None, "and the indicator comes down");
     }
 }

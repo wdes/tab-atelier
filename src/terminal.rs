@@ -1,6 +1,4 @@
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// SPDX-License-Identifier: MPL-2.0
 
 #![cfg(feature = "gui")]
 
@@ -269,6 +267,12 @@ pub struct TerminalView {
     /// Set by the PTY event-loop thread when the shell dies (see
     /// [`EventProxy::exited`]); read on the UI thread by `has_exited`.
     exited: Arc<std::sync::atomic::AtomicBool>,
+    /// Text a program in this tab asked to put on the clipboard, waiting to be
+    /// handed to gpui. See [`EventProxy::clipboard`] — the copy itself has to happen
+    /// on the UI thread, so it is parked here by the parser and drained by
+    /// [`Self::take_clipboard`].
+    #[cfg(feature = "gui")]
+    clipboard: Arc<std::sync::Mutex<Option<String>>>,
     scrollbar_dragging: Rc<Cell<bool>>,
     scroll_acc: Rc<Cell<f32>>,
     pub theme: ThemeName,
@@ -788,6 +792,8 @@ impl TerminalView {
         // Shell death arrives as `ChildExit` on this flag (see
         // `EventProxy::exited`) — no per-tab watcher loop needed.
         let exited = proxy.exited.clone();
+        #[cfg(feature = "gui")]
+        let clipboard = proxy.clipboard.clone();
 
         let recipe = SpawnRecipe {
             cwd: cwd.map(std::path::Path::to_path_buf),
@@ -814,6 +820,8 @@ impl TerminalView {
             pid: 0,
             spawn_recipe: Some(recipe),
             exited,
+            #[cfg(feature = "gui")]
+            clipboard,
             scrollbar_dragging: Rc::new(Cell::new(false)),
             scroll_acc: Rc::new(Cell::new(0.0)),
             theme: ThemeName::default(),
@@ -852,6 +860,21 @@ impl TerminalView {
     /// pulling the working size from `last_size`/`cell_size` and the shell/env
     /// from the stashed [`SpawnRecipe`]. Called eagerly for the active tab, and
     /// in the background for the rest so restored agents come back online.
+    /// Change the rendered font size and re-measure the cell.
+    ///
+    /// `cell_size` is memoised on first paint, and every grid dimension is
+    /// derived from it, so dropping it is what makes the change take effect —
+    /// the next paint re-measures and the PTY resize follows from the new
+    /// columns and rows. Without this the setting would only apply to tabs
+    /// opened afterwards, which is indistinguishable from "does nothing".
+    pub fn set_font_size(&mut self, size: f32) {
+        if (self.font_config.size - size).abs() < f32::EPSILON {
+            return;
+        }
+        self.font_config.size = size;
+        self.cell_size = None;
+    }
+
     pub fn ensure_spawned(&mut self) {
         let Some(recipe) = self.spawn_recipe.take() else {
             return;
@@ -1032,6 +1055,17 @@ impl TerminalView {
 
     pub fn has_exited(&self) -> bool {
         self.exited.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Take any clipboards write this tab's programs asked for since the last call.
+    ///
+    /// Drained on the UI thread because putting something on the clipboard needs
+    /// gpui's `App`, which the parser callback has no access to. Taking rather than
+    /// peeking, so a value is delivered exactly once — a clippy that never cleared
+    /// would re-copy the same text on every sweep.
+    #[cfg(feature = "gui")]
+    pub fn take_clipboard(&self) -> Option<String> {
+        self.clipboard.lock().ok().and_then(|mut slot| slot.take())
     }
 
     /// Drop the render caches (previous frame's rows, shaped-glyph cache,
@@ -1735,33 +1769,31 @@ impl Render for TerminalView {
                     ks.modifiers.alt,
                     ks.modifiers.function,
                 );
-                if ks.modifiers.control && ks.modifiers.shift {
-                    match ks.key.as_str() {
-                        "c" => {
+                // Window-level chords never reach the PTY. `crate::app_chord`
+                // is the single table both this and the root handler read, so
+                // what we swallow here is exactly what the root acts on when
+                // the event bubbles (see its doc comment).
+                if let Some(chord) =
+                    crate::app_chord(&ks.key, ks.modifiers.control, ks.modifiers.shift, ks.modifiers.alt)
+                {
+                    match chord {
+                        crate::AppChord::Copy => {
                             if let Some(text) = this.copy_selection() {
                                 cx.write_to_clipboard(ClipboardItem::new_string(text));
                             }
-                            return;
                         }
-                        "v" => {
+                        crate::AppChord::Paste => {
                             if let Some(item) = cx.read_from_clipboard()
                                 && let Some(text) = Self::clipboard_to_paste_text(&item)
                             {
                                 this.send_clipboard(&text);
                             }
-                            return;
                         }
-                        "t" => return,
-                        _ => {}
+                        // Swallowed only — the root opens the switcher / adds
+                        // the tab / switches, so the shell never sees `^P`
+                        // (readline "previous") or `^T`.
+                        crate::AppChord::TabSwitcher | crate::AppChord::NewTab | crate::AppChord::NextTab => {}
                     }
-                }
-                if ks.modifiers.alt && ks.key.as_str() == "tab" {
-                    return;
-                }
-                // Ctrl+P opens the app-level MRU tab switcher — handled by the
-                // root `on_key_down` once this bubbles up. Swallow it here so it
-                // doesn't also reach the shell as `^P` (readline "previous").
-                if ks.modifiers.control && !ks.modifiers.shift && !ks.modifiers.alt && ks.key.as_str() == "p" {
                     return;
                 }
                 if ks.modifiers.shift && !ks.modifiers.control {

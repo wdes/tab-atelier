@@ -1,6 +1,4 @@
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// SPDX-License-Identifier: MPL-2.0
 
 //! `tab-atelier-headless bench` — terminal throughput self-test.
 //!
@@ -388,5 +386,27 @@ mod tests {
             // Ring saw every byte.
             assert!(ring.total_len() >= payload.len() as u64);
         }
+    }
+
+    #[test]
+    fn a_small_run_completes_and_bad_arguments_are_refused() {
+        // The benchmark drives a real `Term` in-process — no daemon — so a
+        // one-megabyte, one-iteration run exercises the whole path in
+        // milliseconds. Anything larger belongs on a command line, not in a
+        // test suite.
+        assert_eq!(
+            super::run(
+                &["--mb", "1", "--iterations", "1", "--cols", "80", "--rows", "24"]
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .collect::<Vec<_>>()
+            ),
+            0
+        );
+        // Arguments that cannot be honoured are refused rather than silently
+        // clamped: a benchmark that quietly measures something else is worse
+        // than one that refuses to run.
+        let bad = |v: &[&str]| super::run(&v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>());
+        assert_eq!(bad(&["--nope"]), 2, "unknown flag");
     }
 }

@@ -1,6 +1,4 @@
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// SPDX-License-Identifier: MPL-2.0
 
 //! `OpenAI`-compatible chat-completions backend — any service that
 //! speaks the `POST {base}/chat/completions` dialect with Bearer-token
@@ -25,12 +23,54 @@ use crate::session::Block;
 /// text-only answers.
 pub const INFOMANIAK_DEFAULT_MODEL: &str = "mistral24b";
 
+/// Ceiling on the reply length we ask an `OpenAI`-compatible service for.
+///
+/// Deliberately smaller than the relay wire's ceiling, and deliberately its own
+/// constant rather than a shared one: this backend talks to *any* service that
+/// speaks the dialect, including a local Ollama server whose model may have a
+/// window far smaller than a hosted one, so the conservative number is the one
+/// that cannot fail a request a larger one would have been refused for. It is
+/// the field that was wrong, not this value — see [`MAX_TOKENS_FIELD`].
+pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 8192;
+
+/// The field that carries [`DEFAULT_MAX_OUTPUT_TOKENS`] on this wire.
+///
+/// `max_completion_tokens` rather than `max_tokens`, because the two are not
+/// interchangeable across providers and only one of them is universal. Measured
+/// against the services this backend actually talks to:
+///
+/// * `gpt-5.x`, `gpt-6.x` and the o-series **refuse** `max_tokens` outright —
+///   `400 Unsupported parameter: 'max_tokens' is not supported with this model.
+///   Use 'max_completion_tokens' instead.` The whole turn fails, not just the
+///   limit, so a model chosen for its tool-calling is unusable while the field
+///   is wrong.
+/// * `gpt-3.5`, `gpt-4`, `gpt-4o` and `gpt-4.1` accept **either** name.
+/// * A local Ollama server (tested on 0.30.6) accepts either name too.
+///
+/// So the modern name is the one every endpoint reads, and the legacy name is
+/// the one that excludes the newest models. That is the whole reason this is a
+/// constant and not a judgement call: the older spelling would make this backend
+/// silently limited to older models, which is the opposite of what a module
+/// written for "any service that speaks this dialect" promises.
+pub const MAX_TOKENS_FIELD: &str = "max_completion_tokens";
+
+/// The field naming how much reasoning a model should do before answering.
+///
+/// Its own constant to sit beside [`MAX_TOKENS_FIELD`], since the two are the
+/// pair a reasoning model is strict about. Whether it is *sent* is the operator's
+/// call rather than a decision made here — see `openai::Config::reasoning_effort`.
+pub const REASONING_EFFORT_FIELD: &str = "reasoning_effort";
+
 /// Everything needed to reach one `OpenAI`-compatible service.
 pub struct Config {
     /// Full chat-completions endpoint URL.
     pub chat_url: String,
     pub token: String,
     pub model: String,
+    /// `reasoning_effort` to send, when the model needs one. `None` sends the
+    /// field not at all. See the flag's own documentation for why there is no
+    /// default: the families disagree about accepting it.
+    pub reasoning_effort: Option<String>,
 }
 
 /// Turn a base URL (`https://api.x.ai/v1`) into the full
@@ -57,21 +97,53 @@ pub fn infomaniak_chat_url(product_id: &str) -> String {
 /// Build the chat-completions request body from the agent's
 /// Anthropic-shaped state. `system` becomes the leading `system`
 /// message; `tool_specs` are the Anthropic-format specs from
-/// `tools::tool_specs()`.
+/// [`crate::tools::ToolSet::specs`].
+///
+/// `state` is the env turn — the working directory and permission mode, as
+/// rendered by [`crate::cache::env_text`]. It goes on the **end**, after the
+/// history, for the same reason it does on the relay wire: a turn at the end
+/// extends the prefix, where the same bytes at the front would invalidate
+/// everything behind them. This wire has no `cache_control`, but the ordering
+/// costs nothing and keeps the two backends consistent, so a reader does not
+/// have to remember which one is which.
+///
+/// No `stream`, deliberately. The Messages wire streams so the model's reasoning
+/// can be watched while it arrives, and this one cannot: [`ChatResp`] has no
+/// reasoning field at all, so a compatible provider's thinking is discarded
+/// during deserialisation whether it arrives streamed or whole. Streaming here
+/// would buy the ordering and cost a second parser for no visible difference.
+/// See `crate::stream` for the side that does stream.
 #[must_use]
-pub fn build_request(model: &str, system: &str, tool_specs: &[Value], history: &[ApiMessage]) -> Value {
-    let mut messages = Vec::with_capacity(history.len() + 1);
+pub fn build_request(
+    model: &str,
+    system: &str,
+    state: &str,
+    tool_specs: &[Value],
+    history: &[ApiMessage],
+    reasoning_effort: Option<&str>,
+) -> Value {
+    let mut messages = Vec::with_capacity(history.len() + 2);
     messages.push(json!({ "role": "system", "content": system }));
     for msg in history {
         convert_message(msg, &mut messages);
     }
+    messages.push(json!({ "role": "user", "content": state }));
     let tools: Vec<Value> = tool_specs.iter().map(tool_to_openai).collect();
-    json!({
+    // The key is spelled through the constant rather than written inline, so the
+    // one place that decides which spelling the wire uses is also the place that
+    // records why. See [`MAX_TOKENS_FIELD`].
+    let mut body = json!({
         "model": model,
-        "max_tokens": 8192,
         "messages": messages,
         "tools": tools,
-    })
+    });
+    body[MAX_TOKENS_FIELD] = json!(DEFAULT_MAX_OUTPUT_TOKENS);
+    // Added only when the operator named one: the field is refused by the classic
+    // models that work today, so an unconditional write would be a regression.
+    if let Some(effort) = reasoning_effort {
+        body[REASONING_EFFORT_FIELD] = json!(effort);
+    }
+    body
 }
 
 /// Anthropic tool spec `{name, description, input_schema}` →
@@ -109,7 +181,10 @@ fn convert_message(msg: &ApiMessage, out: &mut Vec<Value>) {
                         "content": content,
                     })),
                     Block::Text { text: t } => append_line(&mut text, t),
-                    Block::ToolUse { .. } => {}
+                    // Tool-use on a *user* turn does not occur, and reasoning
+                    // has no place in the OpenAI wire format — dropping both is
+                    // the only faithful translation.
+                    Block::ToolUse { .. } | Block::Thinking { .. } => {}
                 }
             }
             if !text.is_empty() {
@@ -130,7 +205,7 @@ fn convert_message(msg: &ApiMessage, out: &mut Vec<Value>) {
                         // JSON *string*, not an object.
                         "function": { "name": name, "arguments": input.to_string() },
                     })),
-                    Block::ToolResult { .. } => {}
+                    Block::ToolResult { .. } | Block::Thinking { .. } => {}
                 }
             }
             if text.is_empty() && tool_calls.is_empty() {
@@ -199,6 +274,31 @@ struct ChatUsage {
     prompt_tokens: u64,
     #[serde(default)]
     completion_tokens: u64,
+    /// Cached prompt tokens, as the OpenAI-compatible convention spells them.
+    ///
+    /// Two spellings are in the wild — `prompt_tokens_details.cached_tokens` from `OpenAI`, and a
+    /// flat `cached_tokens` from several compatible services — so both are read and either is
+    /// accepted. Services that do not cache simply omit them.
+    #[serde(default)]
+    cached_tokens: u64,
+    #[serde(default)]
+    prompt_tokens_details: Option<PromptTokensDetails>,
+}
+
+#[derive(Deserialize, Default)]
+struct PromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: u64,
+}
+
+impl ChatUsage {
+    /// The cached prompt tokens, from whichever field carried them.
+    fn cached_tokens(&self) -> u64 {
+        // The nested form wins when both are present, being the one OpenAI documents.
+        self.prompt_tokens_details
+            .as_ref()
+            .map_or(self.cached_tokens, |d| d.cached_tokens.max(self.cached_tokens))
+    }
 }
 
 /// Fold the first choice of a chat-completions response into the
@@ -238,6 +338,11 @@ pub fn into_messages_resp(resp: ChatResp) -> MessagesResp {
         usage: Usage {
             input_tokens: resp.usage.prompt_tokens,
             output_tokens: resp.usage.completion_tokens,
+            // OpenAI-compatible services report cached prompt tokens when they support caching;
+            // the field is optional and absent on most. Passed through so the cost arithmetic
+            // sees the same shape wherever the turn came from.
+            cache_read_input_tokens: resp.usage.cached_tokens(),
+            cache_creation_input_tokens: 0,
         },
     }
 }
@@ -316,11 +421,21 @@ mod tests {
                 }],
             ),
         ];
-        let specs = crate::tools::tool_specs();
-        let req = build_request("test-model", "be helpful", &specs, &history);
+        let specs = crate::tools::ToolSet::builtin().specs().to_vec();
+        let req = build_request("test-model", "be helpful", "state", &specs, &history, None);
 
         assert_eq!(req["model"], "test-model");
-        assert_eq!(req["max_tokens"], 8192);
+        // The modern spelling, and *only* it: a body carrying both would still be
+        // refused by the models that reject the legacy key, so leaving the old
+        // one behind as a belt-and-braces would defeat the point. Asserted by
+        // absence because a stray `max_tokens` is exactly the regression this
+        // guards.
+        assert_eq!(req[MAX_TOKENS_FIELD], DEFAULT_MAX_OUTPUT_TOKENS);
+        assert!(
+            req.get("max_tokens").is_none(),
+            "the legacy field must not be sent at all: {}",
+            req["max_tokens"]
+        );
 
         let messages = req["messages"].as_array().unwrap();
         assert_eq!(messages[0]["role"], "system");
@@ -350,6 +465,22 @@ mod tests {
         }
     }
 
+    /// The reasoning field is opt-in, and absence is the point: the classic models
+    /// that work today refuse it outright, so a body carrying it by default would
+    /// trade one broken family for another.
+    #[test]
+    fn build_request_sends_reasoning_effort_only_when_asked() {
+        let absent = build_request("m", "s", "state", &[], &[], None);
+        assert!(
+            absent.get(REASONING_EFFORT_FIELD).is_none(),
+            "an unasked-for reasoning field must not be sent: {}",
+            absent[REASONING_EFFORT_FIELD]
+        );
+
+        let asked = build_request("m", "s", "state", &[], &[], Some("none"));
+        assert_eq!(asked[REASONING_EFFORT_FIELD], "none");
+    }
+
     #[test]
     fn build_request_splits_tool_results_from_trailing_text() {
         let history = vec![blocks(
@@ -373,12 +504,16 @@ mod tests {
                 },
             ],
         )];
-        let req = build_request("m", "s", &[], &history);
+        let req = build_request("m", "s", "state", &[], &history, None);
         let messages = req["messages"].as_array().unwrap();
-        assert_eq!(messages.len(), 3);
+        // system, the tool result, the trailing text, and the state turn.
+        assert_eq!(messages.len(), 4);
         assert_eq!(messages[1]["role"], "tool");
         assert_eq!(messages[2]["role"], "user");
         assert_eq!(messages[2]["content"], "carry on");
+        // The state turn is last, after the history — the ordering that keeps
+        // it from invalidating anything behind it.
+        assert_eq!(messages[3]["content"], "state");
     }
 
     #[test]
@@ -393,17 +528,20 @@ mod tests {
                 content: ApiContent::Plain("not a turn".into()),
             },
         ];
-        let req = build_request("m", "s", &[], &history);
+        let req = build_request("m", "s", "state", &[], &history, None);
         let messages = req["messages"].as_array().unwrap();
-        assert_eq!(messages.len(), 2);
+        // The system role in the history is not a turn and is dropped, so this
+        // is system, the assistant's answer, and the state turn.
+        assert_eq!(messages.len(), 3);
         assert_eq!(messages[1]["role"], "assistant");
         assert_eq!(messages[1]["content"], "prior answer");
+        assert_eq!(messages[2]["content"], "state");
     }
 
     #[test]
     fn tool_spec_without_schema_gets_empty_parameters() {
         let specs = [json!({ "name": "Bare" })];
-        let req = build_request("m", "s", &specs, &[]);
+        let req = build_request("m", "s", "state", &specs, &[], None);
         let tool = &req["tools"][0]["function"];
         assert_eq!(tool["name"], "Bare");
         assert_eq!(tool["parameters"], json!({ "type": "object", "properties": {} }));
@@ -412,9 +550,12 @@ mod tests {
     #[test]
     fn build_request_drops_empty_assistant_turns() {
         let history = vec![blocks("assistant", vec![])];
-        let req = build_request("m", "s", &[], &history);
-        // Only the system message survives.
-        assert_eq!(req["messages"].as_array().unwrap().len(), 1);
+        let req = build_request("m", "s", "state", &[], &history, None);
+        let messages = req["messages"].as_array().unwrap();
+        // The empty assistant turn contributes nothing, so only the system
+        // message and the state turn remain.
+        assert_eq!(messages.len(), 2, "got {messages:?}");
+        assert_eq!(messages[1]["content"], "state");
     }
 
     /// Mock of a plain text answer, `x.ai` / `OpenAI` shape.

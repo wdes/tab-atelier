@@ -1,0 +1,54 @@
+[package]
+name = "tab-atelier-kiosk"
+version = "0.1.0-dev"
+edition = "2024"
+license = "MPL-2.0"
+description = "Web kiosk for tab-atelier"
+repository = "https://github.com/wdes/tab-atelier"
+publish = false
+
+[[bin]]
+name = "tab-atelier-kiosk"
+path = "src/main.rs"
+
+[lib]
+name = "tab_atelier_kiosk"
+path = "src/lib.rs"
+
+[dependencies]
+clap = { version = "4", default-features = false, features = ["derive", "std", "help", "usage", "error-context"] }
+http = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "net", "sync", "time", "io-util", "macros", "signal"] }
+ureq = { version = "3", features = ["json"] }
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[package.metadata.deb]
+name = "tab-atelier-kiosk"
+maintainer = "William Desportes <williamdes@wdes.fr>"
+copyright = "2026, William Desportes <williamdes@wdes.fr>"
+license-file = ["../../LICENSE", "0"]
+extended-description = "The tab-atelier web Kiosk: decision, report and intent panes, over HTTP."
+section = "utils"
+priority = "optional"
+# The Kiosk is a standalone server package, not part of the desktop install.
+# Keep init-system-helpers explicit because maintainer scripts use deb-systemd-invoke on upgrades.
+depends = "$auto, adduser, init-system-helpers"
+assets = [
+    ["target/release/tab-atelier-kiosk", "/usr/bin/", "755"],
+    ["systemd/tab-atelier-kiosk.service", "/usr/lib/systemd/system/", "644"],
+    ["README.md", "/usr/share/doc/tab-atelier-kiosk/", "644"],
+]
+maintainer-scripts = "debian/"
+systemd-units = { unit-name = "tab-atelier-kiosk", enable = false, start = false }
