@@ -43,9 +43,12 @@ pub mod logs;
 /// the deliberate, local way to drop history nobody reads.
 pub mod prune;
 pub mod remote;
+pub mod set_assignment;
+pub mod set_card;
 pub mod set_context;
 pub mod set_font;
 pub mod set_meta;
+pub mod set_rehome;
 pub mod set_status;
 /// Headless-side basic-action subcommands.
 ///
@@ -53,6 +56,12 @@ pub mod set_status;
 /// after the first one added; see the module docstring for details.
 pub mod share_link;
 pub mod style;
+pub mod tab_field;
+/// `tab-atelier task <push|claim|beat|done|list>` (primitive #11).
+///
+/// The typed task queue with an atomic claim: the pure backend + the thin HTTP
+/// client.
+pub mod task;
 /// `tab-atelier tasks` — the contract-net fold over the blackboard: what work
 /// exists, who bid, who won, what finished.
 pub mod tasks;
