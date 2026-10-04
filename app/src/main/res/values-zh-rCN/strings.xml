@@ -1,0 +1,655 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<resources xmlns:tools="http://schemas.android.com/tools">
+  <string name="app_desc">简洁、强大、开源的SSH客户端。</string>
+  <string name="service_desc">维护 SSH 连接和已加载的公钥</string>
+  <string name="app_copyright">版权所有 © Kenny Root</string>
+  <string name="title_pubkey_list">公钥</string>
+  <string name="title_port_forwards_list">端口转发</string>
+  <string name="title_help">帮助</string>
+  <string name="title_eula">许可协议</string>
+  <string name="title_color_picker">选取颜色</string>
+  <string name="title_settings">设置</string>
+  <string name="title_pubkey_generate">生成</string>
+  <string name="terms_and_conditions">条款与条件</string>
+  <string name="hints">提示</string>
+  <string name="keyboard_shortcuts">键盘快捷键</string>
+  <string name="increase_font_size">放大字体</string>
+  <string name="increase_font_shortcut">Ctrl 加 +</string>
+  <string name="decrease_font_size">缩小字体</string>
+  <string name="decrease_font_shortcut">Ctrl 加 -</string>
+  <string name="paste_shortcut">Ctrl-Shift-V</string>
+  <string name="pubkey_generate">生成</string>
+  <string name="pubkey_delete">删除密钥</string>
+  <string name="pubkey_gather_entropy">正在收集熵</string>
+  <string name="pubkey_touch_prompt">触摸这个方框来获取随机性：已完成%1$d%%</string>
+  <string name="pubkey_touch_hint">请在下方的方框内随机移动手指以保证密钥生成的随机性。</string>
+  <string name="pubkey_generating">正在生成密钥对…</string>
+  <string name="pubkey_copy_private">复制私钥</string>
+  <string name="pubkey_copy_private_openssh">复制私钥（OpenSSH）</string>
+  <string name="pubkey_copy_private_pem">复制私钥（PEM 格式）</string>
+  <string name="pubkey_copy_private_encrypted">复制私钥（已加密）</string>
+  <string name="pubkey_copy_public">复制公钥</string>
+  <string name="pubkey_export_public">导出公钥</string>
+  <string name="pubkey_export_private">导出私钥</string>
+  <string name="pubkey_export_private_openssh">导出私钥（OpenSSH）</string>
+  <string name="pubkey_export_private_pem">导出私钥（PEM 格式）</string>
+  <string name="pubkey_export_private_encrypted">导出私钥（已加密）</string>
+  <string name="pubkey_export_set_passphrase">设置导出密码短语</string>
+  <string name="pubkey_export_passphrase_message">输入一个密码短语以加密导出的密钥</string>
+  <string name="pubkey_export_confirm_passphrase">确认密码短语</string>
+  <string name="pubkey_export_passphrase_mismatch">密码短语不匹配</string>
+  <string name="pubkey_import_encrypted_title">导入加密密钥</string>
+  <string name="pubkey_import_encrypted_message">请输入密码以解密密钥“%1$s”（%2$s）</string>
+  <string name="pubkey_import_button">导入</string>
+  <string name="pubkey_import_encrypt_key">用于存储的加密密钥</string>
+  <string name="pubkey_import_reuse_password">使用相同的密码进行加密</string>
+  <string name="pubkey_import_new_password">新密码</string>
+  <string name="pubkey_import_confirm_password">确认密码</string>
+  <string name="pubkey_change_password">更改密码</string>
+  <string name="pubkey_unlock">解锁密钥</string>
+  <string name="pubkey_unlock_message">请输入密码以解锁密钥“%1$s”</string>
+  <string name="pubkey_nickname_exists">已存在具有此别名的密钥</string>
+  <string name="pubkey_load_on_start">启动时载入密钥</string>
+  <string name="pubkey_confirm_use">使用前确认</string>
+  <string name="portforward_edit">编辑端口转发</string>
+  <string name="portforward_delete">删除端口转发</string>
+  <string name="prompt_nickname">昵称：</string>
+  <string name="prompt_source_port">源端口：</string>
+  <string name="prompt_destination">目标端口：</string>
+  <string name="prompt_old_password">旧密码：</string>
+  <string name="prompt_username">用户名：</string>
+  <string name="prompt_password">密码：</string>
+  <string name="prompt_again">(再次输入)</string>
+  <string name="prompt_type">类型：</string>
+  <string name="prompt_password_can_be_blank">注意：密码可以为空</string>
+  <string name="prompt_bits">位数：</string>
+  <string name="prompt_pubkey_password">密钥\'%1$s\'的密码</string>
+  <string name="prompt_allow_agent_to_use_key">允许远程主机\n使用密钥 \'%1$s\'？</string>
+  <string name="host_verification_failure_warning_header">警告：远程主机身份标识已改变！</string>
+  <string name="host_verification_failure_warning">可能有人正在做非善意的事情！\n可能有人正在偷听你的会话(中间人攻击)！\n但也可能是主机密钥刚刚被更改。</string>
+  <string name="prompt_continue_connecting">你确定要\n继续连接？</string>
+  <string name="host_authenticity_warning">无法验证‘%1$s’主机</string>
+  <string name="host_fingerprint">主机 %1$s 密钥指纹是 %2$s</string>
+  <string name="host_key_verification_title">主机密钥验证</string>
+  <string name="fingerprint_format_header">指纹格式</string>
+  <string name="host_key_type_and_size">%1$s %2$d 位</string>
+  <string name="fingerprint_copy_description">将指纹复制到剪贴板</string>
+  <string name="alert_passwords_do_not_match_msg">密码不匹配！</string>
+  <string name="alert_wrong_password_msg">密码错误！</string>
+  <string name="button_resize">改变窗口大小</string>
+  <string name="alert_disconnect_msg">连接中断</string>
+  <string name="network_lost_grace_period">网络连接中断，正在尝试重新连接……</string>
+  <string name="network_grace_period_expired">网络未恢复，正在断开连接……</string>
+  <string name="network_restored_same_ip">网络已恢复，连接已保持。</string>
+  <string name="network_restored_ip_changed">网络已恢复，但 IP 地址已更改，正在重新连接……</string>
+  <string name="network_restored_no_previous_state">网络已恢复，正在验证连接……</string>
+  <string name="pref_emulation_category">终端模拟</string>
+  <string name="pref_emulation_title">仿真模式</string>
+  <string name="pref_scrollback_title">回滚长度</string>
+  <string name="pref_scrollback_summary">在内存中为每个控制台保留的回滚缓存长度</string>
+  <string name="pref_fontfamily_title">字体</string>
+  <string name="pref_customfont_title">添加自定义字体</string>
+  <string name="pref_customfont_summary">通过名称添加一个来自 Google Fonts 的字体</string>
+  <string name="dialog_customfont_title">添加自定义字体</string>
+  <string name="dialog_customfont_hint">Google Fonts 的名称（例如：Cascadia Code）</string>
+  <string name="button_add">添加</string>
+  <string name="button_remove">删除</string>
+  <string name="font_validating">正在验证字体……</string>
+  <string name="font_downloading">正在下载字体……</string>
+  <string name="pref_localfont_title">导入本地字体</string>
+  <string name="pref_localfont_summary">从存储空间导入字体文件（TTF、OTF）。</string>
+  <string name="dialog_localfont_title">导入字体</string>
+  <string name="dialog_localfont_hint">字体的显示名称</string>
+  <string name="button_import">导入</string>
+  <string name="font_importing">正在导入字体……</string>
+  <string name="pref_backupkeys_title">备份公钥</string>
+  <string name="pref_backupkeys_summary">使用Android的备份机制保存私钥的备份</string>
+  <string name="pref_ui_category">用户界面</string>
+  <string name="pref_language_title">语言</string>
+  <string name="pref_language_system_default">系统默认</string>
+  <string name="pref_theme_title">主题</string>
+  <string name="pref_theme_system">系统默认</string>
+  <string name="pref_theme_light">轻量</string>
+  <string name="pref_theme_dark">深色</string>
+  <string name="pref_titlebarhide_title">自动隐藏标题栏</string>
+  <string name="pref_titlebarhide_summary">点击控制台以显示标题栏和访问菜单</string>
+  <string name="pref_alwaysvisible_title">特殊键始终可见</string>
+  <string name="pref_pg_updn_gesture_title">向上/向下翻页手势</string>
+  <string name="pref_pg_updn_gesture_summary">在屏幕左侧的三分之一以内滑动向终端发送向上/向下翻页</string>
+  <string name="pref_fullscreen_title">全屏</string>
+  <string name="pref_fullscreen_summary">处于控制台状态时隐藏状态栏</string>
+  <string name="pref_keyboard_category">键盘</string>
+  <string name="pref_shiftfkeys_title">使用 Shift + 数字键作为功能键（F键）</string>
+  <string name="pref_shiftfkeys_summary">在硬件键盘上，使用 Shift 键和数字键组合发送 F1-F10</string>
+  <string name="pref_ctrlfkeys_title">使用 Ctrl + 数字键作为功能键（F键）</string>
+  <string name="pref_ctrlfkeys_summary">在软件键盘上，使用 Ctrl 键和数字键组合发送 F1 - F10</string>
+  <string name="pref_volumefont_title">使用音量键改变字体大小</string>
+  <string name="pref_volumefont_summary">也可在单个主机设置中改变字体大小</string>
+  <string name="pref_memkeys_title">在内存中记录密钥</string>
+  <string name="pref_memkeys_summary">将解锁的密钥保留于内存中，直到后端服务被终止</string>
+  <string name="pref_conn_persist_title">在后台保持连接</string>
+  <string name="pref_conn_persist_summary">即使切换到其他应用，也能保持会话连接状态</string>
+  <string name="pref_keymode_title">目录快捷方式</string>
+  <string name="pref_stickymodifiers_title">粘滞键</string>
+  <string name="only_alt">仅 alt</string>
+  <string name="pref_camera_title">相机快捷键</string>
+  <string name="pref_keepalive_title">保持屏幕唤醒</string>
+  <string name="pref_keepalive_summary">终端运行时禁止屏幕休眠</string>
+  <string name="pref_wifilock_title">保持Wi-Fi活动</string>
+  <string name="pref_wifilock_summary">会话运行时禁止Wi-Fi关闭</string>
+  <string name="pref_bumpyarrows_title">触摸反馈</string>
+  <string name="pref_bumpyarrows_summary">发送方向键时振动，连接延迟时有帮助</string>
+  <string name="pref_bell_category">终端响铃</string>
+  <string name="pref_bell_title">响铃</string>
+  <string name="pref_bell_summary">在终端提示时播放声音</string>
+  <string name="pref_bell_volume_title">铃声音量</string>
+  <string name="pref_bell_vibrate_title">响铃时振动</string>
+  <string name="pref_bell_vibrate_summary">终端提示时震动</string>
+  <string name="pref_bell_notification_title">后台通知</string>
+  <string name="pref_bell_notification_summary">当终端在后台响铃时发出通知</string>
+  <string name="list_keymode_right">使用右侧按键</string>
+  <string name="list_keymode_left">使用左侧按键</string>
+  <string name="list_keymode_none">禁用</string>
+  <string name="list_pubkeyids_none">不使用密钥</string>
+  <string name="list_pubkeyids_any">使用任何已解锁密钥</string>
+  <string name="hostpref_nickname_title">昵称</string>
+  <string name="hostpref_color_title">颜色类型</string>
+  <string name="color_red">红色</string>
+  <string name="color_pink">粉色</string>
+  <string name="color_purple">紫色</string>
+  <string name="color_deep_purple">深紫色</string>
+  <string name="color_indigo">靛蓝</string>
+  <string name="color_blue">蓝色</string>
+  <string name="color_light_blue">浅蓝色</string>
+  <string name="color_cyan">青色</string>
+  <string name="color_teal">青色</string>
+  <string name="color_green">绿色</string>
+  <string name="color_light_green">浅绿色</string>
+  <string name="color_lime">青柠</string>
+  <string name="color_yellow">黄色</string>
+  <string name="color_amber">琥珀</string>
+  <string name="color_orange">橙色</string>
+  <string name="color_gray">灰色</string>
+  <string name="hostpref_fontsize_title">字型大小 (pt)</string>
+  <string name="hostpref_fontfamily_title">字体</string>
+  <string name="hostpref_colorscheme_title">终端配色方案</string>
+  <string name="hostpref_pubkeyid_title">使用密钥验证</string>
+  <string name="hostpref_authagent_title">使用 SSH 认证代理</string>
+  <string name="hostpref_postlogin_title">登录后自动运行</string>
+  <string name="hostpref_compression_title">压缩</string>
+  <string name="hostpref_compression_summary">此选项对低速网络会有帮助</string>
+  <string name="hostpref_wantsession_title">启动Shell会话</string>
+  <string name="hostpref_wantsession_summary">禁用此设置以仅使用端口转发</string>
+  <string name="hostpref_stayconnected_title">保持连接</string>
+  <string name="hostpref_stayconnected_summary">断线重连</string>
+  <string name="hostpref_quickdisconnect_title">连接断开时关闭</string>
+  <string name="hostpref_quickdisconnect_summary">远程连接断开后，立即关闭不提示。</string>
+  <string name="hostpref_delkey_title">DEL键</string>
+  <string name="hostpref_encoding_title">编码</string>
+  <string name="hostpref_username_title">用户名</string>
+  <string name="hostpref_save_password_summary">安全地存储登录密码，以便自动进行身份验证。</string>
+  <string name="hostpref_password_title">密码</string>
+  <string name="hostpref_password_unchanged">密码（未更改）</string>
+  <string name="hostpref_clear_password">清除已保存的密码</string>
+  <string name="hostpref_hostname_title">主机</string>
+  <string name="hostpref_port_title">端口</string>
+  <string name="hostpref_profile_title">个人资料</string>
+  <string name="hostpref_profile_summary">选择一个配置，以使用其终端设置。</string>
+  <string name="hostpref_profile_none">无（使用主机设置）</string>
+  <string name="profile_controlled_setting">由配置文件控制</string>
+  <string name="font_use_default">使用默认设置</string>
+  <string name="font_system_default">默认（等宽字体）</string>
+  <string name="pubkey_unknown">未知的密钥</string>
+  <string name="colorscheme_default">默认</string>
+  <string name="profile_editor_title_new">新建配置</string>
+  <string name="profile_editor_title_edit">编辑资料</string>
+  <string name="profile_editor_save">保存</string>
+  <string name="profile_editor_name_label">配置文件名称</string>
+  <string name="profile_editor_section_icon_color">图标颜色</string>
+  <string name="profile_editor_section_color_scheme">配色方案</string>
+  <string name="profile_editor_section_font">字体</string>
+  <string name="profile_editor_section_terminal">终端</string>
+  <string name="profile_editor_font_family_title">字体家族</string>
+  <string name="profile_editor_font_size_title">字体大小：%d</string>
+  <string name="profile_editor_force_size_title">强制设置尺寸</string>
+  <string name="profile_editor_force_size_summary">强制将终端设置为特定大小（列数 x 行数），而不是自动调整以适应屏幕。</string>
+  <string name="profile_editor_force_size_enable">启用强制尺寸</string>
+  <string name="profile_editor_force_size_columns">列</string>
+  <string name="profile_editor_force_size_rows">行数</string>
+  <string name="profile_icon_color_none">无（使用主机颜色）</string>
+  <string name="profile_list_title">配置资料</string>
+  <string name="profile_list_create_profile">创建配置文件</string>
+  <string name="profile_list_empty_message">目前还没有配置文件。点击“+”来创建一个。</string>
+  <string name="profile_list_more_options">更多选项</string>
+  <string name="profile_list_duplicate">复制</string>
+  <string name="profile_list_delete">删除</string>
+  <string name="profile_create_dialog_title">创建配置文件</string>
+  <string name="profile_create_name_label">配置文件名称</string>
+  <string name="profile_create_button">创建</string>
+  <string name="profile_create_cancel">取消</string>
+  <string name="profile_delete_dialog_title">删除配置</string>
+  <string name="profile_delete_dialog_message">您确定要删除“%s”吗？</string>
+  <string name="profile_delete_button">删除</string>
+  <string name="profile_delete_cancel">取消</string>
+  <string name="profile_summary_font">字体：%1$s %2$d磅</string>
+  <string name="profile_summary_emulation">模拟：%s</string>
+  <string name="console_menu_reconnect">重新连接</string>
+  <string name="console_menu_close">关闭</string>
+  <string name="console_menu_paste">粘贴</string>
+  <string name="console_menu_portforwards">端口转发</string>
+  <string name="console_menu_resize">指定终端大小</string>
+  <string name="console_menu_urlscan">URL 扫描</string>
+  <string name="console_url_no_handler">没有可用的应用程序来打开此 URL</string>
+  <string name="console_url_not_supported">不支持此 URL 类型</string>
+  <string name="button_yes">确认</string>
+  <string name="button_no">否</string>
+  <string name="portforward_local">本地</string>
+  <string name="portforward_remote">远程</string>
+  <string name="portforward_dynamic">动态(SOCKS)</string>
+  <string name="portforward_pos">创建端口转发</string>
+  <string name="portforward_save">保存</string>
+  <string name="format_username">用户名</string>
+  <string name="format_hostname">主机名</string>
+  <string name="format_port">端口</string>
+  <string name="list_menu_pubkeys">管理密钥</string>
+  <string name="list_menu_sortcolor">按颜色排序</string>
+  <string name="list_menu_sortname">按名称排序</string>
+  <string name="list_menu_disconnect">断开所有连接</string>
+  <string name="list_menu_settings">设置</string>
+  <string name="list_host_disconnect">断开连接</string>
+  <string name="list_host_edit">编辑主机</string>
+  <string name="list_host_portforwards">编辑端口转发</string>
+  <string name="list_host_delete">删除主机</string>
+  <string name="list_host_duplicate">复制主机</string>
+  <string name="list_host_forget_keys">忘记主机密钥</string>
+  <string name="list_camera_ctrlaspace">Ctrl+A 然后 Space</string>
+  <string name="list_camera_ctrla">Ctrl+A</string>
+  <string name="list_camera_esc">Esc</string>
+  <string name="list_camera_esc_a">Esc+A</string>
+  <string name="list_camera_none">无</string>
+  <string name="list_camera_text_input">文本输入</string>
+  <string name="delete_message">确定要删除\'%1$s\'吗？</string>
+  <string name="delete_pos">是，删除</string>
+  <string name="delete_neg">取消</string>
+  <string name="disconnect_all_message">你确定你要断开所有连接的主机？</string>
+  <string name="disconnect_all_pos">是，断开</string>
+  <string name="disconnect_all_neg">取消</string>
+  <string name="terminal_connecting">正在通过 %3$s 端口连接到 %1$s:%2$d</string>
+  <string name="terminal_sucess">验证主机 %1$s 密钥： %2$s</string>
+  <string name="terminal_failed">主机密钥验证失败。</string>
+  <string name="terminal_using_s2c_algorithm">服务器到客户端算法：%1$s %2$s</string>
+  <string name="terminal_using_c2s_algorithm">客户端到服务器算法：%1$s %2$s</string>
+  <string name="terminal_using_algorithm">使用算法：%1$s %2$s</string>
+  <string name="terminal_kex_algorithm">密钥交换算法: %s</string>
+  <string name="terminal_auth">尝试身份验证</string>
+  <string name="terminal_auth_pass">尝试使用“密码” 进行身份验证</string>
+  <string name="terminal_auth_pass_fail">“密码”验证失败</string>
+  <string name="terminal_auth_saved_password">正在尝试使用已保存的密码……</string>
+  <string name="terminal_auth_saved_password_fail">保存的密码验证失败</string>
+  <string name="terminal_auth_pubkey_any">尝试“公钥”验证，使用内存中的任何公钥</string>
+  <string name="terminal_auth_pubkey_invalid">所选公钥失效,请在主机中重新选择</string>
+  <string name="terminal_auth_pubkey_specific">尝试\'公钥\'验证，使用指定的公钥</string>
+  <string name="terminal_auth_biometric">正在请求对密钥“%1$s”进行生物特征验证。</string>
+  <string name="terminal_auth_biometric_invalidated">生物识别密钥“%1$s”已失效。当设备上注册新的指纹时，可能会发生这种情况。请生成新的密钥。</string>
+  <string name="terminal_auth_pubkey_fail">使用密钥“%1$s”进行“公钥”验证失败</string>
+  <string name="terminal_auth_ki">尝试“键盘交互式”验证</string>
+  <string name="terminal_auth_ki_fail">“键盘交互式”验证失败</string>
+  <string name="terminal_auth_fail">主机不支持“密码”或“键盘交互式”验证。</string>
+  <string name="terminal_no_session">由于主机设置不能启动该会话。</string>
+  <string name="terminal_enable_portfoward">启用端口转发：%1$s</string>
+  <string name="local_shell_unavailable">失败! 本地Shell在该手机上不可用</string>
+  <string name="notification_text">%1$s 需要你关注。</string>
+  <string name="no">不使用</string>
+  <string name="yes">使用</string>
+  <string name="title_scheme_manager">管理配色方案</string>
+  <string name="button_new_scheme">新方案</string>
+  <string name="button_duplicate_scheme">重复</string>
+  <string name="button_delete_scheme">删除</string>
+  <string name="dialog_title_new_scheme">新的配色方案</string>
+  <string name="label_scheme_name">方案名称</string>
+  <string name="label_scheme_description">描述（可选）</string>
+  <string name="dialog_title_delete_scheme">删除方案？</string>
+  <string name="dialog_message_delete_scheme">您确定要删除“%1$s”吗？此操作无法撤销。</string>
+  <string name="button_confirm">确认</string>
+  <string name="button_cancel">取消</string>
+  <string name="label_built_in_scheme">内置</string>
+  <string name="label_custom_scheme">自定义</string>
+  <string name="empty_custom_schemes">没有自定义方案。点击“新建方案”以创建一个。</string>
+  <string name="button_export_scheme">导出配置</string>
+  <string name="button_import_scheme">导入配置</string>
+  <string name="message_export_success">已导出 %1$s</string>
+  <string name="message_import_success">已导入 %1$s</string>
+  <string name="error_export_failed">导出方案失败：%1$s</string>
+  <string name="error_import_failed">无法导入方案：%1$s</string>
+  <string name="error_invalid_json">无效的 JSON 文件</string>
+  <string name="title_palette_editor">编辑颜色调板</string>
+  <string name="button_reset_all_colors">重置所有设置</string>
+  <string name="section_ansi_colors">ANSI 颜色（0-15）</string>
+  <string name="dialog_title_edit_color">编辑颜色 %1$d</string>
+  <string name="dialog_title_reset_all">重置所有颜色？</string>
+  <string name="dialog_message_reset_all">这将把所有 256 种颜色重置为其默认值。此操作无法撤销。</string>
+  <string name="app_is_running">ConnectBot 正在运行</string>
+  <string name="label_red">红色</string>
+  <string name="label_green">绿色</string>
+  <string name="label_blue">蓝色</string>
+  <string name="label_hex_color">十六进制颜色</string>
+  <string name="section_fg_bg_colors">前台和后台</string>
+  <string name="label_foreground_color">前台</string>
+  <string name="label_background_color">背景</string>
+  <string name="label_base_scheme">基本方案：</string>
+  <string name="menu_manage_colors">管理配色方案</string>
+  <string name="section_color_preview">预览</string>
+  <string name="image_description_connected">已连接。</string>
+  <string name="image_description_disconnected">已断开连接。</string>
+  <string name="image_description_toggle_control_character">切换控制字符。</string>
+  <string name="image_description_send_escape_character">发送Escape字符。</string>
+  <string name="image_description_send_tab_character">发送TAB字符。</string>
+  <string name="image_description_hide_keyboard">隐藏键盘</string>
+  <string name="image_description_show_keyboard">显示键盘。</string>
+  <string name="image_description_up">向上的箭头</string>
+  <string name="image_description_down">向下的箭头</string>
+  <string name="image_description_left">向左的箭头</string>
+  <string name="image_description_right">向右的箭头</string>
+  <string name="button_key_esc">Esc</string>
+  <string name="button_key_ctrl">Ctrl</string>
+  <string name="button_key_home">Home</string>
+  <string name="button_key_end">End</string>
+  <string name="button_key_pgup">PgUp</string>
+  <string name="button_key_pgdn">PgDn</string>
+  <string name="button_key_f1">F1</string>
+  <string name="button_key_f2">F2</string>
+  <string name="button_key_f3">F3</string>
+  <string name="button_key_f4">F4</string>
+  <string name="button_key_f5">F5</string>
+  <string name="button_key_f6">F6</string>
+  <string name="button_key_f7">F7</string>
+  <string name="button_key_f8">F8</string>
+  <string name="button_key_f9">F9</string>
+  <string name="button_key_f10">F10</string>
+  <string name="button_key_f11">F11</string>
+  <string name="button_key_f12">F12</string>
+  <string name="terminal_keyboard_text_input_button">文本输入</string>
+  <string name="terminal_text_input_dialog_title">文本输入</string>
+  <string name="terminal_text_input_dialog_label">输入要发送到终端的文本</string>
+  <string name="terminal_text_input_resize_handle">调整大小</string>
+  <string name="console_menu_text_input">文本输入</string>
+  <string name="button_send">发送</string>
+  <string name="button_ok">好的</string>
+  <string name="button_close">关闭</string>
+  <string name="button_back">返回</string>
+  <string name="button_navigate_up">向上导航</string>
+  <string name="button_more_options">更多选项</string>
+  <string name="button_host_options">主机选项</string>
+  <string name="button_collapse">折叠</string>
+  <string name="error_key_load_failed">未能加载密钥“%1$s”： %2$s</string>
+  <string name="error_connection_failed">无法连接到 %1$s (%2$s)：%3$s</string>
+  <string name="error_port_forward_load_failed">无法加载 %1$s 的端口转发： %2$s</string>
+  <string name="error_host_save_failed">无法保存主机 %1$s：%2$s</string>
+  <string name="error_color_scheme_load_failed">未能加载配色方案：%s</string>
+  <string name="host_duplicate_nickname">%1$s（复制）</string>
+  <string name="empty_hosts_message">未配置任何主机</string>
+  <string name="empty_pubkeys_message">未找到密钥。</string>
+  <string name="empty_port_forwards_message">未配置端口转发。</string>
+  <string name="empty_urls_message">未在终端缓冲区中找到 URL</string>
+  <string name="console_default_title">控制台</string>
+  <string name="host_editor_show_advanced">显示高级选项</string>
+  <string name="host_editor_hide_advanced">隐藏高级选项</string>
+  <string name="resize_width_label">宽度（列数）</string>
+  <string name="resize_height_label">高度（行数）</string>
+  <string name="resize_disable_force_size">禁用强制尺寸</string>
+  <string name="pubkey_editor_key_type_label">密钥类型</string>
+  <string name="pubkey_editor_options_label">选项</string>
+  <string name="pubkey_editor_encrypted_startup_warning">加密密钥无法在启动时解锁</string>
+  <string name="pubkey_type_label">类型：%s</string>
+  <string name="pubkey_encrypted_description">已加密</string>
+  <string name="pubkey_not_encrypted_description">未加密</string>
+  <string name="pubkey_biometric_protection">指纹保护</string>
+  <string name="pubkey_biometric_description">使用您的指纹保护此密钥</string>
+  <string name="pubkey_biometric_not_enrolled">未注册指纹。请在设备设置中设置指纹以使用此功能。</string>
+  <string name="pubkey_biometric_key_type_warning">指纹保护功能仅适用于 RSA 和 EC 密钥</string>
+  <string name="pubkey_biometric_prompt_title">使用密钥进行身份验证</string>
+  <string name="pubkey_biometric_prompt_subtitle">触摸指纹传感器以解锁“%1$s”</string>
+  <string name="pubkey_biometric_description_icon">通过指纹保护</string>
+  <string name="pubkey_biometric_not_available">指纹验证不可用</string>
+  <string name="portforward_nickname_placeholder">内部 Web 服务器</string>
+  <string name="portforward_port_range_error">端口号必须在 1 到 65535 之间</string>
+  <string name="portforward_destination_placeholder">localhost:80</string>
+  <string name="portforward_destination_format_error">格式应为：主机名:端口（例如：localhost:80）</string>
+  <string name="portforward_type_label">类型：%s</string>
+  <string name="portforward_enable">启用</string>
+  <string name="portforward_disable">禁用</string>
+  <string name="portforward_enabled">端口转发已启用</string>
+  <string name="portforward_disabled">端口转发已禁用</string>
+  <string name="protocol_spinner_label">协议</string>
+  <string name="expand">展开</string>
+  <string name="hostpref_authagent_with_confirmation">需要确认</string>
+  <string name="hostpref_add_host">添加主机</string>
+  <string name="hostpref_save_host">保存主机</string>
+  <string name="hostpref_setting_title">主机设置</string>
+  <string name="pubkey_import_existing">导入已有的公钥</string>
+  <string name="notification_permission_title">在后台保持连接</string>
+  <string name="notification_permission_message">ConnectBot 需要通知权限才能在您切换应用时保持连接的活跃状态。如果没有此权限，系统可能会断开您的连接以节省电池电量。</string>
+  <string name="grant_permission">允许</string>
+  <string name="connect_anyway">仍然连接</string>
+  <string name="notification_permission_denied_title">需要通知权限</string>
+  <string name="notification_permission_denied_message">为了让您的连接在后台保持活跃，请在系统设置中启用 ConnectBot 的通知功能。</string>
+  <string name="open_settings">打开设置</string>
+  <string name="notification_permission_denied_snackbar">连接可能会在没有通知的情况下中断</string>
+  <string name="notification_permission_console_warning">后台连接可能会中断</string>
+  <string name="terminal_no_route">您是否正在尝试访问本地主机？请授予本地网络权限。</string>
+  <string name="loading_message">正在加载……</string>
+  <string name="migration_checking">正在检查数据库……</string>
+  <string name="migration_title">数据库迁移</string>
+  <string name="migration_warning">请在迁移过程中不要关闭应用程序</string>
+  <string name="migration_stats_hosts">已迁移的主机数量：%d</string>
+  <string name="migration_stats_pubkeys">已迁移的 SSH 密钥：%d</string>
+  <string name="migration_stats_port_forwards">已迁移的端口转发： %d</string>
+  <string name="migration_stats_known_hosts">已迁移的已知主机：%d</string>
+  <string name="migration_failed_title">迁移失败</string>
+  <string name="migration_failed_message">数据库迁移过程中发生错误：%s</string>
+  <string name="migration_retry">重试</string>
+  <string name="migration_failed_help">如果问题仍然存在，请将上述调试日志复制到 %1$s 并提交问题报告</string>
+  <string name="migration_warnings_title">迁移注意事项</string>
+  <string name="migration_copy_warnings">复制警告信息</string>
+  <string name="migration_debug_log_title">调试日志</string>
+  <string name="migration_copy_debug_log">复制调试日志</string>
+  <string name="disconnect_host_alert">您确定要断开与“%1$s”的连接吗？</string>
+  <string name="delete_host_confirm">您确定要删除主机“%1$s”吗？</string>
+  <string name="forget_host_keys_confirm">您确定要删除已保存的 \'%1$s\' 的主机密钥吗？下次连接时，系统会提示您验证主机密钥。</string>
+  <string name="list_pubkey_edit">编辑公钥</string>
+  <string name="hostpref_ipversion_title">IP版本</string>
+  <string name="ipversion_auto">自动</string>
+  <string name="ipversion_ipv4">仅支持 IPv4</string>
+  <string name="ipversion_ipv6">仅支持 IPv6</string>
+  <string name="hostpref_jumphost_title">跳板主机（ProxyJump）</string>
+  <string name="hostpref_jumphost_summary">通过另一个 SSH 主机连接</string>
+  <string name="list_jumphost_none">无（直接连接）</string>
+  <string name="terminal_connecting_via_jump">通过跳板主机连接： %s</string>
+  <string name="terminal_jump_connected">已连接到跳板主机：%s</string>
+  <string name="terminal_jump_authenticated">已验证跳板主机：%s</string>
+  <string name="terminal_jump_failed">无法连接到跳板主机 %1$s：%2$s</string>
+  <string name="terminal_jump_auth_failed">跳转主机的身份验证失败：%s</string>
+  <string name="terminal_jump_not_found">未在已保存的主机列表中找到跳板主机</string>
+  <string name="terminal_jump_password">用于跳转主机的密码：%s：</string>
+  <string name="view_logs">查看日志</string>
+  <string name="logs_title">应用程序日志</string>
+  <string name="copy_logs">复制日志</string>
+  <string name="logs_copied">日志已复制到剪贴板</string>
+  <string name="logs_bug_report_info">如需报告错误，请复制这些日志，然后在 https://connectbot.org/bug 上提交新的问题</string>
+  <string name="no_logs_available">没有可用的日志</string>
+  <string name="help_section_about">关于</string>
+  <string name="title_contact">联系方式和技术支持</string>
+  <string name="help_section_contact">联系方式和技术支持</string>
+  <string name="help_website">网站</string>
+  <string name="help_github">源代码</string>
+  <string name="help_report_bug">报告一个错误</string>
+  <string name="help_section_donate">支持开发</string>
+  <string name="help_donate_github">GitHub 赞助</string>
+  <string name="help_donate_coffee">请我喝杯咖啡</string>
+  <string name="colorscheme_default_description">默认终端颜色</string>
+  <string name="colorscheme_solarized_dark_description">为机器和人为您提供精准色彩</string>
+  <string name="colorscheme_solarized_light_description">使用浅色背景的 Solarized 主题</string>
+  <string name="colorscheme_dracula_description">终端的深色主题</string>
+  <string name="colorscheme_nord_description">一种具有北极色彩的蓝白色调</string>
+  <string name="colorscheme_gruvbox_dark_description">复古风格配色方案</string>
+  <string name="colorscheme_monokai_description">灵感来源于 Sublime Text 的主题</string>
+  <string name="colorscheme_tomorrow_night_description">简洁舒适的深色主题</string>
+  <string name="pref_profiles_category">配置资料</string>
+  <string name="pref_default_profile_title">默认配置</string>
+  <string name="pref_default_profile_none">无（使用主机设置）</string>
+  <string name="pref_alwaysvisible_summary">始终显示常用按键</string>
+  <string name="pref_customterminal_title">自定义终端类型</string>
+  <string name="pref_customterminal_summary">为远程服务器添加自定义 TERM 值</string>
+  <string name="dialog_customterminal_title">添加自定义终端类型</string>
+  <string name="dialog_customterminal_hint">终端类型（例如：rxvt-unicode）</string>
+  <string name="dialog_custom_value_label">输入自定义值</string>
+  <string name="list_camera_ctrlaspace_description">按 Ctrl+A，然后按空格键</string>
+  <string name="list_camera_ctrla_description">Ctrl+A</string>
+  <string name="list_camera_esc_description">Esc</string>
+  <string name="list_camera_esc_a_description">Esc+A</string>
+  <string name="list_camera_none_description">无</string>
+  <string name="list_camera_text_input_description">文本输入</string>
+  <string name="list_menu_export_hosts">导出主机列表</string>
+  <string name="list_menu_import_hosts">导入主机</string>
+  <string name="export_hosts_success">已导出 %1$d 个主机和 %2$d 个配置</string>
+  <string name="import_hosts_success">已导入 %1$d 个主机（跳过 %2$d 个）和 %3$d 个配置（跳过 %4$d 个）</string>
+  <string name="export_hosts_failed">无法导出主机列表：%s</string>
+  <string name="import_hosts_failed">导入主机失败：%s</string>
+  <string name="shortcut_customize_title">自定义快捷方式</string>
+  <string name="shortcut_icon_color">图标颜色</string>
+  <string name="shortcut_icon_style">图标样式</string>
+  <string name="shortcut_use_host_color">使用主机颜色</string>
+  <string name="shortcut_create">创建快捷方式</string>
+  <string name="icon_style_terminal">终端</string>
+  <string name="icon_style_server">服务器</string>
+  <string name="icon_style_cloud">云</string>
+  <string name="icon_style_key">密钥</string>
+  <string name="pref_auth_on_launch_title">启动时进行身份验证</string>
+  <string name="pref_auth_on_launch_summary">打开应用时，需要指纹、面部识别或设备密码验证</string>
+  <string name="pref_security_category">安全性</string>
+  <string name="auth_screen_title">ConnectBot 已被锁定</string>
+  <string name="auth_screen_unlock_button">点击以解锁</string>
+  <string name="auth_prompt_title">解锁 ConnectBot</string>
+  <string name="auth_prompt_subtitle">请验证您的身份以继续</string>
+  <string name="pref_language_download" tools:machine_translated="true">下载语言包</string>
+  <string name="pref_language_download_failed" tools:machine_translated="true">下载失败，点击重试。</string>
+  <string name="portforward_host_address" tools:machine_translated="true">主机地址</string>
+  <string name="portforward_source_addr_localhost" tools:machine_translated="true">本地主机</string>
+  <string name="portforward_source_addr_localhost_ipv4" tools:machine_translated="true">本地主机（仅 IPv4）</string>
+  <string name="portforward_source_addr_localhost_ipv6" tools:machine_translated="true">本地主机（仅 IPv6）</string>
+  <string name="portforward_source_addr_all" tools:machine_translated="true">所有地址</string>
+  <string name="portforward_source_addr_all_ipv4" tools:machine_translated="true">所有 IPv4 地址</string>
+  <string name="portforward_source_addr_all_ipv6" tools:machine_translated="true">所有 IPv6 地址</string>
+  <string name="portforward_source_addr_specific" tools:machine_translated="true">特定地址</string>
+  <string name="portforward_source_addr_specific_placeholder" tools:machine_translated="true">192.168.1.1</string>
+  <string name="pubkey_import_from_clipboard" tools:machine_translated="true">从剪贴板导入</string>
+  <string name="pubkey_import_clipboard_key_label" tools:machine_translated="true">私钥内容</string>
+  <string name="pubkey_paste_from_clipboard" tools:machine_translated="true">从剪贴板粘贴</string>
+  <string name="auth_banner_title" tools:machine_translated="true">来自 %1$s 的身份验证消息。</string>
+  <string name="terminal_auth_banner_header" tools:machine_translated="true">[%1$s] 身份验证消息：</string>
+  <string name="pref_imetogglekey_title" tools:machine_translated="true">显示输入法切换键</string>
+  <string name="pref_imetogglekey_summary" tools:machine_translated="true">在特殊按键行中添加一个输入法引擎 (IME) 按钮，用于切换需要组合缓冲区的语言（如日语、中文、韩语等）的组合模式。</string>
+  <string name="pref_ime_shortcut_mode_title" tools:machine_translated="true">完整 IME 的 Ctrl/Alt 快捷键</string>
+  <string name="pref_ime_shortcut_mode_disabled" tools:machine_translated="true">没有解决方法。</string>
+  <string name="pref_ime_shortcut_mode_type_null" tools:machine_translated="true">原始按键事件</string>
+  <string name="pref_ime_shortcut_mode_force_ascii" tools:machine_translated="true">强制使用 ASCII 键盘（推荐）</string>
+  <string name="pref_swipe_sessions_title" tools:machine_translated="true">滑动切换会话。</string>
+  <string name="pref_swipe_sessions_summary" tools:machine_translated="true">启用水平滑动来切换终端会话。默认情况下已禁用，以提高可访问性。</string>
+  <string name="console_switch_session" tools:machine_translated="true">切换会话。</string>
+  <string name="console_previous_session" tools:machine_translated="true">上一会话</string>
+  <string name="console_next_session" tools:machine_translated="true">下一个会话。</string>
+  <string name="button_key_alt" tools:machine_translated="true">Alt</string>
+  <string name="image_description_toggle_alt_key" tools:machine_translated="true">切换 Alt 键。</string>
+  <string name="button_key_ime" tools:machine_translated="true">输入法</string>
+  <string name="image_description_toggle_compose_mode" tools:machine_translated="true">切换输入法编辑器的组合模式。</string>
+  <string name="console_menu_compose_mode" tools:machine_translated="true">输入法合成模式</string>
+  <string name="hostpref_profile_edit" tools:machine_translated="true">编辑所选资料。</string>
+  <string name="terminal_mosh_installing" tools:machine_translated="true">正在准备 Mosh 支持……</string>
+  <string name="terminal_mosh_starting" tools:machine_translated="true">正在启动 Mosh 连接……</string>
+  <string name="terminal_mosh_install_timeout" tools:machine_translated="true">警告：Mosh 安装超时。</string>
+  <string name="terminal_mosh_launching_server" tools:machine_translated="true">正在远程主机上启动 mosh 服务器……</string>
+  <string name="terminal_mosh_server_failed" tools:machine_translated="true">无法在远程主机上启动 mosh 服务器。</string>
+  <string name="terminal_mosh_client_failed" tools:machine_translated="true">mosh客户端启动失败。</string>
+  <string name="terminal_mosh_connected" tools:machine_translated="true">Mosh 连接已建立。</string>
+  <string name="terminal_mosh_error" tools:machine_translated="true">Mosh 出错：%1$s</string>
+  <string name="hostpref_mosh_server_title" tools:machine_translated="true">Mosh 服务器命令</string>
+  <string name="hostpref_mosh_server_summary" tools:machine_translated="true">自定义 `mosh-server` 的路径或命令（留空则使用默认设置）。</string>
+  <string name="hostpref_mosh_port_title" tools:machine_translated="true">Mosh UDP 端口</string>
+  <string name="hostpref_mosh_port_summary" tools:machine_translated="true">为 Mosh 设置固定的 UDP 端口（设置为 0 时，将自动选择 60000-61000 范围内的端口）。</string>
+  <string name="hostpref_locale_title" tools:machine_translated="true">区域设置。</string>
+  <string name="hostpref_locale_summary" tools:machine_translated="true">Mosh 会话的区域设置（例如，en_US.UTF-8）</string>
+  <string name="mosh_feature_title" tools:machine_translated="true">支持 Mosh 的动态功能模块。</string>
+  <string name="pref_mosh_release_title" tools:machine_translated="true">Mosh 版本及其源代码。</string>
+  <string name="pref_mosh_installing" tools:machine_translated="true">正在准备 Mosh 支持……</string>
+  <string name="editor_discard_changes_title" tools:machine_translated="true">放弃更改？</string>
+  <string name="editor_discard_changes_message" tools:machine_translated="true">如果您在未保存的情况下离开，您所做的修改将会丢失。</string>
+  <string name="editor_discard" tools:machine_translated="true">放弃（更改）</string>
+  <string name="editor_save" tools:machine_translated="true">保存</string>
+  <string name="import_json_file_too_large" tools:machine_translated="true">导入的 JSON 文件过大（最大限制为 8MB）。</string>
+  <string name="import_file_unavailable" tools:machine_translated="true">无法打开所选文件。</string>
+  <string name="profile_inline_images" tools:machine_translated="true">内联图像</string>
+  <string name="inline_images_off" tools:machine_translated="true">关闭。</string>
+  <string name="inline_images_ask" tools:machine_translated="true">询问。</string>
+  <string name="inline_images_on" tools:machine_translated="true">开启。</string>
+  <string name="inline_images_prompt_title" tools:machine_translated="true">显示内联图片吗？</string>
+  <string name="inline_images_prompt_message" tools:machine_translated="true">是否允许此主机在此会话期间显示内联图像？</string>
+  <string name="automation_load_failed" tools:machine_translated="true">无法加载自动化程序。</string>
+  <string name="automation_save_failed" tools:machine_translated="true">无法保存自动化配置。</string>
+  <string name="automation_invalid_action" tools:machine_translated="true">请检查文本、模式、持续时间或所选的端口转发设置。</string>
+  <string name="automation_action_failed" tools:machine_translated="true">操作失败。</string>
+  <string name="automation_timed_out" tools:machine_translated="true">等待文本超时。</string>
+  <string name="automation_buffer_overflow" tools:machine_translated="true">在自动化程序处理之前，已经产生了过多的输出。</string>
+  <string name="automation_no_session" tools:machine_translated="true">此操作需要一个已打开的终端会话。</string>
+  <string name="automation_forward_missing" tools:machine_translated="true">端口转发配置丢失。</string>
+  <string name="automation_forward_unsupported" tools:machine_translated="true">此连接不支持端口转发。</string>
+  <string name="automation_wait_text" tools:machine_translated="true">等待字符串。</string>
+  <string name="automation_send_text" tools:machine_translated="true">发送字符串。</string>
+  <string name="automation_send_key" tools:machine_translated="true">发送特殊按键。</string>
+  <string name="automation_delay" tools:machine_translated="true">等待。</string>
+  <string name="automation_disconnect" tools:machine_translated="true">断开连接。</string>
+  <string name="automation_enable_forward" tools:machine_translated="true">启用端口转发。</string>
+  <string name="automation_disable_forward" tools:machine_translated="true">禁用端口转发。</string>
+  <string name="automation_add" tools:machine_translated="true">添加操作。</string>
+  <string name="automation_save" tools:machine_translated="true">保存</string>
+  <string name="automation_edit" tools:machine_translated="true">编辑</string>
+  <string name="automation_delete" tools:machine_translated="true">删除</string>
+  <string name="automation_move_up" tools:machine_translated="true">向上移动。</string>
+  <string name="automation_move_down" tools:machine_translated="true">向下移动。</string>
+  <string name="automation_drag" tools:machine_translated="true">拖动以重新排序。</string>
+  <string name="automation_cancel" tools:machine_translated="true">取消。</string>
+  <string name="automation_text" tools:machine_translated="true">文本</string>
+  <string name="automation_regex" tools:machine_translated="true">正则表达式</string>
+  <string name="automation_regex_help" tools:machine_translated="true">匹配传入的文本，不进行 ANSI 格式化。正则表达式支持 RE2 语法；不支持环视和反向引用。</string>
+  <string name="automation_duration" tools:machine_translated="true">持续时间（秒）</string>
+  <string name="automation_timeout" tools:machine_translated="true">超时时间（秒）</string>
+  <string name="automation_key" tools:machine_translated="true">键。</string>
+  <string name="automation_forward" tools:machine_translated="true">端口转发。</string>
+  <string name="automation_failure" tools:machine_translated="true">发生错误时</string>
+  <string name="automation_stop" tools:machine_translated="true">停止自动化。</string>
+  <string name="automation_continue" tools:machine_translated="true">继续。</string>
+  <string name="automation_save_host" tools:machine_translated="true">保存主机以配置自动化。</string>
+  <string name="automation_progress" tools:machine_translated="true">自动化：当前步骤：%1$d，总步骤：%2$d。</string>
+  <string name="automation_failure_step" tools:machine_translated="true">操作步骤：%1$d： %2$s</string>
+  <string name="automation_cancel_run" tools:machine_translated="true">取消自动化操作。</string>
+  <string name="automation_key_enter" tools:machine_translated="true">输入</string>
+  <string name="automation_key_tab" tools:machine_translated="true">选项卡</string>
+  <string name="automation_key_escape" tools:machine_translated="true">退出</string>
+  <string name="automation_key_backspace" tools:machine_translated="true">退格键</string>
+  <string name="automation_key_delete" tools:machine_translated="true">删除</string>
+  <string name="automation_key_up" tools:machine_translated="true">向上箭头。</string>
+  <string name="automation_key_down" tools:machine_translated="true">向下箭头。</string>
+  <string name="automation_key_left" tools:machine_translated="true">向左箭头。</string>
+  <string name="automation_key_right" tools:machine_translated="true">右箭头。</string>
+  <string name="automation_key_home" tools:machine_translated="true">主页</string>
+  <string name="automation_key_end" tools:machine_translated="true">结束。</string>
+  <string name="automation_key_insert" tools:machine_translated="true">插入</string>
+  <string name="automation_key_page_up" tools:machine_translated="true">翻页（向上）</string>
+  <string name="automation_key_page_down" tools:machine_translated="true">向下翻页</string>
+  <string name="automation_key_function" tools:machine_translated="true">F%1$s</string>
+  <string name="automation_key_shift" tools:machine_translated="true">Shift（切换）</string>
+  <string name="automation_seconds" tools:machine_translated="true">%.3f 秒</string>
+  <plurals name="automation_count" tools:machine_translated="true">
+    <item quantity="one">%1$d 个操作</item>
+    <item quantity="other">共 %1$d 个操作。</item>
+  </plurals>
+</resources>

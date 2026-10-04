@@ -1,0 +1,21 @@
+name: Continuous Integration (tags)
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+concurrency:
+  group: ci-main-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  ci:
+    name: CI
+    uses: ./.github/workflows/ci-build.yml
+    permissions:
+      contents: write
+      pull-requests: write
+    with:
+      is_push: true
+    secrets: inherit

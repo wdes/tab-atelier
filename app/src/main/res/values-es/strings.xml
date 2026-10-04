@@ -1,0 +1,655 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<resources xmlns:tools="http://schemas.android.com/tools">
+  <string name="app_desc">Cliente de SSH sencillo, potente y de código abierto.</string>
+  <string name="service_desc">Mantiene las conexiones SSH y las claves públicas cargadas</string>
+  <string name="app_copyright">Derechos de autor © Kenny Root</string>
+  <string name="title_pubkey_list">Claves Publicas</string>
+  <string name="title_port_forwards_list">Traducciones de puerto</string>
+  <string name="title_help">Ayuda</string>
+  <string name="title_eula">Licencia</string>
+  <string name="title_color_picker">Escoger un color</string>
+  <string name="title_settings">Ajustes</string>
+  <string name="title_pubkey_generate">Generar</string>
+  <string name="terms_and_conditions">Términos y condiciones</string>
+  <string name="hints">Sugerencias</string>
+  <string name="keyboard_shortcuts">Atajos de teclado</string>
+  <string name="increase_font_size">Aumentar el tamaño de letra</string>
+  <string name="increase_font_shortcut">Ctrl +</string>
+  <string name="decrease_font_size">Disminuir el tamaño de letra</string>
+  <string name="decrease_font_shortcut">Ctrl -</string>
+  <string name="paste_shortcut">Ctrl + Shift + V</string>
+  <string name="pubkey_generate">Generar</string>
+  <string name="pubkey_delete">Eliminar clave</string>
+  <string name="pubkey_gather_entropy">Haciendo acopio de entropía</string>
+  <string name="pubkey_touch_prompt">Toque esta caja para conseguir aleatoriedad: %1$d%% hecho</string>
+  <string name="pubkey_touch_hint">Para poder conseguir aleatoriedad durante la generacion de la clave, mueva su dedo aleatoriamente sobre la caja a continuación.</string>
+  <string name="pubkey_generating">Generar llavero de claves…</string>
+  <string name="pubkey_copy_private">Copiar clave privada</string>
+  <string name="pubkey_copy_private_openssh">Copia clave privada (OpenSSH)</string>
+  <string name="pubkey_copy_private_pem">Copia clave privada (PEM)</string>
+  <string name="pubkey_copy_private_encrypted">Copia clave privada (cifrada)</string>
+  <string name="pubkey_copy_public">Copiar clave pública</string>
+  <string name="pubkey_export_public">Exportar clave pública</string>
+  <string name="pubkey_export_private">Exportar clave privada</string>
+  <string name="pubkey_export_private_openssh">Exportar clave privada (OpenSSH)</string>
+  <string name="pubkey_export_private_pem">Exportar clave privada (PEM)</string>
+  <string name="pubkey_export_private_encrypted">Exportar clave privada (cifrada)</string>
+  <string name="pubkey_export_set_passphrase">Establecer frase de contraseña de exportación</string>
+  <string name="pubkey_export_passphrase_message">Introduce una frase de contraseña para cifrar la clave exportada</string>
+  <string name="pubkey_export_confirm_passphrase">Confirma la frase de acceso</string>
+  <string name="pubkey_export_passphrase_mismatch">Las frases de contraseña no coinciden</string>
+  <string name="pubkey_import_encrypted_title">Importar clave cifrada</string>
+  <string name="pubkey_import_encrypted_message">Introduzca la contraseña para descifrar la clave \'%1$s\' (%2$s)</string>
+  <string name="pubkey_import_button">Importar</string>
+  <string name="pubkey_import_encrypt_key">Cifra la clave para su almacenamiento</string>
+  <string name="pubkey_import_reuse_password">Utilice la misma contraseña para el cifrado</string>
+  <string name="pubkey_import_new_password">Nueva contraseña</string>
+  <string name="pubkey_import_confirm_password">Confirme la contraseña</string>
+  <string name="pubkey_change_password">Cambiar contraseña</string>
+  <string name="pubkey_unlock">Desbloquear clave</string>
+  <string name="pubkey_unlock_message">Introduce la contraseña para desbloquear la clave \'%1$s\'</string>
+  <string name="pubkey_nickname_exists">Una clave con este apodo ya existe</string>
+  <string name="pubkey_load_on_start">Cargar clave al inicio</string>
+  <string name="pubkey_confirm_use">Confirme antes de usar</string>
+  <string name="portforward_edit">Editar redireccionamiento de puerto</string>
+  <string name="portforward_delete">Eliminar redireccionamiento de puerto</string>
+  <string name="prompt_nickname">Nombre:</string>
+  <string name="prompt_source_port">Puerto fuente:</string>
+  <string name="prompt_destination">Destino:</string>
+  <string name="prompt_old_password">Contraseña antigua:</string>
+  <string name="prompt_username">Nombre de usuario:</string>
+  <string name="prompt_password">Contraseña:</string>
+  <string name="prompt_again">(de nuevo)</string>
+  <string name="prompt_type">Tipo:</string>
+  <string name="prompt_password_can_be_blank">Nota: la contraseña puede ser dejada en blanco</string>
+  <string name="prompt_bits">Bits:</string>
+  <string name="prompt_pubkey_password">Contraseña para clave \'%1$s\'</string>
+  <string name="prompt_allow_agent_to_use_key">¿Autorizar maquina remota\nde usar clave \'%1$s\'?</string>
+  <string name="host_verification_failure_warning_header">ATENCIÓN: ¡LA IDENTIFICACIÓN DE LA MAQUINA REMOTA HA CAMBIADO!</string>
+  <string name="host_verification_failure_warning">¡ES POSIBLE QUE ALGUIEN ESTE HACIENDO ALGO INAPROPIADO!\n¡Alguien puede estar interviniendo en estos momentos (ataque de intermediario)!\nTambién es posible que la clave haya sido cambiada.</string>
+  <string name="prompt_continue_connecting">¿Esta seguro de que desea\nseguir conectándose?</string>
+  <string name="host_authenticity_warning">La autenticidad de la máquina \'%1$s\' no puede ser establecida.</string>
+  <string name="host_fingerprint">La clave huella de la maquina %1$s es %2$s</string>
+  <string name="host_key_verification_title">Verificación de clave del host</string>
+  <string name="fingerprint_format_header">Formato de huella digital</string>
+  <string name="host_key_type_and_size">%1$s %2$d bits se traduce como \n%1$s %2$d bits</string>
+  <string name="fingerprint_copy_description">Copiar huella digital al portapapeles</string>
+  <string name="alert_passwords_do_not_match_msg">¡Las contraseñas no coinciden!</string>
+  <string name="alert_wrong_password_msg">¡Contraseña errónea!</string>
+  <string name="button_resize">Redimensionar</string>
+  <string name="alert_disconnect_msg">Conexión perdida</string>
+  <string name="network_lost_grace_period">Red de conexión perdida esperando para reconectar…</string>
+  <string name="network_grace_period_expired">Red de no restaurada desconectando…</string>
+  <string name="network_restored_same_ip">Red de restaurada, conexión mantenida</string>
+  <string name="network_restored_ip_changed">Red de restaurada pero la dirección IP cambio reconectando…</string>
+  <string name="network_restored_no_previous_state">Red de restaurada verificando conexión…</string>
+  <string name="pref_emulation_category">Emulación del terminal</string>
+  <string name="pref_emulation_title">Modo emulación</string>
+  <string name="pref_scrollback_title">Tamaño de navegación</string>
+  <string name="pref_scrollback_summary">Tamaño de búfer que quedara en memoria para cada consola.</string>
+  <string name="pref_fontfamily_title">Fuente</string>
+  <string name="pref_customfont_title">Agregar fuente personalizada</string>
+  <string name="pref_customfont_summary">Agregar una fuente de Google Fonts por nombre</string>
+  <string name="dialog_customfont_title">Agregar fuente personalizada</string>
+  <string name="dialog_customfont_hint">Nombre de fuente de Google (por ejemplo, Código Cascadia)</string>
+  <string name="button_add">Agregar</string>
+  <string name="button_remove">Eliminar</string>
+  <string name="font_validating">Validando fuente…</string>
+  <string name="font_downloading">Descargando la fuente…</string>
+  <string name="pref_localfont_title">Importar fuente local</string>
+  <string name="pref_localfont_summary">Importa un archivo de fuente desde almacenamiento TTF OTF</string>
+  <string name="dialog_localfont_title">Importar Fuente</string>
+  <string name="dialog_localfont_hint">Nombre de visualización para la fuente</string>
+  <string name="button_import">Importar</string>
+  <string name="font_importing">Importando fuente…</string>
+  <string name="pref_backupkeys_title">Copia de seguridad de claves públicas</string>
+  <string name="pref_backupkeys_summary">Mantener copias de seguridad de las claves privadas usando el mecanismo de Android</string>
+  <string name="pref_ui_category">Interfaz de usuario</string>
+  <string name="pref_language_title">Idioma</string>
+  <string name="pref_language_system_default">Configuración predeterminada del sistema</string>
+  <string name="pref_theme_title">Tema</string>
+  <string name="pref_theme_system">Configuración predeterminada del sistema</string>
+  <string name="pref_theme_light">Ligero</string>
+  <string name="pref_theme_dark">Oscuro</string>
+  <string name="pref_titlebarhide_title">Ocultar automáticamente la barra de título</string>
+  <string name="pref_titlebarhide_summary">Tocar la pantalla para que se muestre la barra de título y el menú de acceso</string>
+  <string name="pref_alwaysvisible_title">Teclas especiales siempre visibles</string>
+  <string name="pref_pg_updn_gesture_title">gesto de página arriba/abajo</string>
+  <string name="pref_pg_updn_gesture_summary">Desliza en el tercio izquierdo de la pantalla para enviar página arriba/abajo en la terminal</string>
+  <string name="pref_fullscreen_title">Pantalla completa</string>
+  <string name="pref_fullscreen_summary">Esconder barra de estatus cuando este en consola</string>
+  <string name="pref_keyboard_category">Teclado</string>
+  <string name="pref_shiftfkeys_title">Mayús+num son las teclas de función F1 a F10</string>
+  <string name="pref_shiftfkeys_summary">En teclados hardware, las teclas de los números + la tecla Mayús son las teclas de función F1 a F10</string>
+  <string name="pref_ctrlfkeys_title">Ctrl+num son las teclas de función F1 a F10</string>
+  <string name="pref_ctrlfkeys_summary">En teclados hardware, las teclas de los números + la tecla Ctrl son las teclas de función F1 a F10</string>
+  <string name="pref_volumefont_title">Las teclas de volumen cambian el tamaño de letra</string>
+  <string name="pref_volumefont_summary">El tamaño de letra puede cambiarse en la configuración de la conexión al host</string>
+  <string name="pref_memkeys_title">Recordar claves en memoria</string>
+  <string name="pref_memkeys_summary">Recordar claves en memoria hasta que el servicio en segundo plano termine</string>
+  <string name="pref_conn_persist_title">Manténgase conectado en segundo plano</string>
+  <string name="pref_conn_persist_summary">Mantén tus sesiones abiertas incluso cuando cambies a otras aplicaciones</string>
+  <string name="pref_keymode_title">Secuencia de teclas para directorios</string>
+  <string name="pref_stickymodifiers_title">Corrección de errores al teclear</string>
+  <string name="only_alt">Detener solamente</string>
+  <string name="pref_camera_title">Boton de la Cámara</string>
+  <string name="pref_keepalive_title">Mantener pantalla activa</string>
+  <string name="pref_keepalive_summary">Prevenir que se apague la pantalla cuando se este trabajando en consola</string>
+  <string name="pref_wifilock_title">Mantener la red inálambrica activa</string>
+  <string name="pref_wifilock_summary">Prevenir que la red inálambrica se apague mientras haya una conexión activa</string>
+  <string name="pref_bumpyarrows_title">Cursor con vibración</string>
+  <string name="pref_bumpyarrows_summary">Vibrar cuando esté enviando teclas de flecha; útil para conexiones con retraso</string>
+  <string name="pref_bell_category">Timbre del terminal</string>
+  <string name="pref_bell_title">Timbre audible</string>
+  <string name="pref_bell_summary">Reproducir sonido en alerta de terminal</string>
+  <string name="pref_bell_volume_title">Volúmen del timbre</string>
+  <string name="pref_bell_vibrate_title">Vibrar con el timbre</string>
+  <string name="pref_bell_vibrate_summary">Vibrar al recibir una alerta en la terminal</string>
+  <string name="pref_bell_notification_title">Notificaciones de fondo</string>
+  <string name="pref_bell_notification_summary">Activar notificacion cuando algun terminal corriendo en el fondo active un timbre.</string>
+  <string name="list_keymode_right">Usar teclas del lado derecho</string>
+  <string name="list_keymode_left">Usar teclas del lado izquierdo</string>
+  <string name="list_keymode_none">Desactivar</string>
+  <string name="list_pubkeyids_none">No usar teclas</string>
+  <string name="list_pubkeyids_any">Utilizar cualquier clave desbloqueada</string>
+  <string name="hostpref_nickname_title">Nombre</string>
+  <string name="hostpref_color_title">Categoria de colores</string>
+  <string name="color_red">Rojo</string>
+  <string name="color_pink">Rosa</string>
+  <string name="color_purple">Púrpura</string>
+  <string name="color_deep_purple">Púrpura profunda</string>
+  <string name="color_indigo">Índigo</string>
+  <string name="color_blue">Azul</string>
+  <string name="color_light_blue">Azul Claro</string>
+  <string name="color_cyan">Cian</string>
+  <string name="color_teal">Verde azulado</string>
+  <string name="color_green">Verde</string>
+  <string name="color_light_green">Verde Claro</string>
+  <string name="color_lime">Cal</string>
+  <string name="color_yellow">Amarillo</string>
+  <string name="color_amber">Ámbar</string>
+  <string name="color_orange">Naranja</string>
+  <string name="color_gray">Gris</string>
+  <string name="hostpref_fontsize_title">Tamaño de la fuente (pt)</string>
+  <string name="hostpref_fontfamily_title">Fuente</string>
+  <string name="hostpref_colorscheme_title">Esquema de colores del terminal</string>
+  <string name="hostpref_pubkeyid_title">Usar clave de autenticación pública</string>
+  <string name="hostpref_authagent_title">Utilizar agente de autenticación SSH</string>
+  <string name="hostpref_postlogin_title">Inicio de sesión después de la automatización</string>
+  <string name="hostpref_compression_title">Compresión</string>
+  <string name="hostpref_compression_summary">Esto puede ayudar con las redes más lentas</string>
+  <string name="hostpref_wantsession_title">Inciar sesión en shell</string>
+  <string name="hostpref_wantsession_summary">Desactive esta preferencia para usar sólo reenvíos por puerto</string>
+  <string name="hostpref_stayconnected_title">Mantenerse conectado</string>
+  <string name="hostpref_stayconnected_summary">Intentar reconectar al equipo si se desconecta</string>
+  <string name="hostpref_quickdisconnect_title">Cerrar al desconectar</string>
+  <string name="hostpref_quickdisconnect_summary">Cerrar inmediatamente tras la desconexión remota sin confirmación</string>
+  <string name="hostpref_delkey_title">Tecla DEL</string>
+  <string name="hostpref_encoding_title">Codificando</string>
+  <string name="hostpref_username_title">Nombre de usuario</string>
+  <string name="hostpref_save_password_summary">Almacene de forma segura la contraseña de inicio de sesión para la autenticación automática</string>
+  <string name="hostpref_password_title">Contraseña</string>
+  <string name="hostpref_password_unchanged">Contraseña (sin cambios)</string>
+  <string name="hostpref_clear_password">Borrar la contraseña guardada</string>
+  <string name="hostpref_hostname_title">Host (equipo anfitrión)</string>
+  <string name="hostpref_port_title">Puerto</string>
+  <string name="hostpref_profile_title">Perfil</string>
+  <string name="hostpref_profile_summary">Selecciona un perfil para usar sus configuraciones de terminal</string>
+  <string name="hostpref_profile_none">Ninguno (usar configuración del host)</string>
+  <string name="profile_controlled_setting">Controlado por perfil</string>
+  <string name="font_use_default">Usar predeterminado</string>
+  <string name="font_system_default">Predeterminado (Monospacio)</string>
+  <string name="pubkey_unknown">Clave desconocida</string>
+  <string name="colorscheme_default">Predeterminado</string>
+  <string name="profile_editor_title_new">Nuevo Perfil</string>
+  <string name="profile_editor_title_edit">Editar Perfil</string>
+  <string name="profile_editor_save">Guardar</string>
+  <string name="profile_editor_name_label">Nombre de perfil</string>
+  <string name="profile_editor_section_icon_color">Color del icono</string>
+  <string name="profile_editor_section_color_scheme">Esquema de colores</string>
+  <string name="profile_editor_section_font">Fuente</string>
+  <string name="profile_editor_section_terminal">Terminal</string>
+  <string name="profile_editor_font_family_title">Familia de fuentes</string>
+  <string name="profile_editor_font_size_title">Tamaño de fuente %d</string>
+  <string name="profile_editor_force_size_title">Tamaño forzado</string>
+  <string name="profile_editor_force_size_summary">Fuerza al terminal a tener un tamaño específico (columnas x filas) en lugar de ajustarse automáticamente al tamaño de la pantalla.</string>
+  <string name="profile_editor_force_size_enable">Habilitar tamaño forzado</string>
+  <string name="profile_editor_force_size_columns">Columnas</string>
+  <string name="profile_editor_force_size_rows">Filas</string>
+  <string name="profile_icon_color_none">Ninguno (usar el color del host)</string>
+  <string name="profile_list_title">Perfiles</string>
+  <string name="profile_list_create_profile">Crear perfil</string>
+  <string name="profile_list_empty_message">Todavía no hay perfiles. Pulsa + para crear uno.</string>
+  <string name="profile_list_more_options">Más opciones</string>
+  <string name="profile_list_duplicate">Duplicar</string>
+  <string name="profile_list_delete">Eliminar</string>
+  <string name="profile_create_dialog_title">Crear Perfil</string>
+  <string name="profile_create_name_label">Nombre de perfil</string>
+  <string name="profile_create_button">Crear</string>
+  <string name="profile_create_cancel">Cancelar</string>
+  <string name="profile_delete_dialog_title">Eliminar Perfil</string>
+  <string name="profile_delete_dialog_message">¿Estás seguro de que deseas eliminar \'%s\'?</string>
+  <string name="profile_delete_button">Eliminar</string>
+  <string name="profile_delete_cancel">Cancelar</string>
+  <string name="profile_summary_font">Fuente %1$s %2$dpt</string>
+  <string name="profile_summary_emulation">Emulación: %s</string>
+  <string name="console_menu_reconnect">Volver a conectar</string>
+  <string name="console_menu_close">Cerrar</string>
+  <string name="console_menu_paste">Pegar</string>
+  <string name="console_menu_portforwards">Traducciones de puerto</string>
+  <string name="console_menu_resize">Forzar un tamaño</string>
+  <string name="console_menu_urlscan">Escaneo de direcciones</string>
+  <string name="console_url_no_handler">No hay ninguna aplicación disponible para abrir esta URL</string>
+  <string name="console_url_not_supported">Este tipo de URL no es compatible</string>
+  <string name="button_yes">Sí</string>
+  <string name="button_no">Denegar</string>
+  <string name="portforward_local">Local</string>
+  <string name="portforward_remote">Remoto</string>
+  <string name="portforward_dynamic">Dinámicos (SOCKS)</string>
+  <string name="portforward_pos">Crear reenvio de puerto</string>
+  <string name="portforward_save">Guardar</string>
+  <string name="format_username">Usuario</string>
+  <string name="format_hostname">nombre del host</string>
+  <string name="format_port">puerto</string>
+  <string name="list_menu_pubkeys">Administrar clave públicas</string>
+  <string name="list_menu_sortcolor">Ordenar por color</string>
+  <string name="list_menu_sortname">Ordenar por nombre</string>
+  <string name="list_menu_disconnect">Desconectar todo</string>
+  <string name="list_menu_settings">Configuración</string>
+  <string name="list_host_disconnect">Desconectar</string>
+  <string name="list_host_edit">Editar equipo</string>
+  <string name="list_host_portforwards">Editar redirección de puertos</string>
+  <string name="list_host_delete">Eliminar equipo</string>
+  <string name="list_host_duplicate">Host duplicado</string>
+  <string name="list_host_forget_keys">Olvidar las claves de host</string>
+  <string name="list_camera_ctrlaspace">Ctrl+A después espacio</string>
+  <string name="list_camera_ctrla">Ctrl+A</string>
+  <string name="list_camera_esc">Esc</string>
+  <string name="list_camera_esc_a">Esc+A</string>
+  <string name="list_camera_none">Ninguno</string>
+  <string name="list_camera_text_input">Entrada de texto</string>
+  <string name="delete_message">¿Está seguro de que quiere eliminar \'%1$s\'?</string>
+  <string name="delete_pos">Sí, eliminar</string>
+  <string name="delete_neg">Cancelar</string>
+  <string name="disconnect_all_message">¿Está seguro de que quiere desconectarse de todos los equipos host?</string>
+  <string name="disconnect_all_pos">Sí, desconectar</string>
+  <string name="disconnect_all_neg">Cancelar</string>
+  <string name="terminal_connecting">Conectando a %1$s:%2$d via %3$s</string>
+  <string name="terminal_sucess">Host (equipo anfitrion) \'%1$s\' clave: %2$s verifiado.</string>
+  <string name="terminal_failed">Verificación del host (equipo anfitrion) fallida</string>
+  <string name="terminal_using_s2c_algorithm">Algoritmo servidor-cliente: %1$s %2$s</string>
+  <string name="terminal_using_c2s_algorithm">Algoritmo cliente-servidor: %1$s %2$s</string>
+  <string name="terminal_using_algorithm">Algoritmo que se esta usando: %1$s %2$s</string>
+  <string name="terminal_kex_algorithm">Algoritmo de intercambio de claves: %s</string>
+  <string name="terminal_auth">Intentando autenticar</string>
+  <string name="terminal_auth_pass">Intentando autenticación de la contraseña</string>
+  <string name="terminal_auth_pass_fail">Método de autenticación \'password\' fallido</string>
+  <string name="terminal_auth_saved_password">Intentando usar la contraseña guardada…</string>
+  <string name="terminal_auth_saved_password_fail">La autenticación con la contraseña guardada falló</string>
+  <string name="terminal_auth_pubkey_any">Intentando autenticacion de la clave pública usando las claves públicas en memoria</string>
+  <string name="terminal_auth_pubkey_invalid">La clave pública selecciona es invalida, intenta reseleccional la clave en el editor de host (equipo anfitrion)</string>
+  <string name="terminal_auth_pubkey_specific">Intentar autenticación de la clave pública con una clave pública determinada</string>
+  <string name="terminal_auth_biometric">Solicitando autenticación biométrica para la clave \'%1$s\'</string>
+  <string name="terminal_auth_biometric_invalidated">La clave biométrica \'%1$s\' ha sido invalidada. Esto puede ocurrir cuando se registran nuevas huellas dactilares en el dispositivo. Por favor, genere una nueva clave.</string>
+  <string name="terminal_auth_pubkey_fail">El método de autenticación \'publickey\' con clave \'%1$s\' ha fallado.</string>
+  <string name="terminal_auth_ki">Intentando autenticación \'interactiva por teclado\'</string>
+  <string name="terminal_auth_ki_fail">El método de autenticación \'interactiva por teclado\' ha fallado</string>
+  <string name="terminal_auth_fail">[Su equipo no soporta el método de autenticación por \'contraseña\' o por \'interacción por teclado\'.]</string>
+  <string name="terminal_no_session">La sesión no se iniciará debido a las preferencias del equipo.</string>
+  <string name="terminal_enable_portfoward">Activar redirección de puerto: %1$s</string>
+  <string name="local_shell_unavailable">¡Fallo! Su intérprete de órdenes local no está disponible en este teléfono.</string>
+  <string name="notification_text">%1$s requiere de tu atención.</string>
+  <string name="no">Denegar</string>
+  <string name="yes">Sí</string>
+  <string name="title_scheme_manager">Administrar esquemas de color</string>
+  <string name="button_new_scheme">Nuevo Esquema</string>
+  <string name="button_duplicate_scheme">Duplicado</string>
+  <string name="button_delete_scheme">Eliminar</string>
+  <string name="dialog_title_new_scheme">Nuevo Esquema de Colores</string>
+  <string name="label_scheme_name">Nombre del esquema</string>
+  <string name="label_scheme_description">Descripción opcional</string>
+  <string name="dialog_title_delete_scheme">¿Eliminar esquema?</string>
+  <string name="dialog_message_delete_scheme">¿Estás seguro de que deseas eliminar \"%1$s\"? Esta acción no se puede deshacer.</string>
+  <string name="button_confirm">Confirmar</string>
+  <string name="button_cancel">Cancelar</string>
+  <string name="label_built_in_scheme">Incorporado</string>
+  <string name="label_custom_scheme">Personalizado</string>
+  <string name="empty_custom_schemes">No esquemas personalizados \"Pulsa Nuevo\" esquema para crear uno.</string>
+  <string name="button_export_scheme">Esquema de exportación</string>
+  <string name="button_import_scheme">Esquema de importación</string>
+  <string name="message_export_success">Exportado %1$s</string>
+  <string name="message_import_success">Importado %1$s</string>
+  <string name="error_export_failed">No se pudo exportar el esquema %1$s</string>
+  <string name="error_import_failed">No se pudo importar el esquema %1$s</string>
+  <string name="error_invalid_json">Archivo JSON no válido</string>
+  <string name="title_palette_editor">Editar Paleta de Colores</string>
+  <string name="button_reset_all_colors">Reiniciar todo</string>
+  <string name="section_ansi_colors">Colores ANSI (0–15)</string>
+  <string name="dialog_title_edit_color">Editar color %1$d</string>
+  <string name="dialog_title_reset_all">¿Reiniciar todos los colores?</string>
+  <string name="dialog_message_reset_all">Esto restablecerá los 256 colores a sus valores predeterminados. Esta acción no se puede deshacer.</string>
+  <string name="app_is_running">ConnectBot está ejecutándose</string>
+  <string name="label_red">Rojo</string>
+  <string name="label_green">Verde</string>
+  <string name="label_blue">Azul</string>
+  <string name="label_hex_color">Color Hexadecimal</string>
+  <string name="section_fg_bg_colors">Primer plano y segundo</string>
+  <string name="label_foreground_color">Primer plano</string>
+  <string name="label_background_color">Fondo</string>
+  <string name="label_base_scheme">Esquema básico:</string>
+  <string name="menu_manage_colors">Administrar esquemas de colores</string>
+  <string name="section_color_preview">Vista previa</string>
+  <string name="image_description_connected">Conectado</string>
+  <string name="image_description_disconnected">Desconectado.</string>
+  <string name="image_description_toggle_control_character">Activar el envío de la pulsación de tecla Control.</string>
+  <string name="image_description_send_escape_character">Enviar una pulsación de la tecla Escape.</string>
+  <string name="image_description_send_tab_character">Enviar una pulsación de la tecla TAB (Tabulador).</string>
+  <string name="image_description_hide_keyboard">Esconder teclado</string>
+  <string name="image_description_show_keyboard">Mostrar teclado.</string>
+  <string name="image_description_up">Tecla cursor arriba</string>
+  <string name="image_description_down">Tecla cursor abajo</string>
+  <string name="image_description_left">Tecla cursor a la izquierda</string>
+  <string name="image_description_right">Tecla cursor a la derecha</string>
+  <string name="button_key_esc">Escape</string>
+  <string name="button_key_ctrl">Ctrl</string>
+  <string name="button_key_home">Inicio</string>
+  <string name="button_key_end">Fin</string>
+  <string name="button_key_pgup">Re Pág</string>
+  <string name="button_key_pgdn">Av Pág</string>
+  <string name="button_key_f1">F1</string>
+  <string name="button_key_f2">F2</string>
+  <string name="button_key_f3">F3</string>
+  <string name="button_key_f4">F4</string>
+  <string name="button_key_f5">F5</string>
+  <string name="button_key_f6">F6</string>
+  <string name="button_key_f7">F7</string>
+  <string name="button_key_f8">F8</string>
+  <string name="button_key_f9">F9</string>
+  <string name="button_key_f10">F10</string>
+  <string name="button_key_f11">F11</string>
+  <string name="button_key_f12">F12</string>
+  <string name="terminal_keyboard_text_input_button">Entrada de texto</string>
+  <string name="terminal_text_input_dialog_title">Entrada de texto</string>
+  <string name="terminal_text_input_dialog_label">Introduzca texto para enviar a la terminal</string>
+  <string name="terminal_text_input_resize_handle">Cambiar tamaño</string>
+  <string name="console_menu_text_input">Entrada de texto</string>
+  <string name="button_send">Enviar</string>
+  <string name="button_ok">De acuerdo</string>
+  <string name="button_close">Cerrar</string>
+  <string name="button_back">Atrás</string>
+  <string name="button_navigate_up">Navegar hacia arriba</string>
+  <string name="button_more_options">Más opciones</string>
+  <string name="button_host_options">Opciones de host</string>
+  <string name="button_collapse">Colapsar</string>
+  <string name="error_key_load_failed">No se pudo cargar la clave \'%1$s\': %2$s</string>
+  <string name="error_connection_failed">No se pudo conectar a %1$s (%2$s): %3$s</string>
+  <string name="error_port_forward_load_failed">No se pudo cargar las reenviaciones de puertos para %1$s %2$s</string>
+  <string name="error_host_save_failed">No se pudo guardar el host %1$s %2$s</string>
+  <string name="error_color_scheme_load_failed">No se pudo cargar el esquema de colores %s</string>
+  <string name="host_duplicate_nickname">%1$s (copia)</string>
+  <string name="empty_hosts_message">Ningún host configurado</string>
+  <string name="empty_pubkeys_message">No se encontraron claves</string>
+  <string name="empty_port_forwards_message">Ningún puerto reenviado configurado</string>
+  <string name="empty_urls_message">No se encontraron URL en el búfer del terminal</string>
+  <string name="console_default_title">Consola</string>
+  <string name="host_editor_show_advanced">Mostrar opciones avanzadas</string>
+  <string name="host_editor_hide_advanced">Ocultar opciones avanzadas</string>
+  <string name="resize_width_label">Anchura columnas</string>
+  <string name="resize_height_label">Altura filas</string>
+  <string name="resize_disable_force_size">Desactivar el ajuste forzado del tamaño</string>
+  <string name="pubkey_editor_key_type_label">Tipo de clave</string>
+  <string name="pubkey_editor_options_label">Opciones</string>
+  <string name="pubkey_editor_encrypted_startup_warning">Las claves cifradas no se pueden desbloquear al inicio</string>
+  <string name="pubkey_type_label">Tipo: %s</string>
+  <string name="pubkey_encrypted_description">Cifrado</string>
+  <string name="pubkey_not_encrypted_description">No cifrado</string>
+  <string name="pubkey_biometric_protection">Protección de huellas dactilares</string>
+  <string name="pubkey_biometric_description">Proteja esta clave con su huella dactilar</string>
+  <string name="pubkey_biometric_not_enrolled">Ninguna huella dactilar registrada. Configura la huella dactilar en la configuracion del dispositivo para utilizar esta caracteristica.</string>
+  <string name="pubkey_biometric_key_type_warning">La protección de huella dactilar solo está disponible para claves RSA y EC</string>
+  <string name="pubkey_biometric_prompt_title">Autenticar para usar la clave</string>
+  <string name="pubkey_biometric_prompt_subtitle">Toca el sensor de huellas dactilares para desbloquear %1$s</string>
+  <string name="pubkey_biometric_description_icon">Protegido por huella dactilar</string>
+  <string name="pubkey_biometric_not_available">La autenticación por huella dactilar no está disponible</string>
+  <string name="portforward_nickname_placeholder">Servidor web interno</string>
+  <string name="portforward_port_range_error">El puerto debe estar entre 1 y 65535</string>
+  <string name="portforward_destination_placeholder">localhost80</string>
+  <string name="portforward_destination_format_error">El formato debe ser host:puerto (por ejemplo, localhost:80)</string>
+  <string name="portforward_type_label">Tipo: %s</string>
+  <string name="portforward_enable">Habilitar</string>
+  <string name="portforward_disable">Deshabilitar</string>
+  <string name="portforward_enabled">Reenvío de puerto habilitado</string>
+  <string name="portforward_disabled">Reenvío de puerto deshabilitado</string>
+  <string name="protocol_spinner_label">Protocolo</string>
+  <string name="expand">Expandir</string>
+  <string name="hostpref_authagent_with_confirmation">requerir confirmación</string>
+  <string name="hostpref_add_host">Añadir host</string>
+  <string name="hostpref_save_host">Guardar host</string>
+  <string name="hostpref_setting_title">Configuración del host</string>
+  <string name="pubkey_import_existing">Importar clave pública existente</string>
+  <string name="notification_permission_title">Mantente conectado en segundo plano</string>
+  <string name="notification_permission_message">ConnectBot necesita permiso para enviar notificaciones para mantener tus conexiones activas cuando cambias de aplicación. De lo contrario, el sistema podría interrumpir tus conexiones para ahorrar batería.</string>
+  <string name="grant_permission">Permitir</string>
+  <string name="connect_anyway">Conectar de todas formas</string>
+  <string name="notification_permission_denied_title">Se requiere permiso de notificación</string>
+  <string name="notification_permission_denied_message">Para mantener tus conexiones activas en segundo plano, activa las notificaciones de ConnectBot en la configuración del sistema.</string>
+  <string name="open_settings">Abrir ajustes</string>
+  <string name="notification_permission_denied_snackbar">Las conexiones pueden interrumpirse sin previo aviso ni solicitud de permiso</string>
+  <string name="notification_permission_console_warning">La conexión podría interrumpirse en segundo plano</string>
+  <string name="terminal_no_route">Estás tratando de acceder a un host local Grant permisos de red local</string>
+  <string name="loading_message">Cargando…</string>
+  <string name="migration_checking">Comprobando base de datos…</string>
+  <string name="migration_title">Migrando Base de Datos</string>
+  <string name="migration_warning">No cierre la aplicación durante la migración</string>
+  <string name="migration_stats_hosts">Hosts migrados %d</string>
+  <string name="migration_stats_pubkeys">Claves SSH migradas %d</string>
+  <string name="migration_stats_port_forwards">Reenvíos de puerto migrados %d</string>
+  <string name="migration_stats_known_hosts">Hosts conocidos migrados %d</string>
+  <string name="migration_failed_title">Falló la migración</string>
+  <string name="migration_failed_message">Ocurrió un error durante la migración de la base de datos %s</string>
+  <string name="migration_retry">Reintentar</string>
+  <string name="migration_failed_help">Si el problema persiste por favor informe este problema en %1$s con el registro de depuración copiado arriba</string>
+  <string name="migration_warnings_title">Avisos de migración</string>
+  <string name="migration_copy_warnings">Copiar advertencias</string>
+  <string name="migration_debug_log_title">Registro de depuración</string>
+  <string name="migration_copy_debug_log">Copiar registro de depuración</string>
+  <string name="disconnect_host_alert">¿Estás seguro de que deseas desconectar de \'%1$s\'?</string>
+  <string name="delete_host_confirm">¿Estás seguro de que deseas eliminar el host \'%1$s\'?</string>
+  <string name="forget_host_keys_confirm">¿Está seguro de que desea eliminar las claves de host almacenadas para \'%1$s\'? Se le pedirá que verifique la clave de host en la próxima conexión.</string>
+  <string name="list_pubkey_edit">Editar clave pública</string>
+  <string name="hostpref_ipversion_title">Versión de IP</string>
+  <string name="ipversion_auto">Automático</string>
+  <string name="ipversion_ipv4">Solo IPv4</string>
+  <string name="ipversion_ipv6">Solo IPv6</string>
+  <string name="hostpref_jumphost_title">Anfitrión de salto (ProxyJump)</string>
+  <string name="hostpref_jumphost_summary">Conectar a través de otro host SSH</string>
+  <string name="list_jumphost_none">Ninguno (conexión directa)</string>
+  <string name="terminal_connecting_via_jump">Conectando vía host de salto %s</string>
+  <string name="terminal_jump_connected">Conectado al servidor de salto: %s</string>
+  <string name="terminal_jump_authenticated">Autenticado en el servidor de salto: %s</string>
+  <string name="terminal_jump_failed">No se pudo conectar al servidor de salto %1$s %2$s</string>
+  <string name="terminal_jump_auth_failed">Autenticación fallida para el host de salto %s</string>
+  <string name="terminal_jump_not_found">Anfitrión de salto no encontrado en los anfitriones guardados</string>
+  <string name="terminal_jump_password">Contraseña para el servidor de salto %s</string>
+  <string name="view_logs">Ver registros</string>
+  <string name="logs_title">Registros de la aplicación</string>
+  <string name="copy_logs">Copiar registros</string>
+  <string name="logs_copied">Registros copiados al portapapeles</string>
+  <string name="logs_bug_report_info">Para informar de un error copia estos registros y abre una nueva incidencia en https://connectbot.org/bug</string>
+  <string name="no_logs_available">No registros disponibles</string>
+  <string name="help_section_about">Acerca de</string>
+  <string name="title_contact">Contacto y asistencia</string>
+  <string name="help_section_contact">Contacto y soporte</string>
+  <string name="help_website">Sitio web</string>
+  <string name="help_github">Código fuente</string>
+  <string name="help_report_bug">Informe de un error</string>
+  <string name="help_section_donate">Apoya el desarrollo</string>
+  <string name="help_donate_github">GitHub Sponsors</string>
+  <string name="help_donate_coffee">Invítame a un café</string>
+  <string name="colorscheme_default_description">Colores de terminal predeterminados</string>
+  <string name="colorscheme_solarized_dark_description">Colores precisos para máquinas y personas</string>
+  <string name="colorscheme_solarized_light_description">Solarizado con fondo claro</string>
+  <string name="colorscheme_dracula_description">Un tema oscuro para la terminal</string>
+  <string name="colorscheme_nord_description">Una paleta de colores ártica norte azulada</string>
+  <string name="colorscheme_gruvbox_dark_description">Esquema de colores con estilo retro</string>
+  <string name="colorscheme_monokai_description">Tema inspirado en Sublime Text</string>
+  <string name="colorscheme_tomorrow_night_description">Un tema oscuro limpio y cómodo</string>
+  <string name="pref_profiles_category">Perfiles</string>
+  <string name="pref_default_profile_title">Perfil predeterminado</string>
+  <string name="pref_default_profile_none">Ninguno (usar configuración del host)</string>
+  <string name="pref_alwaysvisible_summary">Mantener las teclas especiales siempre visibles</string>
+  <string name="pref_customterminal_title">Tipos de terminales personalizados</string>
+  <string name="pref_customterminal_summary">Agregar valores personalizados de TERM para servidores remotos</string>
+  <string name="dialog_customterminal_title">Agregar tipo de terminal personalizado</string>
+  <string name="dialog_customterminal_hint">Tipo de terminal por ejemplo rxvt unicode</string>
+  <string name="dialog_custom_value_label">Introducir valor personalizado</string>
+  <string name="list_camera_ctrlaspace_description">Ctrl+A luego Espacio</string>
+  <string name="list_camera_ctrla_description">Ctrl+A</string>
+  <string name="list_camera_esc_description">Esc</string>
+  <string name="list_camera_esc_a_description">Esc+A</string>
+  <string name="list_camera_none_description">Ninguno</string>
+  <string name="list_camera_text_input_description">Entrada de texto</string>
+  <string name="list_menu_export_hosts">Exportar hosts</string>
+  <string name="list_menu_import_hosts">Importar hosts</string>
+  <string name="export_hosts_success">Se exportaron %1$d hosts y %2$d perfiles</string>
+  <string name="import_hosts_success">Se importaron %1$d hosts (%2$d omitidos) y %3$d perfiles (%4$d omitidos)</string>
+  <string name="export_hosts_failed">No se pudieron exportar los hosts: %s</string>
+  <string name="import_hosts_failed">No se pudieron importar los hosts: %s</string>
+  <string name="shortcut_customize_title">Personalizar acceso directo</string>
+  <string name="shortcut_icon_color">Color del icono</string>
+  <string name="shortcut_icon_style">Estilo del icono</string>
+  <string name="shortcut_use_host_color">Utilizar color de host</string>
+  <string name="shortcut_create">Crear acceso directo</string>
+  <string name="icon_style_terminal">Terminal</string>
+  <string name="icon_style_server">Servidor</string>
+  <string name="icon_style_cloud">Nube</string>
+  <string name="icon_style_key">Clave</string>
+  <string name="pref_auth_on_launch_title">Autenticación al inicio</string>
+  <string name="pref_auth_on_launch_summary">Solicite la huella dactilar, el reconocimiento facial o el PIN del dispositivo al abrir la aplicación</string>
+  <string name="pref_security_category">Seguridad</string>
+  <string name="auth_screen_title">ConnectBot está bloqueado</string>
+  <string name="auth_screen_unlock_button">Toca para desbloquear</string>
+  <string name="auth_prompt_title">Desbloquee ConnectBot</string>
+  <string name="auth_prompt_subtitle">Verifique su identidad para continuar</string>
+  <string name="pref_language_download" tools:machine_translated="true">Descargar paquete de idioma</string>
+  <string name="pref_language_download_failed" tools:machine_translated="true">La descarga falló, toque para intentarlo de nuevo.</string>
+  <string name="portforward_host_address" tools:machine_translated="true">Dirección del host</string>
+  <string name="portforward_source_addr_localhost" tools:machine_translated="true">localhost</string>
+  <string name="portforward_source_addr_localhost_ipv4" tools:machine_translated="true">Dirección local (solo IPv4)</string>
+  <string name="portforward_source_addr_localhost_ipv6" tools:machine_translated="true">localhost (solo IPv6)</string>
+  <string name="portforward_source_addr_all" tools:machine_translated="true">Todas las direcciones</string>
+  <string name="portforward_source_addr_all_ipv4" tools:machine_translated="true">Todas las direcciones IPv4</string>
+  <string name="portforward_source_addr_all_ipv6" tools:machine_translated="true">Todas las direcciones IPv6</string>
+  <string name="portforward_source_addr_specific" tools:machine_translated="true">Dirección específica</string>
+  <string name="portforward_source_addr_specific_placeholder" tools:machine_translated="true">192.168.1.1</string>
+  <string name="pubkey_import_from_clipboard" tools:machine_translated="true">Importar desde el portapapeles</string>
+  <string name="pubkey_import_clipboard_key_label" tools:machine_translated="true">Contenido de la clave privada</string>
+  <string name="pubkey_paste_from_clipboard" tools:machine_translated="true">Pegar desde el portapapeles</string>
+  <string name="auth_banner_title" tools:machine_translated="true">Mensaje de autenticación procedente de %1$s</string>
+  <string name="terminal_auth_banner_header" tools:machine_translated="true">[%1$s] Mensaje de autenticación:</string>
+  <string name="pref_imetogglekey_title" tools:machine_translated="true">Mostrar la tecla de alternancia de IME.</string>
+  <string name="pref_imetogglekey_summary" tools:machine_translated="true">Agrega un botón de IME a la fila de teclas especiales que active o desactive el modo de composición para los idiomas que requieren un búfer de composición (japonés, chino, coreano, etc.).</string>
+  <string name="pref_ime_shortcut_mode_title" tools:machine_translated="true">Atajos de teclado Ctrl/Alt para el IME completo.</string>
+  <string name="pref_ime_shortcut_mode_disabled" tools:machine_translated="true">No hay solución alternativa.</string>
+  <string name="pref_ime_shortcut_mode_type_null" tools:machine_translated="true">Eventos de teclado sin procesar.</string>
+  <string name="pref_ime_shortcut_mode_force_ascii" tools:machine_translated="true">Forzar el uso de ASCII (recomendado)</string>
+  <string name="pref_swipe_sessions_title" tools:machine_translated="true">Desliza para cambiar de sesión.</string>
+  <string name="pref_swipe_sessions_summary" tools:machine_translated="true">Active la función de deslizamiento horizontal para cambiar entre sesiones de terminal. Esta función está desactivada por defecto para facilitar la accesibilidad.</string>
+  <string name="console_switch_session" tools:machine_translated="true">Cambiar sesión</string>
+  <string name="console_previous_session" tools:machine_translated="true">Sesión anterior</string>
+  <string name="console_next_session" tools:machine_translated="true">Siguiente sesión</string>
+  <string name="button_key_alt" tools:machine_translated="true">Alt</string>
+  <string name="image_description_toggle_alt_key" tools:machine_translated="true">Alternar la tecla Alt.</string>
+  <string name="button_key_ime" tools:machine_translated="true">IME</string>
+  <string name="image_description_toggle_compose_mode" tools:machine_translated="true">Activar/desactivar el modo de composición para la entrada de texto con el IME.</string>
+  <string name="console_menu_compose_mode" tools:machine_translated="true">Modo de composición (IME)</string>
+  <string name="hostpref_profile_edit" tools:machine_translated="true">Editar el perfil seleccionado.</string>
+  <string name="terminal_mosh_installing" tools:machine_translated="true">Preparando el soporte para Mosh…</string>
+  <string name="terminal_mosh_starting" tools:machine_translated="true">Estableciendo la conexión Mosh…</string>
+  <string name="terminal_mosh_install_timeout" tools:machine_translated="true">Advertencia: la instalación de Mosh ha superado el tiempo límite.</string>
+  <string name="terminal_mosh_launching_server" tools:machine_translated="true">Iniciando mosh-server en el host remoto…</string>
+  <string name="terminal_mosh_server_failed" tools:machine_translated="true">No se pudo iniciar mosh-server en el host remoto.</string>
+  <string name="terminal_mosh_client_failed" tools:machine_translated="true">No se pudo iniciar mosh-client.</string>
+  <string name="terminal_mosh_connected" tools:machine_translated="true">Conexión Mosh establecida.</string>
+  <string name="terminal_mosh_error" tools:machine_translated="true">Error de Mosh: %1$s</string>
+  <string name="hostpref_mosh_server_title" tools:machine_translated="true">Comando del servidor Mosh</string>
+  <string name="hostpref_mosh_server_summary" tools:machine_translated="true">Ruta o comando personalizado para el servidor Mosh (dejar en blanco para usar la configuración predeterminada).</string>
+  <string name="hostpref_mosh_port_title" tools:machine_translated="true">Puerto UDP de Mosh</string>
+  <string name="hostpref_mosh_port_summary" tools:machine_translated="true">Puerto UDP fijo para mosh (0 para el rango automático de 60000 a 61000)</string>
+  <string name="hostpref_locale_title" tools:machine_translated="true">Configuración regional</string>
+  <string name="hostpref_locale_summary" tools:machine_translated="true">Configuración regional para la sesión de Mosh (por ejemplo, en_US.UTF-8)</string>
+  <string name="mosh_feature_title" tools:machine_translated="true">Mosh</string>
+  <string name="pref_mosh_release_title" tools:machine_translated="true">Versión de Mosh y código fuente.</string>
+  <string name="pref_mosh_installing" tools:machine_translated="true">Preparando el soporte para Mosh…</string>
+  <string name="editor_discard_changes_title" tools:machine_translated="true">¿Descartar los cambios?</string>
+  <string name="editor_discard_changes_message" tools:machine_translated="true">Perderá las modificaciones realizadas si sale sin guardar.</string>
+  <string name="editor_discard" tools:machine_translated="true">Descartar</string>
+  <string name="editor_save" tools:machine_translated="true">Guardar</string>
+  <string name="import_json_file_too_large" tools:machine_translated="true">El archivo JSON es demasiado grande para importarlo (el tamaño máximo es de 8 MB).</string>
+  <string name="import_file_unavailable" tools:machine_translated="true">No se puede abrir el archivo seleccionado.</string>
+  <string name="profile_inline_images" tools:machine_translated="true">Imágenes en línea</string>
+  <string name="inline_images_off" tools:machine_translated="true">Desactivado.</string>
+  <string name="inline_images_ask" tools:machine_translated="true">Preguntar.</string>
+  <string name="inline_images_on" tools:machine_translated="true">Activado</string>
+  <string name="inline_images_prompt_title" tools:machine_translated="true">¿Mostrar imágenes en línea?</string>
+  <string name="inline_images_prompt_message" tools:machine_translated="true">¿Permitir que este host muestre imágenes en línea durante el resto de esta sesión?</string>
+  <string name="automation_load_failed" tools:machine_translated="true">No se pudo cargar la automatización.</string>
+  <string name="automation_save_failed" tools:machine_translated="true">No se pudo guardar la automatización.</string>
+  <string name="automation_invalid_action" tools:machine_translated="true">Verifique el texto, el patrón, la duración o el puerto de reenvío seleccionado.</string>
+  <string name="automation_action_failed" tools:machine_translated="true">La acción no se completó.</string>
+  <string name="automation_timed_out" tools:machine_translated="true">Se agotó el tiempo de espera para la aparición del texto.</string>
+  <string name="automation_buffer_overflow" tools:machine_translated="true">Se generó demasiada información antes de que la automatización pudiera procesarla.</string>
+  <string name="automation_no_session" tools:machine_translated="true">Esta acción requiere una sesión de terminal activa.</string>
+  <string name="automation_forward_missing" tools:machine_translated="true">Falta la configuración de reenvío de puertos.</string>
+  <string name="automation_forward_unsupported" tools:machine_translated="true">Esta conexión no admite la redirección de puertos.</string>
+  <string name="automation_wait_text" tools:machine_translated="true">Esperar a que se complete la cadena.</string>
+  <string name="automation_send_text" tools:machine_translated="true">Enviar cadena</string>
+  <string name="automation_send_key" tools:machine_translated="true">Enviar tecla especial</string>
+  <string name="automation_delay" tools:machine_translated="true">Esperar</string>
+  <string name="automation_disconnect" tools:machine_translated="true">Desconectar</string>
+  <string name="automation_enable_forward" tools:machine_translated="true">Activar el reenvío de puertos.</string>
+  <string name="automation_disable_forward" tools:machine_translated="true">Desactivar el reenvío de puertos.</string>
+  <string name="automation_add" tools:machine_translated="true">Añadir acción</string>
+  <string name="automation_save" tools:machine_translated="true">Guardar</string>
+  <string name="automation_edit" tools:machine_translated="true">Editar</string>
+  <string name="automation_delete" tools:machine_translated="true">Eliminar</string>
+  <string name="automation_move_up" tools:machine_translated="true">Subir</string>
+  <string name="automation_move_down" tools:machine_translated="true">Bajar</string>
+  <string name="automation_drag" tools:machine_translated="true">Arrastra para cambiar el orden.</string>
+  <string name="automation_cancel" tools:machine_translated="true">Cancelar</string>
+  <string name="automation_text" tools:machine_translated="true">Texto</string>
+  <string name="automation_regex" tools:machine_translated="true">Expresión regular</string>
+  <string name="automation_regex_help" tools:machine_translated="true">Coincide con el texto entrante sin aplicar formato ANSI. La expresión regular admite la sintaxis RE2; no se admiten las búsquedas anticipadas ni las referencias inversas.</string>
+  <string name="automation_duration" tools:machine_translated="true">Duración (en segundos)</string>
+  <string name="automation_timeout" tools:machine_translated="true">Tiempo de espera (en segundos)</string>
+  <string name="automation_key" tools:machine_translated="true">Clave</string>
+  <string name="automation_forward" tools:machine_translated="true">Reenvío de puertos</string>
+  <string name="automation_failure" tools:machine_translated="true">En caso de error.</string>
+  <string name="automation_stop" tools:machine_translated="true">Detener la automatización.</string>
+  <string name="automation_continue" tools:machine_translated="true">Continuar</string>
+  <string name="automation_save_host" tools:machine_translated="true">Guarde el host para configurar la automatización.</string>
+  <string name="automation_progress" tools:machine_translated="true">Automatización: %1$d / %2$d</string>
+  <string name="automation_failure_step" tools:machine_translated="true">Acción %1$d: %2$s</string>
+  <string name="automation_cancel_run" tools:machine_translated="true">Cancelar la automatización</string>
+  <string name="automation_key_enter" tools:machine_translated="true">Intro</string>
+  <string name="automation_key_tab" tools:machine_translated="true">Pestaña</string>
+  <string name="automation_key_escape" tools:machine_translated="true">Salir</string>
+  <string name="automation_key_backspace" tools:machine_translated="true">Retroceso</string>
+  <string name="automation_key_delete" tools:machine_translated="true">Eliminar</string>
+  <string name="automation_key_up" tools:machine_translated="true">Flecha hacia arriba</string>
+  <string name="automation_key_down" tools:machine_translated="true">Flecha hacia abajo</string>
+  <string name="automation_key_left" tools:machine_translated="true">Flecha izquierda</string>
+  <string name="automation_key_right" tools:machine_translated="true">Flecha derecha</string>
+  <string name="automation_key_home" tools:machine_translated="true">Inicio</string>
+  <string name="automation_key_end" tools:machine_translated="true">Finalizar</string>
+  <string name="automation_key_insert" tools:machine_translated="true">Insertar</string>
+  <string name="automation_key_page_up" tools:machine_translated="true">Avance de página</string>
+  <string name="automation_key_page_down" tools:machine_translated="true">Avance de página</string>
+  <string name="automation_key_function" tools:machine_translated="true">F%1$s</string>
+  <string name="automation_key_shift" tools:machine_translated="true">Tecla Mayús.</string>
+  <string name="automation_seconds" tools:machine_translated="true">%1$.3f segundos</string>
+  <plurals name="automation_count" tools:machine_translated="true">
+    <item quantity="one">%1$d acción</item>
+    <item quantity="other">%1$d acciones</item>
+  </plurals>
+</resources>

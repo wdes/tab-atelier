@@ -1,0 +1,345 @@
+/*
+ * ConnectBot: simple, powerful, open-source SSH client for Android
+ * Copyright 2025-2026 Kenny Root
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.connectbot.ui.navigation
+
+import androidx.compose.runtime.Composable
+import androidx.compose.ui.Modifier
+import androidx.lifecycle.Lifecycle
+import androidx.navigation.NavBackStackEntry
+import androidx.navigation.NavController
+import androidx.navigation.NavHostController
+import androidx.navigation.NavOptions
+import androidx.navigation.NavType
+import androidx.navigation.compose.NavHost
+import androidx.navigation.compose.composable
+import androidx.navigation.navArgument
+import org.connectbot.data.entity.Host
+import org.connectbot.ui.screens.colors.ColorsScreen
+import org.connectbot.ui.screens.colors.PaletteEditorScreen
+import org.connectbot.ui.screens.console.ConsoleScreen
+import org.connectbot.ui.screens.contact.ContactScreen
+import org.connectbot.ui.screens.eula.EulaScreen
+import org.connectbot.ui.screens.generatepubkey.GeneratePubkeyScreen
+import org.connectbot.ui.screens.help.HelpScreen
+import org.connectbot.ui.screens.hints.HintsScreen
+import org.connectbot.ui.screens.hosteditor.HostEditorScreen
+import org.connectbot.ui.screens.hostlist.HostListScreen
+import org.connectbot.ui.screens.portforwardlist.PortForwardEditorScreen
+import org.connectbot.ui.screens.portforwardlist.PortForwardListScreen
+import org.connectbot.ui.screens.profiles.ProfileEditorScreen
+import org.connectbot.ui.screens.profiles.ProfileListScreen
+import org.connectbot.ui.screens.pubkeyeditor.PubkeyEditorScreen
+import org.connectbot.ui.screens.pubkeylist.PubkeyListScreen
+import org.connectbot.ui.screens.settings.SettingsScreen
+import org.connectbot.util.IconStyle
+import timber.log.Timber
+
+@Composable
+fun ConnectBotNavHost(
+    navController: NavHostController,
+    onNavigateToConsole: (Host) -> Unit,
+    modifier: Modifier = Modifier,
+    startDestination: String = NavDestinations.HOST_LIST,
+    makingShortcut: Boolean = false,
+    onSelectShortcut: (Host, String?, IconStyle) -> Unit = { _, _, _ -> },
+    shouldShowNotificationWarning: () -> Boolean = { false },
+    onNotificationSnackbarFinish: () -> Unit = {},
+) {
+    NavHost(
+        navController = navController,
+        startDestination = startDestination,
+        modifier = modifier,
+    ) {
+        composable(NavDestinations.HOST_LIST) {
+            HostListScreen(
+                makingShortcut = makingShortcut,
+                onNavigateToConsole = onNavigateToConsole,
+                onSelectShortcut = onSelectShortcut,
+                onNavigateToEditHost = { host ->
+                    if (host != null) {
+                        navController.navigateSafely("${NavDestinations.HOST_EDITOR}?${NavArgs.HOST_ID}=${host.id}")
+                    } else {
+                        navController.navigateSafely(NavDestinations.HOST_EDITOR)
+                    }
+                },
+                onNavigateToSettings = {
+                    navController.navigateSafely(NavDestinations.SETTINGS)
+                },
+                onNavigateToSettingsHighlightConnPersist = {
+                    navController.navigateSafely(NavDestinations.SETTINGS_HIGHLIGHT_CONN_PERSIST)
+                },
+                onNavigateToPubkeys = {
+                    navController.navigateSafely(NavDestinations.PUBKEY_LIST)
+                },
+                onNavigateToPortForwards = { host ->
+                    navController.navigateSafely("${NavDestinations.PORT_FORWARD_LIST}/${host.id}")
+                },
+                onNavigateToProfiles = {
+                    navController.navigateSafely(NavDestinations.PROFILES)
+                },
+                onNavigateToHelp = {
+                    navController.navigateSafely(NavDestinations.HELP)
+                },
+                shouldShowNotificationWarning = shouldShowNotificationWarning,
+                onNotificationSnackbarFinish = onNotificationSnackbarFinish,
+            )
+        }
+
+        composable(
+            route = "${NavDestinations.CONSOLE}/{${NavArgs.HOST_ID}}",
+            arguments = listOf(
+                navArgument(NavArgs.HOST_ID) { type = NavType.LongType },
+            ),
+        ) {
+            ConsoleScreen(
+                onNavigateBack = { navController.safePopBackStack() },
+                onNavigateToPortForwards = { hostIdForPortForwards ->
+                    navController.navigateSafely("${NavDestinations.PORT_FORWARD_LIST}/$hostIdForPortForwards")
+                },
+                onNavigateToSettings = {
+                    navController.navigateSafely(NavDestinations.SETTINGS_HIGHLIGHT_CONN_PERSIST)
+                },
+            )
+        }
+
+        composable(
+            route = "${NavDestinations.HOST_EDITOR}?${NavArgs.HOST_ID}={${NavArgs.HOST_ID}}",
+            arguments = listOf(
+                navArgument(NavArgs.HOST_ID) {
+                    type = NavType.LongType
+                    defaultValue = -1L
+                },
+            ),
+        ) {
+            HostEditorScreen(
+                onNavigateBack = { navController.safePopBackStack() },
+                onNavigateToProfile = { profileId ->
+                    navController.navigateSafely("${NavDestinations.PROFILE_EDITOR}/$profileId")
+                },
+                onNavigateToAutomation = { hostId ->
+                    navController.navigateSafely("${NavDestinations.AUTOMATION_EDITOR}/$hostId")
+                },
+            )
+        }
+
+        composable(
+            route = "${NavDestinations.AUTOMATION_EDITOR}/{${NavArgs.HOST_ID}}",
+            arguments = listOf(navArgument(NavArgs.HOST_ID) { type = NavType.LongType }),
+        ) {
+            org.connectbot.ui.screens.automation.AutomationEditorScreen(
+                onNavigateBack = { navController.safePopBackStack() },
+            )
+        }
+
+        composable(NavDestinations.PUBKEY_LIST) {
+            PubkeyListScreen(
+                onNavigateBack = { navController.safePopBackStack() },
+                onNavigateToGenerate = { navController.navigateSafely(NavDestinations.GENERATE_PUBKEY) },
+                onNavigateToEdit = { pubkey ->
+                    navController.navigateSafely("${NavDestinations.PUBKEY_EDITOR}/${pubkey.id}")
+                },
+            )
+        }
+
+        composable(NavDestinations.GENERATE_PUBKEY) {
+            GeneratePubkeyScreen(
+                onNavigateBack = { navController.safePopBackStack() },
+            )
+        }
+
+        composable(
+            route = "${NavDestinations.PUBKEY_EDITOR}/{${NavArgs.PUBKEY_ID}}",
+            arguments = listOf(
+                navArgument(NavArgs.PUBKEY_ID) { type = NavType.LongType },
+            ),
+        ) {
+            PubkeyEditorScreen(
+                onNavigateBack = { navController.safePopBackStack() },
+            )
+        }
+
+        composable(
+            route = "${NavDestinations.PORT_FORWARD_LIST}/{${NavArgs.HOST_ID}}",
+            arguments = listOf(
+                navArgument(NavArgs.HOST_ID) { type = NavType.LongType },
+            ),
+        ) { entry ->
+            PortForwardListScreen(
+                onNavigateBack = { navController.safePopBackStack() },
+                onNavigateToEditor = { forwardId ->
+                    entry.arguments?.getLong(NavArgs.HOST_ID)?.let { hostId ->
+                        navController.navigateSafely("${NavDestinations.PORT_FORWARD_EDITOR}/$hostId/${forwardId ?: 0L}")
+                    }
+                },
+            )
+        }
+
+        composable(
+            route = "${NavDestinations.PORT_FORWARD_EDITOR}/{${NavArgs.HOST_ID}}/{${NavArgs.FORWARD_ID}}",
+            arguments = listOf(
+                navArgument(NavArgs.HOST_ID) { type = NavType.LongType },
+                navArgument(NavArgs.FORWARD_ID) { type = NavType.LongType },
+            ),
+        ) {
+            PortForwardEditorScreen(onNavigateBack = { navController.safePopBackStack() })
+        }
+
+        composable(
+            route = "${NavDestinations.SETTINGS}?highlight={highlight}",
+            arguments = listOf(
+                navArgument("highlight") {
+                    type = NavType.StringType
+                    nullable = true
+                    defaultValue = null
+                },
+            ),
+        ) {
+            val highlight = it.arguments?.getString("highlight")
+            SettingsScreen(
+                onNavigateBack = { navController.safePopBackStack() },
+                highlightItem = highlight,
+            )
+        }
+
+        composable(NavDestinations.COLORS) {
+            ColorsScreen(
+                onNavigateBack = { navController.safePopBackStack() },
+                onNavigateToPaletteEditor = { schemeId ->
+                    navController.navigateSafely("${NavDestinations.PALETTE_EDITOR}/$schemeId")
+                },
+            )
+        }
+
+        composable(
+            route = "${NavDestinations.PALETTE_EDITOR}/{${NavArgs.SCHEME_ID}}",
+            arguments = listOf(
+                navArgument(NavArgs.SCHEME_ID) { type = NavType.LongType },
+            ),
+        ) {
+            PaletteEditorScreen(
+                onNavigateBack = { navController.safePopBackStack() },
+                onNavigateToDuplicate = { newSchemeId ->
+                    navController.navigate(
+                        route = "${NavDestinations.PALETTE_EDITOR}/$newSchemeId",
+                        navOptions = NavOptions.Builder()
+                            .setPopUpTo(
+                                route = "${NavDestinations.PALETTE_EDITOR}/{${NavArgs.SCHEME_ID}}",
+                                inclusive = true,
+                            )
+                            .build(),
+                    )
+                },
+            )
+        }
+
+        composable(NavDestinations.PROFILES) {
+            ProfileListScreen(
+                onNavigateBack = { navController.safePopBackStack() },
+                onNavigateToEdit = { profile ->
+                    navController.navigateSafely("${NavDestinations.PROFILE_EDITOR}/${profile.id}")
+                },
+                onNavigateToColors = {
+                    navController.navigateSafely(NavDestinations.COLORS)
+                },
+            )
+        }
+
+        composable(
+            route = "${NavDestinations.PROFILE_EDITOR}/{${NavArgs.PROFILE_ID}}",
+            arguments = listOf(
+                navArgument(NavArgs.PROFILE_ID) { type = NavType.LongType },
+            ),
+        ) {
+            ProfileEditorScreen(
+                onNavigateBack = { navController.safePopBackStack() },
+                onNavigateToColors = {
+                    navController.navigateSafely(NavDestinations.COLORS)
+                },
+            )
+        }
+
+        composable(NavDestinations.HELP) {
+            HelpScreen(
+                onNavigateBack = { navController.safePopBackStack() },
+                onNavigateToHints = { navController.navigateSafely(NavDestinations.HINTS) },
+                onNavigateToEula = { navController.navigateSafely(NavDestinations.EULA) },
+                onNavigateToContact = { navController.navigateSafely(NavDestinations.CONTACT) },
+            )
+        }
+
+        composable(NavDestinations.CONTACT) {
+            ContactScreen(
+                onNavigateBack = { navController.safePopBackStack() },
+            )
+        }
+
+        composable(NavDestinations.EULA) {
+            EulaScreen(
+                onNavigateBack = { navController.safePopBackStack() },
+            )
+        }
+
+        composable(NavDestinations.HINTS) {
+            HintsScreen(
+                onNavigateBack = { navController.safePopBackStack() },
+            )
+        }
+    }
+}
+
+/**
+ * If the lifecycle is not resumed it means this NavBackStackEntry already processed a nav event.
+ *
+ * This is used to de-duplicate navigation events.
+ */
+private fun NavBackStackEntry?.lifecycleIsResumed() = this?.lifecycle?.currentState == Lifecycle.State.RESUMED
+
+/**
+ * Safely pops the back stack, preventing double navigation when the user rapidly taps
+ * the back button. This checks if the current destination's lifecycle state is RESUMED
+ * before allowing the navigation to proceed.
+ */
+internal fun NavHostController.safePopBackStack() = if (currentBackStackEntry.lifecycleIsResumed()) popBackStack() else false
+
+/**
+ * A more robust navigate function that avoids navigating to the
+ * same destination currently on screen.
+ *
+ * This checks the destination of the navigation action against the current
+ * destination.
+ *
+ * @param route The destination route to navigate to.
+ * @param navOptions Optional NavOptions to apply to this navigation.
+ */
+fun NavController.navigateSafely(
+    route: String,
+    navOptions: NavOptions? = null,
+) {
+    // Find the destination for the given route.
+    val destination = graph.findNode(route)
+
+    if (destination != null) {
+        // Check if the target destination is the same as the current one.
+        if (destination.id != currentDestination?.id) {
+            navigate(route, navOptions)
+        }
+    } else {
+        Timber.w("Navigating to unknown NavGraph destination $route")
+        navigate(route, navOptions)
+    }
+}

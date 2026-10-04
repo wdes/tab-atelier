@@ -1,0 +1,284 @@
+/*
+ * ConnectBot: simple, powerful, open-source SSH client for Android
+ * Copyright 2025-2026 Kenny Root
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.connectbot.ui.screens.profiles
+
+import android.content.Context
+import android.content.SharedPreferences
+import androidx.lifecycle.SavedStateHandle
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import dagger.hilt.android.lifecycle.HiltViewModel
+import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import org.connectbot.data.ColorSchemeRepository
+import org.connectbot.data.ProfileRepository
+import org.connectbot.data.entity.ColorScheme
+import org.connectbot.data.entity.Profile
+import org.connectbot.di.CoroutineDispatchers
+import org.connectbot.util.LocalFontProvider
+import org.connectbot.util.TerminalFont
+import org.connectbot.util.TerminalFontProvider
+import java.nio.charset.Charset
+import javax.inject.Inject
+
+data class ProfileEditorUiState(
+    val profileId: Long = -1L,
+    val name: String = "",
+    val iconColor: String? = null,
+    val colorSchemeId: Long = -1L,
+    val availableColorSchemes: List<ColorScheme> = emptyList(),
+    val fontFamily: String? = null,
+    val fontSize: Int = 10,
+    val delKey: String = "del",
+    val inlineImages: String = "ask",
+    val encoding: String = "UTF-8",
+    val emulation: String = "xterm-256color",
+    val forceSizeEnabled: Boolean = false,
+    val forceSizeRows: Int = 24,
+    val forceSizeColumns: Int = 80,
+    val customTerminalTypes: List<String> = emptyList(),
+    val customFonts: List<String> = emptyList(),
+    val localFonts: List<Pair<String, String>> = emptyList(),
+    val isLoading: Boolean = true,
+    val isSaving: Boolean = false,
+    val hasUnsavedChanges: Boolean = false,
+    val saveError: String? = null,
+    val fontDownloadInProgress: Boolean = false,
+)
+
+@HiltViewModel
+class ProfileEditorViewModel @Inject constructor(
+    savedStateHandle: SavedStateHandle,
+    private val profileRepository: ProfileRepository,
+    private val colorSchemeRepository: ColorSchemeRepository,
+    private val prefs: SharedPreferences,
+    @ApplicationContext private val context: Context,
+    private val dispatchers: CoroutineDispatchers,
+) : ViewModel() {
+
+    val commonEncodings: List<String> = listOf(
+        "UTF-8",
+        "ISO-8859-1",
+        "US-ASCII",
+        "windows-1252",
+        "CP437",
+    )
+
+    val allEncodings: List<String> = run {
+        val charsets = Charset.availableCharsets().keys.toMutableSet()
+        charsets.add("CP437")
+        charsets.sortedWith(String.CASE_INSENSITIVE_ORDER)
+    }
+
+    private val profileId: Long = savedStateHandle.get<Long>("profileId") ?: -1L
+    private val localFontProvider = LocalFontProvider(context)
+    private val fontProvider = TerminalFontProvider(context, dispatchers.io)
+
+    private val _uiState = MutableStateFlow(ProfileEditorUiState(profileId = profileId))
+    val uiState: StateFlow<ProfileEditorUiState> = _uiState.asStateFlow()
+
+    init {
+        loadCustomFonts()
+        loadLocalFonts()
+        loadCustomTerminalTypes()
+        observeColorSchemes()
+        if (profileId != -1L) {
+            loadProfile()
+        } else {
+            _uiState.update { it.copy(isLoading = false) }
+        }
+    }
+
+    private fun loadCustomFonts() {
+        val customFontsString = prefs.getString("customFonts", "") ?: ""
+        val customFonts = if (customFontsString.isBlank()) {
+            emptyList()
+        } else {
+            customFontsString.split(",").filter { it.isNotBlank() }
+        }
+        _uiState.update { it.copy(customFonts = customFonts) }
+    }
+
+    private fun loadCustomTerminalTypes() {
+        val customTerminalTypesString = prefs.getString("customTerminalTypes", "") ?: ""
+        val customTerminalTypes = if (customTerminalTypesString.isBlank()) {
+            emptyList()
+        } else {
+            customTerminalTypesString.split(",").filter { it.isNotBlank() }
+        }
+        _uiState.update { it.copy(customTerminalTypes = customTerminalTypes) }
+    }
+
+    private fun loadLocalFonts() {
+        val localFonts = localFontProvider.getImportedFonts()
+        _uiState.update { it.copy(localFonts = localFonts) }
+    }
+
+    private fun observeColorSchemes() {
+        viewModelScope.launch {
+            colorSchemeRepository.observeAllSchemes().collect { schemes ->
+                _uiState.update { it.copy(availableColorSchemes = schemes) }
+            }
+        }
+    }
+
+    private fun loadProfile() {
+        viewModelScope.launch {
+            val profile = profileRepository.getById(profileId)
+            if (profile != null) {
+                val forceSizeEnabled = profile.forceSizeRows != null && profile.forceSizeColumns != null
+                _uiState.update {
+                    it.copy(
+                        name = profile.name,
+                        iconColor = profile.iconColor,
+                        colorSchemeId = profile.colorSchemeId,
+                        fontFamily = profile.fontFamily,
+                        fontSize = profile.fontSize,
+                        delKey = profile.delKey,
+                        inlineImages = profile.inlineImages,
+                        encoding = profile.encoding,
+                        emulation = profile.emulation,
+                        forceSizeEnabled = forceSizeEnabled,
+                        forceSizeRows = profile.forceSizeRows ?: 24,
+                        forceSizeColumns = profile.forceSizeColumns ?: 80,
+                        isLoading = false,
+                        hasUnsavedChanges = false,
+                    )
+                }
+            } else {
+                _uiState.update { it.copy(isLoading = false) }
+            }
+        }
+    }
+
+    fun updateName(value: String) {
+        _uiState.update { it.copy(name = value, saveError = null, hasUnsavedChanges = true) }
+    }
+
+    fun updateIconColor(value: String?) {
+        _uiState.update { it.copy(iconColor = value, hasUnsavedChanges = true) }
+    }
+
+    fun updateColorSchemeId(value: Long) {
+        _uiState.update { it.copy(colorSchemeId = value, hasUnsavedChanges = true) }
+    }
+
+    fun updateFontFamily(value: String?) {
+        _uiState.update { it.copy(fontFamily = value, hasUnsavedChanges = true) }
+        // Preload the font
+        if (value != null) {
+            preloadFont(value)
+        }
+    }
+
+    private fun preloadFont(storedValue: String) {
+        if (LocalFontProvider.isLocalFont(storedValue)) return
+        val googleFontName = TerminalFont.getGoogleFontName(storedValue)
+        if (googleFontName.isBlank()) return
+        viewModelScope.launch {
+            _uiState.update { it.copy(fontDownloadInProgress = true) }
+            fontProvider.loadFontByNameSuspend(googleFontName)
+            _uiState.update { it.copy(fontDownloadInProgress = false) }
+        }
+    }
+
+    fun updateFontSize(value: Int) {
+        _uiState.update { it.copy(fontSize = value, hasUnsavedChanges = true) }
+    }
+
+    fun updateDelKey(value: String) {
+        _uiState.update { it.copy(delKey = value, hasUnsavedChanges = true) }
+    }
+
+    fun updateInlineImages(value: String) {
+        _uiState.update { it.copy(inlineImages = value, hasUnsavedChanges = true) }
+    }
+
+    fun updateEncoding(value: String) {
+        _uiState.update { it.copy(encoding = value, hasUnsavedChanges = true) }
+    }
+
+    fun updateEmulation(value: String) {
+        _uiState.update { it.copy(emulation = value, hasUnsavedChanges = true) }
+    }
+
+    fun updateForceSizeEnabled(value: Boolean) {
+        _uiState.update { it.copy(forceSizeEnabled = value, hasUnsavedChanges = true) }
+    }
+
+    fun updateForceSizeRows(value: Int) {
+        _uiState.update { it.copy(forceSizeRows = value.coerceIn(1, 999), hasUnsavedChanges = true) }
+    }
+
+    fun updateForceSizeColumns(value: Int) {
+        _uiState.update { it.copy(forceSizeColumns = value.coerceIn(1, 999), hasUnsavedChanges = true) }
+    }
+
+    fun save(onSuccess: () -> Unit) {
+        val state = _uiState.value
+        if (state.isSaving || !state.hasUnsavedChanges) return
+        _uiState.update { it.copy(isSaving = true, saveError = null) }
+        viewModelScope.launch {
+            if (state.name.isBlank()) {
+                _uiState.update { it.copy(isSaving = false, saveError = "Name cannot be empty") }
+                return@launch
+            }
+
+            // Check for duplicate name (excluding current profile)
+            val excludeId = if (profileId != -1L) profileId else null
+            val nameExists = try {
+                withContext(dispatchers.io) { profileRepository.nameExists(state.name, excludeId) }
+            } catch (e: Exception) {
+                _uiState.update { it.copy(isSaving = false, saveError = e.message ?: "Failed to check profile name") }
+                return@launch
+            }
+            if (nameExists) {
+                _uiState.update { it.copy(isSaving = false, saveError = "A profile with this name already exists") }
+                return@launch
+            }
+
+            val profile = Profile(
+                id = if (profileId != -1L) profileId else 0,
+                name = state.name,
+                iconColor = state.iconColor,
+                colorSchemeId = state.colorSchemeId,
+                fontFamily = state.fontFamily,
+                fontSize = state.fontSize,
+                delKey = state.delKey,
+                inlineImages = state.inlineImages,
+                encoding = state.encoding,
+                emulation = state.emulation,
+                forceSizeRows = if (state.forceSizeEnabled) state.forceSizeRows else null,
+                forceSizeColumns = if (state.forceSizeEnabled) state.forceSizeColumns else null,
+            )
+
+            try {
+                withContext(dispatchers.io) { profileRepository.save(profile) }
+                _uiState.update { it.copy(isSaving = false, hasUnsavedChanges = false) }
+                onSuccess()
+            } catch (e: Exception) {
+                _uiState.update { it.copy(isSaving = false, saveError = e.message ?: "Failed to save profile") }
+            }
+        }
+    }
+}

@@ -1,0 +1,655 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<resources xmlns:tools="http://schemas.android.com/tools">
+  <string name="app_desc">Basit, güçlü, açık-kaynak SSH istemcisi</string>
+  <string name="service_desc">SSH bağlantılarını ve yüklenmiş açık-anahtarları muhafaza eder</string>
+  <string name="title_pubkey_list">Açık-anahtarlar</string>
+  <string name="title_port_forwards_list">Port yönlendirme</string>
+  <string name="title_help">Yardım</string>
+  <string name="title_color_picker">Bir renk seç</string>
+  <string name="title_settings">Ayarlar</string>
+  <string name="title_pubkey_generate">Oluştur</string>
+  <string name="terms_and_conditions">Şartlar &amp; Koşullar</string>
+  <string name="hints">İpuçları</string>
+  <string name="keyboard_shortcuts">Klavye Kısayolları</string>
+  <string name="increase_font_size">Yazıtipi Boyutunu Büyüt</string>
+  <string name="increase_font_shortcut">Ctrl ve +</string>
+  <string name="decrease_font_size">Yazıtipi Boyutunu Küçült</string>
+  <string name="decrease_font_shortcut">Ctrl ve -</string>
+  <string name="paste_shortcut">Ctrl-Shift-V</string>
+  <string name="pubkey_generate">Oluştur</string>
+  <string name="pubkey_delete">Anahtarı Sil</string>
+  <string name="pubkey_gather_entropy">Entropi Toplanıyor</string>
+  <string name="pubkey_touch_prompt">Rastgele girdi toplamak için bu kutuya dokun: %1$d%% oluşturuldu</string>
+  <string name="pubkey_touch_hint">Anahtar oluşturmada gerekli rastgele girdi kaydedebilmemiz için parmağınızı aşağıdaki kutu üzerinde rastgele haraket ettiriniz.</string>
+  <string name="pubkey_generating">Anahtar çifti oluşturuluyor…</string>
+  <string name="pubkey_copy_private">Özel-anahtarı kopyala</string>
+  <string name="pubkey_copy_public">Umumi-anahtarı kopyala</string>
+  <string name="pubkey_change_password">Şifreyi değiştir</string>
+  <string name="pubkey_unlock">Anahtarın şifresini giriniz</string>
+  <string name="pubkey_load_on_start">Başlangıçta anahtarı yükle</string>
+  <string name="pubkey_confirm_use">Kullanım öncesi doğrulama</string>
+  <string name="portforward_edit">Port yönlendirmeyi düzenle</string>
+  <string name="portforward_delete">Port yönlendirmeyi sil</string>
+  <string name="prompt_nickname">Rumuz:</string>
+  <string name="prompt_source_port">Kaynak kapı:</string>
+  <string name="prompt_destination">Hedef (Anasistem:Port):</string>
+  <string name="prompt_old_password">Eski şifre:</string>
+  <string name="prompt_password">Şifre:</string>
+  <string name="prompt_again">(tekrar)</string>
+  <string name="prompt_type">Tip:</string>
+  <string name="prompt_password_can_be_blank">Not: parola boş bırakılabilir</string>
+  <string name="prompt_bits">İkiller:</string>
+  <string name="prompt_pubkey_password">Anahtar \'%1$s\' için parola</string>
+  <string name="prompt_allow_agent_to_use_key">Uzak anasistemin \'%1$s\' anahtarını\nkullanmasına izin ver?</string>
+  <string name="host_verification_failure_warning_header">UYARI: UZAK ANASİSTEM KİMLİĞİ DEĞİŞMİŞ!</string>
+  <string name="host_verification_failure_warning">BİRİLERİNİN KÖTÜ BİRŞEYLER YAPIYOR OLMASI OLASI!\nBirileri şu anda sizi dinliyor olabilir (aradaki adam saldırısı)!\nSadece anasistem anahtarı da değişmiş olabilir.</string>
+  <string name="prompt_continue_connecting">Bağlanmaya devam etmek\nistediğinize emin misiniz?</string>
+  <string name="host_authenticity_warning">Anasistem \'%1$s\' in gerçekliği doğrulanamadı.</string>
+  <string name="host_fingerprint">Anasistem %1$s anahtar parmakizi %2$s</string>
+  <string name="alert_passwords_do_not_match_msg">Parolalar uyuşmuyor!</string>
+  <string name="alert_wrong_password_msg">Yanlış parola!</string>
+  <string name="button_resize">Yeniden boyutlandır</string>
+  <string name="alert_disconnect_msg">Bağlantı Kesildi</string>
+  <string name="pref_emulation_category">Uçbirim öykünümü</string>
+  <string name="pref_emulation_title">Öykünüm kipi</string>
+  <string name="pref_scrollback_title">Geri kaydırma boyu</string>
+  <string name="pref_scrollback_summary">Her bir konsol için bellekte tutulacak geri kaydırma arabellek boyu</string>
+  <string name="pref_ui_category">Kullanıcı arayüzü</string>
+  <string name="pref_fullscreen_title">Tüm ekran</string>
+  <string name="pref_fullscreen_summary">Konsolda iken durum çubuğunu gizle</string>
+  <string name="pref_keyboard_category">Klavye</string>
+  <string name="pref_memkeys_title">Anahtarları bellekte tut</string>
+  <string name="pref_memkeys_summary">Kilidi açılmış anahtarları arkadaki hizmetler sonlanana kadar bellekte tut</string>
+  <string name="pref_keymode_title">Dizin kısayolları</string>
+  <string name="pref_camera_title">Kamera kısayolu</string>
+  <string name="pref_keepalive_title">Ekranı açık tut</string>
+  <string name="pref_keepalive_summary">Bir konsolda çalışırken ekranın kapanmasını engelle</string>
+  <string name="pref_wifilock_title">Wi-Fi etkin tut</string>
+  <string name="pref_wifilock_summary">Bir oturum etkinken Wi-Fi kapanmasını engelle</string>
+  <string name="pref_bumpyarrows_title">dalgalı oklar</string>
+  <string name="pref_bell_category">Terminal zili</string>
+  <string name="pref_bell_title">Sesli zil</string>
+  <string name="pref_bell_volume_title">Zil ses düzeyi</string>
+  <string name="pref_bell_vibrate_title">Titreşim</string>
+  <string name="pref_bell_notification_title">Arkaplan uyarıları</string>
+  <string name="pref_bell_notification_summary">Arka planda çalışan terminal zil sesinde uyarı gönder</string>
+  <string name="list_keymode_right">Sağ taraftaki tuşları kullan</string>
+  <string name="list_keymode_left">Sol taraftaki tuşları kullan</string>
+  <string name="list_keymode_none">Devre Dışı Bırak</string>
+  <string name="list_pubkeyids_none">Tuşları kullanma</string>
+  <string name="list_pubkeyids_any">Herhangi bir tuşu kullan</string>
+  <string name="hostpref_nickname_title">Rumuz</string>
+  <string name="hostpref_color_title">Renk kategorisi</string>
+  <string name="hostpref_fontsize_title">Yazıtipi boyutu (pt)</string>
+  <string name="hostpref_pubkeyid_title">Umumi-anahtar doğrulaması yap</string>
+  <string name="hostpref_authagent_title">SSH auth agent teyidi kullan</string>
+  <string name="hostpref_postlogin_title">post-login otomasyonu</string>
+  <string name="hostpref_compression_title">Sıkıştırma</string>
+  <string name="hostpref_compression_summary">Yavaş ağlarda yardımcı olabilir</string>
+  <string name="hostpref_wantsession_title">Shell oturumu başlat</string>
+  <string name="hostpref_wantsession_summary">Sadece port yönlendirmeyi kullanmak için bu seçeneği boş bırakın</string>
+  <string name="hostpref_stayconnected_title">Bağlı kal</string>
+  <string name="hostpref_stayconnected_summary">Bağlantı koparsa tekrar bağlanmayı dene</string>
+  <string name="hostpref_delkey_title">DEL tuşu</string>
+  <string name="hostpref_encoding_title">Dil Kodlaması</string>
+  <string name="hostpref_username_title">Kullanıcı Adı</string>
+  <string name="hostpref_hostname_title">Sunucu</string>
+  <string name="hostpref_port_title">Port</string>
+  <string name="console_menu_close">Kapat</string>
+  <string name="console_menu_paste">Yapıştır</string>
+  <string name="console_menu_portforwards">Port Yönlendirmeleri</string>
+  <string name="console_menu_resize">Ebat zorunlu</string>
+  <string name="console_menu_urlscan">URL Tara</string>
+  <string name="button_yes">Evet</string>
+  <string name="button_no">Hayır</string>
+  <string name="portforward_local">Yerel</string>
+  <string name="portforward_remote">Uzak</string>
+  <string name="portforward_dynamic">Dinamik (SOCKS)</string>
+  <string name="portforward_pos">Port yönlendirmesi oluştur</string>
+  <string name="format_username">kullanıcı adı</string>
+  <string name="format_hostname">sunucu adı</string>
+  <string name="format_port">port</string>
+  <string name="list_menu_pubkeys">Umumi-anahtarlar Yönetimi</string>
+  <string name="list_menu_sortcolor">Rengine göre sırala</string>
+  <string name="list_menu_sortname">İsime göre sırala</string>
+  <string name="list_menu_settings">Ayarlar</string>
+  <string name="list_host_disconnect">Bağlantıyı kes</string>
+  <string name="list_host_edit">Sunucu düzenle</string>
+  <string name="list_host_portforwards">Port yönlendirmeleri düzenle</string>
+  <string name="list_host_delete">Sunucuyu sil</string>
+  <string name="list_camera_ctrlaspace">Ctrl+A ardından Boşluk</string>
+  <string name="list_camera_ctrla">Ctrl+A</string>
+  <string name="list_camera_esc">Esc</string>
+  <string name="list_camera_esc_a">Esc+A</string>
+  <string name="list_camera_none">Hiçbiri</string>
+  <string name="delete_message">\'%1$s\' silinecek onaylıyor musunuz?</string>
+  <string name="delete_pos">Evet, sil</string>
+  <string name="delete_neg">İptal Et</string>
+  <string name="terminal_connecting">%3$s ile %1$s:%2$d bağlanıyor</string>
+  <string name="terminal_sucess">Host doğrulaması \'%1$s\' anahtar: %2$s</string>
+  <string name="terminal_failed">Sunucu anahtarı doğrulaması başarısız oldu</string>
+  <string name="terminal_using_s2c_algorithm">Server-to-client s2c algoritması: %1$s %2$s</string>
+  <string name="terminal_using_c2s_algorithm">Client-to-server c2s algoritması: %1$s %2$s</string>
+  <string name="terminal_using_algorithm">Kullanılan algoritma: %1$s %2$s</string>
+  <string name="terminal_auth">Kimlik doğrulaması yapılıyor</string>
+  <string name="terminal_auth_pass">\'Şifre\' doğrulaması yapılıyor</string>
+  <string name="terminal_auth_pass_fail">Kimlik doğrulama \'şifre\' başarısız</string>
+  <string name="terminal_auth_pubkey_any">Bellekteki herhangi bir umumi-anahtar ile \'umumi-anahtar\' doğrulaması yapılıyor</string>
+  <string name="terminal_auth_pubkey_invalid">Seçilen umumi-anahtar geçersiz, host düzenleyicideki anahtarı tekrar seçerek deneyiniz</string>
+  <string name="terminal_auth_pubkey_specific">yerel umumi-anahtar specific public key ile \'publickey\' doğrulaması yapılıyor</string>
+  <string name="terminal_auth_pubkey_fail">Anahtar \'%1$s\' ile \'publickey\' doğrulama işlemi başarısız</string>
+  <string name="terminal_auth_ki">\'Klavyeden karşılıklı\' kimlik doğrulaması deneniyor</string>
+  <string name="terminal_auth_ki_fail">\'Klavyeden karşılıklı\' kimlik doğrulaması işlemi başarısız</string>
+  <string name="terminal_auth_fail">[Hostunuz \'şifre\' veya \'klavyeden karşılıklı\' kimlik doğrulamasını desteklemiyor.]</string>
+  <string name="terminal_no_session">Sunucu tercihleri sebebiyle oturum başlatılamıyor</string>
+  <string name="terminal_enable_portfoward">Port yönlendirmesini etkinleştir: %1$s</string>
+  <string name="local_shell_unavailable">Başarısız! Yerel shell bu telefonda kullanılamıyor.</string>
+  <string name="notification_text">%1$s sizi uyarıyor</string>
+  <string name="no">Hayır</string>
+  <string name="yes">Evet</string>
+  <string name="app_is_running">ConnectBot çalışıyor</string>
+  <string name="image_description_connected">Bağlandı.</string>
+  <string name="image_description_show_keyboard">Klavye göster.</string>
+  <string name="app_copyright" tools:machine_translated="true">Telif hakkı © Kenny Root</string>
+  <string name="title_eula" tools:machine_translated="true">Lisans</string>
+  <string name="pubkey_copy_private_openssh" tools:machine_translated="true">Özel anahtarı (OpenSSH) kopyala</string>
+  <string name="pubkey_copy_private_pem" tools:machine_translated="true">Özel anahtarı (PEM) kopyala</string>
+  <string name="pubkey_copy_private_encrypted" tools:machine_translated="true">Şifrelenmiş özel anahtarı kopyala</string>
+  <string name="pubkey_export_public" tools:machine_translated="true">Herkese açık anahtarı dışa aktar</string>
+  <string name="pubkey_export_private" tools:machine_translated="true">Özel anahtarı dışa aktar</string>
+  <string name="pubkey_export_private_openssh" tools:machine_translated="true">Özel anahtarı dışa aktar (OpenSSH)</string>
+  <string name="pubkey_export_private_pem" tools:machine_translated="true">Özel anahtarı dışa aktar (PEM)</string>
+  <string name="pubkey_export_private_encrypted" tools:machine_translated="true">Şifrelenmiş özel anahtarı dışa aktar</string>
+  <string name="pubkey_export_set_passphrase" tools:machine_translated="true">Anahtarı dışa aktarırken kullanılacak şifreyi ayarlayın.</string>
+  <string name="pubkey_export_passphrase_message" tools:machine_translated="true">Dışa aktarılan anahtarı şifrelemek için bir parola girin.</string>
+  <string name="pubkey_export_confirm_passphrase" tools:machine_translated="true">Şifreyi tekrar girerek onaylayın.</string>
+  <string name="pubkey_export_passphrase_mismatch" tools:machine_translated="true">Girilen parolalar eşleşmiyor.</string>
+  <string name="pubkey_import_encrypted_title" tools:machine_translated="true">Şifrelenmiş anahtarı içe aktar</string>
+  <string name="pubkey_import_encrypted_message" tools:machine_translated="true">İçe aktarılan anahtar dosyasının şifresini çözmek için lütfen şifreyi girin: \'%1$s\' (%2$s)</string>
+  <string name="pubkey_import_button" tools:machine_translated="true">İçe Aktar</string>
+  <string name="pubkey_import_encrypt_key" tools:machine_translated="true">Anahtarı şifreleyerek sakla</string>
+  <string name="pubkey_import_reuse_password" tools:machine_translated="true">Şifreleme için aynı parolayı kullanın</string>
+  <string name="pubkey_import_new_password" tools:machine_translated="true">Yeni parola</string>
+  <string name="pubkey_import_confirm_password" tools:machine_translated="true">Şifreyi tekrar girin</string>
+  <string name="pubkey_unlock_message" tools:machine_translated="true">Şifrelenmiş anahtar \'%1$s\'yi açmak için şifreyi girin.</string>
+  <string name="pubkey_nickname_exists" tools:machine_translated="true">Bu takma ada sahip bir anahtar zaten mevcut.</string>
+  <string name="prompt_username" tools:machine_translated="true">Kullanıcı adı:</string>
+  <string name="host_key_verification_title" tools:machine_translated="true">Ana bilgisayar anahtarı doğrulama</string>
+  <string name="fingerprint_format_header" tools:machine_translated="true">Parmak izi formatı</string>
+  <string name="host_key_type_and_size" tools:machine_translated="true">%1$s %2$d bit</string>
+  <string name="fingerprint_copy_description" tools:machine_translated="true">Parmak izini panoya kopyala</string>
+  <string name="network_lost_grace_period" tools:machine_translated="true">Ağ bağlantısı kesildi, yeniden bağlanmayı bekliyor…</string>
+  <string name="network_grace_period_expired" tools:machine_translated="true">Ağ yeniden bağlanmadı, bağlantı kesiliyor…</string>
+  <string name="network_restored_same_ip" tools:machine_translated="true">Ağ yeniden sağlandı, bağlantı devam ediyor.</string>
+  <string name="network_restored_ip_changed" tools:machine_translated="true">Ağ yeniden bağlandı ancak IP adresi değişti, yeniden bağlanılıyor…</string>
+  <string name="network_restored_no_previous_state" tools:machine_translated="true">Ağ yeniden bağlandı, bağlantı kontrol ediliyor…</string>
+  <string name="pref_fontfamily_title" tools:machine_translated="true">Yazı tipi</string>
+  <string name="pref_customfont_title" tools:machine_translated="true">Özel yazı tipi ekle</string>
+  <string name="pref_customfont_summary" tools:machine_translated="true">Google Fonts\'tan bir yazı tipini adına göre ekleyin.</string>
+  <string name="dialog_customfont_title" tools:machine_translated="true">Özel Yazı Tipi Ekle</string>
+  <string name="dialog_customfont_hint" tools:machine_translated="true">Google Fontlar\'daki yazı tipi adı (örneğin, Cascadia Code)</string>
+  <string name="button_add" tools:machine_translated="true">Ekle</string>
+  <string name="button_remove" tools:machine_translated="true">Kaldır</string>
+  <string name="font_validating" tools:machine_translated="true">Font doğrulanıyor…</string>
+  <string name="font_downloading" tools:machine_translated="true">Yazı tipi indiriliyor…</string>
+  <string name="pref_localfont_title" tools:machine_translated="true">Yerel yazı tipini içe aktar</string>
+  <string name="pref_localfont_summary" tools:machine_translated="true">Depolama alanından bir yazı tipi dosyası içe aktarın (TTF, OTF)</string>
+  <string name="dialog_localfont_title" tools:machine_translated="true">Fontu Yükle</string>
+  <string name="dialog_localfont_hint" tools:machine_translated="true">Yazı tipinin görünen adı</string>
+  <string name="button_import" tools:machine_translated="true">İçe Aktar</string>
+  <string name="font_importing" tools:machine_translated="true">Font dosyası yükleniyor…</string>
+  <string name="pref_backupkeys_title" tools:machine_translated="true">Herkese açık anahtarların yedeğini al</string>
+  <string name="pref_backupkeys_summary" tools:machine_translated="true">Android\'in yedekleme mekanizmasını kullanarak özel anahtarların yedeklerini saklayın.</string>
+  <string name="pref_language_title" tools:machine_translated="true">Dil</string>
+  <string name="pref_language_system_default" tools:machine_translated="true">Sistem varsayılanı</string>
+  <string name="pref_language_download" tools:machine_translated="true">Dil paketini indir</string>
+  <string name="pref_language_download_failed" tools:machine_translated="true">İndirme başarısız oldu, yeniden denemek için dokunun.</string>
+  <string name="pref_theme_title" tools:machine_translated="true">Tema</string>
+  <string name="pref_theme_system" tools:machine_translated="true">Sistem varsayılanı</string>
+  <string name="pref_theme_light" tools:machine_translated="true">Açık</string>
+  <string name="pref_theme_dark" tools:machine_translated="true">Koyu</string>
+  <string name="pref_titlebarhide_title" tools:machine_translated="true">Başlık çubuğunu otomatik olarak gizle</string>
+  <string name="pref_titlebarhide_summary" tools:machine_translated="true">Başlık çubuğunu göstermek ve menüye erişmek için konsola dokunun.</string>
+  <string name="pref_alwaysvisible_title" tools:machine_translated="true">Özel tuşlar her zaman görünür.</string>
+  <string name="pref_pg_updn_gesture_title" tools:machine_translated="true">Sayfa yukarı/aşağı kaydırma hareketi</string>
+  <string name="pref_pg_updn_gesture_summary" tools:machine_translated="true">Ekranın sol üçte birini kaydırarak, \"pg up/dn\" komutunu terminale gönderin.</string>
+  <string name="pref_shiftfkeys_title" tools:machine_translated="true">Shift+sayı tuşları, F tuşlarıdır.</string>
+  <string name="pref_shiftfkeys_summary" tools:machine_translated="true">Donanımsal klavyelerde sayı tuşları, Shift tuşuyla birlikte F1-F10 tuşlarını gönderir.</string>
+  <string name="pref_ctrlfkeys_title" tools:machine_translated="true">Ctrl tuşuyla birlikte kullanılan sayılar, F tuşlarıdır.</string>
+  <string name="pref_ctrlfkeys_summary" tools:machine_translated="true">Yazılım klavyelerinde sayı tuşlarına Ctrl tuşuyla birlikte basıldığında F1-F10 tuşları gönderilir.</string>
+  <string name="pref_volumefont_title" tools:machine_translated="true">Ses tuşları yazı tipi boyutunu değiştirir.</string>
+  <string name="pref_volumefont_summary" tools:machine_translated="true">Yazı tipi boyutu, profil ayarlarından da değiştirilebilir.</string>
+  <string name="pref_conn_persist_title" tools:machine_translated="true">Arka planda bağlantıyı sürdür.</string>
+  <string name="pref_conn_persist_summary" tools:machine_translated="true">Diğer uygulamalara geçseniz bile oturumlarınızı açık tutun.</string>
+  <string name="pref_stickymodifiers_title" tools:machine_translated="true">Sabit değiştiriciler</string>
+  <string name="only_alt" tools:machine_translated="true">Yalnızca Alt</string>
+  <string name="pref_bumpyarrows_summary" tools:machine_translated="true">Yön tuşlarına basıldığında titreşim; gecikmeli bağlantılarda kullanışlıdır.</string>
+  <string name="pref_bell_summary" tools:machine_translated="true">Terminal uyarısı etkinleştirildiğinde ses çal.</string>
+  <string name="pref_bell_vibrate_summary" tools:machine_translated="true">Terminal uyarısı olduğunda titreşim</string>
+  <string name="color_red" tools:machine_translated="true">Kırmızı</string>
+  <string name="color_pink" tools:machine_translated="true">Pembe</string>
+  <string name="color_purple" tools:machine_translated="true">Mor</string>
+  <string name="color_deep_purple" tools:machine_translated="true">Koyu Mor</string>
+  <string name="color_indigo" tools:machine_translated="true">Koyu mavi</string>
+  <string name="color_blue" tools:machine_translated="true">Mavi</string>
+  <string name="color_light_blue" tools:machine_translated="true">Açık Mavi</string>
+  <string name="color_cyan" tools:machine_translated="true">Camgöbeği</string>
+  <string name="color_teal" tools:machine_translated="true">Deniz yeşili</string>
+  <string name="color_green" tools:machine_translated="true">Yeşil</string>
+  <string name="color_light_green" tools:machine_translated="true">Açık Yeşil</string>
+  <string name="color_lime" tools:machine_translated="true">Limon yeşili</string>
+  <string name="color_yellow" tools:machine_translated="true">Sarı</string>
+  <string name="color_amber" tools:machine_translated="true">Krem rengi</string>
+  <string name="color_orange" tools:machine_translated="true">Turuncu</string>
+  <string name="color_gray" tools:machine_translated="true">Gri</string>
+  <string name="hostpref_fontfamily_title" tools:machine_translated="true">Yazı tipi</string>
+  <string name="hostpref_colorscheme_title" tools:machine_translated="true">Terminal renk teması</string>
+  <string name="hostpref_quickdisconnect_title" tools:machine_translated="true">Bağlantı kesildiğinde kapatma seçeneğini göster</string>
+  <string name="hostpref_quickdisconnect_summary" tools:machine_translated="true">Bağlantı kesildikten sonra herhangi bir uyarı göstermeden hemen kapatın.</string>
+  <string name="hostpref_save_password_summary" tools:machine_translated="true">Oturum açma parolasını güvenli bir şekilde saklayarak otomatik kimlik doğrulamayı etkinleştirin</string>
+  <string name="hostpref_password_title" tools:machine_translated="true">Şifre</string>
+  <string name="hostpref_password_unchanged" tools:machine_translated="true">Şifre (değiştirilmedi)</string>
+  <string name="hostpref_clear_password" tools:machine_translated="true">Kaydedilmiş parolayı sil</string>
+  <string name="hostpref_profile_title" tools:machine_translated="true">Profil</string>
+  <string name="hostpref_profile_summary" tools:machine_translated="true">Bir profil seçerek, o profilin terminal ayarlarını kullanabilirsiniz.</string>
+  <string name="hostpref_profile_none" tools:machine_translated="true">Hiçbiri (sunucu ayarlarını kullan)</string>
+  <string name="profile_controlled_setting" tools:machine_translated="true">Profil tarafından yönetiliyor.</string>
+  <string name="font_use_default" tools:machine_translated="true">Varsayılanı Kullan</string>
+  <string name="font_system_default" tools:machine_translated="true">Varsayılan (Sabit Genişlikli)</string>
+  <string name="pubkey_unknown" tools:machine_translated="true">Bilinmeyen anahtar</string>
+  <string name="colorscheme_default" tools:machine_translated="true">Varsayılan</string>
+  <string name="profile_editor_title_new" tools:machine_translated="true">Yeni Profil</string>
+  <string name="profile_editor_title_edit" tools:machine_translated="true">Profili Düzenle</string>
+  <string name="profile_editor_save" tools:machine_translated="true">Kaydet</string>
+  <string name="profile_editor_name_label" tools:machine_translated="true">Profil Adı</string>
+  <string name="profile_editor_section_icon_color" tools:machine_translated="true">Simge Rengi</string>
+  <string name="profile_editor_section_color_scheme" tools:machine_translated="true">Renk Şeması</string>
+  <string name="profile_editor_section_font" tools:machine_translated="true">Yazı Tipi</string>
+  <string name="profile_editor_section_terminal" tools:machine_translated="true">Terminal</string>
+  <string name="profile_editor_font_family_title" tools:machine_translated="true">Yazı Tipi Ailesi</string>
+  <string name="profile_editor_font_size_title" tools:machine_translated="true">Yazı Tipi Boyutu: %d</string>
+  <string name="profile_editor_force_size_title" tools:machine_translated="true">Kuvvet Boyutu</string>
+  <string name="profile_editor_force_size_summary" tools:machine_translated="true">Terminalin boyutunu otomatik olarak ekran boyutuna göre ayarlamak yerine, belirli bir boyuta (sütun x satır) zorla ayarlayın.</string>
+  <string name="profile_editor_force_size_enable" tools:machine_translated="true">Zorunlu boyutlandırma özelliğini etkinleştir</string>
+  <string name="profile_editor_force_size_columns" tools:machine_translated="true">Sütunlar</string>
+  <string name="profile_editor_force_size_rows" tools:machine_translated="true">Satırlar</string>
+  <string name="profile_icon_color_none" tools:machine_translated="true">Yok (ana bilgisayarın rengini kullan)</string>
+  <string name="profile_list_title" tools:machine_translated="true">Profiller</string>
+  <string name="profile_list_create_profile" tools:machine_translated="true">Yeni profil oluştur</string>
+  <string name="profile_list_empty_message" tools:machine_translated="true">Henüz profil oluşturulmamış. Bir profil oluşturmak için \"+\" işaretine dokunun.</string>
+  <string name="profile_list_more_options" tools:machine_translated="true">Daha fazla seçenek</string>
+  <string name="profile_list_duplicate" tools:machine_translated="true">Çoğalt</string>
+  <string name="profile_list_delete" tools:machine_translated="true">Sil</string>
+  <string name="profile_create_dialog_title" tools:machine_translated="true">Yeni Profil Oluştur</string>
+  <string name="profile_create_name_label" tools:machine_translated="true">Profil Adı</string>
+  <string name="profile_create_button" tools:machine_translated="true">Oluştur</string>
+  <string name="profile_create_cancel" tools:machine_translated="true">İptal et</string>
+  <string name="profile_delete_dialog_title" tools:machine_translated="true">Profili Sil</string>
+  <string name="profile_delete_dialog_message" tools:machine_translated="true">\'%s\' adlı profili silmek istediğinizden emin misiniz?</string>
+  <string name="profile_delete_button" tools:machine_translated="true">Sil</string>
+  <string name="profile_delete_cancel" tools:machine_translated="true">İptal et</string>
+  <string name="profile_summary_font" tools:machine_translated="true">Yazı tipi: %1$s %2$d punto</string>
+  <string name="profile_summary_emulation" tools:machine_translated="true">Emülasyon: %s</string>
+  <string name="console_menu_reconnect" tools:machine_translated="true">Yeniden bağlan</string>
+  <string name="console_url_no_handler" tools:machine_translated="true">Bu URL\'yi açabilecek bir uygulama bulunmuyor.</string>
+  <string name="console_url_not_supported" tools:machine_translated="true">Bu URL türü desteklenmiyor.</string>
+  <string name="portforward_save" tools:machine_translated="true">Kaydet</string>
+  <string name="list_menu_disconnect" tools:machine_translated="true">Tüm bağlantıları kes</string>
+  <string name="list_host_duplicate" tools:machine_translated="true">Seçili sunucuyu çoğalt</string>
+  <string name="list_host_forget_keys" tools:machine_translated="true">Kaydedilmiş ana bilgisayar anahtarlarını sil</string>
+  <string name="list_camera_text_input" tools:machine_translated="true">Metin Girişi</string>
+  <string name="disconnect_all_message" tools:machine_translated="true">Tüm bağlı sunuculardan bağlantıyı kesmek istediğinizden emin misiniz?</string>
+  <string name="disconnect_all_pos" tools:machine_translated="true">Evet, bağlantıyı kes</string>
+  <string name="disconnect_all_neg" tools:machine_translated="true">İptal Et</string>
+  <string name="terminal_kex_algorithm" tools:machine_translated="true">Anahtar değişim algoritması: %s</string>
+  <string name="terminal_auth_saved_password" tools:machine_translated="true">Kaydedilmiş parolayı kullanmaya çalışılıyor…</string>
+  <string name="terminal_auth_saved_password_fail" tools:machine_translated="true">Kaydedilmiş parola ile kimlik doğrulama başarısız oldu</string>
+  <string name="terminal_auth_biometric" tools:machine_translated="true">\'%1$s\' anahtarının kilidini açmak için biyometrik kimlik doğrulama işlemi başlatılıyor.</string>
+  <string name="terminal_auth_biometric_invalidated" tools:machine_translated="true">Biyometrik anahtar \'%1$s\' geçersiz hale getirildi. Bu, cihaza yeni parmak izleri kaydedildiğinde meydana gelebilir. Lütfen yeni bir anahtar oluşturun.</string>
+  <string name="title_scheme_manager" tools:machine_translated="true">Renk Şemalarını Yönet</string>
+  <string name="button_new_scheme" tools:machine_translated="true">Yeni Tema</string>
+  <string name="button_duplicate_scheme" tools:machine_translated="true">Kopyala</string>
+  <string name="button_delete_scheme" tools:machine_translated="true">Sil</string>
+  <string name="dialog_title_new_scheme" tools:machine_translated="true">Yeni Renk Şeması</string>
+  <string name="label_scheme_name" tools:machine_translated="true">Şema Adı</string>
+  <string name="label_scheme_description" tools:machine_translated="true">Açıklama (isteğe bağlı)</string>
+  <string name="dialog_title_delete_scheme" tools:machine_translated="true">Şemayı silmek istediğinizden emin misiniz?</string>
+  <string name="dialog_message_delete_scheme" tools:machine_translated="true">\"%1$s\" öğesini silmek istediğinizden emin misiniz? Bu işlem geri alınamaz.</string>
+  <string name="button_confirm" tools:machine_translated="true">Onayla</string>
+  <string name="button_cancel" tools:machine_translated="true">İptal Et</string>
+  <string name="label_built_in_scheme" tools:machine_translated="true">Yerleşik</string>
+  <string name="label_custom_scheme" tools:machine_translated="true">Özel</string>
+  <string name="empty_custom_schemes" tools:machine_translated="true">Özel şema bulunmuyor. Yeni bir şema oluşturmak için \"Yeni Şema\"ya dokunun.</string>
+  <string name="button_export_scheme" tools:machine_translated="true">Renk Şemasını Dışa Aktar</string>
+  <string name="button_import_scheme" tools:machine_translated="true">Şema İçeri Aktar</string>
+  <string name="message_export_success" tools:machine_translated="true">%1$s başarıyla dışa aktarıldı.</string>
+  <string name="message_import_success" tools:machine_translated="true">%1$s başarıyla içe aktarıldı.</string>
+  <string name="error_export_failed" tools:machine_translated="true">Şema dışa aktarımı başarısız oldu: %1$s</string>
+  <string name="error_import_failed" tools:machine_translated="true">Şema içe aktarımı başarısız oldu: %1$s</string>
+  <string name="error_invalid_json" tools:machine_translated="true">Geçersiz JSON dosyası</string>
+  <string name="title_palette_editor" tools:machine_translated="true">Renk Paleti Düzenle</string>
+  <string name="button_reset_all_colors" tools:machine_translated="true">Tümünü Sıfırla</string>
+  <string name="section_ansi_colors" tools:machine_translated="true">ANSI Renkleri (0–15)</string>
+  <string name="dialog_title_edit_color" tools:machine_translated="true">%1$d Numaralı Rengi Düzenle</string>
+  <string name="dialog_title_reset_all" tools:machine_translated="true">Tüm renkler sıfırlansın mı?</string>
+  <string name="dialog_message_reset_all" tools:machine_translated="true">Bu işlem, tüm 256 rengi varsayılan değerlerine döndürecektir. Bu işlem geri alınamaz.</string>
+  <string name="label_red" tools:machine_translated="true">Kırmızı</string>
+  <string name="label_green" tools:machine_translated="true">Yeşil</string>
+  <string name="label_blue" tools:machine_translated="true">Mavi</string>
+  <string name="label_hex_color" tools:machine_translated="true">Onaltılık Renk</string>
+  <string name="section_fg_bg_colors" tools:machine_translated="true">Ön Plan ve Arka Plan</string>
+  <string name="label_foreground_color" tools:machine_translated="true">Ön plan</string>
+  <string name="label_background_color" tools:machine_translated="true">Arka plan</string>
+  <string name="label_base_scheme" tools:machine_translated="true">Temel şema:</string>
+  <string name="menu_manage_colors" tools:machine_translated="true">Renk Şemalarını Yönet</string>
+  <string name="section_color_preview" tools:machine_translated="true">Önizleme</string>
+  <string name="image_description_disconnected" tools:machine_translated="true">Bağlantısı kesildi.</string>
+  <string name="image_description_toggle_control_character" tools:machine_translated="true">Kontrol karakterini değiştir.</string>
+  <string name="image_description_send_escape_character" tools:machine_translated="true">Kaçış karakteri gönder.</string>
+  <string name="image_description_send_tab_character" tools:machine_translated="true">TAB karakterini gönder.</string>
+  <string name="image_description_hide_keyboard" tools:machine_translated="true">Klavye görünümünü gizle.</string>
+  <string name="image_description_up" tools:machine_translated="true">Yukarı ok</string>
+  <string name="image_description_down" tools:machine_translated="true">Aşağı ok</string>
+  <string name="image_description_left" tools:machine_translated="true">Sol ok</string>
+  <string name="image_description_right" tools:machine_translated="true">Sağa bakan ok</string>
+  <string name="button_key_esc" tools:machine_translated="true">Esc</string>
+  <string name="button_key_ctrl" tools:machine_translated="true">Ctrl</string>
+  <string name="button_key_home" tools:machine_translated="true">Ana Sayfa</string>
+  <string name="button_key_end" tools:machine_translated="true">Bitti</string>
+  <string name="button_key_pgup" tools:machine_translated="true">Sayfa Yukarı</string>
+  <string name="button_key_pgdn" tools:machine_translated="true">Sayfa Aşağı</string>
+  <string name="button_key_f1" tools:machine_translated="true">F1</string>
+  <string name="button_key_f2" tools:machine_translated="true">F2</string>
+  <string name="button_key_f3" tools:machine_translated="true">F3</string>
+  <string name="button_key_f4" tools:machine_translated="true">F4</string>
+  <string name="button_key_f5" tools:machine_translated="true">F5</string>
+  <string name="button_key_f6" tools:machine_translated="true">F6</string>
+  <string name="button_key_f7" tools:machine_translated="true">F7</string>
+  <string name="button_key_f8" tools:machine_translated="true">F8</string>
+  <string name="button_key_f9" tools:machine_translated="true">F9</string>
+  <string name="button_key_f10" tools:machine_translated="true">F10</string>
+  <string name="button_key_f11" tools:machine_translated="true">F11</string>
+  <string name="button_key_f12" tools:machine_translated="true">F12</string>
+  <string name="terminal_keyboard_text_input_button" tools:machine_translated="true">Metin girişi</string>
+  <string name="terminal_text_input_dialog_title" tools:machine_translated="true">Metin Girişi</string>
+  <string name="terminal_text_input_dialog_label" tools:machine_translated="true">Terminal\'e göndermek istediğiniz metni girin.</string>
+  <string name="terminal_text_input_resize_handle" tools:machine_translated="true">Boyutunu değiştir</string>
+  <string name="console_menu_text_input" tools:machine_translated="true">Metin girişi</string>
+  <string name="button_send" tools:machine_translated="true">Gönder</string>
+  <string name="button_ok" tools:machine_translated="true">Tamam</string>
+  <string name="button_close" tools:machine_translated="true">Kapat</string>
+  <string name="button_back" tools:machine_translated="true">Geri</string>
+  <string name="button_navigate_up" tools:machine_translated="true">Yukarı kaydır</string>
+  <string name="button_more_options" tools:machine_translated="true">Daha fazla seçenek</string>
+  <string name="button_host_options" tools:machine_translated="true">Ev sahibi seçenekleri</string>
+  <string name="button_collapse" tools:machine_translated="true">Daralt</string>
+  <string name="error_key_load_failed" tools:machine_translated="true">\'%1$s\' anahtarını yükleme işlemi başarısız oldu: %2$s</string>
+  <string name="error_connection_failed" tools:machine_translated="true">%1$s (%2$s) adresine bağlanırken bir hata oluştu: %3$s</string>
+  <string name="error_port_forward_load_failed" tools:machine_translated="true">%1$s için port yönlendirme ayarları yüklenirken bir hata oluştu: %2$s</string>
+  <string name="error_host_save_failed" tools:machine_translated="true">%1$s ana bilgisayarının yapılandırmasını kaydetme işlemi başarısız oldu: %2$s</string>
+  <string name="error_color_scheme_load_failed" tools:machine_translated="true">Renk şeması yüklenemedi: %s</string>
+  <string name="host_duplicate_nickname" tools:machine_translated="true">%1$s (kopyası)</string>
+  <string name="empty_hosts_message" tools:machine_translated="true">Henüz hiçbir ana bilgisayar yapılandırılmadı.</string>
+  <string name="empty_pubkeys_message" tools:machine_translated="true">Anahtar bulunamadı.</string>
+  <string name="empty_port_forwards_message" tools:machine_translated="true">Herhangi bir ana bilgisayar için port yönlendirme yapılandırılmamış.</string>
+  <string name="empty_urls_message" tools:machine_translated="true">Terminal arabelleğinde URL bulunamadı.</string>
+  <string name="console_default_title" tools:machine_translated="true">Konsol</string>
+  <string name="host_editor_show_advanced" tools:machine_translated="true">Gelişmiş seçenekleri göster</string>
+  <string name="host_editor_hide_advanced" tools:machine_translated="true">Gelişmiş seçenekleri gizle</string>
+  <string name="resize_width_label" tools:machine_translated="true">Genişlik (sütun)</string>
+  <string name="resize_height_label" tools:machine_translated="true">Yükseklik (satır)</string>
+  <string name="resize_disable_force_size" tools:machine_translated="true">Zorunlu boyutlandırmayı devre dışı bırak</string>
+  <string name="pubkey_editor_key_type_label" tools:machine_translated="true">Anahtar türü</string>
+  <string name="pubkey_editor_options_label" tools:machine_translated="true">Seçenekler</string>
+  <string name="pubkey_editor_encrypted_startup_warning" tools:machine_translated="true">Şifrelenmiş anahtarlar, sistem başlangıcında açılamaz.</string>
+  <string name="pubkey_type_label" tools:machine_translated="true">Tür: %s</string>
+  <string name="pubkey_encrypted_description" tools:machine_translated="true">Şifrelenmiş</string>
+  <string name="pubkey_not_encrypted_description" tools:machine_translated="true">Şifrelenmemiş</string>
+  <string name="pubkey_biometric_protection" tools:machine_translated="true">Parmak iziyle koruma</string>
+  <string name="pubkey_biometric_description" tools:machine_translated="true">Bu anahtarı parmak izinizle koruyun</string>
+  <string name="pubkey_biometric_not_enrolled" tools:machine_translated="true">Parmak izi kaydı bulunamadı. Bu özelliği kullanmak için cihaz ayarlarından parmak izi kaydı yapın.</string>
+  <string name="pubkey_biometric_key_type_warning" tools:machine_translated="true">Parmak izi koruması yalnızca RSA ve EC anahtarları için kullanılabilir.</string>
+  <string name="pubkey_biometric_prompt_title" tools:machine_translated="true">Anahtarı kullanmak için kimliğinizi doğrulayın</string>
+  <string name="pubkey_biometric_prompt_subtitle" tools:machine_translated="true">\'%1$s\' cihazının kilidini açmak için parmak izi sensörüne dokunun.</string>
+  <string name="pubkey_biometric_description_icon" tools:machine_translated="true">Parmak izi ile korunan</string>
+  <string name="pubkey_biometric_not_available" tools:machine_translated="true">Parmak izi kimlik doğrulaması şu anda kullanılamıyor.</string>
+  <string name="portforward_nickname_placeholder" tools:machine_translated="true">Dahili Web Sunucusu</string>
+  <string name="portforward_port_range_error" tools:machine_translated="true">Port numarası 1 ile 65535 arasında olmalıdır.</string>
+  <string name="portforward_destination_placeholder" tools:machine_translated="true">localhost:80</string>
+  <string name="portforward_destination_format_error" tools:machine_translated="true">Format şu şekilde olmalıdır: ana bilgisayar:port (örneğin, localhost:80)</string>
+  <string name="portforward_host_address" tools:machine_translated="true">Ana bilgisayar adresi</string>
+  <string name="portforward_source_addr_localhost" tools:machine_translated="true">Yerel ana bilgisayar</string>
+  <string name="portforward_source_addr_localhost_ipv4" tools:machine_translated="true">Yerel ağ (yalnızca IPv4)</string>
+  <string name="portforward_source_addr_localhost_ipv6" tools:machine_translated="true">Yerel ağ (yalnızca IPv6)</string>
+  <string name="portforward_source_addr_all" tools:machine_translated="true">Tüm adresler</string>
+  <string name="portforward_source_addr_all_ipv4" tools:machine_translated="true">Tüm IPv4 adresleri</string>
+  <string name="portforward_source_addr_all_ipv6" tools:machine_translated="true">Tüm IPv6 adresleri</string>
+  <string name="portforward_source_addr_specific" tools:machine_translated="true">Belirli adres</string>
+  <string name="portforward_source_addr_specific_placeholder" tools:machine_translated="true">192.168.1.1</string>
+  <string name="portforward_type_label" tools:machine_translated="true">Tür: %s</string>
+  <string name="portforward_enable" tools:machine_translated="true">Etkinleştir</string>
+  <string name="portforward_disable" tools:machine_translated="true">Devre dışı bırak</string>
+  <string name="portforward_enabled" tools:machine_translated="true">Port yönlendirme etkinleştirildi</string>
+  <string name="portforward_disabled" tools:machine_translated="true">Port yönlendirme devre dışı bırakıldı.</string>
+  <string name="protocol_spinner_label" tools:machine_translated="true">Protokol</string>
+  <string name="expand" tools:machine_translated="true">Genişlet</string>
+  <string name="hostpref_authagent_with_confirmation" tools:machine_translated="true">onay gerektirir</string>
+  <string name="hostpref_add_host" tools:machine_translated="true">Yeni ana bilgisayar ekle</string>
+  <string name="hostpref_save_host" tools:machine_translated="true">Mevcut sunucuyu kaydet</string>
+  <string name="hostpref_setting_title" tools:machine_translated="true">Ev sahibi ayarları</string>
+  <string name="pubkey_import_existing" tools:machine_translated="true">Mevcut genel anahtarı içe aktar</string>
+  <string name="pubkey_import_from_clipboard" tools:machine_translated="true">Panodan aktar</string>
+  <string name="pubkey_import_clipboard_key_label" tools:machine_translated="true">Özel anahtar içeriği</string>
+  <string name="pubkey_paste_from_clipboard" tools:machine_translated="true">Panoya kopyalananı yapıştır</string>
+  <string name="notification_permission_title" tools:machine_translated="true">Arka planda bağlantıda kalın.</string>
+  <string name="notification_permission_message" tools:machine_translated="true">ConnectBot’un, uygulamalar arasında geçiş yaparken bağlantılarınızın aktif kalması için bildirim iznine ihtiyacı vardır. Bu izin verilmezse, sistem pil ömrünü korumak için bağlantılarınızı kesebilir.</string>
+  <string name="grant_permission" tools:machine_translated="true">İzin Ver</string>
+  <string name="connect_anyway" tools:machine_translated="true">Yine de bağlanın</string>
+  <string name="notification_permission_denied_title" tools:machine_translated="true">Bildirim izni gerekiyor</string>
+  <string name="notification_permission_denied_message" tools:machine_translated="true">Arka planda bağlantılarınızın aktif kalmasını sağlamak için lütfen sistem ayarlarında ConnectBot için bildirimleri etkinleştirin.</string>
+  <string name="open_settings" tools:machine_translated="true">Ayarları aç</string>
+  <string name="notification_permission_denied_snackbar" tools:machine_translated="true">Bildirim izni verilmezse bağlantılar kesilebilir.</string>
+  <string name="notification_permission_console_warning" tools:machine_translated="true">Arka planda bağlantı kesilebilir.</string>
+  <string name="terminal_no_route" tools:machine_translated="true">Yerel bir sunucuya erişmeye mi çalışıyorsunuz? Yerel ağ izinlerini verin.</string>
+  <string name="loading_message" tools:machine_translated="true">Yükleniyor…</string>
+  <string name="migration_checking" tools:machine_translated="true">Veritabanı kontrol ediliyor…</string>
+  <string name="migration_title" tools:machine_translated="true">Veritabanı Aktarılıyor</string>
+  <string name="migration_warning" tools:machine_translated="true">Lütfen geçiş işlemi sırasında uygulamayı kapatmayın.</string>
+  <string name="migration_stats_hosts" tools:machine_translated="true">Taşınan sunucu sayısı: %d</string>
+  <string name="migration_stats_pubkeys" tools:machine_translated="true">Taşınan SSH anahtarı sayısı: %d</string>
+  <string name="migration_stats_port_forwards" tools:machine_translated="true">Yeniden yönlendirilen port sayısı: %d</string>
+  <string name="migration_stats_known_hosts" tools:machine_translated="true">Geçirilmiş bilinen ana bilgisayar sayısı: %d</string>
+  <string name="migration_failed_title" tools:machine_translated="true">Geçiş Başarısız Oldu</string>
+  <string name="migration_failed_message" tools:machine_translated="true">Veritabanı geçişi sırasında bir hata oluştu: %s</string>
+  <string name="migration_retry" tools:machine_translated="true">Yeniden Dene</string>
+  <string name="migration_failed_help" tools:machine_translated="true">Sorun devam ederse, lütfen bu sorunu %1$s adresinde bildirin ve yukarıda kopyalanan hata ayıklama günlüğünü ekleyin.</string>
+  <string name="migration_warnings_title" tools:machine_translated="true">Veritabanı Geçişi Hakkındaki Uyarılar</string>
+  <string name="migration_copy_warnings" tools:machine_translated="true">Uyarıları Kopyala</string>
+  <string name="migration_debug_log_title" tools:machine_translated="true">Hata Ayıklama Günlüğü</string>
+  <string name="migration_copy_debug_log" tools:machine_translated="true">Hata Ayıklama Kaydını Kopyala</string>
+  <string name="disconnect_host_alert" tools:machine_translated="true">\'%1$s\' adresinden bağlantıyı kesmek istediğinizden emin misiniz?</string>
+  <string name="delete_host_confirm" tools:machine_translated="true">\'%1$s\' adlı ana bilgisayarı silmek istediğinizden emin misiniz?</string>
+  <string name="forget_host_keys_confirm" tools:machine_translated="true">\'%1$s\' için saklanan ana bilgisayar anahtarlarını silmek istediğinizden emin misiniz? Bir sonraki bağlantıda ana bilgisayar anahtarının doğrulanması istenecektir.</string>
+  <string name="list_pubkey_edit" tools:machine_translated="true">Herkese açık anahtarı düzenle</string>
+  <string name="hostpref_ipversion_title" tools:machine_translated="true">IP sürümü</string>
+  <string name="ipversion_auto" tools:machine_translated="true">Otomatik</string>
+  <string name="ipversion_ipv4" tools:machine_translated="true">Yalnızca IPv4</string>
+  <string name="ipversion_ipv6" tools:machine_translated="true">Yalnızca IPv6</string>
+  <string name="hostpref_jumphost_title" tools:machine_translated="true">Atlama sunucusu (ProxyJump)</string>
+  <string name="hostpref_jumphost_summary" tools:machine_translated="true">Başka bir SSH sunucusu üzerinden bağlanın</string>
+  <string name="list_jumphost_none" tools:machine_translated="true">Yok (doğrudan bağlantı)</string>
+  <string name="terminal_connecting_via_jump" tools:machine_translated="true">Ara sunucu üzerinden bağlantı kuruluyor: %s</string>
+  <string name="terminal_jump_connected" tools:machine_translated="true">Ara sunucuya bağlandı: %s</string>
+  <string name="terminal_jump_authenticated" tools:machine_translated="true">Uzak sunucuya başarılı bir şekilde bağlanıldı: %s</string>
+  <string name="terminal_jump_failed" tools:machine_translated="true">%1$s adlı atlama sunucusuna bağlanılamadı: %2$s</string>
+  <string name="terminal_jump_auth_failed" tools:machine_translated="true">Atlama sunucusunda kimlik doğrulama başarısız oldu: %s</string>
+  <string name="terminal_jump_not_found" tools:machine_translated="true">Kaydedilmiş hostlar arasında jump host bulunamadı.</string>
+  <string name="terminal_jump_password" tools:machine_translated="true">Uzak sunucu için şifre: %s:</string>
+  <string name="view_logs" tools:machine_translated="true">Günlükleri Görüntüle</string>
+  <string name="logs_title" tools:machine_translated="true">Uygulama Günlükleri</string>
+  <string name="copy_logs" tools:machine_translated="true">Günlükleri Kopyala</string>
+  <string name="logs_copied" tools:machine_translated="true">Günlükler panoya kopyalandı.</string>
+  <string name="logs_bug_report_info" tools:machine_translated="true">Bir hatayı bildirmek için, bu günlükleri kopyalayın ve https://connectbot.org/bug adresinde yeni bir sorun kaydı oluşturun.</string>
+  <string name="no_logs_available" tools:machine_translated="true">Kayıt bulunamadı.</string>
+  <string name="help_section_about" tools:machine_translated="true">Hakkında</string>
+  <string name="title_contact" tools:machine_translated="true">İletişim ve Destek</string>
+  <string name="help_section_contact" tools:machine_translated="true">İletişim ve Destek</string>
+  <string name="help_website" tools:machine_translated="true">Web sitesi</string>
+  <string name="help_github" tools:machine_translated="true">Kaynak Kodu</string>
+  <string name="help_report_bug" tools:machine_translated="true">Bir Hatayı Bildirin</string>
+  <string name="help_section_donate" tools:machine_translated="true">Geliştirme Çalışmalarına Destek Verin</string>
+  <string name="help_donate_github" tools:machine_translated="true">GitHub Sponsorları</string>
+  <string name="help_donate_coffee" tools:machine_translated="true">Bana bir kahve ısmarlayın.</string>
+  <string name="colorscheme_default_description" tools:machine_translated="true">Varsayılan terminal renkleri</string>
+  <string name="colorscheme_solarized_dark_description" tools:machine_translated="true">Makine ve insanlar için hassas renkler</string>
+  <string name="colorscheme_solarized_light_description" tools:machine_translated="true">Açık renkli arka plana sahip Solarized teması.</string>
+  <string name="colorscheme_dracula_description" tools:machine_translated="true">Terminal için koyu renkli bir tema.</string>
+  <string name="colorscheme_nord_description" tools:machine_translated="true">Arktik, kuzeye dönük mavimsi bir renk paleti</string>
+  <string name="colorscheme_gruvbox_dark_description" tools:machine_translated="true">Retro tarzı renk teması</string>
+  <string name="colorscheme_monokai_description" tools:machine_translated="true">Sublime Text\'ten esinlenilerek oluşturulan tema</string>
+  <string name="colorscheme_tomorrow_night_description" tools:machine_translated="true">Temiz ve kullanışlı bir koyu tema</string>
+  <string name="pref_profiles_category" tools:machine_translated="true">Profiller</string>
+  <string name="pref_default_profile_title" tools:machine_translated="true">Varsayılan Profil</string>
+  <string name="pref_default_profile_none" tools:machine_translated="true">Yok (ana bilgisayar ayarlarını kullan)</string>
+  <string name="pref_alwaysvisible_summary" tools:machine_translated="true">Özel tuşları her zaman görünür durumda tutun</string>
+  <string name="pref_customterminal_title" tools:machine_translated="true">Özel Terminal Türleri</string>
+  <string name="pref_customterminal_summary" tools:machine_translated="true">Uzak sunucular için özel TERM değerleri ekleyin.</string>
+  <string name="dialog_customterminal_title" tools:machine_translated="true">Özel Terminal Türü Ekle</string>
+  <string name="dialog_customterminal_hint" tools:machine_translated="true">Terminal türü (örneğin, rxvt-unicode)</string>
+  <string name="dialog_custom_value_label" tools:machine_translated="true">Özel değeri girin</string>
+  <string name="list_camera_ctrlaspace_description" tools:machine_translated="true">Ctrl+A, ardından Boşluk tuşu</string>
+  <string name="list_camera_ctrla_description" tools:machine_translated="true">Ctrl+A</string>
+  <string name="list_camera_esc_description" tools:machine_translated="true">Esc</string>
+  <string name="list_camera_esc_a_description" tools:machine_translated="true">Esc+A</string>
+  <string name="list_camera_none_description" tools:machine_translated="true">Yok</string>
+  <string name="list_camera_text_input_description" tools:machine_translated="true">Metin girişi</string>
+  <string name="list_menu_export_hosts" tools:machine_translated="true">Tüm Ana Bilgisayarları Dışa Aktar</string>
+  <string name="list_menu_import_hosts" tools:machine_translated="true">Ana Bilgisayarları İçe Aktar</string>
+  <string name="export_hosts_success" tools:machine_translated="true">%1$d sayıda ana bilgisayar ve %2$d sayıda profil dışa aktarıldı.</string>
+  <string name="import_hosts_success" tools:machine_translated="true">%1$d sayıda ana bilgisayar (%2$d adet atlandı) ve %3$d sayıda profil (%4$d adet atlandı) başarıyla içe aktarıldı.</string>
+  <string name="export_hosts_failed" tools:machine_translated="true">Ana makinelerin dışa aktarılması başarısız oldu: %s</string>
+  <string name="import_hosts_failed" tools:machine_translated="true">Ana bilgisayarların içe aktarılması başarısız oldu: %s</string>
+  <string name="shortcut_customize_title" tools:machine_translated="true">Kısayol Simgesini Özelleştir</string>
+  <string name="shortcut_icon_color" tools:machine_translated="true">Simge Rengi</string>
+  <string name="shortcut_icon_style" tools:machine_translated="true">Simge Stili</string>
+  <string name="shortcut_use_host_color" tools:machine_translated="true">Ana bilgisayarın yapılandırılmış rengini kullan</string>
+  <string name="shortcut_create" tools:machine_translated="true">Kısayol Oluştur</string>
+  <string name="icon_style_terminal" tools:machine_translated="true">Terminal</string>
+  <string name="icon_style_server" tools:machine_translated="true">Sunucu</string>
+  <string name="icon_style_cloud" tools:machine_translated="true">Bulut</string>
+  <string name="icon_style_key" tools:machine_translated="true">Anahtar</string>
+  <string name="pref_auth_on_launch_title" tools:machine_translated="true">Uygulama başlatıldığında kimlik doğrulama</string>
+  <string name="pref_auth_on_launch_summary" tools:machine_translated="true">Uygulamayı açarken parmak izi, yüz tanıma veya cihaz PIN\'i gerektir.</string>
+  <string name="pref_security_category" tools:machine_translated="true">Güvenlik</string>
+  <string name="auth_screen_title" tools:machine_translated="true">ConnectBot kilitlendi</string>
+  <string name="auth_screen_unlock_button" tools:machine_translated="true">Kilidini açmak için dokunun.</string>
+  <string name="auth_prompt_title" tools:machine_translated="true">ConnectBot\'un kilidini açın</string>
+  <string name="auth_prompt_subtitle" tools:machine_translated="true">Devam etmek için kimliğinizi doğrulayın</string>
+  <string name="auth_banner_title" tools:machine_translated="true">%1$s\'den gelen kimlik doğrulama mesajı</string>
+  <string name="terminal_auth_banner_header" tools:machine_translated="true">[%1$s] Kimlik doğrulama mesajı:</string>
+  <string name="pref_imetogglekey_title" tools:machine_translated="true">IME geçiş tuşunu göster</string>
+  <string name="pref_imetogglekey_summary" tools:machine_translated="true">Özel tuşlar satırına, bileşim arabelleği gerektiren diller (Japonca, Çince, Korece vb.) için bileşim modunu etkinleştiren bir IME düğmesi ekleyin.</string>
+  <string name="pref_ime_shortcut_mode_title" tools:machine_translated="true">Tam IME için Ctrl/Alt kısayolları</string>
+  <string name="pref_ime_shortcut_mode_disabled" tools:machine_translated="true">Herhangi bir geçici çözüm bulunmuyor.</string>
+  <string name="pref_ime_shortcut_mode_type_null" tools:machine_translated="true">Ham anahtar olayları</string>
+  <string name="pref_ime_shortcut_mode_force_ascii" tools:machine_translated="true">ASCII\'yi zorla etkinleştir (önerilir)</string>
+  <string name="pref_swipe_sessions_title" tools:machine_translated="true">Oturumlar arasında kaydırarak geçiş yapın.</string>
+  <string name="pref_swipe_sessions_summary" tools:machine_translated="true">Terminal oturumları arasında geçiş yapmak için yatay kaydırma özelliğini etkinleştirin. Erişilebilirlik için varsayılan olarak devre dışıdır.</string>
+  <string name="console_switch_session" tools:machine_translated="true">Oturumu değiştir</string>
+  <string name="console_previous_session" tools:machine_translated="true">Önceki oturum</string>
+  <string name="console_next_session" tools:machine_translated="true">Sonraki oturum</string>
+  <string name="button_key_alt" tools:machine_translated="true">Alt</string>
+  <string name="image_description_toggle_alt_key" tools:machine_translated="true">Alt tuşunu etkinleştir/devre dışı bırak.</string>
+  <string name="button_key_ime" tools:machine_translated="true">IME</string>
+  <string name="image_description_toggle_compose_mode" tools:machine_translated="true">Sanal klavyedeki IME giriş alanı için kompozisyon modunu etkinleştir/devre dışı bırak.</string>
+  <string name="console_menu_compose_mode" tools:machine_translated="true">Kompozisyon modu (IME)</string>
+  <string name="hostpref_profile_edit" tools:machine_translated="true">Seçili profili düzenle</string>
+  <string name="terminal_mosh_installing" tools:machine_translated="true">Mosh desteği hazırlanıyor...</string>
+  <string name="terminal_mosh_starting" tools:machine_translated="true">Mosh bağlantısı başlatılıyor...</string>
+  <string name="terminal_mosh_install_timeout" tools:machine_translated="true">Uyarı: Mosh kurulumu zaman aşımına uğradı.</string>
+  <string name="terminal_mosh_launching_server" tools:machine_translated="true">Uzak sunucuda mosh-server başlatılıyor...</string>
+  <string name="terminal_mosh_server_failed" tools:machine_translated="true">Uzak sunucuda mosh-server başlatılamadı.</string>
+  <string name="terminal_mosh_client_failed" tools:machine_translated="true">mosh istemcisi başlatılamadı.</string>
+  <string name="terminal_mosh_connected" tools:machine_translated="true">Mosh bağlantısı kuruldu.</string>
+  <string name="terminal_mosh_error" tools:machine_translated="true">Mosh hatası: %1$s</string>
+  <string name="hostpref_mosh_server_title" tools:machine_translated="true">Mosh sunucu komutu</string>
+  <string name="hostpref_mosh_server_summary" tools:machine_translated="true">Özel mosh sunucu yolu veya komutu (varsayılanı kullanmak için boş bırakın).</string>
+  <string name="hostpref_mosh_port_title" tools:machine_translated="true">Mosh UDP bağlantı noktası</string>
+  <string name="hostpref_mosh_port_summary" tools:machine_translated="true">Mosh için sabit bir UDP bağlantı noktası (otomatik olarak 60000-61000 aralığında çalışması için 0 girin).</string>
+  <string name="hostpref_locale_title" tools:machine_translated="true">Yerel Ayar</string>
+  <string name="hostpref_locale_summary" tools:machine_translated="true">Mosh oturumu için kullanılacak yerel ayar (örneğin, en_US.UTF-8).</string>
+  <string name="mosh_feature_title" tools:machine_translated="true">Mosh desteği sağlayan dinamik özellik modülünün başlığı</string>
+  <string name="pref_mosh_release_title" tools:machine_translated="true">Mosh sürümü ve kaynak kodu</string>
+  <string name="pref_mosh_installing" tools:machine_translated="true">Mosh desteği hazırlanıyor...</string>
+  <string name="editor_discard_changes_title" tools:machine_translated="true">Değişiklikleri kaydetmeden çıkmak istiyor musunuz?</string>
+  <string name="editor_discard_changes_message" tools:machine_translated="true">Kaydetmeden çıkarsanız, yaptığınız değişiklikler kaybolacaktır.</string>
+  <string name="editor_discard" tools:machine_translated="true">Kaydetmeden çıkış yap</string>
+  <string name="editor_save" tools:machine_translated="true">Kaydet</string>
+  <string name="import_json_file_too_large" tools:machine_translated="true">İçe aktarılmak istenen JSON dosyası çok büyük (maksimum 8 MB).</string>
+  <string name="import_file_unavailable" tools:machine_translated="true">Seçilen dosya açılamıyor.</string>
+  <string name="profile_inline_images" tools:machine_translated="true">Satır İçi Görüntüler</string>
+  <string name="inline_images_off" tools:machine_translated="true">Kapalı</string>
+  <string name="inline_images_ask" tools:machine_translated="true">Sor</string>
+  <string name="inline_images_on" tools:machine_translated="true">Açık</string>
+  <string name="inline_images_prompt_title" tools:machine_translated="true">Satır içi resimleri gösterilsin mi?</string>
+  <string name="inline_images_prompt_message" tools:machine_translated="true">Bu oturumun geri kalanında bu ana bilgisayarın satır içi görüntüleri göstermesine izin verilsin mi?</string>
+  <string name="automation_load_failed" tools:machine_translated="true">Otomasyon yüklenemedi.</string>
+  <string name="automation_save_failed" tools:machine_translated="true">Otomasyon kaydedilemedi.</string>
+  <string name="automation_invalid_action" tools:machine_translated="true">Metni, deseni, süreyi veya seçilen bağlantı noktası yönlendirmesini kontrol edin.</string>
+  <string name="automation_action_failed" tools:machine_translated="true">İşlem başarısız oldu.</string>
+  <string name="automation_timed_out" tools:machine_translated="true">Belirlenen süre içinde metin gelmediği için işlem başarısız oldu.</string>
+  <string name="automation_buffer_overflow" tools:machine_translated="true">Otomasyonun işleyebileceğinden daha fazla veri geldi.</string>
+  <string name="automation_no_session" tools:machine_translated="true">Bu işlem için açık bir terminal oturumu gereklidir.</string>
+  <string name="automation_forward_missing" tools:machine_translated="true">Bağlantı noktası yönlendirmesi eksik.</string>
+  <string name="automation_forward_unsupported" tools:machine_translated="true">Bu bağlantı, port yönlendirmeyi desteklemiyor.</string>
+  <string name="automation_wait_text" tools:machine_translated="true">Dize için bekleyin.</string>
+  <string name="automation_send_text" tools:machine_translated="true">Dizeyi gönder</string>
+  <string name="automation_send_key" tools:machine_translated="true">Özel tuşu gönder</string>
+  <string name="automation_delay" tools:machine_translated="true">Bekle</string>
+  <string name="automation_disconnect" tools:machine_translated="true">Bağlantıyı Kes</string>
+  <string name="automation_enable_forward" tools:machine_translated="true">Port yönlendirmesini etkinleştir</string>
+  <string name="automation_disable_forward" tools:machine_translated="true">Port yönlendirmeyi devre dışı bırak</string>
+  <string name="automation_add" tools:machine_translated="true">İşlem ekle</string>
+  <string name="automation_save" tools:machine_translated="true">Kaydet</string>
+  <string name="automation_edit" tools:machine_translated="true">Düzenle</string>
+  <string name="automation_delete" tools:machine_translated="true">Sil</string>
+  <string name="automation_move_up" tools:machine_translated="true">Yukarı taşı</string>
+  <string name="automation_move_down" tools:machine_translated="true">Aşağı kaydır</string>
+  <string name="automation_drag" tools:machine_translated="true">Sırayı değiştirmek için sürükleyin.</string>
+  <string name="automation_cancel" tools:machine_translated="true">İptal et</string>
+  <string name="automation_text" tools:machine_translated="true">Metin</string>
+  <string name="automation_regex" tools:machine_translated="true">Düzenli ifade</string>
+  <string name="automation_regex_help" tools:machine_translated="true">Gelen metni, ANSI biçimlendirmesi olmadan eşleştirir. Düzenli ifade (regex), RE2 sözdizimini destekler; ileriye dönük ve geriye dönük referanslar desteklenmez.</string>
+  <string name="automation_duration" tools:machine_translated="true">Süre (saniye)</string>
+  <string name="automation_timeout" tools:machine_translated="true">Zaman Aşımı (saniye)</string>
+  <string name="automation_key" tools:machine_translated="true">Anahtar</string>
+  <string name="automation_forward" tools:machine_translated="true">Bağlantı yönlendirme</string>
+  <string name="automation_failure" tools:machine_translated="true">Başarısızlık durumunda</string>
+  <string name="automation_stop" tools:machine_translated="true">Otomasyonu durdurun.</string>
+  <string name="automation_continue" tools:machine_translated="true">Devam et</string>
+  <string name="automation_save_host" tools:machine_translated="true">Otomasyon ayarlarını yapmak için sunucuyu kaydedin.</string>
+  <string name="automation_progress" tools:machine_translated="true">Otomasyon: %1$d / %2$d</string>
+  <string name="automation_failure_step" tools:machine_translated="true">İşlem %1$d: %2$s</string>
+  <string name="automation_cancel_run" tools:machine_translated="true">Otomasyonu iptal et</string>
+  <string name="automation_key_enter" tools:machine_translated="true">Giriş yapın</string>
+  <string name="automation_key_tab" tools:machine_translated="true">Sekme</string>
+  <string name="automation_key_escape" tools:machine_translated="true">Çıkış</string>
+  <string name="automation_key_backspace" tools:machine_translated="true">Geri Tuşu</string>
+  <string name="automation_key_delete" tools:machine_translated="true">Sil</string>
+  <string name="automation_key_up" tools:machine_translated="true">Yukarı ok</string>
+  <string name="automation_key_down" tools:machine_translated="true">Aşağı ok</string>
+  <string name="automation_key_left" tools:machine_translated="true">Sol ok</string>
+  <string name="automation_key_right" tools:machine_translated="true">Sağ ok</string>
+  <string name="automation_key_home" tools:machine_translated="true">Ana Sayfa</string>
+  <string name="automation_key_end" tools:machine_translated="true">Son</string>
+  <string name="automation_key_insert" tools:machine_translated="true">Ekle</string>
+  <string name="automation_key_page_up" tools:machine_translated="true">Sayfa Yukarı</string>
+  <string name="automation_key_page_down" tools:machine_translated="true">Sayfa Aşağı</string>
+  <string name="automation_key_function" tools:machine_translated="true">F%1$s</string>
+  <string name="automation_key_shift" tools:machine_translated="true">Shift tuşu</string>
+  <string name="automation_seconds" tools:machine_translated="true">%1$.3f sn</string>
+  <plurals name="automation_count" tools:machine_translated="true">
+    <item quantity="one">%1$d işlem</item>
+    <item quantity="other">%1$d işlem</item>
+  </plurals>
+</resources>

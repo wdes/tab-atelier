@@ -1,0 +1,29 @@
+name: Continuous Integration
+
+on:
+  push:
+    branches: [ main ]
+    paths-ignore:
+      - '**.md'
+      - '.gitignore'
+      - '.gitattributes'
+      - 'LICENSE'
+      - '.java-version'
+      - 'icons/**'
+  schedule:
+    - cron: "0 7 */3 * *"
+
+concurrency:
+  group: ci-main-${{ github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    name: CI
+    uses: ./.github/workflows/ci-build.yml
+    permissions:
+      contents: write
+      pull-requests: write
+    with:
+      is_push: ${{ github.event_name == 'push' }}
+    secrets: inherit
