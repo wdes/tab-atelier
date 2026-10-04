@@ -45,6 +45,7 @@ import org.connectbot.util.SecurePasswordStorage
 import timber.log.Timber
 import java.io.ByteArrayInputStream
 import java.io.IOException
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 import java.util.zip.GZIPInputStream
@@ -61,6 +62,10 @@ import java.util.zip.GZIPInputStream
  */
 class TabAtelier : AbsTransport() {
 
+    // Written by the listener's own thread (which adopts the socket in onOpen)
+    // and read by whoever is sending a keystroke, so it is volatile rather than
+    // merely late-initialised.
+    @Volatile
     private var socket: WebSocket? = null
 
     /** Bytes the daemon sent, waiting to be handed to the terminal emulator. */
@@ -112,24 +117,56 @@ class TabAtelier : AbsTransport() {
         }
 
         val token = client.token(host.id)
-        val url = base.webSocketUrl("/tabs/by-id/$tabKey/ws")
-        val request = Request.Builder()
-            .url(url)
-            .apply { if (!token.isNullOrBlank()) header("Authorization", "Bearer $token") }
-            .build()
+        // The token rides in the query string, not an Authorization header: the
+        // daemon refuses the header alone on a WS upgrade. See
+        // TabAtelierBase.webSocketUrl for the why.
+        val url = base.webSocketUrl("/tabs/by-id/$tabKey/ws", token)
+        val request = Request.Builder().url(url).build()
 
+        // Wait for the daemon to accept the connection, the way Telnet waits for
+        // its socket, before telling the bridge the session is up.
+        //
+        // This is not merely tidy: `bridge.onConnected()` is what creates the
+        // Relay, which is what reads this transport. Calling it before the
+        // handshake would start the relay on a socket that is not open yet, and
+        // the terminal would sit on "connecting" forever — the failure the user
+        // saw. It is also why this method may block: `connect()` is called on
+        // the io dispatcher (TerminalBridge.startConnection), never on the UI
+        // thread.
+        val opened = CountDownLatch(1)
         Timber.d("Opening tab-atelier session for host %d at %s", host.id, base.origin)
-        socket = client.clientFor(host.id, base).newWebSocket(request, Listener())
+        val webSocket = client.clientFor(host.id, base).newWebSocket(request, Listener(opened))
+        socket = webSocket
+
+        if (!opened.await(CONNECT_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+            webSocket.cancel()
+            socket = null
+            throw IOException("Timed out connecting to $url")
+        }
+        // A socket that failed or closed before opening is a failed connection,
+        // not a session that ends immediately: the bridge has to hear about it
+        // as such, so the user gets the reason instead of an empty terminal.
+        failure?.let { throw it }
+        if (!open) {
+            throw IOException("The tab-atelier session at $url closed before it opened")
+        }
+
+        bridge?.onConnected()
     }
 
-    private inner class Listener : WebSocketListener() {
+    private inner class Listener(private val opened: CountDownLatch) : WebSocketListener() {
 
         override fun onOpen(webSocket: WebSocket, response: Response) {
+            // Adopted here as well as by connect(), because this can run before
+            // newWebSocket returns and the first frames below must not be
+            // dropped for want of a socket to send them on.
+            socket = webSocket
             open = true
             // The daemon stamps the tab's last_used_at on this frame, which is
             // what puts the tab the user just opened at the top of the list.
             webSocket.send(byteArrayOf(TAG_FOCUS).toByteString())
             sendDimensions()
+            opened.countDown()
         }
 
         override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
@@ -165,6 +202,7 @@ class TabAtelier : AbsTransport() {
             Timber.d("tab-atelier session closed: %d %s", code, reason)
             closed = true
             inbound.offer(END_OF_STREAM)
+            opened.countDown()
         }
 
         override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
@@ -172,6 +210,7 @@ class TabAtelier : AbsTransport() {
             failure = IOException(t.message ?: "tab-atelier connection failed", t)
             closed = true
             inbound.offer(END_OF_STREAM)
+            opened.countDown()
         }
     }
 
@@ -210,9 +249,12 @@ class TabAtelier : AbsTransport() {
 
             if (frame == null) {
                 failure?.let { throw it }
-                if (closed || !open) return -1
-                // Nothing yet. Zero means "no data right now" to the caller, the
-                // same as a socket read timeout.
+                // -1 is what ends the relay's read loop, so it is reserved for
+                // the session being over and nothing else. A connection that has
+                // merely not finished opening yet is "nothing right now" — the
+                // same as a socket read timeout — and reporting EOF there would
+                // kill the session before the daemon has said anything.
+                if (closed) return -1
                 return 0
             }
             if (frame.isEmpty()) {
@@ -349,6 +391,17 @@ class TabAtelier : AbsTransport() {
         private const val TAG_PREVIEW: Byte = 0x0C
 
         private const val CLOSE_NORMAL = 1000
+
+        /**
+         * How long [connect] waits for the daemon to accept the WebSocket before
+         * giving up.
+         *
+         * Comfortably longer than the client's own connect timeout, because what
+         * is being waited for is not just the TCP connection: the daemon
+         * authenticates the request and attaches to the tab's PTY as well, and a
+         * tab that is busy spawning should still open.
+         */
+        private const val CONNECT_TIMEOUT_SECONDS = 15L
 
         /** How long a read waits before reporting "nothing yet" to the caller. */
         private const val READ_POLL_MILLIS = 250L

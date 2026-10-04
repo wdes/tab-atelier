@@ -35,6 +35,13 @@ import android.util.Base64
 import androidx.test.core.app.ApplicationProvider
 import com.sun.net.httpserver.HttpServer
 import okhttp3.CertificatePinner
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.Response
+import okhttp3.WebSocket
+import okhttp3.WebSocketListener
+import okio.ByteString
+import okio.ByteString.Companion.toByteString
 import org.connectbot.BuildConfig
 import org.connectbot.util.SecurePasswordStorage
 import org.junit.Assert.assertEquals
@@ -52,6 +59,9 @@ import java.net.InetSocketAddress
 import java.security.cert.CertificateException
 import java.security.cert.CertificateFactory
 import java.security.cert.X509Certificate
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 import javax.net.ssl.HostnameVerifier
 import javax.net.ssl.X509TrustManager
@@ -109,9 +119,36 @@ class TabAtelierClientTest {
     @Test
     fun webSocketUrlFollowsTheSameBaseAsHttp() {
         val c = client()
-        assertEquals("wss://host.example/x", c.base("https://host.example")!!.webSocketUrl("/x"))
-        assertEquals("ws://host.example:7890/x", c.base("http://host.example:7890")!!.webSocketUrl("/x"))
-        assertEquals("wss://host.example/prefix/x", c.base("https://host.example/prefix")!!.webSocketUrl("/x"))
+        assertEquals("wss://host.example/x", c.base("https://host.example")!!.webSocketUrl("/x", null))
+        assertEquals("ws://host.example:7890/x", c.base("http://host.example:7890")!!.webSocketUrl("/x", null))
+        assertEquals("wss://host.example/prefix/x", c.base("https://host.example/prefix")!!.webSocketUrl("/x", null))
+    }
+
+    /**
+     * The token has to ride in the query string, because the daemon refuses a WS
+     * upgrade that carries only an `Authorization` header — verified against a
+     * live daemon, which answers 401 for the header and 101 for `?token=`. This
+     * pins the form, since a session that 401s only at the moment a user taps a
+     * tab is a failure that unit tests of everything else would not catch.
+     */
+    @Test
+    fun webSocketUrlCarriesTheTokenInTheQuery() {
+        val c = client()
+        assertEquals(
+            "wss://host.example/tabs/by-id/abc/ws?token=s3cret",
+            c.base("https://host.example")!!.webSocketUrl("/tabs/by-id/abc/ws", "s3cret"),
+        )
+        assertEquals(
+            "wss://host.example/prefix/tabs/by-id/abc/ws?token=s3cret",
+            c.base("https://host.example/prefix")!!.webSocketUrl("/tabs/by-id/abc/ws", "s3cret"),
+        )
+        // A token needing escaping must be escaped, not pasted in raw: it would
+        // otherwise truncate the query at the `&`, authenticating as the wrong
+        // token or none at all.
+        assertEquals(
+            "wss://host.example/x?token=a%26b%3Dc",
+            c.base("https://host.example")!!.webSocketUrl("/x", "a&b=c"),
+        )
     }
 
     // ---------------- which certificate may be trusted, and on what evidence ----------------
@@ -330,7 +367,7 @@ class TabAtelierClientTest {
             url != null,
         )
         val token = System.getenv("TABATELIER_TEST_TOKEN")
-        val hostId = 4242L
+        val hostId = HOST_ID
         val c = client()
         val base = c.base(url)!!
         assertTrue("this test is about TLS, so $url must be https", base.secure)
@@ -403,6 +440,88 @@ class TabAtelierClientTest {
     }
 
     /**
+     * The session path, against a real daemon.
+     *
+     * Everything else about the transport is compile-checked and reasoned about,
+     * but this is the one part that had never run: the WebSocket the terminal is
+     * read from, at the route and with the auth the app uses. A socket that never
+     * opens is a terminal that sits on "connecting" forever, which is exactly the
+     * failure this test exists to catch before a user sees it.
+     *
+     * It deliberately sends only the focus frame (`0x0B`) — the frame the app
+     * sends on connect, and metadata rather than input — so running this against
+     * a live workstation cannot type into somebody's tab.
+     */
+    @Test
+    fun aTabSessionOpensOverTheWebSocketAndSpeaksTheProtocol() {
+        val url = System.getenv("TABATELIER_TEST_URL")
+        assumeTrue(
+            "set TABATELIER_TEST_URL to a tab-atelier server over https:// to run this",
+            url != null,
+        )
+        val token = System.getenv("TABATELIER_TEST_TOKEN")
+        val c = client()
+        val base = c.base(url)!!
+        val tabs = c.fetchTabs(HOST_ID, base, token)
+        assumeTrue("this server has no tabs to open", tabs.isNotEmpty())
+
+        // The same URL and the same client the transport builds — the pinned one,
+        // which is the point: a WebSocket over the system CA store would fail
+        // against a self-signed daemon even though the tab list loaded.
+        val request = Request.Builder().url(base.webSocketUrl("/tabs/by-id/${tabs.first().id}/ws", token)).build()
+
+        val opened = CountDownLatch(1)
+        val frames = LinkedBlockingQueue<ByteArray>()
+        var failure: Throwable? = null
+        val socket = c.clientFor(HOST_ID, base).newWebSocket(
+            request,
+            object : WebSocketListener() {
+                override fun onOpen(webSocket: WebSocket, response: Response) {
+                    // What the transport sends on open; stamps the tab's last use.
+                    webSocket.send(byteArrayOf(TAG_FOCUS).toByteString())
+                    opened.countDown()
+                }
+
+                override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
+                    frames.offer(bytes.toByteArray())
+                }
+
+                override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                    failure = t
+                    opened.countDown()
+                }
+
+                override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                    opened.countDown()
+                }
+            },
+        )
+
+        try {
+            assertTrue(
+                "the daemon must accept the session WebSocket; failed: $failure",
+                opened.await(15, TimeUnit.SECONDS),
+            )
+            assertNull("the WebSocket must open, not fail", failure)
+
+            // An idle tab may legitimately say nothing, so a frame is not
+            // required. What is required is that whatever arrives is something
+            // the transport renders: an unknown tag here would mean the daemon
+            // and the client disagree about the protocol.
+            val frame = frames.poll(5, TimeUnit.SECONDS)
+            if (frame != null) {
+                assertTrue("the daemon sent an empty frame", frame.isNotEmpty())
+                assertTrue(
+                    "unknown frame tag ${frame[0]}: the client does not render this daemon's protocol",
+                    frame[0] in SERVER_FRAME_TAGS,
+                )
+            }
+        } finally {
+            socket.close(1000, null)
+        }
+    }
+
+    /**
      * Serves one response at `/tabs` on loopback, and runs [block] with the URL
      * it can be reached at plus the headers that request carried.
      *
@@ -436,6 +555,21 @@ class TabAtelierClientTest {
     }
 
     private companion object {
+        /** The host id used by the live tests; any value works, it is only a key. */
+        const val HOST_ID = 4242L
+
+        /** `0x0b`, the focus frame the transport sends on connect. */
+        const val TAG_FOCUS: Byte = 0x0B
+
+        /**
+         * The tags the daemon sends to a client, from its `src/api_ws.rs`:
+         * output, metadata, gzipped output and the quick preview. Kept here
+         * rather than shared with the transport on purpose — this is the test's
+         * independent statement of the protocol, so a typo in one does not agree
+         * with a typo in the other.
+         */
+        val SERVER_FRAME_TAGS = setOf<Byte>(0x02, 0x03, 0x0A, 0x0C)
+
         /**
          * The DER of [fixtureCertificate], base64. A self-signed P-256
          * certificate for `ta-test-fixture`, whose private key was discarded

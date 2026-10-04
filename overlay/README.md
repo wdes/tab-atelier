@@ -234,6 +234,25 @@ and the local shell all still work, and `remove.txt` is empty. A future mileston
 may retire the transports that have no use here, but only if that is wanted: the
 additive shape is what keeps an upstream sync to a pin bump.
 
-Not yet exercised on a device: the session path is compile- and unit-tested
-only, and has never run against a real daemon.
+The session path has now been run against a real daemon, which is how two bugs
+were found that nothing else would have caught:
+
+- **The transport never told the bridge it was connected.** `bridge.onConnected()`
+  is what creates the Relay, which is what reads the transport; every other
+  transport calls it, `TabAtelier` did not, so the terminal sat on "connecting
+  via tabatelier…" forever. `connect()` now waits for the WebSocket to open and
+  then signals it, which is also why it may block — it runs on the io dispatcher.
+- **The daemon refuses the token as an `Authorization` header on a WebSocket
+  upgrade** and accepts it only as `?token=`. This is a daemon-side bug:
+  `extract_token` (`src/api_ws.rs`) reads the query first and the header second,
+  but the query lookup is `req.uri().query()?`, whose `?` returns from the whole
+  function when there is no query — so a bare `/tabs/by-id/{id}/ws` never reaches
+  the documented header fallback and 401s. Verified by raw handshake: header
+  alone → 401, `?token=` → 101. The app uses the query form (as the daemon's own
+  browser client does); fixing `extract_token` would let the header form work and
+  let the client drop `?token=`, which is the better primitive since it keeps the
+  token out of URLs and logs.
+
+Not yet exercised on a real device: everything above is measured from the host
+against a live daemon over the app's own code paths, not from the phone.
 

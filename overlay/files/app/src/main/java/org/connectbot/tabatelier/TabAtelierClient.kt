@@ -110,9 +110,24 @@ class TabAtelierBase private constructor(private val url: HttpUrl) {
      * A string rather than an [HttpUrl], which accepts only http and https —
      * `HttpUrl.Builder.scheme("wss")` throws, so the scheme is swapped in the
      * canonical URL [httpUrl] produced.
+     *
+     * The token goes in the query string, not in an `Authorization` header, and
+     * that is not a stylistic choice. The daemon's `extract_token`
+     * (`src/api_ws.rs`) reads the query first and the header second, but the
+     * query lookup is `req.uri().query()?` — the `?` returns from the whole
+     * function when there is no query at all, so a request to a bare
+     * `/tabs/by-id/{id}/ws` never reaches the header fallback and is refused
+     * with 401. Verified against a live daemon: header alone → 401, `?token=` →
+     * 101. The daemon's own browser client uses this form for the same reason.
+     * Fixing `extract_token` on the daemon side would let this carry the header
+     * instead, which is the better primitive — it keeps the token out of URLs,
+     * and so out of logs.
      */
-    fun webSocketUrl(path: String): String {
-        val http = httpUrl(path).toString()
+    fun webSocketUrl(path: String, token: String?): String {
+        val http = httpUrl(path).newBuilder()
+            .apply { if (!token.isNullOrBlank()) addQueryParameter("token", token) }
+            .build()
+            .toString()
         return webSocketScheme + http.substring(scheme.length)
     }
 
