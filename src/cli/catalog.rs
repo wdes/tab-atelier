@@ -2191,6 +2191,7 @@ mod tests {
             tabs: vec![maximal_tab_state("tab-x"), maximal_tab_state("tab-y")],
             active: 1,
             windowed: false,
+            dashboard_share_token: String::new(),
         };
         assert!(remove_tab_from_saved(&mut saved, "tab-x"), "X removed");
         assert_eq!(saved.tabs.len(), 1);
@@ -2206,6 +2207,7 @@ mod tests {
             tabs: vec![maximal_tab_state("ghost"), maximal_tab_state("keep")],
             active: 0,
             windowed: false,
+            dashboard_share_token: String::new(),
         };
         assert!(remove_tab_from_saved(&mut saved, "ghost"));
         // (2a) absent from the persisted set.
@@ -2231,6 +2233,7 @@ mod tests {
             tabs: vec![maximal_tab_state("gone")],
             active: 0,
             windowed: false,
+            dashboard_share_token: String::new(),
         };
         // Retire de-registers it.
         assert!(remove_tab_from_saved(&mut saved, "gone"));
@@ -2573,6 +2576,7 @@ mod tests {
             tabs: vec![maximal_tab_state("gone"), maximal_tab_state("keep")],
             active: 0,
             windowed: false,
+            dashboard_share_token: String::new(),
         };
         crate::save_state_serialized(&base, &serde_json::to_string(&saved).unwrap());
 

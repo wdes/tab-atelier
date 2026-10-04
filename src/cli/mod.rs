@@ -20,8 +20,10 @@ pub mod brief;
 /// The single shared client-subcommand router used by both the GUI
 /// (`src/main.rs`) and the headless daemon ([`dispatch`]).
 pub mod catalog;
-/// `tab-atelier --check` — preflight the GUI's runtime libraries.
 pub mod check;
+/// `tab-atelier --check` — preflight the GUI's runtime libraries.
+/// `tab-atelier clarify` — controlled context refresh via in-place re-home.
+pub mod clarify;
 pub mod claude_hook;
 pub mod client;
 pub mod delegate;

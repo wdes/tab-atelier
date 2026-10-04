@@ -90,8 +90,8 @@ const MAIN_JS: &str = include_str!("../assets/main.js");
 // The harness dashboard's own JS/CSS — served publicly at `/assets/dashboard.*`
 // (the `/dashboard` HTML page itself is behind the auth gate). Same cache-buster
 // story as `main.*`.
-const DASHBOARD_CSS: &str = include_str!("../assets/dashboard.css");
-const DASHBOARD_JS: &str = include_str!("../assets/dashboard.js");
+const DASHBOARD_CSS: &str = include_str!("../assets/dashboard/index.css");
+const DASHBOARD_JS: &str = include_str!("../assets/dashboard/index.js");
 // Site icons + metadata served at the origin root (`/favicon.ico`, …). The
 // `.svg` reuses the app icon; the raster set is rendered from it. `robots.txt`
 // mirrors the `X-Robots-Tag: noindex` stance for crawlers that check it first.
@@ -410,6 +410,8 @@ struct ErrorResponse {
 
 #[derive(Clone)]
 pub struct SnapshotTab {
+    pub last_compaction_at: Option<u64>,
+    pub context_pct: Option<u8>,
     /// Stable per-tab UUID, mirrored from `TabState.id`. Used to route
     /// `POST /tabs/by-id/{id}/status` to the right tab independent of
     /// its position in the list (renames don't change it).
@@ -666,6 +668,13 @@ pub struct EnvChange {
 
 /// One `POST /tabs/by-id/{id}/meta` change, drained by the main loop onto the
 /// tab's [`crate::TabState::meta`]. `value: None` removes the key.
+///
+/// `allow(dead_code)` because the fields are read by the **headless** loop
+/// (`headless.rs`, behind the `headless` feature) and by this module's tests;
+/// neither counts when the lib is compiled for the GUI, which is where the lint
+/// fires. The alternative — reading them from the GUI too — would be inventing
+/// a consumer to please a linter.
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct MetaChange {
     pub tab_id: String,
@@ -3230,6 +3239,8 @@ pub fn test_snapshot_tab(id: &str, name: &str) -> SnapshotTab {
         evaluations: Vec::new(),
         usage_count: None,
         conventions: Vec::new(),
+        context_pct: None,
+        last_compaction_at: None,
     }
 }
 
@@ -3322,6 +3333,106 @@ pub fn test_snapshot(tabs: Vec<SnapshotTab>) -> TabSnapshot {
         master_token: String::new(),
         dashboard_share_token: String::new(),
     }
+}
+
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+#[must_use]
+pub fn rehome_safe_to_close(status: Option<&str>) -> bool {
+    status == REHOME_STEPS.last().map(|st| st.slug)
+}
+
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+/// Resolve a tab's project, in order: (1) `<project>:` override; (2) basename of
+/// a repo cwd; (3) `méta` lane for a meta-role itinerant; (4) `divers`.
+pub fn project_of(cwd: Option<&str>, assignment: Option<&str>) -> String {
+    let (over, _phase, role) = assignment.map_or((None, String::new(), String::new()), parse_assignment);
+    if let Some(p) = over {
+        return p;
+    }
+    if let Some(c) = cwd {
+        let base = c.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+        if !base.is_empty() && !WORK_ROOT_NAMES.contains(&base.to_ascii_lowercase().as_str()) {
+            return base.to_string();
+        }
+    }
+    if META_ROLES.contains(&role.as_str()) {
+        META_LANE.to_string()
+    } else {
+        DIVERS_LANE.to_string()
+    }
+}
+
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+pub fn dashboard_url_for_role(role: &str, project: &str, base: &str, token: &str) -> String {
+    let base = base.trim_end_matches('/');
+    if role == "tichef" || project == META_LANE || project.is_empty() {
+        format!("{base}/dashboard?token={token}")
+    } else {
+        format!("{base}/dashboard?project={project}&token={token}")
+    }
+}
+
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+#[must_use]
+pub fn rehome_badge(status: Option<&str>) -> Option<(&'static str, bool)> {
+    let last = REHOME_STEPS.len() - 1;
+    REHOME_STEPS
+        .iter()
+        .enumerate()
+        .find(|(_, st)| Some(st.slug) == status)
+        .map(|(i, st)| (st.label, i == last))
+}
+
+const META_LANE: &str = "méta";
+
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+const DIVERS_LANE: &str = "divers";
+
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+/// Dev work-roots whose basename is NOT a project (a shell parked at the parent
+/// of the repos). `ponytail:` heuristic list, no git detection — a tab actually
+/// inside `~/Dev/kalpin-back` still maps to `kalpin-back`; upgrade = walk to
+/// the enclosing `.git`.
+const WORK_ROOT_NAMES: [&str; 6] = ["dev", "src", "code", "projects", "repos", "workspace"];
+
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+/// Roles that mark an itinerant meta-specialist: with no repo cwd and no
+/// project override, such a tab lands in the shared **`méta`** lane rather than
+/// `divers`. See docs/dashboard.md "Dimension projet + voie méta".
+const META_ROLES: [&str; 4] = ["planner", "auditor", "tichef", "orchestrator"];
+
+/// THE single source of truth for the 4 re-home states, in progress order
+/// (audit Q3). Validation (`POST …/rehome`), the safe-to-close gate, and the
+/// badge all derive from this — adding a 5th state means editing only here. The
+/// last step is the terminal `safe-to-close`, posted by the old agent on its
+/// ACK, which gates the "close the predecessor" action. (`set_rehome.rs`'s
+/// `--help` / 400 text is kept in sync by `rehome_help_lists_every_state`.)
+pub const REHOME_STEPS: [RehomeStep; 4] = [
+    RehomeStep {
+        slug: "handoff-written",
+        label: "handoff écrit",
+    },
+    RehomeStep {
+        slug: "successor-ready",
+        label: "successeur prêt",
+    },
+    RehomeStep {
+        slug: "ack-sent",
+        label: "ACK envoyé",
+    },
+    RehomeStep {
+        slug: "safe-to-close",
+        label: "SAFE À FERMER",
+    },
+];
+
+/// One re-home lifecycle step: the wire slug + its French progress-badge label.
+pub struct RehomeStep {
+    pub slug: &'static str,
+    /// Read only by `rehome_badge` (a GUI-only consumer, app.rs); `REHOME_STEPS`
+    /// still sets it in both editions, so it's dead — not absent — in headless.
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
+    pub label: &'static str,
 }
 
 #[cfg(test)]
