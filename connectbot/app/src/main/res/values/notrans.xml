@@ -18,7 +18,8 @@
  */
 -->
 <resources>
-	<string name="app_name" translatable="false">ConnectBot</string>
+	<!-- Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): see overlay/README.md. -->
+	<string name="app_name" translatable="false">Tab Atelier Remote</string>
 
 	<!-- Placeholder for source port field. Should show  -->
 	<string name="portforward_source_port_placeholder">8080</string>
