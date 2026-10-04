@@ -1,4 +1,3 @@
-import io.github.reactivecircus.appversioning.toSemVer
 import org.gradle.api.DefaultTask
 import org.gradle.api.file.DirectoryProperty
 import org.gradle.api.provider.Property
@@ -80,7 +79,6 @@ plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.compose)
     alias(libs.plugins.ksp)
-    alias(libs.plugins.app.versioning)
     alias(libs.plugins.easylauncher)
     alias(libs.plugins.spotless)
     alias(libs.plugins.hilt.android)
@@ -98,23 +96,9 @@ val prepareOssMoshArtifacts = tasks.register<PrepareOssMoshArtifacts>("prepareOs
     assetsDirectory.set(generatedOssMosh.map { it.dir("assets") })
 }
 
-appVersioning {
-    tagFilter.set("v[0-9].*")
-    overrideVersionCode { gitTag, _, _ ->
-        val semVer = gitTag.toSemVer()
-        semVer.major * 10000000 + semVer.minor * 100000 + semVer.patch * 1000 + gitTag.commitsSinceLatestTag
-    }
-    overrideVersionName { gitTag, _, _ ->
-        if (gitTag.commitsSinceLatestTag != 0) {
-            "git-${gitTag.rawTagName}-${gitTag.commitsSinceLatestTag}-g${gitTag.commitHash}"
-        } else {
-            gitTag.rawTagName
-        }
-    }
-}
-
 android {
     namespace = "org.connectbot"
+    ndkVersion = "26.1.10909125"
     compileSdk =
         libs.versions.compileSdk
             .get()
@@ -123,7 +107,22 @@ android {
     dynamicFeatures += setOf(":mosh")
 
     defaultConfig {
-        applicationId = "org.connectbot"
+        // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): version comes
+        // from the caller, not from upstream's git tags. See overlay/README.md.
+        versionCode = (project.findProperty("appVersionCode") as String?)?.toInt() ?: 16777473
+        versionName = (project.findProperty("appVersionName") as String?) ?: "0.6.0"
+        // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): the commit
+        // this APK was built from, shown on the About screen. CI passes
+        // -PbuildCommit; a build that does not still compiles, and says so.
+        // See overlay/README.md.
+        buildConfigField("String", "BUILD_COMMIT", "\"${(project.findProperty("buildCommit") as String?) ?: "unknown"}\"")
+        // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): the commit
+        // of upstream ConnectBot this APK was built against — the submodule pin
+        // — so the About screen can name both halves of the fork.
+        buildConfigField("String", "UPSTREAM_COMMIT", "\"${(project.findProperty("upstreamCommit") as String?) ?: "unknown"}\"")
+        // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): this fork
+        // ships as fr.wdes.tab_atelier. See overlay/README.md.
+        applicationId = "fr.wdes.tab_atelier"
 
         minSdk =
             libs.versions.minSdk
@@ -505,6 +504,9 @@ dependencies {
     implementation(libs.timber)
     implementation(libs.re2j)
     implementation(libs.reorderable)
+    // Changed for Tab Atelier Remote: the tab-atelier daemon's tab list is
+    // fetched over HTTP.
+    implementation(libs.okhttp)
 
     val composeBom = platform(libs.androidx.compose.bom)
     implementation(composeBom)
