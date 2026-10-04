@@ -28,6 +28,8 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+
+pub mod intent;
 use std::time::Duration;
 
 use bytes::Bytes;

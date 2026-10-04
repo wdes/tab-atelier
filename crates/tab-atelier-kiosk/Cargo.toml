@@ -59,3 +59,8 @@ assets = [
 ]
 maintainer-scripts = "debian/"
 systemd-units = { unit-name = "tab-atelier-kiosk", enable = false, start = false }
+
+[dev-dependencies]
+# Test-only: the intentions module writes to a directory, and each test wants
+# one of its own rather than a shared path that parallel runs would race on.
+tempfile = "3"
