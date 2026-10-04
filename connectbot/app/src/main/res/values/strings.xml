@@ -1,0 +1,1583 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+/*
+ * ConnectBot: simple, powerful, open-source SSH client for Android
+ * Copyright 2007-2025 Kenny Root
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+-->
+
+<resources xmlns:tools="http://schemas.android.com/tools"
+	xmlns:xliff="urn:oasis:names:tc:xliff:document:1.2">
+	<!-- Summary of what ConnectBot is; used as a short description in the Android running apps list -->
+	<string name="app_desc">"Simple, powerful, open-source SSH client."</string>
+
+	<!-- Summary of what the ConnectBot service does; displayed in the Android running apps list -->
+	<string name="service_desc">"Maintains SSH connections and loaded pubkeys"</string>
+
+	<!-- Displayed in the "Help" screen to denote the copyright of this app. -->
+	<string name="app_copyright">Copyright &#xA9; Kenny Root</string>
+
+	<!-- Window title for the Pubkeys List -->
+	<string name="title_pubkey_list">"Pubkeys"</string>
+	<!-- Window title for the Port Forwards List -->
+	<string name="title_port_forwards_list">"Port forwards"</string>
+	<!-- Window title for Help index -->
+	<string name="title_help">"Help"</string>
+	<!-- Window title for the license/EULA screen -->
+	<string name="title_eula">License</string>
+	<!-- Dialog title for color picker dialog -->
+	<string name="title_color_picker">"Pick a color"</string>
+	<!-- Window title for the global applications settings activity. -->
+	<string name="title_settings">Settings</string>
+	<!-- Window title when generating a new pubkey. -->
+	<string name="title_pubkey_generate">Generate</string>
+
+	<!-- Title for the help page with the terms & conditions of the app. -->
+	<string name="terms_and_conditions">"Terms &amp; Conditions"</string>
+
+	<!-- Title for the help page with the hints about the app. -->
+	<string name="hints">"Hints"</string>
+
+	<!-- Title for the help dialog showing keyboard shortcuts. -->
+	<string name="keyboard_shortcuts">"Keyboard Shortcuts"</string>
+	<!-- Text in a keyboard shortcuts list lined up to keys which increase the terminal font-size. -->
+	<string name="increase_font_size">"Increase Font Size"</string>
+	<!-- Keyboard shortcut for increasing the font size. -->
+	<string name="increase_font_shortcut">Ctrl and +</string>
+	<!-- Text in a keyboard shortcuts list lined up to keys which decrease the terminal font-size. -->
+	<string name="decrease_font_size">"Decrease Font Size"</string>
+	<!-- Keyboard shortcut for decreasing the font size. -->
+	<string name="decrease_font_shortcut">Ctrl and -</string>
+	<!-- Keyboard shortcut for pasting into the terminal. -->
+	<string name="paste_shortcut">Ctrl-Shift-V</string>
+
+	<!-- Button text to generate a new SSH public/private key pair -->
+	<string name="pubkey_generate">"Generate"</string>
+	<!-- Context menu action to delete a saved public key -->
+	<string name="pubkey_delete">"Delete key"</string>
+	<!-- Dialog title when user must move finger randomly over an area to gather entropy (collect random bits) -->
+	<string name="pubkey_gather_entropy">"Gathering Entropy"</string>
+	<!-- Progress message showing percentage of random data collected for key generation -->
+	<string name="pubkey_touch_prompt">"Touch this box to gather randomness: %1$d%% done"</string>
+	<!-- Instructions to user on how to provide randomness by moving their finger over the screen -->
+	<string name="pubkey_touch_hint">"In order to assure randomness during the key generation, move your finger randomly over the box below."</string>
+	<!-- Progress message shown while generating a new SSH key pair -->
+	<string name="pubkey_generating">"Generating key pair…"</string>
+	<!-- Context menu action to copy the private key to clipboard in the default format -->
+	<string name="pubkey_copy_private">"Copy private key"</string>
+	<!-- Context menu action to copy the private key to clipboard in OpenSSH format -->
+	<string name="pubkey_copy_private_openssh">"Copy private key (OpenSSH)"</string>
+	<!-- Context menu action to copy the private key to clipboard in PEM format -->
+	<string name="pubkey_copy_private_pem">"Copy private key (PEM)"</string>
+	<!-- Context menu action to copy the encrypted private key to clipboard -->
+	<string name="pubkey_copy_private_encrypted">"Copy private key (encrypted)"</string>
+	<!-- Context menu action to copy the public key to clipboard -->
+	<string name="pubkey_copy_public">"Copy public key"</string>
+	<!-- Context menu action to export the public key to a file -->
+	<string name="pubkey_export_public">"Export public key"</string>
+	<!-- Context menu action to export the private key to a file in the default format -->
+	<string name="pubkey_export_private">"Export private key"</string>
+	<!-- Context menu action to export the private key to a file in OpenSSH format -->
+	<string name="pubkey_export_private_openssh">"Export private key (OpenSSH)"</string>
+	<!-- Context menu action to export the private key to a file in PEM format -->
+	<string name="pubkey_export_private_pem">"Export private key (PEM)"</string>
+	<!-- Context menu action to export the encrypted private key to a file -->
+	<string name="pubkey_export_private_encrypted">"Export private key (encrypted)"</string>
+	<!-- Dialog title for setting a passphrase when exporting a key -->
+	<string name="pubkey_export_set_passphrase">"Set export passphrase"</string>
+	<!-- Instructions to enter a passphrase to encrypt the key being exported -->
+	<string name="pubkey_export_passphrase_message">"Enter a passphrase to encrypt the exported key"</string>
+	<!-- Label for the field where user confirms the passphrase by entering it again -->
+	<string name="pubkey_export_confirm_passphrase">"Confirm passphrase"</string>
+	<!-- Error message shown when the passphrase and confirmation passphrase don't match -->
+	<string name="pubkey_export_passphrase_mismatch">"Passphrases do not match"</string>
+	<!-- Dialog title when importing an encrypted SSH key file -->
+	<string name="pubkey_import_encrypted_title">"Import encrypted key"</string>
+	<!-- Prompt asking user to enter the password to decrypt an imported key file. First parameter is key nickname, second is key type. -->
+	<string name="pubkey_import_encrypted_message">"Enter password to decrypt key '%1$s' (%2$s)"</string>
+	<!-- Button text to confirm importing a key -->
+	<string name="pubkey_import_button">"Import"</string>
+	<!-- Checkbox label in the import encrypted key dialog. When checked, the imported key will be encrypted for storage on the device. -->
+	<string name="pubkey_import_encrypt_key">"Encrypt key for storage"</string>
+	<!-- Checkbox label that appears when 'Encrypt key for storage' is checked. When checked, the same password used to decrypt the imported key will be used to encrypt it for storage. -->
+	<string name="pubkey_import_reuse_password">"Use same password for encryption"</string>
+	<!-- Label for the password field when entering a new password to encrypt the imported key for storage. -->
+	<string name="pubkey_import_new_password">"New password"</string>
+	<!-- Label for the password confirmation field when setting a new password to encrypt the imported key. -->
+	<string name="pubkey_import_confirm_password">"Confirm password"</string>
+	<!-- Context menu action to change the password protecting a private key -->
+	<string name="pubkey_change_password">"Change password"</string>
+	<!-- Context menu action to unlock an encrypted key for use in authentication -->
+	<string name="pubkey_unlock">"Unlock key"</string>
+	<!-- Dialog message prompting the user to enter password to unlock an encrypted key. -->
+	<string name="pubkey_unlock_message">"Enter password to unlock key '%1$s'"</string>
+	<!-- Error message shown when user tries to use a nickname that already exists for another key. -->
+	<string name="pubkey_nickname_exists">"A key with this nickname already exists"</string>
+	<!-- Context menu checkbox that indicates that this pubkey entry should attempt to be loaded upon starting the app. -->
+	<string name="pubkey_load_on_start">"Load key on start"</string>
+	<!-- Pubkey preference asking user whether the key use should be confirmed via prompt before it can be used for authentication -->
+	<string name="pubkey_confirm_use">"Confirm before use"</string>
+
+	<!-- Context menu action where a user can edite the selected port forward for the host. -->
+	<string name="portforward_edit">"Edit port forward"</string>
+	<!-- Context menu action where a user can delete the selected port forward from the host. -->
+	<string name="portforward_delete">"Delete port forward"</string>
+
+	<!-- Label for the input field where user enters a nickname for a host or key -->
+	<string name="prompt_nickname">"Nickname:"</string>
+	<!-- The source TCP port for port forwards. -->
+	<string name="prompt_source_port">"Source port:"</string>
+	<!-- The "host:port" combination used for port forward destinations. -->
+	<string name="prompt_destination">"Destination:"</string>
+	<!-- Prompt presented to the user when the server requests that they change their password. This is the entry for the old password. -->
+	<string name="prompt_old_password">"Old password:"</string>
+	<!-- Prompt for user to enter their username when the host has no username configured. -->
+	<string name="prompt_username">"Username:"</string>
+	<!-- Prompt for user to enter their password to log into the host when using 'password' authentication. -->
+	<string name="prompt_password">"Password:"</string>
+	<!-- Added after a "Password:" prompt to indicate user needs to confirm entry. -->
+	<string name="prompt_again">"(again)"</string>
+	<!-- Label for the user to select port forward type. -->
+	<string name="prompt_type">"Type:"</string>
+	<!-- Hint given below the password input box that lets them know that they are allowed to leave the field blank. -->
+	<string name="prompt_password_can_be_blank">"Note: password can be blank"</string>
+	<!-- Prompt for the size of the private key in bits. -->
+	<string name="prompt_bits">"Bits:"</string>
+
+	<!-- Prompt for the password to unlock a certain pubkey. -->
+	<string name="prompt_pubkey_password">"Password for key '%1$s'"</string>
+
+	<!-- Prompt for whether to allow SSH Authentication Agent to use the specified key. Note that the '\n' means split the line so it's actually "host to use key" -->
+	<string name="prompt_allow_agent_to_use_key">"Allow remote host to"\n"use key '%1$s'?"</string>
+
+	<!-- The header of the warning a user gets when the host key has changed. Note that this can be a very serious attack, so we try to be as "loud" to the user as possible. -->
+	<string name="host_verification_failure_warning_header">"WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!"</string>
+	<!-- The body of the warning a user gets when the host key has changed. Note that this can be a very serious attack, so we try to be as "loud" to the user as possible. -->
+	<string name="host_verification_failure_warning">"IT IS POSSIBLE THAT SOMEONE IS DOING SOMETHING NASTY!"\n"Someone could be eavesdropping on you right now (man-in-the-middle attack)!"\n"It is also possible that the host key has just been changed."</string>
+
+	<!-- Prompt user must answer yes or no to when the remote host fails verification of encryption fingerprint -->
+	<string name="prompt_continue_connecting">"Are you sure you want to continue connecting?"</string>
+
+	<!-- Sent to user when the remote public encryption key fingerprint doesn't match the local database -->
+	<string name="host_authenticity_warning">"The authenticity of host '%1$s' can't be established."</string>
+	<!-- First field is encryption algorithm. Second is the actual fingerprint in hex digits -->
+	<string name="host_fingerprint">"Host %1$s key fingerprint is %2$s"</string>
+
+	<!-- Title for the host key fingerprint verification prompt shown when connecting to a new host -->
+	<string name="host_key_verification_title">Host key verification</string>
+	<!-- Section header for the fingerprint formats display area -->
+	<string name="fingerprint_format_header">Fingerprint format</string>
+	<!-- Format string showing key type and size, e.g., "RSA 2048 bits". First field is key type, second is key size in bits. -->
+	<string name="host_key_type_and_size">%1$s %2$d bits</string>
+	<!-- Content description for the copy fingerprint to clipboard button, used by screen readers for accessibility -->
+	<string name="fingerprint_copy_description">Copy fingerprint to clipboard</string>
+
+	<!-- Error message shown when entered password and confirmation password don't match -->
+	<string name="alert_passwords_do_not_match_msg">"Passwords do not match!"</string>
+	<!-- Error message shown when user enters an incorrect password -->
+	<string name="alert_wrong_password_msg">"Wrong password!"</string>
+
+	<!-- Button that resizes the screen to the user-specified dimensions. -->
+	<string name="button_resize">"Resize"</string>
+
+	<!-- Alert dialog title shown when connection to the remote host is lost -->
+	<string name="alert_disconnect_msg">"Connection Lost"</string>
+
+	<!-- Message shown when network connection is lost and app is waiting to reconnect -->
+	<string name="network_lost_grace_period">"Network lost, waiting to reconnect…"</string>
+	<!-- Message shown when the 60-second grace period expires without network restoration -->
+	<string name="network_grace_period_expired">"Network not restored, disconnecting…"</string>
+	<!-- Message shown when network is restored and connection can continue (same IP address) -->
+	<string name="network_restored_same_ip">"Network restored, connection maintained"</string>
+	<!-- Message shown when network is restored but IP address changed, requiring reconnection -->
+	<string name="network_restored_ip_changed">"Network restored but IP changed, reconnecting…"</string>
+	<!-- Message shown when network is restored but previous network state is unknown -->
+	<string name="network_restored_no_previous_state">"Network restored, verifying connection…"</string>
+
+	<!-- The category title for terminal emulation preferences. -->
+	<string name="pref_emulation_category">"Terminal emulation"</string>
+
+	<!-- Name for the emulation terminal type preference. -->
+	<string name="pref_emulation_title">"Emulation mode"</string>
+	<!-- Description of the emulation terminal type preference. -->
+
+	<!-- Name for the scrollback size preference -->
+	<string name="pref_scrollback_title">"Scrollback size"</string>
+	<!-- Description of the scrollback size preference -->
+	<string name="pref_scrollback_summary">"Size of scrollback buffer to keep in memory for each console"</string>
+
+	<!-- Name for the font family preference -->
+	<string name="pref_fontfamily_title">"Font"</string>
+	<!-- Description of the font family preference -->
+
+	<!-- Title for adding custom font -->
+	<string name="pref_customfont_title">"Add custom font"</string>
+	<!-- Summary for adding custom font -->
+	<string name="pref_customfont_summary">"Add a font from Google Fonts by name"</string>
+	<!-- Dialog title for adding custom font -->
+	<string name="dialog_customfont_title">"Add Custom Font"</string>
+	<!-- Hint for custom font name input -->
+	<string name="dialog_customfont_hint">"Google Fonts name (e.g., Cascadia Code)"</string>
+	<!-- Button to add font -->
+	<string name="button_add">"Add"</string>
+	<!-- Button to remove font -->
+	<string name="button_remove">"Remove"</string>
+	<!-- Message shown when validating font -->
+	<string name="font_validating">"Validating font…"</string>
+	<!-- Message shown while downloading a font from Google Fonts -->
+	<string name="font_downloading">"Downloading font…"</string>
+
+	<!-- Title for importing local font -->
+	<string name="pref_localfont_title">"Import local font"</string>
+	<!-- Summary for importing local font -->
+	<string name="pref_localfont_summary">"Import a font file from storage (TTF, OTF)"</string>
+	<!-- Dialog title for importing local font -->
+	<string name="dialog_localfont_title">"Import Font"</string>
+	<!-- Hint for local font name input -->
+	<string name="dialog_localfont_hint">"Display name for the font"</string>
+	<!-- Button to import font -->
+	<string name="button_import">"Import"</string>
+	<!-- Message shown when importing font -->
+	<string name="font_importing">"Importing font…"</string>
+
+	<!-- Title of the preference used to enable or disable the back-up of pubkeys. -->
+	<string name="pref_backupkeys_title">Backup pubkeys</string>
+	<!-- Summary for the preference used to enable or disable the back-up of pubkeys. -->
+	<string name="pref_backupkeys_summary">Keep back-ups of the private keys using Android\'s backup mechanism</string>
+
+	<!-- The category title for user interface preferences -->
+	<string name="pref_ui_category">"User interface"</string>
+
+	<!-- Name for the language preference -->
+	<string name="pref_language_title">Language</string>
+	<!-- Default option for language preference that uses the system locale -->
+	<string name="pref_language_system_default">System default</string>
+	<!-- Description of clickable icon shown on language pack list item when it has not been downloaded. -->
+	<string name="pref_language_download">Download language pack</string>
+	<!-- Description of error icon shown on language pack list item when download failed. -->
+	<string name="pref_language_download_failed">Download failed, tap to retry</string>
+
+	<!-- Title of the theme mode selector preference in the User Interface settings section -->
+	<string name="pref_theme_title">Theme</string>
+	<!-- Theme option: follow the OS light/dark setting -->
+	<string name="pref_theme_system">System default</string>
+	<!-- Theme option: always use the light theme regardless of OS setting -->
+	<string name="pref_theme_light">Light</string>
+	<!-- Theme option: always use the dark theme regardless of OS setting -->
+	<string name="pref_theme_dark">Dark</string>
+
+	<!-- Name for the titlebar hide preference -->
+	<string name="pref_titlebarhide_title">"Autohide title bar"</string>
+	<!-- Summary for the titlebar hide preference -->
+	<string name="pref_titlebarhide_summary">"Tap console to show title bar and access menu"</string>
+
+	<!-- Title for special keys always visible preference -->
+	<string name="pref_alwaysvisible_title">Special keys always visible</string>
+
+	<!-- Title for the IME toggle key preference (shows an extra "IME" key in the special-keys row) -->
+	<string name="pref_imetogglekey_title">Show IME toggle key</string>
+	<!-- Summary for the IME toggle key preference -->
+	<string name="pref_imetogglekey_summary">Add an IME button to the special keys row that toggles compose mode for languages requiring a composition buffer (Japanese, Chinese, Korean, etc.)</string>
+	<!-- Title for choosing how the full IME handles a terminal shortcut after Ctrl or Alt is tapped -->
+	<string name="pref_ime_shortcut_mode_title">Full IME Ctrl/Alt shortcuts</string>
+	<!-- Choice that leaves full IME behavior unchanged when Ctrl or Alt is tapped -->
+	<string name="pref_ime_shortcut_mode_disabled">No workaround</string>
+	<!-- Choice that temporarily requests raw key events from the IME when Ctrl or Alt is tapped -->
+	<string name="pref_ime_shortcut_mode_type_null">Raw key events</string>
+	<!-- Choice that temporarily requests an ASCII keyboard from the IME when Ctrl or Alt is tapped -->
+	<string name="pref_ime_shortcut_mode_force_ascii">Force ASCII (recommended)</string>
+
+	<!-- Name for the page up/down gesture preference -->
+	<string name="pref_pg_updn_gesture_title">"Page up/down gesture"</string>
+	<!-- Summary for the full screen preference -->
+	<string name="pref_pg_updn_gesture_summary">"Swipe the left third of the screen to send pg up/dn to the terminal"</string>
+	<!-- Name for the optional swipe-to-switch-sessions preference -->
+	<string name="pref_swipe_sessions_title">Swipe between sessions</string>
+	<!-- Summary for the optional swipe-to-switch-sessions preference -->
+	<string name="pref_swipe_sessions_summary">Enable horizontal swiping to switch terminal sessions. Off by default for accessibility.</string>
+
+	<!-- Name for the full screen preference -->
+	<string name="pref_fullscreen_title">"Full screen"</string>
+	<!-- Summary for the full screen preference -->
+	<string name="pref_fullscreen_summary">"Hide status bar while in console"</string>
+
+	<!-- The category title for keyboard preferences -->
+	<string name="pref_keyboard_category">"Keyboard"</string>
+
+	<!-- Name for the shifted numbers are f-keys preference -->
+	<string name="pref_shiftfkeys_title">"Shift+num are F-keys"</string>
+	<!-- Summary for the shifted numbers are f-keys preference -->
+	<string name="pref_shiftfkeys_summary">"On hardware keyboards, number keys send F1-F10 with shift"</string>
+
+	<!-- Name for the ctrl'ed numbers are f-keys preference -->
+	<string name="pref_ctrlfkeys_title">"Ctrl+num are F-keys"</string>
+	<!-- Summary for the ctrl'ed numbers are f-keys preference -->
+	<string name="pref_ctrlfkeys_summary">"On software keyboards, number keys send F1-F10 with ctrl"</string>
+
+	<!-- Name for the volume keys control font size preference -->
+	<string name="pref_volumefont_title">"Volume keys change font size"</string>
+	<!-- Summary for the volume keys control font size preference -->
+	<string name="pref_volumefont_summary">"Font size can also be changed in profile settings"</string>
+
+	<!-- Name for the memorize keys preference -->
+	<string name="pref_memkeys_title">"Remember keys in memory"</string>
+	<!-- Summary for the memorize keys preference -->
+	<string name="pref_memkeys_summary">"Keep unlocked keys in memory until backend service is terminated"</string>
+
+	<!-- Title for the preference that keeps the background service running to prevent connection drops. -->
+	<string name="pref_conn_persist_title">"Stay connected in the background"</string>
+	<!-- Summary for the preference that keeps the background service running to prevent connection drops. -->
+	<string name="pref_conn_persist_summary">"Keep your sessions open even when you switch to other apps"</string>
+
+	<!-- Name for the keyboard shortcuts preference -->
+	<string name="pref_keymode_title">"Directory shortcuts"</string>
+
+	<!-- Name for the sticky modifiers preference -->
+	<string name="pref_stickymodifiers_title">"Sticky modifiers"</string>
+
+	<!-- Sticky modifier preference value description for when only the Alt key should be a sticky modifier. -->
+	<string name="only_alt">"Only alt"</string>
+
+	<!-- Name for the camera shortcut usage preference -->
+	<string name="pref_camera_title">"Camera shortcut"</string>
+
+	<!-- Name for the keep screen on preference -->
+	<string name="pref_keepalive_title">"Keep screen awake"</string>
+	<!-- Summary for the camera shortcut usage preference -->
+	<string name="pref_keepalive_summary">"Prevent the screen from turning off when working in a console"</string>
+
+	<!-- Name for the Wi-Fi lock preference -->
+	<string name="pref_wifilock_title">"Keep Wi-Fi active"</string>
+	<!-- Summary for the Wi-Fi lock preference -->
+	<string name="pref_wifilock_summary">"Prevent Wi-Fi from turning off when a session is active"</string>
+
+	<!-- Name for the haptic feedback (bumpy arrow) preference -->
+	<string name="pref_bumpyarrows_title">"Bumpy arrows"</string>
+	<!-- Summary for the haptic feedback (bumpy arrow) preference -->
+	<string name="pref_bumpyarrows_summary">"Vibrate when sending arrow keys; useful for laggy connections"</string>
+
+	<!-- Category title for the Terminal Bell preferences -->
+	<string name="pref_bell_category">"Terminal bell"</string>
+
+	<!-- Checkbox preference title for the audible terminal bell feature -->
+	<string name="pref_bell_title">"Audible bell"</string>
+	<!-- Brief summary of the user preference that causes a bell sound to play when the terminal alert is triggered. -->
+	<string name="pref_bell_summary">"Play sound on terminal alert"</string>
+
+	<!-- Title for the slider preference to set the volume -->
+	<string name="pref_bell_volume_title">"Bell volume"</string>
+
+	<!-- Checkbox preference title for the vibrate on terminal bell feature -->
+	<string name="pref_bell_vibrate_title">"Vibrate on bell"</string>
+	<!-- Brief summary of the feature that causes the phone to vibrate when a terminal alert would cause the "bell" sound to play normally. -->
+	<string name="pref_bell_vibrate_summary">"Vibrate on terminal alert</string>
+
+	<!-- Checkbox preference title for the receive notifications on terminal bell feature -->
+	<string name="pref_bell_notification_title">"Background notifications"</string>
+	<!-- Brief summary of the feature that is enabled when the checkbox preference for the receive notifications on terminal bell feature is checked -->
+	<string name="pref_bell_notification_summary">"Send notification when a terminal running in the background sounds a bell."</string>
+
+	<!-- Preference selection to indicate use of right side of keyboard for special shortcuts. -->
+	<string name="list_keymode_right">"Use right-side keys"</string>
+	<!-- Preference selection to indicate use of left side of keyboard for special shortcuts. -->
+	<string name="list_keymode_left">"Use left-side keys"</string>
+	<!-- Preference selection to indicate never to use special shortcut keys. -->
+	<string name="list_keymode_none">"Disable"</string>
+
+	<!-- Preference to not use pubkeys to authenticate to this host. -->
+	<string name="list_pubkeyids_none">"Do not use keys"</string>
+	<!-- Preference to use any pubkey to authenticate to this host. -->
+	<string name="list_pubkeyids_any">"Use any unlocked key"</string>
+
+	<!-- Host nickname field preference title -->
+	<string name="hostpref_nickname_title">"Nickname"</string>
+
+	<!-- Host color category preference title -->
+	<string name="hostpref_color_title">"Color category"</string>
+
+	<!-- Color category names used for visual identification of hosts. These appear in the color selector dropdown. -->
+	<!-- Color name for red (#F44336) -->
+	<string name="color_red">Red</string>
+	<!-- Color name for pink (#E91E63) -->
+	<string name="color_pink">Pink</string>
+	<!-- Color name for purple (#9C27B0) -->
+	<string name="color_purple">Purple</string>
+	<!-- Color name for deep purple (#673AB7) -->
+	<string name="color_deep_purple">Deep Purple</string>
+	<!-- Color name for indigo (#3F51B5) -->
+	<string name="color_indigo">Indigo</string>
+	<!-- Color name for blue (#2196F3) -->
+	<string name="color_blue">Blue</string>
+	<!-- Color name for light blue (#03A9F4) -->
+	<string name="color_light_blue">Light Blue</string>
+	<!-- Color name for cyan (#00BCD4) -->
+	<string name="color_cyan">Cyan</string>
+	<!-- Color name for teal (#009688) -->
+	<string name="color_teal">Teal</string>
+	<!-- Color name for green (#4CAF50) -->
+	<string name="color_green">Green</string>
+	<!-- Color name for light green (#8BC34A) -->
+	<string name="color_light_green">Light Green</string>
+	<!-- Color name for lime (#CDDC39) -->
+	<string name="color_lime">Lime</string>
+	<!-- Color name for yellow (#FFEB3B) -->
+	<string name="color_yellow">Yellow</string>
+	<!-- Color name for amber (#FFC107) -->
+	<string name="color_amber">Amber</string>
+	<!-- Color name for orange (#FF9800) -->
+	<string name="color_orange">Orange</string>
+	<!-- Color name for gray (#9E9E9E) -->
+	<string name="color_gray">Gray</string>
+
+	<!-- Host's default font size when opening the terminal in points (pt) -->
+	<string name="hostpref_fontsize_title">"Font size (pt)"</string>
+
+	<!-- Host's font family preference title -->
+	<string name="hostpref_fontfamily_title">"Font"</string>
+
+	<!-- Host's color scheme preference title -->
+	<string name="hostpref_colorscheme_title">"Terminal color scheme"</string>
+
+	<!-- Host pubkey usage preference title -->
+	<string name="hostpref_pubkeyid_title">"Use pubkey authentication"</string>
+
+	<!-- Preference title for the SSH Authentication Agent Forwarding for a host connection -->
+	<string name="hostpref_authagent_title">"Use SSH auth agent"</string>
+
+	<!-- Host post-login automation preference title -->
+	<string name="hostpref_postlogin_title">"Post-login automation"</string>
+
+	<!-- Host compression preference title -->
+	<string name="hostpref_compression_title">"Compression"</string>
+	<!-- Summary for compression preference -->
+	<string name="hostpref_compression_summary">"This may help with slower networks"</string>
+
+	<!-- Setting for whether we want a session to start up when we connect to a host -->
+	<string name="hostpref_wantsession_title">"Start shell session"</string>
+	<!-- Summary for field asking whether a shell session should be started up upon connection or not -->
+	<string name="hostpref_wantsession_summary">"Disable this preference to only use port forwards"</string>
+
+	<!-- Setting for whether the host should be reconnected to automatically upon disconnect -->
+	<string name="hostpref_stayconnected_title">"Stay connected"</string>
+	<!-- Summary for preference asking whether the host should be reconnected to when it disconnects -->
+	<string name="hostpref_stayconnected_summary">"Try to reconnect to host if disconnected"</string>
+
+	<!-- Setting for whether we should prompt to close after getting disconnected -->
+	<string name="hostpref_quickdisconnect_title">"Close on disconnect"</string>
+	<!-- Summary explaining that the console will close automatically without prompting when connection ends -->
+	<string name="hostpref_quickdisconnect_summary">"Close immediately after remote disconnect without prompting."</string>
+
+	<!-- Setting for what key code is sent to the server when DEL key is pressed. -->
+	<string name="hostpref_delkey_title">"DEL Key"</string>
+
+	<!-- Host character encoding preference title -->
+	<string name="hostpref_encoding_title">"Encoding"</string>
+
+	<!-- Username field title for host editor preference -->
+	<string name="hostpref_username_title">"Username"</string>
+
+	<!-- Password field supporting text in host editor -->
+	<string name="hostpref_save_password_summary">"Store login password securely for automatic authentication"</string>
+	<!-- Password field title in host editor -->
+	<string name="hostpref_password_title">"Password"</string>
+	<!-- Password field label when there is an existing password saved -->
+	<string name="hostpref_password_unchanged">"Password (unchanged)"</string>
+	<!-- Button to clear a saved password -->
+	<string name="hostpref_clear_password">"Clear saved password"</string>
+
+	<!-- Hostname field title for host editor preference -->
+	<string name="hostpref_hostname_title">"Host"</string>
+
+	<!-- Port field title for host editor preference -->
+	<string name="hostpref_port_title">"Port"</string>
+
+	<!-- When editing a host entry, this is displayed for the section about changing the
+	     configuration profile of a host. The profile controls terminal colors, terminal
+	     font, etc. -->
+	<string name="hostpref_profile_title">Profile</string>
+	<!-- Description text shown below the profile selector explaining what selecting a profile does -->
+	<string name="hostpref_profile_summary">Select a profile to use its terminal settings</string>
+	<!-- Dropdown option shown when no profile is selected, indicating host-specific settings will be used instead -->
+	<string name="hostpref_profile_none">None (use host settings)</string>
+	<!-- Link below the host profile selector that opens the selected profile for editing -->
+	<string name="hostpref_profile_edit">Edit selected profile</string>
+	<!-- Message displayed when a setting is disabled because it's controlled by a profile instead of host settings -->
+	<string name="profile_controlled_setting">Controlled by profile</string>
+	<!-- Dropdown option to use the default font when configuring font family -->
+	<string name="font_use_default">Use Default</string>
+	<!-- Display name for the system default monospace font option -->
+	<string name="font_system_default">Default (Monospace)</string>
+	<!-- Fallback text shown when referencing a pubkey that no longer exists in the database -->
+	<string name="pubkey_unknown">Unknown key</string>
+	<!-- Default name shown for the default color scheme when no specific scheme is selected -->
+	<string name="colorscheme_default">Default</string>
+
+	<!-- Profile editor screen strings -->
+	<!-- Window title shown when creating a new profile -->
+	<string name="profile_editor_title_new">New Profile</string>
+	<!-- Window title shown when editing an existing profile -->
+	<string name="profile_editor_title_edit">Edit Profile</string>
+	<!-- Content description for the save button that saves profile changes -->
+	<string name="profile_editor_save">Save</string>
+	<!-- Label for the text field where user enters the profile name -->
+	<string name="profile_editor_name_label">Profile Name</string>
+	<!-- Section header for icon color selection area -->
+	<string name="profile_editor_section_icon_color">Icon Color</string>
+	<!-- Section header for color scheme selection area -->
+	<string name="profile_editor_section_color_scheme">Color Scheme</string>
+	<!-- Section header for font configuration area -->
+	<string name="profile_editor_section_font">Font</string>
+	<!-- Section header for terminal emulation settings area -->
+	<string name="profile_editor_section_terminal">Terminal</string>
+	<!-- Subsection title for font family selector -->
+	<string name="profile_editor_font_family_title">Font Family</string>
+	<!-- Subsection title showing current font size. Parameter is the font size in points. -->
+	<string name="profile_editor_font_size_title">Font Size: %d</string>
+	<!-- Subsection title for force size settings -->
+	<string name="profile_editor_force_size_title">Force Size</string>
+	<!-- Summary text explaining what force size does -->
+	<string name="profile_editor_force_size_summary">Force the terminal to a specific size (columns x rows) instead of auto-sizing to fit the screen.</string>
+	<!-- Label for the enable force size switch -->
+	<string name="profile_editor_force_size_enable">Enable force size</string>
+	<!-- Label for the force size columns input field -->
+	<string name="profile_editor_force_size_columns">Columns</string>
+	<!-- Label for the force size rows input field -->
+	<string name="profile_editor_force_size_rows">Rows</string>
+	<!-- Dropdown option to not override host color with profile color -->
+	<string name="profile_icon_color_none">None (use host color)</string>
+
+	<!-- Profile list screen strings -->
+	<!-- Window title for the profiles list screen -->
+	<string name="profile_list_title">Profiles</string>
+	<!-- Content description for the FAB button that creates a new profile -->
+	<string name="profile_list_create_profile">Create profile</string>
+	<!-- Message shown when there are no profiles, encouraging user to create one -->
+	<string name="profile_list_empty_message">No profiles yet. Tap + to create one.</string>
+	<!-- Content description for the menu button on each profile item -->
+	<string name="profile_list_more_options">More options</string>
+	<!-- Menu item to duplicate/copy a profile -->
+	<string name="profile_list_duplicate">Duplicate</string>
+	<!-- Menu item to delete a profile -->
+	<string name="profile_list_delete">Delete</string>
+	<!-- Dialog title when creating a new profile -->
+	<string name="profile_create_dialog_title">Create Profile</string>
+	<!-- Label for the profile name text field in create dialog -->
+	<string name="profile_create_name_label">Profile Name</string>
+	<!-- Button text to confirm creating a new profile -->
+	<string name="profile_create_button">Create</string>
+	<!-- Button text to cancel creating a new profile -->
+	<string name="profile_create_cancel">Cancel</string>
+	<!-- Dialog title when deleting a profile -->
+	<string name="profile_delete_dialog_title">Delete Profile</string>
+	<!-- Confirmation message asking if user wants to delete a profile. Parameter is the profile name. -->
+	<string name="profile_delete_dialog_message">Are you sure you want to delete \'%s\'?</string>
+	<!-- Button text to confirm deleting a profile -->
+	<string name="profile_delete_button">Delete</string>
+	<!-- Button text to cancel deleting a profile -->
+	<string name="profile_delete_cancel">Cancel</string>
+	<!-- Summary text showing font settings. First parameter is font name, second is font size in points. -->
+	<string name="profile_summary_font">Font: %1$s %2$dpt</string>
+	<!-- Summary text showing emulation setting. Parameter is the terminal emulation type. -->
+	<string name="profile_summary_emulation">Emulation: %s</string>
+
+	<!-- Button to reconnect to a disconnected host. -->
+	<string name="console_menu_reconnect">Reconnect</string>
+	<!-- Content description and dialog title for switching between active terminal sessions. -->
+	<string name="console_switch_session">Switch session</string>
+	<!-- Button to switch to the previous active terminal session. -->
+	<string name="console_previous_session">Previous session</string>
+	<!-- Button to switch to the next active terminal session. -->
+	<string name="console_next_session">Next session</string>
+	<!-- Button to close the disconnected terminal window. -->
+	<string name="console_menu_close">"Close"</string>
+	<!-- Button to paste from the clipboard to the terminal. -->
+	<string name="console_menu_paste">"Paste"</string>
+	<!-- Button that brings user to the Port Forwards List. -->
+	<string name="console_menu_portforwards">"Port forwards"</string>
+	<!-- Button that brings user to the terminal resizing dialog where they can force a size. -->
+	<string name="console_menu_resize">"Force size"</string>
+	<!-- Button that brings up the list of URLs on the current screen -->
+	<string name="console_menu_urlscan">"URL scan"</string>
+	<!-- Error shown in a snackbar when the user taps a URL but no app on the device can handle it -->
+	<string name="console_url_no_handler">No app available to open this URL</string>
+	<!-- Error shown in a snackbar when the URL type is not supported -->
+	<string name="console_url_not_supported">This URL type is not supported</string>
+	<!-- Dialog title for an SSH authentication banner sent by a server. Parameter is the host or jump host name. -->
+	<string name="auth_banner_title">Authentication message from %1$s</string>
+
+	<!-- Button label to answer "Yes" to a yes/no prompt -->
+	<string name="button_yes">"Yes"</string>
+	<!-- Button label to answer "No" to a yes/no prompt -->
+	<string name="button_no">"No"</string>
+
+	<!-- Selection for a "local" port forward. E.g., connections to a port listening locally is forwarded to the remote end's listening port. -->
+	<string name="portforward_local">"Local"</string>
+	<!-- Selection for a "remote" port forward. E.g., connections to a port listening remotely is forwarded to the local end's listening port. -->
+	<string name="portforward_remote">"Remote"</string>
+	<!-- Selection for a "dynamic" port forward. E.g., connections to a port listening locally is forwarded based on the SOCKS protocol to an arbitrary remote host and port. -->
+	<string name="portforward_dynamic">"Dynamic (SOCKS)"</string>
+	<!-- Button that commits the port forward to be made from the Port Forward Creation dialog. -->
+	<string name="portforward_pos">"Create port forward"</string>
+
+	<!-- Button that saves changes to an existing port forward in the Port Forward Edit dialog. -->
+	<string name="portforward_save">"Save"</string>
+
+	<!-- Part of the formatting hints that will be used like: username@hostname:port -->
+	<string name="format_username">"username"</string>
+	<!-- Part of the formatting hints that will be used like: username@hostname:port -->
+	<string name="format_hostname">"hostname"</string>
+	<!-- Part of the formatting hints that will be used like: username@hostname:port -->
+	<string name="format_port">"port"</string>
+
+	<!-- Menu item to open the pubkey management screen -->
+	<string name="list_menu_pubkeys">"Manage pubkeys"</string>
+	<!-- Selection choice to sort hosts by color. -->
+	<string name="list_menu_sortcolor">"Sort by color"</string>
+	<!-- Selection choice to sort hosts by nickname. -->
+	<string name="list_menu_sortname">"Sort by name"</string>
+	<!-- Menu item to disconnect all the hosts. -->
+	<string name="list_menu_disconnect">"Disconnect all"</string>
+	<!-- Menu item to open the app settings screen -->
+	<string name="list_menu_settings">"Settings"</string>
+
+	<!-- Context menu action to disconnect from the selected host -->
+	<string name="list_host_disconnect">"Disconnect"</string>
+	<!-- Context menu action to edit the selected host configuration -->
+	<string name="list_host_edit">"Edit host"</string>
+	<!-- Context menu action to edit port forwards for the selected host -->
+	<string name="list_host_portforwards">"Edit port forwards"</string>
+	<!-- Context menu action to delete the selected host -->
+	<string name="list_host_delete">"Delete host"</string>
+	<!-- Context menu action to duplicate the selected host -->
+	<string name="list_host_duplicate">"Duplicate host"</string>
+	<!-- Context menu action to forget stored host keys for the selected host -->
+	<string name="list_host_forget_keys">"Forget host keys"</string>
+
+	<!-- Selection to indicate pressing the Camera button should send "Ctrl+A then Space". -->
+	<string name="list_camera_ctrlaspace">"Ctrl+A then Space"</string>
+	<!-- Selection to indicate pressing the Camera button should send "Ctrl+A". -->
+	<string name="list_camera_ctrla">"Ctrl+A"</string>
+	<!-- Selection to indicate pressing the Camera button should send the "Esc" key. -->
+	<string name="list_camera_esc">"Esc"</string>
+	<!-- Selection to indicate pressing the Camera button should send "Esc+A". -->
+	<string name="list_camera_esc_a">"Esc+A"</string>
+	<!-- Selection to indicate pressing the Camera button should send nothing at all. -->
+	<string name="list_camera_none">"None"</string>
+	<!-- Selection to indicate pressing the Camera button should open the text input dialog. -->
+	<string name="list_camera_text_input">"Text Input"</string>
+
+	<!-- Confirmation dialog message asking user to confirm deletion. Parameter is the item name. -->
+	<string name="delete_message">"Are you sure you want to delete '%1$s'?"</string>
+	<!-- Positive button text confirming deletion -->
+	<string name="delete_pos">"Yes, delete"</string>
+	<!-- Negative button text canceling deletion -->
+	<string name="delete_neg">"Cancel"</string>
+
+	<!-- Confirmation dialog message asking user to confirm disconnecting from all hosts -->
+	<string name="disconnect_all_message">"Are you sure you want to disconnect from all connected hosts?"</string>
+	<!-- Positive button text confirming disconnection from all hosts -->
+	<string name="disconnect_all_pos">"Yes, disconnect"</string>
+	<!-- Negative button text canceling the disconnect all action -->
+	<string name="disconnect_all_neg">"Cancel"</string>
+
+	<!-- Displayed in terminal when attempting to connect to a host. The first two
+	     variables are host:port and the third is the protocol (e.g., SSH) -->
+	<string name="terminal_connecting" tools:ignore="PluralsCandidate">"Connecting to %1$s:%2$d via %3$s"</string>
+
+	<!-- Displays the host key to the user in the terminal -->
+	<string name="terminal_sucess">"Verified host '%1$s' key: %2$s"</string>
+	<!-- Error message shown in terminal when host key verification fails -->
+	<string name="terminal_failed">"Host key verification failed."</string>
+
+	<!-- Displayed on the terminal describing the cryptographic algorithm names -->
+	<string name="terminal_using_s2c_algorithm">"Server-to-client algorithm: %1$s %2$s"</string>
+	<!-- Displayed on the terminal describing the cryptographic algorithm names -->
+	<string name="terminal_using_c2s_algorithm">"Client-to-server algorithm: %1$s %2$s"</string>
+	<!-- Displayed on the terminal describing the cryptographic algorithm names -->
+	<string name="terminal_using_algorithm">"Using algorithm: %1$s %2$s"</string>
+
+	<!-- Displayed on the terminal during a SSH connection describing the cryptographic key
+	     exchange algorithm used to establish a shared secret between this program and the
+	     server. -->
+	<string name="terminal_kex_algorithm">Key exchange algorithm: %s</string>
+
+	<!-- Message shown in terminal when starting authentication process -->
+	<string name="terminal_auth">"Trying to authenticate"</string>
+	<!-- Header shown before an SSH authentication banner in the terminal. Parameter is the host or jump host name. -->
+	<string name="terminal_auth_banner_header">"[%1$s] Authentication message:"</string>
+
+	<!-- Message shown in terminal when attempting password authentication method -->
+	<string name="terminal_auth_pass">"Attempting 'password' authentication"</string>
+	<!-- Message shown in terminal when password authentication fails -->
+	<string name="terminal_auth_pass_fail">"Authentication method 'password' failed"</string>
+	<!-- Message shown in terminal when attempting saved password authentication -->
+	<string name="terminal_auth_saved_password">"Trying saved password…"</string>
+	<!-- Message shown in terminal when saved password authentication fails -->
+	<string name="terminal_auth_saved_password_fail">"Saved password authentication failed"</string>
+
+	<!-- Message shown in terminal when trying public key authentication with any available key -->
+	<string name="terminal_auth_pubkey_any">"Attempting 'publickey' authentication with any in-memory public keys"</string>
+	<!-- Error message shown when the selected public key is corrupted or invalid -->
+	<string name="terminal_auth_pubkey_invalid">"Selected public key is invalid, try reselecting key in host editor"</string>
+	<!-- Message shown in terminal when attempting public key authentication with a specific key -->
+	<string name="terminal_auth_pubkey_specific">"Attempting 'publickey' authentication with a specific public key"</string>
+	<!-- Message shown in terminal when requesting biometric authentication to unlock a key. Parameter is the key nickname. -->
+	<string name="terminal_auth_biometric">"Requesting biometric authentication for key '%1$s'"</string>
+	<!-- Message shown when a biometric key has been invalidated due to new fingerprint enrollment. Parameter is the key nickname. -->
+	<string name="terminal_auth_biometric_invalidated">"Biometric key '%1$s' has been invalidated. This can happen when new fingerprints are enrolled on the device. Please generate a new key."</string>
+	<!-- Message shown in terminal when public key authentication fails. Parameter is the key nickname. -->
+	<string name="terminal_auth_pubkey_fail">"Authentication method 'publickey' with key '%1$s' failed"</string>
+
+	<!-- Message shown in terminal when attempting keyboard-interactive authentication method -->
+	<string name="terminal_auth_ki">"Attempting 'keyboard-interactive' authentication"</string>
+	<!-- Message shown in terminal when keyboard-interactive authentication fails -->
+	<string name="terminal_auth_ki_fail">"Authentication method 'keyboard-interactive' failed"</string>
+
+	<!-- Error message shown when server doesn't support any of the authentication methods we can use -->
+	<string name="terminal_auth_fail">"[Your host doesn't support 'password' or 'keyboard-interactive' authentication.]"</string>
+
+	<!-- Message shown in terminal when shell session is not started because user disabled it in host settings -->
+	<string name="terminal_no_session">"Session will not be started due to host preference."</string>
+	<!-- Message shown in terminal when a port forward is enabled. Parameter is the port forward description. -->
+	<string name="terminal_enable_portfoward">"Enable port forward: %1$s"</string>
+
+	<!-- Error message shown when trying to open a local shell but it's not available on the device -->
+	<string name="local_shell_unavailable">"Failure! Local shell is unavailable on this phone."</string>
+
+	<!-- Mosh transport messages -->
+	<!-- Message shown in terminal when Mosh support is being prepared or downloaded before connecting. -->
+	<string name="terminal_mosh_installing">"Preparing Mosh support…"</string>
+	<!-- Message shown in terminal when starting Mosh connection -->
+	<string name="terminal_mosh_starting">"Starting Mosh connection…"</string>
+	<!-- Message shown in terminal when Mosh installation times out -->
+	<string name="terminal_mosh_install_timeout">"Warning: Mosh installation timed out"</string>
+	<!-- Message shown in terminal when launching mosh-server on remote host -->
+	<string name="terminal_mosh_launching_server">"Launching mosh-server on remote host…"</string>
+	<!-- Message shown in terminal when mosh-server fails to start -->
+	<string name="terminal_mosh_server_failed">"Failed to start mosh-server on remote host"</string>
+	<!-- Message shown in terminal when mosh-client fails to start -->
+	<string name="terminal_mosh_client_failed">"Failed to start mosh-client"</string>
+	<!-- Message shown in terminal when Mosh connection is established -->
+	<string name="terminal_mosh_connected">"Mosh connection established"</string>
+	<!-- Message shown in terminal when Mosh encounters an error. Parameter is the error message. -->
+	<string name="terminal_mosh_error">"Mosh error: %1$s"</string>
+
+	<!-- Mosh host editor fields -->
+	<!-- Title for the Mosh server command setting -->
+	<string name="hostpref_mosh_server_title">"Mosh server command"</string>
+	<!-- Summary for the Mosh server command setting -->
+	<string name="hostpref_mosh_server_summary">"Custom mosh-server path or command (leave blank for default)"</string>
+	<!-- Title for the Mosh UDP port setting -->
+	<string name="hostpref_mosh_port_title">"Mosh UDP port"</string>
+	<!-- Summary for the Mosh UDP port setting -->
+	<string name="hostpref_mosh_port_summary">"Fixed UDP port for mosh (0 for automatic 60000-61000 range)"</string>
+	<!-- Title for the Mosh locale setting -->
+	<string name="hostpref_locale_title">"Locale"</string>
+	<!-- Summary for the Mosh locale setting -->
+	<string name="hostpref_locale_summary">"Locale for mosh session (e.g., en_US.UTF-8)"</string>
+
+	<!-- Title of the dynamic feature module delivering Mosh support -->
+	<string name="mosh_feature_title">"Mosh"</string>
+
+	<!-- Link in About section to the release that supplied the Mosh client and its source archives. -->
+	<string name="pref_mosh_release_title">"Mosh release and source code"</string>
+	<!-- Mosh installation progress text. -->
+	<string name="pref_mosh_installing">"Preparing Mosh support…"</string>
+
+	<!-- Text sent to the user to alert them that a Terminal Bell is received in a background session -->
+	<string name="notification_text">"%1$s wants your attention."</string>
+
+	<!-- Preference selection for SSH Authentication Agent to never use pubkeys -->
+	<string name="no">"No"</string>
+	<!-- Preference selection for SSH Authentication Agent to be able to use pubkeys -->
+	<string name="yes">"Yes"</string>
+
+	<!-- Window title for color scheme manager screen -->
+	<string name="title_scheme_manager">"Manage Color Schemes"</string>
+
+	<!-- Button text to create a new color scheme -->
+	<string name="button_new_scheme">"New Scheme"</string>
+
+	<!-- Button text to duplicate a color scheme -->
+	<string name="button_duplicate_scheme">"Duplicate"</string>
+
+	<!-- Button text to delete a color scheme -->
+	<string name="button_delete_scheme">"Delete"</string>
+
+	<!-- Dialog title when creating a new color scheme -->
+	<string name="dialog_title_new_scheme">"New Color Scheme"</string>
+
+	<!-- Label for scheme name input field -->
+	<string name="label_scheme_name">"Scheme Name"</string>
+
+	<!-- Label for scheme description input field (optional) -->
+	<string name="label_scheme_description">"Description (optional)"</string>
+
+	<!-- Confirmation dialog title when deleting a scheme -->
+	<string name="dialog_title_delete_scheme">"Delete Scheme?"</string>
+
+	<!-- Confirmation dialog message when deleting a scheme -->
+	<string name="dialog_message_delete_scheme">"Are you sure you want to delete \"%1$s\"? This action cannot be undone."</string>
+
+	<!-- Button text for confirm action in dialogs -->
+	<string name="button_confirm">"Confirm"</string>
+
+	<!-- Button text for cancel action in dialogs -->
+	<string name="button_cancel">"Cancel"</string>
+
+	<!-- Title shown when leaving an item editor with unsaved changes. -->
+	<string name="editor_discard_changes_title">Discard changes?</string>
+	<!-- Message in the unsaved changes dialog shown by item editors. -->
+	<string name="editor_discard_changes_message">Your edits will be lost if you leave without saving.</string>
+	<!-- Button that leaves an item editor without saving changes. -->
+	<string name="editor_discard">Discard</string>
+	<!-- Button that saves changes from the unsaved changes dialog. -->
+	<string name="editor_save">Save</string>
+
+	<!-- Label indicating a scheme is built-in and cannot be deleted -->
+	<string name="label_built_in_scheme">"Built-in"</string>
+
+	<!-- Label indicating a scheme is custom/user-created -->
+	<string name="label_custom_scheme">"Custom"</string>
+
+	<!-- Empty state message when no custom schemes exist -->
+	<string name="empty_custom_schemes">"No custom schemes. Tap \"New Scheme\" to create one."</string>
+
+	<!-- Button text to export a color scheme to JSON file -->
+	<string name="button_export_scheme">"Export Scheme"</string>
+
+	<!-- Button text to import a color scheme from JSON file -->
+	<string name="button_import_scheme">"Import Scheme"</string>
+
+	<!-- Success message after exporting a scheme -->
+	<string name="message_export_success">"Exported %1$s"</string>
+
+	<!-- Success message after importing a scheme -->
+	<string name="message_import_success">"Imported %1$s"</string>
+
+	<!-- Error message when export fails -->
+	<string name="error_export_failed">"Failed to export scheme: %1$s"</string>
+
+	<!-- Error message when import fails -->
+	<string name="error_import_failed">"Failed to import scheme: %1$s"</string>
+
+	<!-- Error message when JSON parsing fails -->
+	<string name="error_invalid_json">"Invalid JSON file"</string>
+
+	<!-- Window title for palette editor screen -->
+	<string name="title_palette_editor">"Edit Color Palette"</string>
+
+	<!-- Button text to reset entire palette to defaults -->
+	<string name="button_reset_all_colors">"Reset All"</string>
+
+	<!-- Section header for ANSI colors (0-15) -->
+	<string name="section_ansi_colors">"ANSI Colors (0–15)"</string>
+
+	<!-- Dialog title when editing a specific color -->
+	<string name="dialog_title_edit_color">"Edit Color %1$d"</string>
+
+	<!-- Confirmation dialog for resetting all colors -->
+	<string name="dialog_title_reset_all">"Reset All Colors?"</string>
+
+	<!-- Message for reset all colors confirmation -->
+	<string name="dialog_message_reset_all">"This will reset all 256 colors to their default values. This action cannot be undone."</string>
+
+	<!-- Displayed in the notification bar that connections are active -->
+	<string name="app_is_running">"ConnectBot is running"</string>
+
+	<!-- RGB color picker labels -->
+	<!-- Label for the red color component slider (0-255) in the RGB color picker -->
+	<string name="label_red">"Red"</string>
+
+	<!-- Label for the green color component slider (0-255) in the RGB color picker -->
+	<string name="label_green">"Green"</string>
+
+	<!-- Label for the blue color component slider (0-255) in the RGB color picker -->
+	<string name="label_blue">"Blue"</string>
+
+	<!-- Label for the hex color input field where users can type a hex color code -->
+	<string name="label_hex_color">"Hex Color"</string>
+
+	<!-- Section header for the foreground and background color selectors in the palette editor -->
+	<string name="section_fg_bg_colors">Foreground &amp; Background</string>
+	<!-- Label under the foreground color swatch in the palette editor -->
+	<string name="label_foreground_color">Foreground</string>
+	<!-- Label under the background color swatch in the palette editor -->
+	<string name="label_background_color">Background</string>
+
+	<!-- Label for the base scheme selector in the new color scheme dialog -->
+	<string name="label_base_scheme">Base scheme:</string>
+	<!-- Icon button in the profile list screen to open color scheme management -->
+	<string name="menu_manage_colors">Manage Color Schemes</string>
+	<!-- Section header for the terminal color preview shown below the ANSI color grid -->
+	<string name="section_color_preview">Preview</string>
+
+	<!-- Accessibility text for connection state in list of hosts when the host is currently
+	 connected. -->
+	<string name="image_description_connected">"Connected."</string>
+
+	<!-- Accessibility text for connection state in list of hosts when the host is currently
+	     disconnected after having been previously connected. -->
+	<string name="image_description_disconnected">"Disconnected."</string>
+
+	<!-- Describes the icon of the "send control character" button in the terminal view for
+	     accessibility purposes. -->
+	<string name="image_description_toggle_control_character">Toggle control character.</string>
+
+	<!-- Describes the icon of the "send escape character" button in the terminal view for
+	     accessibility purposes. -->
+	<string name="image_description_send_escape_character">Send escape character.</string>
+
+	<!-- Describes the icon of the "send tab character" button in the terminal view for
+	     accessibility purposes. -->
+	<string name="image_description_send_tab_character">Send TAB character.</string>
+
+	<!-- Describes the icon of the "hide keyboard" button in the terminal view for accessibility
+	     purposes. -->
+	<string name="image_description_hide_keyboard">Hide keyboard.</string>
+
+	<!-- Describes the icon of the "show keyboard" button in the terminal view for accessibility
+	     purposes. -->
+	<string name="image_description_show_keyboard">Show keyboard.</string>
+
+	<!-- Describes the icon of the "Arrow up" button in the terminal view for accessibility
+	     purposes. -->
+	<string name="image_description_up">Arrow up</string>
+
+	<!-- Describes the icon of the "Arrow down" button in the terminal view for accessibility
+	     purposes. -->
+	<string name="image_description_down">Arrow down</string>
+
+	<!-- Describes the icon of the "Arrow left" button in the terminal view for accessibility
+	     purposes. -->
+	<string name="image_description_left">Arrow left</string>
+
+	<!-- Describes the icon of the "Arrow right" button in the terminal view for accessibility
+	     purposes. -->
+	<string name="image_description_right">Arrow right</string>
+
+	<!-- Text for the "Esc" button in virtual keyboard. -->
+	<string name="button_key_esc">Esc</string>
+	<!-- Text for the "Ctrl" button in virtual keyboard. -->
+	<string name="button_key_ctrl">Ctrl</string>
+	<!-- Text for the "Alt" button in virtual keyboard. -->
+	<string name="button_key_alt">Alt</string>
+	<!-- Accessibility description for the Alt button in the virtual keyboard. -->
+	<string name="image_description_toggle_alt_key">Toggle Alt key.</string>
+	<!-- Text for the "IME" button in virtual keyboard that toggles compose mode for IME composition (Japanese, etc.) -->
+	<string name="button_key_ime">IME</string>
+	<!-- Accessibility description for the IME toggle button in the virtual keyboard -->
+	<string name="image_description_toggle_compose_mode">Toggle compose mode for IME input</string>
+
+	<!-- Text for the "Home" button in virtual keyboard. -->
+	<string name="button_key_home">Home</string>
+	<!-- Text for the "End" button in virtual keyboard. -->
+	<string name="button_key_end">End</string>
+	<!-- Text for the "Page Up" button in virtual keyboard. -->
+	<string name="button_key_pgup">PgUp</string>
+	<!-- Text for the "Page Down" button in virtual keyboard. -->
+	<string name="button_key_pgdn">PgDn</string>
+	<!-- Text for the "F1" button in virtual keyboard. -->
+	<string name="button_key_f1">F1</string>
+	<!-- Text for the "F2" button in virtual keyboard. -->
+	<string name="button_key_f2">F2</string>
+	<!-- Text for the "F3" button in virtual keyboard. -->
+	<string name="button_key_f3">F3</string>
+	<!-- Text for the "F4" button in virtual keyboard. -->
+	<string name="button_key_f4">F4</string>
+	<!-- Text for the "F5" button in virtual keyboard. -->
+	<string name="button_key_f5">F5</string>
+	<!-- Text for the "F6" button in virtual keyboard. -->
+	<string name="button_key_f6">F6</string>
+	<!-- Text for the "F7" button in virtual keyboard. -->
+	<string name="button_key_f7">F7</string>
+	<!-- Text for the "F8" button in virtual keyboard. -->
+	<string name="button_key_f8">F8</string>
+	<!-- Text for the "F9" button in virtual keyboard. -->
+	<string name="button_key_f9">F9</string>
+	<!-- Text for the "F10" button in virtual keyboard. -->
+	<string name="button_key_f10">F10</string>
+	<!-- Text for the "F11" button in virtual keyboard. -->
+	<string name="button_key_f11">F11</string>
+	<!-- Text for the "F12" button in virtual keyboard. -->
+	<string name="button_key_f12">F12</string>
+
+	<!-- Button in virtual keyboard that opens text input dialog for composing longer text with full IME support -->
+	<string name="terminal_keyboard_text_input_button">Text input</string>
+
+	<!-- Title for the floating text input dialog where users can type longer text with full keyboard/IME support -->
+	<string name="terminal_text_input_dialog_title">Text Input</string>
+
+	<!-- Label for the text field in the floating text input dialog where users compose their text -->
+	<string name="terminal_text_input_dialog_label">Enter text to send to terminal</string>
+
+	<!-- Content description for the resize handle in the floating text input dialog -->
+	<string name="terminal_text_input_resize_handle">Resize</string>
+
+	<!-- Menu item in console toolbar to open floating text input dialog -->
+	<string name="console_menu_text_input">Text input</string>
+
+	<!-- Menu item in console overflow menu that toggles compose mode for IME composition (Japanese, etc.) -->
+	<string name="console_menu_compose_mode">Compose mode (IME)</string>
+
+	<!-- Send button in floating text input dialog -->
+	<string name="button_send">Send</string>
+
+	<!-- Common UI button labels -->
+	<!-- Button label for confirming an action -->
+	<string name="button_ok">OK</string>
+	<!-- Button label for closing a dialog -->
+	<string name="button_close">Close</string>
+	<!-- Accessibility label for back navigation button; used for screen readers -->
+	<string name="button_back">Back</string>
+	<!-- Accessibility label for navigate up button in app bar; used for screen readers -->
+	<string name="button_navigate_up">Navigate up</string>
+	<!-- Accessibility label for more options menu button; used for screen readers -->
+	<string name="button_more_options">More options</string>
+	<!-- Accessibility label for host options menu button; used for screen readers -->
+	<string name="button_host_options">Host options</string>
+	<!-- Accessibility label for collapse button; used for screen readers -->
+	<string name="button_collapse">Collapse</string>
+
+	<!-- Error messages -->
+	<!-- Error message shown when a public key fails to load at startup -->
+	<string name="error_key_load_failed">Failed to load key \'%1$s\': %2$s</string>
+	<!-- Error message shown when a connection to a host fails -->
+	<string name="error_connection_failed">Failed to connect to %1$s (%2$s): %3$s</string>
+	<!-- Error message shown when port forwards fail to load for a host -->
+	<string name="error_port_forward_load_failed">Failed to load port forwards for %1$s: %2$s</string>
+	<!-- Error message shown when saving host configuration fails -->
+	<string name="error_host_save_failed">Failed to save host %1$s: %2$s</string>
+	<!-- Error message shown when loading a color scheme fails -->
+	<string name="error_color_scheme_load_failed">Failed to load color scheme: %s</string>
+
+	<!-- Format string for the nickname of a duplicated host -->
+	<string name="host_duplicate_nickname">%1$s (copy)</string>
+
+	<!-- Empty state messages -->
+	<!-- Message shown when no hosts have been configured yet -->
+	<string name="empty_hosts_message">No hosts configured</string>
+	<!-- Message shown when no public keys have been generated or imported yet -->
+	<string name="empty_pubkeys_message">No keys found.</string>
+	<!-- Message shown when no port forwards have been configured for a host -->
+	<string name="empty_port_forwards_message">No port forwards configured.</string>
+	<!-- Message shown when no URLs are found in the terminal buffer during URL scan -->
+	<string name="empty_urls_message">No URLs found in terminal buffer</string>
+
+	<!-- Console screen messages -->
+	<!-- Default title for console screen when no specific host is connected -->
+	<string name="console_default_title">Console</string>
+
+	<!-- Host editor screen labels -->
+	<!-- Text for button to show advanced host options -->
+	<string name="host_editor_show_advanced">Show advanced options</string>
+	<!-- Text for button to hide advanced host options -->
+	<string name="host_editor_hide_advanced">Hide advanced options</string>
+
+	<!-- Terminal resize dialog -->
+	<!-- Label for width input field in terminal resize dialog -->
+	<string name="resize_width_label">Width (columns)</string>
+	<!-- Label for height input field in terminal resize dialog -->
+	<string name="resize_height_label">Height (rows)</string>
+	<!-- Button to disable force size and return to auto-sizing -->
+	<string name="resize_disable_force_size">Disable force size</string>
+
+	<!-- Public key editor labels -->
+	<!-- Label for key type field in the SSH pubkey editor -->
+	<string name="pubkey_editor_key_type_label">Key type</string>
+	<!-- Label for the options section on SSH pubkey editor -->
+	<string name="pubkey_editor_options_label">Options</string>
+	<!-- Warning message shown when encrypted SSH pubkeys are set to load on startup -->
+	<string name="pubkey_editor_encrypted_startup_warning">Encrypted keys cannot be unlocked at startup</string>
+
+	<!-- Public key list labels -->
+	<!-- Label prefix for displaying key type in list -->
+	<string name="pubkey_type_label">Type: %s</string>
+	<!-- Accessibility description for encrypted key icon -->
+	<string name="pubkey_encrypted_description">Encrypted</string>
+	<!-- Accessibility description for unencrypted key icon -->
+	<string name="pubkey_not_encrypted_description">Not encrypted</string>
+
+	<!-- Biometric authentication strings -->
+	<!-- Label for biometric protection toggle in key generation -->
+	<string name="pubkey_biometric_protection">Fingerprint protection</string>
+	<!-- Description for biometric protection option -->
+	<string name="pubkey_biometric_description">Protect this key with your fingerprint</string>
+	<!-- Warning shown when biometrics are not enrolled -->
+	<string name="pubkey_biometric_not_enrolled">No fingerprint enrolled. Set up fingerprint in device settings to use this feature.</string>
+	<!-- Warning shown when key type doesn\'t support biometric protection -->
+	<string name="pubkey_biometric_key_type_warning">Fingerprint protection is only available for RSA and EC keys</string>
+	<!-- Title for biometric prompt when unlocking a key -->
+	<string name="pubkey_biometric_prompt_title">Authenticate to use key</string>
+	<!-- Subtitle for biometric prompt -->
+	<string name="pubkey_biometric_prompt_subtitle">Touch the fingerprint sensor to unlock \'%1$s\'</string>
+	<!-- Accessibility description for biometric-protected key icon -->
+	<string name="pubkey_biometric_description_icon">Protected by fingerprint</string>
+	<!-- Error message when biometric authentication is not available in current context -->
+	<string name="pubkey_biometric_not_available">Fingerprint authentication is not available</string>
+
+	<!-- Port forward editor labels -->
+	<!-- Placeholder for port forward nickname field. Should show an example nickname for a port forward. -->
+	<string name="portforward_nickname_placeholder">Internal Webserver</string>
+	<!-- Error message when port is out of valid range -->
+	<string name="portforward_port_range_error">Port must be between 1 and 65535</string>
+	<!-- Placeholder for destination field -->
+	<string name="portforward_destination_placeholder">localhost:80</string>
+	<!-- Error message for invalid destination format -->
+	<string name="portforward_destination_format_error">Format should be host:port (e.g., localhost:80)</string>
+	<!-- Label for the host address spinner shown when type is Remote -->
+	<string name="portforward_host_address">Host address</string>
+	<!-- Host address option: bind to localhost (default) -->
+	<string name="portforward_source_addr_localhost">Localhost</string>
+	<!-- Host address option: bind to 127.0.0.1 (IPv4 loopback only) -->
+	<string name="portforward_source_addr_localhost_ipv4">Localhost (IPv4 only)</string>
+	<!-- Host address option: bind to ::1 (IPv6 loopback only) -->
+	<string name="portforward_source_addr_localhost_ipv6">Localhost (IPv6 only)</string>
+	<!-- Host address option: bind to all interfaces (empty string in SSH) -->
+	<string name="portforward_source_addr_all">All addresses</string>
+	<!-- Host address option: bind to 0.0.0.0 (all IPv4 interfaces) -->
+	<string name="portforward_source_addr_all_ipv4">All IPv4 addresses</string>
+	<!-- Host address option: bind to :: (all IPv6 interfaces) -->
+	<string name="portforward_source_addr_all_ipv6">All IPv6 addresses</string>
+	<!-- Host address option: user enters a specific address manually -->
+	<string name="portforward_source_addr_specific">Specific address</string>
+	<!-- Placeholder for the specific host address text field -->
+	<string name="portforward_source_addr_specific_placeholder">192.168.1.1</string>
+
+	<!-- Port forward list labels -->
+	<!-- Label prefix for displaying port forward type in list -->
+	<string name="portforward_type_label">Type: %s</string>
+	<!-- Menu item to enable port forward on live connection -->
+	<string name="portforward_enable">Enable</string>
+	<!-- Menu item to disable port forward on live connection -->
+	<string name="portforward_disable">Disable</string>
+	<!-- Content description for enabled port forward visual indicator -->
+	<string name="portforward_enabled">Port forward enabled</string>
+	<!-- Content description for disabled port forward visual indicator -->
+	<string name="portforward_disabled">Port forward disabled</string>
+
+	<!-- Label for spinner which allows user to select SSH/Telnet/Local. -->
+	<string name="protocol_spinner_label">Protocol</string>
+	<!-- Label for button which expands/collapses section. -->
+	<string name="expand">Expand</string>
+	<!-- Label for checkbox which, when check, makes SSL authorization require confirmation. -->
+	<string name="hostpref_authagent_with_confirmation">require confirmation</string>
+	<!-- Text for button which, when clicked, adds a new host. -->
+	<string name="hostpref_add_host">Add host</string>
+	<!-- Text for button which, when clicked, saves an existing host. -->
+	<string name="hostpref_save_host">Save host</string>
+	<!-- Title shown in the app bar when editing an existing host's settings. -->
+	<string name="hostpref_setting_title">Host setting</string>
+	<!-- Text for button which, when clicked, brings up picker to import an existing pubkey. -->
+	<string name="pubkey_import_existing">Import existing pubkey</string>
+	<!-- Text for button which, when clicked, imports a pubkey from the clipboard. -->
+	<string name="pubkey_import_from_clipboard">Import from clipboard</string>
+	<!-- Label for the key content text field in the import-from-clipboard dialog. -->
+	<string name="pubkey_import_clipboard_key_label">Private key content</string>
+	<!-- Content description for the paste button in the import-from-clipboard dialog. -->
+	<string name="pubkey_paste_from_clipboard">Paste from clipboard</string>
+
+	<!-- Title for notification permission dialog shown when user first tries to connect to a host.
+	     Explains that notifications keep SSH connections alive. -->
+	<string name="notification_permission_title">"Stay connected in the background"</string>
+
+	<!-- Explanation message shown in permission dialog when user tries to connect to a host.
+	     Explains why notification permission is needed and what happens without it. -->
+	<string name="notification_permission_message">"ConnectBot needs notification permission to keep your connections active when you switch apps. Without it, the system may drop your connections to save battery."</string>
+
+	<!-- Button text to grant notification permission in the permission explanation dialog. -->
+	<string name="grant_permission">"Allow"</string>
+
+	<!-- Button text to proceed with connecting without granting notification permission. -->
+	<string name="connect_anyway">"Connect anyway"</string>
+
+	<!-- Title for dialog directing users to app settings when notification permission was denied.
+	     Shown when user tries to enable persist connections after denying permission. -->
+	<string name="notification_permission_denied_title">"Notification permission needed"</string>
+
+	<!-- Message explaining that user must enable notification permission in app settings.
+	     Shown when notification permission was previously denied and user tries to enable persist connections. -->
+	<string name="notification_permission_denied_message">"To keep your connections active in the background, please enable notifications for ConnectBot in the system settings."</string>
+
+	<!-- Button text to open ConnectBot app settings page where user can grant notification permission. -->
+	<string name="open_settings">"Open settings"</string>
+
+	<!-- Snackbar shown on host list when notification permission was denied.
+	     Informs user that connections will drop when app is backgrounded. -->
+	<string name="notification_permission_denied_snackbar">"Connections may drop without notification permission"</string>
+
+	<!-- Snackbar shown on console screen when notification permission is denied and persist connections is enabled. -->
+	<string name="notification_permission_console_warning">"Connection may drop in background"</string>
+
+	<!-- Message shown to user when they're trying to connect to a host on a local network but
+	     have not granted the permission yet. -->
+	<string name="terminal_no_route">Are you trying to access a local host? Grant local network permissions.</string>
+
+	<!-- Loading message shown during app initialization -->
+	<string name="loading_message">Loading…</string>
+
+	<!-- Database migration screen messages. Displayed during one-time migration from legacy database format to Room database. -->
+	<!-- Title shown while checking if database migration is needed -->
+	<string name="migration_checking">Checking database…</string>
+	<!-- Title shown during database migration process -->
+	<string name="migration_title">Migrating Database</string>
+	<!-- Warning message shown during migration to inform user not to close the app -->
+	<string name="migration_warning">Please do not close the app during migration</string>
+	<!-- Statistics label showing number of hosts migrated -->
+	<string name="migration_stats_hosts">Hosts migrated: %d</string>
+	<!-- Statistics label showing number of SSH keys migrated -->
+	<string name="migration_stats_pubkeys">SSH keys migrated: %d</string>
+	<!-- Statistics label showing number of port forwards migrated -->
+	<string name="migration_stats_port_forwards">Port forwards migrated: %d</string>
+	<!-- Statistics label showing number of known hosts migrated -->
+	<string name="migration_stats_known_hosts">Known hosts migrated: %d</string>
+	<!-- Title shown when migration fails -->
+	<string name="migration_failed_title">Migration Failed</string>
+	<!-- Error message shown when migration fails, includes error details -->
+	<string name="migration_failed_message">An error occurred during database migration: %s</string>
+	<!-- Button label to retry failed migration -->
+	<string name="migration_retry">Retry</string>
+	<!-- Help text shown after migration failure with link to GitHub issues -->
+	<string name="migration_failed_help">If the problem persists, please report this issue at %1$s with the debug log copied above</string>
+	<!-- Title for warnings section shown during database migration -->
+	<string name="migration_warnings_title">Migration Warnings</string>
+	<!-- Button text to copy migration warnings to clipboard for reporting issues -->
+	<string name="migration_copy_warnings">Copy Warnings</string>
+	<!-- Title for debug log section shown when migration fails -->
+	<string name="migration_debug_log_title">Debug Log</string>
+	<!-- Button text to copy debug log to clipboard for reporting issues -->
+	<string name="migration_copy_debug_log">Copy Debug Log</string>
+	<!-- Shown in the alert dialog when a user chooses the 'disconnect' item to disconnect from a SSH or Telnet host. -->
+	<string name="disconnect_host_alert">Are you sure you want to disconnect from \'%1$s\'?</string>
+	<!-- Shown in the alert dialog when a user chooses the 'delete host' item to delete a host. -->
+	<string name="delete_host_confirm">Are you sure you want to delete host \'%1$s\'?</string>
+	<!-- Shown in the alert dialog when a user chooses the 'forget host keys' item. -->
+	<string name="forget_host_keys_confirm">Are you sure you want to forget the stored host keys for \'%1$s\'? You will be prompted to verify the host key on the next connection.</string>
+	<!-- Menu selection to edit a pubkey details (e.g., nickname) -->
+	<string name="list_pubkey_edit">Edit pubkey</string>
+
+	<!-- IP Version selection for host connections -->
+	<!-- Title for IP version preference in host editor -->
+	<string name="hostpref_ipversion_title">IP version</string>
+	<!-- Option for automatic IP version selection (try both IPv4 and IPv6) -->
+	<string name="ipversion_auto">Automatic</string>
+	<!-- Option to force IPv4-only connections -->
+	<string name="ipversion_ipv4">IPv4 only</string>
+	<!-- Option to force IPv6-only connections -->
+	<string name="ipversion_ipv6">IPv6 only</string>
+
+	<!-- ProxyJump / Jump Host support -->
+	<!-- Title for jump host selector in host editor -->
+	<string name="hostpref_jumphost_title">Jump host (ProxyJump)</string>
+	<!-- Summary text explaining jump host functionality -->
+	<string name="hostpref_jumphost_summary">Connect through another SSH host</string>
+	<!-- Option for no jump host (direct connection) -->
+	<string name="list_jumphost_none">None (direct connection)</string>
+	<!-- Terminal message when connecting via jump host -->
+	<string name="terminal_connecting_via_jump">Connecting via jump host: %s</string>
+	<!-- Terminal message when connected to jump host -->
+	<string name="terminal_jump_connected">Connected to jump host: %s</string>
+	<!-- Terminal message when authenticated to jump host -->
+	<string name="terminal_jump_authenticated">Authenticated to jump host: %s</string>
+	<!-- Terminal message when jump host connection fails -->
+	<string name="terminal_jump_failed">Failed to connect to jump host %1$s: %2$s</string>
+	<!-- Terminal message when jump host authentication fails -->
+	<string name="terminal_jump_auth_failed">Authentication failed for jump host: %s</string>
+	<!-- Terminal message when jump host is not found in database -->
+	<string name="terminal_jump_not_found">Jump host not found in saved hosts</string>
+	<!-- Password prompt prefix for jump host -->
+	<string name="terminal_jump_password">Password for jump host %s:</string>
+
+	<!-- Button text to view application logs for debugging -->
+	<string name="view_logs">View Logs</string>
+	<!-- Title for the log viewer dialog -->
+	<string name="logs_title">Application Logs</string>
+	<!-- Button text to copy logs to clipboard for bug reporting -->
+	<string name="copy_logs">Copy Logs</string>
+	<!-- Confirmation message shown when logs are copied to clipboard -->
+	<string name="logs_copied">Logs copied to clipboard</string>
+	<!-- Instruction text for reporting bugs with logs -->
+	<string name="logs_bug_report_info">To report a bug, copy these logs and open a new issue at https://connectbot.org/bug</string>
+	<!-- Message shown when no logs are available -->
+	<string name="no_logs_available">No logs available</string>
+
+	<!-- Section title for the "Help" screen showing information about the program itself. -->
+	<string name="help_section_about">About</string>
+
+	<!-- Window title for the Contact &amp; Support screen, also used as button text in Help screen. -->
+	<string name="title_contact">Contact &amp; Support</string>
+
+	<!-- Section title for the "Help" screen showing contact and support information. -->
+	<string name="help_section_contact">Contact &amp; Support</string>
+	<!-- Label for the official website link in the Help screen. -->
+	<string name="help_website">Website</string>
+	<!-- URL for the official ConnectBot website. -->
+	<string name="help_website_url" translatable="false">https://connectbot.org/</string>
+	<!-- Label for the GitHub repository link in the Help screen. -->
+	<string name="help_github">Source Code</string>
+	<!-- URL for the ConnectBot GitHub repository. -->
+	<string name="help_github_url" translatable="false">https://github.com/connectbot/connectbot</string>
+	<!-- Label for the bug report/issue tracker link in the Help screen. -->
+	<string name="help_report_bug">Report a Bug</string>
+	<!-- URL for the ConnectBot issue tracker. -->
+	<string name="help_report_bug_url" translatable="false">https://connectbot.org/bug</string>
+	<!-- Section title for the "Help" screen showing donation options. -->
+	<string name="help_section_donate">Support Development</string>
+	<!-- Label for the GitHub Sponsors donation link in the Help screen. -->
+	<string name="help_donate_github">GitHub Sponsors</string>
+	<!-- URL for the GitHub Sponsors page. -->
+	<string name="help_donate_github_url" translatable="false">https://github.com/sponsors/kruton</string>
+	<!-- Label for the Buy Me a Coffee donation link in the Help screen. -->
+	<string name="help_donate_coffee">Buy Me a Coffee</string>
+	<!-- URL for the Buy Me a Coffee page. -->
+	<string name="help_donate_coffee_url" translatable="false">https://buymeacoffee.com/kruton</string>
+
+	<!-- Built-in color scheme descriptions for terminal display -->
+	<!-- Description of the default terminal color scheme -->
+	<string name="colorscheme_default_description">Default terminal colors</string>
+	<!-- Description of the Solarized Dark color scheme -->
+	<string name="colorscheme_solarized_dark_description">Precision colors for machines and people</string>
+	<!-- Description of the Solarized Light color scheme -->
+	<string name="colorscheme_solarized_light_description">Solarized with light background</string>
+	<!-- Description of the Dracula color scheme -->
+	<string name="colorscheme_dracula_description">A dark theme for the terminal</string>
+	<!-- Description of the Nord color scheme -->
+	<string name="colorscheme_nord_description">An arctic, north-bluish color palette</string>
+	<!-- Description of the Gruvbox Dark color scheme -->
+	<string name="colorscheme_gruvbox_dark_description">Retro groove color scheme</string>
+	<!-- Description of the Monokai color scheme -->
+	<string name="colorscheme_monokai_description">Sublime Text inspired theme</string>
+	<!-- Description of the Tomorrow Night color scheme -->
+	<string name="colorscheme_tomorrow_night_description">A clean and comfortable dark theme</string>
+
+	<!-- Settings screen strings -->
+	<!-- Category title for profile settings section -->
+	<string name="pref_profiles_category">Profiles</string>
+	<!-- Setting title for default profile selection -->
+	<string name="pref_default_profile_title">Default Profile</string>
+	<!-- Summary text when no default profile is selected -->
+	<string name="pref_default_profile_none">None (use host settings)</string>
+	<!-- Summary text for special keys always visible setting -->
+	<string name="pref_alwaysvisible_summary">Keep special keys always visible</string>
+	<!-- Title for custom terminal types preference -->
+	<string name="pref_customterminal_title">Custom Terminal Types</string>
+	<!-- Summary for custom terminal types preference -->
+	<string name="pref_customterminal_summary">Add custom TERM values for remote servers</string>
+	<!-- Dialog title for adding a custom terminal type -->
+	<string name="dialog_customterminal_title">Add Custom Terminal Type</string>
+	<!-- Label/hint for terminal type input field -->
+	<string name="dialog_customterminal_hint">Terminal type (e.g., rxvt-unicode)</string>
+	<!-- Label for custom value input in list preference dialogs -->
+	<string name="dialog_custom_value_label">Enter custom value</string>
+	<!-- Summary description for Ctrl+A then Space camera button action -->
+	<string name="list_camera_ctrlaspace_description">Ctrl+A then Space</string>
+	<!-- Summary description for Ctrl+A camera button action -->
+	<string name="list_camera_ctrla_description">Ctrl+A</string>
+	<!-- Summary description for Esc camera button action -->
+	<string name="list_camera_esc_description">Esc</string>
+	<!-- Summary description for Esc+A camera button action -->
+	<string name="list_camera_esc_a_description">Esc+A</string>
+	<!-- Summary description for None camera button action -->
+	<string name="list_camera_none_description">None</string>
+	<!-- Summary description for text input camera button action -->
+	<string name="list_camera_text_input_description">Text input</string>
+
+	<!-- Host export/import menu items -->
+	<!-- Menu item to export all hosts to a JSON file -->
+	<string name="list_menu_export_hosts">Export Hosts</string>
+	<!-- Menu item to import hosts from a JSON file -->
+	<string name="list_menu_import_hosts">Import Hosts</string>
+
+	<!-- Host export/import messages -->
+	<!-- Success message shown after exporting hosts to a file. Parameters: %1$d = host count, %2$d = profile count -->
+	<string name="export_hosts_success">Exported %1$d hosts and %2$d profiles</string>
+	<!-- Success message shown after importing hosts from a file. Parameters: %1$d = hosts imported, %2$d = hosts skipped, %3$d = profiles imported, %4$d = profiles skipped -->
+	<string name="import_hosts_success">Imported %1$d hosts (%2$d skipped) and %3$d profiles (%4$d skipped)</string>
+	<!-- Error message when host export fails -->
+	<string name="export_hosts_failed">Failed to export hosts: %s</string>
+	<!-- Error message when host import fails -->
+	<string name="import_hosts_failed">Failed to import hosts: %s</string>
+	<!-- Error shown when an imported JSON file exceeds the safe size limit. -->
+	<string name="import_json_file_too_large">JSON file is too large to import (maximum 8 MB)</string>
+	<!-- Error shown when a selected import file cannot be opened. -->
+	<string name="import_file_unavailable">Cannot open selected file</string>
+
+	<!-- Shortcut customization dialog strings -->
+	<!-- Dialog title when customizing a shortcut icon -->
+	<string name="shortcut_customize_title">Customize Shortcut</string>
+	<!-- Label for the shortcut icon color selection dropdown -->
+	<string name="shortcut_icon_color">Icon Color</string>
+	<!-- Label for the shortcut icon style selection dropdown -->
+	<string name="shortcut_icon_style">Icon Style</string>
+	<!-- Checkbox label to use the host\'s configured color for the shortcut -->
+	<string name="shortcut_use_host_color">Use host color</string>
+	<!-- Button to create the customized shortcut -->
+	<string name="shortcut_create">Create Shortcut</string>
+	<!-- Icon style option: terminal prompt icon -->
+	<string name="icon_style_terminal">Terminal</string>
+	<!-- Icon style option: server/computer icon -->
+	<string name="icon_style_server">Server</string>
+	<!-- Icon style option: cloud icon -->
+	<string name="icon_style_cloud">Cloud</string>
+	<!-- Icon style option: key/security icon -->
+	<string name="icon_style_key">Key</string>
+
+	<!-- Authentication on launch -->
+	<!-- Title for the authentication on launch preference in settings -->
+	<string name="pref_auth_on_launch_title">Authentication on launch</string>
+	<!-- Summary for the authentication on launch preference -->
+	<string name="pref_auth_on_launch_summary">Require fingerprint, face, or device PIN when opening the app</string>
+	<!-- Category title for security preferences in settings -->
+	<string name="pref_security_category">Security</string>
+	<!-- Title shown on the authentication lock screen -->
+	<string name="auth_screen_title">ConnectBot is locked</string>
+	<!-- Button text to trigger authentication on the lock screen -->
+	<string name="auth_screen_unlock_button">Tap to unlock</string>
+	<!-- Title shown in the biometric/device credential authentication prompt -->
+	<string name="auth_prompt_title">Unlock ConnectBot</string>
+	<!-- Subtitle shown in the biometric/device credential authentication prompt -->
+	<string name="auth_prompt_subtitle">Verify your identity to continue</string>
+
+  <!-- Inline images -->
+	<!-- Profile setting controlling Kitty and iTerm inline images. -->
+	<string name="profile_inline_images">InlineImages</string>
+	<!-- InlineImages choice: reject images without prompting. -->
+	<string name="inline_images_off">Off</string>
+	<!-- InlineImages choice: ask once per terminal session. -->
+	<string name="inline_images_ask">Ask</string>
+	<!-- InlineImages choice: allow images without prompting. -->
+	<string name="inline_images_on">On</string>
+	<!-- Title of the inline image permission prompt in a terminal session. -->
+	<string name="inline_images_prompt_title">Display inline images?</string>
+	<!-- Permission applies to all Kitty and iTerm images for this session only. -->
+	<string name="inline_images_prompt_message">Allow this host to display inline images for the rest of this session?</string>
+
+  <!-- Post-login automation -->
+	<!-- Automation editor load failure. -->
+	<string name="automation_load_failed">Could not load automation</string>
+	<!-- Automation editor save failure; draft is retained. -->
+	<string name="automation_save_failed">Could not save automation</string>
+	<!-- Action editor validation error. -->
+	<string name="automation_invalid_action">Check the text, pattern, duration, or selected port forward</string>
+	<!-- Generic automation execution failure; does not reveal sent text. -->
+	<string name="automation_action_failed">Action failed</string>
+	<!-- Wait-for-text timeout failure. -->
+	<string name="automation_timed_out">Timed out waiting for text</string>
+	<!-- Automation stops rather than silently dropping captured output. -->
+	<string name="automation_buffer_overflow">Too much output arrived before automation could process it</string>
+	<!-- Automation step requires a terminal session. -->
+	<string name="automation_no_session">This action requires an open terminal session</string>
+	<!-- Automation references a deleted or missing forward. -->
+	<string name="automation_forward_missing">Port forward is missing</string>
+	<!-- Port forward automation on a non-SSH connection. -->
+	<string name="automation_forward_unsupported">This connection does not support port forwarding</string>
+	<!-- Automation action type. -->
+	<string name="automation_wait_text">Wait for string</string>
+	<!-- Automation action type. -->
+	<string name="automation_send_text">Send string</string>
+	<!-- Automation action type. -->
+	<string name="automation_send_key">Send special key</string>
+	<!-- Automation action type. -->
+	<string name="automation_delay">Wait</string>
+	<!-- Automation action type. -->
+	<string name="automation_disconnect">Disconnect</string>
+	<!-- Automation action type. -->
+	<string name="automation_enable_forward">Enable port forward</string>
+	<!-- Automation action type. -->
+	<string name="automation_disable_forward">Disable port forward</string>
+	<!-- Small card at the end of the automation list. -->
+	<string name="automation_add">Add action</string>
+	<!-- Automation editor save FAB and confirmation action. -->
+	<string name="automation_save">Save</string>
+	<!-- Edit an automation action. -->
+	<string name="automation_edit">Edit</string>
+	<!-- Delete an automation action. -->
+	<string name="automation_delete">Delete</string>
+	<!-- Accessible reorder action. -->
+	<string name="automation_move_up">Move up</string>
+	<!-- Accessible reorder action. -->
+	<string name="automation_move_down">Move down</string>
+	<!-- Automation action drag handle accessibility description. -->
+	<string name="automation_drag">Drag to reorder</string>
+	<!-- Cancel automation or dismiss a dialog. -->
+	<string name="automation_cancel">Cancel</string>
+	<!-- Multiline action text input label. -->
+	<string name="automation_text">Text</string>
+	<!-- Match mode toggle label. -->
+	<string name="automation_regex">Regular expression</string>
+	<!-- RE2 regex limitations shown in the action editor. -->
+	<string name="automation_regex_help">Matches incoming text without ANSI formatting. Regex supports RE2 syntax; lookaround and backreferences are not supported.</string>
+	<!-- Action delay input label. -->
+	<string name="automation_duration">Duration (seconds)</string>
+	<!-- Wait-for-text timeout input label. -->
+	<string name="automation_timeout">Timeout (seconds)</string>
+	<!-- Special key picker label. -->
+	<string name="automation_key">Key</string>
+	<!-- Port forward selector label. -->
+	<string name="automation_forward">Port forward</string>
+	<!-- Failure policy selector label. -->
+	<string name="automation_failure">On failure</string>
+	<!-- Failure policy choice. -->
+	<string name="automation_stop">Stop automation</string>
+	<!-- Failure policy choice. -->
+	<string name="automation_continue">Continue</string>
+	<!-- Automation row for an unsaved host. -->
+	<string name="automation_save_host">Save host to configure automation</string>
+	<!-- Automation row summary; number of actions. -->
+	<plurals name="automation_count">
+		<item quantity="one">%1$d action</item>
+		<item quantity="other">%1$d actions</item>
+	</plurals>
+	<!-- Console automation status; current step and total. -->
+	<string name="automation_progress">Automation: %1$d / %2$d</string>
+	<!-- Console automation failure; step and reason. -->
+	<string name="automation_failure_step">Action %1$d: %2$s</string>
+	<!-- Console button to cancel automation while leaving connection open. -->
+	<string name="automation_cancel_run">Cancel automation</string>
+	<!-- Terminal key picker label for enter. -->
+	<string name="automation_key_enter">Enter</string>
+	<!-- Terminal key picker label for tab. -->
+	<string name="automation_key_tab">Tab</string>
+	<!-- Terminal key picker label for escape. -->
+	<string name="automation_key_escape">Escape</string>
+	<!-- Terminal key picker label for backspace. -->
+	<string name="automation_key_backspace">Backspace</string>
+	<!-- Terminal key picker label for delete. -->
+	<string name="automation_key_delete">Delete</string>
+	<!-- Terminal key picker label for up. -->
+	<string name="automation_key_up">Up arrow</string>
+	<!-- Terminal key picker label for down. -->
+	<string name="automation_key_down">Down arrow</string>
+	<!-- Terminal key picker label for left. -->
+	<string name="automation_key_left">Left arrow</string>
+	<!-- Terminal key picker label for right. -->
+	<string name="automation_key_right">Right arrow</string>
+	<!-- Terminal key picker label for home. -->
+	<string name="automation_key_home">Home</string>
+	<!-- Terminal key picker label for end. -->
+	<string name="automation_key_end">End</string>
+	<!-- Terminal key picker label for insert. -->
+	<string name="automation_key_insert">Insert</string>
+	<!-- Terminal key picker label for page_up. -->
+	<string name="automation_key_page_up">Page Up</string>
+	<!-- Terminal key picker label for page_down. -->
+	<string name="automation_key_page_down">Page Down</string>
+	<!-- Terminal key picker label for function. -->
+	<string name="automation_key_function">F%1$s</string>
+	<!-- Shift modifier toggle in the special-key editor and action summary. -->
+	<string name="automation_key_shift">Shift</string>
+	<!-- Action summary duration in seconds. -->
+	<string name="automation_seconds">%1$.3f s</string>
+</resources>

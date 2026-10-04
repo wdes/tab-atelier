@@ -1,0 +1,329 @@
+/*
+ * ConnectBot: simple, powerful, open-source SSH client for Android
+ * Copyright 2025-2026 Kenny Root
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.connectbot.ui.screens.colors
+
+import androidx.lifecycle.SavedStateHandle
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.onStart
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
+import org.connectbot.data.ColorSchemePresets
+import org.connectbot.data.ColorSchemeRepository
+import org.connectbot.di.CoroutineDispatchers
+import org.connectbot.util.HostConstants
+import javax.inject.Inject
+
+data class PaletteEditorUiState(
+    val schemeId: Long = -1,
+    val schemeName: String = "",
+    val schemeDescription: String = "",
+    val palette: IntArray = ColorSchemePresets.default.colors,
+    val editingColorIndex: Int? = null,
+    val isLoading: Boolean = false,
+    val error: String? = null,
+    val showResetAllDialog: Boolean = false,
+    val foregroundColorIndex: Int = HostConstants.DEFAULT_FG_COLOR,
+    val backgroundColorIndex: Int = HostConstants.DEFAULT_BG_COLOR,
+    val isBuiltIn: Boolean = false,
+    val showDuplicateDialog: Boolean = false,
+    val hasUnsavedMetadata: Boolean = false,
+    val isSavingMetadata: Boolean = false,
+) {
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (javaClass != other?.javaClass) return false
+
+        other as PaletteEditorUiState
+
+        if (schemeId != other.schemeId) return false
+        if (schemeName != other.schemeName) return false
+        if (schemeDescription != other.schemeDescription) return false
+        if (!palette.contentEquals(other.palette)) return false
+        if (editingColorIndex != other.editingColorIndex) return false
+        if (isLoading != other.isLoading) return false
+        if (error != other.error) return false
+        if (showResetAllDialog != other.showResetAllDialog) return false
+        if (foregroundColorIndex != other.foregroundColorIndex) return false
+        if (backgroundColorIndex != other.backgroundColorIndex) return false
+        if (isBuiltIn != other.isBuiltIn) return false
+        if (showDuplicateDialog != other.showDuplicateDialog) return false
+        if (hasUnsavedMetadata != other.hasUnsavedMetadata) return false
+        if (isSavingMetadata != other.isSavingMetadata) return false
+
+        return true
+    }
+
+    override fun hashCode(): Int {
+        var result = schemeId.toInt()
+        result = 31 * result + schemeName.hashCode()
+        result = 31 * result + schemeDescription.hashCode()
+        result = 31 * result + palette.contentHashCode()
+        result = 31 * result + (editingColorIndex ?: 0)
+        result = 31 * result + isLoading.hashCode()
+        result = 31 * result + (error?.hashCode() ?: 0)
+        result = 31 * result + showResetAllDialog.hashCode()
+        result = 31 * result + foregroundColorIndex
+        result = 31 * result + backgroundColorIndex
+        result = 31 * result + isBuiltIn.hashCode()
+        result = 31 * result + showDuplicateDialog.hashCode()
+        result = 31 * result + hasUnsavedMetadata.hashCode()
+        result = 31 * result + isSavingMetadata.hashCode()
+        return result
+    }
+}
+
+@HiltViewModel
+class PaletteEditorViewModel @Inject constructor(
+    private val savedStateHandle: SavedStateHandle,
+    private val repository: ColorSchemeRepository,
+    private val dispatchers: CoroutineDispatchers,
+) : ViewModel() {
+
+    private val schemeId = savedStateHandle.get<Long>("schemeId") ?: 0
+    private val _uiState = MutableStateFlow(PaletteEditorUiState(schemeId = schemeId))
+    val uiState: StateFlow<PaletteEditorUiState> = _uiState.asStateFlow()
+
+    private val _navigateToDuplicate = MutableSharedFlow<Long>()
+    val navigateToDuplicate: SharedFlow<Long> = _navigateToDuplicate.asSharedFlow()
+
+    init {
+        observeScheme()
+        observePalette()
+        observeDefaults()
+    }
+
+    private fun observeScheme() {
+        viewModelScope.launch {
+            repository.observeScheme(schemeId)
+                .catch { e -> _uiState.update { it.copy(error = e.message ?: "Failed to load scheme") } }
+                .collect { scheme ->
+                    if (scheme != null) {
+                        _uiState.update {
+                            it.copy(
+                                schemeName = if (it.hasUnsavedMetadata) it.schemeName else scheme.name,
+                                schemeDescription = if (it.hasUnsavedMetadata) it.schemeDescription else scheme.description,
+                                isBuiltIn = scheme.isBuiltIn,
+                                error = null,
+                            )
+                        }
+                    } else {
+                        _uiState.update { it.copy(error = "Scheme not found") }
+                    }
+                }
+        }
+    }
+
+    private fun observePalette() {
+        viewModelScope.launch {
+            repository.observeSchemeColors(schemeId)
+                .onStart { _uiState.update { it.copy(isLoading = true) } }
+                .catch { e ->
+                    _uiState.update { it.copy(isLoading = false, error = e.message ?: "Failed to load palette") }
+                }
+                .collect { palette ->
+                    _uiState.update {
+                        it.copy(
+                            palette = palette,
+                            isLoading = false,
+                            error = null,
+                        )
+                    }
+                }
+        }
+    }
+
+    private fun observeDefaults() {
+        viewModelScope.launch {
+            repository.observeSchemeDefaults(schemeId)
+                .catch { e -> _uiState.update { it.copy(error = e.message ?: "Failed to load defaults") } }
+                .collect { defaults ->
+                    _uiState.update {
+                        it.copy(
+                            foregroundColorIndex = defaults.first,
+                            backgroundColorIndex = defaults.second,
+                            error = null,
+                        )
+                    }
+                }
+        }
+    }
+
+    fun editColor(colorIndex: Int) {
+        _uiState.update { it.copy(editingColorIndex = colorIndex) }
+    }
+
+    fun closeColorEditor() {
+        _uiState.update { it.copy(editingColorIndex = null) }
+    }
+
+    fun updateColor(colorIndex: Int, newColor: Int) {
+        viewModelScope.launch {
+            try {
+                // Update in database
+                repository.setColorForScheme(schemeId, colorIndex, newColor)
+
+                // No need to update local state manually, observePalette will handle it
+                _uiState.update { it.copy(editingColorIndex = null) }
+            } catch (e: Exception) {
+                _uiState.update {
+                    it.copy(error = e.message ?: "Failed to update color")
+                }
+            }
+        }
+    }
+
+    fun resetColor(colorIndex: Int) {
+        viewModelScope.launch {
+            try {
+                // Get the default color
+                val defaultColor = ColorSchemePresets.default.colors[colorIndex]
+
+                // Update in database
+                repository.setColorForScheme(schemeId, colorIndex, defaultColor)
+
+                // No need to update local state manually, observePalette will handle it
+            } catch (e: Exception) {
+                _uiState.update {
+                    it.copy(error = e.message ?: "Failed to reset color")
+                }
+            }
+        }
+    }
+
+    fun showResetAllDialog() {
+        _uiState.update { it.copy(showResetAllDialog = true) }
+    }
+
+    fun hideResetAllDialog() {
+        _uiState.update { it.copy(showResetAllDialog = false) }
+    }
+
+    fun resetAllColors() {
+        viewModelScope.launch {
+            try {
+                // Reset to defaults in database
+                repository.resetSchemeToDefaults(schemeId)
+
+                // No need to reload manually, observers will handle it
+                _uiState.update { it.copy(showResetAllDialog = false) }
+            } catch (e: Exception) {
+                _uiState.update {
+                    it.copy(
+                        error = e.message ?: "Failed to reset palette",
+                        showResetAllDialog = false,
+                    )
+                }
+            }
+        }
+    }
+
+    fun updateForegroundColor(colorIndex: Int) {
+        if (_uiState.value.isBuiltIn) {
+            _uiState.update { it.copy(error = "Cannot modify built-in schemes. Duplicate to customize.") }
+            return
+        }
+        _uiState.update { it.copy(foregroundColorIndex = colorIndex) }
+        saveFgBg()
+    }
+
+    fun updateBackgroundColor(colorIndex: Int) {
+        if (_uiState.value.isBuiltIn) {
+            _uiState.update { it.copy(error = "Cannot modify built-in schemes. Duplicate to customize.") }
+            return
+        }
+        _uiState.update { it.copy(backgroundColorIndex = colorIndex) }
+        saveFgBg()
+    }
+
+    private fun saveFgBg() {
+        viewModelScope.launch {
+            try {
+                repository.setDefaultColorsForScheme(
+                    schemeId,
+                    _uiState.value.foregroundColorIndex,
+                    _uiState.value.backgroundColorIndex,
+                )
+            } catch (e: Exception) {
+                _uiState.update { it.copy(error = e.message ?: "Failed to save colors") }
+            }
+        }
+    }
+
+    fun updateName(newName: String) {
+        _uiState.update { it.copy(schemeName = newName, hasUnsavedMetadata = true) }
+    }
+
+    fun updateDescription(newDescription: String) {
+        _uiState.update { it.copy(schemeDescription = newDescription, hasUnsavedMetadata = true) }
+    }
+
+    fun saveNameAndDescription(onSuccess: () -> Unit) {
+        val state = _uiState.value
+        if (state.isBuiltIn || state.isSavingMetadata || !state.hasUnsavedMetadata || state.schemeName.isBlank()) return
+        _uiState.update { it.copy(isSavingMetadata = true) }
+        viewModelScope.launch {
+            try {
+                val saved = repository.renameScheme(
+                    schemeId,
+                    state.schemeName,
+                    state.schemeDescription,
+                )
+                if (!saved) throw IllegalStateException("Failed to save name")
+                _uiState.update { it.copy(hasUnsavedMetadata = false) }
+                onSuccess()
+            } catch (e: Exception) {
+                _uiState.update { it.copy(error = e.message ?: "Failed to save name") }
+            } finally {
+                _uiState.update { it.copy(isSavingMetadata = false) }
+            }
+        }
+    }
+
+    fun showDuplicateDialog() {
+        _uiState.update { it.copy(showDuplicateDialog = true) }
+    }
+
+    fun hideDuplicateDialog() {
+        _uiState.update { it.copy(showDuplicateDialog = false) }
+    }
+
+    fun duplicateScheme(newName: String) {
+        viewModelScope.launch {
+            try {
+                val newId = repository.duplicateScheme(schemeId, newName)
+                _uiState.update { it.copy(showDuplicateDialog = false) }
+                _navigateToDuplicate.emit(newId)
+            } catch (e: Exception) {
+                _uiState.update { it.copy(error = e.message ?: "Failed to duplicate scheme") }
+            }
+        }
+    }
+
+    fun clearError() {
+        _uiState.update { it.copy(error = null) }
+    }
+}
