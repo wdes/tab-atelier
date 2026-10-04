@@ -205,19 +205,33 @@ Slint client's string for continuity.
 
 **Tapping a tab opens it.** The session is the daemon's own WebSocket protocol,
 not SSH: one tag byte then the payload, with keystrokes out, output in (gzipped
-output inflated with `GZIPInputStream` — gzip, not a raw deflate stream), the
-terminal size reported, and a "focused" frame as the session opens, which is what
-makes the daemon stamp the tab's `last_used_at`. So using a tab is what moves it
-up the list the list sorts by.
+output inflated with `GZIPInputStream` — gzip, not a raw deflate stream), and a
+"focused" frame as the session opens, which is what makes the daemon stamp the
+tab's `last_used_at`. So using a tab is what moves it up the list the list sorts
+by.
 
-Two details worth not rediscovering:
+**The terminal mirrors the daemon's grid; it does not drive it.** A tab is a real
+workstation terminal — the one this was built against is 193 columns — and the
+daemon *refuses* to resize it, on purpose: a phone viewer must not reflow a shared
+PTY out from under an agent's TUI or another viewer. So a client that renders at
+its own width gets the tab's whole scrollback replayed with cursor positions
+computed for a different geometry, and every line wraps somewhere new. The
+symptom is a session that looks like several terminals at once, with only the
+last-drawn prompt reading correctly. The fix is the meta frame's `cols`/`rows`
+(tag `0x03`), which the terminal adopts as a forced size and fits its *font* to —
+the same way the daemon's own browser client behaves on a phone. Three
+consequences, each of which looks like a bug if you do not know it:
 
-- **Resize is a no-op in the daemon's v1.** A tab is a terminal on a real screen
-  and the workstation wins, so a phone renders a tab's output at the
-  workstation's width, with the workstation's wrapping. The frame is sent anyway:
-  it costs nothing and works the day the daemon honours it.
-- **The size frame is JSON**, `{"cols":N,"rows":M}`, not the two big-endian
-  shorts the tag suggests.
+- **Nothing is sent back about size.** `setDimensions` is deliberately empty. A
+  resize frame is documented as a server-side no-op, and this protocol's
+  reference client never sends one — a mirror that tells the server its size is
+  asking a future daemon to do the opposite of what it wants.
+- **The preview paint (tag `0x0c`) is not rendered.** It carries the last screen
+  as text, sent ahead of a large catch-up so a viewer paints immediately, and it
+  is a hint rather than a stream: feeding it to the emulator concatenates it with
+  the replay that follows, drawing the same screen twice.
+- **A profile's forced size still wins**, and every other transport is unaffected,
+  because the flow a transport would report through starts null.
 
 Which tab to open cannot ride on the host row — a row is the daemon, not one of
 its tabs, and a WebSocket cannot be asked for a tab once it is open. So the id
@@ -236,21 +250,56 @@ slot has only ever held one child. They are wrapped in a `Row`, and the
 regression test asserts the *click* rather than the presence of the node — a
 stacked control is present, visible and enabled, and still unusable.
 
-### 0005 — leaving a terminal puts the keyboard away
+### 0005 — console-screen behaviour
 
-One file, `ui/screens/console/ConsoleScreen.kt`, deliberately its own patch
-rather than folded into 0004: it is not about the tab-atelier server type, it
-applies to every transport, and upstream may well want it.
+One file, `ui/screens/console/ConsoleScreen.kt`, deliberately its own patch rather
+than folded into 0004: it is not about the tab-atelier server type, it applies to
+every transport, and upstream may well want it. Two changes, both about what the
+console does around a session rather than how it talks to one.
 
-The app is a single Activity, so the IME outlives the console screen: backing out
-to the host list left the keyboard up over a list with no text field in it. The
-fix hides it imperatively from a `DisposableEffect` on dispose. Clearing
-`showSoftwareKeyboard` would not do — disposal is the last thing the composition
-does, so there is no recomposition left to act on a state change.
+**Leaving a terminal puts the keyboard away.** The app is a single Activity, so
+the IME outlives the console screen: backing out to the host list left the
+keyboard up over a list with no text field in it. The fix hides it imperatively
+from a `DisposableEffect` on dispose. Clearing `showSoftwareKeyboard` would not do
+— disposal is the last thing the composition does, so there is no recomposition
+left to act on a state change. It is guarded on `isChangingConfigurations`, so
+rotating the device mid-session does not close the keyboard: MainActivity does not
+handle orientation itself, so a rotation disposes this screen without the user
+having left anything.
 
-It is guarded on `isChangingConfigurations`, so rotating the device mid-session
-does not close the keyboard: MainActivity does not handle orientation itself, so
-a rotation disposes this screen without the user having left anything.
+**The terminal adopts the remote's grid size** when one is reported, which is what
+makes a tab-atelier tab render as one screen rather than several — see the grid
+mirror in 0004's section above. A profile's forced size still wins, since that is
+a deliberate choice by the user.
+
+### 0006 — the bridge reports the remote's grid
+
+One file, `service/TerminalBridge.kt`: a `StateFlow` holding the rows×cols a
+transport reports, plus the setter a transport calls. It lives on the bridge
+because that is what the console is already observing, so there is no second
+channel to keep in sync — and being a `StateFlow` that starts `null`, it costs
+every other transport nothing at all, since they never set it and the console
+therefore never forces a size for them.
+
+Non-positive values are ignored rather than stored: a 0-column terminal is not a
+size, and a daemon that sent one would have the client render nothing at all.
+
+**This file was newly modified for the grid mirror, and had to be given a patch to
+exist at all.** It is the only file this work touched that upstream had no
+patched copy of, so until 0006 was written, an `apply-overlay.sh` would have
+reverted the mirror silently — there was nothing in `patches/` or `files/` to
+reproduce it from. Worth stating plainly because the class of mistake is easy to
+repeat: every modified file must be owned by a patch or be a copy in `files/`, and
+the way to check is
+
+    comm -23 <(git -C connectbot diff --name-only | sort) \
+             <(cat overlay/patches/*.patch | grep '^diff --git' | sed 's|.* b/||' | sort -u)
+
+which prints any file that is modified but unreproducible. Beyond that, a hash
+comparison between "before" and "after" only proves reproduction if something
+also asserts the change is *present* in the rebuilt tree — two trees that both
+lack a change compare equal. So verify both: the diff hash, and a `grep` for a
+symbol the change introduces.
 
 ## Current state
 
@@ -261,25 +310,36 @@ and the local shell all still work, and `remove.txt` is empty. A future mileston
 may retire the transports that have no use here, but only if that is wanted: the
 additive shape is what keeps an upstream sync to a pin bump.
 
-The session path has now been run against a real daemon, which is how two bugs
-were found that nothing else would have caught:
+The session path has now been run against a real daemon, which is how the bugs
+below were found — none of them by the unit tests, all of them against a live
+server:
 
+- **The terminal rendered a 193-column workstation terminal at phone width**, so
+  a tab looked like several terminals at once with one readable prompt line at the
+  bottom. The daemon replays a tab's whole scrollback with cursor positions
+  computed for its own geometry and refuses to be resized, so the client has to
+  mirror that geometry — see the grid mirror in 0004's section above. The
+  readable line was the `0x0c` preview paint, which was being fed to the emulator
+  as output and so drawn on top of the replay.
 - **The transport never told the bridge it was connected.** `bridge.onConnected()`
   is what creates the Relay, which is what reads the transport; every other
   transport calls it, `TabAtelier` did not, so the terminal sat on "connecting
   via tabatelier…" forever. `connect()` now waits for the WebSocket to open and
   then signals it, which is also why it may block — it runs on the io dispatcher.
+- **The chevron that hides a daemon's tab list could not be clicked**, because a
+  row's trailing content is a stack: it and the overflow button occupied the same
+  coordinates. See the layout note in 0004's section above.
 - **The daemon refuses the token as an `Authorization` header on a WebSocket
   upgrade** and accepts it only as `?token=`. This is a daemon-side bug:
-  `extract_token` (`src/api_ws.rs`) reads the query first and the header second,
-  but the query lookup is `req.uri().query()?`, whose `?` returns from the whole
-  function when there is no query — so a bare `/tabs/by-id/{id}/ws` never reaches
+  `extract_token` (`src/api_ws.rs`) read the query first and the header second,
+  but the query lookup was `req.uri().query()?`, whose `?` returns from the whole
+  function when there is no query — so a bare `/tabs/by-id/{id}/ws` never reached
   the documented header fallback and 401s. Verified by raw handshake: header
-  alone → 401, `?token=` → 101. The app uses the query form (as the daemon's own
-  browser client does); fixing `extract_token` would let the header form work and
-  let the client drop `?token=`, which is the better primitive since it keeps the
-  token out of URLs and logs.
+  alone → 401, `?token=` → 101. Fixed on main; the app still uses the query form,
+  which works against a daemon that has not been redeployed.
 
 Not yet exercised on a real device: everything above is measured from the host
-against a live daemon over the app's own code paths, not from the phone.
+against a live daemon over the app's own code paths, not from the phone. In
+particular the grid mirror's *font* fitting — whether a 193-column grid is
+readable at arm's length — is a judgement only a device can make.
 

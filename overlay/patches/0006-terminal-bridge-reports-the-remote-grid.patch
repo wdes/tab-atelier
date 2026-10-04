@@ -1,0 +1,41 @@
+diff --git a/app/src/main/java/org/connectbot/service/TerminalBridge.kt b/app/src/main/java/org/connectbot/service/TerminalBridge.kt
+index 208bd124..2ef795db 100644
+--- a/app/src/main/java/org/connectbot/service/TerminalBridge.kt
++++ b/app/src/main/java/org/connectbot/service/TerminalBridge.kt
+@@ -292,6 +292,11 @@ class TerminalBridge {
+     private val _delKeyModeFlow = MutableStateFlow<DelKeyMode>(DelKeyMode.Delete)
+     val delKeyModeFlow: StateFlow<DelKeyMode> = _delKeyModeFlow.asStateFlow()
+ 
++    // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): the grid size the
++    // remote end reports it is using, in rows×cols, or null when it has not said.
++    private val _remoteGridSize = MutableStateFlow<Pair<Int, Int>?>(null)
++    val remoteGridSize: StateFlow<Pair<Int, Int>?> = _remoteGridSize.asStateFlow()
++
+     // Terminal emulator from ConnectBot Terminal library
+     val terminalEmulator: TerminalEmulator
+ 
+@@ -787,6 +792,24 @@ class TerminalBridge {
+         onTextInputRequest?.invoke()
+     }
+ 
++    /**
++     * Told by a transport when the remote end reports the grid size its terminal
++     * is actually using, in rows×cols.
++     *
++     * Added for Tab Atelier Remote (Apache-2.0 section 4(b)): a tab-atelier tab is
++     * a real workstation terminal and the daemon refuses to resize it — a phone
++     * viewer must not reflow a shared PTY out from under an agent's TUI or another
++     * viewer — so the only way to render one faithfully is to mirror its geometry
++     * rather than drive it. ConsoleScreen turns this into a forced terminal size.
++     *
++     * A non-positive dimension is ignored rather than stored: a 0-column terminal
++     * is not a size, and a daemon that sent one would have this client render
++     * nothing at all.
++     */
++    fun setRemoteGridSize(rows: Int, cols: Int) {
++        if (rows > 0 && cols > 0) _remoteGridSize.value = Pair(rows, cols)
++    }
++
+     /**
+      * Internal method to request actual PTY terminal once we've finished
+      * authentication. If called before authenticated, it will just fail.

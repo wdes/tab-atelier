@@ -42,6 +42,8 @@ import org.connectbot.data.entity.Host
 import org.connectbot.service.DisconnectReason
 import org.connectbot.tabatelier.TabAtelierClient
 import org.connectbot.util.SecurePasswordStorage
+import org.json.JSONException
+import org.json.JSONObject
 import timber.log.Timber
 import java.io.ByteArrayInputStream
 import java.io.IOException
@@ -85,9 +87,6 @@ class TabAtelier : AbsTransport() {
     /** The tail of a frame too large for the caller's buffer. */
     private var leftover: ByteArray? = null
     private var leftoverOffset = 0
-
-    private var pendingColumns = 0
-    private var pendingRows = 0
 
     override fun connect() {
         val host = host
@@ -165,32 +164,17 @@ class TabAtelier : AbsTransport() {
             // The daemon stamps the tab's last_used_at on this frame, which is
             // what puts the tab the user just opened at the top of the list.
             webSocket.send(byteArrayOf(TAG_FOCUS).toByteString())
-            sendDimensions()
             opened.countDown()
         }
 
         override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
-            val frame = bytes.toByteArray()
-            if (frame.isEmpty()) return
-            val payload = when (frame[0]) {
-                TAG_OUTPUT -> frame.copyOfRange(1, frame.size)
-                TAG_OUTPUT_GZIP -> gunzip(frame, 1)
-                // Already renderable text, sent ahead of a large catch-up burst so
-                // a phone paints the last screen immediately instead of waiting for
-                // the whole scrollback.
-                TAG_PREVIEW -> frame.copyOfRange(1, frame.size)
-                // Tab metadata (name, size, agent state). The list already shows
-                // it and the terminal does not need it, so this is deliberately
-                // ignored rather than half-parsed.
-                TAG_META -> return
-                // Unknown tags are dropped, not fatal: a newer daemon must not be
-                // able to break an older client.
-                else -> {
-                    Timber.d("Ignoring unknown tab-atelier frame tag %d", frame[0].toInt())
-                    return
-                }
+            when (val frame = decodeFrame(bytes.toByteArray())) {
+                is Frame.Output -> if (frame.bytes.size > 0) inbound.offer(frame.bytes.toByteArray())
+                // The one piece of tab metadata this client does need: the grid
+                // size whose geometry the terminal has to mirror.
+                is Frame.Grid -> bridge?.setRemoteGridSize(frame.rows, frame.cols)
+                Frame.Ignored -> Unit
             }
-            if (payload.isNotEmpty()) inbound.offer(payload)
         }
 
         // The daemon sends no text frames; a session that does is not one we
@@ -294,27 +278,94 @@ class TabAtelier : AbsTransport() {
         inbound.offer(END_OF_STREAM)
     }
 
-    override fun setDimensions(columns: Int, rows: Int, width: Int, height: Int) {
-        pendingColumns = columns
-        pendingRows = rows
-        sendDimensions()
+    /**
+     * Deliberately does nothing.
+     *
+     * The obvious implementation — tell the daemon what size we are rendering at —
+     * is wrong twice over, so it is not done at all rather than sent and hoped
+     * for. Resizing a tab is a documented no-op in the daemon's v1: a tab is a real
+     * workstation terminal and the desktop wins, because a phone viewer must not
+     * reflow a shared PTY out from under an agent's TUI or another viewer. And the
+     * daemon's own browser client, which is this protocol's reference, does not
+     * send this frame either — it mirrors the server's grid instead.
+     *
+     * So this client mirrors it too: the meta frame's cols/rows become the
+     * terminal's forced size (see [TerminalBridge.setRemoteGridSize]), and the
+     * terminal fits its font to that grid. Sending a resize would invite a future
+     * daemon to believe the size it was told, which is the opposite of what a
+     * mirror wants.
+     */
+    override fun setDimensions(columns: Int, rows: Int, width: Int, height: Int) = Unit
+
+    /**
+     * What one server frame means to this client.
+     *
+     * Only output and the grid size are understood; everything else, including the
+     * daemon's quick preview paint, is dropped rather than guessed at.
+     */
+    internal sealed interface Frame {
+        /**
+         * Terminal output to hand to the emulator.
+         *
+         * Holds a [ByteString] rather than a `ByteArray` so that this class's own
+         * equality means what it looks like it means: `ByteArray` compares by
+         * reference, so a `data class` wrapping one is two unequal values for the
+         * same bytes — a trap for anything that compares two frames, tests
+         * included.
+         */
+        data class Output(val bytes: ByteString) : Frame
+
+        /** The grid size the daemon's terminal is using, in rows×cols. */
+        data class Grid(val rows: Int, val cols: Int) : Frame
+
+        /** Nothing this client renders. */
+        data object Ignored : Frame
     }
 
     /**
-     * Tells the daemon the size this phone is rendering at.
+     * Decodes one frame: a tag byte, then its payload.
      *
-     * The payload is JSON, not the two big-endian shorts it looks like it ought
-     * to be: the daemon parses `{"cols":N,"rows":M}`.
-     *
-     * It is sent knowing the current daemon ignores it — resizing a tab is a
-     * documented no-op in v1, because a tab is a real workstation terminal with a
-     * real size and the desktop wins. So a phone renders the tab's output at its
-     * own width, with the wrapping the workstation chose. Sending it anyway costs
-     * one frame and means the day the daemon honours it, this already works.
+     * Nothing here throws. A frame this client cannot read is dropped, because a
+     * newer daemon must not be able to break an older client by sending something
+     * it has not learned yet — the alternative is a session that dies on a frame it
+     * did not need.
      */
-    private fun sendDimensions() {
-        if (!open || pendingColumns <= 0 || pendingRows <= 0) return
-        send(TAG_RESIZE, """{"cols":$pendingColumns,"rows":$pendingRows}""".toByteArray())
+    internal fun decodeFrame(frame: ByteArray): Frame {
+        if (frame.isEmpty()) return Frame.Ignored
+        return when (frame[0]) {
+            TAG_OUTPUT -> Frame.Output(frame.copyOfRange(1, frame.size).toByteString())
+            TAG_OUTPUT_GZIP -> Frame.Output(gunzip(frame, 1).toByteString())
+            // The grid the daemon's terminal is using, which is the size a client
+            // has to render at: the daemon refuses to be resized, so mirroring it
+            // is the only faithful rendering. See setDimensions.
+            TAG_META -> parseGrid(frame) ?: Frame.Ignored
+            // The quick preview paint, tag 0x0c, is deliberately not rendered. It
+            // is terminal output by shape but not a stream: a hint to paint the
+            // last screen without waiting out a large catch-up. Feeding it to the
+            // emulator concatenates it with the real replay that follows, so the
+            // session draws the same screen twice.
+            else -> Frame.Ignored
+        }
+    }
+
+    /**
+     * The grid size out of a meta frame's JSON, or null if it does not carry one
+     * this client can use.
+     *
+     * A null answer is not a failure worth reporting upwards: the frame carries
+     * other tab metadata that the list screen already shows, so one whose shape
+     * this client does not recognise simply leaves the terminal at its own size.
+     */
+    private fun parseGrid(frame: ByteArray): Frame.Grid? = try {
+        val meta = JSONObject(String(frame, 1, frame.size - 1, Charsets.UTF_8))
+        // Absent keys, and the JSON null the daemon uses for "unknown", both arrive
+        // as an absent optInt default of 0 — which is not a size.
+        val rows = meta.optInt("rows", 0)
+        val cols = meta.optInt("cols", 0)
+        if (rows > 0 && cols > 0) Frame.Grid(rows, cols) else null
+    } catch (e: JSONException) {
+        Timber.d(e, "tab-atelier meta frame was not JSON this client understands")
+        null
     }
 
     private fun send(tag: Byte, payload: ByteArray) {
@@ -381,14 +432,18 @@ class TabAtelier : AbsTransport() {
         /**
          * Frame tags, from the daemon's `src/api_ws.rs`. One tag byte, then the
          * payload.
+         *
+         * Two the daemon defines are deliberately absent, because this client does
+         * not speak them: `0x04` resize, which the daemon ignores anyway and which
+         * a mirror must not send (see [setDimensions]), and `0x0c` preview, whose
+         * payload would be drawn twice if it were fed to the emulator as output
+         * (see [decodeFrame]).
          */
         private const val TAG_INPUT: Byte = 0x01
         private const val TAG_OUTPUT: Byte = 0x02
         private const val TAG_META: Byte = 0x03
-        private const val TAG_RESIZE: Byte = 0x04
         private const val TAG_OUTPUT_GZIP: Byte = 0x0A
         private const val TAG_FOCUS: Byte = 0x0B
-        private const val TAG_PREVIEW: Byte = 0x0C
 
         private const val CLOSE_NORMAL = 1000
 
