@@ -25,8 +25,10 @@
 
 use std::time::Duration;
 
-use super::{bench, bench_lag, brain, claude_hook, delegate, flags, logging, remote};
-use super::{set_context, set_font, set_meta, set_status, share_link, team, tokens};
+use super::{bench, bench_lag, brain, claude_hook, delegate, flags, logging, remote, task};
+use super::{
+    set_assignment, set_card, set_context, set_font, set_meta, set_rehome, set_status, share_link, team, tokens,
+};
 
 // ── the local API endpoint ──────────────────────────────────────────
 //
@@ -214,6 +216,17 @@ pub fn dispatch(name: &str, rest: &[String]) -> Option<i32> {
         "set-font" => set_font::run(rest),
         "set-context" => set_context::run(rest),
         "set-meta" => set_meta::run(rest),
+        // Agent card (persisted, hook-immune identity).
+        "set-assignment" => set_assignment::run(rest),
+        "set-rehome-status" => set_rehome::run(rest),
+        "set-specialty" => set_card::specialty(rest),
+        "set-orchestrator" => set_card::orchestrator(rest),
+        "set-objective" => set_card::objective(rest),
+        "set-current-task" => set_card::current_task(rest),
+        "set-rounds-active" => set_card::rounds_active(rest),
+        "set-conventions" => set_card::conventions(rest),
+        "set-evaluation" => set_card::evaluation(rest),
+        "bump-usage" => set_card::bump(rest),
         "style" => super::style::run(rest),
         "token" => tokens::show(rest),
         "rotate-tokens" => tokens::rotate(rest),
@@ -223,6 +236,8 @@ pub fn dispatch(name: &str, rest: &[String]) -> Option<i32> {
         "dispatch" => delegate::run(rest),
         "remote" => remote::run(rest),
         "brain" => brain::run(rest),
+        // task primitive (#11): typed queue with an atomic claim.
+        "task" => task::run(rest),
         "schedule" => share_link::schedule(rest),
         "log" => logging::run(rest),
         "logs" => super::logs::run(rest),
