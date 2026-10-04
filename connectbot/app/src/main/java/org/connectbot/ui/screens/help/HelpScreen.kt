@@ -115,7 +115,8 @@ fun HelpScreen(
                     // both commits, each named, so a bug report says which build
                     // of this app and which build of upstream it came from.
                     // BUILD_COMMIT is -PbuildCommit (the pushed SHA in CI);
-                    // UPSTREAM_COMMIT is the connectbot submodule's HEAD.
+                    // UPSTREAM_COMMIT is the commit the ConnectBot subtree was
+                    // taken from, read from its git-subtree-split trailer.
                     Text(
                         text = "Tab Atelier commit ${BuildConfig.BUILD_COMMIT}",
                         style = MaterialTheme.typography.bodyMedium,
@@ -204,7 +205,7 @@ fun HelpScreen(
                     modifier = Modifier.padding(bottom = 16.dp),
                 )
                 // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)):
-                // credit both projects on one line. See overlay/README.md.
+                // credit both projects on one line. See docs/connectbot-fork.md.
                 Text(
                     text = "ConnectBot & Tab-Atelier",
                     style = MaterialTheme.typography.bodyMedium,

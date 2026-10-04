@@ -1,3 +1,0 @@
-# Files to delete from the upstream tree before building, one path per line.
-# Empty for now: milestone 1 keeps every upstream transport compiling. The SSH,
-# telnet, mosh and local-shell removal lands here.

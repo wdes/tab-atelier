@@ -15,11 +15,20 @@ developed as part of ConnectBot:
 
 Fork point: e484bd3a84ea5cc22800a8f7067d9984b7ccc7ea (2026-10-02)
 
-The ConnectBot source is not committed here. It is pulled in as a git
-submodule pinned to the commit above, and the files under overlay/ are
-applied on top of it before the build. Per section 4(b) of the Apache
-License, Version 2.0, every file under overlay/ is a modified ConnectBot
-source file and carries a header saying so.
+The ConnectBot source is committed here, under connectbot/, as a squashed git
+subtree of the commit above — upstream's tree, without upstream's history. That
+squash commit records the fork point in its own `git-subtree-split` trailer, so
+the two cannot drift apart.
+
+Per section 4(b) of the Apache License, Version 2.0, the notice that we changed
+files is the set of commits that touch connectbot/, each of which names the
+upstream file it modifies and shows the change. Every modified region also
+carries a short "Changed for Tab Atelier Remote" comment in the code itself, so
+the notice survives being read out of context. To see the complete change set:
+
+    base=$(git log -1 --grep='git-subtree-split:' \
+        --format='%(trailers:key=git-subtree-split,valueonly)')
+    git diff "$base" -- connectbot/
 
 Neither the name "ConnectBot" nor any upstream contributor's name is used to
 endorse this fork. Section 6 of the Apache License, Version 2.0 grants no

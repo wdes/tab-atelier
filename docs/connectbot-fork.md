@@ -1,37 +1,48 @@
-# Overlay — every change we make to ConnectBot
+# The ConnectBot fork — every change we make
 
-Upstream ConnectBot lives in `../connectbot`, pinned to one commit, never
-edited in place. This directory is the complete record of what Tab Atelier
-Remote changes about it.
+ConnectBot's code lives in `../connectbot` as a **squashed `git subtree`**: its
+tree, without its history. Our changes are ordinary commits that touch it, so
+this document and `git diff` are the complete record of what Tab Atelier Remote
+changes about it.
 
+To see exactly that diff, against the upstream base the squash records:
+
+```sh
+base=$(git log -1 --grep='git-subtree-split:' --format='%(trailers:key=git-subtree-split,valueonly)')
+git diff "$base" -- connectbot/
 ```
-patches/   quilt-style patches against upstream files
-files/     files that do not exist upstream, copied in verbatim
-remove.txt upstream files we delete
-```
 
-`../scripts/apply-overlay.sh` applies all three over a pristine checkout, and
-`--check` reports whether they still apply after a pin bump without touching
-anything.
+A commit that changes `connectbot/` is a change to the app; a commit elsewhere is
+about the build, the docs, or this record.
+
+**This was not always the shape.** The code was a submodule pinned to upstream,
+with our changes kept as quilt-style patches in `overlay/` (`patches/`,
+`files/`, `remove.txt`) and applied over a pristine checkout by
+`scripts/apply-overlay.sh` before every build. That has one property that cannot
+be designed around — *an applied patch set is uncommitted changes by definition*
+— so the working tree was permanently dirty, and a clean tree was only reachable
+by committing into a repository whose remote is upstream's. A squash commit's
+`git-subtree-split` trailer is what replaced the pin, and it survives future
+syncs with nothing to remember.
 
 ## Licence position
 
 ConnectBot is Apache-2.0. Distributing a modified build obliges us to:
 
-- ship the licence text — `files/app/src/main/assets/connectbot-LICENSE.txt`,
+- ship the licence text — `connectbot/app/src/main/assets/connectbot-LICENSE.txt`,
   packaged into the APK;
 - keep upstream's copyright notices, including the per-file header that
   upstream's own Spotless config enforces;
-- **say that we changed the files** (§4(b)). The patches in `patches/` are that
-  record: each one names the upstream file it modifies and shows the change,
+- **say that we changed the files** (§4(b)). The commits that touch `connectbot/`
+  are that record — each names the upstream file it modifies and shows the change,
   and each modified region carries a short "Changed for Tab Atelier Remote"
   comment in the code itself so the notice survives being read out of context;
 - not use upstream's marks (§6). The app is named and described as Tab Atelier
   Remote, and every user-visible link points at this project, not ConnectBot's.
 
-`../NOTICE` carries the full attribution, including the fork commit.
+`../NOTICE` carries the full attribution, including the upstream base commit.
 
-## Why the overlay is small
+## Why the change set is small
 
 The obvious way to fork is to rename the package to `fr.wdes.tab_atelier`
 everywhere — about 160 of the ~380 source files — and then edit them. That
@@ -40,7 +51,7 @@ would make every upstream sync a rebase across a rewritten tree.
 Android does not require it. `applicationId` is independent of the Kotlin
 package, so the app is `fr.wdes.tab_atelier` (which the ADI ownership token and
 the installed app's upgrade path both require) while the code stays
-`org.connectbot` on disk. The overlay then only has to touch the build config,
+`org.connectbot` on disk. The change set then only has to touch the build config,
 the strings a user sees, and the files the product actually needs to differ.
 
 ## What each patch does
@@ -75,12 +86,12 @@ Kenny Root's notice and adds ours beside it, rather than replacing it.
 This patch rewrites upstream strings and **nothing else**. Strings we *add* do
 not belong here — see "Adding a string" below.
 
-### Adding a string (no patch)
+### Adding a string
 
 Strings this fork adds go in
-`files/app/src/main/res/values/strings_tabatelier.xml`. That file is copied in
-verbatim, so adding a string is adding a line to it, and an upstream sync has
-nothing to rebase. Android's resource merger combines every file under
+`connectbot/app/src/main/res/values/strings_tabatelier.xml` — a file upstream
+does not have, so adding a string is adding a line to it, and an upstream sync
+has nothing to rebase. Android's resource merger combines every file under
 `res/values/`, so a resource does not care which file declares it.
 
 **Replacing** an upstream string is the case that cannot work this way: two
@@ -106,6 +117,13 @@ the same in every locale, and a translated commit hash or URL would be a defect.
 
 ### 0004 — the tab-atelier server type
 
+> The numbers in these headings are **historical**: each was one patch file in the
+> old `overlay/patches/`, and they are kept as labels because the sections below
+> refer to each other by them (`see 0004's section above`). There are no patch
+> files now — the changes are commits that touch `connectbot/`, and the headings
+> group the same changes they always did. Where a section says a file "is copied
+> in from `files/`", read it as "is a file upstream does not have".
+
 A fifth protocol, `tabatelier`, beside ssh/telnet/mosh/local — added, not
 substituted, so every upstream transport keeps working. A host of this type is a
 tab-atelier daemon: one URL addresses it, a bearer token authenticates against
@@ -119,7 +137,7 @@ Files: `transport/Transport.kt`, `transport/AbsTransport.kt`,
 ViewModels, `AndroidManifest.xml`, and the build files (OkHttp, which the app
 did not previously depend on).
 
-New files live in `files/`, since upstream has nothing like them:
+New files are added under `connectbot/`, since upstream has nothing like them:
 `tabatelier/TabAtelierClient.kt` (the parsed base URL, HTTP, TLS),
 `tabatelier/TabAtelierTab.kt` (the model and its parsing),
 `transport/TabAtelier.kt` (the transport), and
@@ -331,29 +349,29 @@ therefore never forces a size for them.
 Non-positive values are ignored rather than stored: a 0-column terminal is not a
 size, and a daemon that sent one would have the client render nothing at all.
 
-**This file was newly modified for the grid mirror, and had to be given a patch to
-exist at all.** It is the only file this work touched that upstream had no
-patched copy of, so until 0006 was written, an `apply-overlay.sh` would have
-reverted the mirror silently — there was nothing in `patches/` or `files/` to
-reproduce it from. Worth stating plainly because the class of mistake is easy to
-repeat: every modified file must be owned by a patch or be a copy in `files/`, and
-the way to check is
+**This file is the one the old overlay could not have kept, and that is the whole
+argument for the subtree.** Under the overlay, a modified file existed only if a
+patch said so, so an edit that nobody wrote into a patch was silently reverted by
+the next `apply-overlay.sh` — and the reproduction check then compared two trees
+that *both* lacked it, so it passed. `service/TerminalBridge.kt` was edited that
+way, and the trap was live until it was given the patch that is now this section's
+commit.
 
-    comm -23 <(git -C connectbot diff --name-only | sort) \
-             <(cat overlay/patches/*.patch | grep '^diff --git' | sed 's|.* b/||' | sort -u)
-
-which prints any file that is modified but unreproducible. Beyond that, a hash
-comparison between "before" and "after" only proves reproduction if something
-also asserts the change is *present* in the rebuilt tree — two trees that both
-lack a change compare equal. So verify both: the diff hash, and a `grep` for a
-symbol the change introduces.
+Nothing can be lost that way now, because a change is a commit or it is nothing:
+there is no second copy of the truth to fall out of step with. The transferable
+part of the lesson is the checking, which the overlay taught the hard way and
+still applies when a subtree sync is verified: **a hash comparison proves nothing
+on its own**, because two trees that both lack a change compare equal. Compare
+content — a `diff` of `git ls-tree` output, or a `grep` for a symbol the change
+introduces — or the check will happily confirm a change that is not there.
 
 ## Current state
 
 The app is a working ConnectBot under our package id, plus the tab-atelier type:
 servers can be added, their tabs are listed and ordered by last use, and tapping
 one opens that tab's terminal. Nothing upstream is removed — SSH, telnet, mosh
-and the local shell all still work, and `remove.txt` is empty. A future milestone
+and the local shell all still work, and nothing upstream is deleted. A future
+milestone
 may retire the transports that have no use here, but only if that is wanted: the
 additive shape is what keeps an upstream sync to a pin bump.
 

@@ -25,14 +25,9 @@ export ANDROID_SDK_ROOT="$ANDROID_HOME"
 : "${JAVA_HOME:=/usr/lib/jvm/java-21-openjdk-amd64}"
 export JAVA_HOME
 
-# The upstream tree carries our overlay, so it is patched, not pristine. Reset
-# and re-apply, so a build never depends on what the last one left behind:
-# checkout restores the files we patched or deleted, and clean removes the ones
-# we copied in (which are untracked, so checkout alone leaves them behind).
-# Build outputs are kept — a rebuild should not start from cold.
-git -C "$upstream" checkout -- .
-git -C "$upstream" clean -fdq -e build -e .gradle -e .kotlin -e .cxx -e .idea
-"$root/scripts/apply-overlay.sh"
+# connectbot/ is an ordinary directory of this repository now — it was a submodule
+# with our changes layered on as quilt patches. Our changes are commits, so there
+# is nothing to reset or re-apply: what is checked out is what gets built.
 
 args=()
 if [[ "$variant" == release ]]; then
@@ -86,10 +81,14 @@ fi
 # so the About screen of a hand-built APK is not a different kind of "unknown".
 APP_BUILD_COMMIT="${APP_BUILD_COMMIT:-$(git -C "$root" rev-parse --short HEAD 2>/dev/null || true)}"
 [[ -n "$APP_BUILD_COMMIT" ]] && args+=("-PbuildCommit=$APP_BUILD_COMMIT")
-# The upstream half of the fork, for the About screen. Read from the submodule
-# checkout rather than passed in, so it is correct locally and in CI (which
-# checks the pin out) with nothing to remember.
-APP_UPSTREAM_COMMIT="${APP_UPSTREAM_COMMIT:-$(git -C "$upstream" rev-parse --short HEAD 2>/dev/null || true)}"
+# The upstream half of the fork, for the About screen. connectbot/ was squashed in
+# with `git subtree`, which records the upstream commit it came from in a
+# `git-subtree-split` trailer — so the most recent commit carrying that trailer is
+# the upstream base, and it stays correct across future subtree pulls with nothing
+# to remember. (It was `git -C connectbot rev-parse HEAD` while connectbot was a
+# submodule; that would now resolve to this repository's own HEAD, since
+# connectbot/ is a plain directory here.)
+APP_UPSTREAM_COMMIT="${APP_UPSTREAM_COMMIT:-$(git -C "$root" log -1 --grep='git-subtree-split:' --format='%(trailers:key=git-subtree-split,valueonly)' 2>/dev/null || true)}"
 [[ -n "$APP_UPSTREAM_COMMIT" ]] && args+=("-PupstreamCommit=$APP_UPSTREAM_COMMIT")
 
 cd "$upstream"

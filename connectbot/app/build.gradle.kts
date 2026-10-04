@@ -108,20 +108,21 @@ android {
 
     defaultConfig {
         // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): version comes
-        // from the caller, not from upstream's git tags. See overlay/README.md.
+        // from the caller, not from upstream's git tags. See docs/connectbot-fork.md.
         versionCode = (project.findProperty("appVersionCode") as String?)?.toInt() ?: 16777473
         versionName = (project.findProperty("appVersionName") as String?) ?: "0.6.0"
         // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): the commit
         // this APK was built from, shown on the About screen. CI passes
         // -PbuildCommit; a build that does not still compiles, and says so.
-        // See overlay/README.md.
+        // See docs/connectbot-fork.md.
         buildConfigField("String", "BUILD_COMMIT", "\"${(project.findProperty("buildCommit") as String?) ?: "unknown"}\"")
         // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): the commit
-        // of upstream ConnectBot this APK was built against — the submodule pin
-        // — so the About screen can name both halves of the fork.
+        // of upstream ConnectBot this APK was built against — the subtree's
+        // upstream base, which build-apk.sh reads from its git-subtree-split
+        // trailer — so the About screen can name both halves of the fork.
         buildConfigField("String", "UPSTREAM_COMMIT", "\"${(project.findProperty("upstreamCommit") as String?) ?: "unknown"}\"")
         // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): this fork
-        // ships as fr.wdes.tab_atelier. See overlay/README.md.
+        // ships as fr.wdes.tab_atelier. See docs/connectbot-fork.md.
         applicationId = "fr.wdes.tab_atelier"
 
         minSdk =

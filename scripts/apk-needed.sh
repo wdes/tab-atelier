@@ -5,7 +5,7 @@
 # Prints `true` or `false`, and its reasoning on stderr.
 #
 #     scripts/apk-needed.sh                  # ask GitHub what the push changed
-#     printf 'overlay/x\n' | scripts/apk-needed.sh --files -   # judge a list
+#     printf 'connectbot/x\n' | scripts/apk-needed.sh --files -   # judge a list
 #
 # WHY THIS IS NOT `on.push.paths`. Two reasons, and the second is the one that
 # bites:
@@ -16,16 +16,20 @@
 #      commits, so no path ever matches — a plain `paths:` filter silently
 #      skips the build.
 #
-# WHAT COUNTS, now that the app is a fork. The app is upstream ConnectBot at a
-# pinned commit, plus the overlay we lay over it. So the inputs are:
+# WHAT COUNTS, now that the app is a fork. The app is ConnectBot's tree with our
+# changes on top of it, all of it under connectbot/ — a squashed subtree, so a
+# change anywhere in it is an ordinary path change. The inputs are:
 #
-#   connectbot            the submodule PIN — a gitlink, so a bump shows up as
-#                         a one-line diff against this path and nothing else.
-#                         Upstream code changed, so the APK changed.
-#   overlay/              our own changes: patches, copied-in files, deletions.
-#   scripts/*.sh          the build (build-apk applies the overlay, publish-apk
-#                         stages the site). Editing the build is a reason to
-#                         run it.
+#   connectbot/           the app: ConnectBot's code and everything we changed in
+#                         it. This is the one that matters, and it is why the
+#                         pattern is a PREFIX and not the bare word: while
+#                         connectbot was a submodule it appeared as a gitlink, so
+#                         `connectbot` exact-matched a pin bump. As a directory a
+#                         change arrives as `connectbot/app/src/...`, which an
+#                         exact match would miss — and skipping the build would
+#                         ship an APK that does not match the commit it claims.
+#   scripts/*.sh          the build (build-apk, publish-apk stages the site).
+#                         Editing the build is a reason to run it.
 #   the workflow itself   same reasoning.
 #
 # Everything else — this repository's daemon, docs, the deb packaging — cannot
@@ -38,7 +42,7 @@ set -euo pipefail
 
 # Paths whose contents end up in, or shape, the APK.
 matches_app() {
-    grep -qE '^(connectbot$|overlay/|scripts/(build-apk|apply-overlay|publish-apk|apk-needed)\.sh$|\.github/workflows/android-apk\.yml$)'
+    grep -qE '^(connectbot/|scripts/(build-apk|publish-apk|apk-needed)\.sh$|\.github/workflows/android-apk\.yml$)'
 }
 
 say() {

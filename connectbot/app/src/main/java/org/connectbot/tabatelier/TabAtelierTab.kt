@@ -18,7 +18,7 @@
 // New file for Tab Atelier Remote, not part of upstream ConnectBot: one tab of
 // a tab-atelier daemon, and the parser for `GET {base}/tabs`. The protocol's
 // own constants live in org.connectbot.transport.TabAtelier. See
-// overlay/README.md.
+// docs/connectbot-fork.md.
 
 package org.connectbot.tabatelier
 

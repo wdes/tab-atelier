@@ -18,7 +18,7 @@
  */
 -->
 <resources>
-	<!-- Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): see overlay/README.md. -->
+	<!-- Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): see docs/connectbot-fork.md. -->
 	<string name="app_name" translatable="false">Tab Atelier Remote</string>
 
 	<!-- Placeholder for source port field. Should show  -->

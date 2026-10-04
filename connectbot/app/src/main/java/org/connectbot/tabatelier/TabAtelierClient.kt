@@ -19,7 +19,7 @@
 // tab-atelier server is addressed by, the HTTP client for its `GET {base}/tabs`,
 // and how far its certificate is trusted — validated by the device where the
 // device can, pinned where nothing else can identify the server. See
-// overlay/README.md.
+// docs/connectbot-fork.md.
 
 package org.connectbot.tabatelier
 

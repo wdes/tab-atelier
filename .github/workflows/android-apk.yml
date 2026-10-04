@@ -2,9 +2,10 @@ name: android-apk
 
 # Build the Android client and publish it to the website (gh-pages /android/).
 #
-# The app lives on this branch, not on main: it is a fork of ConnectBot held as
-# a submodule plus an overlay (see README.md), so it is built here and only the
-# APK is published. Nothing about it needs the daemon's tree.
+# The app lives on this branch, not on main: it is a fork of ConnectBot, held as a
+# squashed subtree in connectbot/ (it was a submodule plus a quilt-style overlay;
+# see docs/connectbot-fork.md), so it is built here and only the APK is published.
+# Nothing about it needs the daemon's tree.
 #
 # on: push to this branch, or run on demand (Actions -> android-apk -> Run
 # workflow). Not `on.push.paths` — the gate is scripts/apk-needed.sh, and the
@@ -71,11 +72,10 @@ jobs:
             ANDROID_HOME: /usr/local/lib/android/sdk
             ANDROID_NDK_VERSION: "26.1.10909125"
         steps:
-            # recursive: upstream ConnectBot is a submodule, pinned to the
-            # commit this branch records. It is public, so no credentials.
+            # connectbot/ is a plain directory of this repository — it was a
+            # submodule pinned upstream, with our changes as quilt patches, and is
+            # now a squashed subtree, so there is no second repository to check out.
             - uses: actions/checkout@v7
-              with:
-                  submodules: recursive
 
             - uses: actions/setup-java@v6
               with:
@@ -124,12 +124,6 @@ jobs:
                   key: android-ndk-${{ env.ANDROID_NDK_VERSION }}-${{ runner.os }}
 
             - uses: gradle/actions/setup-gradle@v6
-
-            # build-apk.sh applies the overlay itself before building; the tests
-            # need it applied too, and doing it here keeps that explicit. It is
-            # what pins the NDK and what carries the changes under test.
-            - name: Apply the overlay
-              run: scripts/apply-overlay.sh
 
             # oss/debug, one variant: oss is what this workflow ships and the
             # debug unit tests are the variant that needs no device. Upstream's
