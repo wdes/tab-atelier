@@ -236,6 +236,22 @@ slot has only ever held one child. They are wrapped in a `Row`, and the
 regression test asserts the *click* rather than the presence of the node — a
 stacked control is present, visible and enabled, and still unusable.
 
+### 0005 — leaving a terminal puts the keyboard away
+
+One file, `ui/screens/console/ConsoleScreen.kt`, deliberately its own patch
+rather than folded into 0004: it is not about the tab-atelier server type, it
+applies to every transport, and upstream may well want it.
+
+The app is a single Activity, so the IME outlives the console screen: backing out
+to the host list left the keyboard up over a list with no text field in it. The
+fix hides it imperatively from a `DisposableEffect` on dispose. Clearing
+`showSoftwareKeyboard` would not do — disposal is the last thing the composition
+does, so there is no recomposition left to act on a state change.
+
+It is guarded on `isChangingConfigurations`, so rotating the device mid-session
+does not close the keyboard: MainActivity does not handle orientation itself, so
+a rotation disposes this screen without the user having left anything.
+
 ## Current state
 
 The app is a working ConnectBot under our package id, plus the tab-atelier type:

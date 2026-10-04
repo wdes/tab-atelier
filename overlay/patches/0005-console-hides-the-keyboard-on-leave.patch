@@ -1,0 +1,45 @@
+diff --git a/app/src/main/java/org/connectbot/ui/screens/console/ConsoleScreen.kt b/app/src/main/java/org/connectbot/ui/screens/console/ConsoleScreen.kt
+index 72587ad7..074db19c 100644
+--- a/app/src/main/java/org/connectbot/ui/screens/console/ConsoleScreen.kt
++++ b/app/src/main/java/org/connectbot/ui/screens/console/ConsoleScreen.kt
+@@ -81,6 +81,7 @@ import androidx.compose.material3.TextButton
+ import androidx.compose.material3.TopAppBar
+ import androidx.compose.material3.TopAppBarDefaults
+ import androidx.compose.runtime.Composable
++import androidx.compose.runtime.DisposableEffect
+ import androidx.compose.runtime.LaunchedEffect
+ import androidx.compose.runtime.SideEffect
+ import androidx.compose.runtime.collectAsState
+@@ -767,6 +768,32 @@ fun ConsoleScreen(
+         }
+     }
+ 
++    // Leaving a terminal puts the keyboard away.
++    //
++    // The app is one Activity, so the IME is not owned by this screen and
++    // survives its disposal: backing out to the host list leaves the keyboard up
++    // over a list with no text field in it, which reads as the app being stuck.
++    // Hiding it imperatively on dispose is reliable where clearing
++    // `showSoftwareKeyboard` would not be — disposal is the last thing this
++    // composition does, so there is no recomposition left to act on a state
++    // change.
++    DisposableEffect(Unit) {
++        onDispose {
++            val activity = context as? Activity ?: return@onDispose
++            // A configuration change recreates the Activity without the user
++            // having left anything, and MainActivity does not handle orientation
++            // itself — so rotating mid-session must not close the keyboard.
++            if (activity.isChangingConfigurations) return@onDispose
++            try {
++                WindowInsetsControllerCompat(activity.window, activity.window.decorView)
++                    .hide(WindowInsetsCompat.Type.ime())
++            } catch (e: IllegalArgumentException) {
++                // The foldable edge case the fullscreen handling above guards.
++                Timber.e(e, "Error hiding the keyboard on leaving the console")
++            }
++        }
++    }
++
+     // Defer navigation until after lifecycle dispatch has finished. Popping from
+     // ON_RESUME synchronously can re-enter Navigation while it is updating entries.
+     // Observing lifecycle state also retries a background disconnect on resume.
