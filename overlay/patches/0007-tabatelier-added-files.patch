@@ -1,0 +1,3668 @@
+From: William Desportes <williamdes@wdes.fr>
+Date: Sun, 4 Oct 2026 21:55:40 +0200
+Subject: tabatelier-added-files
+
+Gbp-Pq: Name tabatelier-added-files
+---
+ .../org.connectbot.data.ConnectBotDatabase/12.json | 809 +++++++++++++++++++++
+ app/src/main/assets/adi-registration.properties    |   1 +
+ app/src/main/assets/connectbot-LICENSE.txt         | 202 +++++
+ .../org/connectbot/tabatelier/TabAtelierClient.kt  | 662 +++++++++++++++++
+ .../org/connectbot/tabatelier/TabAtelierTab.kt     |  96 +++
+ .../java/org/connectbot/transport/TabAtelier.kt    | 688 ++++++++++++++++++
+ app/src/main/res/values/strings_tabatelier.xml     |  70 ++
+ .../service/TerminalManagerTabSwitchTest.kt        | 118 +++
+ .../connectbot/tabatelier/TabAtelierClientTest.kt  | 695 ++++++++++++++++++
+ .../org/connectbot/transport/TabAtelierTest.kt     | 238 ++++++
+ 10 files changed, 3579 insertions(+)
+ create mode 100644 app/schemas/org.connectbot.data.ConnectBotDatabase/12.json
+ create mode 100644 app/src/main/assets/adi-registration.properties
+ create mode 100644 app/src/main/assets/connectbot-LICENSE.txt
+ create mode 100644 app/src/main/java/org/connectbot/tabatelier/TabAtelierClient.kt
+ create mode 100644 app/src/main/java/org/connectbot/tabatelier/TabAtelierTab.kt
+ create mode 100644 app/src/main/java/org/connectbot/transport/TabAtelier.kt
+ create mode 100644 app/src/main/res/values/strings_tabatelier.xml
+ create mode 100644 app/src/test/kotlin/org/connectbot/service/TerminalManagerTabSwitchTest.kt
+ create mode 100644 app/src/test/kotlin/org/connectbot/tabatelier/TabAtelierClientTest.kt
+ create mode 100644 app/src/test/kotlin/org/connectbot/transport/TabAtelierTest.kt
+
+diff --git a/app/schemas/org.connectbot.data.ConnectBotDatabase/12.json b/app/schemas/org.connectbot.data.ConnectBotDatabase/12.json
+new file mode 100644
+index 00000000..0f7a1426
+--- /dev/null
++++ b/app/schemas/org.connectbot.data.ConnectBotDatabase/12.json
+@@ -0,0 +1,809 @@
++{
++  "formatVersion": 1,
++  "database": {
++    "version": 12,
++    "identityHash": "8db738fe3a71916ca983faf715a074ea",
++    "entities": [
++      {
++        "tableName": "hosts",
++        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `nickname` TEXT NOT NULL, `protocol` TEXT NOT NULL, `username` TEXT NOT NULL, `hostname` TEXT NOT NULL, `port` INTEGER NOT NULL, `host_key_algo` TEXT, `last_connect` INTEGER NOT NULL, `color` TEXT, `use_keys` INTEGER NOT NULL, `use_auth_agent` TEXT, `post_login` TEXT, `pubkey_id` INTEGER NOT NULL, `want_session` INTEGER NOT NULL, `compression` INTEGER NOT NULL, `stay_connected` INTEGER NOT NULL, `quick_disconnect` INTEGER NOT NULL, `scrollback_lines` INTEGER NOT NULL, `use_ctrl_alt_as_meta_key` INTEGER NOT NULL, `jump_host_id` INTEGER, `profile_id` INTEGER, `ip_version` TEXT NOT NULL DEFAULT 'IPV4_AND_IPV6', `mosh_port` INTEGER NOT NULL DEFAULT 0, `mosh_server` TEXT, `locale` TEXT NOT NULL DEFAULT 'en_US.UTF-8', `tabatelier_url` TEXT)",
++        "fields": [
++          {
++            "fieldPath": "id",
++            "columnName": "id",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "nickname",
++            "columnName": "nickname",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "protocol",
++            "columnName": "protocol",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "username",
++            "columnName": "username",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "hostname",
++            "columnName": "hostname",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "port",
++            "columnName": "port",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "hostKeyAlgo",
++            "columnName": "host_key_algo",
++            "affinity": "TEXT"
++          },
++          {
++            "fieldPath": "lastConnect",
++            "columnName": "last_connect",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "color",
++            "columnName": "color",
++            "affinity": "TEXT"
++          },
++          {
++            "fieldPath": "useKeys",
++            "columnName": "use_keys",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "useAuthAgent",
++            "columnName": "use_auth_agent",
++            "affinity": "TEXT"
++          },
++          {
++            "fieldPath": "postLogin",
++            "columnName": "post_login",
++            "affinity": "TEXT"
++          },
++          {
++            "fieldPath": "pubkeyId",
++            "columnName": "pubkey_id",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "wantSession",
++            "columnName": "want_session",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "compression",
++            "columnName": "compression",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "stayConnected",
++            "columnName": "stay_connected",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "quickDisconnect",
++            "columnName": "quick_disconnect",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "scrollbackLines",
++            "columnName": "scrollback_lines",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "useCtrlAltAsMetaKey",
++            "columnName": "use_ctrl_alt_as_meta_key",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "jumpHostId",
++            "columnName": "jump_host_id",
++            "affinity": "INTEGER"
++          },
++          {
++            "fieldPath": "profileId",
++            "columnName": "profile_id",
++            "affinity": "INTEGER"
++          },
++          {
++            "fieldPath": "ipVersion",
++            "columnName": "ip_version",
++            "affinity": "TEXT",
++            "notNull": true,
++            "defaultValue": "'IPV4_AND_IPV6'"
++          },
++          {
++            "fieldPath": "moshPort",
++            "columnName": "mosh_port",
++            "affinity": "INTEGER",
++            "notNull": true,
++            "defaultValue": "0"
++          },
++          {
++            "fieldPath": "moshServer",
++            "columnName": "mosh_server",
++            "affinity": "TEXT"
++          },
++          {
++            "fieldPath": "locale",
++            "columnName": "locale",
++            "affinity": "TEXT",
++            "notNull": true,
++            "defaultValue": "'en_US.UTF-8'"
++          },
++          {
++            "fieldPath": "tabAtelierUrl",
++            "columnName": "tabatelier_url",
++            "affinity": "TEXT"
++          }
++        ],
++        "primaryKey": {
++          "autoGenerate": true,
++          "columnNames": [
++            "id"
++          ]
++        },
++        "indices": [
++          {
++            "name": "index_hosts_nickname",
++            "unique": true,
++            "columnNames": [
++              "nickname"
++            ],
++            "orders": [],
++            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_hosts_nickname` ON `${TABLE_NAME}` (`nickname`)"
++          },
++          {
++            "name": "index_hosts_protocol_username_hostname_port",
++            "unique": false,
++            "columnNames": [
++              "protocol",
++              "username",
++              "hostname",
++              "port"
++            ],
++            "orders": [],
++            "createSql": "CREATE INDEX IF NOT EXISTS `index_hosts_protocol_username_hostname_port` ON `${TABLE_NAME}` (`protocol`, `username`, `hostname`, `port`)"
++          }
++        ]
++      },
++      {
++        "tableName": "pubkeys",
++        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `nickname` TEXT NOT NULL, `type` TEXT NOT NULL, `private_key` BLOB, `public_key` BLOB NOT NULL, `encrypted` INTEGER NOT NULL, `startup` INTEGER NOT NULL, `confirmation` INTEGER NOT NULL, `created_date` INTEGER NOT NULL, `storage_type` TEXT NOT NULL, `allow_backup` INTEGER NOT NULL, `keystore_alias` TEXT)",
++        "fields": [
++          {
++            "fieldPath": "id",
++            "columnName": "id",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "nickname",
++            "columnName": "nickname",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "type",
++            "columnName": "type",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "privateKey",
++            "columnName": "private_key",
++            "affinity": "BLOB"
++          },
++          {
++            "fieldPath": "publicKey",
++            "columnName": "public_key",
++            "affinity": "BLOB",
++            "notNull": true
++          },
++          {
++            "fieldPath": "encrypted",
++            "columnName": "encrypted",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "startup",
++            "columnName": "startup",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "confirmation",
++            "columnName": "confirmation",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "createdDate",
++            "columnName": "created_date",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "storageType",
++            "columnName": "storage_type",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "allowBackup",
++            "columnName": "allow_backup",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "keystoreAlias",
++            "columnName": "keystore_alias",
++            "affinity": "TEXT"
++          }
++        ],
++        "primaryKey": {
++          "autoGenerate": true,
++          "columnNames": [
++            "id"
++          ]
++        },
++        "indices": [
++          {
++            "name": "index_pubkeys_nickname",
++            "unique": true,
++            "columnNames": [
++              "nickname"
++            ],
++            "orders": [],
++            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_pubkeys_nickname` ON `${TABLE_NAME}` (`nickname`)"
++          },
++          {
++            "name": "index_pubkeys_storage_type",
++            "unique": false,
++            "columnNames": [
++              "storage_type"
++            ],
++            "orders": [],
++            "createSql": "CREATE INDEX IF NOT EXISTS `index_pubkeys_storage_type` ON `${TABLE_NAME}` (`storage_type`)"
++          },
++          {
++            "name": "index_pubkeys_allow_backup",
++            "unique": false,
++            "columnNames": [
++              "allow_backup"
++            ],
++            "orders": [],
++            "createSql": "CREATE INDEX IF NOT EXISTS `index_pubkeys_allow_backup` ON `${TABLE_NAME}` (`allow_backup`)"
++          }
++        ]
++      },
++      {
++        "tableName": "port_forwards",
++        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `host_id` INTEGER NOT NULL, `nickname` TEXT NOT NULL, `type` TEXT NOT NULL, `source_addr` TEXT NOT NULL DEFAULT 'localhost', `source_port` INTEGER NOT NULL, `dest_addr` TEXT, `dest_port` INTEGER NOT NULL, `start_enabled` INTEGER NOT NULL DEFAULT 1, FOREIGN KEY(`host_id`) REFERENCES `hosts`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE )",
++        "fields": [
++          {
++            "fieldPath": "id",
++            "columnName": "id",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "hostId",
++            "columnName": "host_id",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "nickname",
++            "columnName": "nickname",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "type",
++            "columnName": "type",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "sourceAddr",
++            "columnName": "source_addr",
++            "affinity": "TEXT",
++            "notNull": true,
++            "defaultValue": "'localhost'"
++          },
++          {
++            "fieldPath": "sourcePort",
++            "columnName": "source_port",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "destAddr",
++            "columnName": "dest_addr",
++            "affinity": "TEXT"
++          },
++          {
++            "fieldPath": "destPort",
++            "columnName": "dest_port",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "startEnabled",
++            "columnName": "start_enabled",
++            "affinity": "INTEGER",
++            "notNull": true,
++            "defaultValue": "1"
++          }
++        ],
++        "primaryKey": {
++          "autoGenerate": true,
++          "columnNames": [
++            "id"
++          ]
++        },
++        "indices": [
++          {
++            "name": "index_port_forwards_host_id",
++            "unique": false,
++            "columnNames": [
++              "host_id"
++            ],
++            "orders": [],
++            "createSql": "CREATE INDEX IF NOT EXISTS `index_port_forwards_host_id` ON `${TABLE_NAME}` (`host_id`)"
++          }
++        ],
++        "foreignKeys": [
++          {
++            "table": "hosts",
++            "onDelete": "CASCADE",
++            "onUpdate": "NO ACTION",
++            "columns": [
++              "host_id"
++            ],
++            "referencedColumns": [
++              "id"
++            ]
++          }
++        ]
++      },
++      {
++        "tableName": "known_hosts",
++        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `host_id` INTEGER, `hostname` TEXT NOT NULL, `port` INTEGER NOT NULL, `host_key_algo` TEXT NOT NULL, `host_key` BLOB NOT NULL, FOREIGN KEY(`host_id`) REFERENCES `hosts`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE )",
++        "fields": [
++          {
++            "fieldPath": "id",
++            "columnName": "id",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "hostId",
++            "columnName": "host_id",
++            "affinity": "INTEGER"
++          },
++          {
++            "fieldPath": "hostname",
++            "columnName": "hostname",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "port",
++            "columnName": "port",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "hostKeyAlgo",
++            "columnName": "host_key_algo",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "hostKey",
++            "columnName": "host_key",
++            "affinity": "BLOB",
++            "notNull": true
++          }
++        ],
++        "primaryKey": {
++          "autoGenerate": true,
++          "columnNames": [
++            "id"
++          ]
++        },
++        "indices": [
++          {
++            "name": "index_known_hosts_host_id",
++            "unique": false,
++            "columnNames": [
++              "host_id"
++            ],
++            "orders": [],
++            "createSql": "CREATE INDEX IF NOT EXISTS `index_known_hosts_host_id` ON `${TABLE_NAME}` (`host_id`)"
++          },
++          {
++            "name": "index_known_hosts_host_id_host_key",
++            "unique": false,
++            "columnNames": [
++              "host_id",
++              "host_key"
++            ],
++            "orders": [],
++            "createSql": "CREATE INDEX IF NOT EXISTS `index_known_hosts_host_id_host_key` ON `${TABLE_NAME}` (`host_id`, `host_key`)"
++          }
++        ],
++        "foreignKeys": [
++          {
++            "table": "hosts",
++            "onDelete": "CASCADE",
++            "onUpdate": "NO ACTION",
++            "columns": [
++              "host_id"
++            ],
++            "referencedColumns": [
++              "id"
++            ]
++          }
++        ]
++      },
++      {
++        "tableName": "color_schemes",
++        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `name` TEXT NOT NULL, `is_built_in` INTEGER NOT NULL, `description` TEXT NOT NULL, `foreground` INTEGER NOT NULL, `background` INTEGER NOT NULL)",
++        "fields": [
++          {
++            "fieldPath": "id",
++            "columnName": "id",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "name",
++            "columnName": "name",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "isBuiltIn",
++            "columnName": "is_built_in",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "description",
++            "columnName": "description",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "foreground",
++            "columnName": "foreground",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "background",
++            "columnName": "background",
++            "affinity": "INTEGER",
++            "notNull": true
++          }
++        ],
++        "primaryKey": {
++          "autoGenerate": true,
++          "columnNames": [
++            "id"
++          ]
++        },
++        "indices": [
++          {
++            "name": "index_color_schemes_name",
++            "unique": true,
++            "columnNames": [
++              "name"
++            ],
++            "orders": [],
++            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_color_schemes_name` ON `${TABLE_NAME}` (`name`)"
++          }
++        ]
++      },
++      {
++        "tableName": "color_palette",
++        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `scheme_id` INTEGER NOT NULL, `color_index` INTEGER NOT NULL, `color` INTEGER NOT NULL, FOREIGN KEY(`scheme_id`) REFERENCES `color_schemes`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE )",
++        "fields": [
++          {
++            "fieldPath": "id",
++            "columnName": "id",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "schemeId",
++            "columnName": "scheme_id",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "colorIndex",
++            "columnName": "color_index",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "color",
++            "columnName": "color",
++            "affinity": "INTEGER",
++            "notNull": true
++          }
++        ],
++        "primaryKey": {
++          "autoGenerate": true,
++          "columnNames": [
++            "id"
++          ]
++        },
++        "indices": [
++          {
++            "name": "index_color_palette_scheme_id",
++            "unique": false,
++            "columnNames": [
++              "scheme_id"
++            ],
++            "orders": [],
++            "createSql": "CREATE INDEX IF NOT EXISTS `index_color_palette_scheme_id` ON `${TABLE_NAME}` (`scheme_id`)"
++          },
++          {
++            "name": "index_color_palette_scheme_id_color_index",
++            "unique": true,
++            "columnNames": [
++              "scheme_id",
++              "color_index"
++            ],
++            "orders": [],
++            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_color_palette_scheme_id_color_index` ON `${TABLE_NAME}` (`scheme_id`, `color_index`)"
++          }
++        ],
++        "foreignKeys": [
++          {
++            "table": "color_schemes",
++            "onDelete": "CASCADE",
++            "onUpdate": "NO ACTION",
++            "columns": [
++              "scheme_id"
++            ],
++            "referencedColumns": [
++              "id"
++            ]
++          }
++        ]
++      },
++      {
++        "tableName": "profiles",
++        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `name` TEXT NOT NULL, `icon_color` TEXT, `color_scheme_id` INTEGER NOT NULL DEFAULT -1, `font_family` TEXT, `font_size` INTEGER NOT NULL DEFAULT 10, `del_key` TEXT NOT NULL DEFAULT 'del', `encoding` TEXT NOT NULL DEFAULT 'UTF-8', `emulation` TEXT NOT NULL DEFAULT 'xterm-256color', `inline_images` TEXT NOT NULL DEFAULT 'ask', `force_size_rows` INTEGER, `force_size_columns` INTEGER)",
++        "fields": [
++          {
++            "fieldPath": "id",
++            "columnName": "id",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "name",
++            "columnName": "name",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "iconColor",
++            "columnName": "icon_color",
++            "affinity": "TEXT"
++          },
++          {
++            "fieldPath": "colorSchemeId",
++            "columnName": "color_scheme_id",
++            "affinity": "INTEGER",
++            "notNull": true,
++            "defaultValue": "-1"
++          },
++          {
++            "fieldPath": "fontFamily",
++            "columnName": "font_family",
++            "affinity": "TEXT"
++          },
++          {
++            "fieldPath": "fontSize",
++            "columnName": "font_size",
++            "affinity": "INTEGER",
++            "notNull": true,
++            "defaultValue": "10"
++          },
++          {
++            "fieldPath": "delKey",
++            "columnName": "del_key",
++            "affinity": "TEXT",
++            "notNull": true,
++            "defaultValue": "'del'"
++          },
++          {
++            "fieldPath": "encoding",
++            "columnName": "encoding",
++            "affinity": "TEXT",
++            "notNull": true,
++            "defaultValue": "'UTF-8'"
++          },
++          {
++            "fieldPath": "emulation",
++            "columnName": "emulation",
++            "affinity": "TEXT",
++            "notNull": true,
++            "defaultValue": "'xterm-256color'"
++          },
++          {
++            "fieldPath": "inlineImages",
++            "columnName": "inline_images",
++            "affinity": "TEXT",
++            "notNull": true,
++            "defaultValue": "'ask'"
++          },
++          {
++            "fieldPath": "forceSizeRows",
++            "columnName": "force_size_rows",
++            "affinity": "INTEGER"
++          },
++          {
++            "fieldPath": "forceSizeColumns",
++            "columnName": "force_size_columns",
++            "affinity": "INTEGER"
++          }
++        ],
++        "primaryKey": {
++          "autoGenerate": true,
++          "columnNames": [
++            "id"
++          ]
++        },
++        "indices": [
++          {
++            "name": "index_profiles_name",
++            "unique": true,
++            "columnNames": [
++              "name"
++            ],
++            "orders": [],
++            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_profiles_name` ON `${TABLE_NAME}` (`name`)"
++          }
++        ]
++      },
++      {
++        "tableName": "automation_actions",
++        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `host_id` INTEGER NOT NULL, `position` INTEGER NOT NULL, `type` TEXT NOT NULL, `text` TEXT NOT NULL, `regex` INTEGER NOT NULL, `duration_ms` INTEGER NOT NULL, `key` INTEGER NOT NULL, `modifiers` INTEGER NOT NULL, `forward_id` INTEGER, `failure_policy` TEXT NOT NULL, PRIMARY KEY(`id`), FOREIGN KEY(`host_id`) REFERENCES `hosts`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE )",
++        "fields": [
++          {
++            "fieldPath": "id",
++            "columnName": "id",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "hostId",
++            "columnName": "host_id",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "position",
++            "columnName": "position",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "type",
++            "columnName": "type",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "text",
++            "columnName": "text",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "regex",
++            "columnName": "regex",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "durationMs",
++            "columnName": "duration_ms",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "key",
++            "columnName": "key",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "modifiers",
++            "columnName": "modifiers",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "forwardId",
++            "columnName": "forward_id",
++            "affinity": "INTEGER"
++          },
++          {
++            "fieldPath": "failurePolicy",
++            "columnName": "failure_policy",
++            "affinity": "TEXT",
++            "notNull": true
++          }
++        ],
++        "primaryKey": {
++          "autoGenerate": false,
++          "columnNames": [
++            "id"
++          ]
++        },
++        "indices": [
++          {
++            "name": "index_automation_actions_host_id",
++            "unique": false,
++            "columnNames": [
++              "host_id"
++            ],
++            "orders": [],
++            "createSql": "CREATE INDEX IF NOT EXISTS `index_automation_actions_host_id` ON `${TABLE_NAME}` (`host_id`)"
++          }
++        ],
++        "foreignKeys": [
++          {
++            "table": "hosts",
++            "onDelete": "CASCADE",
++            "onUpdate": "NO ACTION",
++            "columns": [
++              "host_id"
++            ],
++            "referencedColumns": [
++              "id"
++            ]
++          }
++        ]
++      }
++    ],
++    "setupQueries": [
++      "CREATE TABLE IF NOT EXISTS room_master_table (id INTEGER PRIMARY KEY,identity_hash TEXT)",
++      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, '8db738fe3a71916ca983faf715a074ea')"
++    ]
++  }
++}
+\ No newline at end of file
+diff --git a/app/src/main/assets/adi-registration.properties b/app/src/main/assets/adi-registration.properties
+new file mode 100644
+index 00000000..836d3e1b
+--- /dev/null
++++ b/app/src/main/assets/adi-registration.properties
+@@ -0,0 +1 @@
++CKWW3DTVNHFSKAAAAAAAAAAAAA
+diff --git a/app/src/main/assets/connectbot-LICENSE.txt b/app/src/main/assets/connectbot-LICENSE.txt
+new file mode 100644
+index 00000000..d6456956
+--- /dev/null
++++ b/app/src/main/assets/connectbot-LICENSE.txt
+@@ -0,0 +1,202 @@
++
++                                 Apache License
++                           Version 2.0, January 2004
++                        http://www.apache.org/licenses/
++
++   TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
++
++   1. Definitions.
++
++      "License" shall mean the terms and conditions for use, reproduction,
++      and distribution as defined by Sections 1 through 9 of this document.
++
++      "Licensor" shall mean the copyright owner or entity authorized by
++      the copyright owner that is granting the License.
++
++      "Legal Entity" shall mean the union of the acting entity and all
++      other entities that control, are controlled by, or are under common
++      control with that entity. For the purposes of this definition,
++      "control" means (i) the power, direct or indirect, to cause the
++      direction or management of such entity, whether by contract or
++      otherwise, or (ii) ownership of fifty percent (50%) or more of the
++      outstanding shares, or (iii) beneficial ownership of such entity.
++
++      "You" (or "Your") shall mean an individual or Legal Entity
++      exercising permissions granted by this License.
++
++      "Source" form shall mean the preferred form for making modifications,
++      including but not limited to software source code, documentation
++      source, and configuration files.
++
++      "Object" form shall mean any form resulting from mechanical
++      transformation or translation of a Source form, including but
++      not limited to compiled object code, generated documentation,
++      and conversions to other media types.
++
++      "Work" shall mean the work of authorship, whether in Source or
++      Object form, made available under the License, as indicated by a
++      copyright notice that is included in or attached to the work
++      (an example is provided in the Appendix below).
++
++      "Derivative Works" shall mean any work, whether in Source or Object
++      form, that is based on (or derived from) the Work and for which the
++      editorial revisions, annotations, elaborations, or other modifications
++      represent, as a whole, an original work of authorship. For the purposes
++      of this License, Derivative Works shall not include works that remain
++      separable from, or merely link (or bind by name) to the interfaces of,
++      the Work and Derivative Works thereof.
++
++      "Contribution" shall mean any work of authorship, including
++      the original version of the Work and any modifications or additions
++      to that Work or Derivative Works thereof, that is intentionally
++      submitted to Licensor for inclusion in the Work by the copyright owner
++      or by an individual or Legal Entity authorized to submit on behalf of
++      the copyright owner. For the purposes of this definition, "submitted"
++      means any form of electronic, verbal, or written communication sent
++      to the Licensor or its representatives, including but not limited to
++      communication on electronic mailing lists, source code control systems,
++      and issue tracking systems that are managed by, or on behalf of, the
++      Licensor for the purpose of discussing and improving the Work, but
++      excluding communication that is conspicuously marked or otherwise
++      designated in writing by the copyright owner as "Not a Contribution."
++
++      "Contributor" shall mean Licensor and any individual or Legal Entity
++      on behalf of whom a Contribution has been received by Licensor and
++      subsequently incorporated within the Work.
++
++   2. Grant of Copyright License. Subject to the terms and conditions of
++      this License, each Contributor hereby grants to You a perpetual,
++      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
++      copyright license to reproduce, prepare Derivative Works of,
++      publicly display, publicly perform, sublicense, and distribute the
++      Work and such Derivative Works in Source or Object form.
++
++   3. Grant of Patent License. Subject to the terms and conditions of
++      this License, each Contributor hereby grants to You a perpetual,
++      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
++      (except as stated in this section) patent license to make, have made,
++      use, offer to sell, sell, import, and otherwise transfer the Work,
++      where such license applies only to those patent claims licensable
++      by such Contributor that are necessarily infringed by their
++      Contribution(s) alone or by combination of their Contribution(s)
++      with the Work to which such Contribution(s) was submitted. If You
++      institute patent litigation against any entity (including a
++      cross-claim or counterclaim in a lawsuit) alleging that the Work
++      or a Contribution incorporated within the Work constitutes direct
++      or contributory patent infringement, then any patent licenses
++      granted to You under this License for that Work shall terminate
++      as of the date such litigation is filed.
++
++   4. Redistribution. You may reproduce and distribute copies of the
++      Work or Derivative Works thereof in any medium, with or without
++      modifications, and in Source or Object form, provided that You
++      meet the following conditions:
++
++      (a) You must give any other recipients of the Work or
++          Derivative Works a copy of this License; and
++
++      (b) You must cause any modified files to carry prominent notices
++          stating that You changed the files; and
++
++      (c) You must retain, in the Source form of any Derivative Works
++          that You distribute, all copyright, patent, trademark, and
++          attribution notices from the Source form of the Work,
++          excluding those notices that do not pertain to any part of
++          the Derivative Works; and
++
++      (d) If the Work includes a "NOTICE" text file as part of its
++          distribution, then any Derivative Works that You distribute must
++          include a readable copy of the attribution notices contained
++          within such NOTICE file, excluding those notices that do not
++          pertain to any part of the Derivative Works, in at least one
++          of the following places: within a NOTICE text file distributed
++          as part of the Derivative Works; within the Source form or
++          documentation, if provided along with the Derivative Works; or,
++          within a display generated by the Derivative Works, if and
++          wherever such third-party notices normally appear. The contents
++          of the NOTICE file are for informational purposes only and
++          do not modify the License. You may add Your own attribution
++          notices within Derivative Works that You distribute, alongside
++          or as an addendum to the NOTICE text from the Work, provided
++          that such additional attribution notices cannot be construed
++          as modifying the License.
++
++      You may add Your own copyright statement to Your modifications and
++      may provide additional or different license terms and conditions
++      for use, reproduction, or distribution of Your modifications, or
++      for any such Derivative Works as a whole, provided Your use,
++      reproduction, and distribution of the Work otherwise complies with
++      the conditions stated in this License.
++
++   5. Submission of Contributions. Unless You explicitly state otherwise,
++      any Contribution intentionally submitted for inclusion in the Work
++      by You to the Licensor shall be under the terms and conditions of
++      this License, without any additional terms or conditions.
++      Notwithstanding the above, nothing herein shall supersede or modify
++      the terms of any separate license agreement you may have executed
++      with Licensor regarding such Contributions.
++
++   6. Trademarks. This License does not grant permission to use the trade
++      names, trademarks, service marks, or product names of the Licensor,
++      except as required for reasonable and customary use in describing the
++      origin of the Work and reproducing the content of the NOTICE file.
++
++   7. Disclaimer of Warranty. Unless required by applicable law or
++      agreed to in writing, Licensor provides the Work (and each
++      Contributor provides its Contributions) on an "AS IS" BASIS,
++      WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
++      implied, including, without limitation, any warranties or conditions
++      of TITLE, NON-INFRINGEMENT, MERCHANTABILITY, or FITNESS FOR A
++      PARTICULAR PURPOSE. You are solely responsible for determining the
++      appropriateness of using or redistributing the Work and assume any
++      risks associated with Your exercise of permissions under this License.
++
++   8. Limitation of Liability. In no event and under no legal theory,
++      whether in tort (including negligence), contract, or otherwise,
++      unless required by applicable law (such as deliberate and grossly
++      negligent acts) or agreed to in writing, shall any Contributor be
++      liable to You for damages, including any direct, indirect, special,
++      incidental, or consequential damages of any character arising as a
++      result of this License or out of the use or inability to use the
++      Work (including but not limited to damages for loss of goodwill,
++      work stoppage, computer failure or malfunction, or any and all
++      other commercial damages or losses), even if such Contributor
++      has been advised of the possibility of such damages.
++
++   9. Accepting Warranty or Additional Liability. While redistributing
++      the Work or Derivative Works thereof, You may choose to offer,
++      and charge a fee for, acceptance of support, warranty, indemnity,
++      or other liability obligations and/or rights consistent with this
++      License. However, in accepting such obligations, You may act only
++      on Your own behalf and on Your sole responsibility, not on behalf
++      of any other Contributor, and only if You agree to indemnify,
++      defend, and hold each Contributor harmless for any liability
++      incurred by, or claims asserted against, such Contributor by reason
++      of your accepting any such warranty or additional liability.
++
++   END OF TERMS AND CONDITIONS
++
++   APPENDIX: How to apply the Apache License to your work.
++
++      To apply the Apache License to your work, attach the following
++      boilerplate notice, with the fields enclosed by brackets "[]"
++      replaced with your own identifying information. (Don't include
++      the brackets!)  The text should be enclosed in the appropriate
++      comment syntax for the file format. We also recommend that a
++      file or class name and description of purpose be included on the
++      same "printed page" as the copyright notice for easier
++      identification within third-party archives.
++
++   Copyright [yyyy] [name of copyright owner]
++
++   Licensed under the Apache License, Version 2.0 (the "License");
++   you may not use this file except in compliance with the License.
++   You may obtain a copy of the License at
++
++       http://www.apache.org/licenses/LICENSE-2.0
++
++   Unless required by applicable law or agreed to in writing, software
++   distributed under the License is distributed on an "AS IS" BASIS,
++   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++   See the License for the specific language governing permissions and
++   limitations under the License.
+diff --git a/app/src/main/java/org/connectbot/tabatelier/TabAtelierClient.kt b/app/src/main/java/org/connectbot/tabatelier/TabAtelierClient.kt
+new file mode 100644
+index 00000000..0126da9a
+--- /dev/null
++++ b/app/src/main/java/org/connectbot/tabatelier/TabAtelierClient.kt
+@@ -0,0 +1,662 @@
++/*
++ * ConnectBot: simple, powerful, open-source SSH client for Android
++ * Copyright 2025-2026 Kenny Root
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++// New file for Tab Atelier Remote, not part of upstream ConnectBot: the URL a
++// tab-atelier server is addressed by, the HTTP client for its `GET {base}/tabs`,
++// and how far its certificate is trusted — validated by the device where the
++// device can, pinned where nothing else can identify the server. See
++// overlay/README.md.
++
++package org.connectbot.tabatelier
++
++import android.content.Context
++import android.content.SharedPreferences
++import dagger.hilt.android.qualifiers.ApplicationContext
++import okhttp3.CertificatePinner
++import okhttp3.HttpUrl
++import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
++import okhttp3.Interceptor
++import okhttp3.OkHttpClient
++import okhttp3.Request
++import org.connectbot.BuildConfig
++import org.connectbot.util.SecurePasswordStorage
++import timber.log.Timber
++import java.security.KeyStore
++import java.security.cert.Certificate
++import java.security.cert.CertificateException
++import java.security.cert.X509Certificate
++import java.util.concurrent.ConcurrentHashMap
++import java.util.concurrent.TimeUnit
++import javax.inject.Inject
++import javax.inject.Singleton
++import javax.net.ssl.HostnameVerifier
++import javax.net.ssl.HttpsURLConnection
++import javax.net.ssl.KeyManager
++import javax.net.ssl.SSLContext
++import javax.net.ssl.SSLPeerUnverifiedException
++import javax.net.ssl.SSLSession
++import javax.net.ssl.TrustManager
++import javax.net.ssl.TrustManagerFactory
++import javax.net.ssl.X509TrustManager
++
++/**
++ * A tab-atelier daemon's base URL, parsed once.
++ *
++ * A server is one URL — `https://host`, `http://host:7890`,
++ * `https://host:8443/prefix` — because a scheme and a path prefix are exactly
++ * what the internal protocol/hostname/port columns cannot express. The scheme
++ * decides whether the daemon is reached over TLS or plain HTTP; the path prefix
++ * is the mount point the daemon serves under.
++ *
++ * Stage 2's terminal WebSocket hangs off the same base, so deriving a URL from
++ * the base lives here rather than at every call site.
++ */
++class TabAtelierBase private constructor(private val url: HttpUrl) {
++    /** `http` or `https`. */
++    val scheme: String = url.scheme
++
++    val host: String = url.host
++
++    /** The port actually dialled: 443 or 80 was filled in from [scheme]. */
++    val port: Int = url.port
++
++    /**
++     * The path prefix, as an encoded path with no trailing slash: `""` for a
++     * daemon at the root of its host, `/prefix` for one behind a path.
++     */
++    val prefix: String = url.encodedPath.trimEnd('/')
++
++    /** Whether this base is reached over TLS, which is what decides pinning. */
++    val secure: Boolean get() = scheme == HTTPS_SCHEME
++
++    /**
++     * `scheme://host:port` — the connection a certificate pin belongs to, and
++     * the name it is recorded under. No prefix: one daemon serves one key at
++     * every path it is mounted under.
++     */
++    val origin: String = url.newBuilder()
++        .encodedPath(ROOT_PATH)
++        .build()
++        .toString()
++        .removeSuffix(ROOT_PATH)
++
++    /** `GET {this}/tabs`, with exactly one slash between prefix and path. */
++    val tabsUrl: String get() = httpUrl(TABS_PATH).toString()
++
++    /**
++     * [path] on this server, e.g. `https://host:8443/prefix/tabs`. [path] starts
++     * with `/`; the prefix is joined to it without doubling or dropping a slash.
++     */
++    fun httpUrl(path: String): HttpUrl = url.newBuilder().encodedPath(prefix + path).build()
++
++    /**
++     * [path] on this server over WebSocket, e.g. `wss://host:8443/prefix/x`:
++     * stage 2's terminal, built from the same base as [httpUrl].
++     *
++     * A string rather than an [HttpUrl], which accepts only http and https —
++     * `HttpUrl.Builder.scheme("wss")` throws, so the scheme is swapped in the
++     * canonical URL [httpUrl] produced.
++     *
++     * The token goes in the query string, not in an `Authorization` header, and
++     * that is not a stylistic choice. The daemon's `extract_token`
++     * (`src/api_ws.rs`) reads the query first and the header second, but the
++     * query lookup is `req.uri().query()?` — the `?` returns from the whole
++     * function when there is no query at all, so a request to a bare
++     * `/tabs/by-id/{id}/ws` never reaches the header fallback and is refused
++     * with 401. Verified against a live daemon: header alone → 401, `?token=` →
++     * 101. The daemon's own browser client uses this form for the same reason.
++     * Fixing `extract_token` on the daemon side would let this carry the header
++     * instead, which is the better primitive — it keeps the token out of URLs,
++     * and so out of logs.
++     */
++    fun webSocketUrl(path: String, token: String?): String {
++        val http = httpUrl(path).newBuilder()
++            .apply { if (!token.isNullOrBlank()) addQueryParameter("token", token) }
++            .build()
++            .toString()
++        return webSocketScheme + http.substring(scheme.length)
++    }
++
++    private val webSocketScheme: String get() = if (secure) "wss" else "ws"
++
++    /**
++     * The canonical base, e.g. `https://host:8443` or `https://host:8443/prefix`
++     * — default port elided, no trailing slash. This is what the editor stores
++     * and the host list shows.
++     */
++    override fun toString(): String = url.newBuilder()
++        .encodedPath(prefix.ifEmpty { ROOT_PATH })
++        .build()
++        .toString()
++        .removeSuffix(ROOT_PATH)
++
++    override fun equals(other: Any?): Boolean = other is TabAtelierBase && other.url == url
++
++    override fun hashCode(): Int = url.hashCode()
++
++    companion object {
++        private const val HTTP_SCHEME = "http"
++        private const val HTTPS_SCHEME = "https"
++        private const val ROOT_PATH = "/"
++        private const val TABS_PATH = "/tabs"
++
++        /**
++         * Parse a server's base URL, or null if it cannot be one.
++         *
++         * Rejected, all for the same reason — quietly dropping part of what the
++         * user typed is worse than saying no:
++         * - what [HttpUrl] itself refuses: no scheme, a scheme other than
++         *   http/https, no host, a port outside 1..65535, a malformed URL;
++         * - credentials, a query or a fragment, which a daemon address has no
++         *   use for and which the request would have to discard.
++         *
++         * Everything else is kept: the scheme chooses TLS or not, the port
++         * defaults to 443/80, and a path prefix is preserved.
++         */
++        fun parse(input: String?): TabAtelierBase? {
++            val url = input?.trim()?.toHttpUrlOrNull() ?: return null
++            if (url.username.isNotEmpty() || url.password.isNotEmpty()) return null
++            if (url.query != null || url.fragment != null) return null
++            return TabAtelierBase(url)
++        }
++    }
++}
++
++/**
++ * Talks to a tab-atelier daemon.
++ *
++ * Stage 1 uses exactly one endpoint, `GET {base}/tabs`; a tab's terminal is a
++ * WebSocket and belongs to stage 2, which asks [clientFor] for the client and
++ * [TabAtelierBase.webSocketUrl] for the URL rather than deriving either again.
++ */
++@Singleton
++class TabAtelierClient @Inject constructor(
++    @ApplicationContext private val context: Context,
++    private val securePasswordStorage: SecurePasswordStorage,
++) {
++    private val basePrefs: SharedPreferences by lazy {
++        context.getSharedPreferences(PREFS_FILE_NAME, Context.MODE_PRIVATE)
++    }
++
++    /**
++     * A client per host *and* origin, so a pin learned for one server is
++     * enforced on that server's own calls and never weakens another's. The
++     * origin is part of the key because it is what a pin is recorded against:
++     * editing a host's URL changes the origin, and the client for the old one is
++     * dropped rather than reused.
++     */
++    private data class ClientKey(val hostId: Long, val origin: String)
++
++    private val clients = ConcurrentHashMap<ClientKey, OkHttpClient>()
++
++    /**
++     * Keys accepted as first use, before they have earned being pinned.
++     *
++     * The trust manager is where a key is actually seen and verified, so it is
++     * where the candidate comes from. `Response.handshake` would have been the
++     * other source, and it was the original one — but it is not always
++     * populated, and when it is absent nothing was ever recorded. That is how
++     * trust-on-first-use quietly became "trust everything, forever": the accept
++     * happened, the record did not.
++     *
++     * A candidate becomes a pin only once a request has come back over it.
++     */
++    private val pendingPins = ConcurrentHashMap<String, String>()
++
++    /** The base URL a host is addressed by, or null if what it holds is not one. */
++    fun base(url: String?): TabAtelierBase? = TabAtelierBase.parse(url)
++
++    /**
++     * The token a host's API calls carry, from ConnectBot's Keystore-backed
++     * per-host secret store — the same store SSH passwords use. It is
++     * deliberately outside the database, so it is not in exports or backups.
++     */
++    fun token(hostId: Long): String? = securePasswordStorage.getPassword(hostId)
++
++    fun saveToken(hostId: Long, token: String?) = securePasswordStorage.savePassword(hostId, token)
++
++    /**
++     * Whether a token is stored for a host, without decrypting it.
++     *
++     * One half of what decides whether a server needs probing again — adding or
++     * clearing a token changes how the daemon answers — so it is asked on every
++     * hosts-Flow emission and stays a cheap lookup.
++     */
++    fun hasToken(hostId: Long): Boolean = securePasswordStorage.hasPassword(hostId)
++
++    /** The SPKI pin recorded for a host's connection, if it has one. */
++    fun pin(hostId: Long, base: TabAtelierBase): String? =
++        basePrefs.getString(pinKey(hostId, base.origin), null)
++
++    /** Forget a host's pins, so the next successful call learns them again. */
++    fun clearPin(hostId: Long) {
++        val prefix = pinPrefix(hostId)
++        val recorded = basePrefs.all.keys.filter { it.startsWith(prefix) }
++        basePrefs.edit().apply { recorded.forEach { remove(it) } }.apply()
++        pendingPins.keys.filter { it.startsWith(prefix) }.forEach(pendingPins::remove)
++        clients.keys.filter { it.hostId == hostId }.forEach(clients::remove)
++    }
++
++    /** Forget a host's token and pin, for when the host itself is deleted. */
++    fun forgetHost(hostId: Long) {
++        securePasswordStorage.deletePassword(hostId)
++        clearPin(hostId)
++    }
++
++    /**
++     * `GET {base}/tabs`, sorted by `last_used_at` descending.
++     *
++     * Blocking network I/O: never call this on the main thread.
++     *
++     * @throws Exception on any network, TLS or parse failure.
++     */
++    fun fetchTabs(hostId: Long, base: TabAtelierBase, token: String?): List<TabAtelierTab> {
++        val request = Request.Builder()
++            .url(base.tabsUrl)
++            .apply { if (!token.isNullOrEmpty()) header("Authorization", "Bearer $token") }
++            .build()
++
++        val response = clientFor(hostId, base).newCall(request).execute()
++        return response.use {
++            if (!it.isSuccessful) {
++                throw IllegalStateException("GET ${base.tabsUrl} returned HTTP ${it.code}")
++            }
++            // The key is only recorded once a request has come back over the
++            // accepted connection, never merely because the socket was accepted:
++            // see recordPin. A chain the device itself vouches for records
++            // nothing — see TrustOnFirstUseManager — and a plain-http daemon has
++            // no handshake, and so nothing to pin.
++            if (base.secure) {
++                recordPin(hostId, base, it.handshake?.peerCertificates)
++            }
++            parseTabAtelierTabs(it.body.string())
++        }
++    }
++
++    /**
++     * The client for a server: built on first use for a host and origin, and
++     * configured for that server alone. Stage 2 reuses it for the WebSocket,
++     * which is what carries the User-Agent and the pin there too.
++     */
++    fun clientFor(hostId: Long, base: TabAtelierBase): OkHttpClient {
++        val key = ClientKey(hostId, base.origin)
++        // The address is part of the key, so editing a host's URL leaves the
++        // client built for its old address unused; drop it, the way the address
++        // it was built for was dropped.
++        clients.keys.filter { it.hostId == hostId && it != key }.forEach(clients::remove)
++        return clients.computeIfAbsent(key) { buildClient(hostId, base) }
++    }
++
++    private fun buildClient(hostId: Long, base: TabAtelierBase): OkHttpClient {
++        val builder = OkHttpClient.Builder()
++            .connectTimeout(CONNECT_TIMEOUT_SECONDS, TimeUnit.SECONDS)
++            .readTimeout(READ_TIMEOUT_SECONDS, TimeUnit.SECONDS)
++            .callTimeout(CALL_TIMEOUT_SECONDS, TimeUnit.SECONDS)
++            .addInterceptor(userAgentInterceptor)
++
++        // A daemon serving plain HTTP — a trusted LAN, or a tunnel that brings
++        // its own encryption — is reached with no TLS configuration at all: no
++        // trust manager, no hostname verifier, no pin. It is deliberately not
++        // upgraded to https, which would only fail against a daemon with no
++        // certificate to offer.
++        if (!base.secure) return builder.build()
++
++        val trustManager = TrustOnFirstUseManager(
++            hostId = hostId,
++            base = base,
++            pins = basePrefs,
++            device = deviceTrustManager(),
++            deviceHostnameVerifier = deviceHostnameVerifier(),
++            rememberAsFirstUse = { accepted ->
++                // Remembered here, pinned later: fetchTabs commits it once a
++                // response has come back over this key. pinOf is what turns the
++                // certificate into the form a pin is compared in, so the
++                // candidate is stored in that same form.
++                pinOf(accepted)?.let { pendingPins[pinKey(hostId, base.origin)] = it }
++            },
++            forgetPinnedKey = { dropPin(hostId, base) },
++        )
++        val sslContext = SSLContext.getInstance(TLS_PROTOCOL).apply {
++            init(null as Array<KeyManager>?, arrayOf<TrustManager>(trustManager), null)
++        }
++
++        return builder
++            // The daemon's own certificate is self-signed, so neither the system
++            // CA store nor name validation can be the gate for it — but a
++            // certificate a CA signed must be validated by that CA, and a renewal
++            // of it must not break us. Which of the two a server is is the trust
++            // manager's decision: see its class comment. Setting only a hostname
++            // verifier — as this client did before the trust manager was added —
++            // fixes nothing, because OkHttp's default trust manager rejects the
++            // chain during the handshake, before any verifier is consulted.
++            .sslSocketFactory(sslContext.socketFactory, trustManager)
++            // The second half of the same decision, which OkHttp *enforces*: the
++            // device's own verifier for a chain the device vouched for, the pin
++            // for a server whose key is its only identity.
++            .hostnameVerifier { hostname, session -> trustManager.verifyHostname(hostname, session) }
++            .build()
++    }
++
++    /**
++     * The device's own trust manager — what decides whether a certificate is one
++     * the device can already vouch for (a public CA, or a CA the user installed)
++     * and therefore one this app must not pin. See [TrustOnFirstUseManager].
++     *
++     * Deliberately the platform's and not OkHttp's: OkHttp's default trust
++     * manager is built on this same authority, and asking it directly keeps the
++     * answer consistent with what the device's own HTTPS stack would do.
++     */
++    private fun deviceTrustManager(): X509TrustManager {
++        val factory = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm())
++        // null: the device's default store, i.e. what Android itself trusts.
++        factory.init(null as KeyStore?)
++        return requireNotNull(factory.trustManagers.filterIsInstance<X509TrustManager>().firstOrNull()) {
++            "The device has no X.509 trust manager to validate a server's certificate with"
++        }
++    }
++
++    /**
++     * The device's own hostname verifier: what Android's HTTPS stack checks a
++     * certificate's names with, for the certificates the device vouches for.
++     */
++    private fun deviceHostnameVerifier(): HostnameVerifier =
++        requireNotNull(HttpsURLConnection.getDefaultHostnameVerifier()) {
++            "The device has no default hostname verifier to check a server's certificate names with"
++        }
++
++    /**
++     * Forget a host's pin for one origin because the device now vouches for that
++     * server's chain.
++     *
++     * A pin belongs to the case where nothing else could vouch for the
++     * certificate, and it would refuse the renewed certificate the device has
++     * just accepted — which is the whole point of not pinning a chain the device
++     * can validate. The candidate goes with it, so a handshake that was accepted
++     * as first use but is now validated cannot commit a pin from its response.
++     */
++    private fun dropPin(hostId: Long, base: TabAtelierBase) {
++        basePrefs.edit().remove(pinKey(hostId, base.origin)).apply()
++        pendingPins.remove(pinKey(hostId, base.origin))
++        Timber.d("Not pinning %s any more: the device validates its certificate", base.origin)
++    }
++
++    /**
++     * Record the leaf certificate's SPKI pin the first time a response arrives
++     * from this host's origin. Later connections must reproduce it.
++     *
++     * The first handshake is *accepted* before anything is recorded, because the
++     * request that earns the pin cannot be made otherwise; what makes that safe
++     * is that the acceptance only buys that one request, and the pin is written
++     * only once its response has come back. A server that is not the daemon —
++     * anything that answers and then fails, or is refused a response — never
++     * becomes the pinned key, and every later connection to it is rejected
++     * against the pin the real daemon earned.
++     *
++     * A chain the *device* vouches for leaves no candidate at all, and so is
++     * never pinned: see [TrustOnFirstUseManager] for why that is the point of
++     * this arrangement rather than a gap in it.
++     */
++    private fun recordPin(hostId: Long, base: TabAtelierBase, chain: List<Certificate>?) {
++        val key = pinKey(hostId, base.origin)
++        val candidate = pendingPins.remove(key) ?: return
++        // The handshake's own view of the same connection is only used to
++        // disagree: a pin that is not the key just used is worse than no pin.
++        val fromHandshake = chain?.firstOrNull()?.let(::pinOf)
++        if (fromHandshake != null && fromHandshake != candidate) {
++            Timber.w(
++                "Not pinning %s: the handshake key is not the one the trust manager accepted",
++                base.origin,
++            )
++            return
++        }
++        if (pin(hostId, base) != null) return
++        basePrefs.edit().putString(key, candidate).apply()
++        Timber.d("Recorded tab-atelier certificate pin for host %d at %s", hostId, base.origin)
++    }
++
++    companion object {
++        private const val PREFS_FILE_NAME = "tabatelier_host_pins"
++
++        private const val CONNECT_TIMEOUT_SECONDS = 10L
++        private const val READ_TIMEOUT_SECONDS = 15L
++        private const val CALL_TIMEOUT_SECONDS = 20L
++        private const val TLS_PROTOCOL = "TLS"
++
++        /**
++         * How this app names itself to a daemon: `ta-remote/0.6.10 (Android)`,
++         * the shape the retired Slint client sent, so a daemon's logs read the
++         * same across both clients. The daemon does not branch on it — the
++         * `app` field of its own `/tabs` response is the daemon's User-Agent,
++         * not ours — so this is about identifying ourselves honestly in logs.
++         */
++        private val userAgent: String = "ta-remote/${BuildConfig.VERSION_NAME} (Android)"
++
++        /**
++         * Sent on every request, so the WebSocket upgrade of stage 2 carries it
++         * too without having to remember to.
++         */
++        private val userAgentInterceptor = Interceptor { chain ->
++            chain.proceed(
++                chain.request().newBuilder().header("User-Agent", userAgent).build(),
++            )
++        }
++    }
++}
++
++/**
++ * Decides whether a daemon's certificate may be used, and on what evidence.
++ *
++ * Which of two cases a server falls into is the *device's* judgement, not this
++ * app's:
++ *
++ * **The device vouches for the chain** — a public CA signed it, or the user
++ * installed its CA here. Something outside this app can vouch for that
++ * certificate *and can re-issue it*, so nothing is pinned: renewals are the
++ * normal life of such a certificate, and a client that refused the renewed one
++ * would be the bug this class was reshaped to fix. The device's own hostname
++ * verifier checks the name, as it would for any other HTTPS connection.
++ *
++ * **The device cannot vouch for the chain** — the daemon's own self-signed
++ * certificate, or an origin certificate whose CA this device does not have.
++ * Nothing else identifies the server, so its key *is* its identity: trust on
++ * first use, then require that exact key. This is the case a pin belongs to.
++ *
++ * A certificate nothing can vouch for is deliberately *not* refused for being
++ * signed by someone: a Cloudflare Origin certificate is a documented way to
++ * reach a daemon here, and its CA is not on an Android device by default. It is
++ * trusted on first use like a self-signed certificate, and says so in the log.
++ */
++internal class TrustOnFirstUseManager(
++    private val hostId: Long,
++    private val base: TabAtelierBase,
++    private val pins: SharedPreferences,
++    /** The device's own trust manager: what "the device vouches for it" means. */
++    private val device: X509TrustManager,
++    /** The device's own hostname verifier, for the chains [device] accepts. */
++    private val deviceHostnameVerifier: HostnameVerifier,
++    /**
++     * Hand a first-use key on as a pin candidate — see
++     * [TabAtelierClient.recordPin], which is what makes it a pin.
++     */
++    private val rememberAsFirstUse: (X509Certificate) -> Unit,
++    /** Forget a pin of a server the device now vouches for: see [checkServerTrusted]. */
++    private val forgetPinnedKey: () -> Unit,
++) : X509TrustManager {
++
++    /** How the certificate of the handshake in progress was accepted. */
++    private enum class Trust {
++        /** The device validated the chain; nothing is pinned for it. */
++        DEVICE,
++
++        /** Nothing could validate it: its key is its identity, and is pinned. */
++        FIRST_USE,
++    }
++
++    /**
++     * What [checkServerTrusted] decided for the handshake in progress, which is
++     * what [verifyHostname] is then asked about.
++     *
++     * OkHttp consults the verifier after the handshake has completed, so the
++     * decision is always from the handshake being verified — including for a
++     * resumed session, whose handshake was this same instance's earlier one. Two
++     * connections to one server can only reach the same decision, so the two
++     * racing writes that sharing this value allows are harmless.
++     */
++    @Volatile
++    private var trust: Trust? = null
++
++    override fun checkServerTrusted(chain: Array<out X509Certificate>, authType: String) {
++        val leaf = chain.firstOrNull()
++            ?: throw CertificateException("No certificate from ${base.host} to compare with its pinned key")
++
++        // Does the device itself vouch for this chain? Then this app pins
++        // nothing: see the class comment. Any pin recorded while nothing could
++        // vouch for the server is dropped with it — a renewal is exactly the
++        // case that makes this matter, and keeping the pin would refuse the
++        // certificate the device has just accepted.
++        if (deviceAccepts(chain, authType)) {
++            trust = Trust.DEVICE
++            if (recordedPin() != null) forgetPinnedKey()
++            return
++        }
++
++        trust = Trust.FIRST_USE
++        val expected = recordedPin()
++        if (expected == null) {
++            // Nothing pinned for this server yet: accept, so the request that
++            // earns the pin can be made. Accepting is not recording — the key is
++            // handed on as a candidate, and only a response makes it a pin.
++            Timber.d(
++                "The device does not vouch for %s's certificate; trusting its key on first use",
++                base.origin,
++            )
++            rememberAsFirstUse(leaf)
++            return
++        }
++
++        if (pinOf(leaf) != expected) {
++            throw CertificateException(
++                "The certificate key of ${base.host} does not match the key pinned for it. " +
++                    "Its certificate was replaced, or this is not the server that was trusted; " +
++                    "clear the host's trust to accept the new key.",
++            )
++        }
++    }
++
++    /**
++     * Whether the device's own trust manager accepts this chain.
++     *
++     * Asked with the same `authType` the TLS stack handed us, which is what the
++     * device's manager is asked by the device's own HTTPS stack: a chain it
++     * accepts here is one it would accept anywhere. Nothing else about a failure
++     * is looked at — an unknown issuer, an expired certificate and a name it does
++     * not cover are all "the device cannot vouch for this", and the consequence
++     * is the same for all three.
++     */
++    private fun deviceAccepts(chain: Array<out X509Certificate>, authType: String): Boolean = try {
++        device.checkServerTrusted(chain, authType)
++        true
++    } catch (e: CertificateException) {
++        Timber.d("The device's trust store does not validate %s: %s", base.origin, e.message)
++        false
++    }
++
++    override fun checkClientTrusted(chain: Array<out X509Certificate>, authType: String) {
++        throw CertificateException("A tab-atelier host is a client, not the server being checked")
++    }
++
++    override fun getAcceptedIssuers(): Array<X509Certificate> = emptyArray()
++
++    /**
++     * Whether a session to [hostname] may be used, which OkHttp *enforces*.
++     *
++     * Follows the decision of the handshake it belongs to, because that is what
++     * was actually checked: the device's hostname verifier for a chain the device
++     * validated, and the pin for a server whose key is its only identity.
++     *
++     * The pin branch answers **true when nothing is pinned**, and that is
++     * load-bearing rather than lenient. It is the first-use case, and refusing it
++     * would refuse the very connection whose response records the pin — circular,
++     * and the bug this class exists to fix, reported as "hostname not verified"
++     * rather than as a certificate error. A pin's authority comes from being
++     * written after a response has come back over the key (see
++     * [TabAtelierClient.recordPin]), never from this check. It answers false when
++     * a pin is recorded and the chain does not reproduce it: the key changed.
++     *
++     * It is also deliberately not a *name* check in that branch: a daemon's
++     * self-signed certificate carries the names the daemon knows itself by, and
++     * the address a user typed is often not one of them (a LAN address,
++     * `127.0.0.1`). The key is the identity there, and it has just been required.
++     */
++    fun verifyHostname(hostname: String, session: SSLSession): Boolean = when (trust) {
++        Trust.DEVICE -> deviceHostnameVerifier.verify(hostname, session)
++        // null cannot happen — this runs after checkServerTrusted of the same
++        // handshake — and the pin check is the safe reading of it, since with
++        // nothing pinned it behaves exactly as first use does.
++        Trust.FIRST_USE, null -> matchesPin(peerCertificatesOf(session))
++    }
++
++    /**
++     * Whether [chain] reproduces the pin recorded for this server: true when
++     * nothing is pinned yet (see [verifyHostname]), false when it is pinned and
++     * [chain] does not reproduce it.
++     */
++    fun matchesPin(chain: List<Certificate>?): Boolean {
++        val expected = recordedPin() ?: return true
++        val leaf = chain?.firstOrNull() ?: return false
++        return pinOf(leaf) == expected
++    }
++
++    /** The peer chain of [session], or null if the session has not been verified. */
++    private fun peerCertificatesOf(session: SSLSession): List<Certificate>? = try {
++        session.peerCertificates.toList()
++    } catch (e: SSLPeerUnverifiedException) {
++        null
++    }
++
++    private fun recordedPin(): String? = pins.getString(pinKey(hostId, base.origin), null)
++}
++
++/** The preferences key one host's pin for one origin is recorded under. */
++private fun pinKey(hostId: Long, origin: String): String = "${pinPrefix(hostId)}$origin"
++
++/** Every pin key of one host, whatever address it was learned at. */
++private fun pinPrefix(hostId: Long): String = "pin_$hostId@"
++
++/**
++ * The OkHttp pin string for a certificate. Delegating to
++ * [CertificatePinner.pin] is deliberate: the value recorded is then exactly what
++ * [CertificatePinner] compares against, so a pin we recorded cannot fail to
++ * verify against itself.
++ */
++private fun pinOf(certificate: Certificate): String? =
++    (certificate as? X509Certificate)?.let { CertificatePinner.pin(it) }
++
++/**
++ * A user-facing explanation of a failed tab-atelier call. The token is never
++ * part of the message.
++ */
++fun tabAtelierErrorMessage(e: Throwable): String = when (e) {
++    // OkHttp reports both a refused pin and a refused name as this, and its own
++    // wording for the second names no host. So the message is ours, and says the
++    // one thing the user can act on without guessing which of the two it was.
++    is SSLPeerUnverifiedException ->
++        "This server's certificate was not accepted. If the server's certificate " +
++            "was replaced, clear the host's trust and try again."
++
++    else -> e.message ?: e.javaClass.simpleName
++}
+diff --git a/app/src/main/java/org/connectbot/tabatelier/TabAtelierTab.kt b/app/src/main/java/org/connectbot/tabatelier/TabAtelierTab.kt
+new file mode 100644
+index 00000000..3455d725
+--- /dev/null
++++ b/app/src/main/java/org/connectbot/tabatelier/TabAtelierTab.kt
+@@ -0,0 +1,96 @@
++/*
++ * ConnectBot: simple, powerful, open-source SSH client for Android
++ * Copyright 2025-2026 Kenny Root
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++// New file for Tab Atelier Remote, not part of upstream ConnectBot: one tab of
++// a tab-atelier daemon, and the parser for `GET {base}/tabs`. The protocol's
++// own constants live in org.connectbot.transport.TabAtelier. See
++// overlay/README.md.
++
++package org.connectbot.tabatelier
++
++import org.json.JSONArray
++import org.json.JSONObject
++
++/**
++ * One tab of a tab-atelier daemon, as reported by `GET {base}/tabs`.
++ *
++ * Every field is optional on the wire: the daemon is a separate program on
++ * another machine and may add, rename or drop fields. Each one is therefore
++ * read independently and a missing or unexpected value falls back to a default
++ * rather than failing the whole list.
++ */
++data class TabAtelierTab(
++    /** Daemon-assigned tab uuid; empty when the daemon did not send one. */
++    val id: String = "",
++    val name: String = "",
++    val badge: String? = null,
++    /** Last non-empty output line, already ANSI-stripped by the daemon. */
++    val preview: String? = null,
++    val active: Boolean = false,
++    val agentState: String? = null,
++    val agentKind: String? = null,
++    val locked: Boolean = false,
++    val viewers: Int = 0,
++    /** Unix milliseconds; 0 when unknown, which sorts last. */
++    val lastUsedAt: Long = 0L,
++)
++
++/**
++ * Parse a `GET {base}/tabs` response body.
++ *
++ * The result is sorted by [TabAtelierTab.lastUsedAt] descending: most recently
++ * used first. Presenting the daemon's own ordering is the point of the list,
++ * so the sort happens here rather than in the UI.
++ *
++ * @throws org.json.JSONException if the body is not a JSON object.
++ */
++fun parseTabAtelierTabs(body: String): List<TabAtelierTab> {
++    val root = JSONObject(body)
++    val tabs = root.optJSONArray("tabs") ?: JSONArray()
++    return (0 until tabs.length())
++        .mapNotNull { index -> tabs.optJSONObject(index)?.let(::toTab) }
++        .sortedByDescending { it.lastUsedAt }
++}
++
++private fun toTab(json: JSONObject): TabAtelierTab = TabAtelierTab(
++    id = json.optText("id") ?: "",
++    name = json.optText("name") ?: "",
++    badge = json.optText("badge"),
++    preview = json.optText("preview"),
++    active = json.optBoolean("active", false),
++    agentState = json.optText("agent_state"),
++    agentKind = json.optText("agent_kind"),
++    locked = json.optBoolean("locked", false),
++    viewers = json.optInt("viewers", 0),
++    lastUsedAt = json.optLong("last_used_at", 0L),
++)
++
++/**
++ * Read a string field, treating null/JSONObject.NULL/blank as absent. A number
++ * where a string was expected is stringified rather than dropped: the tab still
++ * shows up, just with a value we did not expect.
++ */
++private fun JSONObject.optText(name: String): String? {
++    if (!has(name) || isNull(name)) return null
++    val value = opt(name)
++    val text = when (value) {
++        is String -> value
++        is Number, is Boolean -> value.toString()
++        else -> null
++    }
++    return text?.takeIf { it.isNotEmpty() }
++}
+diff --git a/app/src/main/java/org/connectbot/transport/TabAtelier.kt b/app/src/main/java/org/connectbot/transport/TabAtelier.kt
+new file mode 100644
+index 00000000..7b244977
+--- /dev/null
++++ b/app/src/main/java/org/connectbot/transport/TabAtelier.kt
+@@ -0,0 +1,688 @@
++/*
++ * ConnectBot: simple, powerful, open-source SSH client for Android
++ * Copyright 2025-2026 Kenny Root
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++// New file for Tab Atelier Remote, not part of upstream ConnectBot: the
++// tab-atelier transport. The host list reads the daemon's tabs over HTTP in
++// TabAtelierClient; this opens one tab's terminal over the daemon's WebSocket.
++// The protocol is the daemon's own (see its assets/main.js for the reference
++// client), not SSH — one tag byte, then the payload.
++//
++// TLS is not configured here on purpose: the connection is made with the
++// OkHttpClient TabAtelierClient builds for the host, which is what carries the
++// certificate pin. Building a client here would quietly opt back into the system
++// CA store and bring back the self-signed failure this class exists to avoid.
++
++package org.connectbot.transport
++
++import android.content.Context
++import android.net.Uri
++import okhttp3.OkHttpClient
++import okhttp3.Request
++import okhttp3.Response
++import okhttp3.WebSocket
++import okhttp3.WebSocketListener
++import okio.ByteString
++import okio.ByteString.Companion.toByteString
++import org.connectbot.R
++import org.connectbot.data.entity.Host
++import org.connectbot.service.DisconnectReason
++import org.connectbot.tabatelier.TabAtelierBase
++import org.connectbot.tabatelier.TabAtelierClient
++import org.connectbot.util.SecurePasswordStorage
++import org.json.JSONException
++import org.json.JSONObject
++import timber.log.Timber
++import java.io.ByteArrayInputStream
++import java.io.IOException
++import java.util.concurrent.CountDownLatch
++import java.util.concurrent.LinkedBlockingQueue
++import java.util.concurrent.TimeUnit
++import java.util.zip.GZIPInputStream
++
++/**
++ * A tab-atelier daemon: it serves a list of terminal tabs over HTTP +
++ * WebSocket, and each tab is one terminal session on the workstation.
++ *
++ * The session is a WebSocket carrying the daemon's own framing — one tag byte,
++ * then the payload — rather than SSH. Which tab to open arrives out of band:
++ * `TerminalManager.setPendingTabKey` records it just before the connection
++ * starts, and [connect] takes it, because a WebSocket carries no way to ask for
++ * a tab and a `Host` row describes the daemon, not one of its tabs.
++ */
++class TabAtelier : AbsTransport() {
++
++    // Written by the listener's own thread (which adopts the socket in onOpen)
++    // and read by whoever is sending a keystroke, so it is volatile rather than
++    // merely late-initialised.
++    @Volatile
++    private var socket: WebSocket? = null
++
++    /** Bytes the daemon sent, waiting to be handed to the terminal emulator. */
++    private val inbound = LinkedBlockingQueue<ByteArray>()
++
++    @Volatile
++    private var open = false
++
++    /** Set once the daemon has gone away, so `read` can report it. */
++    @Volatile
++    private var closed = false
++
++    /** A failure worth surfacing instead of a clean end of stream. */
++    @Volatile
++    private var failure: IOException? = null
++
++    /** The tail of a frame too large for the caller's buffer. */
++    private var leftover: ByteArray? = null
++    private var leftoverOffset = 0
++
++    /**
++     * What a tab switch needs to open another socket on the same server, kept
++     * from [connect] because a switch happens long after it has returned.
++     */
++    private var client: TabAtelierClient? = null
++    private var base: TabAtelierBase? = null
++
++    /** The tab this session is on, so a switch to the same one can be a no-op. */
++    @Volatile
++    private var currentTabKey: String? = null
++
++    /**
++     * Identifies the socket that speaks for this session.
++     *
++     * A switch replaces the socket, and the socket being replaced still calls back
++     * — `onClosed` for the one closed, and possibly `onFailure` for one that was
++     * still handshaking. Neither is this session ending, so every listener carries
++     * the marker it was made with and ignores callbacks once a later socket has
++     * replaced it. Without this, moving a session to another tab would read as the
++     * session dying, which is the one thing a switch must not look like.
++     */
++    @Volatile
++    private var currentAttempt: Any? = null
++
++    override fun connect() {
++        val host = host
++        val service = manager
++        if (host == null || service == null) {
++            // No service means no context to render anything with, so this is a
++            // log line rather than a terminal message.
++            Timber.w("tab-atelier transport started without a host or a terminal manager")
++            return
++        }
++
++        val client = TabAtelierClient(service, SecurePasswordStorage(service))
++        val base = client.base(host.tabAtelierUrl?.takeIf { it.isNotBlank() })
++        if (base == null) {
++            bridge?.outputLine(service.getString(R.string.tabatelier_url_missing))
++            bridge?.dispatchDisconnect(DisconnectReason.REMOTE_EOF)
++            return
++        }
++        // Kept for switchTab, which has to reach the same server again long after
++        // this has returned.
++        this.client = client
++        this.base = base
++
++        // Which tab, and only just decided: taken rather than read, so a later
++        // session cannot inherit it from this one.
++        val tabKey = service.takePendingTabKey(host.id)
++        if (tabKey.isNullOrBlank()) {
++            bridge?.outputLine(service.getString(R.string.tabatelier_tab_not_chosen))
++            bridge?.dispatchDisconnect(DisconnectReason.REMOTE_EOF)
++            return
++        }
++
++        currentTabKey = tabKey
++        openSocket(tabKey)
++
++        bridge?.onConnected()
++    }
++
++    /**
++     * Opens a socket for [tabKey] and waits until the daemon has accepted it.
++     *
++     * Shared by [connect] and [switchTab], so a moved session is set up exactly
++     * like a fresh one: same route, same auth, same first frames. It says nothing
++     * to the bridge and never touches [closed] — a switch is not a new session, and
++     * reporting the old socket's end would stop the read loop that has to survive
++     * the move.
++     *
++     * Waiting for the daemon is not merely tidy. `bridge.onConnected()` is what
++     * creates the Relay, which is what reads this transport; starting it on a
++     * socket that is not open yet leaves the terminal on "connecting via
++     * tabatelier…" forever, which is the failure this replaced. Blocking is
++     * therefore expected here, and safe: this runs on the io dispatcher
++     * (TerminalBridge.startConnection), never on the UI thread.
++     */
++    private fun openSocket(tabKey: String) {
++        val host = host ?: throw IOException("No host to open a tab-atelier session for")
++        val client = client ?: throw IOException("No connection to open a tab-atelier session on")
++        val base = base ?: throw IOException("No address to reach ${host.nickname} at")
++
++        // The token rides in the query string, not an Authorization header: the
++        // daemon refuses the header alone on a WS upgrade. See
++        // TabAtelierBase.webSocketUrl for the why.
++        val url = base.webSocketUrl("/tabs/by-id/$tabKey/ws", client.token(host.id))
++        val request = Request.Builder().url(url).build()
++
++        // Marks this socket as the one that speaks for the session, so the socket
++        // it replaces — closed, but still calling back — cannot be mistaken for it.
++        // Set before the socket exists, so a listener that runs before
++        // newWebSocket returns still finds itself current. See [currentAttempt].
++        val attempt = Any()
++        currentAttempt = attempt
++        open = false
++
++        val opened = CountDownLatch(1)
++        Timber.d("Opening tab-atelier session for host %d at %s", host.id, base.origin)
++        val webSocket = client.clientFor(host.id, base).newWebSocket(request, Listener(opened, attempt))
++        socket = webSocket
++
++        if (!opened.await(CONNECT_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
++            webSocket.cancel()
++            if (socket === webSocket) socket = null
++            throw IOException("Timed out connecting to $url")
++        }
++        // A socket that failed or closed before opening is a failed connection, not
++        // a session that ends immediately: the bridge has to hear about it as such,
++        // so the user gets the reason instead of an empty terminal.
++        failure?.let { throw it }
++        if (!open) {
++            throw IOException("The tab-atelier session at $url closed before it opened")
++        }
++    }
++
++    /**
++     * Moves this session to another tab of the same server.
++     *
++     * Added for Tab Atelier Remote (Apache-2.0 section 4(b)). The app is a viewer
++     * and a tab never dies on the daemon, so another tab of a server the user is
++     * already on is a *move* rather than a second session: ConnectBot keys a
++     * session by host — which is what the running notification, the host list's
++     * connected indicator and the session maps all assume — and a server with
++     * several tabs is the case that assumption did not have.
++     *
++     * **It must not end the session, and that is the whole difficulty.** Relay
++     * reads [read], and `-1` ends its read loop, so a switch done by closing this
++     * transport and building a new one would kill the session it is moving. So
++     * nothing here touches [closed], the socket being replaced is detached from
++     * [currentAttempt] before it is closed so its callbacks cannot read as the
++     * session ending, and between the two sockets [read] reports "nothing right
++     * now" — which is what a socket with no bytes yet reports anyway.
++     *
++     * The screen needs no clearing. The daemon's replay opens with a form feed, so
++     * the new tab's first bytes clear before they repaint, which is what the
++     * daemon's own browser client relies on for exactly this. What is dropped is
++     * the *queue*: frames of the tab being left are not the tab being opened, and
++     * the full replay that follows would otherwise be drawn underneath them.
++     *
++     * @return true when this session took the move — it moved, or it failed and is
++     *   now reporting that failure itself. False when there was nothing to move
++     *   (no connection yet, or the same tab again), so the caller should open a
++     *   session instead.
++     */
++    fun switchTab(tabKey: String): Boolean {
++        if (tabKey.isBlank() || tabKey == currentTabKey) return false
++        if (client == null || base == null) return false
++
++        val previous = socket
++        currentAttempt = null
++        socket = null
++        previous?.close(CLOSE_NORMAL, null)
++
++        inbound.clear()
++        leftover = null
++        leftoverOffset = 0
++        // The old socket's failure, if it had one, is not this socket's.
++        failure = null
++
++        return try {
++            openSocket(tabKey)
++            currentTabKey = tabKey
++            Timber.d("Moved the tab-atelier session to tab %s", tabKey)
++            true
++        } catch (e: IOException) {
++            // The move failed and the session has no socket left. Reported the way a
++            // lost connection is reported, rather than leaving a terminal that looks
++            // alive and never updates again.
++            Timber.w(e, "Could not move the tab-atelier session to tab %s", tabKey)
++            failure = e
++            closed = true
++            inbound.offer(END_OF_STREAM)
++            true
++        }
++    }
++
++    private inner class Listener(
++        private val opened: CountDownLatch,
++        private val attempt: Any,
++    ) : WebSocketListener() {
++
++        /**
++         * Whether this listener's socket is still the one speaking for the
++         * session.
++         *
++         * A socket that [switchTab] replaced must not be able to end the session
++         * it was replaced in, so every callback checks this first. See
++         * [currentAttempt].
++         */
++        private fun isCurrent(): Boolean = currentAttempt === attempt
++
++        override fun onOpen(webSocket: WebSocket, response: Response) {
++            if (!isCurrent()) return
++            // Adopted here as well as by openSocket, because this can run before
++            // newWebSocket returns and the first frames below must not be
++            // dropped for want of a socket to send them on.
++            socket = webSocket
++            open = true
++            // The daemon stamps the tab's last_used_at on this frame, which is
++            // what puts the tab the user just opened at the top of the list — and
++            // what moves it there when an open session is switched to it.
++            webSocket.send(byteArrayOf(TAG_FOCUS).toByteString())
++            opened.countDown()
++        }
++
++        override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
++            if (!isCurrent()) return
++            when (val frame = decodeFrame(bytes.toByteArray())) {
++                is Frame.Output -> if (frame.bytes.size > 0) inbound.offer(frame.bytes.toByteArray())
++                is Frame.Meta -> {
++                    // The name the console's title shows, and the grid its
++                    // terminal has to mirror.
++                    frame.name?.let { bridge?.setRemoteTabName(it) }
++                    frame.grid?.let { bridge?.setRemoteGridSize(it.rows, it.cols) }
++                    // Applied on every meta frame, including a null: a tab whose
++                    // viewer has no background of its own must not keep the colour
++                    // of the tab the session was on before it.
++                    bridge?.setRemoteBackgroundColor(frame.bgColor)
++                }
++                Frame.Ignored -> Unit
++            }
++        }
++
++        // The daemon sends no text frames; a session that does is not one we
++        // understand, and the comment is here so the unused parameter is not
++        // mistaken for an oversight.
++        override fun onMessage(webSocket: WebSocket, text: String) = Unit
++
++        override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
++            if (!isCurrent()) {
++                Timber.d("Ignoring the close of a tab-atelier socket this session replaced")
++                return
++            }
++            Timber.d("tab-atelier session closed: %d %s", code, reason)
++            closed = true
++            inbound.offer(END_OF_STREAM)
++            opened.countDown()
++        }
++
++        override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
++            if (!isCurrent()) {
++                Timber.d(t, "Ignoring the failure of a tab-atelier socket this session replaced")
++                return
++            }
++            Timber.w(t, "tab-atelier session failed")
++            failure = IOException(t.message ?: "tab-atelier connection failed", t)
++            closed = true
++            inbound.offer(END_OF_STREAM)
++            opened.countDown()
++        }
++    }
++
++    /**
++     * Blocks until the daemon sends something, the session ends, or the poll
++     * window expires.
++     *
++     * Blocking is the contract here — `TerminalBridge` reads on a thread of its
++     * own, and Telnet's implementation blocks the same way. The poll is what
++     * keeps a disconnect responsive without busy-waiting: a closed socket is
++     * noticed within the window rather than only when bytes happen to arrive.
++     */
++    @Throws(IOException::class)
++    override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
++        if (length <= 0) return 0
++
++        while (true) {
++            val rest = leftover
++            if (rest != null) {
++                val n = minOf(length, rest.size - leftoverOffset)
++                System.arraycopy(rest, leftoverOffset, buffer, offset, n)
++                leftoverOffset += n
++                if (leftoverOffset >= rest.size) {
++                    leftover = null
++                    leftoverOffset = 0
++                }
++                return n
++            }
++
++            val frame = try {
++                inbound.poll(READ_POLL_MILLIS, TimeUnit.MILLISECONDS)
++            } catch (e: InterruptedException) {
++                Thread.currentThread().interrupt()
++                throw IOException("interrupted while reading from the tab-atelier session", e)
++            }
++
++            if (frame == null) {
++                failure?.let { throw it }
++                // -1 is what ends the relay's read loop, so it is reserved for
++                // the session being over and nothing else. A connection that has
++                // merely not finished opening yet is "nothing right now" — the
++                // same as a socket read timeout — and reporting EOF there would
++                // kill the session before the daemon has said anything.
++                if (closed) return -1
++                return 0
++            }
++            if (frame.isEmpty()) {
++                failure?.let { throw it }
++                return -1
++            }
++            leftover = frame
++            leftoverOffset = 0
++        }
++    }
++
++    // Keystrokes go out as they are typed. The daemon writes each frame straight
++    // to the PTY, so batching would buy nothing but latency, and one frame per
++    // keypress is what the reference client does too.
++    @Throws(IOException::class)
++    override fun write(buffer: ByteArray) {
++        send(TAG_INPUT, buffer)
++    }
++
++    @Throws(IOException::class)
++    override fun write(c: Int) {
++        send(TAG_INPUT, byteArrayOf(c.toByte()))
++    }
++
++    // The WebSocket's send queue is already asynchronous; there is nothing
++    // buffered here to push.
++    @Throws(IOException::class)
++    override fun flush() = Unit
++
++    override fun close() {
++        open = false
++        closed = true
++        socket?.close(CLOSE_NORMAL, null)
++        socket = null
++        // A read parked on the queue learns the session ended instead of waiting
++        // out its poll window.
++        inbound.offer(END_OF_STREAM)
++    }
++
++    /**
++     * Deliberately does nothing.
++     *
++     * The obvious implementation — tell the daemon what size we are rendering at —
++     * is wrong twice over, so it is not done at all rather than sent and hoped
++     * for. Resizing a tab is a documented no-op in the daemon's v1: a tab is a real
++     * workstation terminal and the desktop wins, because a phone viewer must not
++     * reflow a shared PTY out from under an agent's TUI or another viewer. And the
++     * daemon's own browser client, which is this protocol's reference, does not
++     * send this frame either — it mirrors the server's grid instead.
++     *
++     * So this client mirrors it too: the meta frame's cols/rows become the
++     * terminal's forced size (see [TerminalBridge.setRemoteGridSize]), and the
++     * terminal fits its font to that grid. Sending a resize would invite a future
++     * daemon to believe the size it was told, which is the opposite of what a
++     * mirror wants.
++     */
++    override fun setDimensions(columns: Int, rows: Int, width: Int, height: Int) = Unit
++
++    /**
++     * What one server frame means to this client.
++     *
++     * Only output and the meta frame are understood; everything else, including
++     * the daemon's quick preview paint, is dropped rather than guessed at.
++     */
++    internal sealed interface Frame {
++        /**
++         * Terminal output to hand to the emulator.
++         *
++         * Holds a [ByteString] rather than a `ByteArray` so that this class's own
++         * equality means what it looks like it means: `ByteArray` compares by
++         * reference, so a `data class` wrapping one is two unequal values for the
++         * same bytes — a trap for anything that compares two frames, tests
++         * included.
++         */
++        data class Output(val bytes: ByteString) : Frame
++
++        /**
++         * The tab metadata this client uses: what the tab is called, the grid its
++         * terminal is using, and the background its viewer paints.
++         *
++         * One frame carries all three, so one type does — see [decodeFrame]. Every
++         * field is nullable when the daemon did not send it in a form this client
++         * understands, which is not an error: they are useful independently.
++         */
++        data class Meta(val name: String?, val grid: Grid?, val bgColor: String?) : Frame {
++            /** The grid size the daemon's terminal is using, in rows×cols. */
++            data class Grid(val rows: Int, val cols: Int)
++        }
++
++        /** Nothing this client renders. */
++        data object Ignored : Frame
++    }
++
++    /**
++     * Decodes one frame: a tag byte, then its payload.
++     *
++     * Nothing here throws. A frame this client cannot read is dropped, because a
++     * newer daemon must not be able to break an older client by sending something
++     * it has not learned yet — the alternative is a session that dies on a frame it
++     * did not need.
++     */
++    internal fun decodeFrame(frame: ByteArray): Frame {
++        if (frame.isEmpty()) return Frame.Ignored
++        return when (frame[0]) {
++            TAG_OUTPUT -> Frame.Output(frame.copyOfRange(1, frame.size).toByteString())
++            TAG_OUTPUT_GZIP -> Frame.Output(gunzip(frame, 1).toByteString())
++            // The tab's own metadata, which is where both the name the console
++            // shows and the grid it has to mirror come from.
++            TAG_META -> parseMeta(frame)
++            // The quick preview paint, tag 0x0c, is deliberately not rendered. It
++            // is terminal output by shape but not a stream: a hint to paint the
++            // last screen without waiting out a large catch-up. Feeding it to the
++            // emulator concatenates it with the real replay that follows, so the
++            // session draws the same screen twice.
++            else -> Frame.Ignored
++        }
++    }
++
++    /**
++     * The parts of a meta frame this client uses, or [Frame.Ignored] when it
++     * carries none of them.
++     *
++     * Both fields are read defensively. The frame is the daemon's, its shape is
++     * not this client's to require, and a field that is absent, null or the wrong
++     * type must leave the session working with a default rather than fail it — the
++     * metadata is a convenience, the terminal is the point.
++     */
++    private fun parseMeta(frame: ByteArray): Frame {
++        val meta = try {
++            JSONObject(String(frame, 1, frame.size - 1, Charsets.UTF_8))
++        } catch (e: JSONException) {
++            Timber.d(e, "tab-atelier meta frame was not JSON this client understands")
++            return Frame.Ignored
++        }
++
++        // Absent keys, and the JSON null the daemon uses for "unknown", both
++        // arrive as an absent optInt default of 0 — which is not a size.
++        val rows = meta.optInt("rows", 0)
++        val cols = meta.optInt("cols", 0)
++        val grid = if (rows > 0 && cols > 0) Frame.Meta.Grid(rows, cols) else null
++
++        // `isNull` and `has` before `optString`, because `optString` does the
++        // wrong thing here in a way that would have shipped: for a JSON null it
++        // returns the *string* "null", not the fallback, so the daemon's own
++        // "unknown" sentinel would become a tab named "null" and the console
++        // would read "server - null". Absent and null are therefore both "no
++        // name", and only a real non-blank string is one.
++        val rawName = if (meta.has("name") && !meta.isNull("name")) meta.optString("name", "") else null
++        val name = rawName?.takeIf { it.isNotBlank() }
++
++        // The tab's own background, which the daemon uses to tell one tab's viewer
++        // from another's. Validated as a #rrggbb literal before it is used, exactly
++        // as the daemon's own browser client validates it — the value ends up as a
++        // colour, and one this client cannot parse must leave the tab's usual
++        // background alone rather than fail the session over a cosmetic field.
++        // Same null-vs-absent trap as the name, hence the same guards.
++        val rawBgColor = if (meta.has(BG_COLOR_KEY) && !meta.isNull(BG_COLOR_KEY)) {
++            meta.optString(BG_COLOR_KEY, "")
++        } else {
++            null
++        }
++        val bgColor = rawBgColor?.takeIf { HEX_COLOR.matches(it) }
++
++        return if (name == null && grid == null && bgColor == null) {
++            Frame.Ignored
++        } else {
++            Frame.Meta(name, grid, bgColor)
++        }
++    }
++
++    private fun send(tag: Byte, payload: ByteArray) {
++        val socket = socket ?: return
++        val frame = ByteArray(payload.size + 1)
++        frame[0] = tag
++        System.arraycopy(payload, 0, frame, 1, payload.size)
++        // A full queue fails rather than blocking the caller, which is the right
++        // way round for a terminal: dropping a keystroke beats stalling the UI
++        // thread. It should not happen at typing rates.
++        if (!socket.send(frame.toByteString())) {
++            Timber.w("tab-atelier send queue rejected a %d byte frame", frame.size)
++        }
++    }
++
++    private fun gunzip(frame: ByteArray, from: Int): ByteArray = try {
++        GZIPInputStream(ByteArrayInputStream(frame, from, frame.size - from)).use { it.readBytes() }
++    } catch (e: IOException) {
++        Timber.w(e, "Ignoring a tab-atelier frame that would not decompress")
++        ByteArray(0)
++    }
++
++    override fun isConnected(): Boolean = socket != null && open && !closed
++
++    override fun isSessionOpen(): Boolean = open && !closed
++
++    override fun getDefaultPort(): Int = DEFAULT_PORT
++
++    override fun getDefaultNickname(username: String?, hostname: String?, port: Int): String = getUri(hostname).toString()
++
++    override fun getSelectionArgs(uri: Uri, selection: MutableMap<String, String>) {
++        selection["protocol"] = PROTOCOL
++        selection["hostname"] = uri.host ?: ""
++        selection["port"] = uri.port.toString()
++    }
++
++    override fun createHost(uri: Uri): Host {
++        val hostname = uri.host ?: ""
++        val port = if (uri.port > 0) uri.port else DEFAULT_PORT
++        val nickname = uri.fragment?.takeIf { it.isNotEmpty() } ?: getDefaultNickname(null, hostname, uri.port)
++        return Host(
++            nickname = nickname,
++            protocol = PROTOCOL,
++            username = "",
++            hostname = hostname,
++            port = port,
++            // A `tabatelier://` link carries no scheme of its own, so the host
++            // starts on the daemon's usual https address: the URL is the field
++            // the editor shows and the row displays, and a host created from a
++            // link should not look empty until it is edited. hostname and port
++            // stay filled for the shortcut intent and the editor's re-entry.
++            tabAtelierUrl = hostname.takeIf { it.isNotEmpty() }?.let { "https://$it:$port" },
++        )
++    }
++
++    override fun usesNetwork(): Boolean = true
++
++    override fun getLocalIpAddress(): String? = null
++
++    companion object {
++        const val PROTOCOL = "tabatelier"
++        const val DEFAULT_PORT = 443
++
++        /**
++         * Frame tags, from the daemon's `src/api_ws.rs`. One tag byte, then the
++         * payload.
++         *
++         * Two the daemon defines are deliberately absent, because this client does
++         * not speak them: `0x04` resize, which the daemon ignores anyway and which
++         * a mirror must not send (see [setDimensions]), and `0x0c` preview, whose
++         * payload would be drawn twice if it were fed to the emulator as output
++         * (see [decodeFrame]).
++         */
++        private const val TAG_INPUT: Byte = 0x01
++        private const val TAG_OUTPUT: Byte = 0x02
++        private const val TAG_META: Byte = 0x03
++        private const val TAG_OUTPUT_GZIP: Byte = 0x0A
++        private const val TAG_FOCUS: Byte = 0x0B
++
++        private const val CLOSE_NORMAL = 1000
++
++        /**
++         * The meta frame's key for a tab's own background colour.
++         *
++         * A wire name, so it is spelled here rather than derived: the daemon's
++         * `tab_meta_json` writes `bg_color` and its viewer reads the same.
++         */
++        private const val BG_COLOR_KEY = "bg_color"
++
++        /**
++         * What a usable background colour looks like: `#rrggbb`, exactly as the
++         * daemon's own browser client requires before it will apply one.
++         *
++         * A malformed value is dropped rather than passed on, so that the app can
++         * never be the thing that renders a tab in an unreadable colour because a
++         * field was in a shape it did not expect.
++         */
++        private val HEX_COLOR = Regex("^#[0-9a-fA-F]{6}$")
++
++        /**
++         * How long [connect] waits for the daemon to accept the WebSocket before
++         * giving up.
++         *
++         * Comfortably longer than the client's own connect timeout, because what
++         * is being waited for is not just the TCP connection: the daemon
++         * authenticates the request and attaches to the tab's PTY as well, and a
++         * tab that is busy spawning should still open.
++         */
++        private const val CONNECT_TIMEOUT_SECONDS = 15L
++
++        /** How long a read waits before reporting "nothing yet" to the caller. */
++        private const val READ_POLL_MILLIS = 250L
++
++        /** Queued to wake a parked read when the session ends. */
++        private val END_OF_STREAM = ByteArray(0)
++
++        @JvmStatic
++        fun getProtocolName(): String = PROTOCOL
++
++        @JvmStatic
++        fun getUri(input: String?): Uri {
++            val authority = input.orEmpty()
++            return Uri.Builder()
++                .scheme(PROTOCOL)
++                .authority(authority)
++                .build()
++        }
++
++        @JvmStatic
++        fun getFormatHint(context: Context): String = String.format(
++            "%s:%s",
++            context.getString(R.string.format_hostname),
++            context.getString(R.string.format_port),
++        )
++    }
++}
+diff --git a/app/src/main/res/values/strings_tabatelier.xml b/app/src/main/res/values/strings_tabatelier.xml
+new file mode 100644
+index 00000000..58a24c80
+--- /dev/null
++++ b/app/src/main/res/values/strings_tabatelier.xml
+@@ -0,0 +1,70 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!--
++	Strings this fork adds, kept in their own file rather than appended to
++	upstream's values/strings.xml.
++
++	Adding to overlay/files/ means it is copied in verbatim: this file is never
++	part of a patch, so adding a string is a line here and nothing to rebase when
++	upstream edits its own strings. Android's resource merger combines every file
++	under res/values/, so a resource does not care which file declares it.
++
++	What CANNOT live here is replacing an upstream string. Two files in the same
++	source set declaring the same name is a duplicate-resource error, not an
++	override, so the few upstream strings we rewrite (app_name, app_desc,
++	app_copyright and the help links) stay in patches/0002 beside their originals.
++
++	The `tabatelier_` and `hostpref_token*` prefixes exist to keep this file
++	conflict-free: a name upstream later adds would otherwise collide and break
++	the build.
++-->
++<resources>
++	<!-- Host editor: a tab-atelier server is one URL — scheme, host, port and
++	     any path prefix the daemon is mounted under — so it is entered as one,
++	     rather than as a hostname and a port that cannot express either. -->
++	<string name="tabatelier_url_title">Server URL</string>
++	<string name="tabatelier_url_hint">https://host:8443</string>
++	<string name="tabatelier_url_summary">The daemon\'s address, including http:// or https:// and any path prefix.</string>
++	<string name="tabatelier_url_error">Enter a URL beginning with http:// or https://, for example https://host:8443</string>
++	<!-- Shown under a server whose stored URL cannot be used, e.g. one from a
++	     backup written by an older version of this app. -->
++	<string name="tabatelier_url_invalid">This server\'s address is not a valid URL. Edit it and enter one, for example https://host:8443</string>
++
++	<!-- Host editor: the tab-atelier server's API token. -->
++	<string name="hostpref_token_title">API token</string>
++	<string name="hostpref_token_unchanged">API token (unchanged)</string>
++	<string name="hostpref_token_summary">Bearer token sent to the tab-atelier daemon.</string>
++	<string name="hostpref_clear_token">Clear saved token</string>
++
++	<!-- Host list: one tab-atelier server's tabs, below its row. -->
++	<string name="tabatelier_refresh_tabs">Refresh tabs</string>
++	<string name="tabatelier_tabs_loading">Loading tabs…</string>
++	<string name="tabatelier_tabs_empty">No tabs</string>
++	<string name="tabatelier_tabs_error">Could not reach this server: %1$s</string>
++	<string name="tabatelier_tab_active">active</string>
++	<string name="tabatelier_tab_locked">Locked</string>
++
++	<!-- Shown when a tab is tapped before the terminal stage exists, so the tap
++	     explains itself instead of looking like a failure. -->
++	<string name="tabatelier_transport_not_yet">tab-atelier terminals arrive in a later stage.</string>
++
++	<!-- Opening a tab's session. Each of these is a session that could not start
++	     for a reason the user can act on, so they say what to do rather than
++	     only what went wrong. -->
++	<string name="tabatelier_url_missing">This server has no address yet. Open it in the host editor and enter its URL, for example https://host:8443</string>
++	<string name="tabatelier_tab_not_chosen">No tab was chosen for this session. Open one from the host list.</string>
++
++	<!-- The console title while a tab is open: the server's name, then the
++	     tab's. A session is "which server" and "which of its tabs", and the tab
++	     is the part that changes between them — two tabs of one server would
++	     otherwise title themselves identically. Positional arguments, so a
++	     translation can order them as its own language needs. -->
++	<string name="tabatelier_console_title_with_tab">%1$s - %2$s</string>
++
++	<!-- The terminal's special-keys bar, reworked for Tab Atelier Remote into a
++	     two-row layout with a function-key page. Only the strings the app did not
++	     already have are here; the rest of the bar's labels are upstream's. -->
++	<string name="button_key_fn">FN</string>
++	<string name="image_description_function_keys">Show function keys</string>
++	<string name="image_description_back_to_keys">Back to the keys</string>
++	<string name="image_description_paste">Paste the clipboard into the terminal</string>
++</resources>
+diff --git a/app/src/test/kotlin/org/connectbot/service/TerminalManagerTabSwitchTest.kt b/app/src/test/kotlin/org/connectbot/service/TerminalManagerTabSwitchTest.kt
+new file mode 100644
+index 00000000..0863ddb5
+--- /dev/null
++++ b/app/src/test/kotlin/org/connectbot/service/TerminalManagerTabSwitchTest.kt
+@@ -0,0 +1,118 @@
++/*
++ * ConnectBot: simple, powerful, open-source SSH client for Android
++ * Copyright 2026 Kenny Root
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++/**
++ * New file for Tab Atelier Remote (Apache-2.0 section 4(b)), ours — upstream has
++ * no tab-atelier server type, so there is nothing to preserve here.
++ *
++ * A tab-atelier server has many tabs, which is the case ConnectBot's session
++ * model did not have: a session is keyed by host, so a second tab of a server
++ * that already has a session used to be refused outright and the user kept seeing
++ * the first tab. The manager now moves the existing session to the tab that was
++ * tapped.
++ *
++ * Both tests stub `getConnectedBridge` to report a session that is already
++ * connected. That is what makes them meaningful: with one connected, falling
++ * through to `openConnection` would throw "Connection already open for that
++ * nickname", so a returned session can only have come from the move.
++ */
++package org.connectbot.service
++
++import kotlinx.coroutines.ExperimentalCoroutinesApi
++import kotlinx.coroutines.test.StandardTestDispatcher
++import kotlinx.coroutines.test.runTest
++import org.connectbot.data.HostRepository
++import org.connectbot.data.entity.Host
++import org.connectbot.di.CoroutineDispatchers
++import org.junit.Assert.assertSame
++import org.junit.Before
++import org.junit.Test
++import org.junit.runner.RunWith
++import org.mockito.Mockito.doReturn
++import org.mockito.Mockito.mock
++import org.mockito.Mockito.spy
++import org.mockito.Mockito.verify
++import org.mockito.Mockito.`when`
++import org.robolectric.RobolectricTestRunner
++
++@OptIn(ExperimentalCoroutinesApi::class)
++@RunWith(RobolectricTestRunner::class)
++class TerminalManagerTabSwitchTest {
++    private val dispatcher = StandardTestDispatcher()
++    private val host = Host(id = 7L, nickname = "workstation")
++
++    private lateinit var manager: TerminalManager
++    private lateinit var repository: HostRepository
++    private lateinit var bridge: TerminalBridge
++
++    @Before
++    fun setUp() {
++        manager = spy(TerminalManager())
++        manager.dispatchers = CoroutineDispatchers(default = dispatcher, io = dispatcher, main = dispatcher)
++        repository = mock(HostRepository::class.java)
++        manager.hostRepository = repository
++        bridge = mock(TerminalBridge::class.java)
++        `when`(bridge.host).thenReturn(host)
++    }
++
++    @Test
++    fun anotherTabOfAConnectedServerMovesThatSession() = runTest(dispatcher) {
++        `when`(repository.findHostById(host.id)).thenReturn(host)
++        doReturn(bridge).`when`(manager).getConnectedBridge(host)
++        doReturn(true).`when`(bridge).switchTab("tab-b")
++
++        val result = manager.openConnectionForHostId(host.id, "tab-b")
++
++        assertSame("the session on this server must be moved to the tab, not duplicated", bridge, result)
++        verify(bridge).switchTab("tab-b")
++    }
++
++    /**
++     * Tapping the tab a session is already on is a no-op, and must not become an
++     * error. This is the case that falling through would break: `openConnection`
++     * refuses a host that already has a session, so the user tapping the tab they
++     * are already looking at would have been shown "Connection already open for
++     * that nickname".
++     */
++    @Test
++    fun tappingTheTabAlreadyOpenKeepsTheSession() = runTest(dispatcher) {
++        `when`(repository.findHostById(host.id)).thenReturn(host)
++        doReturn(bridge).`when`(manager).getConnectedBridge(host)
++        // A move to the tab the session is already on takes nothing.
++        doReturn(false).`when`(bridge).switchTab("tab-a")
++
++        val result = manager.openConnectionForHostId(host.id, "tab-a")
++
++        assertSame(bridge, result)
++        verify(bridge).switchTab("tab-a")
++    }
++
++    /**
++     * A move that failed still hands back the session, because the session has
++     * reported the failure itself — it has no socket left and says so, the same as
++     * any other lost connection. Returning null, or opening a second session, would
++     * either hide the failure or duplicate it.
++     */
++    @Test
++    fun aFailedMoveStillHandsBackTheSession() = runTest(dispatcher) {
++        `when`(repository.findHostById(host.id)).thenReturn(host)
++        doReturn(bridge).`when`(manager).getConnectedBridge(host)
++        doReturn(false).`when`(bridge).switchTab("tab-c")
++
++        assertSame(bridge, manager.openConnectionForHostId(host.id, "tab-c"))
++    }
++}
+diff --git a/app/src/test/kotlin/org/connectbot/tabatelier/TabAtelierClientTest.kt b/app/src/test/kotlin/org/connectbot/tabatelier/TabAtelierClientTest.kt
+new file mode 100644
+index 00000000..11083eb2
+--- /dev/null
++++ b/app/src/test/kotlin/org/connectbot/tabatelier/TabAtelierClientTest.kt
+@@ -0,0 +1,695 @@
++/**
++ * Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): new file, ours —
++ * upstream has no tab-atelier server type, so there is nothing to preserve here.
++ *
++ * Three kinds of test in one class.
++ *
++ * The URL, JSON and header tests start an HTTP server on loopback themselves, so
++ * they run everywhere, CI included, and they pin the things the user reported
++ * broken: a server addressed by URL (scheme, port and path prefix), plain http
++ * being possible at all, the list ordered most-recently-used first, and the
++ * User-Agent identifying us the way the retired client did.
++ *
++ * The trust tests ask the trust manager itself which certificate it may use and
++ * on what evidence — the decision that matters, and the one a live server cannot
++ * exercise both halves of, since a fixture cannot be a public CA. See
++ * `theDeviceDecidesWhatIsPinned` below.
++ *
++ * The TLS test is end to end over a socket and needs a real daemon, so it skips
++ * unless `TABATELIER_TEST_URL` (and optionally `TABATELIER_TEST_TOKEN`) is set. A
++ * test that only passes on one machine is worse than no test, so CI skips it; run
++ * it with:
++ *
++ *     TABATELIER_TEST_URL=https://192.168.1.15:7891 \
++ *     TABATELIER_TEST_TOKEN=$(cat ~/.local/state/tab-atelier/api.token) \
++ *     ./gradlew :app:testOssDebugUnitTest --tests '*TabAtelierClientTest*'
++ *
++ * A daemon whose certificate the device itself validates — a Cloudflare Origin
++ * certificate with its CA installed — is *not pinned* on purpose, so that test
++ * asserts whichever of the two cases the server it was pointed at is in.
++ */
++package org.connectbot.tabatelier
++
++import android.content.Context
++import android.util.Base64
++import androidx.test.core.app.ApplicationProvider
++import com.sun.net.httpserver.HttpServer
++import okhttp3.CertificatePinner
++import okhttp3.OkHttpClient
++import okhttp3.Request
++import okhttp3.Response
++import okhttp3.WebSocket
++import okhttp3.WebSocketListener
++import okio.ByteString
++import okio.ByteString.Companion.toByteString
++import org.connectbot.BuildConfig
++import org.connectbot.util.SecurePasswordStorage
++import org.json.JSONObject
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertNotNull
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertSame
++import org.junit.Assert.assertTrue
++import org.junit.Assume.assumeTrue
++import org.junit.Test
++import org.junit.runner.RunWith
++import org.robolectric.RobolectricTestRunner
++import java.io.ByteArrayInputStream
++import java.net.InetSocketAddress
++import java.security.cert.CertificateException
++import java.security.cert.CertificateFactory
++import java.security.cert.X509Certificate
++import java.util.concurrent.CountDownLatch
++import java.util.concurrent.LinkedBlockingQueue
++import java.util.concurrent.TimeUnit
++import java.util.concurrent.atomic.AtomicReference
++import javax.net.ssl.HostnameVerifier
++import javax.net.ssl.X509TrustManager
++
++@RunWith(RobolectricTestRunner::class)
++class TabAtelierClientTest {
++
++    private val context: Context
++        get() = ApplicationProvider.getApplicationContext()
++
++    private fun client() = TabAtelierClient(context, SecurePasswordStorage(context))
++
++    // ---------------- the URL the editor stores ----------------
++
++    @Test
++    fun baseFillsInThePortFromTheScheme() {
++        val c = client()
++        assertEquals(443, c.base("https://host.example")!!.port)
++        assertEquals(80, c.base("http://host.example")!!.port)
++        assertEquals(8443, c.base("https://host.example:8443")!!.port)
++    }
++
++    @Test
++    fun baseKeepsAPathPrefixAndJoinsItWithOneSlash() {
++        val c = client()
++        assertEquals("https://host.example/tabs", c.base("https://host.example")!!.tabsUrl)
++        assertEquals("https://host.example/prefix/tabs", c.base("https://host.example/prefix")!!.tabsUrl)
++        assertEquals(
++            "a stored trailing slash must not double",
++            "https://host.example/prefix/tabs",
++            c.base("https://host.example/prefix/")!!.tabsUrl,
++        )
++    }
++
++    @Test
++    fun baseRejectsWhatIsNotAServerUrl() {
++        val c = client()
++        val rejected = listOf(
++            null, "", "   ",
++            "host.example", "host.example:7890", "ftp://host.example",
++            "https://", "https://host.example:0", "https://host.example:99999",
++        )
++        for (bad in rejected) {
++            assertNull("should be rejected: $bad", c.base(bad))
++        }
++    }
++
++    @Test
++    fun httpIsNotSilentlyUpgradedToHttps() {
++        val c = client()
++        assertTrue(c.base("https://host.example")!!.secure)
++        assertFalse("a LAN daemon over http must stay http", c.base("http://host.example:7890")!!.secure)
++    }
++
++    @Test
++    fun webSocketUrlFollowsTheSameBaseAsHttp() {
++        val c = client()
++        assertEquals("wss://host.example/x", c.base("https://host.example")!!.webSocketUrl("/x", null))
++        assertEquals("ws://host.example:7890/x", c.base("http://host.example:7890")!!.webSocketUrl("/x", null))
++        assertEquals("wss://host.example/prefix/x", c.base("https://host.example/prefix")!!.webSocketUrl("/x", null))
++    }
++
++    /**
++     * The token has to ride in the query string, because the daemon refuses a WS
++     * upgrade that carries only an `Authorization` header — verified against a
++     * live daemon, which answers 401 for the header and 101 for `?token=`. This
++     * pins the form, since a session that 401s only at the moment a user taps a
++     * tab is a failure that unit tests of everything else would not catch.
++     */
++    @Test
++    fun webSocketUrlCarriesTheTokenInTheQuery() {
++        val c = client()
++        assertEquals(
++            "wss://host.example/tabs/by-id/abc/ws?token=s3cret",
++            c.base("https://host.example")!!.webSocketUrl("/tabs/by-id/abc/ws", "s3cret"),
++        )
++        assertEquals(
++            "wss://host.example/prefix/tabs/by-id/abc/ws?token=s3cret",
++            c.base("https://host.example/prefix")!!.webSocketUrl("/tabs/by-id/abc/ws", "s3cret"),
++        )
++        // A token needing escaping must be escaped, not pasted in raw: it would
++        // otherwise truncate the query at the `&`, authenticating as the wrong
++        // token or none at all.
++        assertEquals(
++            "wss://host.example/x?token=a%26b%3Dc",
++            c.base("https://host.example")!!.webSocketUrl("/x", "a&b=c"),
++        )
++    }
++
++    // ---------------- which certificate may be trusted, and on what evidence ----------------
++
++    /**
++     * The decision this app makes about a certificate, asked of the thing that
++     * makes it — no socket, because which of the two cases a server is in is
++     * decided by the device's own trust store, and no test can install a CA
++     * there that a public server would have. Here the device's answer is the
++     * fixture, and the subject under test is what the app does with it.
++     */
++
++    @Test
++    fun aChainTheDeviceValidatesIsNeverPinned() {
++        val hostId = 7L
++        val base = client().base("https://host.example")!!
++        val key = pinKeyOf(hostId, base)
++        // A pin left over from when nothing could vouch for this server. It has
++        // to go: the reason to pin was that the key was the only identity, and
++        // that is no longer the case — so a renewal must not be refused.
++        pins().edit().putString(key, tamperedPin()).commit()
++
++        var remembered: X509Certificate? = null
++        var forgotten = false
++        val manager = TrustOnFirstUseManager(
++            hostId = hostId,
++            base = base,
++            pins = pins(),
++            device = DeviceTrustManager(validates = true),
++            deviceHostnameVerifier = HostnameVerifier { _, _ -> true },
++            rememberAsFirstUse = { remembered = it },
++            forgetPinnedKey = {
++                forgotten = true
++                pins().edit().remove(key).commit()
++            },
++        )
++
++        manager.checkServerTrusted(arrayOf(fixtureCertificate()), "EC")
++
++        assertNull("a certificate the device validates must not be handed on as a pin", remembered)
++        assertTrue("the pin of a server the device validates must be dropped", forgotten)
++        assertNull("the pin must be gone, not merely ignored", pins().getString(key, null))
++    }
++
++    @Test
++    fun aChainTheDeviceRejectsIsPinnedOnFirstUse() {
++        val hostId = 8L
++        val base = client().base("https://host.example")!!
++        val certificate = fixtureCertificate()
++        var remembered: X509Certificate? = null
++
++        val manager = TrustOnFirstUseManager(
++            hostId = hostId,
++            base = base,
++            pins = pins(),
++            device = DeviceTrustManager(validates = false),
++            deviceHostnameVerifier = HostnameVerifier { _, _ -> true },
++            rememberAsFirstUse = { remembered = it },
++            forgetPinnedKey = {},
++        )
++
++        // Nothing may be thrown: this is the connection that earns the pin, and
++        // refusing it is the bug that made a self-signed server unreachable.
++        manager.checkServerTrusted(arrayOf(certificate), "EC")
++
++        assertSame("the key has to be handed on, or nothing is ever pinned", certificate, remembered)
++    }
++
++    @Test
++    fun aPinnedKeyIsAcceptedAndAChangedOneIsRefused() {
++        val hostId = 9L
++        val base = client().base("https://host.example")!!
++        val certificate = fixtureCertificate()
++        pins().edit().putString(pinKeyOf(hostId, base), CertificatePinner.pin(certificate)).commit()
++
++        val manager = TrustOnFirstUseManager(
++            hostId = hostId,
++            base = base,
++            pins = pins(),
++            device = DeviceTrustManager(validates = false),
++            deviceHostnameVerifier = HostnameVerifier { _, _ -> true },
++            rememberAsFirstUse = {},
++            forgetPinnedKey = {},
++        )
++
++        manager.checkServerTrusted(arrayOf(certificate), "EC")
++
++        // The recorded pin is only ever the value CertificatePinner produces, so
++        // a pin cannot fail to verify against the certificate it came from.
++        assertTrue(manager.matchesPin(listOf(certificate)))
++
++        pins().edit().putString(pinKeyOf(hostId, base), tamperedPin()).commit()
++        val failure = runCatching { manager.checkServerTrusted(arrayOf(certificate), "EC") }
++            .exceptionOrNull()
++        assertTrue(
++            "a key that is not the pinned one must fail during the handshake, was: $failure",
++            failure is CertificateException,
++        )
++        assertFalse("and must not be accepted by the verifier either", manager.matchesPin(listOf(certificate)))
++    }
++
++    /**
++     * Building a client for an https server must work on the device, because it
++     * reaches for two platform facilities — the device's X.509 trust manager and
++     * its default hostname verifier — that are the app's only source of "is this
++     * certificate one the device can vouch for". A platform that did not provide
++     * one would fail this at first use of any https server, which is a crash the
++     * user would see as the app being unable to talk to a server at all.
++     *
++     * The plain-http client is built too, since it must *not* touch TLS at all.
++     */
++    @Test
++    fun aClientBuildsForBothAValidatedAndAPlainServer() {
++        val c = client()
++        assertNotNull(c.clientFor(1L, c.base("https://host.example")!!))
++        assertNotNull(c.clientFor(2L, c.base("http://host.example:7890")!!))
++    }
++
++    private fun pins() = context.getSharedPreferences("tabatelier_host_pins", Context.MODE_PRIVATE)
++
++    private fun pinKeyOf(hostId: Long, base: TabAtelierBase) = "pin_$hostId@${base.origin}"
++
++    private fun tamperedPin(): String = "sha256/" + Base64.encodeToString(ByteArray(32) { 0x42.toByte() }, Base64.NO_WRAP)
++
++    /** The device's trust store, with the answer the test is about. */
++    private class DeviceTrustManager(private val validates: Boolean) : X509TrustManager {
++        override fun checkServerTrusted(chain: Array<out X509Certificate>, authType: String) {
++            if (!validates) throw CertificateException("not a chain the device's store validates")
++        }
++
++        override fun checkClientTrusted(chain: Array<out X509Certificate>, authType: String) =
++            throw CertificateException("unused: this side is always the client")
++
++        override fun getAcceptedIssuers(): Array<X509Certificate> = emptyArray()
++    }
++
++    /**
++     * A self-signed certificate, as a fixture.
++     *
++     * Nothing on the unit-test classpath can mint one — no CA, no BouncyCastle —
++     * so it is a fixed DER blob parsed by the platform's own certificate parser.
++     * It is a fixture and not a secret: nothing trusts it, and nothing signs with
++     * its key (which is discarded).
++     */
++    private fun fixtureCertificate(): X509Certificate {
++        val der = Base64.decode(FIXTURE_CERTIFICATE_DER, Base64.DEFAULT)
++        return CertificateFactory.getInstance("X.509")
++            .generateCertificate(ByteArrayInputStream(der)) as X509Certificate
++    }
++
++    // ---------------- against a daemon this test starts ----------------
++
++    @Test
++    fun fetchesOverPlainHttp_sortsNewestFirst_andSaysWhoItIs() {
++        val body = """
++            {"tabs":[
++              {"id":"seen-long-ago","name":"second","preview":"older output","active":false,"last_used_at":1000},
++              {"id":"seen-last","name":"first","preview":"newest output","active":true,"last_used_at":2000},
++              {"id":"never","name":"third","preview":"","active":false}
++            ]}
++        """.trimIndent()
++
++        withServer(body) { url, headers ->
++            val c = client()
++            val base = c.base(url)!!
++            assertFalse(base.secure)
++
++            val tabs = c.fetchTabs(hostId = 1L, base = base, token = "secret-token")
++
++            // The original complaint: the list has to be ordered by last use, and
++            // a tab the API omits a timestamp for (never viewed) belongs last.
++            assertEquals(
++                listOf("first", "second", "third"),
++                tabs.map { it.name },
++            )
++            assertEquals(2000L, tabs.first().lastUsedAt)
++            assertEquals(0L, tabs.last().lastUsedAt)
++
++            // The daemon does not branch on the request's User-Agent, but we
++            // identify ourselves the way the retired client did so its logs stay
++            // comparable.
++            assertEquals("ta-remote/${BuildConfig.VERSION_NAME} (Android)", headers()["user-agent"])
++            assertEquals("Bearer secret-token", headers()["authorization"])
++        }
++    }
++
++    @Test
++    fun anUnauthorizedResponseIsAnErrorAndNotAnEmptyList() {
++        withServer(status = 401, body = """{"error":"unauthorized"}""") { url, _ ->
++            val c = client()
++            val failure = runCatching { c.fetchTabs(1L, c.base(url)!!, "wrong-token") }.exceptionOrNull()
++            assertTrue(
++                "a rejected token must not render as 'this server has no tabs': $failure",
++                failure is IllegalStateException,
++            )
++        }
++    }
++
++    // ---------------- the reported bug: TLS with a self-signed certificate ----------------
++
++    /**
++     * The reported bug, end to end: a self-signed certificate was rejected
++     * outright. The first connection is now accepted, and — when nothing but the
++     * key identifies the server — that key is recorded and required afterwards,
++     * with a *different* key refused rather than trusted.
++     *
++     * Each step evicts the connection pool first. Without that OkHttp reuses the
++     * established TLS connection and no handshake happens, so the pin would never
++     * be consulted and this test would pass while proving nothing.
++     */
++    @Test
++    fun selfSignedIsAcceptedOnFirstUseThenPinnedAndAChangedKeyIsRefused() {
++        val url = System.getenv("TABATELIER_TEST_URL")
++        assumeTrue(
++            "set TABATELIER_TEST_URL to a tab-atelier server over https:// to run this",
++            url != null,
++        )
++        val token = System.getenv("TABATELIER_TEST_TOKEN")
++        val hostId = HOST_ID
++        val c = client()
++        val base = c.base(url)!!
++        assertTrue("this test is about TLS, so $url must be https", base.secure)
++
++        // Start from "never seen this server", so a previous run's tampered pin
++        // cannot leak into this one.
++        c.clearPin(hostId)
++
++        // 1. First use. This is the case that used to fail with
++        //    CERTIFICATE_VERIFY_FAILED, because OkHttp's default trust manager
++        //    checked the chain against the system CA store before our verifier
++        //    was ever consulted. It is accepted now either because the device
++        //    validates the certificate, or on first use.
++        val first = c.fetchTabs(hostId, base, token)
++        assertTrue("expected at least one tab from $url", first.isNotEmpty())
++
++        // 2. Whether anything is pinned is the decision this client makes, and
++        //    it depends on the server, so the rest of the test follows it instead
++        //    of assuming one of the two.
++        val pin = c.pin(hostId, base)
++        if (pin == null) {
++            // The device validated this server's certificate: a CA signed it, or
++            // the user installed its CA — a Cloudflare Origin certificate with
++            // its CA installed, through the documented deployment. Pinning it
++            // would be the bug, since a renewal would then be refused. The only
++            // thing left to assert is that a fresh handshake still succeeds.
++            c.clientFor(hostId, base).connectionPool.evictAll()
++            assertEquals(
++                "a device-validated certificate must be accepted again, and never pinned",
++                first.size,
++                c.fetchTabs(hostId, base, token).size,
++            )
++            return
++        }
++        assertTrue(
++            "the pin must be in the form a pin is compared in, was $pin",
++            pin.startsWith("sha256/"),
++        )
++
++        // 3. The recorded key is accepted on a fresh handshake.
++        c.clientFor(hostId, base).connectionPool.evictAll()
++        assertEquals(
++            "the pinned key must be accepted again",
++            first.size,
++            c.fetchTabs(hostId, base, token).size,
++        )
++
++        // 4. A changed key is refused. Tampering with the recorded pin is the
++        //    only honest way to simulate this without a second certificate: the
++        //    handshake now presents a key that does not match what was pinned.
++        tamperWithRecordedPins()
++        c.clientFor(hostId, base).connectionPool.evictAll()
++        val failure = runCatching { c.fetchTabs(hostId, base, token) }.exceptionOrNull()
++        assertNotNull("a changed key must fail the connection, not be trusted", failure)
++        val messages = generateSequence(failure) { it.cause }.mapNotNull { it.message }.toList()
++        // Deliberately loose about the wording and strict about the substance:
++        // the connection must be refused, and the refusal must be about this
++        // host rather than an empty result or a timeout.
++        assertTrue(
++            "a changed key must be refused in a way that names the host, was: $messages",
++            messages.any { it.contains(base.host) },
++        )
++    }
++
++    /** Replaces every recorded pin with one no real certificate can match. */
++    private fun tamperWithRecordedPins() {
++        val keys = pins().all.keys.filter { it.startsWith("pin_") }
++        assertTrue("expected a recorded pin to tamper with", keys.isNotEmpty())
++        pins().edit().apply { keys.forEach { putString(it, tamperedPin()) } }.commit()
++    }
++
++    /**
++     * The session path, against a real daemon.
++     *
++     * Everything else about the transport is compile-checked and reasoned about,
++     * but this is the one part that had never run: the WebSocket the terminal is
++     * read from, at the route and with the auth the app uses. A socket that never
++     * opens is a terminal that sits on "connecting" forever, which is exactly the
++     * failure this test exists to catch before a user sees it.
++     *
++     * It deliberately sends only the focus frame (`0x0B`) — the frame the app
++     * sends on connect, and metadata rather than input — so running this against
++     * a live workstation cannot type into somebody's tab.
++     */
++    @Test
++    fun aTabSessionOpensOverTheWebSocketAndSpeaksTheProtocol() {
++        val url = System.getenv("TABATELIER_TEST_URL")
++        assumeTrue(
++            "set TABATELIER_TEST_URL to a tab-atelier server over https:// to run this",
++            url != null,
++        )
++        val token = System.getenv("TABATELIER_TEST_TOKEN")
++        val c = client()
++        val base = c.base(url)!!
++        val tabs = c.fetchTabs(HOST_ID, base, token)
++        assumeTrue("this server has no tabs to open", tabs.isNotEmpty())
++
++        // The same URL and the same client the transport builds — the pinned one,
++        // which is the point: a WebSocket over the system CA store would fail
++        // against a self-signed daemon even though the tab list loaded.
++        val request = Request.Builder().url(base.webSocketUrl("/tabs/by-id/${tabs.first().id}/ws", token)).build()
++
++        val opened = CountDownLatch(1)
++        val frames = LinkedBlockingQueue<ByteArray>()
++        var failure: Throwable? = null
++        val socket = c.clientFor(HOST_ID, base).newWebSocket(
++            request,
++            object : WebSocketListener() {
++                override fun onOpen(webSocket: WebSocket, response: Response) {
++                    // What the transport sends on open; stamps the tab's last use.
++                    webSocket.send(byteArrayOf(TAG_FOCUS).toByteString())
++                    opened.countDown()
++                }
++
++                override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
++                    frames.offer(bytes.toByteArray())
++                }
++
++                override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
++                    failure = t
++                    opened.countDown()
++                }
++
++                override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
++                    opened.countDown()
++                }
++            },
++        )
++
++        try {
++            assertTrue(
++                "the daemon must accept the session WebSocket; failed: $failure",
++                opened.await(15, TimeUnit.SECONDS),
++            )
++            assertNull("the WebSocket must open, not fail", failure)
++
++            // An idle tab may legitimately say nothing, so a frame is not
++            // required. What is required is that whatever arrives is something
++            // the transport renders: an unknown tag here would mean the daemon
++            // and the client disagree about the protocol.
++            val frame = frames.poll(5, TimeUnit.SECONDS)
++            if (frame != null) {
++                assertTrue("the daemon sent an empty frame", frame.isNotEmpty())
++                assertTrue(
++                    "unknown frame tag ${frame[0]}: the client does not render this daemon's protocol",
++                    frame[0] in SERVER_FRAME_TAGS,
++                )
++            }
++        } finally {
++            socket.close(1000, null)
++        }
++    }
++
++    /**
++     * Switching a session to another tab, live.
++     *
++     * The app does this when a second tab of a server is tapped: one session per
++     * server, moved to the tab that was tapped, rather than a second session —
++     * ConnectBot keys a session by host. Two things that move depends on can only
++     * be checked against a daemon, and both are checked here:
++     *
++     * - the client is reusable for a *second* socket on the same server (a session
++     *   holds one client, and a switch reuses it);
++     * - each tab's socket is bound to the tab that was asked for, so what the
++     *   session shows is the tab the user tapped. This is asserted the strong way:
++     *   the name the socket reports has to be that tab's own name, from the list
++     *   the daemon gives, not merely *a* name.
++     */
++    @Test
++    fun eachTabOfAServerOpensItsOwnSessionOnTheSameClient() {
++        val url = System.getenv("TABATELIER_TEST_URL")
++        assumeTrue(
++            "set TABATELIER_TEST_URL to a tab-atelier server over https:// to run this",
++            url != null,
++        )
++        val token = System.getenv("TABATELIER_TEST_TOKEN")
++        val c = client()
++        val base = c.base(url)!!
++        val tabs = c.fetchTabs(HOST_ID, base, token)
++        assumeTrue("this server needs at least two tabs to switch between", tabs.size >= 2)
++
++        val client = c.clientFor(HOST_ID, base)
++        for (tab in tabs.take(2)) {
++            val name = openOneSession(client, base, tab.id, token)
++            assertEquals(
++                "the session must be bound to the tab that was asked for, not another",
++                tab.name,
++                name,
++            )
++        }
++    }
++
++    /**
++     * Opens one tab's session on [client] and returns the name the daemon reports
++     * for it, or null if it reports none.
++     *
++     * The meta frame is parsed here rather than through the transport's decoder, so
++     * that this is an independent statement of the protocol: a change on one side
++     * that the other does not match fails the test instead of agreeing with itself.
++     */
++    private fun openOneSession(
++        client: OkHttpClient,
++        base: TabAtelierBase,
++        tabId: String,
++        token: String?,
++    ): String? {
++        val request = Request.Builder().url(base.webSocketUrl("/tabs/by-id/$tabId/ws", token)).build()
++        val opened = CountDownLatch(1)
++        val meta = AtomicReference<String?>(null)
++        var failure: Throwable? = null
++        val socket = client.newWebSocket(
++            request,
++            object : WebSocketListener() {
++                override fun onOpen(webSocket: WebSocket, response: Response) {
++                    webSocket.send(byteArrayOf(TAG_FOCUS).toByteString())
++                    opened.countDown()
++                }
++
++                override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
++                    val frame = bytes.toByteArray()
++                    if (frame.isNotEmpty() && frame[0] == TAG_META.toByte()) {
++                        meta.compareAndSet(
++                            null,
++                            JSONObject(String(frame, 1, frame.size - 1, Charsets.UTF_8))
++                                .optString("name")
++                                .takeIf { it.isNotBlank() },
++                        )
++                    }
++                }
++
++                override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
++                    failure = t
++                    opened.countDown()
++                }
++
++                override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
++                    opened.countDown()
++                }
++            },
++        )
++        return try {
++            assertTrue("the daemon must accept a session on this tab; failed: $failure", opened.await(15, TimeUnit.SECONDS))
++            assertNull(failure)
++            // The meta frame arrives before any output, so it is worth waiting for;
++            // a tab that never reports it is a daemon/client disagreement.
++            val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
++            while (meta.get() == null && failure == null && System.nanoTime() < deadline) {
++                Thread.sleep(20)
++            }
++            meta.get()
++        } finally {
++            socket.close(1000, null)
++        }
++    }
++
++    /**
++     * Serves one response at `/tabs` on loopback, and runs [block] with the URL
++     * it can be reached at plus the headers that request carried.
++     *
++     * The headers are a function rather than a value because they only exist once
++     * the request has been made — inside [block].
++     */
++    private fun withServer(
++        body: String,
++        status: Int = 200,
++        block: (url: String, headers: () -> Map<String, String>) -> Unit,
++    ) {
++        val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
++        val seen = AtomicReference<Map<String, String>>(emptyMap())
++        server.createContext("/tabs") { exchange ->
++            // Keyed in lower case: com.sun.net.httpserver.Headers normalises
++            // names, so "User-Agent" arrives as "user-agent" and a
++            // case-sensitive lookup would never find it.
++            seen.set(exchange.requestHeaders.entries.associate { it.key.lowercase() to it.value.first() })
++            val bytes = body.toByteArray()
++            exchange.responseHeaders.add("Content-Type", "application/json")
++            exchange.sendResponseHeaders(status, bytes.size.toLong())
++            exchange.responseBody.use { it.write(bytes) }
++            exchange.close()
++        }
++        server.start()
++        try {
++            block("http://127.0.0.1:${server.address.port}") { seen.get() }
++        } finally {
++            server.stop(0)
++        }
++    }
++
++    private companion object {
++        /** The host id used by the live tests; any value works, it is only a key. */
++        const val HOST_ID = 4242L
++
++        /** `0x0b`, the focus frame the transport sends on connect. */
++        const val TAG_FOCUS: Byte = 0x0B
++
++        /** `0x03`, the frame carrying a tab's own metadata: its name and size. */
++        const val TAG_META: Byte = 0x03
++
++        /**
++         * The tags the daemon sends to a client, from its `src/api_ws.rs`:
++         * output, metadata, gzipped output and the quick preview. Kept here
++         * rather than shared with the transport on purpose — this is the test's
++         * independent statement of the protocol, so a typo in one does not agree
++         * with a typo in the other.
++         */
++        val SERVER_FRAME_TAGS = setOf<Byte>(0x02, 0x03, 0x0A, 0x0C)
++
++        /**
++         * The DER of [fixtureCertificate], base64. A self-signed P-256
++         * certificate for `ta-test-fixture`, whose private key was discarded
++         * when it was made — see the method for why it is a fixed blob.
++         */
++        const val FIXTURE_CERTIFICATE_DER = """
++            MIIBpDCCAUugAwIBAgIUEuR1hXpgK6imVNI6DWux6GlosKAwCgYIKoZIzj0EAwIwGjEYMBYGA1UE
++            AwwPdGEtdGVzdC1maXh0dXJlMB4XDTI2MTAwNDA3Mzk1N1oXDTM2MTAwMTA3Mzk1N1owGjEYMBYG
++            A1UEAwwPdGEtdGVzdC1maXh0dXJlMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEM4uivSdfevTV
++            8H7JzUoAHCWso6CxL9dnwFEoMIdsW6YCsAIcV5dOaqe6DgEtgYhr2K9TiKkSoVn88hcvCajSgaNv
++            MG0wHQYDVR0OBBYEFL/2tj/FISEL313eQcMv1VU6LQtTMB8GA1UdIwQYMBaAFL/2tj/FISEL313e
++            QcMv1VU6LQtTMA8GA1UdEwEB/wQFMAMBAf8wGgYDVR0RBBMwEYIPdGEtdGVzdC1maXh0dXJlMAoG
++            CCqGSM49BAMCA0cAMEQCIH6CDNvr9cTaDtGQow6Knq/U6jFSTFXGxmXqljMqGpjhAiADOCpYemnP
++            Kz8ZZBUVgPtPG9jPW5+h1rdlBAMk7SWJIg==
++        """
++    }
++}
+diff --git a/app/src/test/kotlin/org/connectbot/transport/TabAtelierTest.kt b/app/src/test/kotlin/org/connectbot/transport/TabAtelierTest.kt
+new file mode 100644
+index 00000000..42605c82
+--- /dev/null
++++ b/app/src/test/kotlin/org/connectbot/transport/TabAtelierTest.kt
+@@ -0,0 +1,238 @@
++/**
++ * New file for Tab Atelier Remote (Apache-2.0 section 4(b)), ours — upstream has
++ * no tab-atelier transport, so there is nothing to preserve here.
++ *
++ * Covers the frame decoder, which is where the daemon's stream is turned into
++ * what the terminal renders. It is a pure function of a frame, so it is tested
++ * directly rather than through a session.
++ *
++ * The tag table it checks against is written out here rather than read from the
++ * transport: this is the test's own statement of the daemon's protocol, so a
++ * change to one side that the other does not match fails here instead of quietly
++ * agreeing with itself.
++ *
++ * Robolectric is only needed for `org.json`, which the Android platform provides
++ * and a plain JVM unit test does not.
++ */
++package org.connectbot.transport
++
++import okio.ByteString.Companion.encodeUtf8
++import org.junit.Assert.assertEquals
++import org.junit.Test
++import org.junit.runner.RunWith
++import org.robolectric.RobolectricTestRunner
++import java.io.ByteArrayOutputStream
++import java.util.zip.GZIPOutputStream
++
++@RunWith(RobolectricTestRunner::class)
++class TabAtelierTest {
++
++    private val transport = TabAtelier()
++
++    private fun frame(tag: Int, payload: String): ByteArray =
++        byteArrayOf(tag.toByte()) + payload.toByteArray(Charsets.UTF_8)
++
++    private fun gzip(payload: String): ByteArray {
++        val out = ByteArrayOutputStream()
++        GZIPOutputStream(out).use { it.write(payload.toByteArray(Charsets.UTF_8)) }
++        return out.toByteArray()
++    }
++
++    @Test
++    fun outputFrames_areHandedToTheTerminal() {
++        val decoded = transport.decodeFrame(frame(0x02, "hello"))
++        assertEquals(TabAtelier.Frame.Output("hello".encodeUtf8()), decoded)
++    }
++
++    /**
++     * Gzipped output is *gzip*, not raw deflate. The tags look interchangeable and
++     * are not: reading one as the other does not throw here, it paints garbage.
++     */
++    @Test
++    fun gzippedOutputFrames_areExpanded() {
++        val decoded = transport.decodeFrame(byteArrayOf(0x0A) + gzip("hello"))
++        assertEquals("hello".encodeUtf8(), (decoded as TabAtelier.Frame.Output).bytes)
++    }
++
++    /**
++     * The grid size, which is the whole reason this decoder exists.
++     *
++     * A tab is a real workstation terminal — the one this was built against is 193
++     * columns — and the daemon refuses to resize it, so mirroring this is the only
++     * way to render the tab's replay in the right places. Rendering at the phone's
++     * own width is what made the session look like several terminals at once.
++     */
++    @Test
++    fun metaFrames_carryTheGridToMirror() {
++        val decoded = transport.decodeFrame(frame(0x03, """{"rows":48,"cols":193}"""))
++        assertEquals(
++            TabAtelier.Frame.Meta(name = null, grid = TabAtelier.Frame.Meta.Grid(rows = 48, cols = 193), bgColor = null),
++            decoded,
++        )
++    }
++
++    /**
++     * The tab's name, which the console title shows beside the server's.
++     *
++     * It comes from the daemon rather than from the row that was tapped, so this
++     * is the frame that has to carry it — and it is the same frame as the grid, so
++     * one test each for "only a name", "only a grid" and "both".
++     */
++    @Test
++    fun metaFrames_carryTheTabName() {
++        assertEquals(
++            "a name alone must still be a usable meta frame",
++            TabAtelier.Frame.Meta(name = "build-2", grid = null, bgColor = null),
++            transport.decodeFrame(frame(0x03, """{"name":"build-2"}""")),
++        )
++        assertEquals(
++            "both, when the daemon sends both",
++            TabAtelier.Frame.Meta(name = "build-2", grid = TabAtelier.Frame.Meta.Grid(rows = 48, cols = 193), bgColor = null),
++            transport.decodeFrame(frame(0x03, """{"name":"build-2","rows":48,"cols":193}""")),
++        )
++    }
++
++    /**
++     * A name that is not a name must not reach the title.
++     *
++     * The console renders "server - name", so an empty or absent name would leave
++     * a trailing separator with nothing after it, which reads as a rendering bug
++     * rather than as a tab without a name. A blank one is therefore not a name
++     * here, and the title falls back to the server's.
++     */
++    /**
++     * The tab's own background, which the daemon uses to tell one tab's viewer from
++     * another's.
++     *
++     * It matters that this is read and not dropped: the daemon keeps the terminal's
++     * own colours — part of the tab — separate from this, so a viewer shows the tab
++     * in its own colour without losing what the terminal renders with.
++     */
++    @Test
++    fun metaFrames_carryTheTabBackground() {
++        assertEquals(
++            TabAtelier.Frame.Meta(
++                name = null,
++                grid = null,
++                bgColor = "#002451",
++            ),
++            transport.decodeFrame(frame(0x03, """{"bg_color":"#002451"}""")),
++        )
++        assertEquals(
++            "all three fields arrive in one frame, so all three must survive it",
++            TabAtelier.Frame.Meta(
++                name = "build-2",
++                grid = TabAtelier.Frame.Meta.Grid(rows = 48, cols = 193),
++                bgColor = "#451c2e",
++            ),
++            transport.decodeFrame(
++                frame(0x03, """{"name":"build-2","rows":48,"cols":193,"bg_color":"#451c2e"}"""),
++            ),
++        )
++    }
++
++    /**
++     * A background this client cannot use must leave the tab's usual one alone,
++     * rather than be passed on to be rendered.
++     *
++     * The daemon's own browser client validates the same shape before applying one,
++     * so a value that is not `#rrggbb` is a value neither end should act on — and
++     * the failure mode of guessing is an unreadable terminal, which is worse than
++     * ignoring a cosmetic field.
++     */
++    @Test
++    fun anUnusableTabBackground_isDroppedNotRendered() {
++        for (bad in listOf("#GGGGGG", "red", "#12345", "#1234567", "002451", "")) {
++            val decoded = transport.decodeFrame(
++                frame(0x03, """{"name":"tab","bg_color":"$bad"}"""),
++            ) as TabAtelier.Frame.Meta
++            assertEquals("a background of \"$bad\" is not a colour", null, decoded.bgColor)
++            assertEquals("the rest of the frame must still be usable", "tab", decoded.name)
++        }
++        // JSON null, the daemon's sentinel for "none", is not the string "null".
++        val nulled = transport.decodeFrame(frame(0x03, """{"name":"tab","bg_color":null}""")) as TabAtelier.Frame.Meta
++        assertEquals(null, nulled.bgColor)
++    }
++
++    @Test
++    fun metaFrames_withoutAUsableName_carryNoName() {
++        // Nothing usable in the frame at all is Ignored, not an empty Meta: a
++        // meta frame that says nothing this client can use has nothing to say.
++        assertEquals(
++            TabAtelier.Frame.Ignored,
++            transport.decodeFrame(frame(0x03, """{"name":""}""")),
++        )
++        assertEquals(
++            TabAtelier.Frame.Ignored,
++            transport.decodeFrame(frame(0x03, """{"name":"   "}""")),
++        )
++        // The daemon's JSON null for "unknown" must not become the string "null".
++        assertEquals(
++            TabAtelier.Frame.Ignored,
++            transport.decodeFrame(frame(0x03, """{"name":null}""")),
++        )
++    }
++
++    @Test
++    fun metaFrames_withoutAGrid_carryNoGrid() {
++        // Zero and the daemon's JSON null for "unknown" are both "not a size", and
++        // neither is an error: the name from the same frame is still usable.
++        assertEquals(
++            TabAtelier.Frame.Meta(name = "tab", grid = null, bgColor = null),
++            transport.decodeFrame(frame(0x03, """{"name":"tab","agent_kind":"claude"}""")),
++        )
++        assertEquals(
++            TabAtelier.Frame.Ignored,
++            transport.decodeFrame(frame(0x03, """{"rows":null,"cols":null}""")),
++        )
++        assertEquals(
++            TabAtelier.Frame.Ignored,
++            transport.decodeFrame(frame(0x03, """{"rows":0,"cols":193}""")),
++        )
++    }
++
++    @Test
++    fun malformedMeta_doesNotThrow() {
++        assertEquals(TabAtelier.Frame.Ignored, transport.decodeFrame(frame(0x03, "not json at all")))
++        assertEquals(TabAtelier.Frame.Ignored, transport.decodeFrame(byteArrayOf(0x03)))
++    }
++
++    /**
++     * The preview paint is not rendered, and this is the regression guard for it.
++     *
++     * Tag 0x0c carries the last screen as terminal output, sent ahead of the full
++     * replay so a viewer paints something immediately. Feeding it to the emulator
++     * concatenates it with the replay that follows and draws the same screen twice
++     * — visible as a jumbled session. It is a hint, not a stream.
++     */
++    @Test
++    fun previewFrames_areNotRendered() {
++        assertEquals(
++            TabAtelier.Frame.Ignored,
++            transport.decodeFrame(frame(0x0C, "last screen as text")),
++        )
++    }
++
++    @Test
++    fun unknownTags_areIgnoredRatherThanFatal() {
++        // A daemon that grows a frame must not be able to break an older client by
++        // sending one it has not learned yet.
++        assertEquals(TabAtelier.Frame.Ignored, transport.decodeFrame(frame(0x7F, "future")))
++        assertEquals(TabAtelier.Frame.Ignored, transport.decodeFrame(ByteArray(0)))
++    }
++
++    /**
++     * `setDimensions` must not tell the daemon anything.
++     *
++     * The daemon refuses to resize a tab on purpose — a phone viewer must not
++     * reflow a shared PTY under an agent's TUI — and this protocol's reference
++     * client mirrors the server's grid rather than driving it. A resize frame here
++     * is what the daemon's own documentation calls a no-op it drops, so sending one
++     * is at best pointless; asserting it is safe to call is the honest limit of
++     * what a unit test can say about a deliberate no-op.
++     */
++    @Test
++    fun setDimensions_isSafeAndSilent() {
++        transport.setDimensions(columns = 45, rows = 20, width = 1080, height = 1920)
++    }
++}

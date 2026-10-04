@@ -1,3 +1,12 @@
+From: William Desportes <williamdes@wdes.fr>
+Date: Sun, 4 Oct 2026 21:55:40 +0200
+Subject: application-id-and-version
+
+Gbp-Pq: Name application-id-and-version
+---
+ app/build.gradle.kts | 38 ++++++++++++++++++++------------------
+ 1 file changed, 20 insertions(+), 18 deletions(-)
+
 diff --git a/app/build.gradle.kts b/app/build.gradle.kts
 index c734cf2c..9764db63 100644
 --- a/app/build.gradle.kts

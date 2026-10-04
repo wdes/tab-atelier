@@ -29,7 +29,9 @@ the same filenames back rather than re-deriving them from commit subjects.
 import argparse
 import os
 import re
+import shutil
 import sys
+import tempfile
 
 import gbp.log
 from gbp.git import GitRepository, GitRepositoryError
@@ -78,25 +80,28 @@ def read_series():
 def do_import(args):
     repo = repo_or_die()
     branch = repo.branch
+    pq_branch = pq_branch_name(branch)
+
     if is_pq_branch(branch):
-        sys.exit(
-            "On %s, which is already a patch queue. Run `export` and switch to %s "
-            "first — importing over a queue would replace commits you may have "
-            "edited." % (branch, pq_branch_base(branch))
-        )
+        # Re-importing from the queue is the normal case once a commit has been
+        # edited, and it must replay onto the same upstream base the queue already
+        # sits on — never onto the queue's own head, which has every patch applied
+        # and so would apply each one on top of itself.
+        base = repo.rev_parse(pq_branch_base(branch))
+        gbp.log.info("Re-importing, replacing this queue (base %s)" % base[:7])
+        # Rewind the queue to upstream; the patches are about to be replayed over
+        # it. Any commit added by hand on the queue is replaced by this, which is
+        # the point: the patches are the record, and the queue is regenerated.
+        repo.force_head(base, hard=True)
+    else:
+        base = repo.head
+        if repo.has_branch(pq_branch):
+            gbp.log.info("Replacing the existing %s (was %s)" % (pq_branch, repo.rev_parse(pq_branch)[:7]))
+            repo.delete_branch(pq_branch)
+        repo.create_branch(pq_branch, base)
+        repo.set_branch(pq_branch)
 
     queue = read_series()
-    pq_branch = pq_branch_name(branch)
-    base = repo.head
-
-    if repo.has_branch(pq_branch):
-        # A re-import replaces the queue, so say so rather than doing it silently:
-        # any commit added or amended on that branch is about to be lost.
-        gbp.log.info("Replacing the existing %s (was %s)" % (pq_branch, repo.rev_parse(pq_branch)[:7]))
-        repo.delete_branch(pq_branch)
-    repo.create_branch(pq_branch, base)
-    repo.set_branch(pq_branch)
-
     gbp.log.info("Importing %d patches onto %s (base %s)" % (len(queue), pq_branch, base[:7]))
     for patch in queue:
         # gbp's subject for a header-less patch is derived from the filename, and
@@ -129,30 +134,72 @@ def do_export(args):
     # Oldest first: that is the series order, and gbp numbers as it writes.
     commits.reverse()
 
-    # Clear the patches this series owns, so a patch removed on the branch does not
-    # linger as a file nothing lists. Only numbered patch files are touched.
-    for entry in sorted(os.listdir(PATCH_DIR)):
-        if PREFIX.match(entry) and entry.endswith(".patch"):
-            os.remove(os.path.join(PATCH_DIR, entry))
+    # Everything is written to a temporary directory and only moved into place
+    # once every patch has been produced. The first version of this deleted the
+    # old patches first and then wrote the new ones, so a failure part-way — and
+    # there was one, `core.abbrev=0` below — left the overlay with no patches at
+    # all. Regenerating must not be able to destroy the thing it regenerates.
+    staging = tempfile.mkdtemp(prefix="pq-export-")
+    try:
+        gbp.log.info("Exporting %d commits" % len(commits))
+        series = []
+        for rev in commits:
+            info = repo.get_commit_info(rev)
+            # A name carried from import, so the filename is the one the patch had
+            # rather than one re-derived from the subject. gbp parses this trailer
+            # itself in `gbp pq export`; doing it here keeps the behaviour identical.
+            name = None
+            for line in (info.get("body") or "").split("\n"):
+                m = re.match(r"Gbp-Pq: Name (.*)$", line)
+                if m:
+                    name = m.group(1).strip()
+            # gbp splits the name into base and *suffix*, and writes
+            # `num_prefix + base + suffix` — so a name without an extension
+            # produces a patch file with no `.patch` on the end. That matters more
+            # than it looks: apply-overlay.sh globs `*.patch`, so a patch named
+            # without the extension is one the overlay never sees. The extension is
+            # carried here rather than in the trailer, so the trailer stays a name.
+            if name and not name.endswith(".patch"):
+                name = name + ".patch"
+            # abbrev=None, and it is not cosmetic. gbp formats this into
+            # `-c core.abbrev=%d`, so the obvious `False` becomes 0 and git refuses
+            # it outright ("abbrev length out of range: 0"). None is what gbp's own
+            # export passes when no abbreviation length is configured.
+            #
+            # renumber=True, because passing a name switches gbp's numbering OFF:
+            # with renumber=False it clears the number prefix and the file lands as
+            # `application-id-and-version.patch`, losing the 0001- the series
+            # relies on. renumber makes gbp write the prefix from the position in
+            # the series, which is what those numbers are for.
+            format_patch(
+                outdir=staging,
+                repo=repo,
+                commit_info=info,
+                series=series,
+                abbrev=None,
+                name=name,
+                renumber=True,
+            )
+            # gbp appends the *filename* to series, not an object, so this is the
+            # path the patch was written to.
+            gbp.log.info("  %s" % os.path.basename(series[-1]))
 
-    gbp.log.info("Exporting %d commits to %s" % (len(commits), PATCH_DIR))
-    series = []
-    for rev in commits:
-        info = repo.get_commit_info(rev)
-        # A name carried from import, so the filename is the one the patch had
-        # rather than one re-derived from the subject. gbp parses this trailer
-        # itself in `gbp pq export`; doing it here keeps the behaviour identical.
-        name = None
-        for line in (info.get("body") or "").split("\n"):
-            m = re.match(r"Gbp-Pq: Name (.*)$", line)
-            if m:
-                name = m.group(1).strip()
-        format_patch(outdir=PATCH_DIR, repo=repo, commit_info=info, series=series, abbrev=False, name=name)
-        gbp.log.info("  %s" % os.path.basename(series[-1].path))
-
-    with open(SERIES, "w") as f:
+        # Now, and only now, replace what is on disk. Numbered patch files first:
+        # a patch removed on the branch must not linger as a file nothing lists.
+        # Matched by prefix rather than by extension, because a patch written by an
+        # earlier version of this script can be missing its `.patch` — and leaving
+        # one behind would put a second copy of the same change in the series.
+        for entry in sorted(os.listdir(PATCH_DIR)):
+            if PREFIX.match(entry) and os.path.isfile(os.path.join(PATCH_DIR, entry)):
+                os.remove(os.path.join(PATCH_DIR, entry))
         for patch in series:
-            f.write("%s\n" % os.path.basename(patch.path))
+            shutil.move(patch, os.path.join(PATCH_DIR, os.path.basename(patch)))
+
+        with open(SERIES, "w") as f:
+            for patch in series:
+                f.write("%s\n" % os.path.basename(patch))
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
 
     gbp.log.info("Wrote %d patches and %s" % (len(series), os.path.basename(SERIES)))
     return 0
