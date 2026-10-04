@@ -109,6 +109,22 @@ fun HelpScreen(
                         text = "Version ${BuildConfig.VERSION_NAME}",
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(bottom = 8.dp),
+                    )
+                    // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)):
+                    // both commits, each named, so a bug report says which build
+                    // of this app and which build of upstream it came from.
+                    // BUILD_COMMIT is -PbuildCommit (the pushed SHA in CI);
+                    // UPSTREAM_COMMIT is the connectbot submodule's HEAD.
+                    Text(
+                        text = "Tab Atelier commit ${BuildConfig.BUILD_COMMIT}",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Text(
+                        text = "ConnectBot commit ${BuildConfig.UPSTREAM_COMMIT}",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.padding(bottom = 24.dp),
                     )
                 }
@@ -158,16 +174,22 @@ fun HelpScreen(
                 }
             }
 
-            item {
-                Button(
-                    onClick = onNavigateToContact,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(vertical = 8.dp),
-                ) {
-                    Text(stringResource(R.string.title_contact))
-                }
-            }
+            // Commented out for Tab Atelier Remote (Apache-2.0 section 4(b)):
+            // this screen is ConnectBot's own community — their IRC channels and
+            // mailing list — which is the wrong place to send our users. The
+            // source-code buttons below are where this app's issues belong.
+            // Left as a comment rather than deleted, so the diff stays small and
+            // restoring it is one uncomment.
+            // item {
+            //     Button(
+            //         onClick = onNavigateToContact,
+            //         modifier = Modifier
+            //             .fillMaxWidth()
+            //             .padding(vertical = 8.dp),
+            //     ) {
+            //         Text(stringResource(R.string.title_contact))
+            //     }
+            // }
 
             item {
                 val uriHandler = LocalUriHandler.current
@@ -181,21 +203,50 @@ fun HelpScreen(
                     style = MaterialTheme.typography.bodyMedium,
                     modifier = Modifier.padding(bottom = 16.dp),
                 )
+                // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)):
+                // credit both projects on one line. See overlay/README.md.
+                Text(
+                    text = "ConnectBot & Tab-Atelier",
+                    style = MaterialTheme.typography.bodyMedium,
+                    modifier = Modifier.padding(bottom = 8.dp),
+                )
                 Text(
                     text = stringResource(R.string.app_copyright),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(bottom = 16.dp),
                 )
+                // Commented out for Tab Atelier Remote (Apache-2.0 section 4(b)):
+                // mosh binaries for ConnectBot's mosh transport, which has
+                // nothing to do with connecting to a tab-atelier server.
+                // Button(
+                //     onClick = {
+                //         uriHandler.openUri("https://github.com/connectbot/mosh4android/releases/latest")
+                //     },
+                //     modifier = Modifier
+                //         .fillMaxWidth()
+                //         .padding(vertical = 8.dp),
+                // ) {
+                //     Text(stringResource(R.string.pref_mosh_release_title))
+                // }
+                // Added for Tab Atelier Remote: this app is a fork, so the
+                // provenance of both halves is one tap away. Literal labels on
+                // purpose — read by every locale identically.
                 Button(
-                    onClick = {
-                        uriHandler.openUri("https://github.com/connectbot/mosh4android/releases/latest")
-                    },
+                    onClick = { uriHandler.openUri("https://github.com/wdes/tab-atelier") },
                     modifier = Modifier
                         .fillMaxWidth()
                         .padding(vertical = 8.dp),
                 ) {
-                    Text(stringResource(R.string.pref_mosh_release_title))
+                    Text("Tab Atelier source code")
+                }
+                Button(
+                    onClick = { uriHandler.openUri("https://github.com/connectbot/connectbot") },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 8.dp),
+                ) {
+                    Text("ConnectBot source code")
                 }
             }
         }
