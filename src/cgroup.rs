@@ -366,11 +366,18 @@ pub fn terminate_tab(tab_id: &str) {
 /// pid 1 but still cgroup members). Call this after [`init`] and BEFORE
 /// respawning tabs, so a fresh `claude --resume <id>` can't run alongside a
 /// still-live copy of the same session — the root cause of the duplicate
-/// ghost sessions. Skips the `supervisor` leaf (that's us). Best-effort.
-pub fn reap_stale_tabs() {
+/// ghost sessions. Skips the `supervisor` leaf (that's us), plus any cgroup
+/// named in `keep_tab_ids`: a hot-swap handoff ([`crate::hotswap`]) carries
+/// live shells whose cgroups are exactly the ones we'd otherwise reap.
+/// Best-effort.
+pub fn reap_stale_tabs(keep_tab_ids: &[String]) {
     let Some(base) = delegated_base() else {
         return;
     };
+    let keep: std::collections::HashSet<String> = keep_tab_ids
+        .iter()
+        .map(|id| format!("tab-{}", sanitize_id(id)))
+        .collect();
     let Ok(entries) = std::fs::read_dir(base) else {
         return;
     };
@@ -379,6 +386,9 @@ pub fn reap_stale_tabs() {
         let name = e.file_name();
         // Only our per-tab cgroups; never the `supervisor` leaf (the daemon).
         if !name.to_string_lossy().starts_with("tab-") {
+            continue;
+        }
+        if keep.contains(&*name.to_string_lossy()) {
             continue;
         }
         let dir = e.path();

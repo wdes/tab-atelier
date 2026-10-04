@@ -37,6 +37,13 @@ pub(crate) mod event_proxy;
 pub(crate) use event_proxy::EventProxy;
 #[cfg(not(feature = "gui"))]
 pub mod headless;
+
+/// Hot swap: upgrade the running binary while every tab's shell stays
+/// alive (`POST /upgrade`).
+///
+/// Unix-only; the non-Unix build gets no-op stubs.
+pub mod hotswap;
+
 /// Experimental HTTP/3 + WebTransport transport (behind `http3`).
 #[cfg(feature = "http3")]
 pub mod http3;
