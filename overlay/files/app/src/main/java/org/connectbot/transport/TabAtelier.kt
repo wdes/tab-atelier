@@ -303,6 +303,10 @@ class TabAtelier : AbsTransport() {
                     // terminal has to mirror.
                     frame.name?.let { bridge?.setRemoteTabName(it) }
                     frame.grid?.let { bridge?.setRemoteGridSize(it.rows, it.cols) }
+                    // Applied on every meta frame, including a null: a tab whose
+                    // viewer has no background of its own must not keep the colour
+                    // of the tab the session was on before it.
+                    bridge?.setRemoteBackgroundColor(frame.bgColor)
                 }
                 Frame.Ignored -> Unit
             }
@@ -455,14 +459,14 @@ class TabAtelier : AbsTransport() {
         data class Output(val bytes: ByteString) : Frame
 
         /**
-         * The tab metadata this client uses: what the tab is called, and the grid
-         * its terminal is using.
+         * The tab metadata this client uses: what the tab is called, the grid its
+         * terminal is using, and the background its viewer paints.
          *
-         * One frame carries both, so one type does — see [decodeFrame]. Either
-         * field is null when the daemon did not send it in a form this client
-         * understands, which is not an error: the two are useful independently.
+         * One frame carries all three, so one type does — see [decodeFrame]. Every
+         * field is nullable when the daemon did not send it in a form this client
+         * understands, which is not an error: they are useful independently.
          */
-        data class Meta(val name: String?, val grid: Grid?) : Frame {
+        data class Meta(val name: String?, val grid: Grid?, val bgColor: String?) : Frame {
             /** The grid size the daemon's terminal is using, in rows×cols. */
             data class Grid(val rows: Int, val cols: Int)
         }
@@ -527,7 +531,25 @@ class TabAtelier : AbsTransport() {
         // name", and only a real non-blank string is one.
         val rawName = if (meta.has("name") && !meta.isNull("name")) meta.optString("name", "") else null
         val name = rawName?.takeIf { it.isNotBlank() }
-        return if (name == null && grid == null) Frame.Ignored else Frame.Meta(name, grid)
+
+        // The tab's own background, which the daemon uses to tell one tab's viewer
+        // from another's. Validated as a #rrggbb literal before it is used, exactly
+        // as the daemon's own browser client validates it — the value ends up as a
+        // colour, and one this client cannot parse must leave the tab's usual
+        // background alone rather than fail the session over a cosmetic field.
+        // Same null-vs-absent trap as the name, hence the same guards.
+        val rawBgColor = if (meta.has(BG_COLOR_KEY) && !meta.isNull(BG_COLOR_KEY)) {
+            meta.optString(BG_COLOR_KEY, "")
+        } else {
+            null
+        }
+        val bgColor = rawBgColor?.takeIf { HEX_COLOR.matches(it) }
+
+        return if (name == null && grid == null && bgColor == null) {
+            Frame.Ignored
+        } else {
+            Frame.Meta(name, grid, bgColor)
+        }
     }
 
     private fun send(tag: Byte, payload: ByteArray) {
@@ -608,6 +630,24 @@ class TabAtelier : AbsTransport() {
         private const val TAG_FOCUS: Byte = 0x0B
 
         private const val CLOSE_NORMAL = 1000
+
+        /**
+         * The meta frame's key for a tab's own background colour.
+         *
+         * A wire name, so it is spelled here rather than derived: the daemon's
+         * `tab_meta_json` writes `bg_color` and its viewer reads the same.
+         */
+        private const val BG_COLOR_KEY = "bg_color"
+
+        /**
+         * What a usable background colour looks like: `#rrggbb`, exactly as the
+         * daemon's own browser client requires before it will apply one.
+         *
+         * A malformed value is dropped rather than passed on, so that the app can
+         * never be the thing that renders a tab in an unreadable colour because a
+         * field was in a shape it did not expect.
+         */
+        private val HEX_COLOR = Regex("^#[0-9a-fA-F]{6}$")
 
         /**
          * How long [connect] waits for the daemon to accept the WebSocket before

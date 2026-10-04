@@ -66,7 +66,7 @@ class TabAtelierTest {
     fun metaFrames_carryTheGridToMirror() {
         val decoded = transport.decodeFrame(frame(0x03, """{"rows":48,"cols":193}"""))
         assertEquals(
-            TabAtelier.Frame.Meta(name = null, grid = TabAtelier.Frame.Meta.Grid(rows = 48, cols = 193)),
+            TabAtelier.Frame.Meta(name = null, grid = TabAtelier.Frame.Meta.Grid(rows = 48, cols = 193), bgColor = null),
             decoded,
         )
     }
@@ -82,12 +82,12 @@ class TabAtelierTest {
     fun metaFrames_carryTheTabName() {
         assertEquals(
             "a name alone must still be a usable meta frame",
-            TabAtelier.Frame.Meta(name = "build-2", grid = null),
+            TabAtelier.Frame.Meta(name = "build-2", grid = null, bgColor = null),
             transport.decodeFrame(frame(0x03, """{"name":"build-2"}""")),
         )
         assertEquals(
             "both, when the daemon sends both",
-            TabAtelier.Frame.Meta(name = "build-2", grid = TabAtelier.Frame.Meta.Grid(rows = 48, cols = 193)),
+            TabAtelier.Frame.Meta(name = "build-2", grid = TabAtelier.Frame.Meta.Grid(rows = 48, cols = 193), bgColor = null),
             transport.decodeFrame(frame(0x03, """{"name":"build-2","rows":48,"cols":193}""")),
         )
     }
@@ -100,6 +100,60 @@ class TabAtelierTest {
      * rather than as a tab without a name. A blank one is therefore not a name
      * here, and the title falls back to the server's.
      */
+    /**
+     * The tab's own background, which the daemon uses to tell one tab's viewer from
+     * another's.
+     *
+     * It matters that this is read and not dropped: the daemon keeps the terminal's
+     * own colours — part of the tab — separate from this, so a viewer shows the tab
+     * in its own colour without losing what the terminal renders with.
+     */
+    @Test
+    fun metaFrames_carryTheTabBackground() {
+        assertEquals(
+            TabAtelier.Frame.Meta(
+                name = null,
+                grid = null,
+                bgColor = "#002451",
+            ),
+            transport.decodeFrame(frame(0x03, """{"bg_color":"#002451"}""")),
+        )
+        assertEquals(
+            "all three fields arrive in one frame, so all three must survive it",
+            TabAtelier.Frame.Meta(
+                name = "build-2",
+                grid = TabAtelier.Frame.Meta.Grid(rows = 48, cols = 193),
+                bgColor = "#451c2e",
+            ),
+            transport.decodeFrame(
+                frame(0x03, """{"name":"build-2","rows":48,"cols":193,"bg_color":"#451c2e"}"""),
+            ),
+        )
+    }
+
+    /**
+     * A background this client cannot use must leave the tab's usual one alone,
+     * rather than be passed on to be rendered.
+     *
+     * The daemon's own browser client validates the same shape before applying one,
+     * so a value that is not `#rrggbb` is a value neither end should act on — and
+     * the failure mode of guessing is an unreadable terminal, which is worse than
+     * ignoring a cosmetic field.
+     */
+    @Test
+    fun anUnusableTabBackground_isDroppedNotRendered() {
+        for (bad in listOf("#GGGGGG", "red", "#12345", "#1234567", "002451", "")) {
+            val decoded = transport.decodeFrame(
+                frame(0x03, """{"name":"tab","bg_color":"$bad"}"""),
+            ) as TabAtelier.Frame.Meta
+            assertEquals("a background of \"$bad\" is not a colour", null, decoded.bgColor)
+            assertEquals("the rest of the frame must still be usable", "tab", decoded.name)
+        }
+        // JSON null, the daemon's sentinel for "none", is not the string "null".
+        val nulled = transport.decodeFrame(frame(0x03, """{"name":"tab","bg_color":null}""")) as TabAtelier.Frame.Meta
+        assertEquals(null, nulled.bgColor)
+    }
+
     @Test
     fun metaFrames_withoutAUsableName_carryNoName() {
         // Nothing usable in the frame at all is Ignored, not an empty Meta: a
@@ -124,7 +178,7 @@ class TabAtelierTest {
         // Zero and the daemon's JSON null for "unknown" are both "not a size", and
         // neither is an error: the name from the same frame is still usable.
         assertEquals(
-            TabAtelier.Frame.Meta(name = "tab", grid = null),
+            TabAtelier.Frame.Meta(name = "tab", grid = null, bgColor = null),
             transport.decodeFrame(frame(0x03, """{"name":"tab","agent_kind":"claude"}""")),
         )
         assertEquals(

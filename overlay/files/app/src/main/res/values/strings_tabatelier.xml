@@ -59,4 +59,12 @@
 	     otherwise title themselves identically. Positional arguments, so a
 	     translation can order them as its own language needs. -->
 	<string name="tabatelier_console_title_with_tab">%1$s - %2$s</string>
+
+	<!-- The terminal's special-keys bar, reworked for Tab Atelier Remote into a
+	     two-row layout with a function-key page. Only the strings the app did not
+	     already have are here; the rest of the bar's labels are upstream's. -->
+	<string name="button_key_fn">FN</string>
+	<string name="image_description_function_keys">Show function keys</string>
+	<string name="image_description_back_to_keys">Back to the keys</string>
+	<string name="image_description_paste">Paste the clipboard into the terminal</string>
 </resources>

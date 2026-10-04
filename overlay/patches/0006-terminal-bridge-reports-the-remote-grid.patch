@@ -1,5 +1,5 @@
 diff --git a/app/src/main/java/org/connectbot/service/TerminalBridge.kt b/app/src/main/java/org/connectbot/service/TerminalBridge.kt
-index 208bd124..e1f75fee 100644
+index 208bd124..413c4d0b 100644
 --- a/app/src/main/java/org/connectbot/service/TerminalBridge.kt
 +++ b/app/src/main/java/org/connectbot/service/TerminalBridge.kt
 @@ -64,6 +64,7 @@ import org.connectbot.terminal.TerminalEmulatorFactory
@@ -10,7 +10,7 @@ index 208bd124..e1f75fee 100644
  import org.connectbot.transport.TransportFactory
  import org.connectbot.util.HostConstants
  import org.connectbot.util.PreferenceConstants
-@@ -292,6 +293,23 @@ class TerminalBridge {
+@@ -292,6 +293,34 @@ class TerminalBridge {
      private val _delKeyModeFlow = MutableStateFlow<DelKeyMode>(DelKeyMode.Delete)
      val delKeyModeFlow: StateFlow<DelKeyMode> = _delKeyModeFlow.asStateFlow()
  
@@ -31,10 +31,21 @@ index 208bd124..e1f75fee 100644
 +    private val _remoteTabName = MutableStateFlow<String?>(null)
 +    val remoteTabName: StateFlow<String?> = _remoteTabName.asStateFlow()
 +
++    // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): the background the
++    // remote end paints this tab's viewer in, as a `#rrggbb` string, or null when
++    // the tab has none of its own.
++    //
++    // The daemon gives each tab a background so its viewers can be told apart at a
++    // glance, and keeps the terminal's own colours — that is part of the tab —
++    // distinct from it. So this overrides the background only; the foreground
++    // stays whatever the terminal itself is rendering with.
++    private val _remoteBackgroundColor = MutableStateFlow<String?>(null)
++    val remoteBackgroundColor: StateFlow<String?> = _remoteBackgroundColor.asStateFlow()
++
      // Terminal emulator from ConnectBot Terminal library
      val terminalEmulator: TerminalEmulator
  
-@@ -787,6 +805,60 @@ class TerminalBridge {
+@@ -787,6 +816,81 @@ class TerminalBridge {
          onTextInputRequest?.invoke()
      }
  
@@ -72,6 +83,27 @@ index 208bd124..e1f75fee 100644
 +     */
 +    fun setRemoteTabName(name: String) {
 +        if (name.isNotBlank()) _remoteTabName.value = name
++    }
++
++    /**
++     * Told by a transport when the remote end reports the background its viewer for
++     * this tab is painted in.
++     *
++     * Added for Tab Atelier Remote (Apache-2.0 section 4(b)): the daemon gives each
++     * tab a background, so its viewers can be told apart. Passed on as the
++     * `#rrggbb` string it arrived as rather than parsed here — the bridge carries
++     * what the remote said, and the console is what turns it into a colour, so
++     * there is one place that decides what a usable colour is.
++     *
++     * **A null clears it, and that is deliberate.** A tab whose viewer has no
++     * background of its own must not inherit the colour of the tab a session was on
++     * before it, so the caller reports what the remote said rather than only the
++     * interesting values. Passing nothing at all is not possible for a switch,
++     * which is exactly the case that would otherwise leave the wrong colour on
++     * screen.
++     */
++    fun setRemoteBackgroundColor(color: String?) {
++        _remoteBackgroundColor.value = color
 +    }
 +
 +    /**
