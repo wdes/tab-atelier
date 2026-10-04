@@ -38,6 +38,8 @@ import org.connectbot.data.entity.Host
 import org.connectbot.data.entity.Profile
 import org.connectbot.data.entity.Pubkey
 import org.connectbot.di.CoroutineDispatchers
+import org.connectbot.tabatelier.TabAtelierClient
+import org.connectbot.transport.TabAtelier
 import org.connectbot.transport.Transport
 import org.connectbot.util.InstallMosh
 import org.connectbot.util.SecurePasswordStorage
@@ -66,6 +68,14 @@ data class HostEditorUiState(
     val ipVersion: String = "IPV4_AND_IPV6",
     val password: String = "",
     val hasExistingPassword: Boolean = false,
+    // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): the tab-atelier
+    // API token, kept in the same Keystore-backed store as a host password.
+    val tabAtelierToken: String = "",
+    val hasExistingToken: Boolean = false,
+    // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): a tab-atelier
+    // server is entered as one URL, which is the only field that can carry a
+    // scheme or a path prefix. Blank for every other protocol.
+    val tabAtelierUrl: String = "",
     val hasUnsavedChanges: Boolean = false,
     val isSaving: Boolean = false,
     // Mosh-specific fields
@@ -85,6 +95,10 @@ class HostEditorViewModel @Inject constructor(
     private val profileRepository: ProfileRepository,
     private val prefs: android.content.SharedPreferences,
     private val securePasswordStorage: SecurePasswordStorage,
+    // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): the client owns
+    // the one parser for a tab-atelier server URL, so the editor saves exactly
+    // what every later call will parse.
+    private val tabAtelierClient: TabAtelierClient,
     @ApplicationContext private val context: Context,
     private val dispatchers: CoroutineDispatchers,
 ) : ViewModel() {
@@ -155,13 +169,30 @@ class HostEditorViewModel @Inject constructor(
 
     private fun getDefaultPort(protocol: String): String = (Transport.fromProtocol(protocol)?.defaultPort ?: 0).toString()
 
+    /**
+     * The URL a tab-atelier host is reached at when none is recorded, from the
+     * hostname and port a host created from a `tabatelier://` link carries.
+     *
+     * Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): a link cannot
+     * express a scheme or a path, so https at the daemon's port is the only
+     * honest guess, and it is the editor's starting point rather than a value
+     * ever saved unlooked-at.
+     */
+    private fun defaultUrlFor(hostname: String, port: Int): String =
+        if (hostname.isBlank()) "" else "https://$hostname:$port"
+
+
     private fun loadHost() {
         viewModelScope.launch {
             _uiState.update { it.copy(isLoading = true) }
             try {
                 val host = repository.findHostById(hostId)
                 if (host != null) {
-                    val hasPassword = securePasswordStorage.hasPassword(hostId)
+                    val hasPassword = host.protocol != TabAtelier.PROTOCOL && securePasswordStorage.hasPassword(hostId)
+                    // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)):
+                    // a tab-atelier host's secret is its API token, in the same
+                    // per-host store.
+                    val hasToken = host.protocol == TabAtelier.PROTOCOL && securePasswordStorage.hasPassword(hostId)
                     _uiState.update {
                         it.copy(
                             nickname = host.nickname,
@@ -180,11 +211,23 @@ class HostEditorViewModel @Inject constructor(
                             jumpHostId = host.jumpHostId,
                             ipVersion = host.ipVersion,
                             hasExistingPassword = hasPassword,
+                            hasExistingToken = hasToken,
                             hasUnsavedChanges = false,
                             // Mosh-specific fields
                             moshPort = host.moshPort.toString(),
                             moshServer = host.moshServer ?: "",
                             locale = host.locale,
+                            // Changed for Tab Atelier Remote (Apache-2.0 section
+                            // 4(b)): the address a tab-atelier daemon is reached
+                            // at. A host stored before this column existed, or
+                            // one whose URL has been emptied elsewhere, starts
+                            // from the https address its hostname and port
+                            // describe.
+                            tabAtelierUrl = if (host.protocol == TabAtelier.PROTOCOL) {
+                                host.tabAtelierUrl ?: defaultUrlFor(host.hostname, host.port)
+                            } else {
+                                ""
+                            },
                             isLoading = false,
                         )
                     }
@@ -243,12 +286,42 @@ class HostEditorViewModel @Inject constructor(
 
     fun updateProtocol(value: String) {
         val oldProtocol = _uiState.value.protocol
-        _uiState.update { it.copy(protocol = value, hasUnsavedChanges = true) }
+        _uiState.update { state ->
+            // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): a
+            // tab-atelier daemon is addressed as https://host:port, and the 22
+            // the editor starts on is never right for it. Adopt its own default
+            // port when the field still holds another protocol's default, so a
+            // freshly picked type does not silently point at port 22.
+            val port = if (value == TabAtelier.PROTOCOL &&
+                (state.port.isBlank() || state.port == getDefaultPort(oldProtocol))
+            ) {
+                getDefaultPort(value)
+            } else {
+                state.port
+            }
+            // The URL is what the tab-atelier type is actually saved from.
+            // When it is empty — a type just picked, or one picked on a host
+            // whose URL the form never held — seed it from the address the rest
+            // of the form already has, so the field is not blank on arrival.
+            val url = if (value == TabAtelier.PROTOCOL && state.tabAtelierUrl.isBlank()) {
+                defaultUrlFor(state.hostname, port.toIntOrNull() ?: TabAtelier.DEFAULT_PORT)
+            } else {
+                state.tabAtelierUrl
+            }
+            state.copy(protocol = value, port = port, tabAtelierUrl = url, hasUnsavedChanges = true)
+        }
 
         if (value == "mosh" && !InstallMosh.isInstalled(context)) {
             preMoshProtocol = oldProtocol
             installMosh(oldProtocol)
         }
+    }
+
+    // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): the tab-atelier
+    // server URL, the field the type is addressed and saved by.
+    fun updateTabAtelierUrl(value: String) {
+        nicknameAutofillEnabled = false
+        _uiState.update { it.copy(tabAtelierUrl = value, hasUnsavedChanges = true) }
     }
 
     fun cancelMoshInstall() {
@@ -349,6 +422,16 @@ class HostEditorViewModel @Inject constructor(
         _uiState.update { it.copy(password = "", hasExistingPassword = false, hasUnsavedChanges = true) }
     }
 
+    // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): the token for a
+    // tab-atelier daemon, which is the only credential that type has.
+    fun updateTabAtelierToken(value: String) {
+        _uiState.update { it.copy(tabAtelierToken = value, hasUnsavedChanges = true) }
+    }
+
+    fun clearSavedToken() {
+        _uiState.update { it.copy(tabAtelierToken = "", hasExistingToken = false, hasUnsavedChanges = true) }
+    }
+
     fun updateMoshPort(value: String) {
         if (value.isEmpty() || value.all { it.isDigit() }) {
             _uiState.update { it.copy(moshPort = value, hasUnsavedChanges = true) }
@@ -377,13 +460,36 @@ class HostEditorViewModel @Inject constructor(
             // Only SSH and Mosh hosts can have a jump host
             val jumpHostId = if (state.protocol == "ssh" || state.protocol == "mosh") state.jumpHostId else null
 
+            // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): a
+            // tab-atelier server is addressed by its URL, and nothing else
+            // speaks that type. The URL is stored canonically — default port
+            // elided, no trailing slash — so the row, the pin key and the
+            // request all agree on what the server is called; hostname and port
+            // are kept in step with it, for the shortcut intent and anything
+            // else that still reads the older fields. A URL that does not parse
+            // is refused here, where the caller can be told, rather than saving
+            // an address every later call would reject.
+            val tabAtelierBase = if (state.protocol == TabAtelier.PROTOCOL) {
+                tabAtelierClient.base(state.tabAtelierUrl)
+                    ?: throw IllegalArgumentException(
+                        "Enter the server's URL, beginning with http:// or https://",
+                    )
+            } else {
+                null
+            }
+            val hostname = tabAtelierBase?.host ?: state.hostname
+            val port = tabAtelierBase?.port
+                ?: state.port.toIntOrNull()
+                ?: getDefaultPort(state.protocol).toIntOrNull()
+                ?: 22
+
             val host = Host(
                 id = existingHost?.id ?: 0L,
                 nickname = state.nickname,
                 protocol = state.protocol,
                 username = state.username,
-                hostname = state.hostname,
-                port = state.port.toIntOrNull() ?: getDefaultPort(state.protocol).toIntOrNull() ?: 22,
+                hostname = hostname,
+                port = port,
                 color = state.color.takeIf { it != "gray" },
                 pubkeyId = state.pubkeyId,
                 profileId = state.profileId,
@@ -403,6 +509,10 @@ class HostEditorViewModel @Inject constructor(
                 moshPort = state.moshPort.toIntOrNull() ?: 0,
                 moshServer = state.moshServer.ifBlank { null },
                 locale = state.locale.ifBlank { "en_US.UTF-8" },
+                // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): the
+                // canonical URL, and null for every other protocol so a host
+                // switched away from tab-atelier does not keep one.
+                tabAtelierUrl = tabAtelierBase?.toString(),
             )
 
             val savedHost = repository.saveHost(host)
@@ -417,6 +527,25 @@ class HostEditorViewModel @Inject constructor(
                     securePasswordStorage.deletePassword(savedHost.id)
                 }
                 // If password is empty but hasExistingPassword is true, keep existing
+            }
+
+            // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): a
+            // tab-atelier host's secret is its API token, held in the same
+            // Keystore-backed per-host store. Switching a host's type away from
+            // tab-atelier must not leave that token sitting in the slot that now
+            // holds an SSH password.
+            when {
+                state.protocol == TabAtelier.PROTOCOL -> {
+                    if (state.tabAtelierToken.isNotEmpty()) {
+                        securePasswordStorage.savePassword(savedHost.id, state.tabAtelierToken)
+                    } else if (!state.hasExistingToken) {
+                        securePasswordStorage.deletePassword(savedHost.id)
+                    }
+                }
+
+                existingHost?.protocol == TabAtelier.PROTOCOL && state.password.isEmpty() -> {
+                    securePasswordStorage.deletePassword(savedHost.id)
+                }
             }
             return true
         } catch (e: Exception) {

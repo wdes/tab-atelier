@@ -52,7 +52,7 @@ import timber.log.Timber
 @Composable
 fun ConnectBotNavHost(
     navController: NavHostController,
-    onNavigateToConsole: (Host) -> Unit,
+    onNavigateToConsole: (Host, String?) -> Unit,
     modifier: Modifier = Modifier,
     startDestination: String = NavDestinations.HOST_LIST,
     makingShortcut: Boolean = false,
@@ -101,9 +101,18 @@ fun ConnectBotNavHost(
         }
 
         composable(
-            route = "${NavDestinations.CONSOLE}/{${NavArgs.HOST_ID}}",
+            // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): the tab
+            // is optional, so a tab-atelier tab can be opened by tapping it.
+            // Absent for every other protocol, and absent when a tab-atelier
+            // host is opened without choosing one of its tabs.
+            route = "${NavDestinations.CONSOLE}/{${NavArgs.HOST_ID}}?${NavArgs.TAB_KEY}={${NavArgs.TAB_KEY}}",
             arguments = listOf(
                 navArgument(NavArgs.HOST_ID) { type = NavType.LongType },
+                navArgument(NavArgs.TAB_KEY) {
+                    type = NavType.StringType
+                    nullable = true
+                    defaultValue = null
+                },
             ),
         ) {
             ConsoleScreen(

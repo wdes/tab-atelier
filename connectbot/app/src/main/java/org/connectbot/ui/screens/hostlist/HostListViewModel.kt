@@ -24,6 +24,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -40,6 +41,10 @@ import org.connectbot.data.entity.Pubkey
 import org.connectbot.di.CoroutineDispatchers
 import org.connectbot.service.ServiceError
 import org.connectbot.service.TerminalManager
+import org.connectbot.tabatelier.TabAtelierClient
+import org.connectbot.tabatelier.TabAtelierTab
+import org.connectbot.tabatelier.tabAtelierErrorMessage
+import org.connectbot.transport.TabAtelier
 import org.connectbot.util.PreferenceConstants
 import javax.inject.Inject
 
@@ -49,8 +54,80 @@ enum class ConnectionState {
     DISCONNECTED,
 }
 
+/**
+ * One row of the host list.
+ *
+ * A tab-atelier host expands into its daemon's tabs, so the list is a single
+ * flattened row list rather than a list of hosts: `LazyColumn` keys must be
+ * unique across hosts and tabs alike.
+ *
+ * New type for Tab Atelier Remote (Apache-2.0 section 4(b)): upstream renders
+ * `uiState.hosts` directly.
+ */
+sealed class HostListRow {
+    /** Stable key for `LazyColumn`, unique across hosts and tabs. */
+    abstract val key: String
+
+    /** A host, as upstream renders it. */
+    data class HostRow(
+        val host: Host,
+        val expanded: Boolean = false,
+        val tabsLoading: Boolean = false,
+    ) : HostListRow() {
+        override val key: String = "host-${host.id}"
+
+        val isTabAtelier: Boolean get() = host.protocol == TabAtelier.PROTOCOL
+    }
+
+    /** One tab of a tab-atelier host, indented under its server row. */
+    data class TabRow(
+        // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): the tab's
+        // host, so tapping the row can open that host's session. hostId alone
+        // would mean looking the host up again in the UI layer.
+        val host: Host,
+        val hostId: Long,
+        val index: Int,
+        val tab: TabAtelierTab,
+    ) : HostListRow() {
+        // The daemon may omit a tab id; the index keeps keys unique either way.
+        override val key: String = "host-$hostId-tab-${tab.id.ifEmpty { "index-$index" }}"
+    }
+
+    /** A note under a tab-atelier host's row: loading, empty, or a failure. */
+    data class TabStatusRow(
+        val hostId: Long,
+        val status: TabStatus,
+        val detail: String? = null,
+    ) : HostListRow() {
+        override val key: String = "host-$hostId-tab-status"
+    }
+}
+
+/** Why a tab-atelier host's row has no tabs under it. */
+enum class TabStatus {
+    LOADING,
+    EMPTY,
+    ERROR,
+}
+
+/**
+ * What the list knows about one tab-atelier host's tabs.
+ *
+ * Held per host id, so one unreachable server shows its own error and nothing
+ * else on the list is affected.
+ */
+data class TabListState(
+    val loading: Boolean = false,
+    val tabs: List<TabAtelierTab> = emptyList(),
+    val error: String? = null,
+)
+
 data class HostListUiState(
     val hosts: List<Host> = emptyList(),
+    // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): the per-host tab
+    // state and which tab-atelier servers are collapsed.
+    val tabStates: Map<Long, TabListState> = emptyMap(),
+    val collapsedTabHosts: Set<Long> = emptySet(),
     val connectionStates: Map<Long, ConnectionState> = emptyMap(),
     val isLoading: Boolean = false,
     val error: String? = null,
@@ -60,7 +137,63 @@ data class HostListUiState(
     val importResult: ImportResult? = null,
     val startupKeyPrompt: Pubkey? = null,
     val startupKeyWrongPassword: Boolean = false,
-)
+) {
+    /**
+     * The host list flattened into rows: hosts, and under an expanded
+     * tab-atelier host its daemon's tabs.
+     *
+     * Derived rather than stored, so a state built by hand — a preview, a test —
+     * still renders its hosts, and there is no second copy of the list to keep
+     * in step. `LazyColumn` keys must be unique across hosts and tabs alike,
+     * which is why the two live in one row list.
+     */
+    val rows: List<HostListRow>
+        get() = flattenHostRows(hosts, tabStates, collapsedTabHosts)
+}
+
+/**
+ * Flatten hosts and their tabs into one row list.
+ *
+ * A host that is not a tab-atelier server contributes exactly its own row, so
+ * nothing about its appearance or behaviour changes.
+ */
+private fun flattenHostRows(
+    hosts: List<Host>,
+    tabStates: Map<Long, TabListState>,
+    collapsed: Set<Long>,
+): List<HostListRow> = buildList {
+    hosts.forEach { host ->
+        val expanded = host.protocol == TabAtelier.PROTOCOL && host.id !in collapsed
+        val state = tabStates[host.id]
+        add(
+            HostListRow.HostRow(
+                host = host,
+                expanded = expanded,
+                tabsLoading = state?.loading == true,
+            ),
+        )
+        if (!expanded) return@forEach
+
+        when {
+            // A refresh that already has tabs to show keeps showing them; the
+            // loading note is only for the first fetch.
+            state == null || (state.loading && state.tabs.isEmpty()) -> add(
+                HostListRow.TabStatusRow(host.id, TabStatus.LOADING),
+            )
+
+            state.error != null -> add(
+                HostListRow.TabStatusRow(host.id, TabStatus.ERROR, state.error),
+            )
+
+            state.tabs.isEmpty() -> add(
+                HostListRow.TabStatusRow(host.id, TabStatus.EMPTY),
+            )
+        }
+        state?.tabs?.forEachIndexed { index, tab ->
+            add(HostListRow.TabRow(host, host.id, index, tab))
+        }
+    }
+}
 
 data class ImportResult(
     val hostsImported: Int,
@@ -80,9 +213,26 @@ class HostListViewModel @Inject constructor(
     private val repository: HostRepository,
     private val dispatchers: CoroutineDispatchers,
     private val sharedPreferences: SharedPreferences,
+    private val tabAtelierClient: TabAtelierClient,
 ) : ViewModel() {
 
     private var terminalManager: TerminalManager? = null
+
+    /**
+     * What a tab-atelier host's probe depends on: the URL it is reached at, and
+     * whether a token is stored for it. Nothing else about a host is part of it,
+     * and `lastConnect` in particular is not: ConnectBot touches it on every
+     * connect and the hosts Flow emits for that, so re-probing on every emission
+     * would hit the daemon each time a session starts.
+     */
+    private data class ProbeFingerprint(val url: String, val hasToken: Boolean)
+
+    /**
+     * The fingerprint each tab-atelier host was last probed with, by host id.
+     * A host is probed when it is new, or when this no longer matches — which is
+     * what an edit that changes its URL or its token does, and nothing else.
+     */
+    private val probeFingerprints = mutableMapOf<Long, ProbeFingerprint>()
     private val _uiState = MutableStateFlow(
         HostListUiState(
             isLoading = true,
@@ -127,7 +277,119 @@ class HostListViewModel @Inject constructor(
                     _uiState.update {
                         it.copy(hosts = hosts, isLoading = false, error = null)
                     }
+                    // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)):
+                    // fetch each tab-atelier server's tabs as the list loads.
+                    syncTabAtelierHosts(hosts)
                 }
+        }
+    }
+
+    /**
+     * Probe every tab-atelier host whose [ProbeFingerprint] has changed, and
+     * drop state for hosts that are gone.
+     */
+    private fun syncTabAtelierHosts(hosts: List<Host>) {
+        val tabHosts = hosts.filter { it.protocol == TabAtelier.PROTOCOL }
+        val ids = tabHosts.map { it.id }.toSet()
+        probeFingerprints.keys.retainAll(ids)
+        _uiState.update { state ->
+            state.copy(tabStates = state.tabStates.filterKeys { it in ids })
+        }
+        tabHosts.forEach { host ->
+            val fingerprint = fingerprintOf(host)
+            if (probeFingerprints[host.id] == fingerprint) return@forEach
+            probeFingerprints[host.id] = fingerprint
+            // An edited server is probed from scratch: what the last probe found
+            // belongs to an address or a token that is no longer this server's,
+            // and leaving its error on the row is what makes a server someone
+            // just fixed look broken until something else reloads the list.
+            forgetTabs(host.id)
+            fetchTabs(host)
+        }
+    }
+
+    /** What a host's probe depends on: its URL, and whether it has a token. */
+    private fun fingerprintOf(host: Host): ProbeFingerprint = ProbeFingerprint(
+        url = host.tabAtelierUrl.orEmpty(),
+        hasToken = tabAtelierClient.hasToken(host.id),
+    )
+
+    /** Drop a host's tabs, and with them whatever the last probe said. */
+    private fun forgetTabs(hostId: Long) {
+        _uiState.update { state -> state.copy(tabStates = state.tabStates - hostId) }
+    }
+
+    /**
+     * Reload one tab-atelier host's tabs. Also the "offer a refresh" action on
+     * its row.
+     */
+    fun refreshTabs(host: Host) {
+        if (host.protocol != TabAtelier.PROTOCOL) return
+        // A manual refresh probes even when nothing about the server changed,
+        // and records what it probed with, so the next unchanged emission does
+        // not read as a change and probe a second time.
+        probeFingerprints[host.id] = fingerprintOf(host)
+        fetchTabs(host)
+    }
+
+    /**
+     * Expand or collapse a tab-atelier host's tabs.
+     */
+    fun toggleTabHost(hostId: Long) {
+        _uiState.update { state ->
+            val collapsed = if (hostId in state.collapsedTabHosts) {
+                state.collapsedTabHosts - hostId
+            } else {
+                state.collapsedTabHosts + hostId
+            }
+            state.copy(collapsedTabHosts = collapsed)
+        }
+    }
+
+    private fun fetchTabs(host: Host) {
+        viewModelScope.launch {
+            _uiState.update { state ->
+                val previous = state.tabStates[host.id]
+                val tabStates = state.tabStates +
+                    (host.id to TabListState(loading = true, tabs = previous?.tabs ?: emptyList()))
+                state.copy(tabStates = tabStates)
+            }
+
+            val result = try {
+                Result.success(
+                    withContext(dispatchers.io) {
+                        // Changed for Tab Atelier Remote (Apache-2.0 section
+                        // 4(b)): the host is addressed by its URL, which carries
+                        // the scheme — http is not upgraded to https — and any
+                        // path prefix. A URL that does not parse is reported as
+                        // this server's error rather than fetched from a guess.
+                        val base = tabAtelierClient.base(host.tabAtelierUrl)
+                            ?: throw IllegalStateException(
+                                context.getString(R.string.tabatelier_url_invalid),
+                            )
+                        tabAtelierClient.fetchTabs(host.id, base, tabAtelierClient.token(host.id))
+                    },
+                )
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+
+            _uiState.update { state ->
+                val previous = state.tabStates[host.id]
+                val tabState = result.fold(
+                    onSuccess = { TabListState(loading = false, tabs = it) },
+                    onFailure = {
+                        TabListState(
+                            loading = false,
+                            tabs = previous?.tabs ?: emptyList(),
+                            error = tabAtelierErrorMessage(it),
+                        )
+                    },
+                )
+                state.copy(tabStates = state.tabStates + (host.id to tabState))
+            }
         }
     }
 
@@ -222,6 +484,13 @@ class HostListViewModel @Inject constructor(
             try {
                 terminalManager?.disconnectHost(host.id)
                 repository.deleteHost(host)
+                // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)):
+                // the host's API token and certificate pin go with it, the way
+                // the repository drops an SSH password.
+                if (host.protocol == TabAtelier.PROTOCOL) {
+                    tabAtelierClient.forgetHost(host.id)
+                }
+                probeFingerprints.remove(host.id)
             } catch (e: Exception) {
                 _uiState.update {
                     it.copy(error = e.message ?: "Failed to delete host")

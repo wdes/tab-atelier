@@ -74,6 +74,8 @@
 				<data android:scheme="mosh"/>
 				<data android:scheme="telnet"/>
 				<data android:scheme="local"/>
+				<!-- Changed for Tab Atelier Remote (Apache-2.0 section 4(b)). -->
+				<data android:scheme="tabatelier"/>
 			</intent-filter>
 			<intent-filter>
 				<action android:name="android.intent.action.VIEW"/>
@@ -85,10 +87,13 @@
 				<data android:scheme="mosh"/>
 				<data android:scheme="telnet"/>
 				<data android:scheme="local"/>
+				<!-- Changed for Tab Atelier Remote (Apache-2.0 section 4(b)). -->
+				<data android:scheme="tabatelier"/>
 				<!-- format:  ssh://user@host:port/#nickname  -->
 				<!-- format:  mosh://user@host:port/#nickname  -->
 				<!-- format:  telnet://host:port/#nickname  -->
 				<!-- format:  local://  -->
+				<!-- format:  tabatelier://host:port/#nickname  -->
 			</intent-filter>
 		</activity>
 

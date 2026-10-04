@@ -33,15 +33,23 @@ import org.connectbot.data.entity.Host
 import org.connectbot.di.CoroutineDispatchers
 import org.connectbot.service.ServiceError
 import org.connectbot.service.TerminalManager
+import org.connectbot.tabatelier.TabAtelierBase
+import org.connectbot.tabatelier.TabAtelierClient
+import org.connectbot.tabatelier.TabAtelierTab
+import org.connectbot.transport.TabAtelier
 import org.connectbot.util.PreferenceConstants
 import org.junit.After
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 import org.mockito.kotlin.any
+import org.mockito.kotlin.anyOrNull
 import org.mockito.kotlin.inOrder
 import org.mockito.kotlin.mock
+import org.mockito.kotlin.times
 import org.mockito.kotlin.verify
 import org.mockito.kotlin.whenever
 
@@ -63,6 +71,7 @@ class HostListViewModelTest {
     private lateinit var editor: SharedPreferences.Editor
     private lateinit var hostsFlow: MutableStateFlow<List<Host>>
     private lateinit var hostsSortedByColorFlow: MutableStateFlow<List<Host>>
+    private lateinit var tabAtelierClient: TabAtelierClient
 
     @Before
     fun setUp() {
@@ -72,6 +81,7 @@ class HostListViewModelTest {
         repository = mock()
         sharedPreferences = mock()
         editor = mock()
+        tabAtelierClient = mock()
         hostsFlow = MutableStateFlow(emptyList())
         hostsSortedByColorFlow = MutableStateFlow(emptyList())
 
@@ -89,7 +99,7 @@ class HostListViewModelTest {
     private fun createViewModel(sortedByColor: Boolean = false): HostListViewModel {
         whenever(sharedPreferences.getBoolean(PreferenceConstants.SORT_BY_COLOR, false))
             .thenReturn(sortedByColor)
-        return HostListViewModel(context, repository, dispatchers, sharedPreferences)
+        return HostListViewModel(context, repository, dispatchers, sharedPreferences, tabAtelierClient)
     }
 
     private fun createTerminalManager(): TerminalManager {
@@ -229,5 +239,161 @@ class HostListViewModelTest {
         val inOrder = inOrder(terminalManager, repository)
         inOrder.verify(terminalManager).disconnectHost(host.id)
         inOrder.verify(repository).deleteHost(host)
+    }
+
+    // ---- What re-probes a tab-atelier server, and what deliberately does not -
+    //
+    // A host's tabs are keyed by host id and only re-read when the fingerprint
+    // of what decides the probe — its URL, and whether a token is stored for it
+    // — changes. These tests pin which host writes reach the daemon, because
+    // the hosts Flow also emits for writes that have nothing to do with the
+    // server's configuration. See HostListViewModel.ProbeFingerprint.
+
+    private fun tabAtelierHost(id: Long = 7L, url: String = DAEMON_URL) = Host(
+        id = id,
+        nickname = "daemon",
+        protocol = TabAtelier.PROTOCOL,
+        hostname = "daemon.example",
+        port = 443,
+        tabAtelierUrl = url,
+    )
+
+    /** TabAtelierBase.parse is pure, so the URL parse under test is the real one. */
+    private fun stubBase(vararg urls: String) {
+        urls.forEach { url ->
+            whenever(tabAtelierClient.base(url))
+                .thenReturn(TabAtelierBase.parse(url) ?: error("not a URL: $url"))
+        }
+    }
+
+    /**
+     * The save-from-editor path: a server that could not be reached, whose URL
+     * the user then corrects and saves.
+     *
+     * Expected: the server is probed again and the stale error is gone, because
+     * an error left on the row reads as the edit not having worked.
+     */
+    @Test
+    fun savingAnEditedServer_reprobesIt_andClearsTheStaleError() = runTest {
+        stubBase(DAEMON_URL, FIXED_URL)
+        whenever(tabAtelierClient.fetchTabs(any(), any(), anyOrNull()))
+            .thenThrow(IllegalStateException("connection refused"))
+            .thenReturn(listOf(TabAtelierTab(id = "t1", name = "shell")))
+
+        val host = tabAtelierHost()
+        val viewModel = createViewModel()
+        hostsFlow.value = listOf(host)
+        advanceUntilIdle()
+        assertTrue(
+            "the failed probe should be on the row",
+            viewModel.uiState.value.tabStates[host.id]?.error != null,
+        )
+
+        // Saving the corrected URL is an ordinary host write, and reaches this
+        // ViewModel as the hosts Flow.
+        hostsFlow.value = listOf(host.copy(tabAtelierUrl = FIXED_URL))
+        advanceUntilIdle()
+
+        val state = viewModel.uiState.value.tabStates[host.id]
+        assertNull("the corrected server should not keep the old error", state?.error)
+        assertEquals(1, state?.tabs?.size)
+        verify(tabAtelierClient, times(2)).fetchTabs(any(), any(), anyOrNull())
+    }
+
+    /** A changed URL re-probes the server it now names. */
+    @Test
+    fun aChangedUrl_reprobesTheServer() = runTest {
+        stubBase(DAEMON_URL, FIXED_URL)
+        whenever(tabAtelierClient.fetchTabs(any(), any(), anyOrNull())).thenReturn(emptyList())
+
+        val host = tabAtelierHost()
+        createViewModel()
+        hostsFlow.value = listOf(host)
+        advanceUntilIdle()
+        verify(tabAtelierClient, times(1)).fetchTabs(any(), any(), anyOrNull())
+
+        hostsFlow.value = listOf(host.copy(tabAtelierUrl = FIXED_URL))
+        advanceUntilIdle()
+        verify(tabAtelierClient, times(2)).fetchTabs(any(), any(), anyOrNull())
+    }
+
+    /**
+     * Adding a token re-probes: a daemon that refused the first probe because it
+     * wants a token must be asked again once the editor has stored one. The
+     * address is unchanged, so this is the token half of the fingerprint.
+     */
+    @Test
+    fun storingAToken_reprobesTheServer() = runTest {
+        stubBase(DAEMON_URL)
+        whenever(tabAtelierClient.fetchTabs(any(), any(), anyOrNull())).thenReturn(emptyList())
+
+        val host = tabAtelierHost()
+        createViewModel()
+        hostsFlow.value = listOf(host)
+        advanceUntilIdle()
+        verify(tabAtelierClient, times(1)).fetchTabs(any(), any(), anyOrNull())
+
+        whenever(tabAtelierClient.hasToken(host.id)).thenReturn(true)
+        // A distinct value, so the state flow emits; lastConnect is deliberately
+        // not part of the fingerprint.
+        hostsFlow.value = listOf(host.copy(lastConnect = 1L))
+        advanceUntilIdle()
+        verify(tabAtelierClient, times(2)).fetchTabs(any(), any(), anyOrNull())
+    }
+
+    /**
+     * "Clear saved token" re-probes, and drops the error the unauthorised probe
+     * left: that error describes a credential that is no longer stored.
+     */
+    @Test
+    fun clearingTheToken_reprobesTheServer_andDropsTheUnauthorisedError() = runTest {
+        stubBase(DAEMON_URL)
+        whenever(tabAtelierClient.hasToken(7L)).thenReturn(true)
+        whenever(tabAtelierClient.fetchTabs(any(), any(), anyOrNull()))
+            .thenThrow(IllegalStateException("GET $DAEMON_URL/tabs returned HTTP 401"))
+            .thenReturn(emptyList())
+
+        val host = tabAtelierHost()
+        val viewModel = createViewModel()
+        hostsFlow.value = listOf(host)
+        advanceUntilIdle()
+        assertTrue(viewModel.uiState.value.tabStates[host.id]?.error != null)
+
+        whenever(tabAtelierClient.hasToken(7L)).thenReturn(false)
+        hostsFlow.value = listOf(host.copy(lastConnect = 1L))
+        advanceUntilIdle()
+
+        assertNull(
+            "the error belonged to the token that was cleared",
+            viewModel.uiState.value.tabStates[host.id]?.error,
+        )
+        verify(tabAtelierClient, times(2)).fetchTabs(any(), any(), anyOrNull())
+    }
+
+    /**
+     * The trap the fingerprint exists for. ConnectBot writes `lastConnect` when
+     * a session starts, so the hosts Flow emits while the user is doing
+     * something else entirely; that write must not reach the daemon, or every
+     * connect would re-probe every server.
+     */
+    @Test
+    fun anUnrelatedHostWrite_doesNotReprobeTheServer() = runTest {
+        stubBase(DAEMON_URL)
+        whenever(tabAtelierClient.fetchTabs(any(), any(), anyOrNull())).thenReturn(emptyList())
+
+        val host = tabAtelierHost()
+        createViewModel()
+        hostsFlow.value = listOf(host)
+        advanceUntilIdle()
+
+        hostsFlow.value = listOf(host.copy(lastConnect = System.currentTimeMillis()))
+        advanceUntilIdle()
+
+        verify(tabAtelierClient, times(1)).fetchTabs(any(), any(), anyOrNull())
+    }
+
+    private companion object {
+        const val DAEMON_URL = "https://daemon.example"
+        const val FIXED_URL = "https://fixed.example"
     }
 }

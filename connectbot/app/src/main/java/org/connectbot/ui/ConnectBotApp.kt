@@ -47,7 +47,7 @@ fun ConnectBotApp(
     onAuthenticationSuccess: () -> Unit,
     onRetryMigration: () -> Unit,
     onSelectShortcut: (Host, String?, IconStyle) -> Unit,
-    onNavigateToConsole: (Host) -> Unit,
+    onNavigateToConsole: (Host, String?) -> Unit,
     modifier: Modifier = Modifier,
     shouldShowNotificationWarning: () -> Boolean = { false },
     onNotificationSnackbarFinish: () -> Unit = {},

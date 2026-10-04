@@ -60,6 +60,12 @@ class ConsoleViewModel @Inject constructor(
     private val notificationPermissionHelper: NotificationPermissionHelper,
 ) : ViewModel() {
     private val hostId: Long = savedStateHandle.get<Long>("hostId") ?: -1L
+
+    // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): which of a
+    // tab-atelier daemon's tabs this console is for, when the route named one.
+    // Absent for every other protocol, and for a tab-atelier host opened without
+    // choosing a tab.
+    private val tabKey: String? = savedStateHandle.get<String>("tab")
     private var terminalManager: TerminalManager? = null
     private var pendingInitialHostId: Long? = hostId.takeIf { it != -1L }
     private var selectedHostId: Long? = null
@@ -223,7 +229,7 @@ class ConsoleViewModel @Inject constructor(
                     if (hostId < 0L) {
                         handleInitialSelectionError("Temporary connection not found")
                     } else {
-                        val bridge = terminalManager?.openConnectionForHostId(hostId)
+                        val bridge = terminalManager?.openConnectionForHostId(hostId, tabKey)
                         if (bridge == null) {
                             handleInitialSelectionError("Failed to open connection: host not found")
                         }

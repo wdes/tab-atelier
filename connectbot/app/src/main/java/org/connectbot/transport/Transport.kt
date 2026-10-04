@@ -19,6 +19,9 @@ package org.connectbot.transport
 
 import android.content.Context
 import android.net.Uri
+// Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): aliased because
+// this file also declares a Transport.TabAtelier object below.
+import org.connectbot.transport.TabAtelier as TabAtelierProtocol
 
 /**
  * Sealed class representing the available transport types in ConnectBot.
@@ -118,6 +121,26 @@ sealed class Transport {
         override fun parseUri(input: String): Uri? = org.connectbot.transport.Mosh.getUri(input)
     }
 
+    /**
+     * Tab Atelier transport - a tab-atelier daemon, serving terminal tabs over
+     * HTTP + WebSocket.
+     *
+     * Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): added here, not
+     * in upstream ConnectBot. The daemon's own default port is 443, since its
+     * URL is https/wss.
+     */
+    object TabAtelier : Transport() {
+        override val protocolName = TabAtelierProtocol.PROTOCOL
+        override val defaultPort = TabAtelierProtocol.DEFAULT_PORT
+        override val usesNetwork = true
+
+        override fun getFormatHint(context: Context): String = TabAtelierProtocol.getFormatHint(context)
+
+        override fun createInstance(): AbsTransport = TabAtelierProtocol()
+
+        override fun parseUri(input: String): Uri? = TabAtelierProtocol.getUri(input)
+    }
+
     companion object {
         /**
          * Get a transport by its protocol name.
@@ -129,6 +152,8 @@ sealed class Transport {
             "mosh" -> Mosh
             "telnet" -> Telnet
             "local" -> Local
+            // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)).
+            TabAtelierProtocol.PROTOCOL -> TabAtelier
             else -> null
         }
 
@@ -136,7 +161,7 @@ sealed class Transport {
          * Get all available transports
          */
         @JvmStatic
-        fun allTransports(): List<Transport> = listOf(Ssh, Mosh, Telnet, Local)
+        fun allTransports(): List<Transport> = listOf(Ssh, Mosh, Telnet, Local, TabAtelier)
 
         /**
          * Get transport from a URI

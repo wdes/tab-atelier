@@ -126,6 +126,20 @@ data class Host(
      */
     @ColumnInfo(name = "locale", defaultValue = "en_US.UTF-8")
     val locale: String = "en_US.UTF-8",
+
+    /**
+     * A tab-atelier daemon's base URL: its scheme (`http` or `https`, which
+     * decides whether TLS is used at all), host, port and optional path prefix,
+     * e.g. `https://host:8443/prefix`. Null for every other protocol, which is
+     * addressed by [hostname] and [port] alone.
+     *
+     * Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): neither a
+     * scheme nor a path prefix fits hostname/port, so this needed a column of
+     * its own. The API token deliberately stays out of the database, in the
+     * Keystore-backed per-host store.
+     */
+    @ColumnInfo(name = "tabatelier_url")
+    val tabAtelierUrl: String? = null,
 ) {
     /**
      * Check if this host is temporary (not saved to database).
@@ -144,6 +158,21 @@ data class Host(
         // Build authority based on protocol
         when (protocol) {
             "local" -> {
+                builder.fragment(nickname)
+            }
+
+            // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): a
+            // tab-atelier host is addressed by hostname and port like SSH, but
+            // has no username to carry.
+            "tabatelier" -> {
+                val authority = buildString {
+                    append(hostname)
+                    if (port > 0) {
+                        append(':')
+                        append(port)
+                    }
+                }
+                builder.authority(authority)
                 builder.fragment(nickname)
             }
 

@@ -27,10 +27,13 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
@@ -42,11 +45,15 @@ import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Error
+import androidx.compose.material.icons.filled.ExpandLess
+import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.Link
 import androidx.compose.material.icons.filled.LinkOff
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
@@ -57,8 +64,10 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.ListItem
+import androidx.compose.material3.ListItemDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarDuration
 import androidx.compose.material3.SnackbarHost
@@ -84,6 +93,7 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.colorResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.core.graphics.toColorInt
 import androidx.hilt.lifecycle.viewmodel.compose.hiltViewModel
@@ -95,6 +105,8 @@ import org.connectbot.data.JsonImportReader
 import org.connectbot.data.JsonImportTooLargeException
 import org.connectbot.data.entity.Host
 import org.connectbot.data.entity.Pubkey
+import org.connectbot.tabatelier.TabAtelierTab
+import org.connectbot.transport.TabAtelier
 import org.connectbot.ui.LocalTerminalManager
 import org.connectbot.ui.PreviewScreen
 import org.connectbot.ui.components.DisconnectAllDialog
@@ -107,12 +119,33 @@ import java.io.IOException
 internal object HostListTestTags {
     fun itemRow(hostId: Long): String = "host_item_${hostId}_row"
     fun itemMenuButton(hostId: Long): String = "host_item_${hostId}_menu_button"
+
+    // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)).
+    fun tabStatus(hostId: Long): String = "host_item_${hostId}_tab_status"
+
+    /**
+     * One of a tab-atelier host's tabs, as a row.
+     *
+     * Added for Tab Atelier Remote: tapping a tab opens that tab's session, and
+     * the tab id has to reach the navigation for that to work. Without a stable
+     * tag there is no way to assert it does.
+     */
+    fun tabRow(hostId: Long, tabId: String): String = "host_item_${hostId}_tab_${tabId}_row"
+
+    /**
+     * The button that shows and hides a tab-atelier host's tab list.
+     *
+     * Tagged so a test can assert the control exists and is clickable: it began
+     * as a bare `Icon`, which is drawn but has no click action, so it could not
+     * be activated and was not announced as a button.
+     */
+    fun itemExpandButton(hostId: Long): String = "host_item_${hostId}_expand_button"
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun HostListScreen(
-    onNavigateToConsole: (Host) -> Unit,
+    onNavigateToConsole: (Host, String?) -> Unit,
     onNavigateToEditHost: (Host?) -> Unit,
     onNavigateToSettings: () -> Unit,
     onNavigateToPubkeys: () -> Unit,
@@ -266,6 +299,8 @@ fun HostListScreen(
         onNavigateToProfiles = onNavigateToProfiles,
         onNavigateToHelp = onNavigateToHelp,
         onToggleSortOrder = viewModel::toggleSortOrder,
+        onToggleTabHost = viewModel::toggleTabHost,
+        onRefreshTabs = viewModel::refreshTabs,
         onDeleteHost = viewModel::deleteHost,
         onDuplicateHost = viewModel::duplicateHost,
         onForgetHostKeys = viewModel::forgetHostKeys,
@@ -284,7 +319,7 @@ fun HostListScreen(
 @Composable
 fun HostListScreenContent(
     uiState: HostListUiState,
-    onNavigateToConsole: (Host) -> Unit,
+    onNavigateToConsole: (Host, String?) -> Unit,
     onNavigateToEditHost: (Host?) -> Unit,
     onNavigateToSettings: () -> Unit,
     onNavigateToPubkeys: () -> Unit,
@@ -292,6 +327,10 @@ fun HostListScreenContent(
     onNavigateToProfiles: () -> Unit,
     onNavigateToHelp: () -> Unit,
     onToggleSortOrder: () -> Unit,
+    // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): a tab-atelier
+    // host's row expands and refreshes its tabs.
+    onToggleTabHost: (Long) -> Unit = {},
+    onRefreshTabs: (Host) -> Unit = {},
     onDeleteHost: (Host) -> Unit,
     onDuplicateHost: (Host) -> Unit,
     onForgetHostKeys: (Host) -> Unit,
@@ -480,28 +519,57 @@ fun HostListScreenContent(
                         ),
                         verticalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
+                        // Changed for Tab Atelier Remote (Apache-2.0 section
+                        // 4(b)): the list is flattened into rows so a
+                        // tab-atelier server's tabs can sit under it with keys
+                        // of their own. A non-tab-atelier host contributes one
+                        // row and renders exactly as before.
                         items(
-                            items = uiState.hosts,
-                            key = { it.id },
-                        ) { host ->
-                            HostListItem(
-                                host = host,
-                                connectionState = uiState.connectionStates[host.id] ?: ConnectionState.UNKNOWN,
-                                onClick = {
-                                    if (makingShortcut) {
-                                        onSelectShortcut(host)
-                                    } else {
-                                        onNavigateToConsole(host)
-                                    }
-                                },
-                                onEdit = { onNavigateToEditHost(host) },
-                                onPortForwards = { onNavigateToPortForwards(host) },
-                                onDuplicate = { onDuplicateHost(host) },
-                                onForgetHostKeys = { onForgetHostKeys(host) },
-                                onDisconnect = { onDisconnectHost(host) },
-                                onDelete = { onDeleteHost(host) },
-                                makingShortcut = makingShortcut,
-                            )
+                            items = uiState.rows,
+                            key = { it.key },
+                        ) { row ->
+                            when (row) {
+                                is HostListRow.HostRow -> HostListItem(
+                                    host = row.host,
+                                    connectionState = uiState.connectionStates[row.host.id] ?: ConnectionState.UNKNOWN,
+                                    onClick = {
+                                        when {
+                                            makingShortcut -> onSelectShortcut(row.host)
+                                            row.isTabAtelier -> onToggleTabHost(row.host.id)
+                                            else -> onNavigateToConsole(row.host, null)
+                                        }
+                                    },
+                                    onEdit = { onNavigateToEditHost(row.host) },
+                                    onPortForwards = { onNavigateToPortForwards(row.host) },
+                                    onDuplicate = { onDuplicateHost(row.host) },
+                                    onForgetHostKeys = { onForgetHostKeys(row.host) },
+                                    onDisconnect = { onDisconnectHost(row.host) },
+                                    onDelete = { onDeleteHost(row.host) },
+                                    onRefreshTabs = { onRefreshTabs(row.host) },
+                                    makingShortcut = makingShortcut,
+                                    expanded = row.expanded,
+                                    tabsLoading = row.tabsLoading,
+                                    // The chevron does what tapping the row does
+                                    // for a tab-atelier server. The child consumes
+                                    // the tap, so it toggles once, not twice.
+                                    onToggleExpanded = { onToggleTabHost(row.host.id) },
+                                )
+
+                                // The tab the user tapped is the session to open.
+                                is HostListRow.TabRow -> TabAtelierTabRow(
+                                    tab = row.tab,
+                                    onOpen = { onNavigateToConsole(row.host, row.tab.id) },
+                                    modifier = Modifier.testTag(
+                                        HostListTestTags.tabRow(row.hostId, row.tab.id),
+                                    ),
+                                )
+
+                                is HostListRow.TabStatusRow -> TabAtelierStatusRow(
+                                    hostId = row.hostId,
+                                    status = row.status,
+                                    detail = row.detail,
+                                )
+                            }
                         }
                     }
                 }
@@ -533,7 +601,14 @@ private fun HostListItem(
     onDelete: () -> Unit,
     modifier: Modifier = Modifier,
     makingShortcut: Boolean = false,
+    // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): a tab-atelier
+    // server's row carries the state of its tabs and the action to reload them.
+    onRefreshTabs: () -> Unit = {},
+    expanded: Boolean = false,
+    tabsLoading: Boolean = false,
+    onToggleExpanded: () -> Unit = {},
 ) {
+    val isTabAtelier = host.protocol == TabAtelier.PROTOCOL
     var showMenu by remember { mutableStateOf(false) }
     var showDeleteDialog by remember { mutableStateOf(false) }
     var showDisconnectDialog by remember { mutableStateOf(false) }
@@ -553,7 +628,16 @@ private fun HostListItem(
     Column(modifier = modifier) {
         ListItem(
             supportingContent = {
-                Text("${host.protocol}://${host.hostname}:${host.port}")
+                // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): a
+                // tab-atelier host's address is its URL, scheme and path prefix
+                // included, so the row shows what was entered rather than the
+                // internal protocol token.
+                val subtitle = if (isTabAtelier) {
+                    host.tabAtelierUrl ?: host.hostname
+                } else {
+                    "${host.protocol}://${host.hostname}:${host.port}"
+                }
+                Text(subtitle)
             },
             leadingContent = {
                 Box(
@@ -575,9 +659,12 @@ private fun HostListItem(
                         contentAlignment = Alignment.Center,
                     ) {
                         Icon(
+                            // Changed for Tab Atelier Remote (Apache-2.0 section
+                            // 4(b)): the tab-atelier type gets a terminal glyph.
                             imageVector = when (host.protocol) {
                                 "ssh" -> Icons.Default.Computer
                                 "telnet" -> Icons.Default.Computer
+                                TabAtelier.PROTOCOL -> Icons.Default.Terminal
                                 else -> Icons.Default.Link
                             },
                             contentDescription = when (connectionState) {
@@ -621,17 +708,56 @@ private fun HostListItem(
             },
             trailingContent = {
                 if (!makingShortcut) {
+                    // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)):
+                    // a row's trailing content is laid out in a stack, not in
+                    // sequence, so two controls put there occupy the same
+                    // coordinates and whichever is drawn last takes every tap.
+                    // Measured before this Row existed: the chevron and the
+                    // overflow button were both at Rect.fromLTRB(1856.0, 192.0,
+                    // 1936.0, 272.0), and a tap on the chevron reached the
+                    // overflow button, so the tab list could not be hidden by its
+                    // own control. A Row is what gives each its own space.
                     Box {
-                        IconButton(
-                            onClick = { showMenu = true },
-                            modifier = Modifier.testTag(HostListTestTags.itemMenuButton(host.id)),
-                        ) {
-                            Icon(Icons.Default.MoreVert, contentDescription = stringResource(R.string.button_host_options))
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            if (isTabAtelier) {
+                                IconButton(
+                                    onClick = onToggleExpanded,
+                                    modifier = Modifier.testTag(HostListTestTags.itemExpandButton(host.id)),
+                                ) {
+                                    Icon(
+                                        imageVector = if (expanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
+                                        contentDescription = stringResource(
+                                            if (expanded) R.string.button_collapse else R.string.expand,
+                                        ),
+                                    )
+                                }
+                            }
+                            IconButton(
+                                onClick = { showMenu = true },
+                                modifier = Modifier.testTag(HostListTestTags.itemMenuButton(host.id)),
+                            ) {
+                                Icon(Icons.Default.MoreVert, contentDescription = stringResource(R.string.button_host_options))
+                            }
                         }
                         DropdownMenu(
                             expanded = showMenu,
                             onDismissRequest = { showMenu = false },
                         ) {
+                            // Changed for Tab Atelier Remote (Apache-2.0 section
+                            // 4(b)): re-read this server's tab list.
+                            if (isTabAtelier) {
+                                DropdownMenuItem(
+                                    text = { Text(stringResource(R.string.tabatelier_refresh_tabs)) },
+                                    onClick = {
+                                        showMenu = false
+                                        onRefreshTabs()
+                                    },
+                                    enabled = !tabsLoading,
+                                    leadingIcon = {
+                                        Icon(Icons.Default.Refresh, null)
+                                    },
+                                )
+                            }
                             DropdownMenuItem(
                                 text = { Text(stringResource(R.string.list_host_edit)) },
                                 onClick = {
@@ -845,7 +971,7 @@ private fun HostListScreenEmptyPreview() {
                 hosts = emptyList(),
                 isLoading = false,
             ),
-            onNavigateToConsole = {},
+            onNavigateToConsole = { _, _ -> },
             onNavigateToEditHost = {},
             onNavigateToSettings = {},
             onNavigateToPubkeys = {},
@@ -871,7 +997,7 @@ private fun HostListScreenLoadingPreview() {
                 hosts = emptyList(),
                 isLoading = true,
             ),
-            onNavigateToConsole = {},
+            onNavigateToConsole = { _, _ -> },
             onNavigateToEditHost = {},
             onNavigateToSettings = {},
             onNavigateToPubkeys = {},
@@ -898,7 +1024,7 @@ private fun HostListScreenErrorPreview() {
                 isLoading = false,
                 error = "Failed to load hosts from database",
             ),
-            onNavigateToConsole = {},
+            onNavigateToConsole = { _, _ -> },
             onNavigateToEditHost = {},
             onNavigateToSettings = {},
             onNavigateToPubkeys = {},
@@ -957,7 +1083,7 @@ private fun HostListScreenPopulatedPreview() {
                 ),
                 isLoading = false,
             ),
-            onNavigateToConsole = {},
+            onNavigateToConsole = { _, _ -> },
             onNavigateToEditHost = {},
             onNavigateToSettings = {},
             onNavigateToPubkeys = {},
@@ -1007,3 +1133,155 @@ private fun StartupKeyPasswordDialog(
         isPassword = true,
     )
 }
+
+/**
+ * One tab of a tab-atelier daemon, nested under its server's row.
+ *
+ * The row shows the tab's name with its last output line beneath it, plus
+ * unobtrusive markers for the states the daemon reports. Tapping it does
+ * nothing yet.
+ *
+ * Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): new, upstream has
+ * no nested rows.
+ */
+@Composable
+private fun TabAtelierTabRow(
+    tab: TabAtelierTab,
+    onOpen: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    ListItem(
+        leadingContent = {
+            Icon(
+                imageVector = Icons.Default.Terminal,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.size(20.dp),
+            )
+        },
+        supportingContent = {
+            tab.preview?.let { preview ->
+                Text(
+                    text = preview,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        },
+        trailingContent = {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                tab.agentState?.let { agentState ->
+                    TabMarker(text = agentState)
+                }
+                if (tab.active) {
+                    TabMarker(
+                        text = stringResource(R.string.tabatelier_tab_active),
+                        color = colorResource(R.color.host_green),
+                    )
+                }
+                if (tab.locked) {
+                    Icon(
+                        imageVector = Icons.Default.Lock,
+                        contentDescription = stringResource(R.string.tabatelier_tab_locked),
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.size(16.dp),
+                    )
+                }
+            }
+        },
+        colors = ListItemDefaults.colors(containerColor = Color.Transparent),
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(start = TAB_INDENT)
+            // Opens this tab's session. The host row holds the daemon; this row
+            // holds which of its terminals to attach to.
+            .clickable(onClick = onOpen),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                text = tab.name.ifEmpty { tab.id },
+                fontWeight = FontWeight.Medium,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f, fill = false),
+            )
+            tab.badge?.let { badge ->
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    text = badge,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+    }
+}
+
+/**
+ * A short, muted marker on a tab row — an agent state, or "active".
+ */
+@Composable
+private fun TabMarker(
+    text: String,
+    color: Color = MaterialTheme.colorScheme.onSurfaceVariant,
+) {
+    Text(
+        text = text,
+        style = MaterialTheme.typography.labelSmall,
+        color = color,
+        maxLines = 1,
+        overflow = TextOverflow.Ellipsis,
+        modifier = Modifier.padding(start = 8.dp),
+    )
+}
+
+/**
+ * The note under a tab-atelier server's row when it has no tabs to show: it is
+ * loading, it has none, or its fetch failed. A failed server shows its own note
+ * and does not affect any other row on the list.
+ *
+ * Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): new.
+ */
+@Composable
+private fun TabAtelierStatusRow(
+    hostId: Long,
+    status: TabStatus,
+    detail: String?,
+    modifier: Modifier = Modifier,
+) {
+    val text = when (status) {
+        TabStatus.LOADING -> stringResource(R.string.tabatelier_tabs_loading)
+        TabStatus.EMPTY -> stringResource(R.string.tabatelier_tabs_empty)
+        TabStatus.ERROR -> stringResource(R.string.tabatelier_tabs_error, detail.orEmpty())
+    }
+
+    Row(
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(start = TAB_INDENT, end = 16.dp, top = 4.dp, bottom = 12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        if (status == TabStatus.LOADING) {
+            CircularProgressIndicator(
+                modifier = Modifier.size(16.dp),
+                strokeWidth = 2.dp,
+            )
+            Spacer(modifier = Modifier.width(8.dp))
+        }
+        Text(
+            text = text,
+            style = MaterialTheme.typography.bodySmall,
+            color = if (status == TabStatus.ERROR) {
+                MaterialTheme.colorScheme.error
+            } else {
+                MaterialTheme.colorScheme.onSurfaceVariant
+            },
+            modifier = Modifier.testTag(HostListTestTags.tabStatus(hostId)),
+        )
+    }
+}
+
+/** How far a tab row is indented under its server's row. */
+private val TAB_INDENT = 44.dp

@@ -34,6 +34,7 @@ import org.connectbot.data.ProfileRepository
 import org.connectbot.data.PubkeyRepository
 import org.connectbot.data.entity.Host
 import org.connectbot.di.CoroutineDispatchers
+import org.connectbot.tabatelier.TabAtelierClient
 import org.connectbot.util.SecurePasswordStorage
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -63,6 +64,7 @@ class HostEditorViewModelTest {
     private lateinit var profileRepository: ProfileRepository
     private lateinit var prefs: SharedPreferences
     private lateinit var securePasswordStorage: SecurePasswordStorage
+    private lateinit var tabAtelierClient: TabAtelierClient
 
     @Before
     fun setUp() {
@@ -75,6 +77,7 @@ class HostEditorViewModelTest {
         profileRepository = mock(ProfileRepository::class.java)
         prefs = mock(SharedPreferences::class.java)
         securePasswordStorage = mock(SecurePasswordStorage::class.java)
+        tabAtelierClient = mock(TabAtelierClient::class.java)
 
         // Mock default behavior for observe calls
         `when`(pubkeyRepository.observeAll()).thenReturn(flowOf(emptyList()))
@@ -99,6 +102,7 @@ class HostEditorViewModelTest {
             profileRepository = profileRepository,
             prefs = prefs,
             securePasswordStorage = securePasswordStorage,
+            tabAtelierClient = tabAtelierClient,
             dispatchers = dispatchers,
         )
     }

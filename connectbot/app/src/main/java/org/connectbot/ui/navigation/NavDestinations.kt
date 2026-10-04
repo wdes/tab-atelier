@@ -46,4 +46,14 @@ object NavArgs {
     const val SCHEME_ID = "schemeId"
     const val PROFILE_ID = "profileId"
     const val FORWARD_ID = "forwardId"
+
+    /**
+     * Which of a tab-atelier daemon's tabs to open, when the route names one.
+     *
+     * Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): optional, and
+     * absent for every other protocol. A daemon's tabs are addressed by their own
+     * id, and a WebSocket cannot be asked for one after it is open, so the choice
+     * has to be made before the session starts.
+     */
+    const val TAB_KEY = "tab"
 }

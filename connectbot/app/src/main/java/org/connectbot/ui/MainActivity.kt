@@ -57,6 +57,7 @@ import org.connectbot.R
 import org.connectbot.data.entity.Host
 import org.connectbot.service.TerminalManager
 import org.connectbot.ui.components.DisconnectAllDialog
+import org.connectbot.ui.navigation.NavArgs
 import org.connectbot.ui.navigation.NavDestinations
 import org.connectbot.ui.theme.ConnectBotTheme
 import org.connectbot.util.IconStyle
@@ -82,6 +83,30 @@ class MainActivity : AppCompatActivity() {
 
     // Holds the host waiting for permission result; not compose state so it doesn't trigger navigation.
     private var hostAwaitingPermission: Host? = null
+
+    // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): which of a
+    // tab-atelier daemon's tabs the connection being waited on is for.
+    //
+    // It has to survive the same waits the host does — the notification
+    // permission dialog and the resume that follows it — or a tab chosen before
+    // the dialog would open the daemon with no tab. Null for every other
+    // protocol, and for a daemon opened without a chosen tab.
+    private var tabAwaitingPermission: String? = null
+    private var pendingTabConnection: String? = null
+
+    /**
+     * The console route for [hostId], carrying [tabKey] when the user chose one.
+     *
+     * A tab-atelier daemon's tabs are addressed by their own id, so which tab to
+     * open has to travel with the navigation rather than be looked up later.
+     * Every other protocol passes null and the route is what it always was.
+     */
+    private fun consoleRoute(hostId: Long, tabKey: String?): String =
+        if (tabKey.isNullOrBlank()) {
+            "${NavDestinations.CONSOLE}/$hostId"
+        } else {
+            "${NavDestinations.CONSOLE}/$hostId?${NavArgs.TAB_KEY}=${Uri.encode(tabKey)}"
+        }
     internal var makingShortcut by mutableStateOf(false)
     private var showDisconnectAllDialog by mutableStateOf(false)
 
@@ -243,8 +268,10 @@ class MainActivity : AppCompatActivity() {
                 if (appUiState is AppUiState.Ready) {
                     pendingHostConnection?.let { host ->
                         Timber.d("Navigating to console for pending host: ${host.nickname}")
+                        val tabKey = pendingTabConnection
                         pendingHostConnection = null
-                        navController.navigate("${NavDestinations.CONSOLE}/${host.id}")
+                        pendingTabConnection = null
+                        navController.navigate(consoleRoute(host.id, tabKey))
                     }
                 }
             }
@@ -263,8 +290,9 @@ class MainActivity : AppCompatActivity() {
                             // Handle host waiting for permission result
                             hostAwaitingPermission?.let { host ->
                                 appViewModel.onNotificationPermissionResult(isGranted = false)
-                                navController.navigate("${NavDestinations.CONSOLE}/${host.id}")
+                                navController.navigate(consoleRoute(host.id, tabAwaitingPermission))
                                 hostAwaitingPermission = null
+                                tabAwaitingPermission = null
                             }
                         },
                         onAllow = {
@@ -279,7 +307,9 @@ class MainActivity : AppCompatActivity() {
             }
 
             // Callback to check permission before navigating to console
-            val onNavigateToConsole: (Host) -> Unit = { host ->
+            // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): the tab
+            // rides along, so tapping one of a daemon's tabs opens that tab.
+            val onNavigateToConsole: (Host, String?) -> Unit = { host, tabKey ->
                 Timber.d("onNavigateToConsole called for host: ${host.nickname}")
 
                 // Check if connection persistence is enabled
@@ -288,13 +318,14 @@ class MainActivity : AppCompatActivity() {
 
                 if (!persistConnections || isNotificationPermissionGranted(context)) {
                     // Either persistence is disabled (no permission needed) or permission granted, navigate immediately
-                    navController.navigate("${NavDestinations.CONSOLE}/${host.id}")
+                    navController.navigate(consoleRoute(host.id, tabKey))
                 } else {
                     // Persistence is enabled but no permission - need to request permission.
                     // Store in hostAwaitingPermission (not compose state) so we don't navigate
                     // until after the permission result is written to prefs.
                     Timber.d("Requesting notification permission before connection")
                     hostAwaitingPermission = host
+                    tabAwaitingPermission = tabKey
                     val shouldShowRationale = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                         this@MainActivity.shouldShowRequestPermissionRationale(Manifest.permission.POST_NOTIFICATIONS)
                     } else {

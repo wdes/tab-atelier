@@ -95,6 +95,16 @@ class TerminalManager :
     private val hostBridgeMap: MutableMap<Host, WeakReference<TerminalBridge>> = HashMap()
     private val nicknameBridgeMap: MutableMap<String, WeakReference<TerminalBridge>> = HashMap()
 
+    // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): which of a
+    // tab-atelier daemon's tabs the next connection for a host should open.
+    //
+    // It cannot ride on the Host: a row describes the daemon, not one of its
+    // tabs, and a WebSocket has no way to ask for a tab once it is open. So the
+    // choice waits here between the tap that made it and the connect that uses
+    // it, and the transport takes it — taken, not read, so a later session
+    // cannot inherit the previous session's tab.
+    private val pendingTabKeys = ConcurrentHashMap<Long, String>()
+
     private val _disconnected = ArrayList<Host>()
     private val _disconnectedFlow = MutableStateFlow<List<Host>>(emptyList())
     val disconnectedFlow: StateFlow<List<Host>> = _disconnectedFlow.asStateFlow()
@@ -461,12 +471,54 @@ class TerminalManager :
      * Looks up the host from the repository and creates a connection.
      *
      * @param hostId the database ID of the host to connect to
+     * @param tabKey for a tab-atelier host, which of its tabs to open. Required
+     *   there, because a WebSocket cannot be asked for a tab once it is open;
+     *   ignored by every other protocol, which connect to the host itself.
      * @return TerminalBridge for the connection, or null if host not found
      */
-    suspend fun openConnectionForHostId(hostId: Long): TerminalBridge? {
+    suspend fun openConnectionForHostId(hostId: Long, tabKey: String? = null): TerminalBridge? {
         val host = hostRepository.findHostById(hostId) ?: return null
+
+        // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): another tab of
+        // a server that already has a session MOVES that session to it, instead of
+        // being refused by openConnection's "already open" check below.
+        //
+        // A tab-atelier server has many tabs and this app is a viewer — the tab
+        // being left keeps running on the daemon — so a move loses nothing, and
+        // keeping one session per server is what the running notification, the host
+        // list's connected indicator and the session maps already assume.
+        //
+        // This returns the existing session whatever the move did, rather than
+        // only when it succeeded, because the three outcomes all end the same way:
+        // it moved; it was already on that tab, which is a no-op rather than an
+        // error; or it failed and has reported the failure itself. Falling through
+        // in any of them would reach openConnection, which refuses a host that
+        // already has a session — turning "tapped the tab I am on" into an error.
+        if (!tabKey.isNullOrBlank()) {
+            val existing = getConnectedBridge(host)
+            if (existing != null) {
+                existing.switchTab(tabKey)
+                // A choice left over from a tap whose session never started is not
+                // this session's; this one has been told directly.
+                pendingTabKeys.remove(host.id)
+                return existing
+            }
+        }
+
+        if (!tabKey.isNullOrBlank()) {
+            pendingTabKeys[host.id] = tabKey
+        }
         return openConnection(host)
     }
+
+    /**
+     * Consumes the pending tab choice for [hostId], if there is one.
+     *
+     * Called by the tab-atelier transport as it connects. Removing rather than
+     * reading is deliberate: a choice belongs to one session, and a stale one
+     * would send the next connection to a tab the user did not pick.
+     */
+    fun takePendingTabKey(hostId: Long): String? = pendingTabKeys.remove(hostId)
 
     /**
      * Update the last-connected value for the given nickname by passing through

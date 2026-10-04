@@ -76,6 +76,8 @@ import org.connectbot.data.entity.ColorScheme
 import org.connectbot.data.entity.Host
 import org.connectbot.data.entity.Profile
 import org.connectbot.data.entity.Pubkey
+import org.connectbot.tabatelier.TabAtelierBase
+import org.connectbot.transport.TabAtelier
 import org.connectbot.ui.PreviewScreen
 import org.connectbot.ui.common.getIconColors
 import org.connectbot.ui.common.getLocalizedColorSchemeDescription
@@ -123,6 +125,9 @@ fun HostEditorScreen(
         onIpVersionChange = viewModel::updateIpVersion,
         onPasswordChange = viewModel::updatePassword,
         onClearPassword = viewModel::clearSavedPassword,
+        onTabAtelierTokenChange = viewModel::updateTabAtelierToken,
+        onClearTabAtelierToken = viewModel::clearSavedToken,
+        onTabAtelierUrlChange = viewModel::updateTabAtelierUrl,
         onMoshPortChange = viewModel::updateMoshPort,
         onMoshServerChange = viewModel::updateMoshServer,
         onLocaleChange = viewModel::updateLocale,
@@ -158,6 +163,10 @@ fun HostEditorScreenContent(
     onIpVersionChange: (String) -> Unit,
     onPasswordChange: (String) -> Unit,
     onClearPassword: () -> Unit,
+    // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)).
+    onTabAtelierTokenChange: (String) -> Unit = {},
+    onClearTabAtelierToken: () -> Unit = {},
+    onTabAtelierUrlChange: (String) -> Unit = {},
     onMoshPortChange: (String) -> Unit = {},
     onMoshServerChange: (String) -> Unit = {},
     onLocaleChange: (String) -> Unit = {},
@@ -171,8 +180,24 @@ fun HostEditorScreenContent(
     }
     var showProtocolMenu by remember { mutableStateOf(false) }
     var showAdvancedOptions by rememberSaveable(hostId) { mutableStateOf(false) }
-    val protocols = listOf("ssh", "mosh", "telnet", "local")
-    val canSave = uiState.protocol == "local" || uiState.hostname.isNotBlank()
+    // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): the tab-atelier
+    // type joins the picker. The existing labels are the lowercase protocol
+    // strings; using the same string here keeps that convention.
+    val protocols = listOf("ssh", "mosh", "telnet", "local", TabAtelier.PROTOCOL)
+    // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): a tab-atelier
+    // host is entered as one URL, and is only valid once that URL parses — the
+    // same parse every later request uses, so the editor cannot accept an
+    // address the client would reject. It needs a token, and no username.
+    val isTabAtelier = uiState.protocol == TabAtelier.PROTOCOL
+    val tabAtelierBase = remember(uiState.tabAtelierUrl, isTabAtelier) {
+        if (isTabAtelier) TabAtelierBase.parse(uiState.tabAtelierUrl) else null
+    }
+    val canSave = when {
+        uiState.protocol == "local" -> true
+        isTabAtelier -> tabAtelierBase != null &&
+            (uiState.tabAtelierToken.isNotBlank() || uiState.hasExistingToken)
+        else -> uiState.hostname.isNotBlank()
+    }
 
     EditorScaffold(
         title = stringResource(if (hostId == -1L) R.string.hostpref_add_host else R.string.hostpref_setting_title),
@@ -264,26 +289,92 @@ fun HostEditorScreenContent(
                     )
                 }
 
-                OutlinedTextField(
-                    value = uiState.hostname,
-                    onValueChange = onHostnameChange,
-                    label = { Text(stringResource(R.string.hostpref_hostname_title)) },
-                    isError = uiState.hostname.isBlank(),
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(top = 8.dp),
-                    singleLine = true,
-                )
+                // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): a
+                // tab-atelier daemon is addressed as one URL, so this one field
+                // stands where the hostname and port below it stand for the
+                // other types — a scheme (http or https) and a path prefix have
+                // nowhere else to go, and http versus https is what decides
+                // whether TLS is used at all.
+                if (isTabAtelier) {
+                    OutlinedTextField(
+                        value = uiState.tabAtelierUrl,
+                        onValueChange = onTabAtelierUrlChange,
+                        label = { Text(stringResource(R.string.tabatelier_url_title)) },
+                        placeholder = { Text(stringResource(R.string.tabatelier_url_hint)) },
+                        isError = uiState.tabAtelierUrl.isNotBlank() && tabAtelierBase == null,
+                        supportingText = {
+                            Text(
+                                if (uiState.tabAtelierUrl.isNotBlank() && tabAtelierBase == null) {
+                                    stringResource(R.string.tabatelier_url_error)
+                                } else {
+                                    stringResource(R.string.tabatelier_url_summary)
+                                },
+                            )
+                        },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(top = 8.dp),
+                        singleLine = true,
+                    )
+                } else {
+                    OutlinedTextField(
+                        value = uiState.hostname,
+                        onValueChange = onHostnameChange,
+                        label = { Text(stringResource(R.string.hostpref_hostname_title)) },
+                        isError = uiState.hostname.isBlank(),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(top = 8.dp),
+                        singleLine = true,
+                    )
 
-                OutlinedTextField(
-                    value = uiState.port,
-                    onValueChange = onPortChange,
-                    label = { Text(stringResource(R.string.hostpref_port_title)) },
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(top = 8.dp),
-                    singleLine = true,
-                )
+                    OutlinedTextField(
+                        value = uiState.port,
+                        onValueChange = onPortChange,
+                        label = { Text(stringResource(R.string.hostpref_port_title)) },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(top = 8.dp),
+                        singleLine = true,
+                    )
+                }
+
+                // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): the
+                // daemon's API token is the only credential a tab-atelier host
+                // has, so it sits beside the address instead of inside the
+                // advanced options.
+                if (isTabAtelier) {
+                    OutlinedTextField(
+                        value = uiState.tabAtelierToken,
+                        onValueChange = onTabAtelierTokenChange,
+                        label = {
+                            Text(
+                                if (uiState.hasExistingToken && uiState.tabAtelierToken.isEmpty()) {
+                                    stringResource(R.string.hostpref_token_unchanged)
+                                } else {
+                                    stringResource(R.string.hostpref_token_title)
+                                },
+                            )
+                        },
+                        supportingText = { Text(stringResource(R.string.hostpref_token_summary)) },
+                        visualTransformation = PasswordVisualTransformation(),
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(top = 8.dp),
+                        singleLine = true,
+                    )
+
+                    if (uiState.hasExistingToken) {
+                        TextButton(
+                            onClick = onClearTabAtelierToken,
+                            modifier = Modifier.padding(top = 4.dp),
+                        ) {
+                            Text(stringResource(R.string.hostpref_clear_token))
+                        }
+                    }
+                }
 
                 Row(
                     modifier = Modifier
@@ -399,12 +490,17 @@ fun HostEditorScreenContent(
             )
 
             // Pubkey selector
-            HorizontalDivider(modifier = Modifier.padding(vertical = 16.dp))
-            PubkeySelector(
-                pubkeyId = uiState.pubkeyId,
-                availablePubkeys = uiState.availablePubkeys,
-                onPubkeySelect = onPubkeyChange,
-            )
+            // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): a
+            // tab-atelier host authenticates with its API token, not a key, so
+            // the SSH pubkey picker does not apply to it.
+            if (!isTabAtelier) {
+                HorizontalDivider(modifier = Modifier.padding(vertical = 16.dp))
+                PubkeySelector(
+                    pubkeyId = uiState.pubkeyId,
+                    availablePubkeys = uiState.availablePubkeys,
+                    onPubkeySelect = onPubkeyChange,
+                )
+            }
 
             // Profile selector
             HorizontalDivider(modifier = Modifier.padding(vertical = 16.dp))
@@ -425,43 +521,48 @@ fun HostEditorScreenContent(
                 )
             }
 
-            // SSH Auth agent
-            HorizontalDivider(modifier = Modifier.padding(vertical = 16.dp))
-            SwitchPreference(
-                title = stringResource(R.string.hostpref_authagent_title),
-                checked = uiState.useAuthAgent != "no",
-                onCheckedChange = { checked ->
-                    onUseAuthAgentChange(if (checked) "yes" else "no")
-                },
-            )
-
-            if (uiState.useAuthAgent != "no") {
+            // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): a
+            // tab-atelier host has no SSH channel, so the SSH-only switches
+            // (auth agent, compression, session) are not offered for it.
+            if (!isTabAtelier) {
+                // SSH Auth agent
+                HorizontalDivider(modifier = Modifier.padding(vertical = 16.dp))
                 SwitchPreference(
-                    title = stringResource(R.string.hostpref_authagent_with_confirmation),
-                    checked = uiState.useAuthAgent == "confirm",
+                    title = stringResource(R.string.hostpref_authagent_title),
+                    checked = uiState.useAuthAgent != "no",
                     onCheckedChange = { checked ->
-                        onUseAuthAgentChange(if (checked) "confirm" else "yes")
+                        onUseAuthAgentChange(if (checked) "yes" else "no")
                     },
                 )
+
+                if (uiState.useAuthAgent != "no") {
+                    SwitchPreference(
+                        title = stringResource(R.string.hostpref_authagent_with_confirmation),
+                        checked = uiState.useAuthAgent == "confirm",
+                        onCheckedChange = { checked ->
+                            onUseAuthAgentChange(if (checked) "confirm" else "yes")
+                        },
+                    )
+                }
+
+                // Compression
+                HorizontalDivider(modifier = Modifier.padding(vertical = 16.dp))
+                SwitchPreference(
+                    title = stringResource(R.string.hostpref_compression_title),
+                    summary = stringResource(R.string.hostpref_compression_summary),
+                    checked = uiState.compression,
+                    onCheckedChange = onCompressionChange,
+                )
+
+                // Want session
+                HorizontalDivider(modifier = Modifier.padding(vertical = 16.dp))
+                SwitchPreference(
+                    title = stringResource(R.string.hostpref_wantsession_title),
+                    summary = stringResource(R.string.hostpref_wantsession_summary),
+                    checked = uiState.wantSession,
+                    onCheckedChange = onWantSessionChange,
+                )
             }
-
-            // Compression
-            HorizontalDivider(modifier = Modifier.padding(vertical = 16.dp))
-            SwitchPreference(
-                title = stringResource(R.string.hostpref_compression_title),
-                summary = stringResource(R.string.hostpref_compression_summary),
-                checked = uiState.compression,
-                onCheckedChange = onCompressionChange,
-            )
-
-            // Want session
-            HorizontalDivider(modifier = Modifier.padding(vertical = 16.dp))
-            SwitchPreference(
-                title = stringResource(R.string.hostpref_wantsession_title),
-                summary = stringResource(R.string.hostpref_wantsession_summary),
-                checked = uiState.wantSession,
-                onCheckedChange = onWantSessionChange,
-            )
 
             // Stay connected
             HorizontalDivider(modifier = Modifier.padding(vertical = 16.dp))

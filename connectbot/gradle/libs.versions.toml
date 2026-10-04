@@ -52,6 +52,9 @@ robolectric = "4.17"
 kover = "0.9.10"
 
 media3CommonKtx = "1.11.1"
+# Changed for Tab Atelier Remote: the tab-atelier daemon is reached over HTTP,
+# for which the app module previously had no client.
+okhttp = "5.5.0"
 navigationTesting = "2.10.2"
 ui = "1.11.4"
 biometric = "1.4.0-alpha02"
@@ -72,6 +75,7 @@ material = { module = "com.google.android.material:material", version.ref = "mat
 timber = { module = "com.jakewharton.timber:timber", version.ref = "timber" }
 re2j = { module = "com.google.re2j:re2j", version.ref = "re2j" }
 reorderable = { module = "sh.calvin.reorderable:reorderable", version.ref = "reorderable" }
+okhttp = { module = "com.squareup.okhttp3:okhttp", version.ref = "okhttp" }
 
 androidx-test-core = { module = "androidx.test:core", version.ref = "testCore" }
 androidx-test-orchestrator = { module = "androidx.test:orchestrator", version.ref = "testOrchestrator" }

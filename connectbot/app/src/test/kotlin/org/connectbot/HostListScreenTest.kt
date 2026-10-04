@@ -17,7 +17,9 @@
 
 package org.connectbot
 
+import androidx.compose.ui.test.assertContentDescriptionEquals
 import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.junit4.v2.createAndroidComposeRule
 import androidx.compose.ui.test.onNodeWithContentDescription
@@ -28,12 +30,15 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import dagger.hilt.android.testing.HiltAndroidRule
 import dagger.hilt.android.testing.HiltAndroidTest
 import org.connectbot.data.entity.Host
+import org.connectbot.tabatelier.TabAtelierTab
 import org.connectbot.ui.screens.hostlist.ConnectionState
 import org.connectbot.ui.screens.hostlist.HostListScreen
 import org.connectbot.ui.screens.hostlist.HostListScreenContent
 import org.connectbot.ui.screens.hostlist.HostListTestTags
 import org.connectbot.ui.screens.hostlist.HostListUiState
+import org.connectbot.ui.screens.hostlist.TabListState
 import org.connectbot.ui.theme.ConnectBotTheme
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Rule
@@ -61,7 +66,7 @@ class HostListScreenTest {
         composeTestRule.setContent {
             ConnectBotTheme {
                 HostListScreen(
-                    onNavigateToConsole = {},
+                    onNavigateToConsole = { _, _ -> },
                     onNavigateToEditHost = {},
                     onNavigateToSettings = {},
                     onNavigateToPubkeys = {},
@@ -84,7 +89,7 @@ class HostListScreenTest {
         composeTestRule.setContent {
             ConnectBotTheme {
                 HostListScreen(
-                    onNavigateToConsole = {},
+                    onNavigateToConsole = { _, _ -> },
                     onNavigateToEditHost = {},
                     onNavigateToSettings = {},
                     onNavigateToPubkeys = {},
@@ -108,7 +113,7 @@ class HostListScreenTest {
         composeTestRule.setContent {
             ConnectBotTheme {
                 HostListScreen(
-                    onNavigateToConsole = {},
+                    onNavigateToConsole = { _, _ -> },
                     onNavigateToEditHost = {},
                     onNavigateToSettings = {},
                     onNavigateToPubkeys = {},
@@ -136,7 +141,7 @@ class HostListScreenTest {
         composeTestRule.setContent {
             ConnectBotTheme {
                 HostListScreen(
-                    onNavigateToConsole = {},
+                    onNavigateToConsole = { _, _ -> },
                     onNavigateToEditHost = { addHostCalled = true },
                     onNavigateToSettings = {},
                     onNavigateToPubkeys = {},
@@ -161,7 +166,7 @@ class HostListScreenTest {
         composeTestRule.setContent {
             ConnectBotTheme {
                 HostListScreen(
-                    onNavigateToConsole = {},
+                    onNavigateToConsole = { _, _ -> },
                     onNavigateToEditHost = {},
                     onNavigateToSettings = {},
                     onNavigateToPubkeys = {},
@@ -187,7 +192,7 @@ class HostListScreenTest {
         composeTestRule.setContent {
             ConnectBotTheme {
                 HostListScreen(
-                    onNavigateToConsole = {},
+                    onNavigateToConsole = { _, _ -> },
                     onNavigateToEditHost = {},
                     onNavigateToSettings = {},
                     onNavigateToSettingsHighlightConnPersist = { navigatedToSettingsHighlight = true },
@@ -215,7 +220,7 @@ class HostListScreenTest {
         composeTestRule.setContent {
             ConnectBotTheme {
                 HostListScreen(
-                    onNavigateToConsole = {},
+                    onNavigateToConsole = { _, _ -> },
                     onNavigateToEditHost = {},
                     onNavigateToSettings = {},
                     onNavigateToPubkeys = {},
@@ -324,7 +329,7 @@ class HostListScreenTest {
                     disconnected.id to ConnectionState.DISCONNECTED,
                 ),
             ),
-            onNavigateToConsole = { navigatedHost = it },
+            onNavigateToConsole = { host, _ -> navigatedHost = host },
         )
 
         composeTestRule
@@ -439,7 +444,7 @@ class HostListScreenTest {
     private fun setHostListContent(
         uiState: HostListUiState = HostListUiState(),
         makingShortcut: Boolean = false,
-        onNavigateToConsole: (Host) -> Unit = {},
+        onNavigateToConsole: (Host, String?) -> Unit = { _, _ -> },
         onSelectShortcut: (Host) -> Unit = {},
         onNavigateToEditHost: (Host?) -> Unit = {},
         onNavigateToSettings: () -> Unit = {},
@@ -455,6 +460,7 @@ class HostListScreenTest {
         onDisconnectAll: () -> Unit = {},
         onExportHosts: () -> Unit = {},
         onImportHosts: () -> Unit = {},
+        onToggleTabHost: (Long) -> Unit = {},
     ) {
         composeTestRule.setContent {
             ConnectBotTheme {
@@ -477,9 +483,96 @@ class HostListScreenTest {
                     onDisconnectAll = onDisconnectAll,
                     onExportHosts = onExportHosts,
                     onImportHosts = onImportHosts,
+                    onToggleTabHost = onToggleTabHost,
                 )
             }
         }
+    }
+
+    /**
+     * Added for Tab Atelier Remote: tapping one of a daemon's tabs has to open
+     * *that* tab.
+     *
+     * The tab id is the whole point. A session opened with a null one attaches to
+     * the daemon with nothing to attach to, and the two bugs found while building
+     * this were both a dropped tab — first the id never left the tap, then the
+     * verifier refused the first connection so none could ever be recorded. So
+     * this asserts the id arrives, not merely that something was clicked.
+     */
+    @Test
+    fun tappingATabRow_opensThatHostsTab() {
+        val host = testHost(id = 41L, nickname = "workstation", protocol = "tabatelier")
+        val tab = TabAtelierTab(id = "t-1", name = "shell")
+        var openedHost: Host? = null
+        var openedTab: String? = null
+
+        setHostListContent(
+            uiState = HostListUiState(
+                hosts = listOf(host),
+                tabStates = mapOf(host.id to TabListState(tabs = listOf(tab))),
+            ),
+            onNavigateToConsole = { tapped, tabKey ->
+                openedHost = tapped
+                openedTab = tabKey
+            },
+        )
+
+        composeTestRule
+            .onNodeWithTag(HostListTestTags.tabRow(host.id, tab.id))
+            .performClick()
+
+        assertEquals(host, openedHost)
+        assertEquals("the tab id must reach the navigation, not just the host", "t-1", openedTab)
+    }
+
+    /**
+     * Added for Tab Atelier Remote: the chevron that shows and hides a daemon's
+     * tab list has to be a real button.
+     *
+     * It began as a bare `Icon` — drawn, with a content description, but with no
+     * click action of its own. Expanding by tapping the row still worked, so
+     * nothing looked wrong on screen; the control simply could not be activated
+     * on its own, was not announced to a screen reader as a button, and its 24dp
+     * sat flush against the overflow button's 48dp. `performClick` is the
+     * assertion because it is exactly what an `Icon` cannot do.
+     */
+    @Test
+    fun theExpandButton_togglesTheTabList() {
+        val host = testHost(id = 42L, nickname = "workstation", protocol = "tabatelier")
+        var toggled = 0L
+
+        setHostListContent(
+            uiState = HostListUiState(
+                hosts = listOf(host),
+                tabStates = mapOf(host.id to TabListState(tabs = emptyList())),
+            ),
+            onToggleTabHost = { toggled = it },
+        )
+
+        composeTestRule
+            .onNodeWithTag(HostListTestTags.itemExpandButton(host.id))
+            .performClick()
+
+        assertEquals("the button must toggle that host's tab list", 42L, toggled)
+    }
+
+    /**
+     * The chevron has to say which way it goes: a tab-atelier server is expanded
+     * unless it is in `collapsedTabHosts`, so the state a user first sees is the
+     * expanded one, and the control has to offer to collapse it rather than
+     * leaving a screen reader to guess.
+     */
+    @Test
+    fun theExpandButton_saysWhetherItWillShowOrHideTheTabs() {
+        val host = testHost(id = 43L, nickname = "workstation", protocol = "tabatelier")
+        val button = { composeTestRule.onNodeWithTag(HostListTestTags.itemExpandButton(host.id)) }
+
+        // Default state: a tab-atelier host is expanded.
+        setHostListContent(uiState = HostListUiState(hosts = listOf(host)))
+        button().assertContentDescriptionEquals(
+            composeTestRule.activity.getString(R.string.button_collapse),
+        )
+        button().assertIsEnabled()
     }
 
     private fun testHost(
