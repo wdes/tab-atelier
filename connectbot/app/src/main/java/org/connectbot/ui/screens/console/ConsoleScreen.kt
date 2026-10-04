@@ -96,6 +96,7 @@ import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEvent
 import androidx.compose.ui.input.key.KeyEventType
@@ -123,6 +124,7 @@ import androidx.compose.ui.text.withLink
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.edit
+import androidx.core.graphics.toColorInt
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.hilt.lifecycle.viewmodel.compose.hiltViewModel
@@ -286,6 +288,43 @@ internal fun shouldShowSoftwareKeyboardForSessionOpen(
     !previousSessionOpen &&
     !hasHardwareKeyboard
 
+/**
+ * The colour a `#rrggbb` string names, or null if it does not name one.
+ *
+ * Added for Tab Atelier Remote (Apache-2.0 section 4(b)): the daemon reports a
+ * tab's viewer background as `#rrggbb`, and the transport has already checked the
+ * shape before passing it on. This is the second, independent check — turning a
+ * string into a colour is where a malformed one would blow up, and a crash on
+ * opening a tab is far worse than a tab painted in the default.
+ *
+ * The shape is checked here rather than left to the parser because **Android's
+ * parser is more permissive than the daemon's format**: `Color.parseColor` accepts
+ * CSS colour names, so `"red"` parses to opaque red rather than failing. Accepting
+ * that would make what a tab looks like depend on Android's name table instead of
+ * on what the daemon sent, and it would mean the two checks disagree about what is
+ * valid — a second line of defence that accepts what the first rejects is not one.
+ * Enforcing the shape first also means the parse below cannot fail, which is why
+ * there is no catch around it.
+ *
+ * Null rather than a fallback colour, so the caller decides what "no colour" looks
+ * like; and `@VisibleForTesting` so the parsing is covered without a live daemon
+ * sending a colour.
+ */
+@VisibleForTesting
+internal fun terminalColorOrNull(hex: String): Color? =
+    if (HEX_COLOR.matches(hex)) Color(hex.toColorInt()) else null
+
+/**
+ * What the daemon can send: `#rrggbb`, exactly as its own browser client requires
+ * before it will apply a background to a tab.
+ *
+ * Spelled out here rather than shared with the transport's check on purpose. The
+ * two are deliberately independent — a mistake in one must not silently agree with
+ * the other — and what keeps them honest is a test on each side, not a shared
+ * constant.
+ */
+private val HEX_COLOR = Regex("^#[0-9a-fA-F]{6}$")
+
 @VisibleForTesting
 internal fun shouldPreserveSoftwareKeyboardForBridgeChange(
     previousBridgeId: Long?,
@@ -400,6 +439,23 @@ private fun ConsoleTerminalPage(
         val fontSize by bridge.fontSizeFlow.collectAsState()
         val delKeyMode by bridge.delKeyModeFlow.collectAsState()
 
+        // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): the background
+        // the daemon paints this tab's viewer in, so its tabs can be told apart.
+        //
+        // Only the BACKGROUND is taken from it. The daemon keeps the terminal's own
+        // colours — which are part of the tab — separate from this, and its own
+        // browser client applies bg_color as the theme's background and leaves the
+        // foreground alone, which is what this does.
+        //
+        // A null falls back to black, which is termlib's own default for this
+        // parameter. Naming it rather than relying on the default is deliberate:
+        // switching tabs must be able to move a coloured tab back to an uncoloured
+        // one, and a null is exactly that case.
+        val remoteBackground by bridge.remoteBackgroundColor.collectAsState()
+        val terminalBackground = remember(remoteBackground) {
+            remoteBackground?.let(::terminalColorOrNull) ?: Color.Black
+        }
+
         LaunchedEffect(fontResult.loadFailed, fontResult.isLoading) {
             if (fontResult.loadFailed && !fontResult.isLoading) {
                 coroutineScope.launch {
@@ -426,6 +482,9 @@ private fun ConsoleTerminalPage(
             resizeSuspended = resizeSuspended,
             focusRequester = termFocusRequester,
             forcedSize = forceSize,
+            // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): the tab's
+            // own background when the daemon reports one, black otherwise.
+            backgroundColor = terminalBackground,
             modifierManager = bridge.keyHandler,
             onSelectionControllerAvailable = { controller ->
                 if (isActive) {
