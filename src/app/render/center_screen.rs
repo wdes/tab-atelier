@@ -19,20 +19,22 @@ impl Render for AppState {
         // frame contend with whatever an API handler was doing under
         // the same mutex (e.g. the /tabs body rebuild).
         let seq = self.activity_signal.load(std::sync::atomic::Ordering::Relaxed);
-        let (new_tab_count, new_tab_cwds): (usize, Vec<PathBuf>) = if seq == self.render_activity_seen.get() {
-            (0, Vec::new())
-        } else {
-            self.render_activity_seen.set(seq);
-            let mut snap = self.api_state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let n = std::mem::take(&mut snap.pending_new_tabs);
-            let cwds: Vec<PathBuf> = std::mem::take(&mut snap.pending_new_tab_cwds).into_iter().collect();
-            drop(snap);
-            (n, cwds)
-        };
-        let mut cwd_iter = new_tab_cwds.into_iter();
+        let (new_tab_count, new_tab_specs): (usize, Vec<crate::api::NewTabSpec>) =
+            if seq == self.render_activity_seen.get() {
+                (0, Vec::new())
+            } else {
+                self.render_activity_seen.set(seq);
+                let mut snap = self.api_state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let n = std::mem::take(&mut snap.pending_new_tabs);
+                let specs: Vec<crate::api::NewTabSpec> =
+                    std::mem::take(&mut snap.pending_new_tab_cwds).into_iter().collect();
+                drop(snap);
+                (n, specs)
+            };
+        let mut spec_iter = new_tab_specs.into_iter();
         for _ in 0..new_tab_count {
-            match cwd_iter.next() {
-                Some(cwd) => self.add_tab_in(cwd, window, cx),
+            match spec_iter.next() {
+                Some(spec) => self.add_tab_from_spec(spec, window, cx),
                 None => self.add_tab(window, cx),
             }
         }

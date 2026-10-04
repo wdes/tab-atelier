@@ -624,6 +624,24 @@ impl crate::schedule::LockState for SnapshotTab {
 /// mean it — a bare `state: "idle"` just parks the indicator.
 pub const WIPE_LABEL: &str = "__clear__";
 
+/// How to create one tab, queued by `POST /tabs` and drained by the owner
+/// (GUI render loop / headless tick).
+///
+/// `cwd` is the only part the previous shape carried. `name` and `cmd` are
+/// what turn four round-trips into one — see `pending_new_tab_cwds` for why
+/// the typing step in particular is worth removing for a programmatic caller.
+#[derive(Clone, Debug, Default)]
+pub struct NewTabSpec {
+    /// Working directory the shell starts in. `None` inherits the active tab's.
+    pub cwd: Option<std::path::PathBuf>,
+    /// Name to give the tab. `None` keeps the default (`Terminal N`).
+    pub name: Option<String>,
+    /// Command to type into the tab once its shell is up, as if a human had
+    /// typed it. Sent through the same input path as `POST /tabs/:id/input`,
+    /// so the same lock and audit rules apply.
+    pub cmd: Option<String>,
+}
+
 /// A status update queued by `POST /tabs/by-id/{id}/status` — drained
 /// by the main loop, which writes both the transient `agent_state`
 /// snapshot and the durable `agent_session_id` / `agent_kind` /
@@ -843,12 +861,20 @@ pub struct TabSnapshot {
     /// shape as `pending_bg_color_changes`.
     pub pending_schedule_changes: Vec<(String, Option<crate::schedule::TabSchedule>)>,
     pub pending_new_tabs: usize,
-    /// Optional explicit cwd hints for the next `pending_new_tabs`
-    /// creations, in FIFO order. Populated by `POST /tabs` with a
-    /// JSON body `{"cwd": "..."}`. Shorter than `pending_new_tabs`
-    /// is fine — the remainder fall back to inheriting from the
-    /// currently-active tab as before.
-    pub pending_new_tab_cwds: std::collections::VecDeque<std::path::PathBuf>,
+    /// What to start in the next `pending_new_tabs` creations, in FIFO order.
+    ///
+    /// Populated by `POST /tabs` with a JSON body `{"cwd": "...", "name":
+    /// "...", "cmd": "..."}`. Shorter than `pending_new_tabs` is fine — the
+    /// remainder fall back to inheriting from the currently-active tab and a
+    /// default name, as before.
+    ///
+    /// `cmd` exists so a caller can start an agent in one request. Without it
+    /// the same result takes four: create the tab, poll `GET /tabs` until the
+    /// new id appears, rename it, then **type the command into the PTY** and
+    /// wait for it to be read. That dance lives in `cli::delegate`, where a
+    /// human is watching each step; a programmatic caller has no reason to pay
+    /// for it, and the typing step is the fragile one.
+    pub pending_new_tab_cwds: std::collections::VecDeque<NewTabSpec>,
     /// Per-tab resource-limit changes queued by `POST /tabs/<id>/limits`,
     /// drained by the owner (GUI render loop / headless tick): `(tab uuid,
     /// override, clear)`. `clear == true` lifts every axis; otherwise the

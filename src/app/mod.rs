@@ -1950,11 +1950,35 @@ impl AppState {
         self.insert_tab(self.tabs.len(), None, window, cx);
     }
 
-    /// Like `add_tab` but with an explicit cwd hint from the API
-    /// (`POST /tabs` with `{cwd: ...}`). Falls back to the existing
-    /// inherit-from-active behaviour when the path doesn't exist.
-    fn add_tab_in(&mut self, cwd: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
-        self.insert_tab(self.tabs.len(), Some(cwd), window, cx);
+    /// Create a tab from a full `POST /tabs` spec: cwd, name, and the command
+    /// to start in it.
+    ///
+    /// All three are optional and applied in that order, so a caller naming
+    /// only a command gets the inherit-cwd and default-name behaviour of
+    /// `add_tab`, plus its command typed in. The name is assigned directly
+    /// rather than through `rename_tab`, which also rewrites the transcript and
+    /// notifies — right for a user renaming a tab, wasteful for one whose name
+    /// was never anything else.
+    fn add_tab_from_spec(&mut self, spec: crate::api::NewTabSpec, window: &mut Window, cx: &mut Context<Self>) {
+        // A spec naming a directory that has since gone falls back to the
+        // inherit-from-active path — what the API did before this existed.
+        match spec.cwd.filter(|p| p.is_dir()) {
+            Some(cwd) => self.insert_tab(self.tabs.len(), Some(cwd), window, cx),
+            None => self.insert_tab(self.tabs.len(), None, window, cx),
+        }
+        let idx = self.tabs.len() - 1;
+        if let Some(name) = spec.name {
+            self.tabs[idx].name = name.into();
+        }
+        // Typed the way a human would, through the same entry point
+        // `POST /tabs/:id/input` uses, so the input lock and the guarded-mode
+        // rules apply to a spawned command exactly as to one sent over the API.
+        if let Some(cmd) = spec.cmd {
+            self.tabs[idx]
+                .view
+                .update(cx, |v, _| v.send_input_bytes(cmd.into_bytes()));
+        }
+        cx.notify();
     }
 
     fn add_tab_after_current(&mut self, window: &mut Window, cx: &mut Context<Self>) {

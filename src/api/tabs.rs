@@ -165,32 +165,123 @@ pub(super) fn close<W: Write>(stream: &mut W, state: &Arc<Mutex<TabSnapshot>>, p
     respond_json(stream, 200, &body);
 }
 
-pub(super) fn create<W: Write>(stream: &mut W, state: &Arc<Mutex<TabSnapshot>>, body_bytes: &[u8]) {
-    // Optional JSON body: `{"cwd": "<path>"}` opens the tab
-    // rooted at that path instead of inheriting from the
-    // active tab. Missing or invalid body → falls back to the
-    // legacy inherit-cwd behaviour.
-    let cwd_hint: Option<std::path::PathBuf> = if body_bytes.is_empty() {
-        None
-    } else {
-        serde_json::from_slice::<serde_json::Value>(body_bytes)
-            .ok()
-            .and_then(|v| {
-                v.get("cwd")
+/// Parse the optional `POST /tabs` body into a [`crate::api::NewTabSpec`].
+///
+/// Separate from [`create`] so the rules below are testable without a socket.
+/// Every field is independent and optional, and anything unparseable yields the
+/// default spec — the caller then gets exactly the behaviour the endpoint had
+/// before `name` and `cmd` existed, which is the safe failure for an HTTP
+/// handler that cannot report a body error mid-request.
+fn parse_new_tab_spec(body_bytes: &[u8]) -> crate::api::NewTabSpec {
+    if body_bytes.is_empty() {
+        return crate::api::NewTabSpec::default();
+    }
+    serde_json::from_slice::<serde_json::Value>(body_bytes)
+        .ok()
+        .map_or_else(crate::api::NewTabSpec::default, |v| {
+            crate::api::NewTabSpec {
+                cwd: v
+                    .get("cwd")
                     .and_then(serde_json::Value::as_str)
-                    .map(std::path::PathBuf::from)
-            })
-    };
+                    .filter(|s| !s.is_empty())
+                    .map(std::path::PathBuf::from),
+                name: v
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string),
+                // Trailing newline, because what receives this is a shell at a
+                // prompt: a command without its Enter is a command nobody runs.
+                cmd: v
+                    .get("cmd")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| {
+                        if s.ends_with('\n') {
+                            s.to_string()
+                        } else {
+                            format!("{s}\n")
+                        }
+                    }),
+            }
+        })
+}
+
+pub(super) fn create<W: Write>(stream: &mut W, state: &Arc<Mutex<TabSnapshot>>, body_bytes: &[u8]) {
+    let spec = parse_new_tab_spec(body_bytes);
+    let explicit = spec.cwd.is_some() || spec.name.is_some() || spec.cmd.is_some();
     let mut state = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     info!(
-        "API: queueing new tab creation (cwd: {})",
-        cwd_hint.as_ref().map_or("inherit", |p| p.to_str().unwrap_or("?"))
+        "API: queueing new tab creation (cwd: {}, name: {}, cmd: {})",
+        spec.cwd.as_ref().map_or("inherit", |p| p.to_str().unwrap_or("?")),
+        spec.name.as_deref().unwrap_or("default"),
+        if spec.cmd.is_some() { "yes" } else { "no" }
     );
     state.pending_new_tabs += 1;
-    if let Some(cwd) = cwd_hint {
-        state.pending_new_tab_cwds.push_back(cwd);
+    // A spec that names nothing is not queued: the drain side pops one per
+    // creation and treats its absence as "inherit", which is the same outcome
+    // an empty spec would produce.
+    if explicit {
+        state.pending_new_tab_cwds.push_back(spec);
     }
     drop(state);
     let body = serde_json::to_string(&serde_json::json!({"queued": "new"})).unwrap_or_default();
     respond_json(stream, 200, &body);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_new_tab_spec;
+
+    /// Each field of the body is independent: a caller naming only a command
+    /// gets a tab whose cwd is inherited and whose name is the default, which
+    /// is the whole point of the change — one request instead of four.
+    #[test]
+    fn a_body_carries_any_subset_of_cwd_name_and_cmd() {
+        let full = parse_new_tab_spec(br#"{"cwd":"/tmp","name":"Bot","cmd":"echo hi"}"#);
+        assert_eq!(full.cwd.as_deref(), Some(std::path::Path::new("/tmp")));
+        assert_eq!(full.name.as_deref(), Some("Bot"));
+        assert_eq!(full.cmd.as_deref(), Some("echo hi\n"));
+
+        let only_cmd = parse_new_tab_spec(br#"{"cmd":"catbus-agent"}"#);
+        assert!(only_cmd.cwd.is_none(), "cwd must stay None so it is inherited");
+        assert!(only_cmd.name.is_none(), "name must stay None for the default");
+        assert_eq!(only_cmd.cmd.as_deref(), Some("catbus-agent\n"));
+
+        let only_name = parse_new_tab_spec(br#"{"name":"Planner"}"#);
+        assert!(only_name.cwd.is_none() && only_name.cmd.is_none());
+        assert_eq!(only_name.name.as_deref(), Some("Planner"));
+    }
+
+    /// The command gets exactly one newline, added or kept, never doubled.
+    ///
+    /// It is typed into a shell, so a missing Enter is a command nobody runs
+    /// and two would run an empty line after it.
+    #[test]
+    fn the_command_gains_one_newline_and_no_more() {
+        assert_eq!(parse_new_tab_spec(br#"{"cmd":"ls"}"#).cmd.as_deref(), Some("ls\n"));
+        assert_eq!(parse_new_tab_spec(br#"{"cmd":"ls\n"}"#).cmd.as_deref(), Some("ls\n"));
+    }
+
+    /// A body that says nothing, or says nothing usable, falls back to the
+    /// legacy inherit-everything behaviour rather than failing the request —
+    /// an HTTP handler has no way to report a body error mid-response.
+    #[test]
+    fn an_empty_or_unusable_body_yields_the_default_spec() {
+        for body in [
+            &b""[..],
+            b"not json",
+            b"{}",
+            br#"{"cwd":""}"#,
+            br#"{"name":""}"#,
+            br#"{"cmd":""}"#,
+            br#"{"cwd":42,"name":null,"cmd":[]}"#,
+        ] {
+            let spec = parse_new_tab_spec(body);
+            assert!(
+                spec.cwd.is_none() && spec.name.is_none() && spec.cmd.is_none(),
+                "body {body:?} should name nothing"
+            );
+        }
+    }
 }

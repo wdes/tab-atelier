@@ -2060,7 +2060,7 @@ fn drain_pending(
     let env_changes: Vec<crate::api::EnvChange> = s.pending_env_changes.drain(..).collect();
     let meta_changes: Vec<crate::api::MetaChange> = s.pending_meta_changes.drain(..).collect();
     let new_tabs = std::mem::take(&mut s.pending_new_tabs);
-    let new_tab_cwds: std::collections::VecDeque<std::path::PathBuf> = std::mem::take(&mut s.pending_new_tab_cwds);
+    let new_tab_specs: std::collections::VecDeque<crate::api::NewTabSpec> = std::mem::take(&mut s.pending_new_tab_cwds);
     drop(s);
     // Whether this drain mutated anything — the caller uses it to force
     // the next snapshot refresh instead of waiting on the heartbeat.
@@ -2089,7 +2089,7 @@ fn drain_pending(
         && relay_config_change.is_none()
         && env_changes.is_empty()
         && new_tabs == 0
-        && new_tab_cwds.is_empty());
+        && new_tab_specs.is_empty());
     // CLI / API lock toggles → runtime HeadlessTab. tabs.json picks
     // it up on the same persist tick a few lines below.
     for (tab_id, locked) in lock_changes {
@@ -2591,9 +2591,17 @@ fn drain_pending(
     }
 
     // New tabs from the API.
-    let mut cwd_hint_iter = new_tab_cwds.into_iter();
+    let mut spec_iter = new_tab_specs.into_iter();
     for _ in 0..new_tabs {
-        let cwd = cwd_hint_iter.next().filter(|p| p.is_dir()).or_else(|| {
+        // A spec naming a directory that no longer exists is dropped rather
+        // than fatal: the fallback below is the inheritance the API had
+        // before, and a caller who named a removed directory should still get
+        // a tab.
+        let spec = spec_iter
+            .next()
+            .filter(|sp| sp.cwd.as_ref().is_none_or(|p| p.is_dir()))
+            .unwrap_or_default();
+        let cwd = spec.cwd.or_else(|| {
             if *active < tabs.len() {
                 platform::process_cwd(tabs[*active].pid).or_else(|| tabs[*active].last_known_cwd.clone())
             } else {
@@ -2605,7 +2613,7 @@ fn drain_pending(
         // Every tab here came from the API — an agent's, not the user's — so
         // it launches with colour output off. See `new_tab_env`.
         env.extend(crate::new_tab_env(true));
-        let name = format!("Terminal {}", tabs.len());
+        let name = spec.name.clone().unwrap_or_else(|| format!("Terminal {}", tabs.len()));
         if let Some(t) = spawn_pty_tab(
             id,
             name,
@@ -2643,6 +2651,18 @@ fn drain_pending(
             // focus alone for the same reason. An explicit `activate` still
             // works if a caller really wants the switch.
             tabs.push(t);
+            // The command this tab was created for, typed into its shell the
+            // way a human would. Written straight away rather than queued for
+            // a later tick: the bytes land in the PTY's kernel buffer before
+            // the shell reads them, which is the same path `echo ls | script`
+            // takes. A shell that is still starting reads them when it is
+            // ready.
+            if let Some(cmd) = &spec.cmd {
+                let idx = tabs.len() - 1;
+                if idx < tabs.len() {
+                    tabs[idx].send_input_bytes(cmd.clone().into_bytes());
+                }
+            }
         }
     }
     did_work

@@ -2894,7 +2894,10 @@ mod tests {
             // The cwd from the command line rides along with the creation, or
             // the new tab silently inherits the active tab's directory.
             assert_eq!(
-                s.pending_new_tab_cwds.front().map(|p| p.display().to_string()),
+                s.pending_new_tab_cwds
+                    .front()
+                    .and_then(|spec| spec.cwd.as_ref())
+                    .map(|p| p.display().to_string()),
                 Some("/tmp/newdir".to_string())
             );
             drop(s);
