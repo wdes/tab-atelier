@@ -40,6 +40,9 @@ pub struct Parsed {
 pub fn parse(name: &str, args: &[String]) -> Result<Parsed, (i32, String)> {
     let raw = match Raw::try_parse_from(std::iter::once(name.to_owned()).chain(args.iter().cloned())) {
         Ok(raw) => raw,
+        // `-h`/`--help` is a successful outcome here, not a failure: the caller
+        // prints the usage and exits 0. clap reports it through the same channel
+        // as a real error, so the distinction is made on its kind.
         Err(err) if err.kind() == clap::error::ErrorKind::DisplayHelp => {
             return Ok(Parsed {
                 action: Action::Help,
@@ -48,6 +51,9 @@ pub fn parse(name: &str, args: &[String]) -> Result<Parsed, (i32, String)> {
         }
         Err(err) => return Err((2, err.to_string())),
     };
+
+    // `--clear` wins over a value, which is the behaviour the callers rely on:
+    // `set-x v --clear` clears rather than setting "v".
     if raw.clear {
         return Ok(Parsed {
             action: Action::Clear,
@@ -67,13 +73,22 @@ pub fn parse(name: &str, args: &[String]) -> Result<Parsed, (i32, String)> {
     })
 }
 
+/// The raw arguments, as clap sees them.
+///
+/// clap rather than a loop over `&[String]`: the repository requires it
+/// (`cli::help_tests`), and here it also removes a class of bug the loop had —
+/// an unknown flag was rejected by a `match` arm rather than by a parser that
+/// knows which flags exist.
 #[derive(Parser, Debug)]
 #[command(name = "tab-atelier", disable_help_subcommand = true)]
 struct Raw {
+    /// Target tab, overriding the ambient one.
     #[arg(long, value_name = "id")]
     tab: Option<String>,
+    /// Clear the field instead of setting it.
     #[arg(long)]
     clear: bool,
+    /// The value to set, as one or more words.
     #[arg(value_name = "value")]
     parts: Vec<String>,
 }
@@ -95,7 +110,13 @@ pub struct Field {
     pub status_err: fn(u16) -> Option<&'static str>,
 }
 
-/// Read the `(url, token)` env pair, or `None` outside a tab (silent no-op).
+/// The `(url, token)` pair for the daemon, or `None` outside a tab (silent no-op).
+///
+/// Through `discover_endpoint()` rather than reading the two variables here.
+/// A daemon whose token lives in a file instead of the environment is the
+/// normal case, and `env::var` returns `None` for it — so a module reading the
+/// variables directly does not fail loudly, it silently does nothing. The rule
+/// is enforced by `cli::client::tests`, which is how this was caught.
 pub(crate) fn api_env() -> Option<(String, String)> {
     super::client::discover_endpoint()
         .ok()
