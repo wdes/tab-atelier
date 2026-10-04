@@ -225,6 +225,17 @@ travels from the tap through the console route's optional `?tab=` argument and i
 *consumed* by the transport (taken, not read), so a later session cannot inherit
 the previous one's tab.
 
+**A row's trailing content is a stack, not a sequence.** The chevron that shows
+and hides a daemon's tab list sits beside the overflow button, and putting both
+in the trailing slot as siblings does not lay them out side by side — they land
+on the same coordinates, and the one drawn last takes every tap. Measured before
+the wrapper existed, both at `Rect.fromLTRB(1856.0, 192.0, 1936.0, 272.0)`:
+`performClick` on the chevron reached the overflow button, so the tab list could
+not be hidden by its own control. Upstream never hit this because its trailing
+slot has only ever held one child. They are wrapped in a `Row`, and the
+regression test asserts the *click* rather than the presence of the node — a
+stacked control is present, visible and enabled, and still unusable.
+
 ## Current state
 
 The app is a working ConnectBot under our package id, plus the tab-atelier type:

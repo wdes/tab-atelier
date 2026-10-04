@@ -923,7 +923,7 @@ index 34cd95e3..ae18dd2a 100644
          } catch (e: Exception) {
              _uiState.update {
 diff --git a/app/src/main/java/org/connectbot/ui/screens/hostlist/HostListScreen.kt b/app/src/main/java/org/connectbot/ui/screens/hostlist/HostListScreen.kt
-index 6b525d34..8bf8e3b9 100644
+index 6b525d34..188d3c79 100644
 --- a/app/src/main/java/org/connectbot/ui/screens/hostlist/HostListScreen.kt
 +++ b/app/src/main/java/org/connectbot/ui/screens/hostlist/HostListScreen.kt
 @@ -27,10 +27,13 @@ import androidx.compose.foundation.layout.Arrangement
@@ -984,7 +984,7 @@ index 6b525d34..8bf8e3b9 100644
  import org.connectbot.ui.LocalTerminalManager
  import org.connectbot.ui.PreviewScreen
  import org.connectbot.ui.components.DisconnectAllDialog
-@@ -107,12 +119,24 @@ import java.io.IOException
+@@ -107,12 +119,33 @@ import java.io.IOException
  internal object HostListTestTags {
      fun itemRow(hostId: Long): String = "host_item_${hostId}_row"
      fun itemMenuButton(hostId: Long): String = "host_item_${hostId}_menu_button"
@@ -1000,6 +1000,15 @@ index 6b525d34..8bf8e3b9 100644
 +     * tag there is no way to assert it does.
 +     */
 +    fun tabRow(hostId: Long, tabId: String): String = "host_item_${hostId}_tab_${tabId}_row"
++
++    /**
++     * The button that shows and hides a tab-atelier host's tab list.
++     *
++     * Tagged so a test can assert the control exists and is clickable: it began
++     * as a bare `Icon`, which is drawn but has no click action, so it could not
++     * be activated and was not announced as a button.
++     */
++    fun itemExpandButton(hostId: Long): String = "host_item_${hostId}_expand_button"
  }
  
  @OptIn(ExperimentalMaterial3Api::class)
@@ -1010,7 +1019,7 @@ index 6b525d34..8bf8e3b9 100644
      onNavigateToEditHost: (Host?) -> Unit,
      onNavigateToSettings: () -> Unit,
      onNavigateToPubkeys: () -> Unit,
-@@ -266,6 +290,8 @@ fun HostListScreen(
+@@ -266,6 +299,8 @@ fun HostListScreen(
          onNavigateToProfiles = onNavigateToProfiles,
          onNavigateToHelp = onNavigateToHelp,
          onToggleSortOrder = viewModel::toggleSortOrder,
@@ -1019,7 +1028,7 @@ index 6b525d34..8bf8e3b9 100644
          onDeleteHost = viewModel::deleteHost,
          onDuplicateHost = viewModel::duplicateHost,
          onForgetHostKeys = viewModel::forgetHostKeys,
-@@ -284,7 +310,7 @@ fun HostListScreen(
+@@ -284,7 +319,7 @@ fun HostListScreen(
  @Composable
  fun HostListScreenContent(
      uiState: HostListUiState,
@@ -1028,7 +1037,7 @@ index 6b525d34..8bf8e3b9 100644
      onNavigateToEditHost: (Host?) -> Unit,
      onNavigateToSettings: () -> Unit,
      onNavigateToPubkeys: () -> Unit,
-@@ -292,6 +318,10 @@ fun HostListScreenContent(
+@@ -292,6 +327,10 @@ fun HostListScreenContent(
      onNavigateToProfiles: () -> Unit,
      onNavigateToHelp: () -> Unit,
      onToggleSortOrder: () -> Unit,
@@ -1039,7 +1048,7 @@ index 6b525d34..8bf8e3b9 100644
      onDeleteHost: (Host) -> Unit,
      onDuplicateHost: (Host) -> Unit,
      onForgetHostKeys: (Host) -> Unit,
-@@ -480,28 +510,53 @@ fun HostListScreenContent(
+@@ -480,28 +519,57 @@ fun HostListScreenContent(
                          ),
                          verticalArrangement = Arrangement.spacedBy(8.dp),
                      ) {
@@ -1094,6 +1103,10 @@ index 6b525d34..8bf8e3b9 100644
 +                                    makingShortcut = makingShortcut,
 +                                    expanded = row.expanded,
 +                                    tabsLoading = row.tabsLoading,
++                                    // The chevron does what tapping the row does
++                                    // for a tab-atelier server. The child consumes
++                                    // the tap, so it toggles once, not twice.
++                                    onToggleExpanded = { onToggleTabHost(row.host.id) },
 +                                )
 +
 +                                // The tab the user tapped is the session to open.
@@ -1114,7 +1127,7 @@ index 6b525d34..8bf8e3b9 100644
                          }
                      }
                  }
-@@ -533,7 +588,13 @@ private fun HostListItem(
+@@ -533,7 +601,14 @@ private fun HostListItem(
      onDelete: () -> Unit,
      modifier: Modifier = Modifier,
      makingShortcut: Boolean = false,
@@ -1123,12 +1136,13 @@ index 6b525d34..8bf8e3b9 100644
 +    onRefreshTabs: () -> Unit = {},
 +    expanded: Boolean = false,
 +    tabsLoading: Boolean = false,
++    onToggleExpanded: () -> Unit = {},
  ) {
 +    val isTabAtelier = host.protocol == TabAtelier.PROTOCOL
      var showMenu by remember { mutableStateOf(false) }
      var showDeleteDialog by remember { mutableStateOf(false) }
      var showDisconnectDialog by remember { mutableStateOf(false) }
-@@ -553,7 +614,16 @@ private fun HostListItem(
+@@ -553,7 +628,16 @@ private fun HostListItem(
      Column(modifier = modifier) {
          ListItem(
              supportingContent = {
@@ -1146,7 +1160,7 @@ index 6b525d34..8bf8e3b9 100644
              },
              leadingContent = {
                  Box(
-@@ -575,9 +645,12 @@ private fun HostListItem(
+@@ -575,9 +659,12 @@ private fun HostListItem(
                          contentAlignment = Alignment.Center,
                      ) {
                          Icon(
@@ -1159,28 +1173,47 @@ index 6b525d34..8bf8e3b9 100644
                                  else -> Icons.Default.Link
                              },
                              contentDescription = when (connectionState) {
-@@ -621,6 +694,20 @@ private fun HostListItem(
+@@ -621,17 +708,56 @@ private fun HostListItem(
              },
              trailingContent = {
                  if (!makingShortcut) {
-+                    if (isTabAtelier) {
-+                        // Changed for Tab Atelier Remote (Apache-2.0 section
-+                        // 4(b)): the chevron shows the expansion the row has,
-+                        // and it is the row's only icon button — reloading the
-+                        // daemon's tabs is a per-row action like edit and
-+                        // delete, so it lives in the overflow below rather than
-+                        // crowding it with a second icon beside it.
-+                        Icon(
-+                            imageVector = if (expanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
-+                            contentDescription = stringResource(
-+                                if (expanded) R.string.button_collapse else R.string.expand,
-+                            ),
-+                        )
-+                    }
++                    // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)):
++                    // a row's trailing content is laid out in a stack, not in
++                    // sequence, so two controls put there occupy the same
++                    // coordinates and whichever is drawn last takes every tap.
++                    // Measured before this Row existed: the chevron and the
++                    // overflow button were both at Rect.fromLTRB(1856.0, 192.0,
++                    // 1936.0, 272.0), and a tap on the chevron reached the
++                    // overflow button, so the tab list could not be hidden by its
++                    // own control. A Row is what gives each its own space.
                      Box {
-                         IconButton(
-                             onClick = { showMenu = true },
-@@ -632,6 +719,21 @@ private fun HostListItem(
+-                        IconButton(
+-                            onClick = { showMenu = true },
+-                            modifier = Modifier.testTag(HostListTestTags.itemMenuButton(host.id)),
+-                        ) {
+-                            Icon(Icons.Default.MoreVert, contentDescription = stringResource(R.string.button_host_options))
++                        Row(verticalAlignment = Alignment.CenterVertically) {
++                            if (isTabAtelier) {
++                                IconButton(
++                                    onClick = onToggleExpanded,
++                                    modifier = Modifier.testTag(HostListTestTags.itemExpandButton(host.id)),
++                                ) {
++                                    Icon(
++                                        imageVector = if (expanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
++                                        contentDescription = stringResource(
++                                            if (expanded) R.string.button_collapse else R.string.expand,
++                                        ),
++                                    )
++                                }
++                            }
++                            IconButton(
++                                onClick = { showMenu = true },
++                                modifier = Modifier.testTag(HostListTestTags.itemMenuButton(host.id)),
++                            ) {
++                                Icon(Icons.Default.MoreVert, contentDescription = stringResource(R.string.button_host_options))
++                            }
+                         }
+                         DropdownMenu(
                              expanded = showMenu,
                              onDismissRequest = { showMenu = false },
                          ) {
@@ -1202,7 +1235,7 @@ index 6b525d34..8bf8e3b9 100644
                              DropdownMenuItem(
                                  text = { Text(stringResource(R.string.list_host_edit)) },
                                  onClick = {
-@@ -845,7 +947,7 @@ private fun HostListScreenEmptyPreview() {
+@@ -845,7 +971,7 @@ private fun HostListScreenEmptyPreview() {
                  hosts = emptyList(),
                  isLoading = false,
              ),
@@ -1211,7 +1244,7 @@ index 6b525d34..8bf8e3b9 100644
              onNavigateToEditHost = {},
              onNavigateToSettings = {},
              onNavigateToPubkeys = {},
-@@ -871,7 +973,7 @@ private fun HostListScreenLoadingPreview() {
+@@ -871,7 +997,7 @@ private fun HostListScreenLoadingPreview() {
                  hosts = emptyList(),
                  isLoading = true,
              ),
@@ -1220,7 +1253,7 @@ index 6b525d34..8bf8e3b9 100644
              onNavigateToEditHost = {},
              onNavigateToSettings = {},
              onNavigateToPubkeys = {},
-@@ -898,7 +1000,7 @@ private fun HostListScreenErrorPreview() {
+@@ -898,7 +1024,7 @@ private fun HostListScreenErrorPreview() {
                  isLoading = false,
                  error = "Failed to load hosts from database",
              ),
@@ -1229,7 +1262,7 @@ index 6b525d34..8bf8e3b9 100644
              onNavigateToEditHost = {},
              onNavigateToSettings = {},
              onNavigateToPubkeys = {},
-@@ -957,7 +1059,7 @@ private fun HostListScreenPopulatedPreview() {
+@@ -957,7 +1083,7 @@ private fun HostListScreenPopulatedPreview() {
                  ),
                  isLoading = false,
              ),
@@ -1238,7 +1271,7 @@ index 6b525d34..8bf8e3b9 100644
              onNavigateToEditHost = {},
              onNavigateToSettings = {},
              onNavigateToPubkeys = {},
-@@ -1007,3 +1109,155 @@ private fun StartupKeyPasswordDialog(
+@@ -1007,3 +1133,155 @@ private fun StartupKeyPasswordDialog(
          isPassword = true,
      )
  }
@@ -1728,10 +1761,20 @@ index 23108b7f..fe6f09f9 100644
                  _uiState.update {
                      it.copy(error = e.message ?: "Failed to delete host")
 diff --git a/app/src/test/kotlin/org/connectbot/HostListScreenTest.kt b/app/src/test/kotlin/org/connectbot/HostListScreenTest.kt
-index cf38eed7..07fb6a24 100644
+index cf38eed7..ad4b5652 100644
 --- a/app/src/test/kotlin/org/connectbot/HostListScreenTest.kt
 +++ b/app/src/test/kotlin/org/connectbot/HostListScreenTest.kt
-@@ -28,12 +28,15 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
+@@ -17,7 +17,9 @@
+ 
+ package org.connectbot
+ 
++import androidx.compose.ui.test.assertContentDescriptionEquals
+ import androidx.compose.ui.test.assertIsDisplayed
++import androidx.compose.ui.test.assertIsEnabled
+ import androidx.compose.ui.test.assertIsNotEnabled
+ import androidx.compose.ui.test.junit4.v2.createAndroidComposeRule
+ import androidx.compose.ui.test.onNodeWithContentDescription
+@@ -28,12 +30,15 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
  import dagger.hilt.android.testing.HiltAndroidRule
  import dagger.hilt.android.testing.HiltAndroidTest
  import org.connectbot.data.entity.Host
@@ -1747,7 +1790,7 @@ index cf38eed7..07fb6a24 100644
  import org.junit.Assert.assertTrue
  import org.junit.Before
  import org.junit.Rule
-@@ -61,7 +64,7 @@ class HostListScreenTest {
+@@ -61,7 +66,7 @@ class HostListScreenTest {
          composeTestRule.setContent {
              ConnectBotTheme {
                  HostListScreen(
@@ -1756,7 +1799,7 @@ index cf38eed7..07fb6a24 100644
                      onNavigateToEditHost = {},
                      onNavigateToSettings = {},
                      onNavigateToPubkeys = {},
-@@ -84,7 +87,7 @@ class HostListScreenTest {
+@@ -84,7 +89,7 @@ class HostListScreenTest {
          composeTestRule.setContent {
              ConnectBotTheme {
                  HostListScreen(
@@ -1765,7 +1808,7 @@ index cf38eed7..07fb6a24 100644
                      onNavigateToEditHost = {},
                      onNavigateToSettings = {},
                      onNavigateToPubkeys = {},
-@@ -108,7 +111,7 @@ class HostListScreenTest {
+@@ -108,7 +113,7 @@ class HostListScreenTest {
          composeTestRule.setContent {
              ConnectBotTheme {
                  HostListScreen(
@@ -1774,7 +1817,7 @@ index cf38eed7..07fb6a24 100644
                      onNavigateToEditHost = {},
                      onNavigateToSettings = {},
                      onNavigateToPubkeys = {},
-@@ -136,7 +139,7 @@ class HostListScreenTest {
+@@ -136,7 +141,7 @@ class HostListScreenTest {
          composeTestRule.setContent {
              ConnectBotTheme {
                  HostListScreen(
@@ -1783,7 +1826,7 @@ index cf38eed7..07fb6a24 100644
                      onNavigateToEditHost = { addHostCalled = true },
                      onNavigateToSettings = {},
                      onNavigateToPubkeys = {},
-@@ -161,7 +164,7 @@ class HostListScreenTest {
+@@ -161,7 +166,7 @@ class HostListScreenTest {
          composeTestRule.setContent {
              ConnectBotTheme {
                  HostListScreen(
@@ -1792,7 +1835,7 @@ index cf38eed7..07fb6a24 100644
                      onNavigateToEditHost = {},
                      onNavigateToSettings = {},
                      onNavigateToPubkeys = {},
-@@ -187,7 +190,7 @@ class HostListScreenTest {
+@@ -187,7 +192,7 @@ class HostListScreenTest {
          composeTestRule.setContent {
              ConnectBotTheme {
                  HostListScreen(
@@ -1801,7 +1844,7 @@ index cf38eed7..07fb6a24 100644
                      onNavigateToEditHost = {},
                      onNavigateToSettings = {},
                      onNavigateToSettingsHighlightConnPersist = { navigatedToSettingsHighlight = true },
-@@ -215,7 +218,7 @@ class HostListScreenTest {
+@@ -215,7 +220,7 @@ class HostListScreenTest {
          composeTestRule.setContent {
              ConnectBotTheme {
                  HostListScreen(
@@ -1810,7 +1853,7 @@ index cf38eed7..07fb6a24 100644
                      onNavigateToEditHost = {},
                      onNavigateToSettings = {},
                      onNavigateToPubkeys = {},
-@@ -324,7 +327,7 @@ class HostListScreenTest {
+@@ -324,7 +329,7 @@ class HostListScreenTest {
                      disconnected.id to ConnectionState.DISCONNECTED,
                  ),
              ),
@@ -1819,7 +1862,7 @@ index cf38eed7..07fb6a24 100644
          )
  
          composeTestRule
-@@ -439,7 +442,7 @@ class HostListScreenTest {
+@@ -439,7 +444,7 @@ class HostListScreenTest {
      private fun setHostListContent(
          uiState: HostListUiState = HostListUiState(),
          makingShortcut: Boolean = false,
@@ -1828,7 +1871,21 @@ index cf38eed7..07fb6a24 100644
          onSelectShortcut: (Host) -> Unit = {},
          onNavigateToEditHost: (Host?) -> Unit = {},
          onNavigateToSettings: () -> Unit = {},
-@@ -482,6 +485,42 @@ class HostListScreenTest {
+@@ -455,6 +460,7 @@ class HostListScreenTest {
+         onDisconnectAll: () -> Unit = {},
+         onExportHosts: () -> Unit = {},
+         onImportHosts: () -> Unit = {},
++        onToggleTabHost: (Long) -> Unit = {},
+     ) {
+         composeTestRule.setContent {
+             ConnectBotTheme {
+@@ -477,11 +483,98 @@ class HostListScreenTest {
+                     onDisconnectAll = onDisconnectAll,
+                     onExportHosts = onExportHosts,
+                     onImportHosts = onImportHosts,
++                    onToggleTabHost = onToggleTabHost,
+                 )
+             }
          }
      }
  
@@ -1866,6 +1923,56 @@ index cf38eed7..07fb6a24 100644
 +
 +        assertEquals(host, openedHost)
 +        assertEquals("the tab id must reach the navigation, not just the host", "t-1", openedTab)
++    }
++
++    /**
++     * Added for Tab Atelier Remote: the chevron that shows and hides a daemon's
++     * tab list has to be a real button.
++     *
++     * It began as a bare `Icon` — drawn, with a content description, but with no
++     * click action of its own. Expanding by tapping the row still worked, so
++     * nothing looked wrong on screen; the control simply could not be activated
++     * on its own, was not announced to a screen reader as a button, and its 24dp
++     * sat flush against the overflow button's 48dp. `performClick` is the
++     * assertion because it is exactly what an `Icon` cannot do.
++     */
++    @Test
++    fun theExpandButton_togglesTheTabList() {
++        val host = testHost(id = 42L, nickname = "workstation", protocol = "tabatelier")
++        var toggled = 0L
++
++        setHostListContent(
++            uiState = HostListUiState(
++                hosts = listOf(host),
++                tabStates = mapOf(host.id to TabListState(tabs = emptyList())),
++            ),
++            onToggleTabHost = { toggled = it },
++        )
++
++        composeTestRule
++            .onNodeWithTag(HostListTestTags.itemExpandButton(host.id))
++            .performClick()
++
++        assertEquals("the button must toggle that host's tab list", 42L, toggled)
++    }
++
++    /**
++     * The chevron has to say which way it goes: a tab-atelier server is expanded
++     * unless it is in `collapsedTabHosts`, so the state a user first sees is the
++     * expanded one, and the control has to offer to collapse it rather than
++     * leaving a screen reader to guess.
++     */
++    @Test
++    fun theExpandButton_saysWhetherItWillShowOrHideTheTabs() {
++        val host = testHost(id = 43L, nickname = "workstation", protocol = "tabatelier")
++        val button = { composeTestRule.onNodeWithTag(HostListTestTags.itemExpandButton(host.id)) }
++
++        // Default state: a tab-atelier host is expanded.
++        setHostListContent(uiState = HostListUiState(hosts = listOf(host)))
++        button().assertContentDescriptionEquals(
++            composeTestRule.activity.getString(R.string.button_collapse),
++        )
++        button().assertIsEnabled()
 +    }
 +
      private fun testHost(
