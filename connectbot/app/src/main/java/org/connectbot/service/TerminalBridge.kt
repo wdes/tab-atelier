@@ -64,6 +64,7 @@ import org.connectbot.terminal.TerminalEmulatorFactory
 import org.connectbot.terminal.UrlScanScope
 import org.connectbot.transport.AbsTransport
 import org.connectbot.transport.SSH
+import org.connectbot.transport.TabAtelier
 import org.connectbot.transport.TransportFactory
 import org.connectbot.util.HostConstants
 import org.connectbot.util.PreferenceConstants
@@ -291,6 +292,34 @@ class TerminalBridge {
     /** DEL key mode from profile */
     private val _delKeyModeFlow = MutableStateFlow<DelKeyMode>(DelKeyMode.Delete)
     val delKeyModeFlow: StateFlow<DelKeyMode> = _delKeyModeFlow.asStateFlow()
+
+    // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): the grid size the
+    // remote end reports it is using, in rows×cols, or null when it has not said.
+    private val _remoteGridSize = MutableStateFlow<Pair<Int, Int>?>(null)
+    val remoteGridSize: StateFlow<Pair<Int, Int>?> = _remoteGridSize.asStateFlow()
+
+    // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): the name the
+    // remote end gives the tab this session is on, or null when it has not said.
+    //
+    // The console title shows it, because a session is "which server" and "which
+    // of its tabs" and the host's name alone cannot say the second: two tabs of
+    // one server would both title themselves with it. It comes from the daemon
+    // rather than from the row the user tapped so that it stays right if the tab
+    // is renamed while the session is open, and so a session restored from saved
+    // state gets the current name rather than the one from when it was saved.
+    private val _remoteTabName = MutableStateFlow<String?>(null)
+    val remoteTabName: StateFlow<String?> = _remoteTabName.asStateFlow()
+
+    // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): the background the
+    // remote end paints this tab's viewer in, as a `#rrggbb` string, or null when
+    // the tab has none of its own.
+    //
+    // The daemon gives each tab a background so its viewers can be told apart at a
+    // glance, and keeps the terminal's own colours — that is part of the tab —
+    // distinct from it. So this overrides the background only; the foreground
+    // stays whatever the terminal itself is rendering with.
+    private val _remoteBackgroundColor = MutableStateFlow<String?>(null)
+    val remoteBackgroundColor: StateFlow<String?> = _remoteBackgroundColor.asStateFlow()
 
     // Terminal emulator from ConnectBot Terminal library
     val terminalEmulator: TerminalEmulator
@@ -785,6 +814,81 @@ class TerminalBridge {
      */
     fun requestOpenTextInput() {
         onTextInputRequest?.invoke()
+    }
+
+    /**
+     * Told by a transport when the remote end reports the grid size its terminal
+     * is actually using, in rows×cols.
+     *
+     * Added for Tab Atelier Remote (Apache-2.0 section 4(b)): a tab-atelier tab is
+     * a real workstation terminal and the daemon refuses to resize it — a phone
+     * viewer must not reflow a shared PTY out from under an agent's TUI or another
+     * viewer — so the only way to render one faithfully is to mirror its geometry
+     * rather than drive it. ConsoleScreen turns this into a forced terminal size.
+     *
+     * A non-positive dimension is ignored rather than stored: a 0-column terminal
+     * is not a size, and a daemon that sent one would have this client render
+     * nothing at all.
+     */
+    fun setRemoteGridSize(rows: Int, cols: Int) {
+        if (rows > 0 && cols > 0) _remoteGridSize.value = Pair(rows, cols)
+    }
+
+    /**
+     * Told by a transport when the remote end reports what the tab this session is
+     * on is called.
+     *
+     * Added for Tab Atelier Remote (Apache-2.0 section 4(b)): the console title
+     * shows this alongside the server's name, because opening two tabs of one
+     * server otherwise gives two sessions with identical titles and no way to tell
+     * which is which. See [remoteTabName] for why it is taken from the daemon
+     * rather than from the row that was tapped.
+     *
+     * A blank name is ignored rather than stored: "server - " is worse than the
+     * server's name alone, and a daemon with nothing to say should leave the title
+     * as it was.
+     */
+    fun setRemoteTabName(name: String) {
+        if (name.isNotBlank()) _remoteTabName.value = name
+    }
+
+    /**
+     * Told by a transport when the remote end reports the background its viewer for
+     * this tab is painted in.
+     *
+     * Added for Tab Atelier Remote (Apache-2.0 section 4(b)): the daemon gives each
+     * tab a background, so its viewers can be told apart. Passed on as the
+     * `#rrggbb` string it arrived as rather than parsed here — the bridge carries
+     * what the remote said, and the console is what turns it into a colour, so
+     * there is one place that decides what a usable colour is.
+     *
+     * **A null clears it, and that is deliberate.** A tab whose viewer has no
+     * background of its own must not inherit the colour of the tab a session was on
+     * before it, so the caller reports what the remote said rather than only the
+     * interesting values. Passing nothing at all is not possible for a switch,
+     * which is exactly the case that would otherwise leave the wrong colour on
+     * screen.
+     */
+    fun setRemoteBackgroundColor(color: String?) {
+        _remoteBackgroundColor.value = color
+    }
+
+    /**
+     * Moves this session to another tab of the same server, returning whether this
+     * session was able to take the move.
+     *
+     * Added for Tab Atelier Remote (Apache-2.0 section 4(b)): another tab of a
+     * server that already has a session moves that session, because ConnectBot keys
+     * a session by host and this app is a viewer — the tab left behind keeps
+     * running on the daemon, so a move loses nothing.
+     *
+     * A false return is not a failure: it means this session is not one that has
+     * tabs — every other transport — so the caller should do what it would have
+     * done anyway, which is open a session.
+     */
+    fun switchTab(tabKey: String): Boolean {
+        val tabatelier = transport as? TabAtelier ?: return false
+        return tabatelier.switchTab(tabKey)
     }
 
     /**
