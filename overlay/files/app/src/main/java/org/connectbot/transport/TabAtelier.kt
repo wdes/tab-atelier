@@ -170,9 +170,12 @@ class TabAtelier : AbsTransport() {
         override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
             when (val frame = decodeFrame(bytes.toByteArray())) {
                 is Frame.Output -> if (frame.bytes.size > 0) inbound.offer(frame.bytes.toByteArray())
-                // The one piece of tab metadata this client does need: the grid
-                // size whose geometry the terminal has to mirror.
-                is Frame.Grid -> bridge?.setRemoteGridSize(frame.rows, frame.cols)
+                is Frame.Meta -> {
+                    // The name the console's title shows, and the grid its
+                    // terminal has to mirror.
+                    frame.name?.let { bridge?.setRemoteTabName(it) }
+                    frame.grid?.let { bridge?.setRemoteGridSize(it.rows, it.cols) }
+                }
                 Frame.Ignored -> Unit
             }
         }
@@ -300,8 +303,8 @@ class TabAtelier : AbsTransport() {
     /**
      * What one server frame means to this client.
      *
-     * Only output and the grid size are understood; everything else, including the
-     * daemon's quick preview paint, is dropped rather than guessed at.
+     * Only output and the meta frame are understood; everything else, including
+     * the daemon's quick preview paint, is dropped rather than guessed at.
      */
     internal sealed interface Frame {
         /**
@@ -315,8 +318,18 @@ class TabAtelier : AbsTransport() {
          */
         data class Output(val bytes: ByteString) : Frame
 
-        /** The grid size the daemon's terminal is using, in rows×cols. */
-        data class Grid(val rows: Int, val cols: Int) : Frame
+        /**
+         * The tab metadata this client uses: what the tab is called, and the grid
+         * its terminal is using.
+         *
+         * One frame carries both, so one type does — see [decodeFrame]. Either
+         * field is null when the daemon did not send it in a form this client
+         * understands, which is not an error: the two are useful independently.
+         */
+        data class Meta(val name: String?, val grid: Grid?) : Frame {
+            /** The grid size the daemon's terminal is using, in rows×cols. */
+            data class Grid(val rows: Int, val cols: Int)
+        }
 
         /** Nothing this client renders. */
         data object Ignored : Frame
@@ -335,10 +348,9 @@ class TabAtelier : AbsTransport() {
         return when (frame[0]) {
             TAG_OUTPUT -> Frame.Output(frame.copyOfRange(1, frame.size).toByteString())
             TAG_OUTPUT_GZIP -> Frame.Output(gunzip(frame, 1).toByteString())
-            // The grid the daemon's terminal is using, which is the size a client
-            // has to render at: the daemon refuses to be resized, so mirroring it
-            // is the only faithful rendering. See setDimensions.
-            TAG_META -> parseGrid(frame) ?: Frame.Ignored
+            // The tab's own metadata, which is where both the name the console
+            // shows and the grid it has to mirror come from.
+            TAG_META -> parseMeta(frame)
             // The quick preview paint, tag 0x0c, is deliberately not rendered. It
             // is terminal output by shape but not a stream: a hint to paint the
             // last screen without waiting out a large catch-up. Feeding it to the
@@ -349,23 +361,37 @@ class TabAtelier : AbsTransport() {
     }
 
     /**
-     * The grid size out of a meta frame's JSON, or null if it does not carry one
-     * this client can use.
+     * The parts of a meta frame this client uses, or [Frame.Ignored] when it
+     * carries none of them.
      *
-     * A null answer is not a failure worth reporting upwards: the frame carries
-     * other tab metadata that the list screen already shows, so one whose shape
-     * this client does not recognise simply leaves the terminal at its own size.
+     * Both fields are read defensively. The frame is the daemon's, its shape is
+     * not this client's to require, and a field that is absent, null or the wrong
+     * type must leave the session working with a default rather than fail it — the
+     * metadata is a convenience, the terminal is the point.
      */
-    private fun parseGrid(frame: ByteArray): Frame.Grid? = try {
-        val meta = JSONObject(String(frame, 1, frame.size - 1, Charsets.UTF_8))
-        // Absent keys, and the JSON null the daemon uses for "unknown", both arrive
-        // as an absent optInt default of 0 — which is not a size.
+    private fun parseMeta(frame: ByteArray): Frame {
+        val meta = try {
+            JSONObject(String(frame, 1, frame.size - 1, Charsets.UTF_8))
+        } catch (e: JSONException) {
+            Timber.d(e, "tab-atelier meta frame was not JSON this client understands")
+            return Frame.Ignored
+        }
+
+        // Absent keys, and the JSON null the daemon uses for "unknown", both
+        // arrive as an absent optInt default of 0 — which is not a size.
         val rows = meta.optInt("rows", 0)
         val cols = meta.optInt("cols", 0)
-        if (rows > 0 && cols > 0) Frame.Grid(rows, cols) else null
-    } catch (e: JSONException) {
-        Timber.d(e, "tab-atelier meta frame was not JSON this client understands")
-        null
+        val grid = if (rows > 0 && cols > 0) Frame.Meta.Grid(rows, cols) else null
+
+        // `isNull` and `has` before `optString`, because `optString` does the
+        // wrong thing here in a way that would have shipped: for a JSON null it
+        // returns the *string* "null", not the fallback, so the daemon's own
+        // "unknown" sentinel would become a tab named "null" and the console
+        // would read "server - null". Absent and null are therefore both "no
+        // name", and only a real non-blank string is one.
+        val rawName = if (meta.has("name") && !meta.isNull("name")) meta.optString("name", "") else null
+        val name = rawName?.takeIf { it.isNotBlank() }
+        return if (name == null && grid == null) Frame.Ignored else Frame.Meta(name, grid)
     }
 
     private fun send(tag: Byte, payload: ByteArray) {

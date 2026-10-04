@@ -1,8 +1,8 @@
 diff --git a/app/src/main/java/org/connectbot/service/TerminalBridge.kt b/app/src/main/java/org/connectbot/service/TerminalBridge.kt
-index 208bd124..2ef795db 100644
+index 208bd124..840eb83a 100644
 --- a/app/src/main/java/org/connectbot/service/TerminalBridge.kt
 +++ b/app/src/main/java/org/connectbot/service/TerminalBridge.kt
-@@ -292,6 +292,11 @@ class TerminalBridge {
+@@ -292,6 +292,23 @@ class TerminalBridge {
      private val _delKeyModeFlow = MutableStateFlow<DelKeyMode>(DelKeyMode.Delete)
      val delKeyModeFlow: StateFlow<DelKeyMode> = _delKeyModeFlow.asStateFlow()
  
@@ -11,10 +11,22 @@ index 208bd124..2ef795db 100644
 +    private val _remoteGridSize = MutableStateFlow<Pair<Int, Int>?>(null)
 +    val remoteGridSize: StateFlow<Pair<Int, Int>?> = _remoteGridSize.asStateFlow()
 +
++    // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): the name the
++    // remote end gives the tab this session is on, or null when it has not said.
++    //
++    // The console title shows it, because a session is "which server" and "which
++    // of its tabs" and the host's name alone cannot say the second: two tabs of
++    // one server would both title themselves with it. It comes from the daemon
++    // rather than from the row the user tapped so that it stays right if the tab
++    // is renamed while the session is open, and so a session restored from saved
++    // state gets the current name rather than the one from when it was saved.
++    private val _remoteTabName = MutableStateFlow<String?>(null)
++    val remoteTabName: StateFlow<String?> = _remoteTabName.asStateFlow()
++
      // Terminal emulator from ConnectBot Terminal library
      val terminalEmulator: TerminalEmulator
  
-@@ -787,6 +792,24 @@ class TerminalBridge {
+@@ -787,6 +804,42 @@ class TerminalBridge {
          onTextInputRequest?.invoke()
      }
  
@@ -34,6 +46,24 @@ index 208bd124..2ef795db 100644
 +     */
 +    fun setRemoteGridSize(rows: Int, cols: Int) {
 +        if (rows > 0 && cols > 0) _remoteGridSize.value = Pair(rows, cols)
++    }
++
++    /**
++     * Told by a transport when the remote end reports what the tab this session is
++     * on is called.
++     *
++     * Added for Tab Atelier Remote (Apache-2.0 section 4(b)): the console title
++     * shows this alongside the server's name, because opening two tabs of one
++     * server otherwise gives two sessions with identical titles and no way to tell
++     * which is which. See [remoteTabName] for why it is taken from the daemon
++     * rather than from the row that was tapped.
++     *
++     * A blank name is ignored rather than stored: "server - " is worse than the
++     * server's name alone, and a daemon with nothing to say should leave the title
++     * as it was.
++     */
++    fun setRemoteTabName(name: String) {
++        if (name.isNotBlank()) _remoteTabName.value = name
 +    }
 +
      /**

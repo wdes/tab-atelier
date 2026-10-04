@@ -1,5 +1,5 @@
 diff --git a/app/src/main/java/org/connectbot/ui/screens/console/ConsoleScreen.kt b/app/src/main/java/org/connectbot/ui/screens/console/ConsoleScreen.kt
-index 72587ad7..d6c287b9 100644
+index 72587ad7..c69bf755 100644
 --- a/app/src/main/java/org/connectbot/ui/screens/console/ConsoleScreen.kt
 +++ b/app/src/main/java/org/connectbot/ui/screens/console/ConsoleScreen.kt
 @@ -81,6 +81,7 @@ import androidx.compose.material3.TextButton
@@ -86,3 +86,36 @@ index 72587ad7..d6c287b9 100644
      }
  
      // Show snackbar for network status messages
+@@ -1196,11 +1239,30 @@ fun ConsoleScreen(
+         // or temporarily visible when titleBarHide is true and showTitleBar is true
+         if (!titleBarHide || showTitleBar) {
+             val density = LocalDensity.current
++            // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): the title
++            // becomes "server - tab" when the remote end reports a tab name.
++            //
++            // Every other transport reports none and keeps the host's nickname
++            // alone, which is right for them — a session is a host. It is not
++            // enough for a tab-atelier session, which is a host *and* one of its
++            // tabs: two tabs of one server would otherwise title themselves
++            // identically, with nothing on screen saying which was which.
++            val remoteTabNameState = currentBridge?.remoteTabName?.collectAsState()
++            val remoteTabName = remoteTabNameState?.value
++            val title = currentBridge?.host?.nickname
++                ?: stringResource(R.string.console_default_title)
+             TopAppBar(
+                 title = {
+                     Text(
+-                        currentBridge?.host?.nickname
+-                            ?: stringResource(R.string.console_default_title),
++                        if (remoteTabName.isNullOrBlank()) {
++                            title
++                        } else {
++                            stringResource(
++                                R.string.tabatelier_console_title_with_tab,
++                                title,
++                                remoteTabName,
++                            )
++                        },
+                         maxLines = 1,
+                         overflow = TextOverflow.Ellipsis,
+                     )

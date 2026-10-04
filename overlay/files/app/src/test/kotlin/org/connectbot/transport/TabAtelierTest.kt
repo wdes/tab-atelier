@@ -65,18 +65,68 @@ class TabAtelierTest {
     @Test
     fun metaFrames_carryTheGridToMirror() {
         val decoded = transport.decodeFrame(frame(0x03, """{"rows":48,"cols":193}"""))
-        assertEquals(TabAtelier.Frame.Grid(rows = 48, cols = 193), decoded)
+        assertEquals(
+            TabAtelier.Frame.Meta(name = null, grid = TabAtelier.Frame.Meta.Grid(rows = 48, cols = 193)),
+            decoded,
+        )
+    }
+
+    /**
+     * The tab's name, which the console title shows beside the server's.
+     *
+     * It comes from the daemon rather than from the row that was tapped, so this
+     * is the frame that has to carry it — and it is the same frame as the grid, so
+     * one test each for "only a name", "only a grid" and "both".
+     */
+    @Test
+    fun metaFrames_carryTheTabName() {
+        assertEquals(
+            "a name alone must still be a usable meta frame",
+            TabAtelier.Frame.Meta(name = "build-2", grid = null),
+            transport.decodeFrame(frame(0x03, """{"name":"build-2"}""")),
+        )
+        assertEquals(
+            "both, when the daemon sends both",
+            TabAtelier.Frame.Meta(name = "build-2", grid = TabAtelier.Frame.Meta.Grid(rows = 48, cols = 193)),
+            transport.decodeFrame(frame(0x03, """{"name":"build-2","rows":48,"cols":193}""")),
+        )
+    }
+
+    /**
+     * A name that is not a name must not reach the title.
+     *
+     * The console renders "server - name", so an empty or absent name would leave
+     * a trailing separator with nothing after it, which reads as a rendering bug
+     * rather than as a tab without a name. A blank one is therefore not a name
+     * here, and the title falls back to the server's.
+     */
+    @Test
+    fun metaFrames_withoutAUsableName_carryNoName() {
+        // Nothing usable in the frame at all is Ignored, not an empty Meta: a
+        // meta frame that says nothing this client can use has nothing to say.
+        assertEquals(
+            TabAtelier.Frame.Ignored,
+            transport.decodeFrame(frame(0x03, """{"name":""}""")),
+        )
+        assertEquals(
+            TabAtelier.Frame.Ignored,
+            transport.decodeFrame(frame(0x03, """{"name":"   "}""")),
+        )
+        // The daemon's JSON null for "unknown" must not become the string "null".
+        assertEquals(
+            TabAtelier.Frame.Ignored,
+            transport.decodeFrame(frame(0x03, """{"name":null}""")),
+        )
     }
 
     @Test
-    fun metaFrames_withoutAGrid_areIgnored() {
-        // The frame carries other tab metadata the list screen already shows, so a
-        // meta frame with no usable size must not be treated as a failure.
+    fun metaFrames_withoutAGrid_carryNoGrid() {
+        // Zero and the daemon's JSON null for "unknown" are both "not a size", and
+        // neither is an error: the name from the same frame is still usable.
         assertEquals(
-            TabAtelier.Frame.Ignored,
+            TabAtelier.Frame.Meta(name = "tab", grid = null),
             transport.decodeFrame(frame(0x03, """{"name":"tab","agent_kind":"claude"}""")),
         )
-        // The daemon uses JSON null for "unknown", and zero is not a size.
         assertEquals(
             TabAtelier.Frame.Ignored,
             transport.decodeFrame(frame(0x03, """{"rows":null,"cols":null}""")),

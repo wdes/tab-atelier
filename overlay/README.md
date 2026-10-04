@@ -233,6 +233,21 @@ consequences, each of which looks like a bug if you do not know it:
 - **A profile's forced size still wins**, and every other transport is unaffected,
   because the flow a transport would report through starts null.
 
+**The tab's name comes from the same meta frame**, so the console titles the
+session "server - tab". A session is "which server" and "which of its tabs", and
+the host's name alone cannot say the second — two tabs of one server would title
+themselves identically. It is taken from the daemon rather than from the row that
+was tapped so that it stays right if the tab is renamed while the session is open,
+and so a session restored from saved state shows the current name rather than the
+one that was on screen when it was saved. Every other transport reports no name
+and keeps the host's nickname alone.
+
+One trap in reading it, which would have shipped: **`org.json`'s `optString`
+returns the *string* `"null"` for a JSON null**, not the fallback — so the
+daemon's own "unknown" sentinel would have titled the session
+`server - null`. The frame is read with `has`/`isNull` first, and only a real
+non-blank string is a name.
+
 Which tab to open cannot ride on the host row — a row is the daemon, not one of
 its tabs, and a WebSocket cannot be asked for a tab once it is open. So the id
 travels from the tap through the console route's optional `?tab=` argument and is
