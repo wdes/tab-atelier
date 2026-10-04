@@ -436,10 +436,17 @@ fn authorise_and_ring(
 /// comparison runs on the exact wire input — see `percent_decode`'s
 /// docstring for the reason this is `Vec<u8>` and not `String`.
 fn extract_token<B>(req: &Request<B>) -> Option<Vec<u8>> {
-    let q = req.uri().query()?;
-    for pair in q.split('&') {
-        if let Some(v) = pair.strip_prefix("token=") {
-            return Some(percent_decode(v));
+    // `if let Some`, not `req.uri().query()?`: the `?` on an Option returns from
+    // this whole function, so a request with no query string at all — which is
+    // the normal shape of a WS upgrade, `/tabs/by-id/{id}/ws` — would return
+    // None here and never reach the header fallback below. That made
+    // `Authorization: Bearer` dead code and 401'd every header-only client
+    // (verified against a live daemon: header alone → 401, `?token=` → 101).
+    if let Some(q) = req.uri().query() {
+        for pair in q.split('&') {
+            if let Some(v) = pair.strip_prefix("token=") {
+                return Some(percent_decode(v));
+            }
         }
     }
     let h = req.headers().get(hyper::header::AUTHORIZATION)?;
@@ -1775,6 +1782,24 @@ mod tests {
         // No credential at all is None, not an empty token.
         assert!(super::extract_token(&req_with("/ws/tabs/0", &[])).is_none());
         assert!(super::extract_token(&req_with("/ws/tabs/0?other=1", &[])).is_none());
+
+        // The header form, and specifically with NO query string: that is the
+        // shape a non-browser client sends (`/tabs/by-id/{id}/ws`), and it used
+        // to be unreachable — the query lookup returned from the whole function
+        // before the header was read, so this asserted nothing and the 401 went
+        // unnoticed. Keep a no-query case here; a query present in the URI would
+        // pass even with the bug.
+        let from_header = super::extract_token(&req_with("/ws/tabs/0", &[("authorization", "Bearer hdr456")]));
+        assert_eq!(from_header.as_deref(), Some(&b"hdr456"[..]));
+        // A query that carries something else must not shadow the header.
+        let other_param = super::extract_token(&req_with("/ws/tabs/0?other=1", &[("authorization", "Bearer hdr456")]));
+        assert_eq!(other_param.as_deref(), Some(&b"hdr456"[..]));
+        // The query still wins when both are present.
+        let both = super::extract_token(&req_with(
+            "/ws/tabs/0?token=abc123",
+            &[("authorization", "Bearer hdr456")],
+        ));
+        assert_eq!(both.as_deref(), Some(&b"abc123"[..]));
     }
 
     #[test]
