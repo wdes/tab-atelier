@@ -1,0 +1,852 @@
+/* Harness control panel. Slice S3. See docs/dashboard.md. */
+:root {
+  color-scheme: light dark;
+  --bg: #f7f7f8;
+  --fg: #1f2328;
+  --panel: #ffffff;
+  --border: #d0d7de;
+  --muted: #57606a;
+  /* Neutral (empty node): faint, dashed. Led colours below work on both themes. */
+  --neutral-fill: #eaeef2;
+  --neutral-stroke: #c0c7cf;
+  /* Led palette as variables so a node fill and its legend swatch (S1) paint the
+     EXACT same colour — the acceptance matches swatch bg against node fill. */
+  --led-idle-fill: #ddf4ff;       --led-idle-stroke: #54aeff;
+  --led-unreviewed-fill: #fff8c5; --led-unreviewed-stroke: #d4a72c;
+  --led-working-fill: #dafbe1;    --led-working-stroke: #2da44e;
+  --led-error-fill: #ffebe9;      --led-error-stroke: #cf222e;
+  --led-dead-fill: #d0d7de;       --led-dead-stroke: #6e7781;
+  --orchestrator-accent: #8250df;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14171c;
+    --fg: #e6edf3;
+    --panel: #1e232b;
+    --border: #30363d;
+    --muted: #9198a1;
+    --neutral-fill: #232a33;
+    --neutral-stroke: #3a424c;
+    --led-idle-fill: #0c2d4a;       --led-idle-stroke: #3b82f6;
+    --led-unreviewed-fill: #3b2e00; --led-unreviewed-stroke: #d4a72c;
+    --led-working-fill: #0f3d22;    --led-working-stroke: #2da44e;
+    --led-error-fill: #4a1512;      --led-error-stroke: #f85149;
+    --led-dead-fill: #2b3138;       --led-dead-stroke: #6e7781;
+    --orchestrator-accent: #d2a8ff;
+  }
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font: 14px/1.4 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  background: var(--bg);
+  color: var(--fg);
+}
+
+.topbar {
+  display: flex;
+  align-items: baseline;
+  gap: 1rem;
+  padding: 0.6rem 1rem;
+  border-bottom: 1px solid var(--border);
+}
+.topbar h1 { font-size: 1rem; margin: 0; font-weight: 600; }
+.status { font-size: 0.8rem; color: var(--muted); }
+.status.ok { color: #2da44e; }
+.status.err { color: #cf222e; }
+
+#dashboard { padding: 1rem; }
+#flow { width: 100%; height: auto; max-height: 40vh; }
+/* The UA `[hidden]{display:none}` rule doesn't reliably win over an SVG's
+   default `display:inline`, so hide #flow explicitly at level 0 (see the
+   toggleAttribute("hidden") in dashboard.js — SVGElement has no `hidden` prop). */
+#flow[hidden] { display: none; }
+
+.back-btn {
+  margin-bottom: 0.8rem;
+  padding: 0.35rem 0.7rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--fg);
+  font: inherit;
+  cursor: pointer;
+}
+.back-btn:hover { background: color-mix(in srgb, var(--fg) 6%, transparent); }
+
+/* --- phase nodes --- */
+.node { cursor: pointer; }
+.node-box {
+  fill: var(--neutral-fill);
+  stroke: var(--neutral-stroke);
+  stroke-width: 2;
+  transition: fill 0.25s ease, stroke 0.25s ease;
+}
+.node-label {
+  text-anchor: middle;
+  fill: var(--fg);
+  font-size: 15px;
+  font-weight: 600;
+}
+/* Live subtitle: occupant name + context (~5 words), truncated in JS. */
+.node-subtitle {
+  text-anchor: middle;
+  fill: var(--muted);
+  font-size: 10px;
+}
+.node-count {
+  text-anchor: middle;
+  fill: var(--muted);
+  font-size: 11px;
+}
+.node:focus { outline: none; }
+.node:focus .node-box,
+.node:hover .node-box { stroke-width: 3; }
+
+.arrow { stroke: var(--border); stroke-width: 2; }
+.arrow-head { fill: var(--border); }
+
+/* Led highlight: one class per state (docs/dashboard.md "led rollup"). Colours
+   come from the --led-*-{fill,stroke} variables so a node and its legend swatch
+   stay in lock-step (S1). */
+.node.led-neutral .node-box    { fill: var(--neutral-fill); stroke: var(--neutral-stroke); stroke-dasharray: 4 4; }
+.node.led-idle .node-box       { fill: var(--led-idle-fill); stroke: var(--led-idle-stroke); }
+.node.led-unreviewed .node-box { fill: var(--led-unreviewed-fill); stroke: var(--led-unreviewed-stroke); }
+.node.led-working .node-box    { fill: var(--led-working-fill); stroke: var(--led-working-stroke); }
+.node.led-error .node-box      { fill: var(--led-error-fill); stroke: var(--led-error-stroke); }
+.node.led-dead .node-box       { fill: var(--led-dead-fill); stroke: var(--led-dead-stroke); }
+
+/* Working nodes pulse so an active phase reads at a glance. */
+.node.led-working .node-box { animation: pulse 1.6s ease-in-out infinite; }
+@keyframes pulse { 50% { opacity: 0.6; } }
+@media (prefers-reduced-motion: reduce) {
+  .node.led-working .node-box { animation: none; }
+}
+
+/* --- level 0: project grid + altitude bands (S6) --- */
+.grid-wrap { position: relative; }
+/* The grid stacks altitude bands top (tichef) -> bottom (workers). */
+.project-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 1.1rem;
+}
+/* One band = one row of cards, laid out in a responsive grid. Server order is
+   preserved within the band. A band with a single altitude looks like a plain
+   grid (clean degrade when no altitude signal exists). */
+.altitude-band {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 0.75rem;
+  position: relative;
+}
+/* Band label (tichef / orchestrators / workers) from data-altitude. */
+.altitude-band::before {
+  content: attr(data-band-label);
+  position: absolute;
+  top: -1.05rem;
+  left: 0;
+  font-size: 0.7rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+/* Delegation edges overlay — drawn by dashboard.js, never eats card clicks. */
+.lineage-layer {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  z-index: 2;
+  overflow: visible;
+}
+.lineage-edge { stroke: var(--muted); stroke-width: 1.5; opacity: 0.7; }
+.lineage-arrow-head { fill: var(--muted); }
+.project-card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  text-align: left;
+  padding: 0.7rem 0.8rem;
+  border: 2px solid var(--neutral-stroke);
+  border-radius: 10px;
+  background: var(--neutral-fill);
+  color: var(--fg);
+  font: inherit;
+  cursor: pointer;
+  transition: fill 0.25s ease, border-color 0.25s ease, transform 0.1s ease;
+}
+.project-card:hover { transform: translateY(-1px); }
+.project-card:focus-visible { outline: 2px solid var(--muted); outline-offset: 2px; }
+.card-name { font-weight: 600; display: flex; align-items: center; gap: 0.35rem; }
+.card-count { color: var(--muted); font-size: 0.8rem; }
+/* The "méta" lane (itinerant specialists) reads as a dashed, transverse card. */
+.project-card.meta { border-style: dashed; }
+/* Orchestrator tint (S5 web): a purple accent on the card / occupant whose role
+   is orchestrator — the lighter treatment the native tab bar gets in gpui. */
+.orch-badge { color: #8250df; font-size: 0.85em; }
+.project-card.orchestrator { box-shadow: inset 0.25rem 0 0 #8250df; }
+.popup-tab.orchestrator { box-shadow: inset 0.2rem 0 0 #8250df; }
+.popup-tab.orchestrator .tab-name::after { content: " ◆"; color: #8250df; font-size: 0.85em; }
+@media (prefers-color-scheme: dark) {
+  .orch-badge, .popup-tab.orchestrator .tab-name::after { color: #d2a8ff; }
+  .project-card.orchestrator { box-shadow: inset 0.25rem 0 0 #d2a8ff; }
+  .popup-tab.orchestrator { box-shadow: inset 0.2rem 0 0 #d2a8ff; }
+}
+
+/* Led rollup on a card mirrors the node palette (docs "led rollup"). */
+.project-card.led-neutral    { border-color: var(--neutral-stroke); background: var(--neutral-fill); }
+.project-card.led-idle       { border-color: #54aeff; background: #ddf4ff; }
+.project-card.led-unreviewed { border-color: #d4a72c; background: #fff8c5; }
+.project-card.led-working    { border-color: #2da44e; background: #dafbe1; }
+.project-card.led-error      { border-color: #cf222e; background: #ffebe9; }
+.project-card.led-dead       { border-color: #6e7781; background: #d0d7de; }
+@media (prefers-color-scheme: dark) {
+  .project-card.led-idle       { border-color: #3b82f6; background: #0c2d4a; }
+  .project-card.led-unreviewed { border-color: #d4a72c; background: #3b2e00; }
+  .project-card.led-working    { border-color: #2da44e; background: #0f3d22; }
+  .project-card.led-error      { border-color: #f85149; background: #4a1512; }
+  .project-card.led-dead       { border-color: #6e7781; background: #2b3138; }
+}
+
+/* --- popup --- */
+.popup {
+  position: absolute;
+  z-index: 10;
+  min-width: 260px;
+  max-width: 420px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.25);
+  padding: 0.5rem 0.6rem;
+}
+.popup-title { font-weight: 600; margin-bottom: 0.4rem; text-transform: capitalize; }
+.popup-tabs { list-style: none; margin: 0; padding: 0; }
+.popup-tab {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 0 0.6rem;
+  padding: 0.35rem 0.3rem;
+  border-top: 1px solid var(--border);
+  cursor: context-menu;
+}
+.popup-tab:hover { background: color-mix(in srgb, var(--fg) 6%, transparent); }
+.tab-name { font-weight: 600; }
+.tab-role { color: var(--muted); font-size: 0.8rem; }
+.tab-item { grid-column: 1; color: var(--fg); }
+.tab-state { grid-column: 2; grid-row: 1; color: var(--muted); font-size: 0.8rem; }
+.tab-tokens { grid-column: 2; grid-row: 2; color: var(--muted); font-size: 0.8rem; white-space: nowrap; }
+.popup-hint { margin-top: 0.4rem; font-size: 0.72rem; color: var(--muted); }
+
+/* Tooltip detail chips (finding b): assignment / cwd / rehome / RAM / CPU. */
+.tab-details {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+  margin-top: 0.2rem;
+}
+.tab-details .td {
+  font-size: 0.68rem;
+  color: var(--muted);
+  padding: 0.05rem 0.35rem;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  white-space: nowrap;
+}
+.tab-details .td-rehome[data-status="safe-to-close"] { color: #1a7f37; border-color: #2da44e; }
+
+/* --- re-home links (Slice C) --- */
+.rehome { margin-top: 1rem; }
+.rehome h2 { font-size: 0.85rem; color: var(--muted); margin: 0 0 0.4rem; }
+.rehome ul { list-style: none; margin: 0; padding: 0; max-width: 560px; }
+.rehome-pair {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.4rem 0.6rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  margin-bottom: 0.3rem;
+}
+.rehome-pair.safe { border-color: #2da44e; }
+.rehome-old { color: var(--muted); }
+.rehome-new { font-weight: 600; }
+.rehome-arrow { color: var(--muted); }
+.rehome-status {
+  margin-left: auto;
+  font-size: 0.72rem;
+  padding: 0.1rem 0.4rem;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--fg) 8%, transparent);
+  color: var(--muted);
+  white-space: nowrap;
+}
+/* Colour the badge by lifecycle stage. */
+.rehome-status[data-status="handoff-written"] { color: #9a6700; background: #fff8c5; }
+.rehome-status[data-status="successor-ready"]  { color: #0969da; background: #ddf4ff; }
+.rehome-status[data-status="ack-sent"]         { color: #6639ba; background: #f0e8ff; }
+.rehome-status[data-status="safe-to-close"]    { color: #1a7f37; background: #dafbe1; }
+.rehome-progress { display: inline-flex; gap: 3px; }
+.rehome-dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--neutral-stroke);
+}
+.rehome-dot.on { background: #57606a; }
+.rehome-dot.current { box-shadow: 0 0 0 2px color-mix(in srgb, var(--fg) 20%, transparent); }
+.rehome-pair.safe .rehome-dot.on { background: #2da44e; }
+@media (prefers-color-scheme: dark) {
+  .rehome-status[data-status="handoff-written"] { color: #d4a72c; background: #3b2e00; }
+  .rehome-status[data-status="successor-ready"]  { color: #54aeff; background: #0c2d4a; }
+  .rehome-status[data-status="ack-sent"]         { color: #d2a8ff; background: #2d2247; }
+  .rehome-status[data-status="safe-to-close"]    { color: #3fb950; background: #0f3d22; }
+  .rehome-dot.on { background: #9198a1; }
+}
+
+/* --- unmapped bucket --- */
+.unmapped { margin-top: 1rem; }
+.unmapped h2 { font-size: 0.85rem; color: var(--muted); margin: 0 0 0.4rem; }
+.unmapped ul { list-style: none; margin: 0; padding: 0; max-width: 420px; }
+.unmapped .popup-tab { border: 1px solid var(--border); border-radius: 6px; margin-bottom: 0.3rem; }
+
+/* --- S1: legend (visual vocabulary key) + persistent toggle --- */
+.legend-toggle {
+  margin: 1rem 0 0.4rem;
+  padding: 0.25rem 0.6rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--muted);
+  font: inherit;
+  font-size: 0.78rem;
+  cursor: pointer;
+}
+.legend-toggle:hover { background: color-mix(in srgb, var(--fg) 6%, transparent); }
+.legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem 1rem;
+  padding: 0.5rem 0.6rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  max-width: 720px;
+}
+/* `.legend{display:flex}` would otherwise beat the UA `[hidden]{display:none}`
+   (equal specificity, later source) — make the toggle actually hide it. */
+.legend[hidden] { display: none; }
+.legend-item { display: inline-flex; align-items: center; gap: 0.35rem; font-size: 0.78rem; color: var(--muted); }
+.legend-swatch {
+  width: 16px; height: 16px; border-radius: 4px;
+  border: 1px solid var(--border);
+  display: inline-block;
+}
+/* Swatch fills MUST equal the node fills (same variables) — see S1 acceptance. */
+.legend-swatch.led-neutral    { background: var(--neutral-fill); border-style: dashed; }
+.legend-swatch.led-idle       { background: var(--led-idle-fill); }
+.legend-swatch.led-unreviewed { background: var(--led-unreviewed-fill); }
+.legend-swatch.led-working    { background: var(--led-working-fill); }
+.legend-swatch.led-error      { background: var(--led-error-fill); }
+.legend-swatch.led-dead       { background: var(--led-dead-fill); }
+.legend-swatch.orchestrator   { background: var(--panel); box-shadow: inset 0.25rem 0 0 var(--orchestrator-accent); }
+/* Lineage arrow key — a little line with an arrowhead glyph, not a colour swatch. */
+.legend-swatch.lineage-edge {
+  width: 24px; height: 0; border: none; border-radius: 0;
+  border-top: 2px solid var(--muted);
+  position: relative;
+}
+.legend-swatch.lineage-edge::after { content: "▶"; position: absolute; right: -3px; top: -8px; font-size: 9px; color: var(--muted); }
+
+/* --- S4: "Dernières heures" activity panel --- */
+.activity { margin-top: 1.2rem; max-width: 720px; }
+.activity h2 { font-size: 0.85rem; color: var(--muted); margin: 0 0 0.5rem; }
+.activity-figures { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-bottom: 0.6rem; }
+.activity-figure {
+  display: flex; flex-direction: column; gap: 0.1rem;
+  padding: 0.4rem 0.6rem;
+  border: 1px solid var(--border); border-radius: 8px;
+  min-width: 90px;
+}
+.activity-figure .fig-value { font-size: 1.1rem; font-weight: 600; }
+.activity-figure .fig-label { font-size: 0.68rem; color: var(--muted); }
+.activity-series { display: flex; flex-wrap: wrap; gap: 1rem; }
+.activity-serie { display: flex; flex-direction: column; gap: 0.2rem; }
+.activity-serie .serie-label { font-size: 0.68rem; color: var(--muted); }
+.activity-bars { display: flex; align-items: flex-end; gap: 3px; height: 44px; }
+.activity-bar {
+  width: 10px;
+  background: var(--led-working-stroke);
+  border-radius: 2px 2px 0 0;
+  min-height: 2px;
+}
+.activity-summary { margin-top: 0.5rem; font-size: 0.72rem; color: var(--muted); }
+.activity-summary li { list-style: none; }
+.activity-record { margin-top: 0.3rem; font-size: 0.72rem; color: var(--muted); }
+.activity-empty { font-size: 0.78rem; color: var(--muted); }
+
+/* --- S6: META / UNASSIGNED bands + orchestrator naming under a repo --- */
+.orch-list { display: flex; flex-direction: column; gap: 0.15rem; margin-top: 0.3rem; }
+.orch-name { font-size: 0.72rem; color: var(--muted); display: flex; align-items: center; gap: 0.3rem; }
+.orch-name::before { content: "◆"; color: var(--orchestrator-accent); font-size: 0.7em; }
+/* A repo with >1 orchestrator renders its list as a small tree. */
+.orch-list.orch-tree { border-left: 2px solid var(--border); padding-left: 0.5rem; margin-left: 0.15rem; }
+.orch-list.orch-tree .orch-name { position: relative; }
+.unassigned-tab {
+  font-size: 0.78rem;
+  padding: 0.35rem 0.6rem;
+  border: 1px dashed var(--border);
+  border-radius: 6px;
+  color: var(--muted);
+}
+
+/* --- Inc6 S2/S4: org-chart (méta top / service -> team -> lead+workers) --- */
+.meta-top {
+  border: 1px dashed var(--orchestrator-accent);
+  border-radius: 8px;
+  padding: 0.5rem 0.6rem;
+  margin-bottom: 1rem;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem;
+}
+.meta-top-label { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); margin-right: 0.3rem; }
+.meta-top-tab {
+  font-size: 0.78rem; font-weight: 600;
+  padding: 0.2rem 0.5rem;
+  border: 1px solid var(--border); border-radius: 6px;
+  background: var(--panel);
+}
+.service {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 0.6rem;
+  margin-bottom: 1rem;
+}
+.service-name { font-weight: 600; margin-bottom: 0.5rem; }
+.service-family { border-left: 3px solid var(--led-working-stroke); }
+.service-mono { border-style: dashed; }
+.service .team { display: inline-block; vertical-align: top; margin: 0 0.5rem 0.5rem 0; }
+.team {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.5rem;
+  min-width: 180px;
+}
+.team-name { font-weight: 600; font-size: 0.85rem; margin-bottom: 0.35rem; }
+.team-lead {
+  font-size: 0.8rem; font-weight: 600;
+  padding: 0.2rem 0.4rem;
+  border-radius: 6px;
+  box-shadow: inset 0.2rem 0 0 var(--orchestrator-accent);
+  background: var(--panel);
+}
+.team-lead-none { color: var(--muted); font-weight: 400; box-shadow: none; }
+/* Workers hang BELOW the lead, as a small tree. */
+.team-members {
+  margin-top: 0.3rem;
+  padding-left: 0.6rem;
+  border-left: 2px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+.worker { font-size: 0.78rem; color: var(--fg); }
+/* A serving méta joined the team — shown available-but-on-loan (indispo). */
+.serving { font-size: 0.78rem; color: var(--muted); font-style: italic; }
+.serving-badge {
+  font-size: 0.62rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  padding: 0.02rem 0.3rem;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--orchestrator-accent) 20%, transparent);
+  color: var(--orchestrator-accent);
+  font-style: normal;
+}
+
+/* --- Inc6 S6: maturity/growth verdict badge --- */
+.verdict-badge {
+  display: inline-block;
+  margin-bottom: 0.5rem;
+  padding: 0.15rem 0.55rem;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: capitalize;
+  background: color-mix(in srgb, var(--led-working-stroke) 18%, transparent);
+  color: var(--led-working-stroke);
+  border: 1px solid var(--led-working-stroke);
+}
+.verdict-badge[data-verdict="maturité"], .verdict-badge[data-verdict="maturite"] {
+  background: color-mix(in srgb, var(--led-idle-stroke) 18%, transparent);
+  color: var(--led-idle-stroke);
+  border-color: var(--led-idle-stroke);
+}
+.verdict-badge[data-verdict="stagnation"], .verdict-badge[data-verdict="régression"], .verdict-badge[data-verdict="regression"] {
+  background: color-mix(in srgb, var(--led-error-stroke) 18%, transparent);
+  color: var(--led-error-stroke);
+  border-color: var(--led-error-stroke);
+}
+
+/* --- Inc7 S1: compact 4-band org-chart --- */
+.band {
+  border-top: 1px dashed var(--border);
+  padding: 0.3rem 0 0.4rem;
+}
+.band:first-child { border-top: none; }
+.band-label {
+  font-size: 0.65rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+  margin-bottom: 0.2rem;
+}
+.band-row { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 0.35rem; }
+.band-node {
+  font-size: 0.72rem;
+  padding: 0.15rem 0.4rem;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--panel);
+  white-space: nowrap;
+  cursor: default;
+}
+.band-node.lead { font-weight: 600; box-shadow: inset 0.18rem 0 0 var(--orchestrator-accent); }
+/* Inc9 (4): supporter nodes — on-demand specialists, visually distinct from the 3
+   autonomous méta daemons (dashed outline, muted, like a freelancer they're close to). */
+.band-node.supporter { border-style: dashed; color: var(--muted); }
+/* Led tint on a compact node = a small left colour bar. */
+.band-node.led-working  { border-left: 3px solid var(--led-working-stroke); }
+.band-node.led-error    { border-left: 3px solid var(--led-error-stroke); }
+.band-node.led-idle     { border-left: 3px solid var(--led-idle-stroke); }
+.band-node.led-unreviewed { border-left: 3px solid var(--led-unreviewed-stroke); }
+.band-node.led-dead     { border-left: 3px solid var(--led-dead-stroke); }
+.band-orch { display: inline-flex; flex-direction: column; gap: 0.2rem; border: 1px solid var(--border); border-radius: 8px; padding: 0.3rem; }
+.orch-repos { display: flex; flex-wrap: wrap; gap: 0.3rem; padding-left: 0.4rem; border-left: 2px solid var(--border); }
+.band-repo { display: inline-flex; flex-direction: column; gap: 0.15rem; }
+.repo-name { font-size: 0.65rem; color: var(--muted); }
+.repo-workers { display: flex; flex-wrap: wrap; gap: 0.2rem; }
+/* A meta specialist on loan to a team (renfort). */
+.band-node.reinforcement { border-style: dashed; }
+.renfort-badge {
+  font-size: 0.6rem; text-transform: uppercase;
+  padding: 0 0.25rem; border-radius: 999px;
+  background: color-mix(in srgb, var(--orchestrator-accent) 20%, transparent);
+  color: var(--orchestrator-accent);
+}
+
+/* Org-chart working area: guarantees a little scroll room so the panned position
+   is preserved across a refresh (Inc7 S3). No-op once a real fleet overflows. */
+body.band-view { min-height: calc(100vh + 180px); }
+
+/* --- Inc7 S4-web: current task + invoked sub-agents chips (per tab) --- */
+.task-chips { display: inline-flex; flex-wrap: wrap; gap: 0.2rem; margin-top: 0.15rem; }
+.band-node .task-chips { display: flex; margin-top: 0.2rem; }
+.task-chip {
+  font-size: 0.62rem;
+  padding: 0.02rem 0.35rem;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--fg) 8%, transparent);
+  color: var(--muted);
+  max-width: 16ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.subagent-chip {
+  font-size: 0.6rem;
+  padding: 0.02rem 0.3rem;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  white-space: nowrap;
+}
+.subagent-chip.state-running { border-color: var(--led-working-stroke); color: var(--led-working-stroke); }
+.subagent-chip.state-completed { border-color: var(--led-idle-stroke); color: var(--led-idle-stroke); }
+.subagent-chip.state-failed, .subagent-chip.state-error { border-color: var(--led-error-stroke); color: var(--led-error-stroke); }
+
+/* --- Inc8 S3: rounds pill + agent-card view --- */
+.rounds-pill {
+  display: inline-block;
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  vertical-align: middle;
+  margin-left: 0.25rem;
+  border: 1px solid var(--border);
+}
+.rounds-pill.rounds-on { background: var(--led-working-stroke); border-color: var(--led-working-stroke); }
+.rounds-pill.rounds-off { background: var(--neutral-stroke); }
+
+.agent-card {
+  position: fixed;
+  top: 50%; left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 50;
+  min-width: 280px;
+  max-width: 460px;
+  max-height: 80vh;
+  overflow: auto;
+  background: var(--panel);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.35);
+  padding: 0.9rem 1rem;
+  font-size: 0.85rem;
+}
+.agent-card .ac-close {
+  position: absolute; top: 0.4rem; right: 0.5rem;
+  border: none; background: transparent; color: var(--muted);
+  font-size: 1.1rem; line-height: 1; cursor: pointer;
+}
+.agent-card .ac-name { font-weight: 700; font-size: 1rem; margin-bottom: 0.5rem; padding-right: 1rem; }
+.agent-card .ac-row { margin: 0.2rem 0; }
+.agent-card .ac-key { color: var(--muted); font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.03em; margin-top: 0.5rem; display: inline-block; }
+/* Inc9-B: a discreet "—" for an empty identity field (the fiche stays complete). */
+.agent-card .ac-empty { color: var(--muted); opacity: 0.6; }
+.agent-card .ac-free { color: var(--led-working-stroke); font-weight: 600; }
+.agent-card ul { margin: 0.15rem 0 0.3rem; padding-left: 1.1rem; }
+.agent-card .ac-log li { color: var(--fg); }
+.agent-card .ac-evals li, .agent-card .ac-crit li { color: var(--muted); }
+
+/* --- Inc8 S1: inline agent-card bits on a band node --- */
+.free-badge {
+  font-size: 0.58rem; text-transform: uppercase; letter-spacing: 0.03em;
+  margin-left: 0.25rem; padding: 0 0.3rem; border-radius: 999px;
+  background: color-mix(in srgb, var(--led-working-stroke) 20%, transparent);
+  color: var(--led-working-stroke);
+}
+.agent-card-inline { display: block; margin-top: 0.15rem; font-size: 0.64rem; color: var(--muted); }
+/* Objective = one compact line (ellipsis), full text on hover (title=). The
+   currentTask is no longer rendered inline — it lives in the `.task-chip` pill
+   (hover-full) + the right-click card. Keeps the band an at-a-glance overview. */
+.agent-card-inline .agent-objective { display: block; max-width: 22ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* --- Inc8 S4: card evaluations trigger indicator --- */
+.eval-trigger {
+  font-size: 0.62rem; padding: 0 0.35rem; border-radius: 999px;
+  color: var(--muted); border: 1px solid var(--border);
+}
+.eval-trigger.armed {
+  color: var(--led-error-stroke);
+  border-color: var(--led-error-stroke);
+  background: color-mix(in srgb, var(--led-error-stroke) 14%, transparent);
+  font-weight: 600;
+}
+.agent-card .ac-scores { color: var(--muted); font-size: 0.72rem; }
+
+/* --- Inc8 conventions fold + clipped-field tooltips --- */
+.conv-flag {
+  font-size: 0.62rem; padding: 0 0.35rem; border-radius: 999px;
+  color: var(--led-unreviewed-stroke);
+  border: 1px solid var(--led-unreviewed-stroke);
+  background: color-mix(in srgb, var(--led-unreviewed-stroke) 14%, transparent);
+  font-weight: 600;
+}
+.agent-card .ac-conv li { color: var(--muted); }
+/* Popup = detail view: fields WRAP (all data visible). Very long values are
+   word-clipped to 50 words in JS with a 'voir plus' toggle (Inc9 (2)); title=""
+   still carries the full text on hover. */
+.agent-card .ac-row, .agent-card .ac-log li, .agent-card .ac-conv li {
+  overflow-wrap: anywhere; max-width: 100%;
+}
+.agent-card .ac-more {
+  color: var(--led-working-stroke); cursor: pointer; text-decoration: underline;
+  margin-left: 0.25rem; font-size: 0.9em; white-space: nowrap;
+}
+.agent-card .ac-more:hover { opacity: 0.8; }
+/* Inc9 (3): ↗ opens the agent's tab in the browser (remote viewer). */
+.agent-card .ac-open {
+  background: none; border: none; cursor: pointer; color: var(--led-working-stroke);
+  font-size: 0.95em; padding: 0 0.25rem; vertical-align: middle;
+}
+.agent-card .ac-open:hover { opacity: 0.8; }
+
+/* --- Inc9 b2: context-usage pill (green <70 / amber 70-90 / red >90) --- */
+.ctx-pill {
+  font-size: 0.58rem; padding: 0 0.3rem; border-radius: 999px;
+  border: 1px solid var(--border); white-space: nowrap; vertical-align: middle;
+}
+.ctx-pill.ctx-ok   { color: var(--led-working-stroke);    border-color: var(--led-working-stroke);    background: color-mix(in srgb, var(--led-working-stroke) 12%, transparent); }
+.ctx-pill.ctx-warn { color: var(--led-unreviewed-stroke); border-color: var(--led-unreviewed-stroke); background: color-mix(in srgb, var(--led-unreviewed-stroke) 14%, transparent); }
+.ctx-pill.ctx-crit { color: var(--led-error-stroke);      border-color: var(--led-error-stroke);      background: color-mix(in srgb, var(--led-error-stroke) 14%, transparent); font-weight: 600; }
+
+/* --- Inc9 b3: discreet recent-compaction badge --- */
+.compact-badge {
+  font-size: 0.62rem; margin-left: 0.15rem; color: var(--muted);
+  vertical-align: middle;
+}
+
+/* --- Catalogue #39 SC2: topbar button + cold-source overlay (distinct from live cards) --- */
+.catalog-toggle {
+  margin-left: auto;
+  padding: 0.25rem 0.7rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--fg);
+  font: inherit; font-size: 0.82rem; cursor: pointer;
+}
+.catalog-toggle:hover { background: color-mix(in srgb, var(--fg) 6%, transparent); }
+
+.catalog-panel {
+  position: fixed;
+  top: 50%; left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 60;
+  width: min(760px, 94vw);
+  max-height: 86vh;
+  overflow: auto;
+  background: var(--panel);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.4);
+}
+.catalog-panel .cat-header {
+  position: sticky; top: 0;
+  display: flex; align-items: center; gap: 0.6rem;
+  padding: 0.7rem 1rem;
+  background: var(--panel);
+  border-bottom: 2px solid var(--border);
+}
+.cat-title { font-weight: 700; font-size: 1rem; }
+.cat-count { color: var(--muted); font-size: 0.78rem; }
+.cat-refresh, .cat-close { margin-left: auto; border: none; background: transparent; color: var(--muted); font-size: 1rem; cursor: pointer; }
+.cat-refresh { margin-left: auto; } .cat-close { margin-left: 0.3rem; font-size: 1.2rem; }
+.cat-list { padding: 0.4rem 0.6rem 0.8rem; }
+.cat-loading, .cat-error, .cat-empty { padding: 1rem; color: var(--muted); }
+
+.cat-skill { border-bottom: 1px solid var(--border); }
+.cat-skill-head {
+  width: 100%; text-align: left; border: none; background: transparent;
+  color: var(--fg); font: inherit; padding: 0.55rem 0.4rem; cursor: pointer;
+  display: flex; align-items: center; gap: 0.4rem;
+}
+.cat-skill-head:hover { background: color-mix(in srgb, var(--fg) 5%, transparent); }
+.cat-caret { color: var(--muted); font-size: 0.75rem; width: 0.9rem; }
+.cat-name { font-weight: 600; }
+.cat-ver { color: var(--muted); font-size: 0.72rem; }
+.cat-skill-body { padding: 0.2rem 0.4rem 0.7rem 1.3rem; font-size: 0.84rem; }
+.cat-field { margin: 0.25rem 0; }
+.cat-key { color: var(--muted); font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.03em; margin-right: 0.3rem; }
+.cat-tag { font-size: 0.72rem; padding: 0.02rem 0.35rem; border: 1px solid var(--border); border-radius: 999px; color: var(--muted); white-space: nowrap; }
+.cat-prompt { white-space: pre-wrap; }
+
+.cat-metrics { margin-top: 0.5rem; }
+.metrics-table { border-collapse: collapse; font-size: 0.76rem; width: 100%; max-width: 460px; }
+.metrics-table th, .metrics-table td { border: 1px solid var(--border); padding: 0.15rem 0.4rem; text-align: right; }
+.metrics-table th[scope="row"], .metrics-table thead th:first-child { text-align: left; color: var(--muted); }
+.fvr-line { margin-top: 0.35rem; font-size: 0.78rem; color: var(--muted); }
+/* Verdict = DIRECTION only (never pass/fail): fresh=blue, resume=purple, else muted. */
+.fvr-verdict { font-size: 0.72rem; padding: 0.05rem 0.4rem; border-radius: 999px; border: 1px solid var(--border); }
+.fvr-verdict.fvr-fresh { color: var(--led-idle-stroke); border-color: var(--led-idle-stroke); background: color-mix(in srgb, var(--led-idle-stroke) 12%, transparent); }
+.fvr-verdict.fvr-resume { color: var(--orchestrator-accent); border-color: var(--orchestrator-accent); background: color-mix(in srgb, var(--orchestrator-accent) 12%, transparent); }
+.fvr-verdict.fvr-inconclusive { color: var(--muted); }
+.fvr-verdict.fvr-insufficient { color: var(--muted); border-style: dashed; }
+.catalog-panel[hidden] { display: none; }
+
+/* --- Catalogue #39 SC3: edit form + delete/restore --- */
+.cat-edit { margin-top: 0.7rem; padding-top: 0.6rem; border-top: 1px dashed var(--border); }
+.cat-edit-row { display: flex; gap: 0.6rem; align-items: flex-start; margin-bottom: 0.4rem; }
+.cat-edit-row > label { flex: 0 0 6.5rem; font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.03em; color: var(--muted); padding-top: 0.25rem; }
+.cat-edit-row > label small { text-transform: none; letter-spacing: 0; }
+.cat-edit input, .cat-edit textarea {
+  flex: 1 1 auto; font: inherit; font-size: 0.82rem;
+  padding: 0.3rem 0.4rem; border: 1px solid var(--border); border-radius: 6px;
+  background: var(--bg); color: var(--fg); resize: vertical;
+}
+.cat-edit-actions { display: flex; align-items: center; gap: 0.5rem; margin-top: 0.2rem; }
+.cat-save, .cat-delete, .cat-restore {
+  font: inherit; font-size: 0.78rem; padding: 0.25rem 0.7rem; border-radius: 6px;
+  border: 1px solid var(--border); background: var(--panel); color: var(--fg); cursor: pointer;
+}
+.cat-save { border-color: var(--led-working-stroke); color: var(--led-working-stroke); }
+.cat-delete { border-color: var(--led-error-stroke); color: var(--led-error-stroke); }
+.cat-restore { border-color: var(--led-idle-stroke); color: var(--led-idle-stroke); }
+.cat-edit-msg { font-size: 0.74rem; color: var(--muted); }
+.cat-edit-msg.err { color: var(--led-error-stroke); }
+.cat-tombstone { font-size: 0.62rem; text-transform: uppercase; color: var(--muted); border: 1px dashed var(--border); border-radius: 999px; padding: 0 0.35rem; }
+.cat-skill.cat-deleted .cat-name { color: var(--muted); text-decoration: line-through; }
+
+/* --- Catalogue #39 SC3-toggle: show-deleted control --- */
+.cat-deleted-toggle { font-size: 0.72rem; color: var(--muted); display: inline-flex; align-items: center; gap: 0.3rem; margin-left: 0.4rem; cursor: pointer; }
+.cat-deleted-toggle input { margin: 0; }
+
+/* --- KIOSK #kiosk (PD2): cross-project pending-decisions panel --- */
+.kiosk-toggle {
+  margin-left: 0.4rem;
+  padding: 0.25rem 0.7rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--fg);
+  font: inherit; font-size: 0.82rem; cursor: pointer;
+  display: inline-flex; align-items: center; gap: 0.35rem;
+}
+.kiosk-toggle:hover { background: color-mix(in srgb, var(--fg) 6%, transparent); }
+/* Badge = nb open decisions (hidden at zero via [hidden]). */
+.kiosk-badge {
+  min-width: 1.1rem; padding: 0 0.3rem; border-radius: 999px;
+  background: var(--led-error-stroke); color: var(--bg);
+  font-size: 0.7rem; font-weight: 700; text-align: center; line-height: 1.3;
+}
+.kiosk-badge[hidden] { display: none; }
+
+.kiosk-panel {
+  position: fixed;
+  top: 50%; left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 60;
+  width: min(760px, 94vw);
+  max-height: 86vh;
+  overflow: auto;
+  background: var(--panel);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.4);
+}
+.kiosk-panel[hidden] { display: none; }
+.kiosk-panel .kk-header {
+  position: sticky; top: 0;
+  display: flex; align-items: center; gap: 0.6rem;
+  padding: 0.7rem 1rem;
+  background: var(--panel);
+  border-bottom: 2px solid var(--border);
+}
+.kk-panel-title { font-weight: 700; font-size: 1rem; }
+.kk-count { color: var(--muted); font-size: 0.78rem; }
+.kk-archived-toggle { font-size: 0.72rem; color: var(--muted); display: inline-flex; align-items: center; gap: 0.3rem; margin-left: 0.4rem; cursor: pointer; }
+.kk-archived-toggle input { margin: 0; }
+.kk-refresh, .kk-close { border: none; background: transparent; color: var(--muted); font-size: 1rem; cursor: pointer; }
+.kk-refresh { margin-left: auto; } .kk-close { margin-left: 0.3rem; font-size: 1.2rem; }
+.kk-list { padding: 0.4rem 0.8rem 0.9rem; }
+.kk-loading, .kk-error, .kk-empty { padding: 1rem; color: var(--muted); }
+
+.kk-group { margin-top: 0.5rem; }
+.kk-project { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); margin: 0.6rem 0 0.3rem; }
+.kk-card { border: 1px solid var(--border); border-radius: 8px; padding: 0.5rem 0.7rem; margin-bottom: 0.5rem; }
+.kk-card.kk-state-archived { opacity: 0.6; }
+.kk-head { display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap; }
+.kk-check { font-size: 0.76rem; color: var(--fg); display: inline-flex; align-items: center; gap: 0.25rem; cursor: pointer; }
+.kk-check input { margin: 0; }
+.kk-title { font-weight: 600; font-size: 0.9rem; }
+.kk-state-tag { margin-left: auto; font-size: 0.66rem; text-transform: uppercase; letter-spacing: 0.03em; color: var(--muted); border: 1px solid var(--border); border-radius: 999px; padding: 0 0.4rem; }
+.kk-field { margin: 0.25rem 0; font-size: 0.82rem; }
+.kk-key { color: var(--muted); font-size: 0.66rem; text-transform: uppercase; letter-spacing: 0.03em; margin-right: 0.3rem; }
+.kk-files { margin: 0.3rem 0; display: flex; flex-direction: column; gap: 0.15rem; }
+.kk-file { font-size: 0.78rem; color: var(--led-idle-stroke); word-break: break-all; }
+.kk-rule { display: flex; align-items: center; gap: 0.5rem; margin-top: 0.4rem; flex-wrap: wrap; }
+.kk-verdict-input { flex: 1 1 12rem; font: inherit; font-size: 0.8rem; padding: 0.25rem 0.4rem; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); color: var(--fg); }
+.kk-verdict-input:disabled { opacity: 0.5; }
+/* Bug3: the explicit ruling action — makes verdict submission evident. */
+.kk-send { font: inherit; font-size: 0.78rem; padding: 0.25rem 0.7rem; border-radius: 6px; border: 1px solid var(--led-working-stroke); background: var(--panel); color: var(--led-working-stroke); cursor: pointer; }
+.kk-send:disabled { opacity: 0.5; cursor: not-allowed; }
+.kk-verdict { font-size: 0.76rem; color: var(--muted); }
+.kk-hint { font-size: 0.72rem; color: var(--muted); font-style: italic; }
+.kk-msg { font-size: 0.74rem; color: var(--muted); }
+.kk-msg.err { color: var(--led-error-stroke); }

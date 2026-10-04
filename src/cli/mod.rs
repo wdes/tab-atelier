@@ -17,11 +17,14 @@ pub mod bench_lag;
 pub mod brain;
 /// `tab-atelier brief` — what a Claude session starting here would be told.
 pub mod brief;
-/// `tab-atelier --check` — preflight the GUI's runtime libraries.
-pub mod check;
-pub mod claude_hook;
 /// The single shared client-subcommand router used by both the GUI
 /// (`src/main.rs`) and the headless daemon ([`dispatch`]).
+pub mod catalog;
+pub mod check;
+/// `tab-atelier --check` — preflight the GUI's runtime libraries.
+/// `tab-atelier clarify` — controlled context refresh via in-place re-home.
+pub mod clarify;
+pub mod claude_hook;
 pub mod client;
 pub mod delegate;
 pub mod dispatch;
@@ -43,9 +46,12 @@ pub mod logs;
 /// the deliberate, local way to drop history nobody reads.
 pub mod prune;
 pub mod remote;
+pub mod set_assignment;
+pub mod set_card;
 pub mod set_context;
 pub mod set_font;
 pub mod set_meta;
+pub mod set_rehome;
 pub mod set_status;
 /// Headless-side basic-action subcommands.
 ///
@@ -53,6 +59,12 @@ pub mod set_status;
 /// after the first one added; see the module docstring for details.
 pub mod share_link;
 pub mod style;
+pub mod tab_field;
+/// `tab-atelier task <push|claim|beat|done|list>` (primitive #11).
+///
+/// The typed task queue with an atomic claim: the pure backend + the thin HTTP
+/// client.
+pub mod task;
 /// `tab-atelier tasks` — the contract-net fold over the blackboard: what work
 /// exists, who bid, who won, what finished.
 pub mod tasks;
@@ -132,6 +144,9 @@ mod help_tests {
                 }
                 // This file is not a parser: it only mentions the marker
                 // because it is the thing doing the looking.
+                if path.file_name().is_some_and(|name| name == "tab_field.rs") {
+                    continue;
+                }
                 if path.ends_with(std::path::Path::new(file!()).file_name().unwrap_or_default()) {
                     continue;
                 }
