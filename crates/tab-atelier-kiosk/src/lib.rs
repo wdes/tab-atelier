@@ -30,6 +30,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 pub mod intent;
+pub mod intent_http;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -54,7 +55,7 @@ pub const DEFAULT_BIND: &str = "127.0.0.1:8282";
 /// amount of memory before the daemon ever sees the request. ponytail: this
 /// also caps a future large upload (file share); raise it, or stream the body
 /// through, when that lands.
-const MAX_REQUEST_BODY: usize = 4 * 1024 * 1024;
+pub(crate) const MAX_REQUEST_BODY: usize = 4 * 1024 * 1024;
 
 /// How many chunks may wait between the upstream reader and hyper.
 const STREAM_CHANNEL_DEPTH: usize = 16;
@@ -65,14 +66,14 @@ const KIOSK_JS: &str = include_str!("../assets/kiosk.js");
 
 /// A body that is either a complete in-memory buffer (local page, stub, error)
 /// or a stream fed by the upstream hop (proxy). Both are `Send` and hyper-ready.
-type BoxBody = BoxBodyInner<Bytes, std::io::Error>;
+pub(crate) type BoxBody = BoxBodyInner<Bytes, std::io::Error>;
 
 fn full(body: impl Into<Bytes>) -> BoxBody {
     Full::new(body.into()).map_err(|never| match never {}).boxed()
 }
 
 /// A JSON response carrying `value`, for everything this crate answers itself.
-fn json_response(status: StatusCode, value: &serde_json::Value) -> Response<BoxBody> {
+pub(crate) fn json_response(status: StatusCode, value: &serde_json::Value) -> Response<BoxBody> {
     Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, "application/json")
@@ -176,9 +177,9 @@ impl Default for HopTimeouts {
 /// One agent for the whole process: it owns the connection pool, and it is the
 /// single place the hop's timeouts are configured.
 #[derive(Debug)]
-struct Upstream {
-    base: String,
-    agent: ureq::Agent,
+pub(crate) struct Upstream {
+    pub(crate) base: String,
+    pub(crate) agent: ureq::Agent,
 }
 
 impl Upstream {
@@ -227,7 +228,16 @@ pub async fn serve(listener: tokio::net::TcpListener, upstream: String) -> std::
 /// so they exercise the real paths without waiting out the production values.
 async fn serve_with(listener: tokio::net::TcpListener, upstream: String, timeouts: HopTimeouts) -> std::io::Result<()> {
     let upstream = Arc::new(Upstream::new(upstream, timeouts));
+    // The intention pane is stateful in a way the proxy is not: it owns a
+    // directory of files. Built once here, and a failure to open it is fatal on
+    // purpose — a Kiosk that starts without its intention directory would show
+    // an empty pane and accept creations it cannot store.
+    let intentions = Arc::new(
+        intent_http::State::from_env(Arc::clone(&upstream))
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("intentions: {err}")))?,
+    );
     loop {
+        let intentions = Arc::clone(&intentions);
         let (stream, _peer) = match listener.accept().await {
             Ok(pair) => pair,
             // A single failed accept (fd exhaustion, client gone) must not take
@@ -242,7 +252,8 @@ async fn serve_with(listener: tokio::net::TcpListener, upstream: String, timeout
         tokio::spawn(async move {
             let service = service_fn(move |req: Request<Incoming>| {
                 let upstream = Arc::clone(&upstream);
-                async move { Ok::<_, std::convert::Infallible>(handle(req, &upstream).await) }
+                let intentions = Arc::clone(&intentions);
+                async move { Ok::<_, std::convert::Infallible>(handle(req, &upstream, &intentions).await) }
             });
             // Connection-level errors (client hung up mid-response) are routine.
             let _ = hyper::server::conn::http1::Builder::new()
@@ -252,8 +263,34 @@ async fn serve_with(listener: tokio::net::TcpListener, upstream: String, timeout
     }
 }
 
-async fn handle(req: Request<Incoming>, upstream: &Upstream) -> Response<BoxBody> {
+async fn handle(
+    req: Request<Incoming>,
+    upstream: &Upstream,
+    intentions: &Arc<intent_http::State>,
+) -> Response<BoxBody> {
     let (parts, body) = req.into_parts();
+
+    // The intention pane is served here, before the route table and the proxy.
+    // A path under `/intent/` that this crate does not recognise falls through
+    // to the daemon, as every unknown path does.
+    if let Some(call) = intent_http::call_for(&parts.method, parts.uri.path()) {
+        if !call.wants_body() {
+            return intent_http::handle(call, Vec::new(), token_of(&parts), Arc::clone(intentions)).await;
+        }
+        let body = match intent_http::read_body(body).await {
+            Ok(bytes) => bytes,
+            Err(reason) => {
+                let status = if reason == "body_too_large" {
+                    StatusCode::PAYLOAD_TOO_LARGE
+                } else {
+                    StatusCode::BAD_REQUEST
+                };
+                return json_response(status, &serde_json::json!({ "error": reason }));
+            }
+        };
+        return intent_http::handle(call, body, token_of(&parts), Arc::clone(intentions)).await;
+    }
+
     match route(&Request::from_parts(parts.clone(), ())) {
         Route::Asset(asset, content_type) => Response::builder()
             .status(StatusCode::OK)
@@ -266,6 +303,56 @@ async fn handle(req: Request<Incoming>, upstream: &Upstream) -> Response<BoxBody
             .expect("static response builder"),
         Route::Proxy => proxy(Request::from_parts(parts, body), upstream).await,
     }
+}
+
+/// The caller's token: `?token=`, or a bearer header.
+///
+/// Read here rather than in the intention module because the proxy path already
+/// knows how to find a token, and two ways of looking for it would eventually
+/// disagree about which one wins.
+fn token_of(parts: &http::request::Parts) -> String {
+    if let Some(query) = parts.uri.query() {
+        for pair in query.split('&') {
+            if let Some(value) = pair.strip_prefix("token=") {
+                return percent_decode(value);
+            }
+        }
+    }
+    parts
+        .headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::to_string)
+        .unwrap_or_default()
+}
+
+/// Minimal `%XX` decoding for a query value.
+///
+/// Hand-rolled for one field: a full percent-decoder is a dependency and a
+/// specification, and a token that needs more than this is a token the daemon
+/// will reject anyway.
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = std::str::from_utf8(&bytes[i + 1..i + 3])
+                .ok()
+                .and_then(|h| u8::from_str_radix(h, 16).ok());
+            if let Some(byte) = hex {
+                out.push(byte);
+                i += 3;
+                continue;
+            }
+        }
+        // `+` is a space in a query string, and a token never contains one, so
+        // decoding it costs nothing and avoids a surprising value.
+        out.push(if bytes[i] == b'+' { b' ' } else { bytes[i] });
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Headers that describe THIS hop and must not be relayed to the next one.
