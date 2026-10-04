@@ -550,6 +550,14 @@ pub enum Commands {
         args: Vec<String>,
     },
 
+    /// KIOSK (PD1): the cross-project decision log
+    /// (`decision push|read|tranch|list [--includeArchived]`).
+    Decision {
+        /// Passed straight through to `cli::decision::run`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
     /// Exchange blackboard entries with configured remotes: `gossip`.
     ///
     /// Anti-entropy, not replication: the log is a grow-only set, so a round
@@ -986,6 +994,7 @@ fn command_exit_code(cli: Cli) -> Option<i32> {
         Commands::Gossip { args } => crate::cli::client::run("gossip", &args),
         Commands::Prune { args } => crate::cli::client::run("prune", &args),
         Commands::Backlog { args } => crate::cli::client::run("backlog", &args),
+        Commands::Decision { args } => crate::cli::client::run("decision", &args),
         Commands::Token => crate::cli::client::run("token", &[]),
         Commands::RotateTokens => crate::cli::client::run("rotate-tokens", &[]),
         Commands::ResetMasterToken => crate::cli::client::run("reset-master-token", &[]),
@@ -1466,6 +1475,12 @@ mod tests {
     /// fixture — only that the table routes them somewhere.
     #[test]
     fn every_subcommand_routes_through_the_table() {
+        // The blackboard path is process-global, so every mutator shares this lock;
+        // without it this test swaps the board out from under a concurrent one that
+        // asserts on its own temp file (e.g. the decision tranch path).
+        let _guard = crate::cli::team::BOARD_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = tempfile::tempdir().expect("tempdir");
         crate::cli::team::set_blackboard_path(Some(dir.path().join("blackboard.jsonl")));
         crate::claims::set_registry_path(Some(dir.path().join("claims.json")));
