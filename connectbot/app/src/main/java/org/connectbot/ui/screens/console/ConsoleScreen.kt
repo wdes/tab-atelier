@@ -81,6 +81,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.collectAsState
@@ -767,6 +768,32 @@ fun ConsoleScreen(
         }
     }
 
+    // Leaving a terminal puts the keyboard away.
+    //
+    // The app is one Activity, so the IME is not owned by this screen and
+    // survives its disposal: backing out to the host list leaves the keyboard up
+    // over a list with no text field in it, which reads as the app being stuck.
+    // Hiding it imperatively on dispose is reliable where clearing
+    // `showSoftwareKeyboard` would not be — disposal is the last thing this
+    // composition does, so there is no recomposition left to act on a state
+    // change.
+    DisposableEffect(Unit) {
+        onDispose {
+            val activity = context as? Activity ?: return@onDispose
+            // A configuration change recreates the Activity without the user
+            // having left anything, and MainActivity does not handle orientation
+            // itself — so rotating mid-session must not close the keyboard.
+            if (activity.isChangingConfigurations) return@onDispose
+            try {
+                WindowInsetsControllerCompat(activity.window, activity.window.decorView)
+                    .hide(WindowInsetsCompat.Type.ime())
+            } catch (e: IllegalArgumentException) {
+                // The foldable edge case the fullscreen handling above guards.
+                Timber.e(e, "Error hiding the keyboard on leaving the console")
+            }
+        }
+    }
+
     // Defer navigation until after lifecycle dispatch has finished. Popping from
     // ON_RESUME synchronously can re-enter Navigation while it is updating entries.
     // Observing lifecycle state also retries a background disconnect on resume.
@@ -905,17 +932,33 @@ fun ConsoleScreen(
         }
     }
 
-    // Initialize forceSize from profile when bridge changes
+    // Initialize forceSize from profile when bridge changes, and otherwise mirror
+    // the grid size the remote end reports.
     LaunchedEffect(currentBridge) {
-        currentBridge?.let { bridge ->
-            val rows = bridge.profileForceSizeRows
-            val cols = bridge.profileForceSizeColumns
-            if (rows != null && cols != null) {
-                forceSize = Pair(rows, cols)
-            } else {
-                forceSize = null
-            }
+        val bridge = currentBridge ?: return@LaunchedEffect
+        val rows = bridge.profileForceSizeRows
+        val cols = bridge.profileForceSizeColumns
+        if (rows != null && cols != null) {
+            forceSize = Pair(rows, cols)
+            return@LaunchedEffect
         }
+        // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): mirror the
+        // remote's grid when it reports one.
+        //
+        // A tab-atelier tab is a real workstation terminal — here, 193 columns —
+        // and its daemon deliberately refuses to be resized, so that a phone
+        // viewer cannot reflow the shared PTY out from under an agent's TUI or
+        // another viewer. Rendering that tab at the phone's own width is what made
+        // a session look like several terminals at once: the daemon replays the
+        // tab's whole scrollback with its cursor positioned for 193 columns, and
+        // at ~45 every one of those lines wraps somewhere different.
+        //
+        // The terminal renders exactly this many columns and fits the FONT to the
+        // viewport, which is also what the daemon's own browser client does for a
+        // phone. A profile's forced size still wins, since that is a deliberate
+        // choice; every other transport reports nothing and is unaffected, because
+        // the flow carries null to begin with.
+        bridge.remoteGridSize.collect { forceSize = it }
     }
 
     // Show snackbar for network status messages
@@ -1196,11 +1239,30 @@ fun ConsoleScreen(
         // or temporarily visible when titleBarHide is true and showTitleBar is true
         if (!titleBarHide || showTitleBar) {
             val density = LocalDensity.current
+            // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): the title
+            // becomes "server - tab" when the remote end reports a tab name.
+            //
+            // Every other transport reports none and keeps the host's nickname
+            // alone, which is right for them — a session is a host. It is not
+            // enough for a tab-atelier session, which is a host *and* one of its
+            // tabs: two tabs of one server would otherwise title themselves
+            // identically, with nothing on screen saying which was which.
+            val remoteTabNameState = currentBridge?.remoteTabName?.collectAsState()
+            val remoteTabName = remoteTabNameState?.value
+            val title = currentBridge?.host?.nickname
+                ?: stringResource(R.string.console_default_title)
             TopAppBar(
                 title = {
                     Text(
-                        currentBridge?.host?.nickname
-                            ?: stringResource(R.string.console_default_title),
+                        if (remoteTabName.isNullOrBlank()) {
+                            title
+                        } else {
+                            stringResource(
+                                R.string.tabatelier_console_title_with_tab,
+                                title,
+                                remoteTabName,
+                            )
+                        },
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                     )
