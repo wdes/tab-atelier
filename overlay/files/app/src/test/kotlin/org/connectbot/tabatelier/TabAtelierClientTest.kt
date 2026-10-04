@@ -44,6 +44,7 @@ import okio.ByteString
 import okio.ByteString.Companion.toByteString
 import org.connectbot.BuildConfig
 import org.connectbot.util.SecurePasswordStorage
+import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -522,6 +523,108 @@ class TabAtelierClientTest {
     }
 
     /**
+     * Switching a session to another tab, live.
+     *
+     * The app does this when a second tab of a server is tapped: one session per
+     * server, moved to the tab that was tapped, rather than a second session —
+     * ConnectBot keys a session by host. Two things that move depends on can only
+     * be checked against a daemon, and both are checked here:
+     *
+     * - the client is reusable for a *second* socket on the same server (a session
+     *   holds one client, and a switch reuses it);
+     * - each tab's socket is bound to the tab that was asked for, so what the
+     *   session shows is the tab the user tapped. This is asserted the strong way:
+     *   the name the socket reports has to be that tab's own name, from the list
+     *   the daemon gives, not merely *a* name.
+     */
+    @Test
+    fun eachTabOfAServerOpensItsOwnSessionOnTheSameClient() {
+        val url = System.getenv("TABATELIER_TEST_URL")
+        assumeTrue(
+            "set TABATELIER_TEST_URL to a tab-atelier server over https:// to run this",
+            url != null,
+        )
+        val token = System.getenv("TABATELIER_TEST_TOKEN")
+        val c = client()
+        val base = c.base(url)!!
+        val tabs = c.fetchTabs(HOST_ID, base, token)
+        assumeTrue("this server needs at least two tabs to switch between", tabs.size >= 2)
+
+        val client = c.clientFor(HOST_ID, base)
+        for (tab in tabs.take(2)) {
+            val name = openOneSession(client, base, tab.id, token)
+            assertEquals(
+                "the session must be bound to the tab that was asked for, not another",
+                tab.name,
+                name,
+            )
+        }
+    }
+
+    /**
+     * Opens one tab's session on [client] and returns the name the daemon reports
+     * for it, or null if it reports none.
+     *
+     * The meta frame is parsed here rather than through the transport's decoder, so
+     * that this is an independent statement of the protocol: a change on one side
+     * that the other does not match fails the test instead of agreeing with itself.
+     */
+    private fun openOneSession(
+        client: OkHttpClient,
+        base: TabAtelierBase,
+        tabId: String,
+        token: String?,
+    ): String? {
+        val request = Request.Builder().url(base.webSocketUrl("/tabs/by-id/$tabId/ws", token)).build()
+        val opened = CountDownLatch(1)
+        val meta = AtomicReference<String?>(null)
+        var failure: Throwable? = null
+        val socket = client.newWebSocket(
+            request,
+            object : WebSocketListener() {
+                override fun onOpen(webSocket: WebSocket, response: Response) {
+                    webSocket.send(byteArrayOf(TAG_FOCUS).toByteString())
+                    opened.countDown()
+                }
+
+                override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
+                    val frame = bytes.toByteArray()
+                    if (frame.isNotEmpty() && frame[0] == TAG_META.toByte()) {
+                        meta.compareAndSet(
+                            null,
+                            JSONObject(String(frame, 1, frame.size - 1, Charsets.UTF_8))
+                                .optString("name")
+                                .takeIf { it.isNotBlank() },
+                        )
+                    }
+                }
+
+                override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                    failure = t
+                    opened.countDown()
+                }
+
+                override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                    opened.countDown()
+                }
+            },
+        )
+        return try {
+            assertTrue("the daemon must accept a session on this tab; failed: $failure", opened.await(15, TimeUnit.SECONDS))
+            assertNull(failure)
+            // The meta frame arrives before any output, so it is worth waiting for;
+            // a tab that never reports it is a daemon/client disagreement.
+            val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+            while (meta.get() == null && failure == null && System.nanoTime() < deadline) {
+                Thread.sleep(20)
+            }
+            meta.get()
+        } finally {
+            socket.close(1000, null)
+        }
+    }
+
+    /**
      * Serves one response at `/tabs` on loopback, and runs [block] with the URL
      * it can be reached at plus the headers that request carried.
      *
@@ -560,6 +663,9 @@ class TabAtelierClientTest {
 
         /** `0x0b`, the focus frame the transport sends on connect. */
         const val TAG_FOCUS: Byte = 0x0B
+
+        /** `0x03`, the frame carrying a tab's own metadata: its name and size. */
+        const val TAG_META: Byte = 0x03
 
         /**
          * The tags the daemon sends to a client, from its `src/api_ws.rs`:

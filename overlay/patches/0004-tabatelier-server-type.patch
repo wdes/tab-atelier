@@ -118,7 +118,7 @@ index ded68890..6fc91683 100644
                  // Build authority with hostname and port
                  val authority = buildString {
 diff --git a/app/src/main/java/org/connectbot/service/TerminalManager.kt b/app/src/main/java/org/connectbot/service/TerminalManager.kt
-index 2ffc9c3c..8144938c 100644
+index 2ffc9c3c..068b5cb7 100644
 --- a/app/src/main/java/org/connectbot/service/TerminalManager.kt
 +++ b/app/src/main/java/org/connectbot/service/TerminalManager.kt
 @@ -95,6 +95,16 @@ class TerminalManager :
@@ -138,7 +138,7 @@ index 2ffc9c3c..8144938c 100644
      private val _disconnected = ArrayList<Host>()
      private val _disconnectedFlow = MutableStateFlow<List<Host>>(emptyList())
      val disconnectedFlow: StateFlow<List<Host>> = _disconnectedFlow.asStateFlow()
-@@ -461,13 +471,28 @@ class TerminalManager :
+@@ -461,13 +471,55 @@ class TerminalManager :
       * Looks up the host from the repository and creates a connection.
       *
       * @param hostId the database ID of the host to connect to
@@ -150,6 +150,33 @@ index 2ffc9c3c..8144938c 100644
 -    suspend fun openConnectionForHostId(hostId: Long): TerminalBridge? {
 +    suspend fun openConnectionForHostId(hostId: Long, tabKey: String? = null): TerminalBridge? {
          val host = hostRepository.findHostById(hostId) ?: return null
++
++        // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): another tab of
++        // a server that already has a session MOVES that session to it, instead of
++        // being refused by openConnection's "already open" check below.
++        //
++        // A tab-atelier server has many tabs and this app is a viewer — the tab
++        // being left keeps running on the daemon — so a move loses nothing, and
++        // keeping one session per server is what the running notification, the host
++        // list's connected indicator and the session maps already assume.
++        //
++        // This returns the existing session whatever the move did, rather than
++        // only when it succeeded, because the three outcomes all end the same way:
++        // it moved; it was already on that tab, which is a no-op rather than an
++        // error; or it failed and has reported the failure itself. Falling through
++        // in any of them would reach openConnection, which refuses a host that
++        // already has a session — turning "tapped the tab I am on" into an error.
++        if (!tabKey.isNullOrBlank()) {
++            val existing = getConnectedBridge(host)
++            if (existing != null) {
++                existing.switchTab(tabKey)
++                // A choice left over from a tap whose session never started is not
++                // this session's; this one has been told directly.
++                pendingTabKeys.remove(host.id)
++                return existing
++            }
++        }
++
 +        if (!tabKey.isNullOrBlank()) {
 +            pendingTabKeys[host.id] = tabKey
 +        }

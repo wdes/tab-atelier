@@ -40,6 +40,7 @@ import okio.ByteString.Companion.toByteString
 import org.connectbot.R
 import org.connectbot.data.entity.Host
 import org.connectbot.service.DisconnectReason
+import org.connectbot.tabatelier.TabAtelierBase
 import org.connectbot.tabatelier.TabAtelierClient
 import org.connectbot.util.SecurePasswordStorage
 import org.json.JSONException
@@ -88,6 +89,30 @@ class TabAtelier : AbsTransport() {
     private var leftover: ByteArray? = null
     private var leftoverOffset = 0
 
+    /**
+     * What a tab switch needs to open another socket on the same server, kept
+     * from [connect] because a switch happens long after it has returned.
+     */
+    private var client: TabAtelierClient? = null
+    private var base: TabAtelierBase? = null
+
+    /** The tab this session is on, so a switch to the same one can be a no-op. */
+    @Volatile
+    private var currentTabKey: String? = null
+
+    /**
+     * Identifies the socket that speaks for this session.
+     *
+     * A switch replaces the socket, and the socket being replaced still calls back
+     * — `onClosed` for the one closed, and possibly `onFailure` for one that was
+     * still handshaking. Neither is this session ending, so every listener carries
+     * the marker it was made with and ignores callbacks once a later socket has
+     * replaced it. Without this, moving a session to another tab would read as the
+     * session dying, which is the one thing a switch must not look like.
+     */
+    @Volatile
+    private var currentAttempt: Any? = null
+
     override fun connect() {
         val host = host
         val service = manager
@@ -105,6 +130,10 @@ class TabAtelier : AbsTransport() {
             bridge?.dispatchDisconnect(DisconnectReason.REMOTE_EOF)
             return
         }
+        // Kept for switchTab, which has to reach the same server again long after
+        // this has returned.
+        this.client = client
+        this.base = base
 
         // Which tab, and only just decided: taken rather than read, so a later
         // session cannot inherit it from this one.
@@ -115,59 +144,158 @@ class TabAtelier : AbsTransport() {
             return
         }
 
-        val token = client.token(host.id)
-        // The token rides in the query string, not an Authorization header: the
-        // daemon refuses the header alone on a WS upgrade. See
-        // TabAtelierBase.webSocketUrl for the why.
-        val url = base.webSocketUrl("/tabs/by-id/$tabKey/ws", token)
-        val request = Request.Builder().url(url).build()
-
-        // Wait for the daemon to accept the connection, the way Telnet waits for
-        // its socket, before telling the bridge the session is up.
-        //
-        // This is not merely tidy: `bridge.onConnected()` is what creates the
-        // Relay, which is what reads this transport. Calling it before the
-        // handshake would start the relay on a socket that is not open yet, and
-        // the terminal would sit on "connecting" forever — the failure the user
-        // saw. It is also why this method may block: `connect()` is called on
-        // the io dispatcher (TerminalBridge.startConnection), never on the UI
-        // thread.
-        val opened = CountDownLatch(1)
-        Timber.d("Opening tab-atelier session for host %d at %s", host.id, base.origin)
-        val webSocket = client.clientFor(host.id, base).newWebSocket(request, Listener(opened))
-        socket = webSocket
-
-        if (!opened.await(CONNECT_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
-            webSocket.cancel()
-            socket = null
-            throw IOException("Timed out connecting to $url")
-        }
-        // A socket that failed or closed before opening is a failed connection,
-        // not a session that ends immediately: the bridge has to hear about it
-        // as such, so the user gets the reason instead of an empty terminal.
-        failure?.let { throw it }
-        if (!open) {
-            throw IOException("The tab-atelier session at $url closed before it opened")
-        }
+        currentTabKey = tabKey
+        openSocket(tabKey)
 
         bridge?.onConnected()
     }
 
-    private inner class Listener(private val opened: CountDownLatch) : WebSocketListener() {
+    /**
+     * Opens a socket for [tabKey] and waits until the daemon has accepted it.
+     *
+     * Shared by [connect] and [switchTab], so a moved session is set up exactly
+     * like a fresh one: same route, same auth, same first frames. It says nothing
+     * to the bridge and never touches [closed] — a switch is not a new session, and
+     * reporting the old socket's end would stop the read loop that has to survive
+     * the move.
+     *
+     * Waiting for the daemon is not merely tidy. `bridge.onConnected()` is what
+     * creates the Relay, which is what reads this transport; starting it on a
+     * socket that is not open yet leaves the terminal on "connecting via
+     * tabatelier…" forever, which is the failure this replaced. Blocking is
+     * therefore expected here, and safe: this runs on the io dispatcher
+     * (TerminalBridge.startConnection), never on the UI thread.
+     */
+    private fun openSocket(tabKey: String) {
+        val host = host ?: throw IOException("No host to open a tab-atelier session for")
+        val client = client ?: throw IOException("No connection to open a tab-atelier session on")
+        val base = base ?: throw IOException("No address to reach ${host.nickname} at")
+
+        // The token rides in the query string, not an Authorization header: the
+        // daemon refuses the header alone on a WS upgrade. See
+        // TabAtelierBase.webSocketUrl for the why.
+        val url = base.webSocketUrl("/tabs/by-id/$tabKey/ws", client.token(host.id))
+        val request = Request.Builder().url(url).build()
+
+        // Marks this socket as the one that speaks for the session, so the socket
+        // it replaces — closed, but still calling back — cannot be mistaken for it.
+        // Set before the socket exists, so a listener that runs before
+        // newWebSocket returns still finds itself current. See [currentAttempt].
+        val attempt = Any()
+        currentAttempt = attempt
+        open = false
+
+        val opened = CountDownLatch(1)
+        Timber.d("Opening tab-atelier session for host %d at %s", host.id, base.origin)
+        val webSocket = client.clientFor(host.id, base).newWebSocket(request, Listener(opened, attempt))
+        socket = webSocket
+
+        if (!opened.await(CONNECT_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+            webSocket.cancel()
+            if (socket === webSocket) socket = null
+            throw IOException("Timed out connecting to $url")
+        }
+        // A socket that failed or closed before opening is a failed connection, not
+        // a session that ends immediately: the bridge has to hear about it as such,
+        // so the user gets the reason instead of an empty terminal.
+        failure?.let { throw it }
+        if (!open) {
+            throw IOException("The tab-atelier session at $url closed before it opened")
+        }
+    }
+
+    /**
+     * Moves this session to another tab of the same server.
+     *
+     * Added for Tab Atelier Remote (Apache-2.0 section 4(b)). The app is a viewer
+     * and a tab never dies on the daemon, so another tab of a server the user is
+     * already on is a *move* rather than a second session: ConnectBot keys a
+     * session by host — which is what the running notification, the host list's
+     * connected indicator and the session maps all assume — and a server with
+     * several tabs is the case that assumption did not have.
+     *
+     * **It must not end the session, and that is the whole difficulty.** Relay
+     * reads [read], and `-1` ends its read loop, so a switch done by closing this
+     * transport and building a new one would kill the session it is moving. So
+     * nothing here touches [closed], the socket being replaced is detached from
+     * [currentAttempt] before it is closed so its callbacks cannot read as the
+     * session ending, and between the two sockets [read] reports "nothing right
+     * now" — which is what a socket with no bytes yet reports anyway.
+     *
+     * The screen needs no clearing. The daemon's replay opens with a form feed, so
+     * the new tab's first bytes clear before they repaint, which is what the
+     * daemon's own browser client relies on for exactly this. What is dropped is
+     * the *queue*: frames of the tab being left are not the tab being opened, and
+     * the full replay that follows would otherwise be drawn underneath them.
+     *
+     * @return true when this session took the move — it moved, or it failed and is
+     *   now reporting that failure itself. False when there was nothing to move
+     *   (no connection yet, or the same tab again), so the caller should open a
+     *   session instead.
+     */
+    fun switchTab(tabKey: String): Boolean {
+        if (tabKey.isBlank() || tabKey == currentTabKey) return false
+        if (client == null || base == null) return false
+
+        val previous = socket
+        currentAttempt = null
+        socket = null
+        previous?.close(CLOSE_NORMAL, null)
+
+        inbound.clear()
+        leftover = null
+        leftoverOffset = 0
+        // The old socket's failure, if it had one, is not this socket's.
+        failure = null
+
+        return try {
+            openSocket(tabKey)
+            currentTabKey = tabKey
+            Timber.d("Moved the tab-atelier session to tab %s", tabKey)
+            true
+        } catch (e: IOException) {
+            // The move failed and the session has no socket left. Reported the way a
+            // lost connection is reported, rather than leaving a terminal that looks
+            // alive and never updates again.
+            Timber.w(e, "Could not move the tab-atelier session to tab %s", tabKey)
+            failure = e
+            closed = true
+            inbound.offer(END_OF_STREAM)
+            true
+        }
+    }
+
+    private inner class Listener(
+        private val opened: CountDownLatch,
+        private val attempt: Any,
+    ) : WebSocketListener() {
+
+        /**
+         * Whether this listener's socket is still the one speaking for the
+         * session.
+         *
+         * A socket that [switchTab] replaced must not be able to end the session
+         * it was replaced in, so every callback checks this first. See
+         * [currentAttempt].
+         */
+        private fun isCurrent(): Boolean = currentAttempt === attempt
 
         override fun onOpen(webSocket: WebSocket, response: Response) {
-            // Adopted here as well as by connect(), because this can run before
+            if (!isCurrent()) return
+            // Adopted here as well as by openSocket, because this can run before
             // newWebSocket returns and the first frames below must not be
             // dropped for want of a socket to send them on.
             socket = webSocket
             open = true
             // The daemon stamps the tab's last_used_at on this frame, which is
-            // what puts the tab the user just opened at the top of the list.
+            // what puts the tab the user just opened at the top of the list — and
+            // what moves it there when an open session is switched to it.
             webSocket.send(byteArrayOf(TAG_FOCUS).toByteString())
             opened.countDown()
         }
 
         override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
+            if (!isCurrent()) return
             when (val frame = decodeFrame(bytes.toByteArray())) {
                 is Frame.Output -> if (frame.bytes.size > 0) inbound.offer(frame.bytes.toByteArray())
                 is Frame.Meta -> {
@@ -186,6 +314,10 @@ class TabAtelier : AbsTransport() {
         override fun onMessage(webSocket: WebSocket, text: String) = Unit
 
         override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+            if (!isCurrent()) {
+                Timber.d("Ignoring the close of a tab-atelier socket this session replaced")
+                return
+            }
             Timber.d("tab-atelier session closed: %d %s", code, reason)
             closed = true
             inbound.offer(END_OF_STREAM)
@@ -193,6 +325,10 @@ class TabAtelier : AbsTransport() {
         }
 
         override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+            if (!isCurrent()) {
+                Timber.d(t, "Ignoring the failure of a tab-atelier socket this session replaced")
+                return
+            }
             Timber.w(t, "tab-atelier session failed")
             failure = IOException(t.message ?: "tab-atelier connection failed", t)
             closed = true

@@ -1,8 +1,16 @@
 diff --git a/app/src/main/java/org/connectbot/service/TerminalBridge.kt b/app/src/main/java/org/connectbot/service/TerminalBridge.kt
-index 208bd124..840eb83a 100644
+index 208bd124..e1f75fee 100644
 --- a/app/src/main/java/org/connectbot/service/TerminalBridge.kt
 +++ b/app/src/main/java/org/connectbot/service/TerminalBridge.kt
-@@ -292,6 +292,23 @@ class TerminalBridge {
+@@ -64,6 +64,7 @@ import org.connectbot.terminal.TerminalEmulatorFactory
+ import org.connectbot.terminal.UrlScanScope
+ import org.connectbot.transport.AbsTransport
+ import org.connectbot.transport.SSH
++import org.connectbot.transport.TabAtelier
+ import org.connectbot.transport.TransportFactory
+ import org.connectbot.util.HostConstants
+ import org.connectbot.util.PreferenceConstants
+@@ -292,6 +293,23 @@ class TerminalBridge {
      private val _delKeyModeFlow = MutableStateFlow<DelKeyMode>(DelKeyMode.Delete)
      val delKeyModeFlow: StateFlow<DelKeyMode> = _delKeyModeFlow.asStateFlow()
  
@@ -26,7 +34,7 @@ index 208bd124..840eb83a 100644
      // Terminal emulator from ConnectBot Terminal library
      val terminalEmulator: TerminalEmulator
  
-@@ -787,6 +804,42 @@ class TerminalBridge {
+@@ -787,6 +805,60 @@ class TerminalBridge {
          onTextInputRequest?.invoke()
      }
  
@@ -64,6 +72,24 @@ index 208bd124..840eb83a 100644
 +     */
 +    fun setRemoteTabName(name: String) {
 +        if (name.isNotBlank()) _remoteTabName.value = name
++    }
++
++    /**
++     * Moves this session to another tab of the same server, returning whether this
++     * session was able to take the move.
++     *
++     * Added for Tab Atelier Remote (Apache-2.0 section 4(b)): another tab of a
++     * server that already has a session moves that session, because ConnectBot keys
++     * a session by host and this app is a viewer — the tab left behind keeps
++     * running on the daemon, so a move loses nothing.
++     *
++     * A false return is not a failure: it means this session is not one that has
++     * tabs — every other transport — so the caller should do what it would have
++     * done anyway, which is open a session.
++     */
++    fun switchTab(tabKey: String): Boolean {
++        val tabatelier = transport as? TabAtelier ?: return false
++        return tabatelier.switchTab(tabKey)
 +    }
 +
      /**

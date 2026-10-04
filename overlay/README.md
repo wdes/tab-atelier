@@ -254,6 +254,38 @@ travels from the tap through the console route's optional `?tab=` argument and i
 *consumed* by the transport (taken, not read), so a later session cannot inherit
 the previous one's tab.
 
+**Another tab of a server that already has a session moves that session.** It does
+not open a second one, and it used to be refused: `TerminalManager` keys a session
+by host, so `openConnection` threw "Connection already open for that nickname" and
+tapping a second tab left the user looking at the first. One session per server is
+worth keeping — it is what the running notification, the host list's connected
+indicator and the session maps all assume — and moving loses nothing, because the
+app is a viewer and the tab being left keeps running on the daemon.
+
+The difficulty is that a move must not look like an ending. `Relay` reads
+`read()`, and `-1` ends its read loop, so a switch done by closing this transport
+and building a new one would kill the session it is moving. So:
+
+- The switch happens **inside** the transport (`switchTab`), which keeps its
+  identity; between the two sockets `read()` reports `0`, "nothing right now",
+  which is what a socket with no bytes yet reports anyway.
+- The socket being replaced is **detached before it is closed** (`currentAttempt`),
+  because its callbacks still run — `onClosed`, and possibly `onFailure` for one
+  still handshaking — and either would otherwise be read as the session ending.
+- The **inbound queue is dropped** but nothing else is: frames of the tab being
+  left are not the tab being opened, and the replay that follows would be drawn
+  underneath them.
+- The screen is **not** cleared explicitly. The daemon's replay opens with a form
+  feed, so the new tab's first bytes clear before they repaint — which is what the
+  daemon's own browser client relies on for exactly this. That client calls
+  `term.reset()` only to wipe a preview frame, which this app no longer renders.
+- A move that fails leaves the session reporting the failure, the same as any
+  other lost connection, rather than sitting there looking alive.
+
+Tapping the tab already open is a no-op, not an error, which is why the manager
+returns the existing session whatever the move did — falling through to
+`openConnection` in that case would hit the "already open" refusal.
+
 **A row's trailing content is a stack, not a sequence.** The chevron that shows
 and hides a daemon's tab list sits beside the overflow button, and putting both
 in the trailing slot as siblings does not lay them out side by side — they land
