@@ -17,7 +17,9 @@
 
 // New file for Tab Atelier Remote, not part of upstream ConnectBot: the URL a
 // tab-atelier server is addressed by, the HTTP client for its `GET {base}/tabs`,
-// and the trust-on-first-use pinning of its certificate. See overlay/README.md.
+// and how far its certificate is trusted — validated by the device where the
+// device can, pinned where nothing else can identify the server. See
+// overlay/README.md.
 
 package org.connectbot.tabatelier
 
@@ -33,6 +35,7 @@ import okhttp3.Request
 import org.connectbot.BuildConfig
 import org.connectbot.util.SecurePasswordStorage
 import timber.log.Timber
+import java.security.KeyStore
 import java.security.cert.Certificate
 import java.security.cert.CertificateException
 import java.security.cert.X509Certificate
@@ -40,10 +43,14 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import javax.inject.Inject
 import javax.inject.Singleton
+import javax.net.ssl.HostnameVerifier
+import javax.net.ssl.HttpsURLConnection
 import javax.net.ssl.KeyManager
 import javax.net.ssl.SSLContext
 import javax.net.ssl.SSLPeerUnverifiedException
+import javax.net.ssl.SSLSession
 import javax.net.ssl.TrustManager
+import javax.net.ssl.TrustManagerFactory
 import javax.net.ssl.X509TrustManager
 
 /**
@@ -255,8 +262,9 @@ class TabAtelierClient @Inject constructor(
             }
             // The key is only recorded once a request has come back over the
             // accepted connection, never merely because the socket was accepted:
-            // see recordPin. A plain-http daemon has no handshake, and so
-            // nothing to pin.
+            // see recordPin. A chain the device itself vouches for records
+            // nothing — see TrustOnFirstUseManager — and a plain-http daemon has
+            // no handshake, and so nothing to pin.
             if (base.secure) {
                 recordPin(hostId, base, it.handshake?.peerCertificates)
             }
@@ -287,57 +295,88 @@ class TabAtelierClient @Inject constructor(
 
         // A daemon serving plain HTTP — a trusted LAN, or a tunnel that brings
         // its own encryption — is reached with no TLS configuration at all: no
-        // pin, no trust manager, no hostname verifier. It is deliberately not
+        // trust manager, no hostname verifier, no pin. It is deliberately not
         // upgraded to https, which would only fail against a daemon with no
         // certificate to offer.
         if (!base.secure) return builder.build()
 
-        val trustManager = TrustOnFirstUseManager(hostId, base, basePrefs) { accepted ->
-            // Remembered here, pinned later: fetchTabs commits it once a
-            // response has come back over this key. pinOf is what turns the
-            // certificate into the form CertificatePinner compares, so the
-            // candidate is stored in that same form.
-            pinOf(accepted)?.let { pendingPins[pinKey(hostId, base.origin)] = it }
-        }
+        val trustManager = TrustOnFirstUseManager(
+            hostId = hostId,
+            base = base,
+            pins = basePrefs,
+            device = deviceTrustManager(),
+            deviceHostnameVerifier = deviceHostnameVerifier(),
+            rememberAsFirstUse = { accepted ->
+                // Remembered here, pinned later: fetchTabs commits it once a
+                // response has come back over this key. pinOf is what turns the
+                // certificate into the form a pin is compared in, so the
+                // candidate is stored in that same form.
+                pinOf(accepted)?.let { pendingPins[pinKey(hostId, base.origin)] = it }
+            },
+            forgetPinnedKey = { dropPin(hostId, base) },
+        )
         val sslContext = SSLContext.getInstance(TLS_PROTOCOL).apply {
             init(null as Array<KeyManager>?, arrayOf<TrustManager>(trustManager), null)
         }
 
-        builder
-            // The daemon's certificate is self-signed or a Cloudflare Origin
-            // certificate, so neither the system CA store nor name validation
-            // can be the gate. The gate is this trust manager, which decides on
-            // the certificate's public key: trust on first use, then require
-            // that exact key. Setting only a hostname verifier — as this client
-            // did before the trust manager was added — is not enough: OkHttp's
-            // default trust manager rejects the chain during the handshake,
-            // before any verifier is consulted, so a self-signed server never
-            // reaches the pin at all.
+        return builder
+            // The daemon's own certificate is self-signed, so neither the system
+            // CA store nor name validation can be the gate for it — but a
+            // certificate a CA signed must be validated by that CA, and a renewal
+            // of it must not break us. Which of the two a server is is the trust
+            // manager's decision: see its class comment. Setting only a hostname
+            // verifier — as this client did before the trust manager was added —
+            // fixes nothing, because OkHttp's default trust manager rejects the
+            // chain during the handshake, before any verifier is consulted.
             .sslSocketFactory(sslContext.socketFactory, trustManager)
-            // The second, independent check that it is the same connection: it
-            // compares the pin, and so cannot pass a key the trust manager would
-            // have rejected.
-            .hostnameVerifier { _, session ->
-                val chain = try {
-                    session.peerCertificates
-                } catch (e: SSLPeerUnverifiedException) {
-                    null
-                }
-                trustManager.matchesPin(chain?.toList())
-            }
+            // The second half of the same decision, which OkHttp *enforces*: the
+            // device's own verifier for a chain the device vouched for, the pin
+            // for a server whose key is its only identity.
+            .hostnameVerifier { hostname, session -> trustManager.verifyHostname(hostname, session) }
+            .build()
+    }
 
-        // Belt and braces: OkHttp's CertificatePinner pins the Subject Public
-        // Key Info rather than the certificate (so a renewal that keeps the key
-        // still matches while a swapped key does not), and it reports the
-        // failure as an SSLPeerUnverifiedException naming the pin.
-        pin(hostId, base)?.let { recorded ->
-            builder.certificatePinner(
-                CertificatePinner.Builder()
-                    .add(base.host, recorded)
-                    .build(),
-            )
+    /**
+     * The device's own trust manager — what decides whether a certificate is one
+     * the device can already vouch for (a public CA, or a CA the user installed)
+     * and therefore one this app must not pin. See [TrustOnFirstUseManager].
+     *
+     * Deliberately the platform's and not OkHttp's: OkHttp's default trust
+     * manager is built on this same authority, and asking it directly keeps the
+     * answer consistent with what the device's own HTTPS stack would do.
+     */
+    private fun deviceTrustManager(): X509TrustManager {
+        val factory = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm())
+        // null: the device's default store, i.e. what Android itself trusts.
+        factory.init(null as KeyStore?)
+        return requireNotNull(factory.trustManagers.filterIsInstance<X509TrustManager>().firstOrNull()) {
+            "The device has no X.509 trust manager to validate a server's certificate with"
         }
-        return builder.build()
+    }
+
+    /**
+     * The device's own hostname verifier: what Android's HTTPS stack checks a
+     * certificate's names with, for the certificates the device vouches for.
+     */
+    private fun deviceHostnameVerifier(): HostnameVerifier =
+        requireNotNull(HttpsURLConnection.getDefaultHostnameVerifier()) {
+            "The device has no default hostname verifier to check a server's certificate names with"
+        }
+
+    /**
+     * Forget a host's pin for one origin because the device now vouches for that
+     * server's chain.
+     *
+     * A pin belongs to the case where nothing else could vouch for the
+     * certificate, and it would refuse the renewed certificate the device has
+     * just accepted — which is the whole point of not pinning a chain the device
+     * can validate. The candidate goes with it, so a handshake that was accepted
+     * as first use but is now validated cannot commit a pin from its response.
+     */
+    private fun dropPin(hostId: Long, base: TabAtelierBase) {
+        basePrefs.edit().remove(pinKey(hostId, base.origin)).apply()
+        pendingPins.remove(pinKey(hostId, base.origin))
+        Timber.d("Not pinning %s any more: the device validates its certificate", base.origin)
     }
 
     /**
@@ -351,6 +390,10 @@ class TabAtelierClient @Inject constructor(
      * anything that answers and then fails, or is refused a response — never
      * becomes the pinned key, and every later connection to it is rejected
      * against the pin the real daemon earned.
+     *
+     * A chain the *device* vouches for leaves no candidate at all, and so is
+     * never pinned: see [TrustOnFirstUseManager] for why that is the point of
+     * this arrangement rather than a gap in it.
      */
     private fun recordPin(hostId: Long, base: TabAtelierBase, chain: List<Certificate>?) {
         val key = pinKey(hostId, base.origin)
@@ -400,37 +443,95 @@ class TabAtelierClient @Inject constructor(
 }
 
 /**
- * Decides whether a daemon's certificate may be trusted, on the certificate's
- * public key rather than on a CA or a name.
+ * Decides whether a daemon's certificate may be used, and on what evidence.
  *
- * First use of a host is accepted, so that a request can be made at all; the key
- * is remembered later, and only once a response has arrived (see
- * [TabAtelierClient.recordPin]). Every later connection must reproduce it. A
- * host whose recorded key no longer matches fails here, during the handshake,
- * with a message naming it — never by quietly adopting the new key. "No pin" is
- * only ever the first-use case from this side: a recorded pin that cannot be
- * read back is a corrupt store, not a reason to trust everything.
+ * Which of two cases a server falls into is the *device's* judgement, not this
+ * app's:
+ *
+ * **The device vouches for the chain** — a public CA signed it, or the user
+ * installed its CA here. Something outside this app can vouch for that
+ * certificate *and can re-issue it*, so nothing is pinned: renewals are the
+ * normal life of such a certificate, and a client that refused the renewed one
+ * would be the bug this class was reshaped to fix. The device's own hostname
+ * verifier checks the name, as it would for any other HTTPS connection.
+ *
+ * **The device cannot vouch for the chain** — the daemon's own self-signed
+ * certificate, or an origin certificate whose CA this device does not have.
+ * Nothing else identifies the server, so its key *is* its identity: trust on
+ * first use, then require that exact key. This is the case a pin belongs to.
+ *
+ * A certificate nothing can vouch for is deliberately *not* refused for being
+ * signed by someone: a Cloudflare Origin certificate is a documented way to
+ * reach a daemon here, and its CA is not on an Android device by default. It is
+ * trusted on first use like a self-signed certificate, and says so in the log.
  */
-private class TrustOnFirstUseManager(
+internal class TrustOnFirstUseManager(
     private val hostId: Long,
     private val base: TabAtelierBase,
     private val pins: SharedPreferences,
+    /** The device's own trust manager: what "the device vouches for it" means. */
+    private val device: X509TrustManager,
+    /** The device's own hostname verifier, for the chains [device] accepts. */
+    private val deviceHostnameVerifier: HostnameVerifier,
+    /**
+     * Hand a first-use key on as a pin candidate — see
+     * [TabAtelierClient.recordPin], which is what makes it a pin.
+     */
     private val rememberAsFirstUse: (X509Certificate) -> Unit,
+    /** Forget a pin of a server the device now vouches for: see [checkServerTrusted]. */
+    private val forgetPinnedKey: () -> Unit,
 ) : X509TrustManager {
 
+    /** How the certificate of the handshake in progress was accepted. */
+    private enum class Trust {
+        /** The device validated the chain; nothing is pinned for it. */
+        DEVICE,
+
+        /** Nothing could validate it: its key is its identity, and is pinned. */
+        FIRST_USE,
+    }
+
+    /**
+     * What [checkServerTrusted] decided for the handshake in progress, which is
+     * what [verifyHostname] is then asked about.
+     *
+     * OkHttp consults the verifier after the handshake has completed, so the
+     * decision is always from the handshake being verified — including for a
+     * resumed session, whose handshake was this same instance's earlier one. Two
+     * connections to one server can only reach the same decision, so the two
+     * racing writes that sharing this value allows are harmless.
+     */
+    @Volatile
+    private var trust: Trust? = null
+
     override fun checkServerTrusted(chain: Array<out X509Certificate>, authType: String) {
+        val leaf = chain.firstOrNull()
+            ?: throw CertificateException("No certificate from ${base.host} to compare with its pinned key")
+
+        // Does the device itself vouch for this chain? Then this app pins
+        // nothing: see the class comment. Any pin recorded while nothing could
+        // vouch for the server is dropped with it — a renewal is exactly the
+        // case that makes this matter, and keeping the pin would refuse the
+        // certificate the device has just accepted.
+        if (deviceAccepts(chain, authType)) {
+            trust = Trust.DEVICE
+            if (recordedPin() != null) forgetPinnedKey()
+            return
+        }
+
+        trust = Trust.FIRST_USE
         val expected = recordedPin()
         if (expected == null) {
             // Nothing pinned for this server yet: accept, so the request that
             // earns the pin can be made. Accepting is not recording — the key is
             // handed on as a candidate, and only a response makes it a pin.
-            Timber.d("First tab-atelier connection to %s; accepting its key for now", base.origin)
-            chain.firstOrNull()?.let(rememberAsFirstUse)
+            Timber.d(
+                "The device does not vouch for %s's certificate; trusting its key on first use",
+                base.origin,
+            )
+            rememberAsFirstUse(leaf)
             return
         }
-
-        val leaf = chain.firstOrNull()
-            ?: throw CertificateException("No certificate from ${base.host} to compare with its pinned key")
 
         if (pinOf(leaf) != expected) {
             throw CertificateException(
@@ -441,6 +542,24 @@ private class TrustOnFirstUseManager(
         }
     }
 
+    /**
+     * Whether the device's own trust manager accepts this chain.
+     *
+     * Asked with the same `authType` the TLS stack handed us, which is what the
+     * device's manager is asked by the device's own HTTPS stack: a chain it
+     * accepts here is one it would accept anywhere. Nothing else about a failure
+     * is looked at — an unknown issuer, an expired certificate and a name it does
+     * not cover are all "the device cannot vouch for this", and the consequence
+     * is the same for all three.
+     */
+    private fun deviceAccepts(chain: Array<out X509Certificate>, authType: String): Boolean = try {
+        device.checkServerTrusted(chain, authType)
+        true
+    } catch (e: CertificateException) {
+        Timber.d("The device's trust store does not validate %s: %s", base.origin, e.message)
+        false
+    }
+
     override fun checkClientTrusted(chain: Array<out X509Certificate>, authType: String) {
         throw CertificateException("A tab-atelier host is a client, not the server being checked")
     }
@@ -448,28 +567,50 @@ private class TrustOnFirstUseManager(
     override fun getAcceptedIssuers(): Array<X509Certificate> = emptyArray()
 
     /**
-     * Whether the session over [chain] may be used.
+     * Whether a session to [hostname] may be used, which OkHttp *enforces*.
      *
-     * **True when nothing is pinned**, and that is load-bearing rather than
-     * lenient. This backs the hostname verifier, and OkHttp *enforces* a
-     * hostname verifier's answer: answering false for "not pinned yet" fails the
-     * very connection whose response would have recorded the pin. That is
-     * circular — no server could ever be reached for the first time, which is
-     * exactly the bug this class exists to fix, only reported as "hostname not
-     * verified" instead of "self-signed certificate". The trust manager has
-     * already accepted the key as first use by this point; the verifier's job is
-     * only to refuse a *changed* key, not to re-litigate a new one.
+     * Follows the decision of the handshake it belongs to, because that is what
+     * was actually checked: the device's hostname verifier for a chain the device
+     * validated, and the pin for a server whose key is its only identity.
      *
-     * A pin's authority comes from being written after a response has come back
-     * over the key (see `recordPin`), never from this check.
+     * The pin branch answers **true when nothing is pinned**, and that is
+     * load-bearing rather than lenient. It is the first-use case, and refusing it
+     * would refuse the very connection whose response records the pin — circular,
+     * and the bug this class exists to fix, reported as "hostname not verified"
+     * rather than as a certificate error. A pin's authority comes from being
+     * written after a response has come back over the key (see
+     * [TabAtelierClient.recordPin]), never from this check. It answers false when
+     * a pin is recorded and the chain does not reproduce it: the key changed.
      *
-     * False when a pin is recorded and [chain] does not reproduce it: the key
-     * changed, and the connection must not be made.
+     * It is also deliberately not a *name* check in that branch: a daemon's
+     * self-signed certificate carries the names the daemon knows itself by, and
+     * the address a user typed is often not one of them (a LAN address,
+     * `127.0.0.1`). The key is the identity there, and it has just been required.
+     */
+    fun verifyHostname(hostname: String, session: SSLSession): Boolean = when (trust) {
+        Trust.DEVICE -> deviceHostnameVerifier.verify(hostname, session)
+        // null cannot happen — this runs after checkServerTrusted of the same
+        // handshake — and the pin check is the safe reading of it, since with
+        // nothing pinned it behaves exactly as first use does.
+        Trust.FIRST_USE, null -> matchesPin(peerCertificatesOf(session))
+    }
+
+    /**
+     * Whether [chain] reproduces the pin recorded for this server: true when
+     * nothing is pinned yet (see [verifyHostname]), false when it is pinned and
+     * [chain] does not reproduce it.
      */
     fun matchesPin(chain: List<Certificate>?): Boolean {
         val expected = recordedPin() ?: return true
         val leaf = chain?.firstOrNull() ?: return false
         return pinOf(leaf) == expected
+    }
+
+    /** The peer chain of [session], or null if the session has not been verified. */
+    private fun peerCertificatesOf(session: SSLSession): List<Certificate>? = try {
+        session.peerCertificates.toList()
+    } catch (e: SSLPeerUnverifiedException) {
+        null
     }
 
     private fun recordedPin(): String? = pins.getString(pinKey(hostId, base.origin), null)
@@ -495,9 +636,12 @@ private fun pinOf(certificate: Certificate): String? =
  * part of the message.
  */
 fun tabAtelierErrorMessage(e: Throwable): String = when (e) {
+    // OkHttp reports both a refused pin and a refused name as this, and its own
+    // wording for the second names no host. So the message is ours, and says the
+    // one thing the user can act on without guessing which of the two it was.
     is SSLPeerUnverifiedException ->
-        "This server's certificate key does not match the key pinned for it. " +
-            "Its certificate was replaced; clear the host's trust to accept the new key."
+        "This server's certificate was not accepted. If the server's certificate " +
+            "was replaced, clear the host's trust and try again."
 
     else -> e.message ?: e.javaClass.simpleName
 }

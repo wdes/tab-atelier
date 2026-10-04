@@ -143,21 +143,52 @@ Three decisions worth not re-litigating:
   trusted LAN or a tunnel wants. An `http://` base is built with no TLS
   configuration at all — no pin, no trust manager, no hostname verifier — and is
   never silently upgraded to https.
-- **TLS is trust on first use, and the gate is a trust manager.** The daemon's
-  certificate is self-signed or a Cloudflare Origin certificate, so neither the
-  system CA store nor name validation can be the gate. The **root cause of the
-  first release's "self-signed certificates do not work"** is worth stating
-  plainly, because the wrong fix is the obvious one: a `hostnameVerifier` alone
-  never runs, since OkHttp's *default* trust manager rejects the chain during
-  the handshake, before any verifier is consulted. So an `X509TrustManager`
-  decides, on the peer's Subject Public Key Info: first use of a host is
-  accepted so the request can be made at all, the key is *persisted* only once a
-  response to that request has come back, and every later connection must
-  reproduce it — including a changed key, which fails during the handshake with
-  a message naming the host. The `hostnameVerifier` (which compares the pin) and
-  OkHttp's `CertificatePinner` stay as independent second checks; the pin string
-  is whatever `CertificatePinner.pin(cert)` produces, so a recorded pin cannot
+- **TLS is validated by the device where the device can, and pinned where
+  nothing else can identify the server.** The daemon's own certificate is
+  self-signed, so neither the system CA store nor name validation can be the
+  gate for it — but a certificate a CA *did* sign must be validated by that CA,
+  and pinning it would be wrong: such a certificate is renewed as a matter of
+  course, and a client that refused the renewed one would be broken by design.
+  Which of the two a server is is the device's judgement, not ours, and the
+  trust manager asks the device directly (`TrustManagerFactory` over the
+  default store) rather than keeping a second opinion:
+
+  - **The device validates the chain** — a public CA signed it, or the user
+    installed its CA (a Cloudflare Origin certificate with its CA installed,
+    which `AGENTS.md` documents as a supported deployment). Nothing is pinned,
+    and any pin left over from before is *dropped*, because a pin that outlived
+    its reason would refuse the renewal the device has just accepted. The
+    device's own hostname verifier checks the name.
+  - **The device cannot** — the daemon's self-signed certificate, or an origin
+    certificate whose CA this device does not have. Nothing else identifies the
+    server, so its key is its identity: trust on first use, then require that
+    exact key. This is the case a pin belongs to, and the name is deliberately
+    *not* checked there: a self-signed certificate carries the names the daemon
+    knows itself by, and the address a user typed (a LAN address, `127.0.0.1`)
+    is often not one of them. The key has just been required instead.
+
+  The **root cause of the first release's "self-signed certificates do not
+  work"** is worth stating plainly, because the wrong fix is the obvious one: a
+  `hostnameVerifier` alone never runs, since OkHttp's *default* trust manager
+  rejects the chain during the handshake, before any verifier is consulted. So
+  an `X509TrustManager` decides, on the peer's Subject Public Key Info: first
+  use of a server is accepted so the request can be made at all, the key is
+  *persisted* only once a response to that request has come back, and every
+  later connection must reproduce it — including a changed key, which fails
+  during the handshake with a message naming the host. The `hostnameVerifier`
+  follows the same decision (the device's verifier, or the pin), and OkHttp's
+  `CertificatePinner` is added for a pinned server only. A pin string is
+  whatever `CertificatePinner.pin(cert)` produces, so a recorded pin cannot
   fail to verify against itself.
+
+  Two details of that arrangement are load-bearing. The verifier answers *true*
+  when nothing is pinned, because OkHttp enforces a verifier's answer and
+  answering false there would refuse the very connection whose response records
+  the pin — circular, and the same bug reported as "hostname not verified"
+  instead of as a certificate error. And a pin is recorded from the key the
+  trust manager accepted, never from `Response.handshake`, which is not always
+  populated — when it was the only source, TOFU quietly became "trust
+  everything, forever".
 
 **A server is re-probed when what the probe depends on changes.** The per-host
 tab state is keyed by host id and invalidated when the host's URL changes or,
