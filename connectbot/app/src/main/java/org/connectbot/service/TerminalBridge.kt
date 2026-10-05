@@ -915,12 +915,20 @@ class TerminalBridge {
      * Split out from applying them so that a remote background can later be applied
      * on top and then taken away again: whatever the profile says stays here, and
      * [applyRemoteBackground] re-applies it with a background of its choosing.
+     *
+     * A remote colour already in hand is re-applied here rather than overwritten,
+     * which closes two orderings that would otherwise silently lose it: a meta frame
+     * that arrives *before* the profile's scheme is known — its colour would be left
+     * on the floor and never retried — and a profile change *during* a session,
+     * where the profile supplies the palette and foreground while the tab keeps
+     * supplying the background.
      */
     private fun applyProfileColorScheme(ansiColors: IntArray, foreground: Int, background: Int) {
         profileAnsiColors = ansiColors
         profileForeground = foreground
         profileBackground = background
-        terminalEmulator.applyColorScheme(ansiColors, foreground, background)
+        val remote = _remoteBackgroundColor.value?.let { remoteBackgroundArgb(it) }
+        terminalEmulator.applyColorScheme(ansiColors, foreground, remote ?: background)
     }
 
     /**
