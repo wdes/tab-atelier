@@ -111,10 +111,13 @@ scripts/build-apk.sh            # signed release APK
 scripts/build-apk.sh --debug    # debug APK, upstream's own debug key
 ```
 
-Needs `ANDROID_HOME` (defaults to this machine's SDK), a JDK 21, and an
-Android NDK only if a native module survives. We removed the two that did —
-mosh and the local-shell exec — which is a commit deleting them like any other,
-and it is why `ndkVersion` is pinned in `connectbot/app/build.gradle.kts`.
+Needs `ANDROID_HOME` (defaults to this machine's SDK), a JDK 21, and an Android
+NDK — `connectbot/app/build.gradle.kts` pins `ndkVersion` because upstream's
+native code is still built: the mosh client (`libmoshexec.so`) and the
+local-shell exec. Neither is used by a tab-atelier session, and both are kept
+deliberately, because this fork adds a protocol rather than replacing the ones
+upstream has — see `docs/connectbot-fork.md`. The NDK is therefore a build
+requirement, not a leftover, and the first build is slow for it.
 
 ## CI and publishing
 
