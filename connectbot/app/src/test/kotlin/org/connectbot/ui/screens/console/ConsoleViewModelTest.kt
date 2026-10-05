@@ -45,6 +45,7 @@ import org.junit.Test
 import org.mockito.kotlin.any
 import org.mockito.kotlin.eq
 import org.mockito.kotlin.mock
+import org.mockito.kotlin.never
 import org.mockito.kotlin.verify
 import org.mockito.kotlin.whenever
 
@@ -111,6 +112,56 @@ class ConsoleViewModelTest {
         val state = viewModel.uiState.value
         assertFalse("Should stop loading after timeout", state.isLoading)
         assertEquals("Should have no bridges", 0, state.bridges.size)
+    }
+
+    /**
+     * Added for Tab Atelier Remote (Apache-2.0 section 4(b)).
+     *
+     * Tapping another tab of a server whose session is already open has to MOVE that
+     * session to the tab that was tapped.
+     *
+     * This is the regression test for the bug that made the feature do nothing. The
+     * move was implemented in `TerminalManager.openConnectionForHostId`, but this
+     * view model only calls that when there is **no** bridge for the host — so a
+     * second tap found the bridge, took neither branch, and the session stayed on
+     * the tab it was already showing. `switchTab` is therefore the assertion: it is
+     * what the second path has to call, and nothing else does, so this fails on the
+     * code that shipped the bug.
+     */
+    @Test
+    fun openingAnotherTabOfAnAlreadyOpenHost_movesThatSession() = runTest {
+        val existing = createMockBridge(1L, "workstation")
+        bridgesFlow.value = listOf(existing)
+        whenever(savedStateHandle.get<Long>("hostId")).thenReturn(1L)
+        whenever(savedStateHandle.get<String>("tab")).thenReturn("tab-b")
+
+        val viewModel = ConsoleViewModel(savedStateHandle, dispatchers, prefs, notificationPermissionHelper)
+        viewModel.setTerminalManager(terminalManager)
+
+        advanceUntilIdle()
+
+        verify(existing).switchTab("tab-b")
+    }
+
+    /**
+     * The other direction, so the fix above cannot become "always move": opening a
+     * host that already has a session *without* naming a tab — every transport that
+     * is not tab-atelier, and a plain reconnect — must leave that session where it
+     * is.
+     */
+    @Test
+    fun openingAnAlreadyOpenHostWithoutATab_leavesTheSessionAlone() = runTest {
+        val existing = createMockBridge(1L, "workstation")
+        bridgesFlow.value = listOf(existing)
+        whenever(savedStateHandle.get<Long>("hostId")).thenReturn(1L)
+        whenever(savedStateHandle.get<String>("tab")).thenReturn(null)
+
+        val viewModel = ConsoleViewModel(savedStateHandle, dispatchers, prefs, notificationPermissionHelper)
+        viewModel.setTerminalManager(terminalManager)
+
+        advanceUntilIdle()
+
+        verify(existing, never()).switchTab(any())
     }
 
     @Test

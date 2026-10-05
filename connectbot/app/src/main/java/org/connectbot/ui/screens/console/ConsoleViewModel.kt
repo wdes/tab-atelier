@@ -234,6 +234,18 @@ class ConsoleViewModel @Inject constructor(
                             handleInitialSelectionError("Failed to open connection: host not found")
                         }
                     }
+                } else if (!tabKey.isNullOrBlank()) {
+                    // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): a
+                    // session that already exists for this host is MOVED to the tab
+                    // that was tapped.
+                    //
+                    // Without this branch, tapping another tab of a server already
+                    // open did nothing at all: the bridge existed, so nothing here
+                    // ran, and the move never happened. The move lives in
+                    // TerminalManager.openConnectionForHostId, which this method
+                    // only reaches when there is no bridge — so the fix needs to be
+                    // on *both* paths, and this is the one a second tap takes.
+                    existingBridge.switchTab(tabKey)
                 }
             } catch (e: Exception) {
                 handleInitialSelectionError(e.message ?: "Failed to create connection")
