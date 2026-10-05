@@ -122,16 +122,6 @@ internal class AuthBannerQueue {
 
     private companion object {
         private const val MAX_AUTH_BANNERS = 10
-
-        /**
-         * What the daemon sends for a tab's viewer background: `#rrggbb`, exactly.
-         *
-         * Spelled out here rather than shared with the console's copy on purpose —
-         * see [hexToArgb]. A shared constant would let a mistake in one silently
-         * agree with the other, and the tests on each side are what keep them
-         * honest.
-         */
-        private val REMOTE_HEX_COLOR = Regex("^#[0-9a-fA-F]{6}$")
     }
 }
 
@@ -962,21 +952,6 @@ class TerminalBridge {
      * better than a second copy, but the two live in different modules and a wrong
      * colour that cannot be traced to its sender is worse than the duplication.
      */
-    /**
-     * A `#rrggbb` string as an ARGB int, or null if it is not one.
-     *
-     * The shape is checked before parsing rather than the parse being caught:
-     * `Color.parseColor` accepts CSS colour names, so `"red"` would quietly become
-     * opaque red, and it reads `charAt(0)` before validating, so an empty string
-     * throws an unchecked exception that a `catch (IllegalArgumentException)` would
-     * not see. Both are the console's parser over again; a shared helper would be
-     * better than a second copy, but the two live in different packages and a wrong
-     * colour that cannot be traced to its sender is worse than the duplication.
-     *
-     * Top-level rather than a member so it can be tested without standing up a whole
-     * bridge — the parsing is the part with the traps in it, and it needs no
-     * terminal to exercise.
-     */
     internal fun remoteBackgroundArgb(hex: String): Int? =
         if (REMOTE_HEX_COLOR.matches(hex)) android.graphics.Color.parseColor(hex) else null
 
@@ -1515,7 +1490,7 @@ class TerminalBridge {
          * What the daemon sends for a tab's viewer background: `#rrggbb`, exactly.
          *
          * Spelled out here rather than shared with the console's copy on purpose —
-         * see [hexToArgb]. A shared constant would let a mistake in one silently
+         * see [remoteBackgroundArgb]. A shared constant would let a mistake in one silently
          * agree with the other, and the tests on each side are what keep them
          * honest.
          */
