@@ -350,6 +350,7 @@ mod tests {
     fn two_providers() -> Registry {
         let mut r = Registry::default();
         r.providers.push(Provider {
+            user_id: None,
             peak: None,
             id: "bedrock".to_owned(),
             wire: Wire::Anthropic,

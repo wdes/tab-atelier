@@ -362,6 +362,7 @@ mod tests {
 
     fn provider(id: &str, base_url: &str) -> Provider {
         Provider {
+            user_id: None,
             id: id.to_owned(),
             wire: crate::provider::Wire::Anthropic,
             base_url: base_url.to_owned(),

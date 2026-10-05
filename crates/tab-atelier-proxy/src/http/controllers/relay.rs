@@ -1306,15 +1306,21 @@ pub(crate) fn upstream_url(base: &str, wire: provider::Wire, path: &str) -> Stri
 }
 
 pub(crate) fn upstream_body(f: &Forward, wire: provider::Wire) -> (String, Bytes) {
+    let attribution = provider_attribution(&f.state, &f.route.provider_id);
     match wire {
         provider::Wire::Anthropic => {
-            if f.local_tools.is_empty() {
+            // Rewriting costs a parse and a re-serialise, so a body is passed
+            // through untouched when nothing has to go into it. The attribution
+            // is a second reason to rewrite, and the only one that applies to a
+            // request carrying no local tools at all.
+            if f.local_tools.is_empty() && attribution.is_none() {
                 return (f.sub_pq.clone(), f.body.clone());
             }
             let body = serde_json::from_slice::<serde_json::Value>(&f.body).map_or_else(
                 |_| f.body.clone(),
                 |mut parsed| {
                     crate::localtool::inject(&mut parsed, &f.local_tools);
+                    stamp_user_id(&mut parsed, provider::Wire::Anthropic, attribution.as_deref());
                     Bytes::from(serde_json::to_vec(&parsed).unwrap_or_default())
                 },
             );
@@ -1326,11 +1332,73 @@ pub(crate) fn upstream_body(f: &Forward, wire: provider::Wire) -> (String, Bytes
             // valid request instead of panicking in a proxy.
             let mut parsed: serde_json::Value = serde_json::from_slice(&f.body).unwrap_or(serde_json::Value::Null);
             crate::localtool::inject(&mut parsed, &f.local_tools);
+            // Stamped after the translation rather than before: `to_chat` moves
+            // fields between the two shapes, and an id written into the incoming
+            // body would have to survive that to reach the vendor.
+            let mut chat = openai::to_chat(&parsed);
+            stamp_user_id(&mut chat, provider::Wire::Openai, attribution.as_deref());
             (
                 "/v1/chat/completions".to_owned(),
-                Bytes::from(serde_json::to_vec(&openai::to_chat(&parsed)).unwrap_or_default()),
+                Bytes::from(serde_json::to_vec(&chat).unwrap_or_default()),
             )
         }
+    }
+}
+
+/// The outbound attribution this provider asks for, if it asks for one.
+///
+/// Read from the registry here rather than threaded through [`destination`],
+/// which resolves the same provider moments earlier for the URL and the
+/// credential: this is one optional string, and a second short lock is cheaper
+/// than a fourth element carried by every caller. A provider that is not in the
+/// registry yields `None` rather than an error — the request is about to fail at
+/// `destination` for the same reason, with a message that names the provider.
+fn provider_attribution(state: &State, provider_id: &str) -> Option<String> {
+    let registry = state.registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    registry.get(provider_id).and_then(|p| p.user_id.clone())
+}
+
+/// Write an attribution into an outgoing body, in the shape its wire expects.
+///
+/// The two differ: the Anthropic shape carries it at `metadata.user_id`, the
+/// `OpenAI` chat shape at the top level.
+///
+/// On the Anthropic shape that field is where the client *itself* puts its
+/// session identity, so this replaces rather than adds — which is the point. An
+/// operator sets [`provider::Provider::user_id`] on a third-party provider, and
+/// the effect is that the vendor receives the deployment's id instead of the
+/// account and device identifiers a Claude Code session would otherwise hand it.
+/// The proxy's own record of the client is taken from the arrival body before
+/// any of this runs, so it loses nothing.
+fn stamp_user_id(body: &mut serde_json::Value, wire: provider::Wire, user_id: Option<&str>) {
+    let Some(user_id) = user_id else {
+        return;
+    };
+    // A body that is not an object is a bug upstream rather than bad input, and
+    // replacing it would send the vendor a shape nothing validated.
+    let Some(object) = body.as_object_mut() else {
+        return;
+    };
+    let id = serde_json::Value::String(user_id.to_owned());
+    match wire {
+        provider::Wire::Openai => {
+            object.insert("user_id".to_owned(), id);
+        }
+        provider::Wire::Anthropic => match object.get_mut("metadata") {
+            Some(metadata) if metadata.is_object() => {
+                metadata
+                    .as_object_mut()
+                    .expect("checked just above")
+                    .insert("user_id".to_owned(), id);
+            }
+            // `metadata` present but not an object: the request is malformed for
+            // this API anyway, and overwriting it would send the vendor
+            // something nobody validated. Left as it is, deliberately.
+            Some(_) => {}
+            None => {
+                object.insert("metadata".to_owned(), serde_json::json!({ "user_id": user_id }));
+            }
+        },
     }
 }
 
@@ -1589,6 +1657,74 @@ mod tests {
         );
         assert_eq!(after, body, "nothing to change, so nothing is rebuilt");
         assert!(local.is_empty());
+    }
+
+    /// An attribution replaces the client's own identity on the Anthropic shape.
+    ///
+    /// This is the one destructive thing the feature does, and it is deliberate:
+    /// `metadata.user_id` is where Claude Code puts its account and device
+    /// identifiers, so an operator setting `user_id` on a third-party provider
+    /// is saying those are not what that vendor should receive. Everything else
+    /// the client put in `metadata` stays where it is.
+    #[test]
+    fn an_anthropic_attribution_replaces_the_clients_own_identity() {
+        let mut body = serde_json::json!({
+            "model": "m",
+            "metadata": { "user_id": r#"{"device_id":"a","account_uuid":"b"}"#, "other": 1 },
+        });
+        stamp_user_id(&mut body, provider::Wire::Anthropic, Some("tchouk"));
+
+        assert_eq!(body["metadata"]["user_id"], "tchouk");
+        assert_eq!(body["metadata"]["other"], 1, "the rest of metadata is the client's");
+    }
+
+    /// A request carrying no `metadata` grows one.
+    ///
+    /// The ordinary case for anything that is not Claude Code: there is nothing
+    /// to replace, so the object has to be made for the id to have somewhere to
+    /// go. Without this the attribution would be recorded and then not sent.
+    #[test]
+    fn an_anthropic_attribution_creates_the_metadata_it_needs() {
+        let mut body = serde_json::json!({ "model": "m", "messages": [] });
+        stamp_user_id(&mut body, provider::Wire::Anthropic, Some("tchouk"));
+        assert_eq!(body["metadata"]["user_id"], "tchouk");
+    }
+
+    /// A `metadata` that is not an object is left as it is, not replaced.
+    ///
+    /// The request is malformed for this API either way, and inventing a shape
+    /// for it would send the vendor a body nothing validated — the worse of the
+    /// two failures.
+    #[test]
+    fn a_malformed_metadata_is_not_replaced() {
+        let mut body = serde_json::json!({ "metadata": "not-an-object" });
+        stamp_user_id(&mut body, provider::Wire::Anthropic, Some("tchouk"));
+        assert_eq!(body["metadata"], "not-an-object");
+    }
+
+    /// The `OpenAI` chat shape carries the id at the top level.
+    ///
+    /// Not under `metadata`: that key means nothing to chat completions, so an
+    /// id written there would be ignored and the attribution lost without a
+    /// word from the vendor.
+    #[test]
+    fn an_openai_attribution_goes_at_the_top_level() {
+        let mut body = serde_json::json!({ "model": "m", "messages": [] });
+        stamp_user_id(&mut body, provider::Wire::Openai, Some("tchouk"));
+        assert_eq!(body["user_id"], "tchouk");
+        assert!(body.get("metadata").is_none(), "the chat shape has no metadata");
+    }
+
+    /// With no attribution configured the body is not touched at all.
+    ///
+    /// Which is every provider but the one that asks for one, so this is the
+    /// path almost every request takes.
+    #[test]
+    fn no_attribution_leaves_the_body_alone() {
+        let original = serde_json::json!({ "model": "m", "metadata": { "user_id": "client" } });
+        let mut body = original.clone();
+        stamp_user_id(&mut body, provider::Wire::Anthropic, None);
+        assert_eq!(body, original, "an unset id changes nothing");
     }
 
     /// A field the proxy has no type for survives being rebuilt.

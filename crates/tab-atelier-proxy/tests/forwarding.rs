@@ -293,6 +293,7 @@ fn stub_provider(id: &str, port: u16, preference: i32, key_path: &std::path::Pat
         preference,
         enabled: true,
         peak: None,
+        user_id: None,
         models: vec![Model {
             id: format!("{id}-balanced"),
             class: Class::Balanced,
@@ -576,6 +577,90 @@ fn compaction_reaches_upstream_and_only_where_it_is_configured() {
     for field in ["tools", "system"] {
         assert_eq!(got[field], want[field], "{field} must survive the pass");
     }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The attribution reaches the vendor, on the provider that configured one.
+///
+/// The unit tests prove `stamp_user_id` writes the right key in the right shape.
+/// This proves it is WIRED — that `upstream_body` looks the id up on the chosen
+/// provider — and that it does the one destructive thing it claims to: a Claude
+/// Code session's own `metadata.user_id`, which is a JSON blob of account and
+/// device identifiers, is what it puts in its place. The proxy's record of that
+/// client is read from the arrival body before any of this runs, so nothing here
+/// is what the panel believes about the session.
+#[test]
+fn the_attribution_replaces_the_clients_identity_upstream() {
+    let _serial = EGRESS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (upstream, seen) = mock_status(200, "{\"usage\":{\"input_tokens\":3,\"output_tokens\":4}}");
+    let dir = scratch("attribution");
+    let stub_key = dir.join("stub.key");
+    std::fs::write(&stub_key, "sk-stub-provider").expect("write stub key");
+
+    let mut provider = stub_provider("primary", upstream, 0, &stub_key);
+    provider.user_id = Some("tchouk".to_owned());
+    provider.models = vec![Model {
+        id: "primary-balanced".to_owned(),
+        class: Class::Balanced,
+        relative_cost: 5,
+        price: None,
+        deprecated: false,
+        note: None,
+    }];
+
+    let mut store = Store::load(dir.join("users.json")).expect("store");
+    let a = store.add("Ada", "Lovelace", "ada@example.org").expect("add");
+    let (_k, key) = store.add_key(&a.email, "laptop").expect("key");
+    let state = Arc::new(State {
+        store: Mutex::new(store),
+        usage: Mutex::new(usage::Store::load(dir.join("usage"))),
+        sched: Mutex::new(qos::Sched::new()),
+        account: Mutex::new(account::Monitor::load(&dir)),
+        inspect: Mutex::new(tab_atelier_proxy::inspect::Store::load(std::env::temp_dir())),
+        wake: tokio::sync::Notify::new(),
+        registry: Mutex::new(Registry {
+            mappings: vec![],
+            providers: vec![provider],
+        }),
+        registry_path: dir.join("providers.json"),
+        provider_backoff: Mutex::new(std::collections::BTreeMap::new()),
+        admin_token: "tap_admin".to_owned(),
+        web_root: None,
+    });
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let port = boot(&rt, state);
+
+    // Exactly what Claude Code sends: the field is already occupied, by the
+    // session's own identity.
+    let payload = r#"{"model":"primary-balanced","max_tokens":1,"metadata":{"user_id":"{\"device_id\":\"abc\",\"account_uuid\":\"def\"}"},"messages":[{"role":"user","content":"hi"}]}"#;
+    let sent = payload.len();
+    let resp = request(
+        port,
+        &format!(
+            "POST /relay/anthropic/v1/messages HTTP/1.1\r\nHost: x\r\nx-api-key: {key}\r\n\
+             Content-Type: application/json\r\nContent-Length: {sent}\r\n\r\n{payload}"
+        ),
+    );
+    assert!(resp.starts_with("HTTP/1.1 200"), "resp: {resp}");
+
+    let seen = seen
+        .recv_timeout(std::time::Duration::from_secs(3))
+        .expect("upstream saw the request");
+    let (_, body) = seen.split_once("\r\n\r\n").expect("headers and body");
+    let got: serde_json::Value = serde_json::from_str(body).expect("upstream body is JSON");
+    assert_eq!(
+        got["metadata"]["user_id"], "tchouk",
+        "the vendor receives the deployment's id, not the session's: {body}"
+    );
+    assert_eq!(
+        got["messages"][0]["content"], "hi",
+        "and nothing else about the request moved: {body}"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }

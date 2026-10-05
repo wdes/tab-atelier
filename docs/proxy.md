@@ -287,7 +287,7 @@ paste this shape in by hand:
   "providers": [
     { "id": "deepseek", "base_url": "https://api.deepseek.com/anthropic",
       "auth": {"kind": "api_key_file", "path": "/var/lib/tab-atelier-proxy/provider-deepseek.key"},
-      "preference": 10, "enabled": true,
+      "preference": 10, "enabled": true, "user_id": "tchouk",
       "models": [
         {"id": "deepseek-flash", "class": "balanced", "relative_cost": 15,
          "price": {"cache_hit": 3000, "input": 150000, "output": 600000}},
@@ -316,6 +316,26 @@ operator copies around and pastes into a bug report. The key gets its own
 `0600` file, written by the UI, read per request — so rotating it is a file
 write, not a restart. `api_key_env` still works for a key already in the unit's
 environment.
+
+**`user_id` is an attribution, for the vendors that ask for one.** DeepSeek takes
+it on either wire — `metadata.user_id` on the Anthropic shape, a top-level
+`user_id` on the chat shape — and uses it to tell one deployment from another, to
+isolate content-safety handling and scheduling, and to isolate KVCache. It is
+checked against the vendor's own rule when the file is read: at most 512
+characters of `[A-Za-z0-9_-]`, refused otherwise. Refused at load rather than per
+request on purpose, because a value the vendor rejects fails *every* request
+behind that entry, and the place to notice that is the file.
+
+Set it once per **deployment** — one id for this host, not one per session. The
+KVCache effect cuts both ways: distinct ids stop sharing cached prefixes, so a
+per-session value would isolate correctly and then bill every shared prefix at
+the miss rate, which is the traffic that benefits most from being cached. The
+subscription refuses the field outright, and that refusal is the interesting
+one: on the Anthropic wire `metadata.user_id` is where the *client* puts its own
+session identity, so a value there would replace the account and device
+identifiers a Claude Code session hands over. Sending an operator's id in their
+place is the point of the field for a third-party vendor and a small act of
+vandalism for the one this host has a plan with.
 
 **`deprecated` is not decoration.** `deepseek-v4-pro` is withdrawn on
 2026-09-14, after which requests to it are served by a *different model* at a

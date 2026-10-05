@@ -42,6 +42,7 @@ pub(crate) fn save(request: &SaveProvider, state: &Arc<State>) -> Reply {
             return crate::http::problem(400, "models: one name per line, no blanks");
         };
         provider::Provider {
+            user_id: None,
             id: id.to_owned(),
             wire: provider::Wire::Anthropic,
             base_url: request.base_url.trim().trim_end_matches('/').to_owned(),
@@ -73,6 +74,10 @@ pub(crate) fn save(request: &SaveProvider, state: &Arc<State>) -> Reply {
         new.enabled = request.enabled.unwrap_or(old.enabled);
         new.auth = old.auth.clone();
         new.peak.clone_from(&old.peak);
+        // Same rule, and the same consequence if it is left out: the form has no
+        // field for the attribution, so a save from the panel would drop it and
+        // the deployment would silently stop identifying itself to the vendor.
+        new.user_id.clone_from(&old.user_id);
         // The model list is rebuilt from text, so every field the text cannot
         // express is carried over by id — the same rule as the four lines above,
         // one level down. `price` is the one that shows: without it the row has

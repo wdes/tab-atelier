@@ -558,6 +558,28 @@ pub struct Provider {
     /// When this provider charges more for the same tokens.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peak: Option<Peak>,
+    /// An outbound attribution stamped on every request to this provider, when
+    /// its API has a field for one.
+    ///
+    /// `DeepSeek` accepts one on both of its wires — `metadata.user_id` on the
+    /// Anthropic shape, a top-level `user_id` on the `OpenAI` one — and uses it
+    /// for three things an operator may actually want: content-safety handling
+    /// that can tell one deployment from another, scheduling isolation, and
+    /// `KVCache` isolation. It is optional because it is per-deployment, not part
+    /// of what makes a provider work: the same `DeepSeek` account might be reached
+    /// by several hosts, and the id is what distinguishes them.
+    ///
+    /// Note the third effect, because it is a cost and not only a feature:
+    /// distinct ids stop sharing `KVCache`. One constant per *deployment* keeps
+    /// that cache shared across every tab behind it, which is what the cached
+    /// traffic here relies on — a per-session id would isolate correctly and
+    /// bill every shared prefix at the miss rate.
+    ///
+    /// A provider with no field for it ignores [`Self::user_id`] entirely, so
+    /// setting it where it means nothing is a config mistake rather than a
+    /// silent no-op. [`Self::unusable_reason`] refuses an id the vendor would.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
 }
 
 impl Provider {
@@ -709,7 +731,26 @@ impl Provider {
     /// made here and enforced wherever a provider is considered.
     #[must_use]
     pub fn unusable_reason(&self) -> Option<String> {
+        // Before the credential: a malformed attribution breaks every request
+        // through this provider, and naming it here means the config is refused
+        // once at load rather than 400ing from the vendor on each call.
+        if let Some(why) = self.user_id_refusal() {
+            return Some(why);
+        }
         match &self.auth {
+            // The subscription is the one provider where this field would do
+            // harm rather than good: it terminates Anthropic traffic, whose
+            // `metadata.user_id` is the client's *own* session identity, so
+            // stamping a deployment id there would replace the account and
+            // device identifiers with one Anthropic has no use for. The field
+            // exists for third-party providers that ask to be told which
+            // deployment is calling.
+            Auth::ClaudeOauth if self.user_id.is_some() => Some(format!(
+                "provider {} spends this host's Claude plan and also sets a user_id. On the Anthropic wire \
+                 that field is where the client puts its own session identity, so this would replace it. \
+                 Remove the user_id: the field is for third-party providers that ask for one.",
+                self.id
+            )),
             Auth::ClaudeOauth if host_of(&self.base_url) != host_of(crate::egress::ANTHROPIC_BASE) => Some(format!(
                 "provider {} has auth claude_oauth but points at {}, not Anthropic — that would send this \
                  host's own Claude token to a third party. Use an api_key_file credential instead.",
@@ -718,6 +759,43 @@ impl Provider {
             )),
             _ => None,
         }
+    }
+
+    /// Why a configured `user_id` could not be sent, if it could not be.
+    ///
+    /// The vendor's own rule, checked so that a value it would reject is refused
+    /// when the config is read rather than by a 400 on every request behind it:
+    /// at most 512 characters, and only `[A-Za-z0-9_-]`. The second half is a
+    /// safety property as well as a format one — a string restricted to those
+    /// characters cannot introduce a second field or break out of the JSON
+    /// string it is written into, whichever of the two wire shapes carries it.
+    #[must_use]
+    fn user_id_refusal(&self) -> Option<String> {
+        let id = self.user_id.as_deref()?;
+        if id.is_empty() {
+            return Some(format!(
+                "provider {} sets an empty user_id, which would send an attribution that identifies nothing",
+                self.id
+            ));
+        }
+        if id.len() > 512 {
+            return Some(format!(
+                "provider {} has a user_id of {} characters; the vendor accepts at most 512",
+                self.id,
+                id.len()
+            ));
+        }
+        if let Some(bad) = id
+            .chars()
+            .find(|c| !(c.is_ascii_alphanumeric() || *c == '-' || *c == '_'))
+        {
+            return Some(format!(
+                "provider {} has a user_id containing {bad:?}; the vendor accepts only ASCII letters, \
+                 digits, dash and underscore",
+                self.id
+            ));
+        }
+        None
     }
 
     /// Whether its credential is actually present.
@@ -964,6 +1042,7 @@ impl Preset {
     pub fn provider_named(self, config_dir: &Path, id: &str) -> Provider {
         match self {
             Self::Deepseek => Provider {
+                user_id: None,
                 id: id.to_owned(),
                 wire: Wire::Anthropic,
                 // The ANTHROPIC-shaped endpoint. DeepSeek also serves an
@@ -1049,25 +1128,32 @@ impl Preset {
             //
             // # Prices are OpenAI's, as published
             //
-            // Per 1M tokens, Sol $5 in / $30 out, Terra $2.50 / $15, Luna
-            // $1 / $6. Same convention as `DeepSeek` above: cache-MISS input
-            // as integers against Anthropic Haiku at 100, which is the figure
-            // that actually decides a reroute. So Luna 100, Terra 250, Sol
-            // 500 — and by output price Sol is dearer than Opus 5.
+            // Per 1M tokens, Standard tier: Sol $4 in / $0.40 cached / $20 out,
+            // Terra $2 / $0.20 / $12, Luna $0.20 / $0.02 / $1.20. Same
+            // convention as `DeepSeek` above: cache-MISS input as integers
+            // against Anthropic Haiku at 100, which is the figure that actually
+            // decides a reroute. So Luna 20, Terra 200, Sol 400.
             //
-            // Note the cache discount does NOT reach the proxy: OpenAI's
-            // `prompt_tokens_details.cached_tokens` is surfaced to the client
-            // in `cache_read_input_tokens`, but `relative_cost` models only
-            // input and output, exactly as it does for every other provider.
+            // The figures previously here were Sol $5/$30, Terra $2.50/$15,
+            // Luna $1/$6 — a generation behind, and transcribed as though the
+            // cache column did not exist. Two of the three were out by more than
+            // the cache discount they were meant to avoid.
             //
-            // No `Price` on these three, though their input and output rates
-            // are right here: OpenAI's cached-input rate is not recorded in
-            // this repository, and billing cached tokens at the miss rate
-            // would overstate the bill precisely on the traffic that is most
-            // cached — the classifier reads at 99.8%. A wrong number is worse
-            // than no number, so these show an unknown cost until that rate is
-            // recorded alongside the other two.
+            // The cache discount does not reach `relative_cost`: OpenAI's
+            // `prompt_tokens_details.cached_tokens` is surfaced to the client in
+            // `cache_read_input_tokens`, but `relative_cost` models only input
+            // and output, exactly as it does for every other provider. It does
+            // reach `Price`, below.
+            //
+            // Cache *writes* are billed at the cached-input rate, which
+            // understates them: OpenAI publishes a distinct write rate (1.25x
+            // the miss rate) and `Price` has no field for it, so the fold the
+            // client already makes applies here too. That is the one figure in
+            // OpenAI's table this repository still does not record; it is worth
+            // a field of its own when writes become a meaningful share of the
+            // traffic, the way cache reads already are.
             Self::Openai => Provider {
+                user_id: None,
                 id: id.to_owned(),
                 wire: Wire::Openai,
                 base_url: "https://api.openai.com/v1".to_owned(),
@@ -1081,9 +1167,9 @@ impl Preset {
                 enabled: true,
                 peak: None,
                 models: vec![
-                    Model::new("gpt-5.6-sol", Class::Heavy, 500),
-                    Model::new("gpt-5.6-terra", Class::Balanced, 250),
-                    Model::new("gpt-5.6-luna", Class::Fast, 100),
+                    Model::new("gpt-5.6-sol", Class::Heavy, 400).priced(400_000, 4_000_000, 20_000_000),
+                    Model::new("gpt-5.6-terra", Class::Balanced, 200).priced(200_000, 2_000_000, 12_000_000),
+                    Model::new("gpt-5.6-luna", Class::Fast, 20).priced(20_000, 200_000, 1_200_000),
                 ],
             },
         }
@@ -1300,6 +1386,7 @@ impl Default for Registry {
     fn default() -> Self {
         Self {
             providers: vec![Provider {
+                user_id: None,
                 id: "anthropic".to_owned(),
                 wire: Wire::Anthropic,
                 base_url: crate::egress::ANTHROPIC_BASE.to_owned(),
@@ -1726,6 +1813,7 @@ mod tests {
         // The same models from a different quota pool — the case the whole
         // reroute story exists for.
         r.providers.push(Provider {
+            user_id: None,
             peak: None,
             id: "bedrock".to_owned(),
             wire: Wire::Anthropic,
@@ -2280,37 +2368,45 @@ mod tests {
         // places apart. Pinning that here is what makes a slip in either unit
         // fail loudly instead of quietly costing 1000x too little: the display
         // and the router would otherwise drift with nothing to compare them.
-        let ds = Preset::Deepseek.provider(Path::new("/var/lib/tab-atelier-proxy"));
-        let mut priced = 0;
-        for model in &ds.models {
-            let Some(price) = model.price else {
-                continue;
-            };
-            assert_eq!(
-                price.input / 10_000,
-                model.relative_cost,
-                "{}: ${}/1M miss-input is {} cents, not {}",
-                model.id,
-                f64::from(price.input) / 1_000_000.0,
-                price.input / 10_000,
-                model.relative_cost,
-            );
-            // And the classes must stay ordered the way the provider prices
-            // them, or a cheap-looking total is hiding an inverted lookup.
-            assert!(
-                price.cache_hit < price.input && price.input < price.output,
-                "{}: hit {} < miss {} < out {} is the shape of every published table",
-                model.id,
-                price.cache_hit,
-                price.input,
-                price.output,
-            );
-            priced += 1;
+        //
+        // Every preset that publishes rates, not only the one that did when this
+        // was written. A second table is exactly where a row copied and not
+        // adjusted hides, and it is how a whole column of OpenAI's prices came to
+        // be a generation out of date: nothing compared them to anything.
+        for (name, preset) in [("deepseek", Preset::Deepseek), ("openai", Preset::Openai)] {
+            let provider = preset.provider(Path::new("/var/lib/tab-atelier-proxy"));
+            let mut priced = 0;
+            for model in &provider.models {
+                let Some(price) = model.price else {
+                    continue;
+                };
+                assert_eq!(
+                    price.input / 10_000,
+                    model.relative_cost,
+                    "{}: ${}/1M miss-input is {} cents, not {}",
+                    model.id,
+                    f64::from(price.input) / 1_000_000.0,
+                    price.input / 10_000,
+                    model.relative_cost,
+                );
+                // And the classes must stay ordered the way the provider prices
+                // them, or a cheap-looking total is hiding an inverted lookup.
+                assert!(
+                    price.cache_hit < price.input && price.input < price.output,
+                    "{}: hit {} < miss {} < out {} is the shape of every published table",
+                    model.id,
+                    price.cache_hit,
+                    price.input,
+                    price.output,
+                );
+                priced += 1;
+            }
+            assert!(priced > 0, "{name} ships at least one priced model");
         }
-        assert!(priced > 0, "the preset ships at least one priced model");
 
         // The one model deliberately left unpriced, because it is withdrawn and
         // its traffic is served by Flash at Flash prices.
+        let ds = Preset::Deepseek.provider(Path::new("/var/lib/tab-atelier-proxy"));
         let pro = ds.models.iter().find(|m| m.id.contains("v4-pro"));
         assert!(
             pro.is_some_and(|m| m.price.is_none()),
@@ -2402,6 +2498,122 @@ mod tests {
         assert_eq!(at_peak.output, 1_200_000, "$1.20/1M at peak");
     }
 
+    /// The same for `OpenAI`, and the reason these figures belong in a test
+    /// rather than only in the comment above the preset: a transcription slip is
+    /// otherwise invisible. The numbers merely have to *look* plausible, which
+    /// they did for a whole generation — Sol was carried as $5/$30 when `OpenAI`
+    /// publishes $4/$20, and nothing in the repository compared the two.
+    #[test]
+    fn the_openai_preset_records_published_rates() {
+        // Standard tier, per 1M tokens. Stored in micro-USD, so every figure is
+        // a factor of a million larger than the published one.
+        let openai = Preset::Openai.provider(Path::new("/var/lib/tab-atelier-proxy"));
+        let rate = |id: &str| {
+            openai
+                .models
+                .iter()
+                .find(|m| m.id == id)
+                .unwrap_or_else(|| panic!("{id} is in the preset"))
+                .price
+                .unwrap_or_else(|| panic!("{id} carries a published rate"))
+        };
+
+        let sol = rate("gpt-5.6-sol");
+        assert_eq!(sol.cache_hit, 400_000, "$0.40/1M cached");
+        assert_eq!(sol.input, 4_000_000, "$4.00/1M");
+        assert_eq!(sol.output, 20_000_000, "$20.00/1M");
+
+        let terra = rate("gpt-5.6-terra");
+        assert_eq!(terra.cache_hit, 200_000, "$0.20/1M cached");
+        assert_eq!(terra.input, 2_000_000, "$2.00/1M");
+        assert_eq!(terra.output, 12_000_000, "$12.00/1M");
+
+        let luna = rate("gpt-5.6-luna");
+        assert_eq!(luna.cache_hit, 20_000, "$0.02/1M cached");
+        assert_eq!(luna.input, 200_000, "$0.20/1M");
+        assert_eq!(luna.output, 1_200_000, "$1.20/1M");
+
+        // One rate, not a schedule: OpenAI publishes no peak window, so an hour
+        // costs the same whenever it runs. A `peak` here — copied from the
+        // DeepSeek preset, which needs one — would silently double every figure
+        // above for half the day.
+        assert!(
+            openai.peak.is_none(),
+            "OpenAI publishes one rate per model, not a peak schedule"
+        );
+    }
+
+    /// A `user_id` the vendor would reject is caught when the config is read.
+    ///
+    /// Not when the first request arrives: a value the vendor refuses breaks
+    /// *every* request through that provider with a 400, so the place to notice
+    /// it is the file, beside the other reasons an entry cannot be used. The
+    /// character set is also the safety property — a value limited to these
+    /// characters cannot add a field or close the string it is written into,
+    /// on either of the two wire shapes that carry one.
+    #[test]
+    fn a_user_id_the_vendor_would_reject_is_refused() {
+        let mut provider = Preset::Deepseek.provider(Path::new("/var/lib/tab-atelier-proxy"));
+
+        for bad in ["", "with space", "semi;colon", "quote\"mark", "sla/sh", "nul\u{0}"] {
+            provider.user_id = Some(bad.to_owned());
+            assert!(
+                provider.user_id_refusal().is_some(),
+                "{bad:?} is not [A-Za-z0-9_-]+ and must be refused"
+            );
+        }
+
+        // The length bound is the vendor's, checked here rather than by a 400
+        // from it on every call behind this entry.
+        provider.user_id = Some("a".repeat(513));
+        assert!(
+            provider.user_id_refusal().is_some_and(|why| why.contains("512")),
+            "513 characters is past the vendor's limit"
+        );
+
+        // And what is allowed stays allowed, both separators included.
+        let longest = "a".repeat(512);
+        for ok in ["tchouk", "tchouk-01", "tchouk_01_AB", longest.as_str()] {
+            provider.user_id = Some(ok.to_owned());
+            assert_eq!(provider.user_id_refusal(), None, "{ok:?} is well-formed");
+        }
+
+        // Unset is the ordinary case for every provider but one.
+        provider.user_id = None;
+        assert_eq!(provider.user_id_refusal(), None);
+    }
+
+    /// The subscription refuses one, because on that wire the field is the
+    /// client's identity rather than an attribution.
+    #[test]
+    fn the_subscription_refuses_a_user_id() {
+        let mut provider = Provider {
+            id: "claude-plan".to_owned(),
+            wire: Wire::Anthropic,
+            base_url: crate::egress::ANTHROPIC_BASE.to_owned(),
+            auth: Auth::ClaudeOauth,
+            preference: 0,
+            enabled: true,
+            peak: None,
+            user_id: Some("tchouk".to_owned()),
+            models: vec![],
+        };
+
+        let why = provider
+            .unusable_reason()
+            .expect("a user_id on the subscription is refused");
+        assert!(why.contains("session identity"), "the refusal explains why: {why}");
+
+        // Cleared, nothing about the field is left to complain about. Asserted
+        // on the message rather than on `unusable_reason` being `None`, so this
+        // does not start failing for the unrelated reason of a missing plan
+        // credential on the machine running it.
+        provider.user_id = None;
+        if let Some(why) = provider.unusable_reason() {
+            assert!(!why.contains("user_id"), "the conflict is gone: {why}");
+        }
+    }
+
     #[test]
     fn a_file_credential_is_read_per_request_and_missing_is_not_ready() {
         let dir = std::env::temp_dir().join(format!("ta-prov-key-{}", uuid::Uuid::new_v4()));
@@ -2477,6 +2689,7 @@ mod tests {
         // Pointed anywhere else, every request hands the subscription
         // credential to a third party — and succeeds, so nothing looks wrong.
         let mut p = Provider {
+            user_id: None,
             id: "not-anthropic".to_owned(),
             wire: Wire::Anthropic,
             base_url: "https://evil.example/v1".to_owned(),
@@ -2637,6 +2850,7 @@ mod tests {
             Auth::ApiKeyEnv { var: "K".to_owned() },
         ] {
             let p = Provider {
+                user_id: None,
                 id: "somewhere-else".to_owned(),
                 wire: Wire::Anthropic,
                 base_url: "https://api.deepseek.com/anthropic".to_owned(),
@@ -2781,23 +2995,32 @@ mod tests {
     ///
     /// That limit is the whole safety argument for it: a model left unpriced on
     /// purpose must stay unpriced, or the dashboard starts stating costs nobody
-    /// published. Each of the four answers here is a claim about the catalogue,
-    /// so a preset that gains or drops a rate will fail this test rather than
-    /// silently widen what the repair is willing to invent.
+    /// published. Every answer here is a claim about the catalogue, so a preset
+    /// that gains or drops a rate will fail this test rather than silently widen
+    /// what the repair is willing to invent.
     #[test]
     fn only_the_rate_the_catalogue_publishes_is_handed_back() {
-        assert!(
-            published_price("deepseek-flash").is_some(),
-            "the one priced model in the tree must answer, or the repair does nothing"
-        );
+        for priced in [
+            "deepseek-flash",
+            // These three used to be listed as unpriced on purpose, so that a
+            // cached token would never be billed at the miss rate. Recording the
+            // cached-input rate is what let them be costed; this keeps them that
+            // way, so the reason for the old caution cannot quietly return.
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+        ] {
+            assert!(
+                published_price(priced).is_some(),
+                "{priced} carries a published rate in the catalogue, so the repair must answer"
+            );
+        }
         for unpriced in [
             // No triple to hand back, for two different reasons. The preset
             // records this one's published rates in a comment and deliberately
             // leaves `price` unset, because `billing_price` skips deprecated
             // models and a price there could never be selected for billing.
             "deepseek-v4-pro",
-            // And this one is listed with no rate anywhere at all.
-            "gpt-5.6-sol",
             // The subscription hop has no per-token cost at all.
             "claude-opus-5",
             // And nothing that was never heard of.
@@ -2876,6 +3099,7 @@ mod tests {
             output: 4,
         };
         let mut p = Provider {
+            user_id: None,
             id: "by-hand".to_owned(),
             wire: Wire::Anthropic,
             base_url: "https://api.deepseek.com/anthropic".to_owned(),
