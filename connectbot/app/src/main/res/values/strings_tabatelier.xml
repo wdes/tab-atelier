@@ -3,15 +3,28 @@
 	Strings this fork adds, kept in their own file rather than appended to
 	upstream's values/strings.xml.
 
-	Adding to overlay/files/ means it is copied in verbatim: this file is never
-	part of a patch, so adding a string is a line here and nothing to rebase when
-	upstream edits its own strings. Android's resource merger combines every file
-	under res/values/, so a resource does not care which file declares it.
+	A separate file means adding a string is a line here and nothing to reconcile
+	when upstream edits its own strings — Android's resource merger combines every
+	file under res/values/, so a resource does not care which file declares it. The
+	same applies per locale: a translation goes in values-<locale>/strings_tabatelier.xml
+	beside this file, which keeps upstream's own locale files untouched. See
+	values-fr/ for an example.
 
 	What CANNOT live here is replacing an upstream string. Two files in the same
 	source set declaring the same name is a duplicate-resource error, not an
 	override, so the few upstream strings we rewrite (app_name, app_desc,
-	app_copyright and the help links) stay in patches/0002 beside their originals.
+	app_copyright and the help links) are edited in upstream's own strings.xml, in
+	the commit that changes them.
+
+	Prefer an upstream string to a new one wherever one fits. A string introduced
+	here is English-only until someone translates it, while one upstream already
+	has arrives in all of its locales — which is why the keys bar uses
+	automation_key_function for its F-keys and console_menu_paste for its paste key
+	rather than strings of its own.
+
+	The `tabatelier_` and `hostpref_token*` prefixes exist to keep this file
+	conflict-free: a name upstream later adds would otherwise collide and break
+	the build.
 
 	The `tabatelier_` and `hostpref_token*` prefixes exist to keep this file
 	conflict-free: a name upstream later adds would otherwise collide and break
@@ -64,7 +77,15 @@
 	     two-row layout with a function-key page. Only the strings the app did not
 	     already have are here; the rest of the bar's labels are upstream's. -->
 	<string name="button_key_fn">FN</string>
+	<!-- translatable="false" on purpose: a function key is F1 in every language, so
+	     this is a notation rather than a string to translate — and saying so is also
+	     what stops lint reporting the literal it replaces as hardcoded text.
+
+	     Upstream has a string for the same thing (automation_key_function), and the
+	     bar used it. Its French is machine-translated as "F %1$s", a space between the
+	     letter and the number, which is wrong for a key label and is exactly what a
+	     notation avoids by not being translated in the first place. -->
+	<string name="button_key_function" translatable="false">F%1$s</string>
 	<string name="image_description_function_keys">Show function keys</string>
 	<string name="image_description_back_to_keys">Back to the keys</string>
-	<string name="image_description_paste">Paste the clipboard into the terminal</string>
 </resources>

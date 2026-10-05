@@ -25,7 +25,6 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -169,7 +168,7 @@ fun TerminalKeyboard(
         onShowIme = onShowIme,
         // The bar sends literal text for the keys that have no key code
         // (`/` and `-`), which is the same path paste uses.
-        onTextPress = { text -> bridge?.injectString(text) },
+        onTextPress = { text -> bridge.injectString(text) },
         onPaste = onPaste,
         onScrollInProgressChange = onScrollInProgressChange,
         imeVisible = imeVisible,
@@ -288,12 +287,19 @@ internal fun TerminalKeyboardContent(
                 ) {
                     if (showFunctionKeys) {
                         for (i in 1..6) {
-                            KeyButton(modifier = Modifier.weight(1f), text = "F$i", onClick = { onKeyPress(functionKeyCode(i)) })
+                            KeyButton(
+                                modifier = Modifier.weight(1f),
+                                text = stringResource(R.string.button_key_function, i.toString()),
+                                onClick = { onKeyPress(functionKeyCode(i)) },
+                            )
                         }
-                        // Six function keys, seven columns: the empty column keeps the
-                        // F page aligned with the main page rather than stretching the
-                        // six keys across the gap.
-                        Spacer(modifier = Modifier.weight(1f))
+                        // No spacer after them: the six function keys share the whole
+                        // row between them.
+                        //
+                        // One was here to hold the F pages to the main page's grid —
+                        // six keys under seven columns — and it read as a missing key
+                        // rather than as alignment. A key that is absent is noticed; a
+                        // gap that means "aligned" is not.
                     } else {
                         KeyButton(
                             modifier = Modifier.weight(1f),
@@ -348,9 +354,12 @@ internal fun TerminalKeyboardContent(
                 ) {
                     if (showFunctionKeys) {
                         for (i in 7..12) {
-                            KeyButton(modifier = Modifier.weight(1f), text = "F$i", onClick = { onKeyPress(functionKeyCode(i)) })
+                            KeyButton(
+                                modifier = Modifier.weight(1f),
+                                text = stringResource(R.string.button_key_function, i.toString()),
+                                onClick = { onKeyPress(functionKeyCode(i)) },
+                            )
                         }
-                        Spacer(modifier = Modifier.weight(1f))
                     } else {
                         KeyButton(
                             modifier = Modifier.weight(1f),
@@ -445,10 +454,10 @@ internal fun TerminalKeyboardContent(
                     KeyButton(
                         modifier = Modifier.fillMaxWidth(),
                         icon = Icons.Default.ContentPaste,
-                        contentDescription = stringResource(R.string.image_description_paste),
+                        contentDescription = stringResource(R.string.console_menu_paste),
                         onClick = onPaste,
                     )
-                } else if (showImeToggleKey) {
+                } else {
                     // The optional soft-keyboard key. It shows or hides the IME
                     // according to which way the IME currently is, rather than being
                     // one toggle: the two actions are not symmetric, and the icon

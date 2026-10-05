@@ -104,7 +104,7 @@ class TerminalKeyboardContentTest {
             .assertIsDisplayed()
             .performClick()
         composeTestRule
-            .onNodeWithContentDescription(composeTestRule.activity.getString(R.string.image_description_paste))
+            .onNodeWithContentDescription(composeTestRule.activity.getString(R.string.console_menu_paste))
             .assertIsDisplayed()
             .performClick()
 
@@ -218,25 +218,23 @@ class TerminalKeyboardContentTest {
     }
 
     /**
-     * The optional keyboard key is opt-in, and hiding it must leave a working bar.
+     * The keyboard key is always in the bar, below `FN`.
      *
-     * The old test asserted that hiding it did not remove the text-input button, which
-     * this bar does not have at all — paste replaced it, on the second page. What
-     * matters now is that the trailing column still holds a usable key when the
-     * optional one is off, since that column is what reaches the second page.
+     * It used to sit behind the `showImeToggleKey` preference, which is what left the
+     * slot under `FN` empty for most people — the bar read as though a key were
+     * missing from it. The preference was upstream's way of making the button optional
+     * in *its* single scrolling row; this layout has the key in it, so nothing gates
+     * it now.
+     *
+     * Asserted with the preference OFF, because that is the case that used to hide it:
+     * an assertion with the default would pass whether the gate were removed or not.
      */
     @Test
-    fun theOptionalKeyboardKeyCanBeHiddenWithoutBreakingTheBar() {
+    fun theKeyboardKeyIsAlwaysThereEvenWithThePreferenceOff() {
         setKeyboardContent(showImeToggleKey = false)
 
         composeTestRule
             .onNodeWithContentDescription(composeTestRule.activity.getString(R.string.image_description_show_keyboard))
-            .assertDoesNotExist()
-        composeTestRule
-            .onNodeWithText(composeTestRule.activity.getString(R.string.button_key_fn))
-            .performClick()
-        composeTestRule
-            .onNodeWithText(composeTestRule.activity.getString(R.string.button_key_f1))
             .assertIsDisplayed()
     }
 

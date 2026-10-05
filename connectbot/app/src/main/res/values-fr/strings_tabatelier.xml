@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+	French for the strings this fork adds.
+
+	In its own file for the same reason the default values/ file is: Android's
+	resource merger combines every file under a values-<locale>/ directory, so a
+	translation does not have to be appended to upstream's own strings.xml — which
+	would make an upstream sync reconcile this file against theirs for no gain.
+
+	Only the strings this fork introduces are here. Everything else the app shows,
+	including the keys bar's other labels, comes from upstream and is already
+	translated in all of its locales.
+-->
+<resources>
+	<!-- "FN" is the abbreviation for "Fonction", so it is identical here; it is
+	     declared rather than left to fall back so the file lists every string the
+	     fork adds and a missing translation is visible as a missing line. -->
+	<string name="button_key_fn">FN</string>
+	<string name="image_description_function_keys">Afficher les touches de fonction</string>
+	<string name="image_description_back_to_keys">Revenir aux touches principales</string>
+</resources>
