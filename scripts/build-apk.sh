@@ -95,7 +95,18 @@ APP_BUILD_COMMIT="${APP_BUILD_COMMIT:-$(git -C "$root" rev-parse --short HEAD 2>
 # history for this reason. This warning is the safety net for everywhere else: a
 # build that cannot name its upstream should say so rather than leave the About
 # screen reading "unknown" with nothing to explain it.
-APP_UPSTREAM_COMMIT="${APP_UPSTREAM_COMMIT:-$(git -C "$root" log -1 --grep='git-subtree-split:' --format='%(trailers:key=git-subtree-split,valueonly)' 2>/dev/null || true)}"
+# The grep is anchored to a line start, and that is the whole correctness of this
+# line. `--grep` searches the entire commit message, so a commit that merely
+# *mentions* the trailer in prose matches it — and `-1` then picks whichever such
+# commit is newest, which need not be a squash commit at all and need not have a
+# trailer to read. That is not hypothetical: a commit whose message discussed the
+# `git-subtree-split` trailer matched, won `-1`, and produced an empty value, so
+# every APK published after it said "unknown". Anchoring the pattern to a line
+# start excludes prose, and taking the first non-empty value survives a message
+# that quotes the line anyway.
+APP_UPSTREAM_COMMIT="${APP_UPSTREAM_COMMIT:-$(git -C "$root" log \
+    --format='%(trailers:key=git-subtree-split,valueonly)' \
+    --grep='^git-subtree-split: ' 2>/dev/null | grep -m1 -v '^$' || true)}"
 if [[ -n "$APP_UPSTREAM_COMMIT" ]]; then
     args+=("-PupstreamCommit=$APP_UPSTREAM_COMMIT")
 else
