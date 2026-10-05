@@ -122,6 +122,16 @@ internal class AuthBannerQueue {
 
     private companion object {
         private const val MAX_AUTH_BANNERS = 10
+
+        /**
+         * What the daemon sends for a tab's viewer background: `#rrggbb`, exactly.
+         *
+         * Spelled out here rather than shared with the console's copy on purpose —
+         * see [hexToArgb]. A shared constant would let a mistake in one silently
+         * agree with the other, and the tests on each side are what keep them
+         * honest.
+         */
+        private val REMOTE_HEX_COLOR = Regex("^#[0-9a-fA-F]{6}$")
     }
 }
 
@@ -246,6 +256,20 @@ class TerminalBridge {
     // Store color scheme info for reapplication
     private var currentColorSchemeId: Long = -1L
     private var fullColorPalette: IntArray = IntArray(0)
+
+    // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): the profile's
+    // colour scheme as last applied to the emulator, kept so it can be re-applied
+    // with a different background — see applyRemoteBackground.
+    //
+    // The emulator is what paints the cells, so its scheme is where a background
+    // actually takes effect. The composable's own `backgroundColor` argument does
+    // not override it, which is why passing a tab's colour there alone left the
+    // terminal black. The profile's colours are remembered separately from whatever
+    // is currently applied so a remote colour can be dropped again without losing
+    // the profile's own background.
+    private var profileAnsiColors: IntArray = IntArray(0)
+    private var profileForeground: Int? = null
+    private var profileBackground: Int? = null
 
     // Profile observation
     private var currentProfileId: Long? = null
@@ -481,7 +505,7 @@ class TerminalBridge {
 
         // Apply color scheme to terminal emulator
         val ansiColors = fullColorPalette.sliceArray(0 until 16)
-        terminalEmulator.applyColorScheme(ansiColors, defaultFgColor, defaultBgColor)
+        applyProfileColorScheme(ansiColors, defaultFgColor, defaultBgColor)
 
         val stickyModifierSetting = when (
             manager.prefs.getString(PreferenceConstants.STICKY_MODIFIERS, PreferenceConstants.NO)
@@ -641,7 +665,7 @@ class TerminalBridge {
             val defaultFgColor = fullColorPalette[defaultFg]
             val defaultBgColor = fullColorPalette[defaultBg]
             val ansiColors = fullColorPalette.sliceArray(0 until 16)
-            terminalEmulator.applyColorScheme(ansiColors, defaultFgColor, defaultBgColor)
+            applyProfileColorScheme(ansiColors, defaultFgColor, defaultBgColor)
         }
 
         // Update force size from profile
@@ -871,7 +895,82 @@ class TerminalBridge {
      */
     fun setRemoteBackgroundColor(color: String?) {
         _remoteBackgroundColor.value = color
+        // The composable's `backgroundColor` is not enough, and that is the whole
+        // reason this method does work: the emulator paints the cells, and its
+        // colour scheme is what decides their background, so the tab's colour has
+        // to be applied there. Passing it to the composable alone left the terminal
+        // as black as the profile's own scheme — which is exactly what a user sees
+        // as "the background does not work".
+        //
+        // Called from the transport's reader thread, and this touches the emulator
+        // the terminal is rendering from, so it is applied on the main dispatcher
+        // the rest of the bridge's UI-adjacent work uses.
+        val background = color?.let { remoteBackgroundArgb(it) }
+        scope.launch(dispatchers.main) { applyRemoteBackground(background) }
     }
+
+    /**
+     * Remembers the profile's colours and applies them to the emulator.
+     *
+     * Split out from applying them so that a remote background can later be applied
+     * on top and then taken away again: whatever the profile says stays here, and
+     * [applyRemoteBackground] re-applies it with a background of its choosing.
+     */
+    private fun applyProfileColorScheme(ansiColors: IntArray, foreground: Int, background: Int) {
+        profileAnsiColors = ansiColors
+        profileForeground = foreground
+        profileBackground = background
+        terminalEmulator.applyColorScheme(ansiColors, foreground, background)
+    }
+
+    /**
+     * Applies the profile's scheme with [background] instead of the profile's own.
+     *
+     * A null background means "the profile's" — which is how a tab that reports no
+     * colour of its own, or a session moving from a coloured tab to an uncoloured
+     * one, returns to the profile's scheme rather than keeping a colour that
+     * belonged to another tab.
+     *
+     * Does nothing until the profile's scheme is known, so a meta frame arriving
+     * before the bridge has finished starting up cannot apply a scheme of its own
+     * making.
+     */
+    private fun applyRemoteBackground(background: Int?) {
+        val foreground = profileForeground ?: return
+        val ansiColors = profileAnsiColors
+        val effective = background ?: profileBackground ?: return
+        if (ansiColors.isEmpty()) return
+        terminalEmulator.applyColorScheme(ansiColors, foreground, effective)
+    }
+
+    /**
+     * A `#rrggbb` string as an ARGB int, or null if it is not one.
+     *
+     * The shape is checked before parsing rather than the parse being caught:
+     * `Color.parseColor` accepts CSS colour names, so `"red"` would quietly become
+     * opaque red, and it reads `charAt(0)` before validating, so an empty string
+     * throws an unchecked exception that a `catch (IllegalArgumentException)` would
+     * not see. Both are the console's parser over again; a shared helper would be
+     * better than a second copy, but the two live in different modules and a wrong
+     * colour that cannot be traced to its sender is worse than the duplication.
+     */
+    /**
+     * A `#rrggbb` string as an ARGB int, or null if it is not one.
+     *
+     * The shape is checked before parsing rather than the parse being caught:
+     * `Color.parseColor` accepts CSS colour names, so `"red"` would quietly become
+     * opaque red, and it reads `charAt(0)` before validating, so an empty string
+     * throws an unchecked exception that a `catch (IllegalArgumentException)` would
+     * not see. Both are the console's parser over again; a shared helper would be
+     * better than a second copy, but the two live in different packages and a wrong
+     * colour that cannot be traced to its sender is worse than the duplication.
+     *
+     * Top-level rather than a member so it can be tested without standing up a whole
+     * bridge — the parsing is the part with the traps in it, and it needs no
+     * terminal to exercise.
+     */
+    internal fun remoteBackgroundArgb(hex: String): Int? =
+        if (REMOTE_HEX_COLOR.matches(hex)) android.graphics.Color.parseColor(hex) else null
 
     /**
      * Moves this session to another tab of the same server, returning whether this
@@ -1403,6 +1502,16 @@ class TerminalBridge {
 
         private const val DEFAULT_FONT_SIZE_SP = 10
         private const val FONT_SIZE_STEP = 2
+
+        /**
+         * What the daemon sends for a tab's viewer background: `#rrggbb`, exactly.
+         *
+         * Spelled out here rather than shared with the console's copy on purpose —
+         * see [hexToArgb]. A shared constant would let a mistake in one silently
+         * agree with the other, and the tests on each side are what keep them
+         * honest.
+         */
+        private val REMOTE_HEX_COLOR = Regex("^#[0-9a-fA-F]{6}$")
     }
 }
 
