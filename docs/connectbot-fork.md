@@ -12,6 +12,13 @@ base=$(git log -1 --grep='git-subtree-split:' --format='%(trailers:key=git-subtr
 git diff "$base" -- connectbot/
 ```
 
+That command and the app's About screen read the same trailer, so both need
+**history**: the squash commit is forty-odd back, and a shallow clone — `--depth 1`,
+which is what `actions/checkout` does unless told otherwise — reaches neither.
+The APK workflow asks for full history for exactly this reason, and
+`scripts/build-apk.sh` warns when it cannot find the trailer rather than leaving
+the About screen reading "unknown" with nothing to explain it.
+
 A commit that changes `connectbot/` is a change to the app; a commit elsewhere is
 about the build, the docs, or this record.
 

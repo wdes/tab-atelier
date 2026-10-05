@@ -88,8 +88,22 @@ APP_BUILD_COMMIT="${APP_BUILD_COMMIT:-$(git -C "$root" rev-parse --short HEAD 2>
 # to remember. (It was `git -C connectbot rev-parse HEAD` while connectbot was a
 # submodule; that would now resolve to this repository's own HEAD, since
 # connectbot/ is a plain directory here.)
+#
+# Reading the trailer needs HISTORY, which is the one thing a shallow clone has
+# none of: the squash commit is forty-odd back, so `--depth 1` — what CI checks
+# out unless told otherwise — finds no trailer at all. The workflow asks for full
+# history for this reason. This warning is the safety net for everywhere else: a
+# build that cannot name its upstream should say so rather than leave the About
+# screen reading "unknown" with nothing to explain it.
 APP_UPSTREAM_COMMIT="${APP_UPSTREAM_COMMIT:-$(git -C "$root" log -1 --grep='git-subtree-split:' --format='%(trailers:key=git-subtree-split,valueonly)' 2>/dev/null || true)}"
-[[ -n "$APP_UPSTREAM_COMMIT" ]] && args+=("-PupstreamCommit=$APP_UPSTREAM_COMMIT")
+if [[ -n "$APP_UPSTREAM_COMMIT" ]]; then
+    args+=("-PupstreamCommit=$APP_UPSTREAM_COMMIT")
+else
+    echo "build-apk: no git-subtree-split trailer in this clone, so the About screen will" >&2
+    echo "  name no upstream ConnectBot commit. A shallow clone cannot reach the squash" >&2
+    echo "  commit it is recorded on; check out with full history, or pass" >&2
+    echo "  APP_UPSTREAM_COMMIT." >&2
+fi
 
 cd "$upstream"
 ./gradlew --no-daemon -Dorg.gradle.jvmargs="-Xmx2g -XX:MaxMetaspaceSize=1g" \

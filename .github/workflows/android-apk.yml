@@ -75,7 +75,24 @@ jobs:
             # connectbot/ is a plain directory of this repository — it was a
             # submodule pinned upstream, with our changes as quilt patches, and is
             # now a squashed subtree, so there is no second repository to check out.
+            #
+            # Full history, and this is load-bearing rather than convenient. The
+            # Help screen's About section names the upstream ConnectBot commit,
+            # and the only record of it is the `git-subtree-split` trailer on the
+            # squash commit — which is forty-odd commits back, so the default
+            # one-commit checkout cannot reach it. `build-apk.sh` then finds no
+            # trailer to read, passes no `-PupstreamCommit`, and the About screen
+            # says "unknown" on every APK this workflow publishes.
+            #
+            # It was `git -C connectbot rev-parse HEAD` while connectbot was a
+            # submodule, which needed no local history at all — that is why this
+            # broke when the pin became a trailer.
+            #
+            # Cheap: this branch is its own lineage of 45 commits, and a full
+            # single-branch clone of it measured 3.0 MB.
             - uses: actions/checkout@v7
+              with:
+                  fetch-depth: 0
 
             - uses: actions/setup-java@v6
               with:
