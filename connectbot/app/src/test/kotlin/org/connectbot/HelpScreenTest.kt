@@ -55,7 +55,6 @@ class HelpScreenTest {
                     onNavigateBack = {},
                     onNavigateToHints = {},
                     onNavigateToEula = {},
-                    onNavigateToContact = {},
                 )
             }
         }
@@ -75,7 +74,6 @@ class HelpScreenTest {
                     onNavigateBack = { backCalled = true },
                     onNavigateToHints = {},
                     onNavigateToEula = {},
-                    onNavigateToContact = {},
                 )
             }
         }
@@ -95,7 +93,6 @@ class HelpScreenTest {
                     onNavigateBack = {},
                     onNavigateToHints = {},
                     onNavigateToEula = {},
-                    onNavigateToContact = {},
                 )
             }
         }
@@ -115,7 +112,6 @@ class HelpScreenTest {
                     onNavigateBack = {},
                     onNavigateToHints = { hintsCalled = true },
                     onNavigateToEula = {},
-                    onNavigateToContact = {},
                 )
             }
         }
@@ -137,7 +133,6 @@ class HelpScreenTest {
                     onNavigateBack = {},
                     onNavigateToHints = {},
                     onNavigateToEula = { eulaCalled = true },
-                    onNavigateToContact = {},
                 )
             }
         }
@@ -194,7 +189,6 @@ class HelpScreenTest {
                     onNavigateBack = {},
                     onNavigateToHints = {},
                     onNavigateToEula = {},
-                    onNavigateToContact = {},
                 )
             }
         }

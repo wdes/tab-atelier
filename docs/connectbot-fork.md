@@ -122,6 +122,22 @@ are commented out with their reasons beside them, and two source-code buttons
 replace them. The labels are literals rather than resources on purpose: they are
 the same in every locale, and a translated commit hash or URL would be a defect.
 
+**The contact screen behind those buttons is gone, not just unlinked.** Disabling
+the button was the first half of that decision — the app must not push a user at
+upstream's community, for licence and product reasons both — and the screen it
+reached, plus its route, its destination constant and its tests, went with the
+button. Leaving the route in place was a trap rather than a saving: a route with
+no entry point is dead weight, and restoring one button later would have silently
+resurrected ConnectBot's IRC and mailing-list screen inside this product, which is
+exactly what the decision said not to do.
+
+This is the one place the fork subtracts rather than adds, so it is worth being
+explicit about the cost: `ContactScreen.kt` no longer exists here, and
+`NavDestinations.kt`, `NavGraph.kt` and `HelpScreen.kt` carry the removal. Every
+other change in this document adds or gates; this one deletes, and an upstream
+sync will offer the screen back. Take it and re-apply the removal, or leave it
+and the route returns with nothing linking to it.
+
 ### 0004 — the tab-atelier server type
 
 > The numbers in these headings are **historical**: each was one patch file in the

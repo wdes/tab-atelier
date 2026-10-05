@@ -71,7 +71,6 @@ fun HelpScreen(
     onNavigateBack: () -> Unit,
     onNavigateToHints: () -> Unit,
     onNavigateToEula: () -> Unit,
-    onNavigateToContact: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     var showKeyboardShortcuts by remember { mutableStateOf(false) }
@@ -393,7 +392,6 @@ private fun HelpScreenPreview() {
             onNavigateBack = {},
             onNavigateToHints = {},
             onNavigateToEula = {},
-            onNavigateToContact = {},
         )
     }
 }

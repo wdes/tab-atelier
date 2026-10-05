@@ -32,7 +32,6 @@ import org.connectbot.data.entity.Host
 import org.connectbot.ui.screens.colors.ColorsScreen
 import org.connectbot.ui.screens.colors.PaletteEditorScreen
 import org.connectbot.ui.screens.console.ConsoleScreen
-import org.connectbot.ui.screens.contact.ContactScreen
 import org.connectbot.ui.screens.eula.EulaScreen
 import org.connectbot.ui.screens.generatepubkey.GeneratePubkeyScreen
 import org.connectbot.ui.screens.help.HelpScreen
@@ -287,13 +286,6 @@ fun ConnectBotNavHost(
                 onNavigateBack = { navController.safePopBackStack() },
                 onNavigateToHints = { navController.navigateSafely(NavDestinations.HINTS) },
                 onNavigateToEula = { navController.navigateSafely(NavDestinations.EULA) },
-                onNavigateToContact = { navController.navigateSafely(NavDestinations.CONTACT) },
-            )
-        }
-
-        composable(NavDestinations.CONTACT) {
-            ContactScreen(
-                onNavigateBack = { navController.safePopBackStack() },
             )
         }
 
