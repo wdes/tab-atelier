@@ -12,7 +12,6 @@ this branch is shaped so that stays obvious and maintainable.
 | --- | --- |
 | `connectbot/` | ConnectBot's tree with our changes on top, as a **squashed `git subtree`**. Our changes are ordinary commits here. |
 | `docs/connectbot-fork.md` | What we changed and why — the record the Apache-2.0 §4(b) notice points at. |
-| `wip/` | Unfinished work kept as patches, inert. See its own note below. |
 | `scripts/build-apk.sh` | Builds and signs the APK with Gradle. |
 | `LICENSE`, `NOTICE` | Apache-2.0, plus the attribution the fork owes upstream. |
 

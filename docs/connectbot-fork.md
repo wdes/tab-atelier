@@ -388,6 +388,49 @@ on its own**, because two trees that both lack a change compare equal. Compare
 content — a `diff` of `git ls-tree` output, or a `grep` for a symbol the change
 introduces — or the check will happily confirm a change that is not there.
 
+### 0007 — a two-row, borderless keys bar
+
+`ui/components/TerminalKeyboard.kt` and the console's `TerminalKeyboard(` call.
+Upstream's bar is one horizontally-scrolling row of bordered keys, so the key a user
+wants is at an unpredictable position off-screen and every key is drawn with an
+outline. This replaces it with a two-row layout:
+
+    ESC  /  -  HOME↑  END  PGPREV            FN
+    TAB  CTRL ALT  ←  ↓  →  PGNEXT          ⌨
+
+`FN` swaps the keys for an F1–F12 page whose trailing button is a back arrow, and
+paste takes the other trailing slot. `PGPREV`/`PGNEXT` are the only keys whose
+meaning differs from the request that produced this: **they send PageUp/PageDown
+rather than scrolling the local scrollback**, because termlib 0.3.10 exposes no
+scroll controller to app code — `onScrollControllerAvailable` belongs to
+`TerminalWithAccessibility`, not the `Terminal` this app calls, and
+`ScrollController` is internal to the library. JuiceSSH's behaviour needs a termlib
+change, not one here. The compose-mode key is gone because the console's own menu
+already toggles it and the layout has no slot; a test pins its absence so a later
+upstream sync cannot resurrect it silently.
+
+**Two of the four bugs this took would have shipped a bar whose keys could not be
+pressed, and both were invisible in the source:**
+
+- `KeyButton` sized every key with a hardcoded width, and a fixed width *beats* the
+  `Modifier.weight(1f)` a caller passes. A row of seven keys therefore stayed seven
+  fixed widths wide however narrow the phone was, so the columns laid out after them
+  — `FN`, the keyboard toggle, paste — fell outside the window. Present, enabled,
+  labelled, unpressable, and device-dependent: it worked on a wide screen.
+- Two keys in the row had no weight, and a key's content fills whatever it is given,
+  so each took the **whole** row and left its neighbours at zero width — `Esc`
+  measured 0×0. A key missing its weight breaks its neighbours rather than itself,
+  which is what made it hard to attribute.
+
+Both were found by measuring bounds rather than reading code, and the measurement is
+the reason to keep the shape: a key that exists, is enabled and is labelled can still
+be impossible to press, so a test that asserts presence proves nothing. The bar's
+tests press each key and check the callback fires.
+
+`KeyButton` also read `contentDescription` only in its icon branch, so passing one
+with a text key dropped it in silence — `FN` had no accessible name. Fixing it is
+what makes "Show function keys" audible rather than the two letters.
+
 ## Current state
 
 The app is a working ConnectBot under our package id, plus the tab-atelier type:
