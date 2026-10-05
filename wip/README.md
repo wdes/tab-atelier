@@ -71,3 +71,34 @@ supported screen. Fix the layout if it is not, then rewrite the tests against th
 layout that survives. The new bar has no compose-mode key either, so whatever
 `onToggleComposeMode` does for this app needs a home before the old bar can go.
 
+
+## The bar's background colour (started 2026-10-05, one line short)
+
+Once a tab's colour worked in the terminal, the keys bar below it was still the
+theme's surface — a strip that does not match the session it belongs to. The change
+is saved at `/tmp/keyboard-bg-colour.patch` (43 lines) and is everything except one
+declaration, which a refused edit left out:
+
+- `TerminalKeyboard` takes `backgroundColor: Color? = null` and forwards it. **Done
+  in the patch.**
+- `TerminalKeyboardContent` needs the same parameter, and the patch does not add it,
+  so it references a name it does not declare and the file will not compile.
+- Its `Surface` then uses `backgroundColor ?: MaterialTheme.colorScheme.surface.copy(alpha = UI_OPACITY)`,
+  with `tonalElevation` dropped to `0.dp` when a colour is supplied — elevation tints
+  the colour, and a tab's background should be the colour the daemon sent rather than
+  that colour plus a shade. Passing the colour to `Surface` also derives the content
+  colour from it through Material's contrast rule, so key labels stay legible on any
+  background rather than assuming the theme's on-surface.
+- `ConsoleScreen` has to pass it at the `TerminalKeyboard(` call site, where
+  `backgroundColor = consoleBackground` is already in scope — that is the value the
+  scaffold and the terminal now use.
+
+The design decision worth keeping: **null means "no colour of its own"**, and every
+use site then keeps what it had — the theme's background for the scaffold, the
+theme's surface for the bar, black for the terminal (termlib's default). A black
+fallback everywhere would have repainted every other transport's console, which is
+what makes nullable rather than defaulted the right shape here.
+
+The two halves are independent, which is why the console half shipped on its own: the
+terminal does not cover the screen, so the scaffold's colour was the band the user
+actually saw.
