@@ -113,6 +113,10 @@ fun TerminalKeyboard(
     isComposeModeActive: Boolean = false,
     onToggleComposeMode: () -> Unit = {},
     onShortcutModifierChange: () -> Unit = {},
+    // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): the session's own
+    // background, so the bar matches the terminal above it. Null keeps the theme's
+    // surface, which is what every transport without a colour of its own gets.
+    barColor: Color? = null,
 ) {
     val context = LocalContext.current
     val prefs = remember { PreferenceManager.getDefaultSharedPreferences(context) }
@@ -157,6 +161,7 @@ fun TerminalKeyboard(
         showImeToggleKey = showImeToggleKey,
         isComposeModeActive = isComposeModeActive,
         onToggleComposeMode = onToggleComposeMode,
+        barColor = barColor,
         modifier = modifier,
     )
 }
@@ -184,6 +189,7 @@ internal fun TerminalKeyboardContent(
     showImeToggleKey: Boolean = true,
     isComposeModeActive: Boolean = false,
     onToggleComposeMode: () -> Unit = {},
+    barColor: Color? = null,
     modifier: Modifier = Modifier,
 ) {
     val scrollState = rememberScrollState()
@@ -231,8 +237,17 @@ internal fun TerminalKeyboardContent(
                     },
                 )
             },
-        color = MaterialTheme.colorScheme.surface.copy(alpha = UI_OPACITY),
-        tonalElevation = 8.dp,
+        // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): the bar takes the
+        // tab's own background, so the strip along the bottom matches the session it
+        // belongs to instead of the theme's surface. tonalElevation is dropped to
+        // zero with it, because elevation tints the colour — a tab's background
+        // should be the colour the daemon sent, not that colour plus a shade.
+        //
+        // Passing the colour to Surface also sets the content colour from it, via
+        // Material's own contrast rule, so the key labels stay legible on any
+        // background the daemon reports rather than assuming the theme's on-surface.
+        color = barColor ?: MaterialTheme.colorScheme.surface.copy(alpha = UI_OPACITY),
+        tonalElevation = if (barColor != null) 0.dp else 8.dp,
     ) {
         Row(
             modifier = Modifier

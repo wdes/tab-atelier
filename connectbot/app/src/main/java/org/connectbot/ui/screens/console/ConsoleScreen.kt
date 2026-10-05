@@ -429,11 +429,6 @@ private fun ConsoleTerminalPage(
     showImeToggleKey: Boolean,
     isComposeModeActive: Boolean,
     onToggleComposeMode: () -> Unit,
-    // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): the colour this page
-    // paints behind the terminal and hands to the keys bar, or null when the tab has
-    // none. Passed in rather than derived here, so the scaffold, the terminal and the
-    // bar cannot disagree about what colour the tab is.
-    backgroundColor: Color? = null,
     onShortcutModifierChange: () -> Unit,
     modifier: Modifier = Modifier,
     terminalModifier: Modifier = Modifier,
@@ -445,15 +440,23 @@ private fun ConsoleTerminalPage(
         val delKeyMode by bridge.delKeyModeFlow.collectAsState()
 
         // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): the background
-        // this tab's viewer is painted in, read once by the console so the scaffold,
-        // the terminal and the keys bar share one value. It used to be derived here,
-        // which coloured only the terminal and left the area around it showing the
-        // theme's own background — a band that did not match the tab.
+        // this tab's viewer is painted in, read from the bridge the page already has.
         //
-        // Black when the tab has none: that is termlib's own default for this
-        // parameter, named rather than relied on so a switch from a coloured tab to
-        // an uncoloured one clears the colour rather than keeping it.
-        val terminalBackground = backgroundColor ?: Color.Black
+        // Read here rather than taken as a parameter so that the terminal and the keys
+        // bar cannot be left uncoloured by a caller that forgets to pass it — which is
+        // precisely what happened first time round: the console computed the colour,
+        // gave it to the scaffold, and never handed it down, so the part the user
+        // actually looks at stayed as it was. One read, two consumers, no link to
+        // forget.
+        //
+        // Two fallbacks, deliberately different, because the two surfaces want
+        // different things: the terminal falls back to black, which is termlib's own
+        // default for that parameter, and the bar to null, which leaves the theme's
+        // surface. A tab with no colour of its own therefore looks exactly as it did
+        // before this app had colours at all.
+        val remoteTabBackground by bridge.remoteBackgroundColor.collectAsState()
+        val remoteTabColor = remember(remoteTabBackground) { remoteTabBackground?.let(::terminalColorOrNull) }
+        val terminalBackground = remoteTabColor ?: Color.Black
 
         LaunchedEffect(fontResult.loadFailed, fontResult.isLoading) {
             if (fontResult.loadFailed && !fontResult.isLoading) {
@@ -545,6 +548,12 @@ private fun ConsoleTerminalPage(
                     isComposeModeActive = isComposeModeActive,
                     onToggleComposeMode = onToggleComposeMode,
                     onShortcutModifierChange = onShortcutModifierChange,
+                    // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): the
+                    // bar takes the session's own background, so the strip along the
+                    // bottom matches the terminal above it instead of showing the
+                    // theme's surface. Null for a session without one, which is what
+                    // keeps every other transport's console unchanged.
+                    barColor = remoteTabColor,
                 )
             }
 
