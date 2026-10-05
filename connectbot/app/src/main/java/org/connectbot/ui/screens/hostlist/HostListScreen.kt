@@ -768,16 +768,29 @@ private fun HostListItem(
                                     Icon(Icons.Default.Edit, null)
                                 },
                             )
-                            DropdownMenuItem(
-                                text = { Text(stringResource(R.string.list_host_portforwards)) },
-                                onClick = {
-                                    showMenu = false
-                                    onPortForwards()
-                                },
-                                leadingIcon = {
-                                    Icon(Icons.Default.Link, null)
-                                },
-                            )
+                            // Changed for Tab Atelier Remote (Apache-2.0 section
+                            // 4(b)): only where port forwarding can actually work.
+                            //
+                            // It could not, for a tab-atelier host: this app's
+                            // transport reports canForwardPorts() as false and every
+                            // mutator as a no-op, so the item led to a screen with a
+                            // working "+" that silently forwarded nothing. The guard
+                            // matches the one the console already applies
+                            // (canForwardPorts), which is true for SSH alone, and it
+                            // matches the sibling item below, which has always been
+                            // gated this way for the same reason.
+                            if (host.protocol == "ssh") {
+                                DropdownMenuItem(
+                                    text = { Text(stringResource(R.string.list_host_portforwards)) },
+                                    onClick = {
+                                        showMenu = false
+                                        onPortForwards()
+                                    },
+                                    leadingIcon = {
+                                        Icon(Icons.Default.Link, null)
+                                    },
+                                )
+                            }
                             DropdownMenuItem(
                                 text = { Text(stringResource(R.string.list_host_duplicate)) },
                                 onClick = {

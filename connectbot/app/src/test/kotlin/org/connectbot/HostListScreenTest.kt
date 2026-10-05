@@ -412,6 +412,38 @@ class HostListScreenTest {
         assertTrue(deletedHost == host)
     }
 
+    /**
+     * Added for Tab Atelier Remote (Apache-2.0 section 4(b)).
+     *
+     * Port forwarding is offered for the transports that can do it, and not for the
+     * one this app exists for. A tab-atelier transport reports `canForwardPorts()`
+     * as false and every mutator as a no-op, so the item led to a screen with a
+     * working "+" that silently forwarded nothing — a tappable affordance that
+     * cannot work, which is worse than one that is not there.
+     *
+     * Asserting a sibling item is present is what gives the first assertion meaning:
+     * "does not exist" passes just as well when the menu never opened, which is the
+     * way this kind of test goes quietly wrong. The ssh half — that the item is
+     * still offered, and still works — is covered by
+     * [hostListScreenContent_hostMenuInvokesActionsAndDialogs], which uses an ssh
+     * host.
+     */
+    @Test
+    fun hostListScreenContent_portForwardsNotOfferedForATabAtelierServer() {
+        val host = testHost(id = 20L, nickname = "workstation", protocol = "tabatelier")
+
+        setHostListContent(uiState = HostListUiState(hosts = listOf(host)))
+
+        openHostMenu(host)
+        composeTestRule
+            .onNodeWithText(composeTestRule.activity.getString(R.string.list_host_portforwards))
+            .assertDoesNotExist()
+        // The menu is open — this is the line that says so.
+        composeTestRule
+            .onNodeWithText(composeTestRule.activity.getString(R.string.list_host_edit))
+            .assertExists()
+    }
+
     @Test
     fun hostListScreenContent_disconnectDisabledWhenHostNotConnected() {
         val host = testHost(id = 4L, nickname = "offline", protocol = "ssh", color = null)
