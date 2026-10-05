@@ -540,7 +540,13 @@ private fun ConsoleTerminalPage(
                     onShowIme = {
                         onShowSoftwareKeyboardChange(true)
                     },
-                    onOpenTextInput = onTextInputRequest,
+                    // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)):
+                    // the bar's trailing button pastes instead of opening the
+                    // floating text-input dialog. Nothing is lost by the swap: the
+                    // title bar already carries both a text-input button and a paste
+                    // button, so the dialog is still one tap away — and a paste
+                    // button belongs beside the keys it is used with.
+                    onPaste = onPasteRequest,
                     onScrollInProgressChange = onKeyboardScrollInProgressChange,
                     imeVisible = imeVisible,
                     playAnimation = !hasPlayedKeyboardAnimation,
@@ -704,6 +710,7 @@ fun ConsoleScreen(
     var scannedUrls by remember { mutableStateOf<List<String>>(emptyList()) }
     var selectionController by remember { mutableStateOf<SelectionController?>(null) }
     var composeController by remember { mutableStateOf<ComposeController?>(null) }
+
     var imeVisible by remember { mutableStateOf(false) }
     var keyboardScrollInProgress by remember { mutableStateOf(false) }
     var previousBridgeIdForImeState by remember { mutableStateOf<Long?>(null) }

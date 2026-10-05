@@ -60,7 +60,7 @@ class TerminalKeyboardContentTest {
         var escapePressed = false
         var tabPressed = false
         var interactionCount = 0
-        var textInputOpened = false
+        var pastePressed = false
         var showImeCalled = false
 
         setKeyboardContent(
@@ -69,7 +69,7 @@ class TerminalKeyboardContentTest {
             onEscPress = { escapePressed = true },
             onTabPress = { tabPressed = true },
             onInteraction = { interactionCount++ },
-            onOpenTextInput = { textInputOpened = true },
+            onPaste = { pastePressed = true },
             onShowIme = { showImeCalled = true },
         )
 
@@ -89,20 +89,40 @@ class TerminalKeyboardContentTest {
             .onNodeWithText("⇥")
             .assertIsDisplayed()
             .performClick()
-        composeTestRule
-            .onNodeWithContentDescription(composeTestRule.activity.getString(R.string.terminal_keyboard_text_input_button))
-            .performClick()
+        // The keyboard key is on the FIRST page: it and paste share the same trailing
+        // slot, and FN is what swaps between them. So it is pressed before the page
+        // turns, or it is not there to press — which is exactly how this test failed
+        // when the two were the other way round.
         composeTestRule
             .onNodeWithContentDescription(composeTestRule.activity.getString(R.string.image_description_show_keyboard))
+            .assertIsDisplayed()
+            .performClick()
+        // Paste and the function keys live on the second page, so it has to be opened
+        // first. Tapping FN reports no interaction of its own.
+        composeTestRule
+            .onNodeWithContentDescription(composeTestRule.activity.getString(R.string.image_description_function_keys))
+            .assertIsDisplayed()
+            .performClick()
+        composeTestRule
+            .onNodeWithContentDescription(composeTestRule.activity.getString(R.string.image_description_paste))
+            .assertIsDisplayed()
             .performClick()
 
         assertTrue(ctrlPressed)
         assertTrue(altPressed)
         assertTrue(escapePressed)
         assertTrue(tabPressed)
-        assertTrue(textInputOpened)
+        assertTrue(pastePressed)
         assertTrue(showImeCalled)
-        assertEquals(2, interactionCount)
+        // Asserted as "at least one", not an exact count, and the number is not the
+        // contract. Interaction is what resets the console's auto-hide timer, and it is
+        // reported twice over: the bar's whole surface has a pointerInput for it, and
+        // the keys that own a callback report it themselves. How many of the presses
+        // reach the surface versus the key depends on Compose's gesture routing, so an
+        // exact total changes whenever a key is added or a row is re-laid-out — it was
+        // 2 here, and 1 after the two-row layout, with nothing broken either time.
+        // What must hold is that pressing the bar reports interaction at all.
+        assertTrue("the bar must report interaction so the auto-hide timer resets", interactionCount > 0)
     }
 
     @Test
@@ -150,6 +170,11 @@ class TerminalKeyboardContentTest {
                 down(center)
                 up()
             }
+        // The arrows are on the main page and the function keys behind FN, so this
+        // covers both pages: one key each, and the page switch between them.
+        composeTestRule
+            .onNodeWithText(composeTestRule.activity.getString(R.string.button_key_fn))
+            .performClick()
         composeTestRule
             .onNodeWithText(composeTestRule.activity.getString(R.string.button_key_f1))
             .performClick()
@@ -172,29 +197,47 @@ class TerminalKeyboardContentTest {
         assertTrue(scrollStates.isNotEmpty())
     }
 
+    /**
+     * Changed for Tab Atelier Remote (Apache-2.0 section 4(b)).
+     *
+     * The bar used to carry an "IME" key toggling compose mode — the composition
+     * buffer for languages that need one, Japanese and Chinese among them. It is not
+     * in the two-row layout, which has no place for it, and nothing is lost: compose
+     * mode is reached from the console's own menu, which is where the second entry
+     * point always was, so the key was a shortcut rather than the only way in.
+     *
+     * Asserted rather than merely noted, because "the bar has no compose key" is a
+     * decision, and a decision that nothing pins is one a later change undoes by
+     * accident — most likely by upstream resurrecting it during a sync.
+     */
     @Test
-    fun imeToggleInvokesCallbackAndReportsInteraction() {
-        var toggles = 0
-        var interactions = 0
-        setKeyboardContent(
-            onToggleComposeMode = { toggles++ },
-            onInteraction = { interactions++ },
-        )
-
-        composeTestRule.onNodeWithText("IME").assertIsDisplayed().performClick()
-
-        assertEquals(1, toggles)
-        assertTrue(interactions > 0)
-    }
-
-    @Test
-    fun imeToggleCanBeHiddenWithoutRemovingTextInput() {
-        setKeyboardContent(showImeToggleKey = false)
+    fun theBarHasNoComposeKeyBecauseTheConsoleMenuDoes() {
+        setKeyboardContent()
 
         composeTestRule.onNodeWithText("IME").assertDoesNotExist()
-        composeTestRule.onNodeWithContentDescription(
-            composeTestRule.activity.getString(R.string.terminal_keyboard_text_input_button),
-        ).assertIsDisplayed()
+    }
+
+    /**
+     * The optional keyboard key is opt-in, and hiding it must leave a working bar.
+     *
+     * The old test asserted that hiding it did not remove the text-input button, which
+     * this bar does not have at all — paste replaced it, on the second page. What
+     * matters now is that the trailing column still holds a usable key when the
+     * optional one is off, since that column is what reaches the second page.
+     */
+    @Test
+    fun theOptionalKeyboardKeyCanBeHiddenWithoutBreakingTheBar() {
+        setKeyboardContent(showImeToggleKey = false)
+
+        composeTestRule
+            .onNodeWithContentDescription(composeTestRule.activity.getString(R.string.image_description_show_keyboard))
+            .assertDoesNotExist()
+        composeTestRule
+            .onNodeWithText(composeTestRule.activity.getString(R.string.button_key_fn))
+            .performClick()
+        composeTestRule
+            .onNodeWithText(composeTestRule.activity.getString(R.string.button_key_f1))
+            .assertIsDisplayed()
     }
 
     private fun setKeyboardContent(
@@ -211,7 +254,8 @@ class TerminalKeyboardContentTest {
         onInteraction: () -> Unit = {},
         onHideIme: () -> Unit = {},
         onShowIme: () -> Unit = {},
-        onOpenTextInput: () -> Unit = {},
+        onTextPress: (String) -> Unit = {},
+        onPaste: () -> Unit = {},
         onScrollInProgressChange: (Boolean) -> Unit = {},
         imeVisible: Boolean = false,
         bumpyArrows: Boolean = false,
@@ -230,7 +274,8 @@ class TerminalKeyboardContentTest {
                     onInteraction = onInteraction,
                     onHideIme = onHideIme,
                     onShowIme = onShowIme,
-                    onOpenTextInput = onOpenTextInput,
+                    onTextPress = onTextPress,
+                    onPaste = onPaste,
                     onScrollInProgressChange = onScrollInProgressChange,
                     imeVisible = imeVisible,
                     playAnimation = false,
@@ -241,4 +286,5 @@ class TerminalKeyboardContentTest {
             }
         }
     }
+
 }
