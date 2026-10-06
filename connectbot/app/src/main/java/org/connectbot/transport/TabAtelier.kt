@@ -235,7 +235,38 @@ class TabAtelier : AbsTransport() {
      */
     fun switchTab(tabKey: String): Boolean {
         if (tabKey.isBlank() || tabKey == currentTabKey) return false
-        if (client == null || base == null) return false
+
+        // A session can exist without a client and a base. They are set by connect(),
+        // and connect() returns before reaching them when the host's address will not
+        // parse — so the bridge stays in the session map while the transport has
+        // nothing to reach the daemon with.
+        //
+        // Refusing in that state is what made a server look broken in two ways at
+        // once: every tab tap returned here in silence, leaving the user looking at
+        // whichever session was already on screen, and because no socket had ever
+        // opened, the screen never updated either — which reads as a frozen session
+        // rather than as a failed connection.
+        //
+        // Both are derivable from the host this transport already holds, so they are
+        // rebuilt here rather than depended on. A restored session is the other case
+        // that lands in this branch, and it is fixed by the same three lines.
+        if (client == null || base == null) {
+            val host = host ?: return false
+            val service = manager ?: return false
+            val rebuilt = TabAtelierClient(service, SecurePasswordStorage(service))
+            val rebuiltBase = rebuilt.base(host.tabAtelierUrl?.takeIf { it.isNotBlank() })
+            if (rebuiltBase == null) {
+                // There is nothing to switch *with*, and saying so is the whole point:
+                // the address the user gave cannot be reached, and the silence here is
+                // what made that take so long to notice. The same message connect()
+                // gives, because it is the same problem.
+                bridge?.outputLine(service.getString(R.string.tabatelier_url_missing))
+                return false
+            }
+            client = rebuilt
+            base = rebuiltBase
+            Timber.d("Rebuilt the tab-atelier client to switch %d to tab %s", host.id, tabKey)
+        }
 
         val previous = socket
         currentAttempt = null
