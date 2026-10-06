@@ -1248,7 +1248,7 @@ async function loadIntentions(el) {
     // Keep the open one if it is still there; otherwise open the first, so the
     // pane is never an empty right-hand side after a reload.
     if (!intentState.active && intentState.list.length) intentState.active = intentState.list[0].slug;
-    if (intentState.active) await openIntention(el, intentState.active, { keepList: true });
+    if (intentState.active) await openIntention(el, intentState.active, { keepNote: true });
     else renderIntentPane(el);
   } catch (err) {
     panel.innerHTML = `<div class="kk-error">intentions indisponibles (${escapeHtml(err.message)})</div>`;
@@ -1259,9 +1259,12 @@ async function loadIntentions(el) {
 async function openIntention(el, slug, opts) {
   const panel = intentPanel(el);
   if (!panel) return;
-  if (!opts || !opts.keepList) intentState.active = slug;
   intentState.active = slug;
-  intentState.note = "";
+  // A deliberate switch clears the previous message; a refresh after an action
+  // must NOT, or the server's explanation of what just happened — "no tab
+  // appeared", say — is erased a millisecond after it is set. The list refresh
+  // passes `keepNote` for that reason.
+  if (!opts || !opts.keepNote) intentState.note = "";
   try {
     const res = await fetch(`/intent/${encodeURIComponent(slug)}`, { headers: { accept: "application/json", ...AUTH_HEADERS } });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
