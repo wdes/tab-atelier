@@ -98,6 +98,7 @@ import androidx.compose.ui.unit.dp
 import androidx.core.graphics.toColorInt
 import androidx.hilt.lifecycle.viewmodel.compose.hiltViewModel
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.connectbot.R
@@ -169,6 +170,32 @@ fun HostListScreen(
 
     val uiState by viewModel.uiState.collectAsState()
     val scope = rememberCoroutineScope()
+
+    // A tab-atelier server's tabs are live and nothing pushes a change: another viewer
+    // on the same daemon can open or close one, an agent can spawn or exit, and this
+    // list is the only place that shows it. So it asks, slowly, while it is on screen.
+    //
+    // Keyed on the ids of the tab-atelier hosts, so the timer runs only while such a
+    // server is listed and restarts only when that set changes — not on every
+    // recomposition, rename or scroll. The loop reads `currentHosts` rather than the
+    // hosts captured when it started, because those go stale as soon as one is added or
+    // renamed, and `refreshTabs` takes a Host rather than an id.
+    //
+    // No spinner comes of this: `fetchTabs` keeps the tabs it already has while it
+    // fetches, and `tabsLoading` only disables the refresh action — so a background
+    // refresh is invisible, which is what a heartbeat has to be.
+    val tabAtelierHostIds = uiState.hosts
+        .filter { it.protocol == TabAtelier.PROTOCOL }
+        .map { it.id }
+    val currentHosts by rememberUpdatedState(uiState.hosts)
+    LaunchedEffect(tabAtelierHostIds) {
+        while (tabAtelierHostIds.isNotEmpty()) {
+            delay(TAB_LIST_REFRESH_MILLIS)
+            tabAtelierHostIds.forEach { id ->
+                currentHosts.firstOrNull { it.id == id }?.let { viewModel.refreshTabs(it) }
+            }
+        }
+    }
 
     // File picker for export
     val exportLauncher = rememberLauncherForActivityResult(
@@ -1298,3 +1325,22 @@ private fun TabAtelierStatusRow(
 
 /** How far a tab row is indented under its server's row. */
 private val TAB_INDENT = 44.dp
+
+/**
+ * How often the host list re-asks a tab-atelier server what its tabs are.
+ *
+ * The tabs of a tab-atelier server change without this app doing anything — another
+ * viewer opens one, an agent finishes and exits — and nothing pushes that change, so
+ * the list has to ask. Nothing else triggers a re-ask either: the fingerprint check
+ * that guards the automatic probe exists to avoid pointless probes, so a server whose
+ * own settings have not changed would never be asked again.
+ *
+ * 15 seconds, at the responsive end of the range that was asked for. The cost is one
+ * small GET per server per interval, which is nothing against a list that has to look
+ * live; the delay is invisible because `fetchTabs` keeps the tabs it already has while
+ * it fetches, so nothing blanks or blinks.
+ *
+ * Do not lower this much further without checking the daemon: every viewer on every
+ * device polls its own timer, and this is a shared server.
+ */
+private const val TAB_LIST_REFRESH_MILLIS = 15_000L
