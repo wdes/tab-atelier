@@ -57,6 +57,7 @@ class TerminalKeyboardContentTest {
     fun terminalKeyboardContent_displaysCoreKeysAndInvokesCallbacks() {
         var ctrlPressed = false
         var altPressed = false
+        var shiftPressed = false
         var escapePressed = false
         var tabPressed = false
         var interactionCount = 0
@@ -66,6 +67,7 @@ class TerminalKeyboardContentTest {
         setKeyboardContent(
             onCtrlPress = { ctrlPressed = true },
             onAltPress = { altPressed = true },
+            onShiftPress = { shiftPressed = true },
             onEscPress = { escapePressed = true },
             onTabPress = { tabPressed = true },
             onInteraction = { interactionCount++ },
@@ -79,6 +81,12 @@ class TerminalKeyboardContentTest {
             .performClick()
         composeTestRule
             .onNodeWithText(composeTestRule.activity.getString(R.string.button_key_alt))
+            .assertIsDisplayed()
+            .performClick()
+        // Shift, which upstream's bar never had: pressing it must reach the caller, so
+        // Shift+Tab is a tap each rather than a key held with one hand.
+        composeTestRule
+            .onNodeWithText(composeTestRule.activity.getString(R.string.button_key_shift))
             .assertIsDisplayed()
             .performClick()
         composeTestRule
@@ -110,6 +118,7 @@ class TerminalKeyboardContentTest {
 
         assertTrue(ctrlPressed)
         assertTrue(altPressed)
+        assertTrue(shiftPressed)
         assertTrue(escapePressed)
         assertTrue(tabPressed)
         assertTrue(pastePressed)
@@ -246,6 +255,7 @@ class TerminalKeyboardContentTest {
         ),
         onCtrlPress: () -> Unit = {},
         onAltPress: () -> Unit = {},
+        onShiftPress: () -> Unit = {},
         onEscPress: () -> Unit = {},
         onTabPress: () -> Unit = {},
         onKeyPress: (Int) -> Unit = {},
@@ -266,6 +276,7 @@ class TerminalKeyboardContentTest {
                     modifierState = modifierState,
                     onCtrlPress = onCtrlPress,
                     onAltPress = onAltPress,
+                    onShiftPress = onShiftPress,
                     onEscPress = onEscPress,
                     onTabPress = onTabPress,
                     onKeyPress = onKeyPress,

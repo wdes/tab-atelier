@@ -88,4 +88,10 @@
 	<string name="button_key_function" translatable="false">F%1$s</string>
 	<string name="image_description_function_keys">Show function keys</string>
 	<string name="image_description_back_to_keys">Back to the keys</string>
+	<!-- The Shift key, which upstream's bar never had — hence no upstream string to
+	     reuse. Translated rather than translatable="false" like the F-keys above,
+	     because a keyboard's Shift key IS labelled differently by language: a French
+	     keyboard prints "Maj". -->
+	<string name="button_key_shift">Shift</string>
+	<string name="image_description_toggle_shift">Toggle Shift key.</string>
 </resources>

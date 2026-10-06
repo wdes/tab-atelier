@@ -18,4 +18,10 @@
 	<string name="button_key_fn">FN</string>
 	<string name="image_description_function_keys">Afficher les touches de fonction</string>
 	<string name="image_description_back_to_keys">Revenir aux touches principales</string>
+	<!-- "Maj" is what a French keyboard prints on the key, so it is shorter than the
+	     English "Shift" rather than longer — which is why this is a translation and
+	     not a translatable="false" notation like the F-keys. The description mirrors
+	     upstream's own French for the Alt key, "Activer/désactiver la touche Alt." -->
+	<string name="button_key_shift">Maj</string>
+	<string name="image_description_toggle_shift">Activer/désactiver la touche Maj.</string>
 </resources>

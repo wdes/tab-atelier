@@ -151,6 +151,21 @@ fun TerminalKeyboard(
             onShortcutModifierChange()
             onInteraction()
         },
+        // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): Shift, which
+        // upstream's bar never had a key for — so `Shift`+`Tab` could only be typed on
+        // a hardware keyboard, and never one-handed on a phone.
+        //
+        // `metaPress(…, true)` is the same call Ctrl and Alt make, and it cycles the
+        // modifier through OFF, TRANSIENT and LOCKED. LOCKED is what makes the request
+        // work one-handed: Shift is latched by one press, `Tab` is pressed separately,
+        // and Shift stays on until it is pressed again. That is also what upstream
+        // calls `ModifierLevel.LOCKED`, and what a French keyboard paints as
+        // "Verr Maj".
+        onShiftPress = {
+            keyHandler.metaPress(TerminalKeyListener.SHIFT_ON, true)
+            onShortcutModifierChange()
+            onInteraction()
+        },
         onEscPress = {
             keyHandler.sendEscape()
             onInteraction()
@@ -190,6 +205,10 @@ fun TerminalKeyboard(
 internal fun TerminalKeyboardContent(
     modifierState: ModifierState,
     onCtrlPress: () -> Unit,
+    // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): the Shift key.
+    // Defaulted so the previews that pass only some of these keep compiling; the bar
+    // always supplies it.
+    onShiftPress: () -> Unit = {},
     onAltPress: () -> Unit,
     onEscPress: () -> Unit,
     onTabPress: () -> Unit,
@@ -382,6 +401,18 @@ internal fun TerminalKeyboardContent(
                             contentDescription = stringResource(R.string.image_description_toggle_alt_key),
                             modifierLevel = modifierState.altState,
                             onClick = onAltPress,
+                        )
+                        // Shift key (sticky modifier). A press latches it, so Shift then
+                        // Tab is two taps with one hand rather than a held key — which is
+                        // the whole point of having it here. `modifierState.shiftState`
+                        // drives the same OFF/TRANSIENT/LOCKED indicator the other two
+                        // modifiers use.
+                        ModifierKeyButton(
+                            modifier = Modifier.weight(1f),
+                            text = stringResource(R.string.button_key_shift),
+                            contentDescription = stringResource(R.string.image_description_toggle_shift),
+                            modifierLevel = modifierState.shiftState,
+                            onClick = onShiftPress,
                         )
                         // Arrow keys (repeatable). Left and right are auto-mirrored:
                         // where they point is a property of the arrow, not of the
