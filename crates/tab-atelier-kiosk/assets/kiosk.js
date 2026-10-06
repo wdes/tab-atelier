@@ -1411,31 +1411,39 @@ function wireIntentDialog(el) {
 
 // Onglet (c) — the draggable separator between the answer and the input box.
 //
-// A pointer drag rather than a resize handle: the pane is not a window, and
-// `setPointerCapture` keeps the drag working when the pointer leaves the thin
-// separator, which is the usual way a DIY split breaks.
+// `pointerdown` is delegated from the PANEL, not attached to the separator: a
+// re-render replaces the pane's innerHTML, so a listener bound to the separator
+// element would be bound to a node that no longer exists. The clicks are
+// delegated for that reason; this was the one that was missed first, and it
+// showed as a drag handle that looked right and did nothing.
+//
+// The move and up listeners do go on the separator, and are removed on up: they
+// only have to outlive the drag, and `setPointerCapture` keeps them firing when
+// the pointer leaves the 6px strip — the usual way a DIY split breaks.
 function wireIntentSplit(panel) {
-  const drag = panel.querySelector(".kk-conv-drag");
-  const main = panel.querySelector(".kk-intent-main");
-  if (!drag || !main) return;
-  drag.addEventListener("pointerdown", (e) => {
+  panel.addEventListener("pointerdown", (e) => {
+    const drag = e.target.closest(".kk-conv-drag");
+    if (!drag) return;
+    const main = panel.querySelector(".kk-intent-main");
+    if (!main) return;
     e.preventDefault();
     drag.setPointerCapture(e.pointerId);
     const move = (ev) => {
       const box = main.getBoundingClientRect();
       if (!box.height) return;
-      // Measured from the BOTTOM: the input box is pinned there, so the drag
-      // sets how much room the answer gets above it.
-      const answerPct = ((ev.clientY - box.top) / box.height) * 100;
-      writeIntentSplit(answerPct);
+      // A share of the height, measured from the top: the answer takes it, and
+      // the input box takes what is left.
+      writeIntentSplit(((ev.clientY - box.top) / box.height) * 100);
       applyIntentSplit(panel);
     };
     const up = () => {
       drag.removeEventListener("pointermove", move);
       drag.removeEventListener("pointerup", up);
+      drag.removeEventListener("pointercancel", up);
     };
     drag.addEventListener("pointermove", move);
     drag.addEventListener("pointerup", up);
+    drag.addEventListener("pointercancel", up);
   });
 }
 
