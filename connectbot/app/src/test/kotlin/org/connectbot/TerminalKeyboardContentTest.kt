@@ -227,20 +227,22 @@ class TerminalKeyboardContentTest {
     }
 
     /**
-     * The keyboard key is always in the bar, below `FN`.
+     * The keyboard key is in the bar, below `FN`, and nothing can take it out.
      *
-     * It used to sit behind the `showImeToggleKey` preference, which is what left the
-     * slot under `FN` empty for most people — the bar read as though a key were
-     * missing from it. The preference was upstream's way of making the button optional
-     * in *its* single scrolling row; this layout has the key in it, so nothing gates
-     * it now.
+     * It used to sit behind upstream's `showImeToggleKey` preference, which is what
+     * left that slot empty for most people — the bar read as though a key were missing
+     * from it. The preference was upstream's way of making the button optional in *its*
+     * single scrolling row; this layout has the key in it, so the parameter is gone
+     * rather than merely defaulted, and there is no longer a state to assert against.
      *
-     * Asserted with the preference OFF, because that is the case that used to hide it:
-     * an assertion with the default would pass whether the gate were removed or not.
+     * Upstream's setting is still on the settings screen and no longer affects the
+     * bar. That is deliberate and recorded in docs/connectbot-fork.md: removing the
+     * row from their preferences screen would be a fork delta larger than the problem,
+     * and a key that is always there is what this bar was asked for.
      */
     @Test
-    fun theKeyboardKeyIsAlwaysThereEvenWithThePreferenceOff() {
-        setKeyboardContent(showImeToggleKey = false)
+    fun theKeyboardKeyIsAlwaysThere() {
+        setKeyboardContent()
 
         composeTestRule
             .onNodeWithContentDescription(composeTestRule.activity.getString(R.string.image_description_show_keyboard))
@@ -267,7 +269,6 @@ class TerminalKeyboardContentTest {
         onScrollInProgressChange: (Boolean) -> Unit = {},
         imeVisible: Boolean = false,
         bumpyArrows: Boolean = false,
-        showImeToggleKey: Boolean = true,
         onToggleComposeMode: () -> Unit = {},
     ) {
         composeTestRule.setContent {
@@ -289,7 +290,6 @@ class TerminalKeyboardContentTest {
                     imeVisible = imeVisible,
                     playAnimation = false,
                     bumpyArrows = bumpyArrows,
-                    showImeToggleKey = showImeToggleKey,
                     onToggleComposeMode = onToggleComposeMode,
                 )
             }

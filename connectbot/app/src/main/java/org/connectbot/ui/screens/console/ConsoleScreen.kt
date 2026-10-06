@@ -426,7 +426,6 @@ private fun ConsoleTerminalPage(
     onInterceptKey: (KeyEvent) -> Boolean,
     onReconnect: () -> Unit,
     snackbarHostState: SnackbarHostState,
-    showImeToggleKey: Boolean,
     isComposeModeActive: Boolean,
     onToggleComposeMode: () -> Unit,
     onShortcutModifierChange: () -> Unit,
@@ -550,7 +549,6 @@ private fun ConsoleTerminalPage(
                     onScrollInProgressChange = onKeyboardScrollInProgressChange,
                     imeVisible = imeVisible,
                     playAnimation = !hasPlayedKeyboardAnimation,
-                    showImeToggleKey = showImeToggleKey,
                     isComposeModeActive = isComposeModeActive,
                     onToggleComposeMode = onToggleComposeMode,
                     onShortcutModifierChange = onShortcutModifierChange,
@@ -649,7 +647,6 @@ fun ConsoleScreen(
     val swipeSessionsEnabled = remember {
         prefs.getBoolean(PreferenceConstants.SWIPE_SESSIONS, false)
     }
-    val showImeToggleKey = remember { prefs.getBoolean(PreferenceConstants.IME_TOGGLE_KEY, true) }
     val imeShortcutInputMode = remember {
         val storedMode = prefs.getString(
             PreferenceConstants.IME_SHORTCUT_INPUT_MODE,
@@ -1244,7 +1241,6 @@ fun ConsoleScreen(
                                 onInterceptKey = handleShortcut,
                                 onReconnect = { viewModel.reconnect(bridge) },
                                 snackbarHostState = snackbarHostState,
-                                showImeToggleKey = showImeToggleKey,
                                 isComposeModeActive = composeController?.isComposeModeActive == true,
                                 onToggleComposeMode = {
                                     composeController?.toggleComposeMode()

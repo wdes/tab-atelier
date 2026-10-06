@@ -409,6 +409,24 @@ change, not one here. The compose-mode key is gone because the console's own men
 already toggles it and the layout has no slot; a test pins its absence so a later
 upstream sync cannot resurrect it silently.
 
+Two of upstream's keys were *added* rather than removed, and one of their preferences
+is now inert:
+
+- **Shift** did not exist in upstream's bar, so `Shift`+`Tab` could only be typed on a
+  hardware keyboard. The key latches through the same `metaPress` cycle `Ctrl` and
+  `Alt` use — `OFF` → `TRANSIENT` → `LOCKED` — and `LOCKED` is what makes it usable
+  one-handed: tap it twice to hold it, then tap `Tab`. That state is upstream's
+  `ModifierLevel.LOCKED`, which a French keyboard paints as `Verr Maj`. Nothing had to
+  change underneath: `TerminalKeyListener` already converted `OUR_SHIFT_MASK` for the
+  encoder, so only the key was missing.
+- **The soft-keyboard key is always present**, below `FN`. It was behind upstream's
+  `showImeToggleKey` preference, which is what left that slot empty and made the bar
+  look as though a key were missing from it. The parameter is gone from the bar rather
+  than defaulted, so nothing can gate it; the preference is still on the settings
+  screen and no longer affects this bar, which is a deliberate choice — removing the
+  row from their preferences screen would be a larger fork delta than the problem, and
+  a key that is always there is what this bar was for.
+
 **Two of the four bugs this took would have shipped a bar whose keys could not be
 pressed, and both were invisible in the source:**
 
