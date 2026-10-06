@@ -326,7 +326,15 @@ fn new(body: &[u8], ctx: &Ctx) -> Result<serde_json::Value, Failure> {
     // not be started would lose the PO's text.
     let spawned = spawn_worker(&slug, &repo, ctx);
     let (worker, note) = match spawned {
-        Ok(Some(id)) => (Some(id), None),
+        Ok(Some(id)) => {
+            // The worker is started with nothing appended; the intention goes
+            // in as its first message. Failing to hand it over does not undo
+            // the intention — the PO's text is the thing worth keeping — but it
+            // is reported, because a worker that never got the brief would
+            // otherwise answer as if it had.
+            let note = open_with(&slug, &id, ctx).err();
+            (Some(id), note)
+        }
         Ok(None) => (
             None,
             Some("no worker command configured; set TAB_ATELIER_INTENT_CMD".to_string()),
@@ -431,17 +439,24 @@ fn front_matter_repo(raw: &str) -> Option<String> {
 /// `Ok(None)` means no command is configured — not an error, just an intention
 /// without an agent. The id is found by name after the request, because
 /// `POST /tabs` queues the creation and returns before the tab is made.
+///
+/// The command is started **exactly as configured**, with nothing appended. The
+/// first version of this passed `--intention <path>`; no agent has that flag,
+/// and inventing one would make the Kiosk work with exactly the runner it was
+/// written against. The intention reaches the worker as its **first message**
+/// instead — see [`open_with`] — which any agent can read and which puts the
+/// brief in the conversation where the PO can see it.
 fn spawn_worker(slug: &str, repo: &str, ctx: &Ctx) -> Result<Option<String>, String> {
     let Some(cmd) = ctx.state.worker_cmd.as_deref() else {
         return Ok(None);
     };
-    // The command carries the intention's own file so the worker starts knowing
-    // what it is working on, rather than needing a first message to be told.
-    let target = ctx.state.intentions.path_of(slug).map(|(path, _)| path)?;
+    // Checked before starting anything: an intention that cannot be read is not
+    // worth a tab, and the error has to arrive before the side effect.
+    ctx.state.intentions.path_of(slug)?;
     let payload = serde_json::json!({
         "cwd": repo,
         "name": State::worker_name(slug),
-        "cmd": format!("{cmd} --intention {}", target.display()),
+        "cmd": cmd,
     });
     let request = http::Request::builder()
         .method("POST")
@@ -463,7 +478,33 @@ fn spawn_worker(slug: &str, repo: &str, ctx: &Ctx) -> Result<Option<String>, Str
             return Ok(Some(id));
         }
     }
-    Ok(None)
+    // The tab was asked for and never appeared. Reported rather than folded
+    // into `Ok(None)`: "no command is configured" and "the daemon accepted the
+    // request and made nothing" look identical from the pane and have nothing
+    // in common, and telling them apart is the difference between checking the
+    // environment and checking the daemon. It cost an hour to learn.
+    Err(format!(
+        "the daemon accepted the tab request but no tab named {:?} appeared within 2s; \
+         check that the daemon was built with `cmd`/`name` support in POST /tabs",
+        State::worker_name(slug)
+    ))
+}
+
+/// Hand the worker its intention and return whatever it answers.
+///
+/// Best-effort by design: the tab exists but the agent inside it may still be
+/// starting, so a failure here does not undo the intention. It is reported so
+/// the pane can say "the worker did not take the brief" rather than showing a
+/// silence with no cause.
+fn open_with(slug: &str, tab_id: &str, ctx: &Ctx) -> Result<String, String> {
+    let raw = ctx.state.intentions.read(slug)?;
+    let briefing = format!(
+        "Tu es le worker de diagnostic d'une intention. Voici le fichier :\n\n{raw}\n\n\
+         Objectif : circonscrire cette intention — perimetre, contraintes, criteres \
+         d'acceptation — en quelques tours. Tu es en LECTURE SEULE : tu ne modifies \
+         aucun fichier sauf ce .md, que tu completes au fil de la discussion."
+    );
+    post_catbus_message(tab_id, &briefing, ctx).map_err(|e| e.message)
 }
 
 /// Post a prompt to a tab's agent and return its reply.

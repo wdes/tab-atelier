@@ -2,17 +2,18 @@
 //   (a) Décisions — the shell wraps the existing decisions list unchanged;
 //   (b) Rapports  — reportsView unwraps the read-model; reportItemHtml renders a LOCAL viewer
 //       link (the sandboxed /decisions/file route) + the remote-link seam;
-//   (c) Grille d'intention — intentMarkdown folds {intent, rows[]} to a markdown artefact.
+//   (c) Intention — the pane is a CONVERSATION with a diagnostic worker (its
+//       own detail is in kiosk.intent.test.mjs; here we only check the shell).
 // Run: node assets/kiosk.tabs.test.mjs
 import assert from "node:assert/strict";
-import { kioskHtml, reportsView, reportItemHtml, reportsHtml, intentMarkdown } from "../kiosk.js";
+import { kioskHtml, reportsView, reportItemHtml, reportsHtml } from "../kiosk.js";
 
 // ============================ kioskHtml — the 3-tab shell ============================
 {
   const html = kioskHtml({ decisions: [{ id: "h1", project: "harness", state: "open", title: "ho" }] });
   // A tablist with exactly the three tabs, in order a→b→c.
   assert.match(html, /class="kk-tabs" role="tablist"/, "a tablist wraps the tabs");
-  for (const [id, label] of [["decisions", "Décisions à prendre"], ["reports", "Rapports"], ["intent", "Grille d'intention"]]) {
+  for (const [id, label] of [["decisions", "Décisions à prendre"], ["reports", "Rapports"], ["intent", "Intention"]]) {
     assert.match(html, new RegExp(`data-tab="${id}"[^>]*>${label}<`), `tab ${id} present with its label`);
   }
   assert.ok(html.indexOf('data-tab="decisions"') < html.indexOf('data-tab="reports"'), "tabs ordered a → b");
@@ -28,11 +29,12 @@ import { kioskHtml, reportsView, reportItemHtml, reportsHtml, intentMarkdown } f
   assert.match(html, /class="kk-show-archived"/, "the show-archived toggle is preserved");
   // (b) reports panel starts as a loading placeholder (filled lazily on activation).
   assert.match(html, /data-panel="reports"[^>]*>.*kk-reports.*kk-loading/s, "reports panel is a lazy loader");
-  // (c) intent panel carries the auto-grow textarea, a G/W/T row, add + post buttons.
-  assert.match(html, /data-panel="intent"[^>]*>[\s\S]*kk-intent-text kk-autogrow/, "intent has an auto-grow textarea");
-  assert.match(html, /kk-gwt-given kk-autogrow[\s\S]*kk-gwt-when[\s\S]*kk-gwt-then/, "intent has a Given/When/Then row");
-  assert.match(html, /class="kk-gwt-add"/, "intent has an add-row button");
-  assert.match(html, /class="kk-intent-post"/, "intent has a 'poser' button");
+  // (c) intent panel starts as a lazy loader too; the conversation itself is
+  // built once the list is known (see kiosk.intent.test.mjs for the pane).
+  assert.match(html, /data-panel="intent"[^>]*>[\s\S]*kk-loading/, "intent panel is a lazy loader");
+  // The dialog travels WITH the shell: it must exist before any intention does,
+  // or "nouvelle intention" would have nothing to open.
+  assert.match(html, /class="kk-intent-dialog"/, "the new-intention dialog is in the shell");
   // A single global close button in the header.
   assert.match(html, /class="kk-close"/, "a global close button");
 }
@@ -68,32 +70,15 @@ import { kioskHtml, reportsView, reportItemHtml, reportsHtml, intentMarkdown } f
   assert.match(reportsHtml({ reports: [{ name: "a.md", path: "outbox/a.md" }] }, true), /kk-report-list/, "reports -> a list");
 }
 
-// ============================ intentMarkdown — grid fields -> markdown ============================
+// ============================ (c) Intention — the shell's share ============================
+// The pane's own logic (conversation parsing, split bounds, escaping) lives in
+// kiosk.intent.test.mjs. What belongs here is what the SHELL decides: that the
+// tab exists, is labelled, and is ordered after Rapports.
 {
-  // Full grid: intent prose + two G/W/T rows.
-  const md = intentMarkdown({
-    intent: "Rendre le kiosk multi-onglets",
-    rows: [
-      { given: "un kiosque servi", when: "j'ouvre le kiosk", then: "je vois 3 onglets" },
-      { given: "l'onglet grille", when: "je pose l'intention", then: "un intent-*.md est écrit" },
-    ],
-  });
-  assert.match(md, /^# Intention\n/, "starts with the Intention heading");
-  assert.match(md, /Rendre le kiosk multi-onglets/, "the intent prose is included");
-  assert.match(md, /## Acceptance \(Given\/When\/Then\)/, "a G/W/T section when rows are present");
-  assert.match(md, /- \*\*Given\*\* un kiosque servi/, "given rendered");
-  assert.match(md, /\*\*When\*\* j'ouvre le kiosk/, "when rendered");
-  assert.match(md, /\*\*Then\*\* je vois 3 onglets/, "then rendered");
-  assert.match(md, /un intent-\*.md est écrit/, "the second row is included");
-  assert.ok(md.endsWith("\n"), "ends with a single trailing newline");
-
-  // Empty rows are dropped; an all-empty grid yields just the heading (server 400s that anyway).
-  const sparse = intentMarkdown({ intent: "juste une idée", rows: [{ given: "", when: "", then: "" }] });
-  assert.ok(!/Acceptance/.test(sparse), "an all-empty row is dropped -> no G/W/T section");
-  assert.match(sparse, /juste une idée/, "the intent prose survives");
-  const bare = intentMarkdown({});
-  assert.equal(bare, "# Intention\n", "an empty grid -> just the heading");
-  assert.doesNotThrow(() => intentMarkdown(null), "null fields -> no throw");
+  const html = kioskHtml({ decisions: [] });
+  assert.match(html, /data-tab="intent"[^>]*>Intention</, "the tab is labelled Intention");
+  assert.ok(html.indexOf('data-tab="reports"') < html.indexOf('data-tab="intent"'), "ordered b → c");
 }
+
 
 console.log("OK: kiosk 3 onglets (shell a/b/c, reports view+item local-link+remote-link-seam, intent markdown fold)");

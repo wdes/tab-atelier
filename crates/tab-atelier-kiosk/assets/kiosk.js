@@ -412,10 +412,11 @@ async function handleCatalogEdit(target) {
 // on-demand (a separate cold source). The server read-model is
 // rendered VERBATIM: state / verdict / visibility are the fold's call, no JS re-gate.
 const DECISIONS_URL = "/decisions";
-// Volet-2 (#kiosk 3 onglets): the Rapports tab reads the cold report list; the Grille
-// d'intention posts a folded intention → a server-named intent-<ts>.md (both same sandbox).
+// Volet (b): the Rapports tab reads the cold report list.
 const REPORTS_URL = "/reports";
-const INTENT_URL = "/intent";
+// Volet (c): the intention tab talks to this crate's own /intent routes — the
+// files are served here, not proxied, which is why there is no INTENT_URL to
+// match the two above.
 // The active Kiosk tab persists across reloads (like the catalogue toggle).
 const KIOSK_TAB_KEY = "ta-dash.kiosk-tab";
 const KIOSK_TABS = ["decisions", "reports", "intent"];
@@ -885,58 +886,218 @@ export function reportsHtml(readModel, canRule, mode = "date") {
     <div class="cat-list cat-list-grouped kk-report-groups">${groups.map(groupHtml).join("")}</div>`;
 }
 
-// Onglet (c) — fold the intention grid fields into a markdown artefact. PURE + XSS-neutral:
-// the text is stored VERBATIM (the /decisions/file viewer escapes-first on read), so nothing
-// here needs to escape. Empty rows are dropped; an all-empty grid yields just the heading.
-export function intentMarkdown(fields) {
-  const f = fields || {};
-  const intent = String(f.intent == null ? "" : f.intent).trim();
-  const rows = Array.isArray(f.rows) ? f.rows : [];
-  const lines = ["# Intention", ""];
-  if (intent) lines.push(intent, "");
-  const gwt = rows
-    .map((r) => ({
-      given: String((r && r.given) || "").trim(),
-      when: String((r && r.when) || "").trim(),
-      then: String((r && r.then) || "").trim(),
-    }))
-    .filter((r) => r.given || r.when || r.then);
-  if (gwt.length) {
-    lines.push("## Acceptance (Given/When/Then)", "");
-    for (const r of gwt) lines.push(`- **Given** ${r.given}`, `  **When** ${r.when}`, `  **Then** ${r.then}`, "");
+// ===== Onglet (c) — Intention =====
+// The intention pane is a CONVERSATION, not a form: the PO talks to a diagnostic
+// worker until the intention is circumscribed, then promotes it to
+// READY-intentions where it becomes a pool for planners.
+//
+// The conversation is the .md file itself — the server appends each turn to it —
+// so this pane only has to read it back. Nothing is kept client-side: a reload
+// shows the same file, and a file edited by hand shows up as written.
+
+// The smallest and largest share of the pane the answer may take. Below the
+// first the question box is unusable; above the second the answer is.
+const INTENT_SPLIT_MIN = 25;
+const INTENT_SPLIT_MAX = 85;
+const INTENT_SPLIT_KEY = "ta-dash.intent-split";
+
+// Pure: keep a stored split inside the usable range.
+//
+// A number read back from localStorage is untrusted — another version may have
+// written it, or a person may have edited it — and a split of 0 would leave the
+// pane with no answer box and no visible way back. Clamping here rather than at
+// the call sites means the drag, the restore and any future caller share one rule.
+export function clampSplit(pct) {
+  // `pct == null` before `Number`: `Number(null)` is 0 and `Number("")` is 0,
+  // both finite, so a missing or blank value would be clamped UP to the floor
+  // instead of falling back to the default — a pane that looks broken rather
+  // than one that looks normal.
+  if (pct == null || pct === "") return 60;
+  const n = Number(pct);
+  if (!Number.isFinite(n)) return 60;
+  return Math.min(INTENT_SPLIT_MAX, Math.max(INTENT_SPLIT_MIN, Math.round(n)));
+}
+
+// Pure: the intentions grouped for the list, working ones first.
+//
+// The server already sorts ready-last; grouping again here is what lets the
+// menu show two labelled sections without the caller slicing an array it would
+// have to know the order of.
+export function intentPaneModel(list) {
+  const items = Array.isArray(list) ? list : [];
+  const norm = (i) => ({
+    slug: String((i && i.slug) || ""),
+    title: String((i && i.title) || (i && i.slug) || ""),
+    repo: String((i && i.repo) || ""),
+    ready: Boolean(i && i.ready),
+  });
+  return {
+    wip: items.filter((i) => !i || !i.ready).map(norm),
+    ready: items.filter((i) => i && i.ready).map(norm),
+  };
+}
+
+// Pure: split an intention file into its conversation turns.
+//
+// The server writes each turn as `### <who>` followed by the text, so the
+// separator is the heading — a regex on the rendered HTML would break on a
+// heading the PO typed inside their own message. Front matter is dropped: it is
+// the file's bookkeeping, not something anyone said.
+export function intentTurns(markdown) {
+  const src = String(markdown == null ? "" : markdown);
+  // Everything after the closing `---` of the front matter.
+  let body = src;
+  if (src.startsWith("---")) {
+    const end = src.indexOf("\n---", 3);
+    if (end !== -1) body = src.slice(src.indexOf("\n", end + 1) + 1);
   }
-  return `${lines.join("\n").replace(/\n+$/, "")}\n`;
+  const turns = [];
+  const heading = /^###[ \t]*(.+?)[ \t]*$/gm;
+  let m;
+  let last = null;
+  while ((m = heading.exec(body)) !== null) {
+    if (last) {
+      turns.push({ who: last.who, text: body.slice(last.end, m.index).trim() });
+    } else {
+      // What comes BEFORE the first heading is the pitch the PO wrote when
+      // creating the intention. Dropping it would lose the one sentence that
+      // says what the intention is about — and the file would open on the
+      // worker's first answer, as if the question had never been asked.
+      const opening = body.slice(0, m.index).trim();
+      if (opening) turns.push({ who: "Vous", text: opening });
+    }
+    last = { who: m[1], end: heading.lastIndex };
+  }
+  if (last) turns.push({ who: last.who, text: body.slice(last.end).trim() });
+  // No heading at all: the whole body is the pitch.
+  if (!turns.length && body.trim()) turns.push({ who: "Vous", text: body.trim() });
+  return turns;
 }
 
-// Onglet (c) — one repeatable Given/When/Then row (three auto-grow textareas).
-function intentRowHtml() {
-  return `<div class="kk-gwt-row">`
-    + `<textarea class="kk-gwt-given kk-autogrow" rows="1" placeholder="Given…"></textarea>`
-    + `<textarea class="kk-gwt-when kk-autogrow" rows="1" placeholder="When…"></textarea>`
-    + `<textarea class="kk-gwt-then kk-autogrow" rows="1" placeholder="Then…"></textarea>`
-    + `</div>`;
+// Pure: render the conversation.
+//
+// Only the text of each turn is shown — no tool calls, no command lines. That
+// filtering is done at the source, not here: the daemon's catbus endpoint
+// answers with the model's final text alone, so a tool invocation never reaches
+// this function. Filtering again on the way out would mean guessing from the
+// prose which lines were commands, and guessing wrong on a line the PO meant.
+export function intentTranscriptHtml(markdown) {
+  const turns = intentTurns(markdown);
+  if (!turns.length) {
+    return `<div class="kk-conv-empty">Aucun échange pour l'instant. Écrivez la première phrase ci-dessous.</div>`;
+  }
+  return turns
+    .map((t) => {
+      const mine = t.who.toLowerCase() === "vous";
+      return `<div class="kk-turn ${mine ? "kk-turn-me" : "kk-turn-worker"}">`
+        + `<div class="kk-turn-who">${escapeHtml(t.who)}</div>`
+        + `<div class="kk-turn-text">${renderDetail(t.text)}</div>`
+        + `</div>`;
+    })
+    .join("");
 }
 
-// Onglet (c) — the intention grid: an auto-grow intent textarea + repeatable G/W/T rows + the
-// "poser l'intention" button. The textareas grow as the text grows (kk-autogrow, wired on input).
-function intentFormHtml() {
-  return `<div class="kk-intent">
-    <p class="kk-intent-hint">Définir l'intention avec le PO. Les champs grandissent à mesure que le texte grandit.</p>
-    <label class="kk-intent-label">Intention
-      <textarea class="kk-intent-text kk-autogrow" rows="3" placeholder="Décrire l'intention / le besoin…"></textarea>
-    </label>
-    <div class="kk-gwt-rows">${intentRowHtml()}</div>
-    <button type="button" class="kk-gwt-add">+ ajouter un Given/When/Then</button>
-    <div class="kk-intent-actions">
-      <button type="button" class="kk-intent-post">poser l'intention</button>
-      <span class="kk-intent-msg" role="status"></span>
+// Pure: one row of the intention list.
+export function intentItemHtml(intention, activeSlug) {
+  const i = intention || {};
+  const active = i.slug === activeSlug;
+  const where = i.ready ? "READY" : "en cours";
+  return `<button type="button" class="kk-intent-item${active ? " is-active" : ""}"`
+    + ` data-intent="${escapeHtml(i.slug)}" title="${escapeHtml(i.repo || "")}">`
+    + `<span class="kk-intent-item-title">${escapeHtml(i.title)}</span>`
+    + `<span class="kk-intent-item-state">${where}</span>`
+    + `</button>`;
+}
+
+// Onglet (c) — the pane: the list, the conversation, the box to write in.
+//
+// `state` is `{list, active, markdown, worker, busy, note}`. Everything here is
+// pure string building; the wiring (fetch, drag, submit) lives in the bootstrap
+// below, which is why this can be asserted without a DOM.
+export function intentPaneHtml(state) {
+  const s = state || {};
+  const model = intentPaneModel(s.list);
+  const split = clampSplit(s.split);
+  const hasActive = Boolean(s.active);
+
+  const listSection = (label, items) => (items.length
+    ? `<div class="kk-intent-group"><div class="kk-intent-group-label">${label}</div>`
+      + items.map((i) => intentItemHtml(i, s.active)).join("")
+      + `</div>`
+    : "");
+
+  const empty = model.wip.length + model.ready.length === 0
+    ? `<p class="kk-intent-hint">Aucune intention. « Nouvelle intention » en crée une et lance un worker pour la circonscrire.</p>`
+    : "";
+
+  const answer = hasActive
+    ? `<div class="kk-conv-transcript">${intentTranscriptHtml(s.markdown)}</div>`
+    : `<div class="kk-conv-empty">Choisissez une intention à gauche, ou créez-en une.</div>`;
+
+  const status = s.note ? `<span class="kk-intent-msg">${escapeHtml(s.note)}</span>` : "";
+  const workerTag = hasActive
+    ? (s.worker
+      ? `<span class="kk-conv-worker is-live" title="${escapeHtml(s.worker)}">worker actif</span>`
+      : `<span class="kk-conv-worker" title="aucun worker pour cette intention">sans worker</span>`)
+    : "";
+
+  return `<div class="kk-intent-pane">
+    <div class="kk-intent-side">
+      <button type="button" class="kk-intent-new">+ Nouvelle intention</button>
+      ${empty}
+      ${listSection("En cours", model.wip)}
+      ${listSection("Prêtes à planifier", model.ready)}
+      ${status}
+    </div>
+    <div class="kk-intent-main" style="--kk-split: ${split}%">
+      <div class="kk-conv-head">
+        <span class="kk-conv-title">${hasActive ? escapeHtml(s.active) : "Intention"}</span>
+        ${workerTag}
+        <button type="button" class="kk-conv-promote"${hasActive ? "" : " disabled"}>Marquer prête</button>
+        <button type="button" class="kk-conv-launch"${hasActive ? "" : " disabled"}
+          title="lancer un agent sur cette intention">Lancer</button>
+      </div>
+      <div class="kk-conv-answer">${answer}</div>
+      <div class="kk-conv-drag" role="separator" aria-label="redimensionner" tabindex="0"></div>
+      <div class="kk-conv-input">
+        <textarea class="kk-conv-text" rows="2" placeholder="Écrire au worker…"
+          ${hasActive ? "" : "disabled"}></textarea>
+        <button type="button" class="kk-conv-send"${hasActive ? "" : " disabled"}>Envoyer</button>
+      </div>
     </div>
   </div>`;
 }
 
-// The 3-tab Kiosk shell: (a) Décisions, (b) Rapports, (c) Grille d'intention. The active tab
-// (persisted) is baked into the markup; a global close button lives in the header. Reports load
-// lazily on activation; the intent form is static. kioskDecisionsHtml keeps the cards intact.
+// Onglet (c) — the "new intention" dialog. A real <dialog> so Escape and the
+// backdrop come from the platform rather than from a key handler that would
+// have to be written, tested, and kept working.
+export function intentDialogHtml() {
+  return `<dialog class="kk-intent-dialog">
+    <form method="dialog" class="kk-intent-form">
+      <label class="kk-intent-label">Titre
+        <input class="kk-intent-title" name="title" required maxlength="120"
+          placeholder="Cloisonnement des externes" autocomplete="off">
+      </label>
+      <label class="kk-intent-label">Dépôt
+        <input class="kk-intent-repo" name="repo" required
+          placeholder="/home/mox2/Dev/kalpin-back" autocomplete="off">
+      </label>
+      <label class="kk-intent-label">Phrase de présentation
+        <textarea class="kk-intent-pitch" name="pitch" rows="3"
+          placeholder="En une phrase : le besoin, et pourquoi maintenant."></textarea>
+      </label>
+      <div class="kk-intent-actions">
+        <button type="submit" class="kk-intent-post">OK</button>
+        <button type="button" class="kk-intent-cancel">Annuler</button>
+      </div>
+    </form>
+  </dialog>`;
+}
+
+// The 3-tab Kiosk shell: (a) Décisions, (b) Rapports, (c) Intention. The active tab
+// (persisted) is baked into the markup; a global close button lives in the header. Panels
+// that read a cold source (reports, intentions) render a placeholder and load on activation;
+// the intention pane is the only one whose content is per-item, so it carries its own state.
 export function kioskHtml(readModel) {
   const active = readKioskTab();
   const tab = (id, label) =>
@@ -950,11 +1111,12 @@ export function kioskHtml(readModel) {
     <div class="kk-tabs" role="tablist">
       ${tab("decisions", "Décisions à prendre")}
       ${tab("reports", "Rapports")}
-      ${tab("intent", "Grille d'intention")}
+      ${tab("intent", "Intention")}
     </div>
     ${panel("decisions", kioskDecisionsHtml(readModel))}
     ${panel("reports", `<div class="kk-reports"><div class="kk-loading">chargement…</div></div>`)}
-    ${panel("intent", intentFormHtml())}`;
+    ${panel("intent", `<div class="kk-intent-pane"><div class="kk-loading">chargement…</div></div>`)}
+    ${intentDialogHtml()}`;
 }
 
 // The badge = nb of OPEN decisions, from any decisions fetch (a cold source —
@@ -1000,7 +1162,7 @@ async function openKiosk() {
 function afterKioskRender(el) {
   const active = readKioskTab();
   if (active === "reports") loadReports(el);
-  if (active === "intent") initAutogrow(el);
+  if (active === "intent") { wireIntent(el); loadIntentions(el); }
 }
 
 // Onglet (a↔b↔c) — switch the visible panel, persist the choice, lazy-load reports, size the
@@ -1011,7 +1173,7 @@ function switchKioskTab(el, tabId) {
   el.querySelectorAll(".kk-tab").forEach((b) => b.setAttribute("aria-selected", String(b.dataset.tab === tabId)));
   el.querySelectorAll(".kk-tabpanel").forEach((p) => { p.hidden = p.dataset.panel !== tabId; });
   if (tabId === "reports") loadReports(el);
-  if (tabId === "intent") initAutogrow(el);
+  if (tabId === "intent") loadIntentions(el);
 }
 
 // Onglet (b) — the active ranging mode + the last fetched model/canRule, so switching the sort
@@ -1036,49 +1198,245 @@ async function loadReports(el) {
   }
 }
 
-// Onglet (c) — auto-grow: fit a textarea's height to its content. Feature-detect (no scrollHeight
-// / no style → no-op). Called on input and once after render for any pre-filled field.
-function autogrow(ta) {
-  if (!ta || !ta.style) return;
-  ta.style.height = "auto";
-  ta.style.height = `${ta.scrollHeight}px`;
-}
-function initAutogrow(el) {
-  el.querySelectorAll(".kk-autogrow").forEach(autogrow);
+// The conversation's textarea is sized by CSS (a few rows) rather than grown to
+// fit: it sits under a draggable split, so its height is the pane's business and
+// not its content's.
+
+// Onglet (c) — the intention pane's own state. It is the only tab whose content
+// is per-item, so it keeps what the others do not need: which intention is open,
+// its file, and whether a request is in flight.
+let intentState = { list: [], active: null, markdown: "", worker: null, busy: false, note: "" };
+
+function intentPanel(el) {
+  return el.querySelector('[data-panel="intent"]');
 }
 
-// Onglet (c) — gather the grid fields, fold to markdown, POST /intent (server writes a
-// server-named intent-<ts>.md). On success, show a viewer link to the created artefact.
-async function postIntent(el) {
-  const panel = el.querySelector('[data-panel="intent"]');
+// Re-render only the pane, so a send does not rebuild the whole Kiosk (which
+// would close an overlay and lose the scroll position of the transcript).
+function renderIntentPane(el) {
+  const panel = intentPanel(el);
   if (!panel) return;
-  const msg = panel.querySelector(".kk-intent-msg");
-  const setMsg = (html, cls) => { if (msg) { msg.innerHTML = html; msg.className = `kk-intent-msg ${cls}`; } };
-  const intent = panel.querySelector(".kk-intent-text")?.value || "";
-  const rows = [...panel.querySelectorAll(".kk-gwt-row")].map((r) => ({
-    given: r.querySelector(".kk-gwt-given")?.value || "",
-    when: r.querySelector(".kk-gwt-when")?.value || "",
-    then: r.querySelector(".kk-gwt-then")?.value || "",
-  }));
-  // Require SOMETHING (mirrors the server's non-empty-content 400) — a lone heading is not an intention.
-  const hasContent = intent.trim() || rows.some((r) => `${r.given}${r.when}${r.then}`.trim());
-  if (!hasContent) { setMsg("saisir une intention ou un Given/When/Then", "err"); return; }
-  const content = intentMarkdown({ intent, rows });
-  const canRule = typeof TOKEN === "string" && TOKEN.length > 0;
-  if (!canRule) { setMsg("lecture seule — ouvrez le kiosque avec un token pour poser une intention", "err"); return; }
+  panel.innerHTML = intentPaneHtml({ ...intentState, split: readIntentSplit() });
+  applyIntentSplit(panel);
+}
+
+function readIntentSplit() {
+  try { return clampSplit(localStorage.getItem(INTENT_SPLIT_KEY)); } catch { return 60; }
+}
+
+function writeIntentSplit(pct) {
+  try { localStorage.setItem(INTENT_SPLIT_KEY, String(clampSplit(pct))); } catch { /* ignore */ }
+}
+
+// The split is a CSS variable on the pane, so the drag writes one value and the
+// layout follows — no per-element arithmetic that would drift from the CSS.
+function applyIntentSplit(panel) {
+  const main = panel.querySelector(".kk-intent-main");
+  if (main) main.style.setProperty("--kk-split", `${readIntentSplit()}%`);
+}
+
+// Onglet (c) — fetch the list, render, and open the first intention if none is.
+async function loadIntentions(el) {
+  const panel = intentPanel(el);
+  if (!panel) return;
+  if (!intentState.list.length) panel.innerHTML = `<div class="kk-loading">chargement…</div>`;
   try {
-    const res = await fetch(INTENT_URL, {
-      method: "POST",
-      headers: { "content-type": "application/json", accept: "application/json", ...AUTH_HEADERS },
-      body: JSON.stringify({ content }),
-    });
+    const res = await fetch("/intent/list", { headers: { accept: "application/json", ...AUTH_HEADERS } });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const out = await res.json();
-    const href = `/decisions/file?path=${encodeURIComponent(out.path || "")}&token=${encodeURIComponent(TOKEN)}`;
-    setMsg(`intention posée ✓ — <a class="kk-file kk-intent-created" href="${escapeHtml(href)}" target="_blank" rel="noopener">${escapeHtml(String(out.name || ""))}</a>`, "ok");
+    intentState.list = (out && out.intentions) || [];
+    // Keep the open one if it is still there; otherwise open the first, so the
+    // pane is never an empty right-hand side after a reload.
+    if (!intentState.active && intentState.list.length) intentState.active = intentState.list[0].slug;
+    if (intentState.active) await openIntention(el, intentState.active, { keepList: true });
+    else renderIntentPane(el);
   } catch (err) {
-    setMsg(`échec : ${escapeHtml(err.message)}`, "err");
+    panel.innerHTML = `<div class="kk-error">intentions indisponibles (${escapeHtml(err.message)})</div>`;
   }
+}
+
+// Onglet (c) — read one intention: its file (the conversation) and its worker.
+async function openIntention(el, slug, opts) {
+  const panel = intentPanel(el);
+  if (!panel) return;
+  if (!opts || !opts.keepList) intentState.active = slug;
+  intentState.active = slug;
+  intentState.note = "";
+  try {
+    const res = await fetch(`/intent/${encodeURIComponent(slug)}`, { headers: { accept: "application/json", ...AUTH_HEADERS } });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const out = await res.json();
+    intentState.markdown = (out && out.markdown) || "";
+    intentState.worker = (out && out.worker) || null;
+  } catch (err) {
+    intentState.markdown = "";
+    intentState.worker = null;
+    intentState.note = `intention illisible : ${err.message}`;
+  }
+  renderIntentPane(el);
+  // The transcript is a conversation: the latest turn is the one to read, so it
+  // starts scrolled to the bottom rather than at the front matter.
+  const transcript = panel.querySelector(".kk-conv-transcript");
+  if (transcript) transcript.scrollTop = transcript.scrollHeight;
+}
+
+// Onglet (c) — ask the worker and append its answer.
+async function sendIntentMessage(el) {
+  const panel = intentPanel(el);
+  if (!panel || !intentState.active || intentState.busy) return;
+  const box = panel.querySelector(".kk-conv-text");
+  const text = (box && box.value || "").trim();
+  if (!text) return;
+  const send = panel.querySelector(".kk-conv-send");
+  intentState.busy = true;
+  intentState.note = "le worker réfléchit…";
+  if (send) send.disabled = true;
+  renderIntentPane(el);
+  try {
+    const res = await fetch(`/intent/${encodeURIComponent(intentState.active)}/ask`, {
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "application/json", ...AUTH_HEADERS },
+      body: JSON.stringify({ text }),
+    });
+    const out = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(out.error || `HTTP ${res.status}`);
+    intentState.markdown = out.markdown || intentState.markdown;
+    intentState.note = "";
+  } catch (err) {
+    // The question is already in the file — the server writes it before asking —
+    // so the pane says what failed without pretending the turn was lost.
+    intentState.note = `pas de réponse : ${err.message}`;
+  } finally {
+    intentState.busy = false;
+  }
+  renderIntentPane(el);
+  const transcript = panel.querySelector(".kk-conv-transcript");
+  if (transcript) transcript.scrollTop = transcript.scrollHeight;
+}
+
+// Onglet (c) — create an intention: the dialog's three fields, then the server
+// writes the file and starts a worker.
+async function createIntention(el, dialog) {
+  const form = dialog.querySelector(".kk-intent-form");
+  const val = (sel) => (form.querySelector(sel)?.value || "").trim();
+  const payload = { title: val(".kk-intent-title"), repo: val(".kk-intent-repo"), pitch: val(".kk-intent-pitch") };
+  if (!payload.title || !payload.repo) return;
+  try {
+    const res = await fetch("/intent/new", {
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "application/json", ...AUTH_HEADERS },
+      body: JSON.stringify(payload),
+    });
+    const out = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(out.error || `HTTP ${res.status}`);
+    dialog.close();
+    intentState.active = out.slug || null;
+    // `note` carries the server's own explanation when a worker could not be
+    // started — an intention with no agent is still an intention, and the pane
+    // says so instead of implying one is running.
+    intentState.note = out.note || "";
+    await loadIntentions(el);
+  } catch (err) {
+    const msg = dialog.querySelector(".kk-intent-msg");
+    if (msg) { msg.textContent = `échec : ${err.message}`; msg.className = "kk-intent-msg err"; }
+  }
+}
+
+// Onglet (c) — promote (move to READY-intentions) and launch (spawn an agent).
+async function intentAction(el, verb) {
+  if (!intentState.active) return;
+  intentState.note = "";
+  try {
+    const res = await fetch(`/intent/${encodeURIComponent(intentState.active)}/${verb}`, {
+      method: "POST",
+      headers: { accept: "application/json", ...AUTH_HEADERS },
+      body: "{}",
+    });
+    const out = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(out.error || `HTTP ${res.status}`);
+    intentState.note = verb === "promote" ? "déplacée dans READY-intentions ✓" : "agent lancé ✓";
+    await loadIntentions(el);
+  } catch (err) {
+    intentState.note = `échec : ${err.message}`;
+    renderIntentPane(el);
+  }
+}
+
+// Onglet (c) — wire the pane's interactions. Delegated from the panel so a
+// re-render does not need the listeners re-attached (the panel element stays).
+function wireIntent(el) {
+  const panel = intentPanel(el);
+  if (!panel || panel.dataset.wired === "1") return;
+  panel.dataset.wired = "1";
+
+  panel.addEventListener("click", (e) => {
+    const item = e.target.closest(".kk-intent-item");
+    if (item) { openIntention(el, item.dataset.intent); return; }
+    if (e.target.closest(".kk-intent-new")) {
+      const dialog = document.querySelector(".kk-intent-dialog");
+      if (dialog) { dialog.showModal(); dialog.querySelector(".kk-intent-title")?.focus(); }
+      return;
+    }
+    if (e.target.closest(".kk-conv-send")) { sendIntentMessage(el); return; }
+    if (e.target.closest(".kk-conv-promote")) { intentAction(el, "promote"); return; }
+    if (e.target.closest(".kk-conv-launch")) { intentAction(el, "launch"); return; }
+    if (e.target.closest(".kk-intent-cancel")) {
+      const dialog = document.querySelector(".kk-intent-dialog");
+      if (dialog) dialog.close();
+    }
+  });
+
+  panel.addEventListener("keydown", (e) => {
+    // Enter sends; Shift+Enter is a newline, because an intention is often a
+    // paragraph and a box that cannot hold one is a box nobody uses twice.
+    if (e.target.matches(".kk-conv-text") && e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      sendIntentMessage(el);
+    }
+  });
+
+  wireIntentDialog(el);
+  wireIntentSplit(panel);
+}
+
+// Onglet (c) — the new-intention dialog submits by value; `method="dialog"`
+// closes it, and the form's `submit` is what posts.
+function wireIntentDialog(el) {
+  const dialog = document.querySelector(".kk-intent-dialog");
+  if (!dialog || dialog.dataset.wired === "1") return;
+  dialog.dataset.wired = "1";
+  const form = dialog.querySelector(".kk-intent-form");
+  form?.addEventListener("submit", (e) => { e.preventDefault(); createIntention(el, dialog); });
+}
+
+// Onglet (c) — the draggable separator between the answer and the input box.
+//
+// A pointer drag rather than a resize handle: the pane is not a window, and
+// `setPointerCapture` keeps the drag working when the pointer leaves the thin
+// separator, which is the usual way a DIY split breaks.
+function wireIntentSplit(panel) {
+  const drag = panel.querySelector(".kk-conv-drag");
+  const main = panel.querySelector(".kk-intent-main");
+  if (!drag || !main) return;
+  drag.addEventListener("pointerdown", (e) => {
+    e.preventDefault();
+    drag.setPointerCapture(e.pointerId);
+    const move = (ev) => {
+      const box = main.getBoundingClientRect();
+      if (!box.height) return;
+      // Measured from the BOTTOM: the input box is pinned there, so the drag
+      // sets how much room the answer gets above it.
+      const answerPct = ((ev.clientY - box.top) / box.height) * 100;
+      writeIntentSplit(answerPct);
+      applyIntentSplit(panel);
+    };
+    const up = () => {
+      drag.removeEventListener("pointermove", move);
+      drag.removeEventListener("pointerup", up);
+    };
+    drag.addEventListener("pointermove", move);
+    drag.addEventListener("pointerup", up);
+  });
 }
 
 function closeKiosk() {
@@ -1195,14 +1553,6 @@ function bootstrap() {
       // Volet-2: the tab bar switches the visible panel (a/b/c) + persists the choice.
       const tabBtn = e.target.closest(".kk-tab");
       if (tabBtn) { switchKioskTab(kioskPanel, tabBtn.dataset.tab); return; }
-      // Volet-2 (c): grow the grid by one repeatable Given/When/Then row.
-      if (e.target.closest(".kk-gwt-add")) {
-        const rows = kioskPanel.querySelector(".kk-gwt-rows");
-        if (rows) { rows.insertAdjacentHTML("beforeend", intentRowHtml()); }
-        return;
-      }
-      // Volet-2 (c): persist the intention grid to outbox/intent-<ts>.md via POST /intent.
-      if (e.target.closest(".kk-intent-post")) { postIntent(kioskPanel); return; }
       if (e.target.closest(".kk-refresh")) { openKiosk(); return; }
       const showArch = e.target.closest(".kk-show-archived");
       if (showArch) { kioskIncludeArchived = !!showArch.checked; openKiosk(); return; }
