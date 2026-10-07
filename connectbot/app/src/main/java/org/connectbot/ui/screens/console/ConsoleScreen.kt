@@ -96,7 +96,9 @@ import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.drawscope.clipRect
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEvent
 import androidx.compose.ui.input.key.KeyEventType
@@ -325,6 +327,22 @@ internal fun terminalColorOrNull(hex: String): Color? =
  */
 private val HEX_COLOR = Regex("^#[0-9a-fA-F]{6}$")
 
+/**
+ * How much of the terminal's edge to clip, which is how its library's green outline is
+ * removed — see the modifier that uses it.
+ *
+ * A judgement rather than a value read from the library: the outline's width is a private
+ * constant in the same `TerminalKt` file as its colour, so it cannot be asked for. Three
+ * dp is comfortably more than an outline is usually drawn at, and less than half a
+ * character at the font size a 193-column grid fits onto a phone — so the cost is a sliver
+ * of the first column and the first row rather than anything legible.
+ *
+ * If a green line survives this on a device, the library's outline is wider than three dp
+ * and this number is what to raise; it is deliberately one constant in one place so that
+ * is a one-word change.
+ */
+private const val TERMINAL_EDGE_CLIP_DP = 3
+
 @VisibleForTesting
 internal fun shouldPreserveSoftwareKeyboardForBridgeChange(
     previousBridgeId: Long?,
@@ -483,6 +501,30 @@ private fun ConsoleTerminalPage(
                     bottom = if (keyboardAlwaysVisible) TERMINAL_KEYBOARD_BAR_HEIGHT_DP.dp else 0.dp,
                 )
                 .then(terminalModifier)
+                // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): termlib draws
+                // a Material-green outline around its terminal — `Color(0xFF4CAF50)` at
+                // 0.6 alpha, hardcoded in the library with no parameter to turn it off —
+                // and this clips it away.
+                //
+                // Clipped rather than painted over, and that is the point: a mask would
+                // have to be the terminal's own background, which for a tab-atelier
+                // session is the tab's colour and for a profile is whatever scheme that
+                // profile uses, so a mask would need to know both or it would draw a
+                // frame of the wrong colour around a session. Clipping needs to know
+                // neither: nothing is drawn where the border was, so the console's own
+                // backdrop shows through, which is already correct for every transport.
+                //
+                // The cost is that the outline's width is a private constant in the
+                // library, so how much to clip is a judgement rather than a value read
+                // from it. Three dp is comfortably more than such an outline is usually
+                // drawn at, and under half a character wide at the font size a 193-column
+                // grid fits — see [TERMINAL_EDGE_CLIP_DP].
+                .drawWithContent {
+                    val inset = TERMINAL_EDGE_CLIP_DP.dp.toPx()
+                    clipRect(inset, inset, size.width - inset, size.height - inset) {
+                        this@drawWithContent.drawContent()
+                    }
+                }
                 .testTag("terminal"),
             typeface = fontResult.typeface,
             initialFontSize = fontSize.sp,
