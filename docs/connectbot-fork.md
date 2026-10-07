@@ -503,6 +503,45 @@ the **native** library: `libjni_cb_term.so` is libvterm, and holds `>|libvterm(%
 and `?1;2c` verbatim. Stopping at the API surface produced a confident answer that was
 wrong.
 
+### Two numbers that had to agree, and a border that is not ours
+
+Three later fixes, each of which reads like something to remove or a detail to skip if
+the reason is not written down.
+
+**The terminal's green outline is termlib's, and is clipped away.** `TerminalBridge` and
+the console draw no border; that one is inside the library, unconditionally, with the
+colour hardcoded — `Color(0xFF4CAF50)`, Material Green 500, at 0.6 alpha — and no
+parameter to turn it off. The console **clips** the terminal's drawing to remove it rather
+than painting over it, and the distinction is the whole design: a mask would have to be
+the terminal's own background, which is the tab's colour for a tab-atelier session and
+whatever scheme the profile uses for every other transport — so a mask would need to know
+both, and would draw a frame of the wrong colour whenever it guessed. A clip needs to know
+neither: nothing is drawn where the border was, so the console's backdrop shows through,
+which is already correct for every tab and every transport.
+
+The clip width is a judgement, because the outline's width is a private constant beside
+its colour and cannot be asked for. `TERMINAL_EDGE_CLIP_DP` is one constant for that
+reason: if a sliver of green survives on a device, that is the number to raise.
+
+**The key bar is an overlay, so the terminal has to be padded clear of it.** The bar is
+drawn with `align(Alignment.BottomCenter)` over the terminal, so nothing sizes the
+terminal area down for it — a `bottom` padding does, and it reserved one key row's height
+while the bar had become two. The bar therefore sat over the terminal's last row and hid
+it, with nothing failing and nothing looking wrong. Both numbers now derive from
+`TERMINAL_KEYBOARD_BAR_HEIGHT_DP`. Note `keyboardAlwaysVisible` defaults to **true**, so
+that padding applies by default.
+
+**Pull-to-refresh re-asks every tab-atelier server.** Per server rather than per row,
+because the gesture is made on the list and means "all of this may be stale", and it
+forces the probe — which is what makes it useful, since the automatic probe is skipped
+when a server's own settings have not changed. The indicator follows the fetches rather
+than a flag of its own, so a failed refresh cannot leave it spinning; `fetchTabs` keeps
+the tabs it already has, so the list does not blank while it turns.
+
+The first two are the same fault as the two key rows needing equal counts: **values that
+have to agree**, kept in a shape where nothing makes them. Where that recurs, the fix is
+to derive one from the other rather than to remember both.
+
 ## Current state
 
 The app is a working ConnectBot under our package id, plus the tab-atelier type:
