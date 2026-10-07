@@ -331,17 +331,19 @@ private val HEX_COLOR = Regex("^#[0-9a-fA-F]{6}$")
  * How much of the terminal's edge to clip, which is how its library's green outline is
  * removed — see the modifier that uses it.
  *
- * A judgement rather than a value read from the library: the outline's width is a private
- * constant in the same `TerminalKt` file as its colour, so it cannot be asked for. Three
- * dp is comfortably more than an outline is usually drawn at, and less than half a
- * character at the font size a 193-column grid fits onto a phone — so the cost is a sliver
- * of the first column and the first row rather than anything legible.
+ * **Two dp, because that is exactly the library's border.** `TERMINAL_BORDER_WIDTH` is not
+ * a compile-time constant, so it does not appear beside its colour; it is assigned in
+ * `TerminalKt`'s static initializer as `Dp(2)`. A first version of this used three, which
+ * clipped two dp of border and one dp of the session's text with it, and the text is what
+ * a reader notices.
  *
- * If a green line survives this on a device, the library's outline is wider than three dp
- * and this number is what to raise; it is deliberately one constant in one place so that
- * is a one-word change.
+ * The width cannot be less than the border and cannot be more without eating text, so this
+ * is the one value that removes the outline and nothing else. It is the floor rather than a
+ * choice: termlib draws the border *over* the terminal's own area, so the outermost two dp
+ * of the grid are always the border's, and no offset can separate them — moving the
+ * drawing moves the border with it.
  */
-private const val TERMINAL_EDGE_CLIP_DP = 3
+private const val TERMINAL_EDGE_CLIP_DP = 2
 
 @VisibleForTesting
 internal fun shouldPreserveSoftwareKeyboardForBridgeChange(
