@@ -449,6 +449,60 @@ tests press each key and check the callback fires.
 with a text key dropped it in silence — `FN` had no accessible name. Fixing it is
 what makes "Show function keys" audible rather than the two letters.
 
+Four smaller faults in the bar were fixed after the layout itself, all reported from
+use rather than found by review:
+
+- **`Esc` and `Tab` ignored a latched modifier.** Both called
+  `keyDispatcher.dispatchKey(0, …)` and then `clearTransients()`, where every other key
+  passes the state built from Ctrl, Alt and Shift. A latched modifier was therefore
+  eaten without reaching the terminal, which is why Shift+Tab was impossible
+  one-handed; both now pass what the rest of the bar passes.
+- **`Tab` was labelled `⇥`**, a symbol no keyboard prints. It is the word now — "TAB" in
+  English, "Tab" in French, so a translation rather than a notation. Upstream has no
+  such label, so it is a string of ours.
+- **The two rows had different key counts** — seven above, eight below — so a weight
+  divided each row differently, every column was off by one, and the up arrow sat above
+  the left arrow rather than above the down arrow. The `|` key the layout was specified
+  with had been dropped; restoring it makes both rows eight. **A key present in one row
+  and not the other shifts that row's whole grid**, so the two have to be counted
+  together — reading either row on its own, both look correctly laid out.
+- **The function keys** use upstream's `button_key_f1`…`f12` rather than a format string
+  of ours. An earlier attempt reused `automation_key_function`, whose French turned out
+  to be a machine translation, "F %1$s", with a space where `F1` belongs.
+
+### The terminal's own answers are not typed into the session
+
+Not one of the numbered patches — this postdates the patch set, and the code is a
+subtree now — but it belongs in this record, because it reads like something a cleanup
+would remove as unnecessary.
+
+`TerminalBridge` wires the emulator's reply channel straight to the session:
+
+    onKeyboardInput = { data -> transportOperations.trySend(WriteData(data)) }
+
+That exists so a terminal can answer a program that asks it something. What makes it
+wrong here is the replay: a tab-atelier session sends the tab's whole scrollback when a
+viewer attaches, and that scrollback contains the query sequences other programs
+printed — so the emulator answers questions nobody asked, on every attach, and the
+answers arrive in the shell as input. A bash prompt grew
+`|libvterm(0.3)` followed by `ESC[?1;2c`: this terminal's XTVERSION reply and its DA1
+reply, typed into a prompt. The daemon's own browser client documents the same hazard
+and disables those replies for the same reason (`assets/main.js`).
+
+Two reply shapes are now dropped, both self-describing and useless on this path: the
+device-attribute replies (`ESC [ ? … c`, `ESC [ > … c`) and device-control strings
+(`ESC P … ESC \`), which is how XTVERSION answers. **A cursor-position report is
+deliberately kept** — a program asks where the cursor is while it is waiting for the
+answer, so dropping that would break the programs that use it rather than the replay
+that does not. The asymmetry is the point, and `isTerminalQueryReply` says so.
+
+Finding it took a wrong turn worth recording. The app was first ruled out on two true
+facts — the emulator's Kotlin API has no reply channel, and the daemon's own emulator
+answers with different bytes — and neither was decisive, because the reply path is in
+the **native** library: `libjni_cb_term.so` is libvterm, and holds `>|libvterm(%d.%d)`
+and `?1;2c` verbatim. Stopping at the API surface produced a confident answer that was
+wrong.
+
 ## Current state
 
 The app is a working ConnectBot under our package id, plus the tab-atelier type:
