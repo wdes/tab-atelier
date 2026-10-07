@@ -97,6 +97,20 @@ const val TERMINAL_KEYBOARD_HEIGHT_DP = 30
 private const val TERMINAL_KEYBOARD_ROWS = 2
 
 /**
+ * How tall the whole bar is, which is what a terminal has to leave free for it.
+ *
+ * Added for Tab Atelier Remote (Apache-2.0 section 4(b)) because the two drifted apart:
+ * the bar was made two rows tall while the console went on reserving room for one, so the
+ * bar sat over the terminal's bottom row and hid it. Nothing failed, and nothing looked
+ * broken — the terminal simply extended under the bar.
+ *
+ * Derived here rather than written out at both sites, so a third row would move both.
+ * The same shape as the two key rows needing equal counts: two numbers that have to agree
+ * are better off being one number.
+ */
+const val TERMINAL_KEYBOARD_BAR_HEIGHT_DP = TERMINAL_KEYBOARD_HEIGHT_DP * TERMINAL_KEYBOARD_ROWS
+
+/**
  * Width of the virtual keyboard keys in dp.
  */
 private const val TERMINAL_KEYBOARD_WIDTH_DP = 45
@@ -288,7 +302,7 @@ internal fun TerminalKeyboardContent(
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .height((TERMINAL_KEYBOARD_HEIGHT_DP * TERMINAL_KEYBOARD_ROWS).dp),
+                .height(TERMINAL_KEYBOARD_BAR_HEIGHT_DP.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             // The whole key area is ONE scroll surface with both rows inside it, so

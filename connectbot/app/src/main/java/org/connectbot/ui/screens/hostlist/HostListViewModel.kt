@@ -333,6 +333,24 @@ class HostListViewModel @Inject constructor(
     }
 
     /**
+     * Refresh every tab-atelier server's tabs at once, for the pull-to-refresh gesture.
+     *
+     * Per server rather than per row, because the gesture is made on the list and means
+     * "all of this may be stale" — and because forcing a probe is what makes it useful
+     * against a server whose tabs look stuck: [refreshTabs] probes even when the
+     * fingerprint says nothing about the server changed, which is exactly the case the
+     * automatic probe skips.
+     *
+     * A server that is not a tab-atelier one has nothing to fetch, so it is left alone
+     * rather than given a failure it cannot act on.
+     */
+    fun refreshAllTabAtelierTabs() {
+        _uiState.value.hosts
+            .filter { it.protocol == TabAtelier.PROTOCOL }
+            .forEach(::refreshTabs)
+    }
+
+    /**
      * Expand or collapse a tab-atelier host's tabs.
      */
     fun toggleTabHost(hostId: Long) {

@@ -76,6 +76,7 @@ import androidx.compose.material3.SnackbarResult
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -328,6 +329,7 @@ fun HostListScreen(
         onToggleSortOrder = viewModel::toggleSortOrder,
         onToggleTabHost = viewModel::toggleTabHost,
         onRefreshTabs = viewModel::refreshTabs,
+        onRefreshAllTabs = viewModel::refreshAllTabAtelierTabs,
         onDeleteHost = viewModel::deleteHost,
         onDuplicateHost = viewModel::duplicateHost,
         onForgetHostKeys = viewModel::forgetHostKeys,
@@ -358,6 +360,9 @@ fun HostListScreenContent(
     // host's row expands and refreshes its tabs.
     onToggleTabHost: (Long) -> Unit = {},
     onRefreshTabs: (Host) -> Unit = {},
+    // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): the pull-to-refresh
+    // gesture, which re-asks every tab-atelier server rather than one row's.
+    onRefreshAllTabs: () -> Unit = {},
     onDeleteHost: (Host) -> Unit,
     onDuplicateHost: (Host) -> Unit,
     onForgetHostKeys: (Host) -> Unit,
@@ -511,6 +516,24 @@ fun HostListScreenContent(
                 .padding(padding)
                 .fillMaxSize(),
         ) {
+            // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): pulling the list
+            // down re-asks every tab-atelier server.
+            //
+            // Per server and not per row, because the gesture is made on the list and
+            // means "all of this may be stale"; and it forces the probe, which is what
+            // makes it useful against a server whose tabs look stuck — the automatic
+            // probe is skipped when a server's own settings have not changed, so a stale
+            // row could otherwise be refreshed by nothing short of editing the server.
+            //
+            // The indicator follows the fetches rather than a flag of its own: it stops
+            // when the last one reports back, so it cannot be left spinning by a refresh
+            // that failed. `fetchTabs` keeps the tabs it already has while it fetches, so
+            // the list underneath does not blank while the indicator turns.
+            PullToRefreshBox(
+                isRefreshing = uiState.tabStates.values.any { it.loading },
+                onRefresh = onRefreshAllTabs,
+                modifier = Modifier.fillMaxSize(),
+            ) {
             when {
                 uiState.isLoading -> {
                     CircularProgressIndicator(
@@ -600,6 +623,7 @@ fun HostListScreenContent(
                         }
                     }
                 }
+            }
             }
         }
     }

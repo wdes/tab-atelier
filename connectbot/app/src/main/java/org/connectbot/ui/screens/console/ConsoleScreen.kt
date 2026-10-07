@@ -153,7 +153,7 @@ import org.connectbot.ui.components.AuthBannerDialog
 import org.connectbot.ui.components.FloatingTextInputDialog
 import org.connectbot.ui.components.InlinePrompt
 import org.connectbot.ui.components.ResizeDialog
-import org.connectbot.ui.components.TERMINAL_KEYBOARD_HEIGHT_DP
+import org.connectbot.ui.components.TERMINAL_KEYBOARD_BAR_HEIGHT_DP
 import org.connectbot.ui.components.TerminalKeyboard
 import org.connectbot.ui.components.UrlScanDialog
 import org.connectbot.ui.theme.terminal
@@ -472,7 +472,15 @@ private fun ConsoleTerminalPage(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(
-                    bottom = if (keyboardAlwaysVisible) TERMINAL_KEYBOARD_HEIGHT_DP.dp else 0.dp,
+                    // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): the
+                    // whole bar, not one row of it.
+                    //
+                    // This reserved TERMINAL_KEYBOARD_HEIGHT_DP — a single key's height —
+                    // while the bar had become two rows tall, so the terminal laid its
+                    // bottom row out underneath the bar and hid it. Nothing failed; the
+                    // text was simply not all visible. The bar and the space held for it
+                    // now come from one constant, so they cannot drift apart again.
+                    bottom = if (keyboardAlwaysVisible) TERMINAL_KEYBOARD_BAR_HEIGHT_DP.dp else 0.dp,
                 )
                 .then(terminalModifier)
                 .testTag("terminal"),
