@@ -465,7 +465,30 @@ class TerminalBridge {
             defaultForeground = Color(defaultFgColor),
             defaultBackground = Color(defaultBgColor),
             onKeyboardInput = { data ->
-                transportOperations.trySend(TransportOperation.WriteData(data))
+                // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): an answer
+                // the emulator makes to a device query is NOT sent to the session.
+                //
+                // This channel exists so a terminal can reply when a *program* asks it
+                // something — device attributes, its version. The problem is that a
+                // tab-atelier session replays the tab's whole scrollback on attach, and
+                // the replay contains the query sequences themselves, so the emulator
+                // answers questions nobody asked. Those answers are then typed into the
+                // shell as input.
+                //
+                // The symptom was a bash prompt growing a fragment like
+                // `|libvterm(0.3)\x1b\\\x1b[?1;2c` — which is this terminal's own
+                // XTVERSION reply followed by its DA1 reply, arriving as keystrokes. The
+                // daemon's browser client documents the same hazard and disables those
+                // replies for the same reason (assets/main.js).
+                //
+                // Only the self-describing replies are dropped, and a cursor-position
+                // report is left alone — a program that asks for one wants the answer.
+                // See [isTerminalQueryReply].
+                if (isTerminalQueryReply(data)) {
+                    Timber.d("Not answering a terminal query the replay re-asks: %d bytes", data.size)
+                } else {
+                    transportOperations.trySend(TransportOperation.WriteData(data))
+                }
             },
             onBell = {
                 manager.onBell(this)
@@ -1502,4 +1525,42 @@ private fun delKeyModeFromProfile(profile: Profile): DelKeyMode = if (profile.de
     DelKeyMode.Backspace
 } else {
     DelKeyMode.Delete
+}
+
+/**
+ * Whether [data] is a terminal answering a device query, rather than something typed.
+ *
+ * Added for Tab Atelier Remote (Apache-2.0 section 4(b)): a tab-atelier session replays
+ * the tab's scrollback on attach, and a replay contains the query sequences other
+ * programs printed — so the emulator answers them again, every attach, and the answers
+ * travel back as session input. The reported symptom was a bash prompt accumulating
+ * `|libvterm(0.3)\x1b\\\x1b[?1;2c`: this terminal's XTVERSION reply followed by its DA1
+ * reply, typed into the shell.
+ *
+ * Two shapes are recognised, and they are the two that are self-describing — the ones a
+ * program asks to identify the terminal, which nothing in this path can make use of:
+ *
+ *   - `ESC [ ? … c` (DA1) and `ESC [ > … c` (DA2), the device-attribute replies.
+ *   - `ESC P … ESC \` (a device-control string), which is how XTVERSION answers, and
+ *     how the terminal reports its name and version.
+ *
+ * Deliberately NOT matched: a cursor-position report (`ESC [ … R`). A program that asks
+ * where the cursor is genuinely needs the answer, and unlike the two above it is asked
+ * at a moment when something is waiting for it. Dropping it would break the programs
+ * that use it rather than the replay that does not.
+ *
+ * Whole-payload rather than a scan for embedded sequences: each reply arrives as its own
+ * callback, so anything that merely *starts* with a reply and carries on is not one, and
+ * mangling it would corrupt real input.
+ */
+internal fun isTerminalQueryReply(data: ByteArray): Boolean {
+    val esc = 0x1b.toByte()
+    if (data.size < 4 || data[0] != esc) return false
+    val isDeviceAttributes = data[1] == '['.code.toByte() &&
+        (data[2] == '?'.code.toByte() || data[2] == '>'.code.toByte()) &&
+        data[data.size - 1] == 'c'.code.toByte()
+    val isDeviceControlString = data[1] == 'P'.code.toByte() &&
+        data[data.size - 1] == '\\'.code.toByte() &&
+        data[data.size - 2] == esc
+    return isDeviceAttributes || isDeviceControlString
 }
