@@ -305,7 +305,7 @@ internal fun TerminalKeyboardContent(
                         for (i in 1..6) {
                             KeyButton(
                                 modifier = Modifier.weight(1f),
-                                text = stringResource(R.string.button_key_function, i.toString()),
+                                text = stringResource(FUNCTION_KEY_LABELS[i - 1]),
                                 onClick = { onKeyPress(functionKeyCode(i)) },
                             )
                         }
@@ -372,14 +372,14 @@ internal fun TerminalKeyboardContent(
                         for (i in 7..12) {
                             KeyButton(
                                 modifier = Modifier.weight(1f),
-                                text = stringResource(R.string.button_key_function, i.toString()),
+                                text = stringResource(FUNCTION_KEY_LABELS[i - 1]),
                                 onClick = { onKeyPress(functionKeyCode(i)) },
                             )
                         }
                     } else {
                         KeyButton(
                             modifier = Modifier.weight(1f),
-                            text = "⇥", // Tab symbol
+                            text = stringResource(R.string.button_key_tab),
                             contentDescription = stringResource(R.string.image_description_send_tab_character),
                             onClick = onTabPress,
                         )
@@ -552,6 +552,34 @@ private val FUNCTION_KEY_CODES = intArrayOf(
 )
 
 private fun functionKeyCode(index: Int): Int = FUNCTION_KEY_CODES[index - 1]
+
+/**
+ * The twelve function keys' labels, from upstream's own strings.
+ *
+ * Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): this fork had a single
+ * `translatable="false"` format string for these, and upstream's twelve are already
+ * translated — identically in every locale it ships, because a function key is `F1`
+ * everywhere, but using theirs means one less string of our own and a label that
+ * follows theirs if it ever changes.
+ *
+ * A table rather than `stringResource` of a computed id, because a resource id cannot be
+ * built from an index, and a `when` over twelve of them would be this list written
+ * sideways — the same shape, and the same reason, as [FUNCTION_KEY_CODES] above.
+ */
+private val FUNCTION_KEY_LABELS = intArrayOf(
+    R.string.button_key_f1,
+    R.string.button_key_f2,
+    R.string.button_key_f3,
+    R.string.button_key_f4,
+    R.string.button_key_f5,
+    R.string.button_key_f6,
+    R.string.button_key_f7,
+    R.string.button_key_f8,
+    R.string.button_key_f9,
+    R.string.button_key_f10,
+    R.string.button_key_f11,
+    R.string.button_key_f12,
+)
 
 @Composable
 private fun KeyButton(

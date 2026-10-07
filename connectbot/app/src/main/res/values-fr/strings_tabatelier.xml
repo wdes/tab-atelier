@@ -23,5 +23,7 @@
 	     not a translatable="false" notation like the F-keys. The description mirrors
 	     upstream's own French for the Alt key, "Activer/désactiver la touche Alt." -->
 	<string name="button_key_shift">Maj</string>
+	<!-- A French keyboard prints "Tab" on the key, not "TAB". -->
+	<string name="button_key_tab">Tab</string>
 	<string name="image_description_toggle_shift">Activer/désactiver la touche Maj.</string>
 </resources>

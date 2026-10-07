@@ -94,7 +94,7 @@ class TerminalKeyboardContentTest {
             .assertIsDisplayed()
             .performClick()
         composeTestRule
-            .onNodeWithText("⇥")
+            .onNodeWithText(composeTestRule.activity.getString(R.string.button_key_tab))
             .assertIsDisplayed()
             .performClick()
         // The keyboard key is on the FIRST page: it and paste share the same trailing
