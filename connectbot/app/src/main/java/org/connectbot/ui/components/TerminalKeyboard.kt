@@ -337,6 +337,19 @@ internal fun TerminalKeyboardContent(
                         // missing its weight breaks its neighbours, not itself, which is
                         // what made it hard to see.
                         KeyButton(modifier = Modifier.weight(1f), text = "/", onClick = { onTextPress("/") })
+                        // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): the
+                        // pipe, which the layout was specified with and this bar had
+                        // dropped. Restoring it is also what aligns the two rows —
+                        // seven keys here against eight below made every column off by
+                        // one, and put the up arrow over the left arrow rather than over
+                        // the down arrow. Eight and eight now, and `↑` at the same index
+                        // as `↓`.
+                        //
+                        // A key in one row with no counterpart in the other is therefore
+                        // not merely cosmetic: it shifts that row's whole grid, which is
+                        // why the two rows have to be counted together rather than each
+                        // looked at on its own.
+                        KeyButton(modifier = Modifier.weight(1f), text = "|", onClick = { onTextPress("|") })
                         KeyButton(modifier = Modifier.weight(1f), text = "-", onClick = { onTextPress("-") })
                         KeyButton(
                             modifier = Modifier.weight(1f),
