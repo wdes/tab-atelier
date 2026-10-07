@@ -74,13 +74,22 @@ class TerminalKeyListener(
     private val _modifierState = MutableStateFlow(getModifierState())
     val modifierState: StateFlow<ModifierState> = _modifierState.asStateFlow()
 
+    // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): these two honour the
+    // modifier state, which they did not — they passed 0 and then cleared it.
+    //
+    // The effect was that a latched modifier was silently eaten by the key after it:
+    // tap Shift, tap Tab, and the Shift was gone without ever reaching the terminal, so
+    // Shift+Tab was impossible from the bar. Ctrl and Alt were lost the same way, which
+    // is why the bar's TAB and Esc keys ignored them while every other key respected
+    // them. The value is what `sendPressedKey` already passed for the rest of the bar;
+    // these two were simply missed.
     fun sendEscape() {
-        keyDispatcher.dispatchKey(0, VTermKey.ESCAPE)
+        keyDispatcher.dispatchKey(modifiersForTerminal, VTermKey.ESCAPE)
         clearTransients()
     }
 
     fun sendTab() {
-        keyDispatcher.dispatchKey(0, VTermKey.TAB)
+        keyDispatcher.dispatchKey(modifiersForTerminal, VTermKey.TAB)
         clearTransients()
     }
 
