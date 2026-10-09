@@ -1,0 +1,24 @@
+Architectures: amd64
+Codename: nightly
+Components: main
+Date: Mon, 05 Oct 2026 08:29:14 +0000
+Description: tab-atelier nightly channel
+Label: tab-atelier
+Origin: tab-atelier
+Suite: nightly
+MD5Sum:
+ 560db1a1bd0b26b383361c0aed18ea05              189 Release
+ d0f0f0cb79f724c03c8bad06e520064d            50273 main/binary-amd64/Packages
+ 3ee72b65467529f4bbee0d7334a17c07            10647 main/binary-amd64/Packages.gz
+SHA1:
+ 8a75f638d79f97d16c5f313ec5fd9e62b112c912              189 Release
+ 0418d2b42d9b1e5063676ba78388c84dac133251            50273 main/binary-amd64/Packages
+ ffd32708f411d440207fb9e11a987edc313ab41e            10647 main/binary-amd64/Packages.gz
+SHA256:
+ 4f36bfa198df3f91fd86d627c86bc6dbff85a1196d4fd50247ed39927d7a0ba7              189 Release
+ eef7f7de7dea15103f2e27c0c39e117e72504cd3f7ed96be6df243de663c708c            50273 main/binary-amd64/Packages
+ d3e84911b2670829b2763ee6f6dc2fa62577f283f9a43beab5bd4408202986ec            10647 main/binary-amd64/Packages.gz
+SHA512:
+ 062a6487dd7630fce12542ac1c502426f9dae844c35ad8657341e0503485d5088c772e3145010a8f785a98bc9ba5a04edfa2053dbdac3f252cde906090a7fd77              189 Release
+ 17913672759111d9158a0472b6c476d1d8707091d6225fe099e0e65be97986b1599d998fcfe106c6114d0d5bb2ea6306d2b4392a03d9e0f2296ba8831a9b8eeb            50273 main/binary-amd64/Packages
+ b54f85187af7597768d40dfe6f584c586904fb28ff548619c7ea12436016c208fd60e29f7a34bfc0ea97635e3a74a7f21a0d9f034cd4176a96dd87aa300b540d            10647 main/binary-amd64/Packages.gz
