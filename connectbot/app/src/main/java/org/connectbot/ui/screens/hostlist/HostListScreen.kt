@@ -37,9 +37,11 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Computer
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
@@ -53,7 +55,10 @@ import androidx.compose.material.icons.filled.LinkOff
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.Terminal
+import androidx.compose.material.icons.outlined.StarBorder
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
@@ -94,6 +99,7 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.colorResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.core.graphics.toColorInt
@@ -133,6 +139,17 @@ internal object HostListTestTags {
      * tag there is no way to assert it does.
      */
     fun tabRow(hostId: Long, tabId: String): String = "host_item_${hostId}_tab_${tabId}_row"
+
+    /**
+     * A tab's pin button, and the filter field above a server's tabs.
+     *
+     * Added for Tab Atelier Remote (Apache-2.0 section 4(b)). Tagged for the same reason
+     * the row is: the pin's state has to be asserted as well as its presence, and a
+     * field's text has to be findable without depending on its placeholder.
+     */
+    fun tabFavouriteButton(tabId: String): String = "host_item_tab_${tabId}_favourite_button"
+
+    fun tabFilterField(hostId: Long): String = "host_item_${hostId}_tab_filter_field"
 
     /**
      * The button that shows and hides a tab-atelier host's tab list.
@@ -330,6 +347,8 @@ fun HostListScreen(
         onToggleTabHost = viewModel::toggleTabHost,
         onRefreshTabs = viewModel::refreshTabs,
         onRefreshAllTabs = viewModel::refreshAllTabAtelierTabs,
+        onToggleTabFavourite = viewModel::toggleTabFavourite,
+        onTabQueryChange = viewModel::setTabQuery,
         onDeleteHost = viewModel::deleteHost,
         onDuplicateHost = viewModel::duplicateHost,
         onForgetHostKeys = viewModel::forgetHostKeys,
@@ -360,6 +379,10 @@ fun HostListScreenContent(
     // host's row expands and refreshes its tabs.
     onToggleTabHost: (Long) -> Unit = {},
     onRefreshTabs: (Host) -> Unit = {},
+    // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): the tab list's two
+    // desktop-side interactions — pinning a tab, and filtering a server's tabs by name.
+    onToggleTabFavourite: (Long, String) -> Unit = { _, _ -> },
+    onTabQueryChange: (Long, String) -> Unit = { _, _ -> },
     // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): the pull-to-refresh
     // gesture, which re-asks every tab-atelier server rather than one row's.
     onRefreshAllTabs: () -> Unit = {},
@@ -608,7 +631,9 @@ fun HostListScreenContent(
                                 // The tab the user tapped is the session to open.
                                 is HostListRow.TabRow -> TabAtelierTabRow(
                                     tab = row.tab,
+                                    isFavourite = row.isFavourite,
                                     onOpen = { onNavigateToConsole(row.host, row.tab.id) },
+                                    onToggleFavourite = { onToggleTabFavourite(row.hostId, row.tab.id) },
                                     modifier = Modifier.testTag(
                                         HostListTestTags.tabRow(row.hostId, row.tab.id),
                                     ),
@@ -618,6 +643,13 @@ fun HostListScreenContent(
                                     hostId = row.hostId,
                                     status = row.status,
                                     detail = row.detail,
+                                )
+
+                                // The filter for that server's tabs, shown above them.
+                                is HostListRow.TabSearchRow -> TabAtelierSearchRow(
+                                    hostId = row.hostId,
+                                    query = row.query,
+                                    onQueryChange = { onTabQueryChange(row.hostId, it) },
                                 )
                             }
                         }
@@ -1208,10 +1240,58 @@ private fun StartupKeyPasswordDialog(
  * Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): new, upstream has
  * no nested rows.
  */
+/**
+ * The filter for one server's tabs, shown above them.
+ *
+ * Added for Tab Atelier Remote (Apache-2.0 section 4(b)): a server can have a lot of tabs
+ * and a name is how one is found. Only appears when the server has tabs to filter, so it
+ * is never a control that can do nothing.
+ *
+ * The query comes from the row rather than from state this holds, so what the field shows
+ * and what the rows were filtered by are the same value — a `remember` here would be a
+ * second copy, and the two would drift the first time a filter was set from anywhere else.
+ */
+@Composable
+private fun TabAtelierSearchRow(
+    hostId: Long,
+    query: String,
+    onQueryChange: (String) -> Unit,
+) {
+    OutlinedTextField(
+        value = query,
+        onValueChange = onQueryChange,
+        singleLine = true,
+        placeholder = { Text(stringResource(R.string.tabatelier_tab_filter_hint)) },
+        leadingIcon = { Icon(Icons.Default.Search, contentDescription = null) },
+        trailingIcon = {
+            // Only when there is something to clear, so the field is quiet when unused.
+            if (query.isNotEmpty()) {
+                IconButton(onClick = { onQueryChange("") }) {
+                    Icon(
+                        imageVector = Icons.Default.Close,
+                        contentDescription = stringResource(R.string.tabatelier_tab_filter_clear),
+                    )
+                }
+            }
+        },
+        // A search key rather than Enter, so the keyboard's action matches what the field
+        // does; the filter applies on every keystroke either way.
+        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+        modifier = Modifier
+            .fillMaxWidth()
+            // Two calls because there is no overload mixing start/end with vertical.
+            .padding(start = TAB_INDENT, end = 16.dp)
+            .padding(vertical = 4.dp)
+            .testTag(HostListTestTags.tabFilterField(hostId)),
+    )
+}
+
 @Composable
 private fun TabAtelierTabRow(
     tab: TabAtelierTab,
     onOpen: () -> Unit,
+    isFavourite: Boolean,
+    onToggleFavourite: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     ListItem(
@@ -1236,6 +1316,35 @@ private fun TabAtelierTabRow(
         },
         trailingContent = {
             Row(verticalAlignment = Alignment.CenterVertically) {
+                // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): the pin.
+                //
+                // An IconButton before the status markers rather than after, so the
+                // markers stay a cluster — they read as one statement about the tab, and a
+                // button between them would split it.
+                //
+                // Shape says the state as well as colour does: a filled star for pinned, an
+                // outlined one for not. Colour alone would be invisible to anyone who
+                // cannot distinguish the two tints, and this is a state a user has to be
+                // able to read.
+                IconButton(
+                    onClick = onToggleFavourite,
+                    modifier = Modifier
+                        .size(32.dp)
+                        .testTag(HostListTestTags.tabFavouriteButton(tab.id)),
+                ) {
+                    Icon(
+                        imageVector = if (isFavourite) Icons.Filled.Star else Icons.Outlined.StarBorder,
+                        contentDescription = stringResource(
+                            if (isFavourite) R.string.tabatelier_tab_unpin else R.string.tabatelier_tab_pin,
+                        ),
+                        tint = if (isFavourite) {
+                            MaterialTheme.colorScheme.primary
+                        } else {
+                            MaterialTheme.colorScheme.onSurfaceVariant
+                        },
+                        modifier = Modifier.size(18.dp),
+                    )
+                }
                 tab.agentState?.let { agentState ->
                     TabMarker(text = agentState)
                 }
@@ -1318,6 +1427,10 @@ private fun TabAtelierStatusRow(
     val text = when (status) {
         TabStatus.LOADING -> stringResource(R.string.tabatelier_tabs_loading)
         TabStatus.EMPTY -> stringResource(R.string.tabatelier_tabs_empty)
+        // Said differently from EMPTY on purpose: "this server has no tabs" and "none of
+        // them match what you typed" call for different reactions, and showing the first
+        // when the second is true reads as the server having lost its tabs.
+        TabStatus.NO_MATCHES -> stringResource(R.string.tabatelier_tabs_no_matches, detail.orEmpty())
         TabStatus.ERROR -> stringResource(R.string.tabatelier_tabs_error, detail.orEmpty())
     }
 

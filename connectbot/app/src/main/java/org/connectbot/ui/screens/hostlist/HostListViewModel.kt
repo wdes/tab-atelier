@@ -88,9 +88,31 @@ sealed class HostListRow {
         val hostId: Long,
         val index: Int,
         val tab: TabAtelierTab,
+        // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): whether this tab
+        // is pinned, so its row can show a filled star rather than an outline one.
+        // Carried on the row because the star is what the user reads the state from,
+        // and looking it up in the UI layer would mean the screen holding a second
+        // copy of the same fact.
+        val isFavourite: Boolean = false,
     ) : HostListRow() {
         // The daemon may omit a tab id; the index keeps keys unique either way.
         override val key: String = "host-$hostId-tab-${tab.id.ifEmpty { "index-$index" }}"
+    }
+
+    /**
+     * The tab-name filter for one tab-atelier host, as the first row under its server.
+     *
+     * Added for Tab Atelier Remote (Apache-2.0 section 4(b)): a row rather than a piece of
+     * the server's own row, because it belongs to that server's tabs and appears with
+     * them. It is a row of the list rather than state held by the screen so that it scrolls
+     * with the tabs it filters, and so that the query the screen shows comes from the same
+     * place as the query the rows were filtered by.
+     */
+    data class TabSearchRow(
+        val hostId: Long,
+        val query: String,
+    ) : HostListRow() {
+        override val key: String = "host-$hostId-tab-search"
     }
 
     /** A note under a tab-atelier host's row: loading, empty, or a failure. */
@@ -108,6 +130,16 @@ enum class TabStatus {
     LOADING,
     EMPTY,
     ERROR,
+
+    /**
+     * The server has tabs, but the filter hides all of them.
+     *
+     * Added for Tab Atelier Remote (Apache-2.0 section 4(b)), and distinct from [EMPTY] on
+     * purpose: "this server has no tabs" and "none of them match what you typed" call for
+     * different reactions, and showing the first when the second is true reads as the
+     * server having lost its tabs.
+     */
+    NO_MATCHES,
 }
 
 /**
@@ -120,6 +152,14 @@ data class TabListState(
     val loading: Boolean = false,
     val tabs: List<TabAtelierTab> = emptyList(),
     val error: String? = null,
+    // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): this server's pinned tab
+    // ids and its tab-name filter.
+    //
+    // Both are desktop-side state that a fetch must not disturb — they belong to the user,
+    // not to the daemon — so `fetchTabs` carries them across from the state it replaces.
+    // Losing a filter on every 15-second refresh would make the search box unusable.
+    val favourites: Set<String> = emptySet(),
+    val query: String = "",
 )
 
 data class HostListUiState(
@@ -174,6 +214,28 @@ private fun flattenHostRows(
         )
         if (!expanded) return@forEach
 
+        // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): the filter and the
+        // pinning happen here, before any row is added, because both the status rows and
+        // the tab rows depend on what survives them.
+        val all = state?.tabs.orEmpty()
+        val favourites = state?.favourites.orEmpty()
+        val query = state?.query.orEmpty()
+        val matches = if (query.isBlank()) {
+            all
+        } else {
+            all.filter { it.name.contains(query.trim(), ignoreCase = true) }
+        }
+        // Pinned tabs first. `sortedByDescending` on a Boolean is stable, so within the
+        // pinned group and within the rest, the daemon's own order — most recently used
+        // first — is preserved exactly.
+        val ordered = matches.sortedByDescending { it.id in favourites }
+
+        // The filter field, whenever there is something it could filter. Not shown for a
+        // server with no tabs, where it would be a control that can do nothing.
+        if (all.isNotEmpty()) {
+            add(HostListRow.TabSearchRow(host.id, query))
+        }
+
         when {
             // A refresh that already has tabs to show keeps showing them; the
             // loading note is only for the first fetch.
@@ -185,12 +247,18 @@ private fun flattenHostRows(
                 HostListRow.TabStatusRow(host.id, TabStatus.ERROR, state.error),
             )
 
-            state.tabs.isEmpty() -> add(
+            all.isEmpty() -> add(
                 HostListRow.TabStatusRow(host.id, TabStatus.EMPTY),
             )
+
+            // The server has tabs and the filter hid them all: saying "no tabs" here would
+            // read as the server having lost them.
+            ordered.isEmpty() -> add(
+                HostListRow.TabStatusRow(host.id, TabStatus.NO_MATCHES, query),
+            )
         }
-        state?.tabs?.forEachIndexed { index, tab ->
-            add(HostListRow.TabRow(host, host.id, index, tab))
+        ordered.forEachIndexed { index, tab ->
+            add(HostListRow.TabRow(host, host.id, index, tab, isFavourite = tab.id in favourites))
         }
     }
 }
@@ -351,6 +419,86 @@ class HostListViewModel @Inject constructor(
     }
 
     /**
+     * Desktop-side state for the tab rows: which tabs are pinned, and what each server's
+     * filter says.
+     *
+     * Its own preferences file rather than the settings this view model is given, because
+     * it is not a preference — it changes as the list is used, and it belongs beside the
+     * host pins rather than on a settings screen. The name follows that file's.
+     */
+    private val tabUiPrefs by lazy {
+        context.getSharedPreferences(TAB_UI_PREFS_FILE_NAME, Context.MODE_PRIVATE)
+    }
+
+    /**
+     * Sets one server's tab-name filter.
+     *
+     * Written through on every keystroke, and that is what makes the query survive the
+     * screen being rebuilt — a rotation, or leaving the app and coming back. `apply`, not
+     * `commit`, so typing never waits on the disk.
+     */
+    fun setTabQuery(hostId: Long, query: String) {
+        writeTabUiPrefs { it.edit().putString(queryKey(hostId), query).apply() }
+        _uiState.update { state -> state.withTabState(hostId) { it.copy(query = query) } }
+    }
+
+    /**
+     * Pins a tab to the top of its server's list, or unpins it.
+     *
+     * Keyed by the tab's id rather than by its position, so a pin follows the tab: a tab
+     * that moves because a different one was used still reads as pinned, which position
+     * would not survive. A tab with no id cannot be keyed and so cannot be pinned — the
+     * daemon gives every tab an id, and the empty case is the fallback this app already
+     * uses for a row key.
+     */
+    fun toggleTabFavourite(hostId: Long, tabId: String) {
+        if (tabId.isEmpty()) return
+        val current = _uiState.value.tabStates[hostId]?.favourites ?: emptySet()
+        val updated = if (tabId in current) current - tabId else current + tabId
+        writeTabUiPrefs { it.edit().putStringSet(favouritesKey(hostId), updated).apply() }
+        _uiState.update { state -> state.withTabState(hostId) { it.copy(favourites = updated) } }
+    }
+
+    /** One server's stored pins, for a session whose state has not been built yet. */
+    private fun storedFavourites(hostId: Long): Set<String> =
+        readTabUiPrefs { it.getStringSet(favouritesKey(hostId), emptySet()) }.orEmpty()
+
+    /** One server's stored filter, for a session whose state has not been built yet. */
+    private fun storedQuery(hostId: Long): String =
+        readTabUiPrefs { it.getString(queryKey(hostId), "") }.orEmpty()
+
+    /**
+     * Reads from the tab-state preferences, or gives back nothing.
+     *
+     * The default rather than a thrown failure, and that is deliberate: these two are read
+     * on the **loading** path, so a preferences store that cannot be opened — which is what
+     * a null application context produces, and what any storage fault would produce — would
+     * otherwise take the whole tab list down with it. A pin and a filter are conveniences;
+     * no tab could load is not an acceptable consequence of losing them. The state in
+     * memory is unaffected either way, so only what survives a restart is at stake.
+     */
+    private fun <T> readTabUiPrefs(read: (SharedPreferences) -> T?): T? = runCatching {
+        read(tabUiPrefs)
+    }.getOrNull()
+
+    /**
+     * Writes to the tab-state preferences, or does not.
+     *
+     * Best-effort for the same reason as [readTabUiPrefs], and separately: what a failure
+     * costs is the persistence, not the interaction. The caller updates the state in memory
+     * either way, so a pin or a filter still works for this session — it simply does not
+     * survive a restart — and throwing here would instead take down the tap that made it.
+     */
+    private fun writeTabUiPrefs(write: (SharedPreferences) -> Unit) {
+        runCatching { write(tabUiPrefs) }
+    }
+
+    /** One server's stored pins, for a session whose state has not been built yet. */
+    private fun favouritesKey(hostId: Long) = "favourites_$hostId"
+
+    private fun queryKey(hostId: Long) = "query_$hostId"
+
+    /**
      * Expand or collapse a tab-atelier host's tabs.
      */
     fun toggleTabHost(hostId: Long) {
@@ -369,7 +517,17 @@ class HostListViewModel @Inject constructor(
             _uiState.update { state ->
                 val previous = state.tabStates[host.id]
                 val tabStates = state.tabStates +
-                    (host.id to TabListState(loading = true, tabs = previous?.tabs ?: emptyList()))
+                    (
+                        host.id to TabListState(
+                            loading = true,
+                            tabs = previous?.tabs ?: emptyList(),
+                            // Seeded from disk when this server's state does not exist yet —
+                            // the first fetch after a restart — and from memory otherwise, so
+                            // a refresh cannot lose what the user has since typed or pinned.
+                            favourites = previous?.favourites ?: storedFavourites(host.id),
+                            query = previous?.query ?: storedQuery(host.id),
+                        )
+                        )
                 state.copy(tabStates = tabStates)
             }
 
@@ -405,6 +563,12 @@ class HostListViewModel @Inject constructor(
                             error = tabAtelierErrorMessage(it),
                         )
                     },
+                ).copy(
+                    // Carried across, because they belong to the user rather than to the
+                    // daemon: losing the filter on every 15-second refresh would make the
+                    // search box unusable, and losing the pins would be worse.
+                    favourites = previous?.favourites ?: emptySet(),
+                    query = previous?.query ?: "",
                 )
                 state.copy(tabStates = state.tabStates + (host.id to tabState))
             }
@@ -647,3 +811,21 @@ class HostListViewModel @Inject constructor(
         manager.dismissPendingStartupKey(pubkey)
     }
 }
+
+/**
+ * The preferences file holding the tab rows' desktop-side state — see
+ * [HostListViewModel.tabUiPrefs].
+ */
+private const val TAB_UI_PREFS_FILE_NAME = "tabatelier_tab_state"
+
+/**
+ * One server's tab state with [update] applied, leaving every other server's alone.
+ *
+ * A missing entry is created empty rather than skipped, so a filter or a pin can be set
+ * before that server's tabs have ever been fetched — which is the order a user can
+ * produce by typing into the field while the first fetch is still in flight.
+ */
+private fun HostListUiState.withTabState(
+    hostId: Long,
+    update: (TabListState) -> TabListState,
+): HostListUiState = copy(tabStates = tabStates + (hostId to update(tabStates[hostId] ?: TabListState())))

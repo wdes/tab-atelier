@@ -22,10 +22,12 @@ import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.junit4.v2.createAndroidComposeRule
+import androidx.compose.ui.test.onAllNodesWithTag
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performTextInput
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import dagger.hilt.android.testing.HiltAndroidRule
 import dagger.hilt.android.testing.HiltAndroidTest
@@ -493,6 +495,8 @@ class HostListScreenTest {
         onExportHosts: () -> Unit = {},
         onImportHosts: () -> Unit = {},
         onToggleTabHost: (Long) -> Unit = {},
+        onToggleTabFavourite: (Long, String) -> Unit = { _, _ -> },
+        onTabQueryChange: (Long, String) -> Unit = { _, _ -> },
     ) {
         composeTestRule.setContent {
             ConnectBotTheme {
@@ -516,6 +520,8 @@ class HostListScreenTest {
                     onExportHosts = onExportHosts,
                     onImportHosts = onImportHosts,
                     onToggleTabHost = onToggleTabHost,
+                    onToggleTabFavourite = onToggleTabFavourite,
+                    onTabQueryChange = onTabQueryChange,
                 )
             }
         }
@@ -556,6 +562,163 @@ class HostListScreenTest {
         assertEquals(host, openedHost)
         assertEquals("the tab id must reach the navigation, not just the host", "t-1", openedTab)
     }
+
+    /**
+     * Added for Tab Atelier Remote (Apache-2.0 section 4(b)).
+     *
+     * A pinned tab sorts above the rest, and everything else keeps the daemon's order.
+     *
+     * The daemon lists a server's tabs most-recently-used first, so the order is
+     * information — a sort that reordered the unpinned ones as a side effect would lose
+     * it. Asserted on the *rendered* order rather than on the sorted list, because the
+     * order is only worth anything where the user sees it.
+     */
+    @Test
+    fun aPinnedTabSortsAboveTheRest() {
+        val host = testHost(id = 50L, nickname = "workstation", protocol = "tabatelier")
+        val tabs = listOf(
+            TabAtelierTab(id = "t-1", name = "first"),
+            TabAtelierTab(id = "t-2", name = "second"),
+            TabAtelierTab(id = "t-3", name = "third"),
+        )
+
+        setHostListContent(
+            uiState = HostListUiState(
+                hosts = listOf(host),
+                tabStates = mapOf(host.id to TabListState(tabs = tabs, favourites = setOf("t-3"))),
+            ),
+        )
+
+        val rendered = renderedTabNames(host.id, tabs)
+        assertEquals("the pinned tab comes first", "third", rendered.first())
+        assertEquals(
+            "and the rest keep the daemon's order",
+            listOf("third", "first", "second"),
+            rendered,
+        )
+    }
+
+    /**
+     * Added for Tab Atelier Remote (Apache-2.0 section 4(b)).
+     *
+     * The filter hides tabs that do not match, and says so rather than reporting the
+     * server as empty — those two are different situations and a user reacts to them
+     * differently.
+     */
+    @Test
+    fun theTabFilterShowsOnlyMatchingTabs() {
+        val host = testHost(id = 51L, nickname = "workstation", protocol = "tabatelier")
+        val tabs = listOf(
+            TabAtelierTab(id = "t-1", name = "build-server"),
+            TabAtelierTab(id = "t-2", name = "notes"),
+            TabAtelierTab(id = "t-3", name = "BUILD-cache"),
+        )
+
+        setHostListContent(
+            uiState = HostListUiState(
+                hosts = listOf(host),
+                tabStates = mapOf(host.id to TabListState(tabs = tabs, query = "build")),
+            ),
+        )
+
+        // Case-insensitively, which is what makes the field usable for a name someone
+        // half-remembers.
+        assertEquals(listOf("build-server", "BUILD-cache"), renderedTabNames(host.id, tabs))
+    }
+
+    @Test
+    fun aFilterThatMatchesNothing_saysSoRatherThanShowingNoTabs() {
+        val host = testHost(id = 52L, nickname = "workstation", protocol = "tabatelier")
+
+        setHostListContent(
+            uiState = HostListUiState(
+                hosts = listOf(host),
+                tabStates = mapOf(
+                    host.id to TabListState(
+                        tabs = listOf(TabAtelierTab(id = "t-1", name = "notes")),
+                        query = "nothing-matches-this",
+                    ),
+                ),
+            ),
+        )
+
+        composeTestRule
+            .onNodeWithText(
+                composeTestRule.activity.getString(
+                    R.string.tabatelier_tabs_no_matches,
+                    "nothing-matches-this",
+                ),
+            )
+            .assertExists()
+    }
+
+    /**
+     * Added for Tab Atelier Remote (Apache-2.0 section 4(b)).
+     *
+     * Pinning a tab reaches the view model, and the button reports the state it is in —
+     * asserted through the callback rather than the node, since a control that is present
+     * and does nothing is the failure this project has hit twice.
+     */
+    @Test
+    fun tappingThePin_reportsTheTabToToggle() {
+        val host = testHost(id = 53L, nickname = "workstation", protocol = "tabatelier")
+        val tab = TabAtelierTab(id = "t-1", name = "shell")
+        var toggled: Pair<Long, String>? = null
+
+        setHostListContent(
+            uiState = HostListUiState(
+                hosts = listOf(host),
+                tabStates = mapOf(host.id to TabListState(tabs = listOf(tab))),
+            ),
+            onToggleTabFavourite = { hostId, tabId -> toggled = hostId to tabId },
+        )
+
+        composeTestRule
+            .onNodeWithTag(HostListTestTags.tabFavouriteButton(tab.id))
+            .performClick()
+
+        assertEquals("the host and the tab both have to reach the view model", 53L to "t-1", toggled)
+    }
+
+    @Test
+    fun typingInTheTabFilter_reportsItForThatHost() {
+        val host = testHost(id = 54L, nickname = "workstation", protocol = "tabatelier")
+        var reported: Pair<Long, String>? = null
+
+        setHostListContent(
+            uiState = HostListUiState(
+                hosts = listOf(host),
+                tabStates = mapOf(
+                    host.id to TabListState(tabs = listOf(TabAtelierTab(id = "t-1", name = "shell"))),
+                ),
+            ),
+            onTabQueryChange = { hostId, query -> reported = hostId to query },
+        )
+
+        composeTestRule
+            .onNodeWithTag(HostListTestTags.tabFilterField(host.id))
+            .performTextInput("sh")
+
+        assertEquals("the query has to be reported against the server it filters", 54L to "sh", reported)
+    }
+
+    /**
+     * The given tabs' names, in the order they appear, by vertical position.
+     *
+     * Read from the rows' bounds rather than from the sorted list the view model built,
+     * because the order only means something where the user sees it — a list sorted
+     * correctly and drawn in the wrong order is still the bug this guards.
+     */
+    private fun renderedTabNames(hostId: Long, tabs: List<TabAtelierTab>): List<String> = tabs
+        .mapNotNull { tab ->
+            composeTestRule
+                .onAllNodesWithTag(HostListTestTags.tabRow(hostId, tab.id))
+                .fetchSemanticsNodes()
+                .firstOrNull()
+                ?.let { tab.name to it.boundsInRoot.top }
+        }
+        .sortedBy { it.second }
+        .map { it.first }
 
     /**
      * Added for Tab Atelier Remote: the chevron that shows and hides a daemon's

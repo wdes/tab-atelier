@@ -542,6 +542,39 @@ The first two are the same fault as the two key rows needing equal counts: **val
 have to agree**, kept in a shape where nothing makes them. Where that recurs, the fix is
 to derive one from the other rather than to remember both.
 
+### Pinning a tab, and filtering a server's tabs by name
+
+Two additions to the tab list, both stored beside the host pins in
+`tabatelier_tab_state` — desktop-side state that belongs to the user rather than to the
+daemon:
+
+- **A tab can be pinned**, and pinned tabs sort above the rest of that server's. The order
+  underneath is the daemon's, which is most-recently-used first, so it carries information
+  — the sort is stable, and a version that reordered the unpinned tabs as a side effect
+  would be losing something. Pins are keyed by the tab's **id**, not its position, so a pin
+  follows its tab when the order changes.
+- **A server's tabs can be filtered by name**, from a field shown above them whenever that
+  server has tabs to filter. A query persists, so it survives a rotation or a restart, and
+  it is a query rather than a mode: the tab list keeps refreshing underneath it.
+
+Both live on `TabListState`, and `fetchTabs` **carries them across from the state it
+replaces** — it builds a fresh state per fetch, so without that a 15-second refresh would
+clear the filter and the pins. That is worth knowing before adding anything else to that
+class: the field is not preserved by construction, only by the two `copy` calls that carry
+it.
+
+The filter and the pins are read on the **loading** path, so both go through
+`readTabUiPrefs`/`writeTabUiPrefs`, which swallow a failure and return a default. A pin and
+a filter are conveniences; losing them must not be able to stop tabs loading, and the first
+version — which called `getSharedPreferences` directly — did exactly that, because a
+preferences store that cannot be opened threw inside the fetch coroutine and no tab
+appeared at all.
+
+A filter that matches nothing says **so**, with the query in the message, rather than
+showing the "no tabs" note: "this server has no tabs" and "none match what you typed" call
+for different reactions, and the first when the second is true reads as the server having
+lost its tabs.
+
 ## Current state
 
 The app is a working ConnectBot under our package id, plus the tab-atelier type:

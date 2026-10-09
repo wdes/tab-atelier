@@ -26,4 +26,20 @@
 	<!-- A French keyboard prints "Tab" on the key, not "TAB". -->
 	<string name="button_key_tab">Tab</string>
 	<string name="image_description_toggle_shift">Activer/désactiver la touche Maj.</string>
+
+	<!-- The tab list's own strings. These were missing rather than untranslated: the
+	     English file had them and this one did not, so every one of them showed in
+	     English inside an otherwise French list. Being in a separate file per locale is
+	     what makes that invisible — there is no "missing translation" warning for a
+	     string that exists in the default file and not in a locale, only a silent
+	     fallback — so it is worth checking this list against the default file whenever
+	     one is added there. -->
+	<string name="tabatelier_tabs_loading">Chargement des onglets…</string>
+	<string name="tabatelier_tabs_empty">Aucun onglet</string>
+	<string name="tabatelier_tabs_error">Serveur injoignable : %1$s</string>
+	<string name="tabatelier_tabs_no_matches">Aucun onglet ne correspond à « %1$s »</string>
+	<string name="tabatelier_tab_filter_hint">Filtrer les onglets par nom</string>
+	<string name="tabatelier_tab_filter_clear">Effacer le filtre</string>
+	<string name="tabatelier_tab_pin">Épingler cet onglet en haut</string>
+	<string name="tabatelier_tab_unpin">Détacher cet onglet</string>
 </resources>

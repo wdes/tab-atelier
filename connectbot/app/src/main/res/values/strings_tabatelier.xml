@@ -52,6 +52,14 @@
 	<string name="tabatelier_refresh_tabs">Refresh tabs</string>
 	<string name="tabatelier_tabs_loading">Loading tabs…</string>
 	<string name="tabatelier_tabs_empty">No tabs</string>
+	<!-- The filter hid every tab this server has, which is a different situation from the
+	     server having none: one says the daemon has nothing, the other says the query does
+	     not match. Naming the query is what makes the difference legible. -->
+	<string name="tabatelier_tabs_no_matches">No tabs match “%1$s”</string>
+	<string name="tabatelier_tab_filter_hint">Filter tabs by name</string>
+	<string name="tabatelier_tab_filter_clear">Clear the filter</string>
+	<string name="tabatelier_tab_pin">Pin this tab to the top</string>
+	<string name="tabatelier_tab_unpin">Unpin this tab</string>
 	<string name="tabatelier_tabs_error">Could not reach this server: %1$s</string>
 	<string name="tabatelier_tab_active">active</string>
 	<string name="tabatelier_tab_locked">Locked</string>
