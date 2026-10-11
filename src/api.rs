@@ -325,6 +325,13 @@ struct TabInfo {
     /// Byte length behind `output_crc`. Pairs with it for the conditional
     /// `/output?since=&crc=` form, and separates "empty" from "unchanged".
     output_len: u64,
+    /// True while a binary hot-swap handoff is in progress
+    /// ([`crate::hotswap::frozen`]). An external daemon that drives tabs
+    /// (nudges, auto-rehome) should leave them alone until it clears —
+    /// acting on a tab whose PTY is mid-adoption would race the handoff.
+    /// Omitted (false) in the normal case.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    in_handoff: bool,
 }
 
 /// One DNS-entries-view row for the `/tabs` response.
@@ -1914,6 +1921,37 @@ fn handle_connection<S: Read + Write>(
         ("POST", "/tabs") => {
             tabs::create(stream, state, &body_bytes);
         }
+        ("POST", "/upgrade") => {
+            // Hot swap: re-exec the (freshly installed) binary at our own
+            // install path while every tab's live PTY is handed across the
+            // exec — the shells, and whatever runs in them, never notice
+            // (see src/hotswap.rs). Reached only with the master token: the
+            // gate above admits master, sidecar peers on `sidecar_route`, or
+            // a `/tabs/by-id/...` share token — `/upgrade` is none of those;
+            // a share token 401s, and read-only mode is refused by the
+            // `is_mutating` gate. The swap happens on the owner loop's next
+            // tick, after this response has flushed — the API drops for a
+            // moment while the new binary boots and re-binds.
+            #[cfg(unix)]
+            {
+                if !crate::hotswap::reexec_target_ok() {
+                    error_json(
+                        stream,
+                        409,
+                        "re-exec target missing — install the new binary at this binary's path first",
+                    );
+                    return;
+                }
+                crate::hotswap::request_upgrade();
+                respond_json(
+                    stream,
+                    200,
+                    &format!(r#"{{"upgrading":true,"pid":{}}}"#, std::process::id()),
+                );
+            }
+            #[cfg(not(unix))]
+            error_json(stream, 501, "hot swap is not supported on this platform");
+        }
         ("POST", "/limits/default") => limits::set_default(stream, state, &body_bytes),
         ("POST", "/claude-only") => claude_only::set(stream, state, &body_bytes),
         ("POST", "/relay-mode") => relay::mode(stream, state, &body_bytes),
@@ -3155,6 +3193,7 @@ mod tests {
             dns: vec![],
             resident_memory_bytes: None,
             tokens: None,
+            in_handoff: false,
         }
     }
 
@@ -4870,6 +4909,65 @@ mod tests {
             .master_token = String::new();
         let resp = request(port, "GET /tabs HTTP/1.1\r\n\r\n");
         assert_eq!(status_code(&resp), 401, "empty master rejects token-less request");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn upgrade_requires_the_master_token() {
+        let (port, _, master) = spawn_server();
+        // No token at all: the gate 401s before the route is even reached.
+        let resp = request(port, &add_close_header("POST /upgrade HTTP/1.1\r\n\r\n"));
+        assert_eq!(status_code(&resp), 401, "token-less POST /upgrade is refused");
+        // A wrong token 401s too — `/upgrade` is not a share-token route.
+        let resp = request(
+            port,
+            &add_close_header("POST /upgrade HTTP/1.1\r\nAuthorization: Bearer nope\r\n\r\n"),
+        );
+        assert_eq!(status_code(&resp), 401, "wrong token rejected");
+        assert!(
+            !crate::hotswap::upgrade_requested(),
+            "a refused request must not arm the swap"
+        );
+        // The master token gets through (the test binary's own /proc/self/exe
+        // is the re-exec target, so `reexec_target_ok` holds).
+        let resp = request(
+            port,
+            &add_close_header(&format!(
+                "POST /upgrade HTTP/1.1\r\nAuthorization: Bearer {master}\r\n\r\n"
+            )),
+        );
+        assert_eq!(status_code(&resp), 200, "master token arms the swap");
+        assert!(resp.contains(r#""upgrading":true"#), "acknowledges the request: {resp}");
+        assert!(crate::hotswap::upgrade_requested(), "swap is armed for the owner loop");
+        // Clean up the process-global so it can't leak into the next test.
+        crate::hotswap::clear_upgrade_request();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn tabs_report_in_handoff_while_frozen() {
+        let (port, state, master) = spawn_server();
+        let get = || {
+            let resp = request(
+                port,
+                &add_close_header(&format!("GET /tabs HTTP/1.1\r\nAuthorization: Bearer {master}\r\n\r\n")),
+            );
+            assert_eq!(status_code(&resp), 200);
+            resp
+        };
+        // Not swapping: the field is omitted (skip_serializing_if false).
+        assert!(!get().contains("in_handoff"), "absent in the steady state");
+        // Mid-handoff: every tab reports it, so an external driver backs off.
+        // `/tabs` serves a cached body, so invalidate like any state change.
+        crate::hotswap::set_frozen(true);
+        state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .invalidate_tabs();
+        let resp = get();
+        crate::hotswap::set_frozen(false);
+        // Pretty-printed JSON, so match the spaced form.
+        assert!(resp.contains(r#""in_handoff": true"#), "flagged while frozen: {resp}");
     }
 
     #[test]
