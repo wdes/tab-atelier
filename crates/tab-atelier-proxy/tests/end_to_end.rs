@@ -848,3 +848,56 @@ fn a_subscription_with_no_credential_file_is_refused_and_not_drawn() {
         "and the provider the file belongs to:\n{resp}"
     );
 }
+
+/// The model pin, through the binary an operator actually runs: set it, watch a
+/// typo get refused, clear it — reading `users.json` each time. The assertion is
+/// on the file, not on the exit code, because a CLI writing a different
+/// directory from the server is the deployment bug this file exists to catch.
+#[test]
+fn a_model_pin_is_set_refused_and_cleared() {
+    let scratch = Scratch::new("model-pin");
+    let s = scratch.path();
+    let on_disk = |scratch: &Path| -> Option<String> {
+        let raw = std::fs::read_to_string(scratch.join("config/users.json")).expect("users.json");
+        let doc: serde_json::Value = serde_json::from_str(&raw).expect("users.json is JSON");
+        doc["accounts"]
+            .as_array()
+            .expect("accounts array")
+            .iter()
+            .find(|a| a["email"] == "ada@example.org")
+            .and_then(|a| a.get("model"))
+            .and_then(|m| m.as_str())
+            .map(str::to_owned)
+    };
+
+    cli(s, &["add", "Ada", "Lovelace", "ada@example.org"]);
+    assert_eq!(on_disk(s), None, "a fresh account carries no pin");
+
+    // A typo is refused AT THE CLI, naming the model, rather than becoming a 503
+    // on every request the account will ever make.
+    let bad = Command::new(BIN)
+        .args(["set-model", "ada@example.org", "claude-sonet-5"])
+        .env("TAB_ATELIER_PROXY_CONFIG", s.join("config"))
+        .env("TAB_ATELIER_PROXY_STATE", s.join("state"))
+        .env("HOME", s.join("home"))
+        .output()
+        .expect("run the CLI");
+    assert!(
+        !bad.status.success(),
+        "a model the catalogue does not publish must be refused"
+    );
+    let stderr = String::from_utf8_lossy(&bad.stderr);
+    assert!(
+        stderr.contains("no model"),
+        "the refusal must name the problem:\n{stderr}"
+    );
+    assert_eq!(on_disk(s), None, "a refused pin must not reach the file");
+
+    // A model the catalogue publishes reaches the file the server reads.
+    cli(s, &["set-model", "ada@example.org", "claude-sonnet-5"]);
+    assert_eq!(on_disk(s).as_deref(), Some("claude-sonnet-5"));
+
+    // An empty model clears it, back to class routing.
+    cli(s, &["set-model", "ada@example.org", ""]);
+    assert_eq!(on_disk(s), None, "an empty model must clear the pin");
+}
