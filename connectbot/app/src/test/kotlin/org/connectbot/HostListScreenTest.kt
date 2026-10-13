@@ -32,8 +32,8 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import dagger.hilt.android.testing.HiltAndroidRule
 import dagger.hilt.android.testing.HiltAndroidTest
 import org.connectbot.data.entity.Host
+import org.connectbot.service.ConnectionState
 import org.connectbot.tabatelier.TabAtelierTab
-import org.connectbot.ui.screens.hostlist.ConnectionState
 import org.connectbot.ui.screens.hostlist.HostListScreen
 import org.connectbot.ui.screens.hostlist.HostListScreenContent
 import org.connectbot.ui.screens.hostlist.HostListTestTags

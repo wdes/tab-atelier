@@ -39,6 +39,7 @@ import org.connectbot.data.HostRepository
 import org.connectbot.data.entity.Host
 import org.connectbot.data.entity.Pubkey
 import org.connectbot.di.CoroutineDispatchers
+import org.connectbot.service.ConnectionState
 import org.connectbot.service.ServiceError
 import org.connectbot.service.TerminalManager
 import org.connectbot.tabatelier.TabAtelierClient
@@ -47,12 +48,6 @@ import org.connectbot.tabatelier.tabAtelierErrorMessage
 import org.connectbot.transport.TabAtelier
 import org.connectbot.util.PreferenceConstants
 import javax.inject.Inject
-
-enum class ConnectionState {
-    UNKNOWN,
-    CONNECTED,
-    DISCONNECTED,
-}
 
 /**
  * One row of the host list.
@@ -639,6 +634,22 @@ class HostListViewModel @Inject constructor(
         // Check if host has an active bridge
         val bridge = manager.bridgesFlow.value.find { it.host.id == host.id }
         if (bridge != null) {
+            // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): a tab-atelier
+            // session reports its own WebSocket state, and that is the answer here.
+            //
+            // The derivation below cannot see a socket that is down while the session
+            // is still up, which is the normal way a WebSocket behaves and the reason
+            // a dropped tab-atelier connection used to keep its green border.
+            // `UNKNOWN` is the flow's initial value and nothing else sets it, so it is
+            // how every other protocol keeps the upstream answer unchanged.
+            //
+            // Reading `.value` rather than collecting is deliberate: this is asked
+            // fresh on every host-status notification, and the transport notifies
+            // whenever it moves, so the snapshot can never be stale in a way that
+            // outlives the recomposition it triggers.
+            val remote = bridge.remoteSocketState.value
+            if (remote != ConnectionState.UNKNOWN) return remote
+
             // Bridge exists but may be disconnected or in grace period
             return if (bridge.disconnected || bridge.isInGracePeriod()) {
                 ConnectionState.DISCONNECTED

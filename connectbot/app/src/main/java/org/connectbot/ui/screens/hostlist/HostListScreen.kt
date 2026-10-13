@@ -114,6 +114,7 @@ import org.connectbot.data.JsonImportTooLargeException
 import org.connectbot.data.entity.Host
 import org.connectbot.data.entity.Pubkey
 import org.connectbot.tabatelier.TabAtelierTab
+import org.connectbot.service.ConnectionState
 import org.connectbot.transport.TabAtelier
 import org.connectbot.ui.LocalTerminalManager
 import org.connectbot.ui.PreviewScreen
@@ -697,11 +698,20 @@ private fun HostListItem(
     var showDisconnectDialog by remember { mutableStateOf(false) }
     var showForgetHostKeysDialog by remember { mutableStateOf(false) }
 
-    // Determine border color based on connection state
+    // Determine border color based on connection state.
+    //
+    // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): RECONNECTING is
+    // drawn in the blue that was already in this palette for exactly this kind of
+    // thing, rather than as either of the other two. Green would be the bug this
+    // feature exists to fix — the session is not up — and red would send the user
+    // looking for a reconnect button for a connection that is already retrying
+    // itself.
     val borderColor = when (connectionState) {
         ConnectionState.CONNECTED -> colorResource(R.color.host_green)
 
         // Green
+        ConnectionState.RECONNECTING -> colorResource(R.color.host_blue)
+
         ConnectionState.DISCONNECTED -> colorResource(R.color.host_red)
 
         // Red
@@ -752,6 +762,7 @@ private fun HostListItem(
                             },
                             contentDescription = when (connectionState) {
                                 ConnectionState.CONNECTED -> stringResource(R.string.image_description_connected)
+                                ConnectionState.RECONNECTING -> stringResource(R.string.tabatelier_image_description_reconnecting)
                                 ConnectionState.DISCONNECTED -> stringResource(R.string.image_description_disconnected)
                                 ConnectionState.UNKNOWN -> null
                             },
@@ -774,12 +785,16 @@ private fun HostListItem(
                             Icon(
                                 imageVector = when (connectionState) {
                                     ConnectionState.CONNECTED -> Icons.Default.CheckCircle
+                                    // Not the error glyph, which would say the
+                                    // opposite of what is happening.
+                                    ConnectionState.RECONNECTING -> Icons.Default.Refresh
                                     ConnectionState.DISCONNECTED -> Icons.Default.Error
                                     ConnectionState.UNKNOWN -> Icons.Default.Computer // Unreachable
                                 },
                                 contentDescription = null,
                                 tint = when (connectionState) {
                                     ConnectionState.CONNECTED -> colorResource(R.color.host_green)
+                                    ConnectionState.RECONNECTING -> colorResource(R.color.host_blue)
                                     ConnectionState.DISCONNECTED -> colorResource(R.color.host_red)
                                     ConnectionState.UNKNOWN -> Color.Gray // Unreachable
                                 },
@@ -902,7 +917,13 @@ private fun HostListItem(
                                     showMenu = false
                                     showDisconnectDialog = true
                                 },
-                                enabled = connectionState == ConnectionState.CONNECTED,
+                                // Changed for Tab Atelier Remote (Apache-2.0 section
+                                // 4(b)): a session that is redialling itself is one
+                                // the user may want to stop, and this is the only
+                                // control that stops it — the retry loop runs until
+                                // it connects or until the session is closed.
+                                enabled = connectionState == ConnectionState.CONNECTED ||
+                                    connectionState == ConnectionState.RECONNECTING,
                                 leadingIcon = {
                                     Icon(Icons.Default.LinkOff, null)
                                 },

@@ -30,6 +30,14 @@ package org.connectbot.transport
 
 import android.content.Context
 import android.net.Uri
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
@@ -39,6 +47,7 @@ import okio.ByteString
 import okio.ByteString.Companion.toByteString
 import org.connectbot.R
 import org.connectbot.data.entity.Host
+import org.connectbot.service.ConnectionState
 import org.connectbot.service.DisconnectReason
 import org.connectbot.tabatelier.TabAtelierBase
 import org.connectbot.tabatelier.TabAtelierClient
@@ -62,6 +71,20 @@ import java.util.zip.GZIPInputStream
  * `TerminalManager.setPendingTabKey` records it just before the connection
  * starts, and [connect] takes it, because a WebSocket carries no way to ask for
  * a tab and a `Host` row describes the daemon, not one of its tabs.
+ *
+ * ## This transport reconnects itself, and that is not an optimisation
+ *
+ * A dropped WebSocket used to leave a session that looked alive and never moved
+ * again: the socket's failure was swallowed (see [Listener.onFailure] for why that
+ * was wrong), and the app's own reconnect path could not help even once told,
+ * because a reconnect builds a *new* transport whose
+ * `TerminalManager.takePendingTabKey` is empty — no tab, no session.
+ *
+ * So the retry lives here, where the tab key still is. That is sound for this
+ * protocol and only for this one: a tab is a real terminal on the daemon and the
+ * daemon replays its whole scrollback on connect, so after a successful redial the
+ * viewer holds the same picture it had before the drop. Nothing is lost by
+ * re-dialling, so nothing has to be asked of the user first.
  */
 class TabAtelier : AbsTransport() {
 
@@ -101,6 +124,76 @@ class TabAtelier : AbsTransport() {
     private var currentTabKey: String? = null
 
     /**
+     * The token this session's sockets authenticate with, taken once in [connect].
+     *
+     * Held rather than looked up per dial because a redial happens whatever the
+     * app is doing, and `SecurePasswordStorage` is a keystore call: the token cannot
+     * change without the user editing the host, which ends the session anyway.
+     */
+    @Volatile
+    private var token: String? = null
+
+    /**
+     * Whether the daemon has accepted a socket for this session yet.
+     *
+     * Decides what a drop means, and what "connected" means to the app. Before the
+     * session has a socket there is nothing to keep alive — the terminal is still on
+     * "connecting via tabatelier…" — so a failed attempt is retried in silence. Once
+     * one has opened the session is live, and from then on it stays live through a
+     * drop: see [handleDrop].
+     *
+     * Cleared only by [close] and [connect], which is what makes a redial behind the
+     * user's back impossible.
+     */
+    @Volatile
+    private var established = false
+
+    /** How many dials in a row have failed, for the backoff. */
+    @Volatile
+    private var attempts = 0
+
+    /**
+     * The redial, when one is in flight, so it can be cancelled once it is not
+     * wanted any more — a session closed by the user, or a switch that has replaced
+     * the socket it was watching.
+     */
+    @Volatile
+    private var retryJob: Job? = null
+
+    /**
+     * Outlives any one socket, because it has to: it is what keeps the session
+     * together across a drop. A [SupervisorJob] so a failed redial cannot take the
+     * scope with it, and [Dispatchers.IO] because dialling blocks by design (see
+     * [openSocket]).
+     */
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    /**
+     * What this session has told the bridge about its socket.
+     *
+     * Kept here rather than only pushed, so a redial that lands on the state already
+     * on screen does not wake the UI to redraw the same colour, and so the state
+     * survives the brief window in which there is no socket to ask.
+     */
+    @Volatile
+    private var socketState = ConnectionState.UNKNOWN
+
+    /**
+     * Moves this session's reported socket state, when it is actually a move.
+     *
+     * The bridge is woken as well, because the state is read out of a snapshot the
+     * host list took earlier: without the notification the flow would hold the new
+     * value and nothing would recompose around it. That is the same
+     * `disconnected`-was-set-and-nobody-told failure this class is being fixed for,
+     * one layer down.
+     */
+    private fun setSocketState(state: ConnectionState) {
+        if (socketState == state) return
+        socketState = state
+        bridge?.onSocketStateChanged(state)
+    }
+
+    /**
      * Identifies the socket that speaks for this session.
      *
      * A switch replaces the socket, and the socket being replaced still calls back
@@ -131,21 +224,50 @@ class TabAtelier : AbsTransport() {
             return
         }
         // Kept for switchTab, which has to reach the same server again long after
-        // this has returned.
+        // this has returned, and for the redials, which reach it many times more.
         this.client = client
         this.base = base
+        this.token = client.token(host.id)
 
-        // Which tab, and only just decided: taken rather than read, so a later
-        // session cannot inherit it from this one.
-        val tabKey = service.takePendingTabKey(host.id)
+        // The tab this session is on is read once and then held, because whoever
+        // puts it there is what a redial does not have: see [retryLoop] for why a
+        // reconnect that goes through `TerminalManager` cannot work for this
+        // protocol.
+        val tabKey = service.takePendingTabKey(host.id) ?: currentTabKey
         if (tabKey.isNullOrBlank()) {
             bridge?.outputLine(service.getString(R.string.tabatelier_tab_not_chosen))
             bridge?.dispatchDisconnect(DisconnectReason.REMOTE_EOF)
             return
         }
 
+        // A fresh transport for the same host — the app's own reconnect, or a
+        // session restored after the process was killed — starts its history over
+        // rather than inheriting the previous transport's counters.
+        attempts = 0
+        established = false
+        closed = false
+        failure = null
         currentTabKey = tabKey
-        openSocket(tabKey)
+
+        // Before the daemon has said anything there is no session to draw, and the
+        // terminal is on its "connecting" line; this is the state that says the app
+        // is working on it rather than waiting on the user.
+        setSocketState(ConnectionState.RECONNECTING)
+
+        try {
+            openSocket(tabKey)
+        } catch (e: IOException) {
+            // A dial that never opened has nothing to keep alive, and the retry the
+            // failed socket started is aimed at a session that does not exist yet:
+            // the bridge never got its `onConnected`, so there is no Relay to read
+            // whatever that retry would eventually open, and it would attach a
+            // viewer to the user's tab that renders nowhere. The caller reports this
+            // — `TerminalBridge.startConnection` catches it — and the user retries
+            // from the list, which is what every other transport here does.
+            cancelRetry()
+            setSocketState(ConnectionState.DISCONNECTED)
+            throw e
+        }
 
         bridge?.onConnected()
     }
@@ -153,11 +275,11 @@ class TabAtelier : AbsTransport() {
     /**
      * Opens a socket for [tabKey] and waits until the daemon has accepted it.
      *
-     * Shared by [connect] and [switchTab], so a moved session is set up exactly
-     * like a fresh one: same route, same auth, same first frames. It says nothing
-     * to the bridge and never touches [closed] — a switch is not a new session, and
-     * reporting the old socket's end would stop the read loop that has to survive
-     * the move.
+     * Shared by [connect], [switchTab] and [retryLoop], so every way this session
+     * gets a socket sets it up exactly like a fresh one: same route, same auth, same
+     * first frames. It says nothing to the bridge and never touches [closed] — a
+     * switch or a redial is not a new session, and reporting the old socket's end
+     * would stop the read loop that has to survive the move.
      *
      * Waiting for the daemon is not merely tidy. `bridge.onConnected()` is what
      * creates the Relay, which is what reads this transport; starting it on a
@@ -165,6 +287,9 @@ class TabAtelier : AbsTransport() {
      * tabatelier…" forever, which is the failure this replaced. Blocking is
      * therefore expected here, and safe: this runs on the io dispatcher
      * (TerminalBridge.startConnection), never on the UI thread.
+     *
+     * @throws IOException when the daemon did not accept the socket, which is what
+     *   [retryLoop] retries and what [connect] lets the bridge report.
      */
     private fun openSocket(tabKey: String) {
         val host = host ?: throw IOException("No host to open a tab-atelier session for")
@@ -174,7 +299,7 @@ class TabAtelier : AbsTransport() {
         // The token rides in the query string, not an Authorization header: the
         // daemon refuses the header alone on a WS upgrade. See
         // TabAtelierBase.webSocketUrl for the why.
-        val url = base.webSocketUrl("/tabs/by-id/$tabKey/ws", client.token(host.id))
+        val url = base.webSocketUrl("/tabs/by-id/$tabKey/ws", token)
         val request = Request.Builder().url(url).build()
 
         // Marks this socket as the one that speaks for the session, so the socket
@@ -268,6 +393,15 @@ class TabAtelier : AbsTransport() {
             Timber.d("Rebuilt the tab-atelier client to switch %d to tab %s", host.id, tabKey)
         }
 
+        // A redial in flight is watching a socket this switch is about to replace,
+        // and the state it would land on is not the state the new tab starts in.
+        cancelRetry()
+
+        // Switching tabs is the app doing something deliberate and likely to work,
+        // so the backoff earned by a server that was down is forgiven here rather
+        // than carried into the new tab.
+        attempts = 0
+
         val previous = socket
         currentAttempt = null
         socket = null
@@ -282,15 +416,24 @@ class TabAtelier : AbsTransport() {
         return try {
             openSocket(tabKey)
             currentTabKey = tabKey
+            // The whole session, not just this socket: a later drop has to redial
+            // the tab that is on screen now. (The socket itself reports CONNECTED
+            // from its own onOpen.)
             Timber.d("Moved the tab-atelier session to tab %s", tabKey)
             true
         } catch (e: IOException) {
             // The move failed and the session has no socket left. Reported the way a
             // lost connection is reported, rather than leaving a terminal that looks
             // alive and never updates again.
+            //
+            // No retry: the tab being moved to was just refused, and by the time a
+            // retry could land the user would have no way to tell which of the two
+            // tabs they were looking at.
             Timber.w(e, "Could not move the tab-atelier session to tab %s", tabKey)
+            cancelRetry()
             failure = e
             closed = true
+            setSocketState(ConnectionState.DISCONNECTED)
             inbound.offer(END_OF_STREAM)
             true
         }
@@ -318,10 +461,15 @@ class TabAtelier : AbsTransport() {
             // dropped for want of a socket to send them on.
             socket = webSocket
             open = true
+            // A socket that has opened is a live connection, whatever it took to
+            // get here, so the backoff starts over: a server that was down and has
+            // come back must not keep being retried on the schedule of its outage.
+            attempts = 0
             // The daemon stamps the tab's last_used_at on this frame, which is
             // what puts the tab the user just opened at the top of the list — and
             // what moves it there when an open session is switched to it.
             webSocket.send(byteArrayOf(TAG_FOCUS).toByteString())
+            onSocketReady()
             opened.countDown()
         }
 
@@ -348,28 +496,234 @@ class TabAtelier : AbsTransport() {
         // mistaken for an oversight.
         override fun onMessage(webSocket: WebSocket, text: String) = Unit
 
+        /**
+         * The daemon closed the socket.
+         *
+         * A close that is not this session asking is the connection dropping, and it
+         * is handled exactly like a failure, because to the user it is one: the
+         * difference between "the peer said goodbye" and "the peer vanished" is not
+         * one a viewer can act on. A close this side asked for never reaches here —
+         * [close] detaches [currentAttempt] first, so the callback fails [isCurrent]
+         * and is ignored.
+         */
         override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
             if (!isCurrent()) {
                 Timber.d("Ignoring the close of a tab-atelier socket this session replaced")
                 return
             }
             Timber.d("tab-atelier session closed: %d %s", code, reason)
-            closed = true
-            inbound.offer(END_OF_STREAM)
             opened.countDown()
+            handleDrop(IOException("the tab-atelier connection closed ($code $reason)"))
         }
 
+        /**
+         * The socket failed.
+         *
+         * **This used to only queue an end-of-stream**, which ended the Relay and told
+         * the bridge nothing. That was the bug behind a session that kept a green
+         * border, kept its tab, and never moved again: `closed` was never set, so the
+         * host list went on deriving "connected", and since nothing called
+         * `dispatchDisconnect` the app never entered any state the user could act on
+         * but force-disconnect. Every other transport here reports its failures to
+         * the bridge; this one now does too, and then redials.
+         */
         override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
             if (!isCurrent()) {
                 Timber.d(t, "Ignoring the failure of a tab-atelier socket this session replaced")
                 return
             }
             Timber.w(t, "tab-atelier session failed")
-            failure = IOException(t.message ?: "tab-atelier connection failed", t)
-            closed = true
-            inbound.offer(END_OF_STREAM)
             opened.countDown()
+            handleDrop(IOException(t.message ?: "tab-atelier connection failed", t))
         }
+    }
+
+    /**
+     * Takes the socket being lost and starts getting it back.
+     *
+     * Runs on the socket's own callback thread, and does nothing there but stop
+     * treating the dead socket as live and hand the redial to [retryLoop]: a socket
+     * callback is the one place in OkHttp where blocking is unambiguously wrong.
+     *
+     * Deliberately does **not** set [closed]. That flag is read by [read] to mean the
+     * session is over and by [isConnected], and a session whose socket is down and
+     * coming back is neither of those. It is set only when there will be no more
+     * attempts.
+     */
+    private fun handleDrop(cause: IOException) {
+        // Whatever arrived before the drop has already been queued and is still
+        // worth rendering, so the queue is left alone. Nothing more is coming.
+        failure = cause
+        open = false
+        closeSocketQuietly()
+
+        when (Reconnect.decide(established = established, closed = closed)) {
+            Reconnect.Action.GIVE_UP -> {
+                // The session is over and the dead socket's callback arrived too
+                // late. Nothing to retry: a redial here would re-attach a viewer to
+                // the user's tab for a session the app has already closed.
+                Timber.d(cause, "Ignoring a drop on a tab-atelier session that is over")
+            }
+
+            Reconnect.Action.RETRY_SILENTLY -> {
+                // No socket has ever opened for this session, so the connection is
+                // still being made: the terminal is on its "connecting" line, the
+                // bridge has not been given its `onConnected` yet, and news of a
+                // failure here would be news of a session it does not know it has.
+                // Retried in silence — [read] returns 0 for an empty queue, which is
+                // how the Relay waits rather than how it stops — with the one
+                // exception of a *first* dial that fails outright, which [connect]
+                // cancels.
+                Timber.d(cause, "A tab-atelier socket did not open; retrying")
+                retrying()
+            }
+
+            Reconnect.Action.RETRY_AND_REPORT -> {
+                // A socket that did open has now gone. This is the case that used to
+                // be invisible, so it is said twice over: the state the host list
+                // draws, and the message the console shows beside the terminal —
+                // which is where the user is actually looking when it happens.
+                //
+                // Deliberately not written *into* the terminal. The daemon replays
+                // the tab's scrollback on reconnect, so a line printed into the
+                // screen would be overwritten by that replay moments later, and
+                // until then it would sit among the remote program's own output
+                // looking like something the server said.
+                Timber.w(cause, "Tab-atelier socket dropped; redialling")
+                manager?.let { service ->
+                    bridge?.emitSessionStatus(service.getString(R.string.tabatelier_connection_lost))
+                }
+                setSocketState(ConnectionState.RECONNECTING)
+                retrying()
+            }
+        }
+    }
+
+    /** Starts a redial if one is not already running. */
+    private fun retrying() {
+        if (retryJob?.isActive == true) return
+        retryJob = scope.launch { retryLoop() }
+    }
+
+    /**
+     * Redials until the session has a socket again, or until it is not wanted.
+     *
+     * Runs on the transport's own scope rather than the bridge's, because what is
+     * being kept alive across the wait is this transport's state: the tab key, the
+     * token, the frames queued for the terminal. A retry that went through
+     * `TerminalManager.requestReconnect` would build a *new* transport, and a new
+     * transport has no tab key — the daemon's protocol carries which tab to open out
+     * of band, just once, so a reconnect without it has nothing to open. That is why
+     * this lives here, and why the app's own reconnect button used to leave the
+     * session dead.
+     *
+     * The backoff is capped and never gives up. Giving up would mean choosing a
+     * moment to tell the user their session is over, and for a viewer that would be
+     * a lie: the daemon holds the tab either way, so a session that is still on
+     * screen is still worth having, and a server that comes back an hour later comes
+     * back to a viewer that is waiting for it.
+     */
+    private suspend fun retryLoop() {
+        try {
+            while (true) {
+                delay(Reconnect.delayMillis(attempts))
+
+                val tabKey = currentTabKey ?: return
+                // Closed while we were waiting — the user is done with this session.
+                if (closed) return
+
+                attempts++
+                try {
+                    openSocket(tabKey)
+                    Timber.i("Reconnected the tab-atelier session for tab %s after %d tr%s",
+                        tabKey, attempts, if (attempts == 1) "y" else "ies")
+                    failure = null
+                    return
+                } catch (e: IOException) {
+                    // Expected while the server is down, and not the user's news:
+                    // the state is already RECONNECTING and saying so again every
+                    // few seconds would be noise on the terminal they came to read.
+                    Timber.d(e, "Tab-atelier redial %d did not connect", attempts)
+                }
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            // Nothing above should throw, but a redial loop that dies silently is
+            // the exact failure this class is being fixed for.
+            Timber.e(e, "The tab-atelier reconnection loop stopped unexpectedly")
+            setSocketState(ConnectionState.DISCONNECTED)
+        }
+    }
+
+    /** Stops any redial in flight, and reports that no more are coming. */
+    private fun cancelRetry() {
+        retryJob?.cancel()
+        retryJob = null
+    }
+
+    /**
+     * What this transport does about a socket it lost: whether the user is told, and
+     * when it dials again.
+     *
+     * Nested here rather than free-standing because it is *this protocol's* answer and
+     * not a general one — a tab-atelier tab survives on the daemon, so a viewer that
+     * redials loses nothing, which is what makes silent retrying defensible. SSH's
+     * answer to the same event is different, and lives in its own transport.
+     *
+     * Both halves are pure functions of their arguments, which is deliberate: the
+     * decision is the substance of this feature and it would otherwise only be
+     * reachable by opening a socket to a real daemon.
+     */
+    internal object Reconnect {
+
+        /** What a lost socket means for the session that lost it. */
+        enum class Action {
+            /** The session is already over; this is a late callback for a dead socket. */
+            GIVE_UP,
+
+            /** Still connecting: keep dialling, and do not tell the user yet. */
+            RETRY_SILENTLY,
+
+            /** A live session lost its socket: tell the user, then keep dialling. */
+            RETRY_AND_REPORT,
+        }
+
+        /**
+         * The rule, stated once.
+         *
+         * [established] is "a socket has opened for this session", not "a socket is
+         * open now" — the second is false in the very case being decided, which is
+         * why the flag has to mean the first. [closed] is checked first because a
+         * session the user has closed must not be resurrected, whatever else is true
+         * of it.
+         */
+        fun decide(established: Boolean, closed: Boolean): Action = when {
+            closed -> Action.GIVE_UP
+            established -> Action.RETRY_AND_REPORT
+            else -> Action.RETRY_SILENTLY
+        }
+
+        /**
+         * How long to wait before the next dial, given how many have already failed.
+         *
+         * A backoff and not a fixed interval, because the two cases are different: a
+         * dropped socket on a moving phone is usually back within seconds and should
+         * not be made to wait, while a server that is down must not be hammered once
+         * a second for as long as the user leaves the app on the screen.
+         *
+         * The last value repeats for every attempt past the end, so this caps and
+         * never gives up: for a viewer, a session that comes back is always worth
+         * more than a session declared over. Retrying while the phone has no network
+         * is not a special case — OkHttp fails such a dial immediately, which just
+         * advances the index to the cap, so an offline phone redials every 30 seconds
+         * until it is not offline.
+         */
+        fun delayMillis(attempts: Int): Long =
+            DELAYS_SECONDS[attempts.coerceIn(0, DELAYS_SECONDS.lastIndex)] * 1000L
+
+        /** The escalating waits, in seconds; the last one is the cap. */
+        private val DELAYS_SECONDS = longArrayOf(2, 5, 10, 20, 30)
     }
 
     /**
@@ -380,6 +734,13 @@ class TabAtelier : AbsTransport() {
      * own, and Telnet's implementation blocks the same way. The poll is what
      * keeps a disconnect responsive without busy-waiting: a closed socket is
      * noticed within the window rather than only when bytes happen to arrive.
+     *
+     * A dropped socket reports 0, not -1, and that is the whole point of the poll
+     * window here: while a redial is in flight the session is neither dead nor
+     * delivering, and 0 is exactly "nothing right now". Throwing the socket's
+     * failure — which this used to do — ends the Relay, and the Relay is the only
+     * thing that will ever read the socket the redial opens. A reconnect that
+     * destroys its own reader is not a reconnect.
      */
     @Throws(IOException::class)
     override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
@@ -406,18 +767,22 @@ class TabAtelier : AbsTransport() {
             }
 
             if (frame == null) {
-                failure?.let { throw it }
-                // -1 is what ends the relay's read loop, so it is reserved for
-                // the session being over and nothing else. A connection that has
-                // merely not finished opening yet is "nothing right now" — the
-                // same as a socket read timeout — and reporting EOF there would
-                // kill the session before the daemon has said anything.
-                if (closed) return -1
+                // Only a session that is over reports its failure or its end.
+                // While a redial is in flight — [closed] false, no socket — this
+                // is "nothing right now", the same as a socket read timeout.
+                if (closed) {
+                    failure?.let { throw it }
+                    return -1
+                }
                 return 0
             }
             if (frame.isEmpty()) {
-                failure?.let { throw it }
-                return -1
+                // Queued by [close], the only thing that ends the session outright.
+                if (closed) {
+                    failure?.let { throw it }
+                    return -1
+                }
+                continue
             }
             leftover = frame
             leftoverOffset = 0
@@ -442,14 +807,79 @@ class TabAtelier : AbsTransport() {
     @Throws(IOException::class)
     override fun flush() = Unit
 
+    /**
+     * Ends the session for good.
+     *
+     * The retry comes first and by its own path, because everything below is about
+     * the socket: a redial that survived this would dial a socket for a session the
+     * user has closed, and the daemon would then see a viewer attach to their tab
+     * that nothing on the phone admits to.
+     */
     override fun close() {
+        cancelRetry()
         open = false
+        established = false
         closed = true
-        socket?.close(CLOSE_NORMAL, null)
-        socket = null
+        setSocketState(ConnectionState.DISCONNECTED)
+        closeSocketQuietly()
         // A read parked on the queue learns the session ended instead of waiting
         // out its poll window.
         inbound.offer(END_OF_STREAM)
+    }
+
+    /**
+     * Whether this session has the daemon.
+     *
+     * **Deliberately true while a redial is in flight**, which is not the same
+     * question as "is a socket open right now" and has to be this one because of who
+     * asks. `TerminalBridge.dispatchDisconnect` closes the transport only
+     * `if (it.isConnected())`, so a false here while the socket is down would make
+     * the user's own Disconnect silently fail to stop the retry: the session would
+     * disappear from the list while a coroutine went on re-attaching a viewer to
+     * their tab. The other askers are port forwards, which a tab-atelier host does
+     * not have.
+     *
+     * It is also what keeps `ConsoleScreen`'s session-open transition from firing
+     * when a redial lands — `isSessionOpen` is what tells that screen the session was
+     * just established, and it uses it to raise the software keyboard. A reconnect is
+     * not an establishment, and popping the keyboard over the terminal the user is
+     * reading would be a strange way to say it came back.
+     *
+     * For this transport the two predicates are the same thing: there is no socket
+     * without a session and no session without a socket, unlike SSH, where the
+     * connection and the PTY are genuinely two.
+     */
+    override fun isConnected(): Boolean = !closed && established
+
+    override fun isSessionOpen(): Boolean = !closed && established
+
+    /**
+     * Lets go of the current socket without anybody hearing about it.
+     *
+     * `currentAttempt` is detached *before* the close, so the socket's own `onClosed`
+     * fails [Listener.isCurrent] and is ignored: this side asked for it, so it is not
+     * a connection dropping. That distinction is what keeps [close] and [switchTab]
+     * from starting a redial of the socket they are deliberately throwing away.
+     */
+    private fun closeSocketQuietly() {
+        currentAttempt = null
+        val previous = socket
+        socket = null
+        previous?.close(CLOSE_NORMAL, null)
+    }
+
+    /**
+     * Records that a socket is open, and says so if it is news.
+     *
+     * Called from [Listener.onOpen] and nowhere else, so this is the one place
+     * "connected" is established: every route to a socket — the first dial, a switch,
+     * a redial — goes through it, and the state is therefore never set from a path
+     * that could disagree with whether a socket actually opened.
+     */
+    private fun onSocketReady() {
+        established = true
+        failure = null
+        setSocketState(ConnectionState.CONNECTED)
     }
 
     /**
@@ -584,7 +1014,17 @@ class TabAtelier : AbsTransport() {
     }
 
     private fun send(tag: Byte, payload: ByteArray) {
-        val socket = socket ?: return
+        val socket = socket
+        if (socket == null || !open) {
+            // Dropped rather than queued, and that is the honest choice: the daemon
+            // replays the tab's whole scrollback when the redial lands, so a
+            // keystroke held back and delivered minutes later would type into a
+            // screen the user has not been looking at. The console shows the
+            // reconnecting state, so this is not silent to the user — only to the
+            // terminal, which is already telling them.
+            Timber.d("Dropping a %d byte frame: the tab-atelier socket is not up", payload.size)
+            return
+        }
         val frame = ByteArray(payload.size + 1)
         frame[0] = tag
         System.arraycopy(payload, 0, frame, 1, payload.size)
@@ -602,10 +1042,6 @@ class TabAtelier : AbsTransport() {
         Timber.w(e, "Ignoring a tab-atelier frame that would not decompress")
         ByteArray(0)
     }
-
-    override fun isConnected(): Boolean = socket != null && open && !closed
-
-    override fun isSessionOpen(): Boolean = open && !closed
 
     override fun getDefaultPort(): Int = DEFAULT_PORT
 

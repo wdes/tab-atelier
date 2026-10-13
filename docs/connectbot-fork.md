@@ -575,6 +575,69 @@ showing the "no tabs" note: "this server has no tabs" and "none match what you t
 for different reactions, and the first when the second is true reads as the server having
 lost its tabs.
 
+### A dropped connection reconnects itself, and the list says which of three states it is in
+
+`TabAtelier` used to swallow a failed socket. Every other transport in this tree tells the
+bridge when its connection dies; this one queued an end-of-stream and said nothing, so
+`disconnected` stayed false, the host list went on deriving "connected" from it, and the
+only way out was the user force-disconnecting — which was the only code path that reached
+`dispatchDisconnect` at all.
+
+Three things were wrong at once, and they are worth separating because each is a different
+kind of mistake:
+
+- **The failure was never reported.** `Listener.onFailure`/`onClosed` now call
+  `handleDrop`, which reports the drop and starts a redial. Reporting is not optional:
+  nothing else in the app can notice a dead socket, because nothing else has one.
+- **There was no state for "the socket is down and I am dialling again".**
+  `ConnectionState` was `UNKNOWN`/`CONNECTED`/`DISCONNECTED`, and it was *derived* —
+  `bridge.disconnected || bridge.isInGracePeriod()` — so it could only ever be as good as
+  those two flags. It gained `RECONNECTING`, and the transport reports its own state
+  through `TerminalBridge.onSocketStateChanged` rather than having anything derive it. That
+  is what makes the colour mean something: *green is a live socket, blue is a redial in
+  flight, red is over*. `RECONNECTING` is `host_blue`, the colour already in the palette
+  for "working on it"; green would be the original bug and red would send the user hunting
+  for a reconnect button that has nothing to do.
+- **Nothing ever dialled again.** `stayConnected` is false by default and the policy is
+  host-level, so a reported drop would have gone to "show the reconnect overlay" and waited
+  for a human. And the app's own auto-reconnect **cannot work for this protocol at all**:
+  `TerminalManager.requestReconnect` → `startConnection` builds a *new* transport, and the
+  tab key arrives out of band through `takePendingTabKey` exactly once — a new transport has
+  no tab, so its `connect()` disconnects. So the retry lives in the transport, where the tab
+  key still is.
+
+The retry is a loop on the transport's own `CoroutineScope` with an escalating backoff that
+caps and never gives up (2s, 5s, 10s, 20s, then 30s). Giving up would mean picking a moment
+to tell the user their session is over, and for a viewer that would often be a lie: the
+daemon holds the tab either way, so a session that comes back an hour later is a session
+worth having kept. The retry **cannot outlive the session** — `close()` cancels it, and
+`switchTab` cancels it before moving, so a redial never lands on a tab the user has left or
+ended.
+
+Three details are load-bearing and easy to get backwards:
+
+- **`isConnected()`/`isSessionOpen()` stay true while a redial is in flight.** This is not
+  "is a socket open" — that is `socket != null && open`, which is false in exactly the case
+  being handled. It has to be the weaker question because of who asks:
+  `TerminalBridge.dispatchDisconnect` closes the transport *only* `if (it.isConnected())`,
+  so a false here would make the user's own Disconnect silently fail to stop the retry, and
+  `ConsoleScreen` uses `isSessionOpen` to detect the session being *newly* open in order to
+  raise the software keyboard — true throughout a reconnect would pop the keyboard over the
+  terminal the user is reading. Both go through a single `established` flag, set only in
+  `onOpen` and cleared in `connect`/`close`.
+- **A drop reports 0 from `read()`, never -1.** `-1` ends the Relay's read loop, and the
+  Relay is the only thing that will ever read the socket the redial opens: a reconnect that
+  destroys its own reader is not a reconnect. `-1` is now reserved for `close()`.
+- **The drop message goes to the console's snackbar, not into the terminal.** The daemon
+  replays the tab's scrollback when the redial lands, so a line printed into the screen
+  would be overwritten moments later — and until then it would sit among the remote
+  program's output looking like something the server said.
+
+The decision itself (`what a lost socket means`) and the backoff schedule are pure
+functions on `TabAtelier.Reconnect`, and both are unit-tested and mutation-checked. That is
+deliberate: they are the substance of the behaviour, and a rule that can only be exercised
+by reproducing a real network drop is a rule that will not be exercised.
+
 ## Current state
 
 The app is a working ConnectBot under our package id, plus the tab-atelier type:
@@ -617,4 +680,11 @@ Not yet exercised on a real device: everything above is measured from the host
 against a live daemon over the app's own code paths, not from the phone. In
 particular the grid mirror's *font* fitting — whether a 193-column grid is
 readable at arm's length — is a judgement only a device can make.
+
+The reconnection path is the same kind of claim. Its *rule* is tested and
+mutation-checked, but no test here has dropped a real socket: the retry loop, the
+backoff, and the three-state indicator are reasoned about and compiled, not
+observed. The first thing to check on a device is that killing the daemon (or
+walking out of Wi-Fi range) turns the host row blue rather than leaving it green,
+and that bringing it back restores the tab without a force-disconnect.
 

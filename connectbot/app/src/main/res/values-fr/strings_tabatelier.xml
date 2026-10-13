@@ -42,4 +42,29 @@
 	<string name="tabatelier_tab_filter_clear">Effacer le filtre</string>
 	<string name="tabatelier_tab_pin">Épingler cet onglet en haut</string>
 	<string name="tabatelier_tab_unpin">Détacher cet onglet</string>
+	<string name="tabatelier_refresh_tabs">Actualiser les onglets</string>
+	<string name="tabatelier_tab_active">actif</string>
+	<string name="tabatelier_tab_locked">Verrouillé</string>
+
+	<!-- The host editor's fields for a tab-atelier server. -->
+	<string name="tabatelier_url_title">URL du serveur</string>
+	<string name="tabatelier_url_hint">https://hote:8443</string>
+	<string name="tabatelier_url_summary">L\'adresse du démon, avec http:// ou https:// et le préfixe de chemin éventuel.</string>
+	<string name="tabatelier_url_error">Saisissez une URL commençant par http:// ou https://, par exemple https://hote:8443</string>
+	<string name="tabatelier_url_invalid">L\'adresse de ce serveur n\'est pas une URL valide. Modifiez-la et saisissez-en une, par exemple https://hote:8443</string>
+	<string name="hostpref_token_title">Jeton d\'API</string>
+	<string name="hostpref_token_unchanged">Jeton d\'API (inchangé)</string>
+	<string name="hostpref_token_summary">Jeton Bearer envoyé au démon tab-atelier.</string>
+	<string name="hostpref_clear_token">Effacer le jeton enregistré</string>
+
+	<!-- Opening a session, and losing one. Like the English, these say what the
+	     user should do rather than only what went wrong. -->
+	<string name="tabatelier_url_missing">Ce serveur n\'a pas encore d\'adresse. Ouvrez-le dans l\'éditeur d\'hôte et saisissez son URL, par exemple https://hote:8443</string>
+	<string name="tabatelier_tab_not_chosen">Aucun onglet n\'a été choisi pour cette session. Ouvrez-en un depuis la liste des serveurs.</string>
+	<string name="tabatelier_transport_not_yet">Les terminaux tab-atelier arrivent dans une étape ultérieure.</string>
+	<string name="tabatelier_connection_lost">Connexion perdue. Reconnexion…</string>
+	<string name="tabatelier_image_description_reconnecting">Reconnexion.</string>
+
+	<!-- The console title while a tab is open: the server, then the tab. -->
+	<string name="tabatelier_console_title_with_tab">%1$s - %2$s</string>
 </resources>

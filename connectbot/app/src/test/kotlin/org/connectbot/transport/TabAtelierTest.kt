@@ -2,9 +2,16 @@
  * New file for Tab Atelier Remote (Apache-2.0 section 4(b)), ours — upstream has
  * no tab-atelier transport, so there is nothing to preserve here.
  *
- * Covers the frame decoder, which is where the daemon's stream is turned into
- * what the terminal renders. It is a pure function of a frame, so it is tested
- * directly rather than through a session.
+ * Covers the two things about this transport that are decided by a rule rather than
+ * carried out by a socket: the frame decoder, which turns the daemon's stream into
+ * what the terminal renders, and the reconnection policy, which decides what a lost
+ * socket means and when to dial again.
+ *
+ * Both are pure functions of their arguments, so both are tested directly rather than
+ * through a session — no server, no WebSocket, no coroutine. That is not only
+ * convenience: the reconnection rule is the substance of the fix it belongs to, and
+ * a rule that can only be exercised by reproducing a real network drop is a rule that
+ * will not be exercised.
  *
  * The tag table it checks against is written out here rather than read from the
  * transport: this is the test's own statement of the daemon's protocol, so a
@@ -18,6 +25,7 @@ package org.connectbot.transport
 
 import okio.ByteString.Companion.encodeUtf8
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
@@ -234,5 +242,100 @@ class TabAtelierTest {
     @Test
     fun setDimensions_isSafeAndSilent() {
         transport.setDimensions(columns = 45, rows = 20, width = 1080, height = 1920)
+    }
+
+    /**
+     * A live session that loses its socket is reported *and* retried.
+     *
+     * This is the bug in one assertion. A dropped socket used to do neither: the
+     * failure was swallowed, so the host list went on reading "connected" from
+     * `disconnected == false`, and nothing dialled again. Getting either half of
+     * this wrong is a different bug — retrying silently leaves a user staring at a
+     * frozen terminal wondering why, and reporting without retrying is the
+     * force-disconnect the user was stuck with.
+     */
+    @Test
+    fun aLostSocketOnALiveSession_isReportedAndRetried() {
+        assertEquals(
+            TabAtelier.Reconnect.Action.RETRY_AND_REPORT,
+            TabAtelier.Reconnect.decide(established = true, closed = false),
+        )
+    }
+
+    /**
+     * A session that never got a socket is retried without being announced.
+     *
+     * Before the first socket opens there is no session for the bridge to hear
+     * about — it has not been given its `onConnected` yet — and the terminal is
+     * already saying it is connecting. Reporting a failure there would be reporting
+     * a session the app does not know it has.
+     */
+    @Test
+    fun aLostSocketBeforeAnyOpened_isRetriedSilently() {
+        assertEquals(
+            TabAtelier.Reconnect.Action.RETRY_SILENTLY,
+            TabAtelier.Reconnect.decide(established = false, closed = false),
+        )
+    }
+
+    /**
+     * A socket lost after the session was closed is not retried at all.
+     *
+     * `close()` detaches the socket before closing it, so its callback is normally
+     * ignored by identity — but the callback and the close run on different threads,
+     * and one that loses that race must still not redial. A retry here would
+     * re-attach a viewer to the user's tab for a session the app has already ended:
+     * a connection the phone has no record of, on the workstation's screen.
+     */
+    @Test
+    fun aLostSocketAfterTheSessionEnded_isNotRetried() {
+        assertEquals(
+            TabAtelier.Reconnect.Action.GIVE_UP,
+            TabAtelier.Reconnect.decide(established = false, closed = true),
+        )
+        assertEquals(
+            TabAtelier.Reconnect.Action.GIVE_UP,
+            TabAtelier.Reconnect.decide(established = true, closed = true),
+        )
+    }
+
+    /**
+     * The redial backs off, and then stops backing off.
+     *
+     * Two things have to be true and they are not the same: the wait must grow, so a
+     * server that is down is not hammered; and it must stop growing, so a session
+     * left on a dead server does not end up waiting hours. Both halves are asserted
+     * because a schedule that only escalates passes a "is it backing off" test and
+     * fails the user.
+     */
+    @Test
+    fun theRedialBacksOffAndThenCaps() {
+        val first = TabAtelier.Reconnect.delayMillis(0)
+        val second = TabAtelier.Reconnect.delayMillis(1)
+        val third = TabAtelier.Reconnect.delayMillis(2)
+
+        assertTrue("the wait must grow: $first then $second", second > first)
+        assertTrue("the wait must keep growing: $second then $third", third > second)
+
+        // Past the end of the schedule the last value repeats, so a long outage settles
+        // at a fixed interval rather than growing without bound.
+        val atCap = TabAtelier.Reconnect.delayMillis(4)
+        assertEquals(atCap, TabAtelier.Reconnect.delayMillis(5))
+        assertEquals(atCap, TabAtelier.Reconnect.delayMillis(1_000))
+        assertTrue("a settled interval must stay useful: $atCap", atCap <= 60_000L)
+    }
+
+    /**
+     * The backoff index is clamped, not wrapped or thrown on.
+     *
+     * `delayMillis` is called with a counter that only ever climbs, so the argument
+     * is a number the caller does not bound. An index into a fixed array has to
+     * survive that: a negative index would come from a counter reset, and past-the-end
+     * is the normal case after a few minutes of a dead server.
+     */
+    @Test
+    fun theBackoffIndexIsClampedNotThrownOn() {
+        assertTrue(TabAtelier.Reconnect.delayMillis(-1) >= 0)
+        assertTrue(TabAtelier.Reconnect.delayMillis(Int.MAX_VALUE) > 0)
     }
 }

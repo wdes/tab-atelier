@@ -335,6 +335,52 @@ class TerminalBridge {
     private val _remoteBackgroundColor = MutableStateFlow<String?>(null)
     val remoteBackgroundColor: StateFlow<String?> = _remoteBackgroundColor.asStateFlow()
 
+    // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): what the transport
+    // says about the socket underneath this session, or null when the transport does
+    // not report it — which is every protocol but tab-atelier.
+    //
+    // Why a transport has to say this itself rather than it being derived from
+    // [disconnected]: a WebSocket is either connected, or was connected and is not
+    // any more, or is being re-dialled, and the session does not have to end for the
+    // first to become the second. [disconnected] means "this session is over" and
+    // stays false through all of it, which is why a dropped tab-atelier connection
+    // used to be drawn exactly like a healthy one.
+    //
+    // A StateFlow, so the host list can keep it in a snapshot it computed earlier and
+    // still recompose when it changes — see [ConnectionState.RECONNECTING].
+    private val _remoteSocketState = MutableStateFlow(ConnectionState.UNKNOWN)
+    val remoteSocketState: StateFlow<ConnectionState> = _remoteSocketState.asStateFlow()
+
+    /**
+     * A tab-atelier transport reporting where its socket stands.
+     *
+     * Called from the socket's own callback thread, so this does no more than write
+     * the flow and wake the manager; the UI reads either the snapshot or the state
+     * the manager hands it, and the notification is what makes either one recompose.
+     */
+    internal fun onSocketStateChanged(state: ConnectionState) {
+        _remoteSocketState.value = state
+        manager.notifyBridgeStateChanged()
+    }
+
+    /**
+     * Tells the console something about this session's own connection.
+     *
+     * The same channel upstream uses for network status, and for the same reasons it
+     * was built: it is emitted from a background thread, and the console shows it
+     * *beside* the terminal rather than printing it into one — so it cannot be
+     * mistaken for the remote program's output, and the daemon's replay cannot wipe
+     * it the way it would wipe a line written into the screen.
+     *
+     * [outputLine] is the other candidate and the wrong one here: it is for the
+     * banner shown before a session exists, and calling it afterwards logs an error
+     * to say so. A connection that drops and redials is exactly the case that has a
+     * session already.
+     */
+    internal fun emitSessionStatus(message: String) {
+        scope.launch { _networkStatusMessages.emit(message) }
+    }
+
     // Terminal emulator from ConnectBot Terminal library
     val terminalEmulator: TerminalEmulator
 

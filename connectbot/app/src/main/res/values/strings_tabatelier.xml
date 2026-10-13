@@ -74,6 +74,21 @@
 	<string name="tabatelier_url_missing">This server has no address yet. Open it in the host editor and enter its URL, for example https://host:8443</string>
 	<string name="tabatelier_tab_not_chosen">No tab was chosen for this session. Open one from the host list.</string>
 
+	<!-- A live session whose WebSocket dropped. Written into the terminal, so it
+	     has to say what is happening *and* that it is being handled: the app
+	     redials by itself, and a message that only said "disconnected" would send
+	     the user looking for a button they do not need. The tab keeps running on
+	     the server throughout — this app is only the viewer — and the daemon
+	     replays the tab's scrollback when the retry lands, so nothing is lost by
+	     waiting. -->
+	<string name="tabatelier_connection_lost">Connection lost. Reconnecting…</string>
+
+	<!-- Accessibility text for the host list's status badge while the connection
+	     is being re-established. Follows upstream's own phrasing for the two
+	     states beside it, and its terminal full stop: it is read aloud, not
+	     shown. -->
+	<string name="tabatelier_image_description_reconnecting">Reconnecting.</string>
+
 	<!-- The console title while a tab is open: the server's name, then the
 	     tab's. A session is "which server" and "which of its tabs", and the tab
 	     is the part that changes between them — two tabs of one server would
