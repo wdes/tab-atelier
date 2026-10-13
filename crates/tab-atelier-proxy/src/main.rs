@@ -75,6 +75,23 @@ enum Command {
         #[arg(default_value = "")]
         provider: String,
     },
+    /// Pin every request from this account to one model.
+    ///
+    /// The model pin outranks the provider pin: choosing a model chooses the
+    /// hop that serves it. An empty model clears the pin and returns the
+    /// account to class routing. Enforced, not preferred: a pin to a model no
+    /// provider serves gets a 503 rather than a quiet fall back.
+    ///
+    /// The pin lives on the ACCOUNT, and an account carries several keys that
+    /// share it — pinning one agent to its own model means giving it its own
+    /// account first. See `docs/proxy.md`, "Pinning someone to a model".
+    SetModel {
+        /// Account email or id.
+        who: String,
+        /// Model id, as published in the catalogue. Empty clears the pin.
+        #[arg(default_value = "")]
+        model: String,
+    },
     /// Install a Claude login copied from a machine that can run `claude`.
     ///
     /// The proxy talks to Anthropic with the host's own Claude OAuth
@@ -114,6 +131,7 @@ fn run() -> Result<(), String> {
         Command::Disable { who } => cli::set_disabled(&who, true),
         Command::Enable { who } => cli::set_disabled(&who, false),
         Command::SetProvider { who, provider } => cli::set_provider(&who, &provider),
+        Command::SetModel { who, model } => cli::set_model(&who, &model),
         Command::Remove { who } => cli::remove_account(&who),
         Command::ImportCredentials { from } => cli::import_credentials(from.as_deref()),
     }

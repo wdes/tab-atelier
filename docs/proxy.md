@@ -443,6 +443,29 @@ An account pinned to a provider that is disabled or out of capacity gets a
 them off. That is the point of a pin: it is a statement about where someone's
 work is allowed to go — a jurisdiction, an invoice, a quota.
 
+### Pinning someone to a model
+
+The **Model** column pins an account to one model. An empty value means class
+routing; a value is enforced just like a provider pin:
+
+```sh
+sudo -u tab-atelier-proxy tab-atelier-proxy set-model ada@example.org gpt-5.6-luna
+```
+
+The model pin outranks the provider pin — naming a model names the hop that
+serves it, so a model pin chooses the provider the request leaves by. The id
+must be one the catalogue publishes, matched whatever its case; anything else
+is refused when the pin is set, at the CLI or by the API, rather than becoming
+a 503 on every request. An empty value clears the pin and returns the account
+to class routing. A pin that stops being served later does get the 503 — like
+the provider pin, there is no quiet fall back.
+
+**The pin lives on the account, not on a key** — and an account carries several
+keys, which share it. So **one model per agent means one account per agent**:
+to give a single agent its own model, give it its own account (and its own key)
+first, then pin that account. Pinning an account that several agents share pins
+them all at once.
+
 ### Model mapping
 
 One global table, applied before routing. "When someone asks for the name on
