@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! The HTTP server: bind, accept, dispatch to a local asset or the daemon.
+//! The HTTP server: bind, accept, dispatch to an asset, a pane, or the daemon.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use http::{Request, Response, StatusCode, header};
+use http_body_util::{BodyExt as _, Limited};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
@@ -13,7 +14,8 @@ use tokio::net::TcpListener;
 
 use crate::body::{BoxBody, full};
 use crate::config::{Config, HopTimeouts, Upstream};
-use crate::proxy::proxy;
+use crate::panes::Panes;
+use crate::proxy::{MAX_REQUEST_BODY, proxy};
 use crate::route::{self, Route};
 
 /// Bind `cfg.bind` and serve until the process is killed.
@@ -23,7 +25,7 @@ use crate::route::{self, Route};
 /// Returns an error if the address cannot be bound.
 pub async fn run(cfg: Config) -> std::io::Result<()> {
     let listener = TcpListener::bind(cfg.bind).await?;
-    serve(listener, cfg.upstream).await
+    serve(listener, cfg).await
 }
 
 /// Serve on an already-bound listener.
@@ -35,14 +37,15 @@ pub async fn run(cfg: Config) -> std::io::Result<()> {
 ///
 /// Does not return errors: a failed `accept` is retried and a failed connection
 /// is dropped. The `Result` matches [`run`]'s shape for callers.
-pub async fn serve(listener: TcpListener, upstream: String) -> std::io::Result<()> {
-    serve_with(listener, upstream, HopTimeouts::default()).await
+pub async fn serve(listener: TcpListener, cfg: Config) -> std::io::Result<()> {
+    serve_with(listener, cfg, HopTimeouts::default()).await
 }
 
 /// [`serve`] with explicit hop deadlines, so a test can compress them and still
 /// exercise the real timeout paths instead of waiting out the production values.
-pub async fn serve_with(listener: TcpListener, upstream: String, timeouts: HopTimeouts) -> std::io::Result<()> {
-    let upstream = Arc::new(Upstream::new(upstream, timeouts));
+pub async fn serve_with(listener: TcpListener, cfg: Config, timeouts: HopTimeouts) -> std::io::Result<()> {
+    let upstream = Arc::new(Upstream::new(cfg.upstream, timeouts));
+    let panes = Arc::new(Panes::new(cfg.journal, cfg.token));
     loop {
         let (stream, _peer) = match listener.accept().await {
             Ok(pair) => pair,
@@ -55,10 +58,12 @@ pub async fn serve_with(listener: TcpListener, upstream: String, timeouts: HopTi
             }
         };
         let upstream = Arc::clone(&upstream);
+        let panes = Arc::clone(&panes);
         tokio::spawn(async move {
             let service = service_fn(move |req: Request<Incoming>| {
                 let upstream = Arc::clone(&upstream);
-                async move { Ok::<_, std::convert::Infallible>(handle(req, &upstream).await) }
+                let panes = Arc::clone(&panes);
+                async move { Ok::<_, std::convert::Infallible>(handle(req, &upstream, &panes).await) }
             });
             // Connection-level errors (client hung up mid-response) are routine.
             let _ = hyper::server::conn::http1::Builder::new()
@@ -68,9 +73,10 @@ pub async fn serve_with(listener: TcpListener, upstream: String, timeouts: HopTi
     }
 }
 
-/// Serve a local asset, or relay the request to the daemon.
-async fn handle(req: Request<Incoming>, upstream: &Upstream) -> Response<BoxBody> {
+/// Serve a local asset, answer a pane, or relay the request to the daemon.
+async fn handle(req: Request<Incoming>, upstream: &Upstream, panes: &Panes) -> Response<BoxBody> {
     let (parts, body) = req.into_parts();
+    let authorization = parts.headers.get(header::AUTHORIZATION).cloned();
     match route::route(&Request::from_parts(parts.clone(), ())) {
         Route::Asset(asset, content_type) => Response::builder()
             .status(StatusCode::OK)
@@ -82,5 +88,44 @@ async fn handle(req: Request<Incoming>, upstream: &Upstream) -> Response<BoxBody
             .body(full(asset))
             .expect("static response builder"),
         Route::Proxy => proxy(Request::from_parts(parts, body), upstream).await,
+        Route::Decisions { include_archived } => {
+            if !panes.authorized(authorization.as_ref()) {
+                return Panes::unauthorized();
+            }
+            panes.list(include_archived)
+        }
+        Route::DecisionFile { path } => {
+            if !panes.authorized(authorization.as_ref()) {
+                return Panes::unauthorized();
+            }
+            panes.file(&path)
+        }
+        Route::DecisionRead { id } => {
+            if !panes.authorized(authorization.as_ref()) {
+                return Panes::unauthorized();
+            }
+            panes.read(&id)
+        }
+        Route::DecisionTranch { id } => {
+            if !panes.authorized(authorization.as_ref()) {
+                return Panes::unauthorized();
+            }
+            match read_verdict(body).await {
+                Ok(verdict) => panes.tranch(&id, &verdict),
+                Err(response) => response,
+            }
+        }
     }
+}
+
+/// Reads the `{ "verdict": "…" }` body of a rule, bounded like any relayed body.
+async fn read_verdict(body: Incoming) -> Result<String, Response<BoxBody>> {
+    let bytes = match Limited::new(body, MAX_REQUEST_BODY).collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(_) => return Err(Panes::bad_request()),
+    };
+    serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()
+        .and_then(|value| value.get("verdict").and_then(|v| v.as_str()).map(str::to_string))
+        .ok_or_else(Panes::bad_request)
 }

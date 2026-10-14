@@ -3,13 +3,19 @@
 //! Runtime configuration, and the upstream hop it configures.
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::time::Duration;
+
+use crate::decisions::Journal;
 
 /// The daemon this crate fronts when `TAB_ATELIER_UPSTREAM` is unset.
 pub const DEFAULT_UPSTREAM: &str = "http://127.0.0.1:7890";
 
 /// Address the kiosk listens on when `TAB_ATELIER_KIOSK_ADDR` is unset.
 pub const DEFAULT_BIND: &str = "127.0.0.1:8282";
+
+/// Where the kiosk's own data lives when the state-dir knobs are unset.
+pub const DEFAULT_STATE_DIR: &str = "/var/lib/tab-atelier-kiosk";
 
 /// Runtime knobs, read from the environment.
 #[derive(Debug, Clone)]
@@ -18,6 +24,14 @@ pub struct Config {
     pub upstream: String,
     /// Address to listen on.
     pub bind: SocketAddr,
+    /// The decision journal this crate serves and mutates.
+    pub journal: Journal,
+    /// The token the panes require, or `None` for a read-refusing kiosk.
+    ///
+    /// `None` is fail-closed: the panes answer 401 rather than serving an
+    /// unauthenticated door onto the board. A kiosk meant to be looked at gets a
+    /// token; one that is not, does not.
+    pub token: Option<String>,
 }
 
 impl Config {
@@ -35,7 +49,18 @@ impl Config {
         let bind = bind
             .parse()
             .map_err(|err| format!("bind address {bind:?} is not an address: {err}"))?;
-        Ok(Self { upstream, bind })
+        let state = std::env::var("TAB_ATELIER_KIOSK_STATE").unwrap_or_else(|_| DEFAULT_STATE_DIR.to_string());
+        let journal = std::env::var("TAB_ATELIER_DECISIONS")
+            .map_or_else(|_| PathBuf::from(&state).join("decisions.jsonl"), PathBuf::from);
+        let outbox =
+            std::env::var("TAB_ATELIER_OUTBOX").map_or_else(|_| PathBuf::from(&state).join("outbox"), PathBuf::from);
+        let token = std::env::var("TAB_ATELIER_KIOSK_TOKEN").ok().filter(|t| !t.is_empty());
+        Ok(Self {
+            upstream,
+            bind,
+            journal: Journal { path: journal, outbox },
+            token,
+        })
     }
 
     /// Read `TAB_ATELIER_UPSTREAM` and `TAB_ATELIER_KIOSK_ADDR`, falling back

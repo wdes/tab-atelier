@@ -10,18 +10,19 @@
 //! header dropped somewhere between them.
 
 use std::fmt::Write as _;
+use std::fs;
 use std::io::{Read as _, Write as _};
 use std::net::{SocketAddr, TcpListener as StdListener, TcpStream as StdStream};
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Duration;
 
 use http::{Method, Request, header};
 use tokio::net::TcpListener;
 
-use crate::assets;
-use crate::config::HopTimeouts;
+use crate::config::{Config, HopTimeouts};
+use crate::decisions::Journal;
 use crate::proxy::MAX_REQUEST_BODY;
-use crate::route::{Route, route};
 use crate::server::serve_with;
 
 /// Factor the production deadlines are compressed by in these tests.
@@ -52,14 +53,39 @@ fn scaled_timeouts() -> HopTimeouts {
     }
 }
 
+/// A fresh state directory, with an empty outbox, for one test.
+fn scratch_dir(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("ta-kiosk-tests-{name}-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(dir.join("outbox")).expect("make outbox");
+    dir
+}
+
+/// A config pointed at `upstream`, with the journal under `state`.
+fn test_config(upstream: String, state: &Path, token: Option<&str>) -> Config {
+    Config {
+        upstream,
+        bind: "127.0.0.1:0".parse().expect("a valid bind address"),
+        journal: Journal {
+            path: state.join("decisions.jsonl"),
+            outbox: state.join("outbox"),
+        },
+        token: token.map(str::to_string),
+    }
+}
+
 /// Bind the kiosk on an ephemeral port and return where it landed.
-async fn spawn_kiosk(upstream: String) -> SocketAddr {
+async fn spawn_kiosk_with(cfg: Config) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind kiosk");
     let addr = listener.local_addr().expect("kiosk address");
     tokio::spawn(async move {
-        let _ = serve_with(listener, upstream, scaled_timeouts()).await;
+        let _ = serve_with(listener, cfg, scaled_timeouts()).await;
     });
     addr
+}
+
+async fn spawn_kiosk(upstream: String) -> SocketAddr {
+    spawn_kiosk_with(test_config(upstream, &scratch_dir("proxy"), None)).await
 }
 
 /// Reads a request head (through the blank line) off a blocking socket.
@@ -172,39 +198,6 @@ fn body_string(mut resp: http::Response<ureq::Body>) -> String {
     let mut out = String::new();
     resp.body_mut().as_reader().read_to_string(&mut out).expect("read body");
     out
-}
-
-/// The classification is the crate: the page and its assets are ours, every
-/// call the page makes is the daemon's.
-#[test]
-fn routes_are_classified_locally_or_proxied() {
-    let classify = |method: Method, path: &str| {
-        Request::builder()
-            .method(method)
-            .uri(path)
-            .body(())
-            .map(|req| route(&req))
-            .expect("build request")
-    };
-    assert_eq!(
-        classify(Method::GET, "/"),
-        Route::Asset(assets::HTML, "text/html; charset=utf-8")
-    );
-    assert_eq!(
-        classify(Method::GET, "/kiosk"),
-        Route::Asset(assets::HTML, "text/html; charset=utf-8")
-    );
-    assert_eq!(
-        classify(Method::GET, "/assets/kiosk.js"),
-        Route::Asset(assets::JS, "text/javascript; charset=utf-8")
-    );
-
-    // The harness routes and the daemon's API belong to the daemon.
-    for path in ["/decisions", "/reports", "/intent", "/api/users", "/tabs"] {
-        assert_eq!(classify(Method::GET, path), Route::Proxy, "{path} is the daemon's");
-    }
-    // A path that looks local is still the daemon's when it is not a fetch.
-    assert_eq!(classify(Method::POST, "/assets/kiosk.js"), Route::Proxy);
 }
 
 /// The page and its assets come from this crate, with their content types, and
@@ -332,11 +325,139 @@ async fn an_oversized_body_is_rejected_before_the_daemon() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_unreachable_upstream_answers_502() {
     let addr = spawn_kiosk("http://127.0.0.1:1".to_string()).await;
-    let resp = get(addr, "/decisions");
+    // A path the kiosk does not own, so it is relayed — and the daemon is absent.
+    let resp = get(addr, "/reports");
     assert_eq!(resp.status(), 502);
     let body = body_string(resp);
     assert!(
         body.contains("upstream_unavailable"),
         "the reason is named, not leaked: {body}"
     );
+}
+
+/// Encode a path for a query, the way a browser would.
+fn urlencode(raw: &str) -> String {
+    raw.replace('/', "%2F")
+}
+
+/// The board is behind the token, and a kiosk with no token lets nobody in.
+///
+/// The pane is the kiosk's own, so a refused request is a 401 here and never a
+/// relay to the daemon — proving the guard is the kiosk's, not the daemon's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_decision_pane_requires_the_token() {
+    let dir = scratch_dir("pane-auth");
+    let addr = spawn_kiosk_with(test_config("http://127.0.0.1:1".to_string(), &dir, Some("s3cret"))).await;
+
+    let anon = get(addr, "/decisions");
+    assert_eq!(anon.status(), 401, "no token is refused");
+
+    let wrong = send(
+        Method::GET,
+        addr,
+        "/decisions",
+        &[("authorization", "Bearer nope")],
+        vec![],
+    );
+    assert_eq!(wrong.status(), 401, "a wrong token is refused");
+
+    let ok = send(
+        Method::GET,
+        addr,
+        "/decisions",
+        &[("authorization", "Bearer s3cret")],
+        vec![],
+    );
+    assert_eq!(ok.status(), 200);
+    assert!(body_string(ok).contains("\"decisions\""));
+
+    // A kiosk with no token configured refuses everyone, not no one.
+    let open_dir = scratch_dir("pane-notoken");
+    let open = spawn_kiosk_with(test_config("http://127.0.0.1:1".to_string(), &open_dir, None)).await;
+    assert_eq!(get(open, "/decisions").status(), 401);
+}
+
+/// The whole board round-trips over HTTP: list, read, rule, serve a linked file,
+/// and refuse everything that should be refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_board_is_read_and_ruled_through_http() {
+    let dir = scratch_dir("pane-board");
+    fs::write(
+        dir.join("decisions.jsonl"),
+        "{\"id\":\"a\",\"title\":\"Ship it?\"}\n{\"id\":\"b\",\"state\":\"archived\",\"title\":\"Old\"}\n",
+    )
+    .expect("write journal");
+    fs::write(dir.join("outbox/note.md"), "# note\n").expect("write note");
+    let addr = spawn_kiosk_with(test_config("http://127.0.0.1:1".to_string(), &dir, Some("t"))).await;
+    let auth = ("authorization", "Bearer t");
+
+    // Open listed, archived hidden until asked for.
+    let board = body_string(send(Method::GET, addr, "/decisions", &[auth], vec![]));
+    assert!(board.contains("\"id\":\"a\""), "open decision listed: {board}");
+    assert!(!board.contains("\"id\":\"b\""), "archived hidden by default");
+    let all = body_string(send(
+        Method::GET,
+        addr,
+        "/decisions?includeArchived=true",
+        &[auth],
+        vec![],
+    ));
+    assert!(all.contains("\"id\":\"b\""), "archived shown when asked");
+
+    // A linked file is served from inside the outbox with its type...
+    let note = send(
+        Method::GET,
+        addr,
+        &format!(
+            "/decisions/file?path={}",
+            urlencode(&dir.join("outbox/note.md").to_string_lossy())
+        ),
+        &[auth],
+        vec![],
+    );
+    assert_eq!(note.status(), 200);
+    assert_eq!(body_string(note), "# note\n");
+
+    // ... and a real file OUTSIDE the outbox is refused, so the guarantee is the
+    // confinement and not the file's existence.
+    let outside = send(
+        Method::GET,
+        addr,
+        &format!(
+            "/decisions/file?path={}",
+            urlencode(&dir.join("decisions.jsonl").to_string_lossy())
+        ),
+        &[auth],
+        vec![],
+    );
+    assert_eq!(outside.status(), 404, "a real file outside the outbox is still refused");
+
+    // Read, then rule.
+    let read = send(Method::POST, addr, "/decisions/a/read", &[auth], vec![]);
+    assert_eq!(read.status(), 200);
+    assert!(body_string(read).contains("\"state\":\"read\""));
+
+    let ruled = send(
+        Method::POST,
+        addr,
+        "/decisions/a/tranch",
+        &[auth],
+        br#"{"verdict":"ship"}"#.to_vec(),
+    );
+    assert_eq!(ruled.status(), 200);
+    let ruled_body = body_string(ruled);
+    assert!(ruled_body.contains("\"state\":\"tranched\""));
+    assert!(ruled_body.contains("\"verdict\":\"ship\""));
+
+    // An unknown id is a 404; a body that is not the expected JSON is a 400.
+    let unknown = send(
+        Method::POST,
+        addr,
+        "/decisions/zzz/tranch",
+        &[auth],
+        br#"{"verdict":"x"}"#.to_vec(),
+    );
+    assert_eq!(unknown.status(), 404);
+    let junk = send(Method::POST, addr, "/decisions/a/tranch", &[auth], b"not json".to_vec());
+    assert_eq!(junk.status(), 400);
 }
