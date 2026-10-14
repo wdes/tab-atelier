@@ -8,10 +8,10 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="robots" content="noindex, nofollow, noarchive">
   <!-- Kiosk deploy seam: base for turning a decision's code-source ref (`src/…:line`) into a
-       clickable repo blob link. EMPTY on purpose: the old
-       a-biskoazh fork 404'd (outbox isn't in the repo), so a code ref degrades to honest
-       copyable text. Set this to the durable repo (e.g. wdes/tab-atelier:tab-atelier-mx) once
-       the durability push lands to re-enable clickable blobs. See classifyDecisionFile in kiosk.js. -->
+       clickable repo blob link. EMPTY on purpose: the fork that carried the outbox 404'd
+       (outbox isn't in the repo), so a code ref degrades to honest copyable text. Set this to
+       the durable repo (e.g. wdes/tab-atelier:<branch>) once a branch does carry it, to
+       re-enable clickable blobs. See classifyDecisionFile in kiosk.js. -->
   <meta name="repo-blob-base" content="">
   <!-- Remote link: the public host a report viewer link is composed onto so it can
        open/copy it off-LAN (the CF tunnel + its auth are the PO's infra, not ours). DEFAULTS to

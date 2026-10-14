@@ -1,7 +1,7 @@
 # Brain anti-storm — rework plan for PR #40
 
 Work order for rewriting [PR #40](https://github.com/wdes/tab-atelier/pull/40)
-(`a-biskoazh:feat/brain-robustness`, cross-repo, draft) before force-pushing our
+(from a fork, cross-repo, draft) before force-pushing our
 version over it. Everything below concerns `src/cli/brain.rs` only.
 
 The submitted version is mechanically clean — `cargo fmt --check` and
@@ -98,7 +98,7 @@ message sits before the `eligible.is_empty()` check and prints every 5 s forever
 ## Style — AGENTS.md compliance
 
 - Strip the fork-internal jargon; none of it has a referent in this repo: `AXE A`
-  / `AXE B`, `rate-limit finding #5`, `rejected (tichef)`, `the PO perceived as a
+  / `AXE B`, `rate-limit finding #5`, `the PO perceived as a
   freeze`, `(PR-worthy)` in a commit subject.
 - "Minimal comments — only when the why is non-obvious." The submission is ~488
   added lines for ~120 of logic. Cut the ratio hard; the surviving comments

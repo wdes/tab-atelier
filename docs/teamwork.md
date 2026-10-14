@@ -105,7 +105,7 @@ supervisor can see the whole fleet's roles in one call.
 
 ```
 tab-atelier set-meta role reviewer          # on my own tab
-tab-atelier set-meta project kalpin-back
+tab-atelier set-meta project app-back
 tab-atelier set-meta role --clear
 tab-atelier set-meta --tab 3 role builder   # on someone else's
 tab-atelier tabs --json | jq '.tabs[] | {name, meta}'

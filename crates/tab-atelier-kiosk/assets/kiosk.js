@@ -487,11 +487,11 @@ export function renderDetail(text) {
 
 // Kiosk deploy seam: base for turning a bare code-source ref into a clickable repo blob
 // link. The kiosk can't know the running checkout's remote/branch, so it reads a
-// <meta name="repo-blob-base"> (kiosk.html). A repository that is not pushed yet has no
-// DEFAULT is EMPTY: the old a-biskoazh fork was a dead 404 (outbox isn't in the repo), so
-// until the durability push lands there is no correct base. Empty disables construction →
-// a code ref degrades to honest copyable text (never a dead link). A deploy sets the meta
-// to the durable repo (e.g. wdes/tab-atelier:tab-atelier-mx) to re-enable clickable blobs.
+// <meta name="repo-blob-base"> (kiosk.html). The outbox is not in this repository, so a fork
+// that carried it 404'd on every ref: until a branch does carry it there is no correct base,
+// and the DEFAULT is EMPTY. Empty disables construction → a code ref degrades to honest
+// copyable text (never a dead link). A deploy sets the meta to the durable repo
+// (e.g. wdes/tab-atelier:<branch>) to re-enable clickable blobs.
 const REPO_BLOB_BASE = (function () {
   const dflt = "";
   if (typeof document === "undefined") return dflt; // node (unit tests) → the empty default

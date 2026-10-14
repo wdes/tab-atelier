@@ -2,7 +2,7 @@
 // files[] must distinguish a SERVABLE DOC (a .md under the served outbox zone → the sandboxed
 // /decisions/file viewer, 200) from a CODE-SOURCE REF (auth.rs:76-78, src/…, anything with a
 // :line → the viewer 404s, so NEVER a /decisions/file link).
-// ⭐ the bug: the repo-blob base defaults to EMPTY (the a-biskoazh fork is gone — it would 404).
+// ⭐ the bug: the repo-blob base defaults to EMPTY (the fork that carried the outbox is gone — it would 404).
 // With no base configured a code ref renders as HONEST COPYABLE TEXT (a kk-file-ref span), NOT
 // a dead github link. codeRefBlobUrl still builds a real blob URL WHEN a base is deployed
 // (future durability push), so the clickable path stays wired for that day.
@@ -21,7 +21,7 @@ import { classifyDecisionFile, decisionFileHtml, decisionCardHtml, codeRefBlobUr
   assert.equal(classifyDecisionFile("docs/readme.md").kind, "code", "a repo .md is not the outbox viewer's job");
 
   // Servable docs: a .md under the outbox zone (live or _archive) → kind "doc".
-  for (const f of ["~/Dev/outbox/migration-fork-to-mx.md", "~/Dev/outbox/_archive/2025-08/ra1c/rep.md", "/home/x/Dev/outbox/note.markdown"]) {
+  for (const f of ["~/Dev/outbox/migration-notes.md", "~/Dev/outbox/_archive/2025-08/ra1c/rep.md", "/home/x/Dev/outbox/note.markdown"]) {
     assert.equal(classifyDecisionFile(f).kind, "doc", `${f} → servable doc`);
   }
 
@@ -29,7 +29,7 @@ import { classifyDecisionFile, decisionFileHtml, decisionCardHtml, codeRefBlobUr
   // `outbox/proposition.md`, `_archive/2026-09/rep.md`. The server (GET /decisions/file)
   // sandboxes to the outbox + its `_archive/` subtree, so a bare outbox/_archive .md IS
   // servable → kind "doc" → the viewer. Before the fix these fell through to a github blob
-  // URL (a-biskoazh) → 404 (outbox isn't in the repo). This block is RED before the fix.
+  // URL (the hosting fork) → 404 (outbox isn't in the repo). This block is RED before the fix.
   for (const f of ["outbox/proposition.md", "_archive/2026-09/rep.md", "outbox/_archive/2025-08/ra1c/rep.markdown"]) {
     assert.equal(classifyDecisionFile(f).kind, "doc", `${f} → bare servable doc (cause-A)`);
   }
@@ -46,7 +46,7 @@ import { classifyDecisionFile, decisionFileHtml, decisionCardHtml, codeRefBlobUr
   assert.equal(classifyDecisionFile("  auth.rs:1  ").kind, "code", "trims whitespace");
 
   // ⭐ (PO « vide-jusqu'au-push »): the DEFAULT repo-blob base is empty, so a code ref
-  // carries NO href — it degrades to honest copyable text, never a dead a-biskoazh github link.
+  // carries NO href — it degrades to honest copyable text, never a dead github link.
   const cr = classifyDecisionFile("auth.rs:76-78");
   assert.equal(cr.kind, "code", "code ref stays kind code");
   assert.ok(!cr.href, `⭐ empty base → NO href on a code ref (copyable text), got ${cr.href}`);
@@ -67,7 +67,7 @@ import { classifyDecisionFile, decisionFileHtml, decisionCardHtml, codeRefBlobUr
   assert.equal(codeRefBlobUrl("a.rs:1", BASE + "/"), `${BASE}/a.rs#L1`, "base trailing slash normalised");
   // no base configured → "" (caller degrades to text, never a 404).
   assert.equal(codeRefBlobUrl("a.rs:1", ""), "", "empty base → no URL (fallback to text)");
-  // ⭐ the bug: the module DEFAULT base is empty (a-biskoazh fork removed) — the builder called
+  // ⭐ the bug: the module DEFAULT base is empty (the hosting fork removed) — the builder called
   // WITHOUT an explicit base returns "" so callers degrade to copyable text.
   assert.equal(codeRefBlobUrl("a.rs:1"), "", "⭐ default base is empty (vide-jusqu'au-push)");
 }
@@ -79,16 +79,16 @@ import { classifyDecisionFile, decisionFileHtml, decisionCardHtml, codeRefBlobUr
   const code = decisionFileHtml("auth.rs:76-78", true);
   assert.match(code, /<span class="kk-file-ref"[^>]*data-copy="auth.rs:76-78"/, "⭐ code ref → copyable kk-file-ref span");
   assert.ok(!/kk-file-repo/.test(code), "⭐ no clickable repo <a> when the base is empty");
-  assert.ok(!/github\.com|a-biskoazh/.test(code), "⭐ no dead a-biskoazh/github link");
+  assert.ok(!/github\.com/.test(code), "⭐ no dead github link");
   assert.ok(!/\/decisions\/file/.test(code), "⭐ NO /decisions/file link for a source (no 404)");
   assert.match(code, />auth.rs:76-78</, "the ref text is shown for the reader");
 
   // ⭐ Acceptance 2: a servable doc keeps the sandboxed file-viewer link (200).
-  const doc = decisionFileHtml("~/Dev/outbox/migration-fork-to-mx.md", true);
+  const doc = decisionFileHtml("~/Dev/outbox/migration-notes.md", true);
   assert.match(doc, /<a class="kk-file" href="\/decisions\/file\?path=/, "⭐ servable doc → the viewer (200)");
-  assert.match(doc, /path=~%2FDev%2Foutbox%2Fmigration-fork-to-mx.md/, "path URL-encoded in the query");
+  assert.match(doc, /path=~%2FDev%2Foutbox%2Fmigration-notes.md/, "path URL-encoded in the query");
   assert.match(doc, /token=/, "carries the page token param when canRule");
-  const docNoTok = decisionFileHtml("~/Dev/outbox/migration-fork-to-mx.md", false);
+  const docNoTok = decisionFileHtml("~/Dev/outbox/migration-notes.md", false);
   assert.ok(!/token=/.test(docNoTok), "no token appended when read-only (canRule=false)");
 
   // A full URL → an external repo link (never the local viewer).
@@ -112,7 +112,7 @@ import { classifyDecisionFile, decisionFileHtml, decisionCardHtml, codeRefBlobUr
   });
   // the bug: the source ref → copyable text (empty base), never a github link, never /decisions/file.
   assert.match(card, /<span class="kk-file-ref"[^>]*data-copy="src\/cli\/decision.rs:520"/, "source → copyable span in the card");
-  assert.ok(!/github\.com|a-biskoazh/.test(card), "no dead github link in the card");
+  assert.ok(!/github\.com/.test(card), "no dead github link in the card");
   // The doc: the viewer link.
   assert.match(card, /<a class="kk-file" href="\/decisions\/file\?path=~%2FDev%2Foutbox%2Frep.md/, "doc → viewer link in the card");
   // The 404-prone case is gone: no source path is wrapped in a /decisions/file href.

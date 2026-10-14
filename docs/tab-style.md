@@ -5,9 +5,9 @@ like it belongs there — in the tab strip, in the terminal itself, and on
 `/tabs` for the mobile remote.
 
 ```
-tab-atelier style --folder ~/Dev/kalpin --color '#7a1f2b' --badge KAL
+tab-atelier style --folder ~/Dev/app --color '#7a1f2b' --badge APP
 tab-atelier style --list
-tab-atelier style --folder ~/Dev/kalpin --clear
+tab-atelier style --folder ~/Dev/app --clear
 ```
 
 ## Why the rule is keyed by folder
@@ -70,7 +70,7 @@ daemon start, like `bg-color --global`:
 ```json
 {
   "folder_styles": {
-    "/home/w/Dev/kalpin": { "color": "#7a1f2b", "badge": "KAL" }
+    "/home/w/Dev/app": { "color": "#7a1f2b", "badge": "APP" }
   }
 }
 ```

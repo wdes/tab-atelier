@@ -63,16 +63,16 @@ import { kioskView, decisionCardHtml, kioskHtml, renderDetail } from "../kiosk.j
 // ============================ kioskHtml — grouping, open-first, badge count ============================
 {
   const rm = { decisions: [
-    { id: "k1", project: "kalpin", state: "tranched", title: "kt", verdict: "NO-GO" },
+    { id: "a1", project: "app", state: "tranched", title: "kt", verdict: "NO-GO" },
     { id: "h1", project: "harness", state: "open", title: "ho" },
     { id: "h2", project: "harness", state: "read", title: "hr" },
-    { id: "k2", project: "kalpin", state: "open", title: "ko" },
+    { id: "a2", project: "app", state: "open", title: "ko" },
   ] };
   const html = kioskHtml(rm);
-  // Grouped by project (harness before kalpin, sorted), a header per project.
+  // Grouped by project (app before harness, sorted), a header per project.
   assert.match(html, /kk-project">harness<\/h3>/, "harness group header");
-  assert.match(html, /kk-project">kalpin<\/h3>/, "kalpin group header");
-  assert.ok(html.indexOf("harness</h3>") < html.indexOf("kalpin</h3>"), "projects sorted");
+  assert.match(html, /kk-project">app<\/h3>/, "app group header");
+  assert.ok(html.indexOf("app</h3>") < html.indexOf("harness</h3>"), "projects sorted");
   // Within harness, the open card (ho) precedes the read card (hr).
   assert.ok(html.indexOf('data-id="h1"') < html.indexOf('data-id="h2"'), "open sorts before read within a project");
   // Badge count = nb OPEN (h1 + k2 = 2), NOT read/tranched.

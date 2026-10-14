@@ -25,7 +25,7 @@
                   joined with spaces.",
     after_help = "Examples:\n  \
                   tab-atelier set-meta role reviewer\n  \
-                  tab-atelier set-meta project kalpin-back\n  \
+                  tab-atelier set-meta project app-back\n  \
                   tab-atelier set-meta role --clear"
 )]
 struct Cli {
