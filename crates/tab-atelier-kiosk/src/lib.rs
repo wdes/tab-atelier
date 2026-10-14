@@ -1,20 +1,35 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! The Kiosk web GUI: its embedded assets, and the routes that serve them.
+//! The Kiosk web GUI: a small server that sits in front of the daemon.
 //!
-//! The Kiosk panes (decision, report, intent) are the daemon's routes today,
-//! and this crate does not answer them yet. What is here is the interface
-//! itself, served from the crate so a package cannot be installed without the
-//! files it needs.
+//! It serves the interface it embeds, and relays every other path to the daemon
+//! on the same origin — the harness routes (`/decisions`, `/reports`, `/intent`)
+//! and the daemon's own API (`/api/*`) alike. Same origin is the point: the page
+//! and the calls it makes then share one origin, so the browser never makes a
+//! cross-origin request and CORS never comes up.
 //!
-//! Split by what changes for its own reason: [`assets`] is the interface
-//! compiled in, [`route`] is the path table and the response it builds, and
-//! [`server`] is the socket loop that ties the two together. The split is here
-//! so the panes can arrive as routes without the accept loop and the asset
-//! constants growing into the same file.
+//! The modules turn on what changes for its own reason:
+//!
+//! - [`assets`] — the interface, compiled in so a package cannot be installed
+//!   without the files it needs.
+//! - [`config`] — the upstream hop and its deadlines.
+//! - [`route`] — where a request goes: a handful of paths are ours, the rest is
+//!   the daemon's.
+//! - [`proxy`] — relaying a request to the daemon and its answer back.
+//! - [`server`] — the socket loop that ties them together.
+//!
+//! The daemon stays the only thing that knows about tabs or decisions; this
+//! crate reaches it over its HTTP API alone and never imports its types.
 
-mod assets;
-mod route;
-mod server;
+pub(crate) mod assets;
+pub(crate) mod body;
+pub(crate) mod config;
+pub(crate) mod proxy;
+pub(crate) mod route;
+pub(crate) mod server;
 
-pub use server::{serve, serve_on};
+#[cfg(test)]
+mod tests;
+
+pub use config::{Config, DEFAULT_BIND, DEFAULT_UPSTREAM};
+pub use server::{run, serve};

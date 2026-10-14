@@ -7147,12 +7147,13 @@ version = "0.5.0-dev"
 name = "tab-atelier-kiosk"
 version = "0.1.0-dev"
 dependencies = [
+ "bytes",
  "clap",
+ "futures-util",
  "http 1.4.2",
  "http-body-util",
  "hyper 1.10.1",
  "hyper-util",
- "serde",
  "serde_json",
  "tokio",
  "ureq",
