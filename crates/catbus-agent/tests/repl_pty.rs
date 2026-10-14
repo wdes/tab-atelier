@@ -879,29 +879,18 @@ fn a_turn_paints_the_spinner_and_then_the_totals_line() {
     // names a model and there is nothing to price — which makes this exactly the state the row
     // displayed before it could price anything, and that state has to survive.
     //
-    // The frames come from the raw bytes, split on the CR that begins each repaint, because
-    // `strip_ansi` drops those CRs — after stripping, every repaint runs together into one line and
-    // the frame painted once the reply is recorded, which carries the ledger's model and *is*
-    // priced, reads as part of the frame before it. That later frame is the ledger working as
-    // intended; what this checks is that a frame went up, with nothing named yet, carrying no price.
+    // Read it off the stream before the first price rather than out of a CR-separated frame: how
+    // the repaints divide into frames depends on how the writes interleave, and on CI the estimate
+    // and the priced row landed in *one* segment — so a frame-shaped search finds no frame that is
+    // unpriced, and fails a row that behaved correctly. Repeats here never reproduced it, so the
+    // difference is the environment's frame boundaries and not the code's.
     //
-    // The predicate asks for all three properties at once rather than taking the first frame that
-    // has the counts and then asserting it is unpriced. That distinction is not academic: how the
-    // repaints divide into CR-separated frames depends on how the writes interleave, and on CI the
-    // estimate and the priced row landed in *one* segment — so the old form picked up a frame that
-    // was priced with the model it named, and failed a row that was behaving correctly. Repeats here
-    // never reproduced it, so the difference is the environment's frame boundaries and not the code's.
-    //
-    // What is worth holding is the property: a frame went up with an estimated input count and no
-    // price, and that holds however the boundaries fall.
-    let inflight = seen
-        .split('\r')
-        .map(strip_ansi)
-        .find(|frame| frame.contains("Thinking") && frame.contains('~') && !frame.contains("USD"))
-        .unwrap_or_else(|| panic!("no frame carried an estimated input count and no price:\n{flat}"));
+    // What is worth holding is the property, which survives however the boundaries fall: before
+    // anything was priced, a frame went up carrying an estimated input count.
+    let before_price = strip_ansi(seen.split("USD").next().unwrap_or(&seen));
     assert!(
-        inflight.contains(" in"),
-        "the frame's figure is an input count: {inflight}"
+        before_price.contains("Thinking") && before_price.contains('~') && before_price.contains(" in"),
+        "no unpriced frame carried an estimated input count:\n{flat}"
     );
 }
 
