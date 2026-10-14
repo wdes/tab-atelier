@@ -897,6 +897,16 @@ fn a_model_pin_is_set_refused_and_cleared() {
     cli(s, &["set-model", "ada@example.org", "claude-sonnet-5"]);
     assert_eq!(on_disk(s).as_deref(), Some("claude-sonnet-5"));
 
+    // The same model in another case is stored as the catalogue spells it, not
+    // as it was typed: routing resolves the pin by exact id, so keeping the
+    // operator's capitalisation would write a value only a 503 could come of.
+    cli(s, &["set-model", "ada@example.org", "claude-SONNET-5"]);
+    assert_eq!(
+        on_disk(s).as_deref(),
+        Some("claude-sonnet-5"),
+        "the pin is stored canonically, not as typed"
+    );
+
     // An empty model clears it, back to class routing.
     cli(s, &["set-model", "ada@example.org", ""]);
     assert_eq!(on_disk(s), None, "an empty model must clear the pin");

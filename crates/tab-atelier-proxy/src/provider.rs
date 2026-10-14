@@ -1505,6 +1505,43 @@ impl Registry {
         self.providers.iter().find(|p| p.id == id)
     }
 
+    /// The id the catalogue ships for `wanted`, matched whatever its case.
+    ///
+    /// The one spelling a model pin may be STORED as, and the shared half of
+    /// validating one: routing resolves a pin by exact id ([`Provider::serves`]),
+    /// so a pin kept in the operator's capitalisation was accepted and then 503'd
+    /// every request — the failure the validation exists to prevent. `None` when
+    /// no provider ships it, or when the only match is withdrawn: routing skips a
+    /// [`Model::deprecated`] id, so a pin to one fails exactly like a typo.
+    #[must_use]
+    pub fn canonical_model(&self, wanted: &str) -> Option<&str> {
+        self.providers
+            .iter()
+            .flat_map(|p| &p.models)
+            .find(|m| !m.deprecated && m.id.eq_ignore_ascii_case(wanted))
+            .map(|m| m.id.as_str())
+    }
+
+    /// Why `wanted` cannot be pinned, with the ids that can.
+    ///
+    /// The alternatives listed are the routable ids only — naming a withdrawn
+    /// one would send the operator to a pin that routes nowhere.
+    #[must_use]
+    pub fn refuses_model(&self, wanted: &str) -> String {
+        let routable = || self.providers.iter().flat_map(|p| &p.models).filter(|m| !m.deprecated);
+        let ids = routable().map(|m| m.id.as_str()).collect::<Vec<_>>().join(", ");
+        if self
+            .providers
+            .iter()
+            .flat_map(|p| &p.models)
+            .any(|m| m.deprecated && m.id.eq_ignore_ascii_case(wanted))
+        {
+            format!("no model {wanted:?} — it is withdrawn; the catalogue serves: {ids}")
+        } else {
+            format!("no model {wanted:?} — the catalogue serves: {ids}")
+        }
+    }
+
     /// Which class a requested model name belongs to.
     ///
     /// Looks through every provider's list first, so a name any of them serves

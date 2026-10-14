@@ -84,19 +84,26 @@ pub(crate) fn set_provider(state: &Arc<State>, who: &str, req: &PinProvider) -> 
 /// that serves it.
 pub(crate) fn set_model(state: &Arc<State>, who: &str, req: &PinModel) -> Reply {
     let wanted = req.model.trim();
-    if !wanted.is_empty() {
-        let known = {
+    // Canonicalised to the catalogue's own spelling before it is stored, for the
+    // reason the CLI does the same: routing resolves the pin by EXACT id, so a
+    // value accepted in whatever case it arrived would be a 503 on every request
+    // — the failure this check is here to prevent.
+    let canonical = if wanted.is_empty() {
+        None
+    } else {
+        let canonical = {
             let reg = state.registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            reg.providers
-                .iter()
-                .any(|p| p.models.iter().any(|m| m.id.eq_ignore_ascii_case(wanted)))
+            reg.canonical_model(wanted)
+                .map(str::to_owned)
+                .ok_or_else(|| reg.refuses_model(wanted))
         };
-        if !known {
-            return failure(400, &format!("no model {wanted:?}"));
+        match canonical {
+            Ok(id) => Some(id),
+            Err(why) => return failure(400, &why),
         }
-    }
+    };
     let mut store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    match store.set_model(who, (!wanted.is_empty()).then_some(wanted)) {
+    match store.set_model(who, canonical.as_deref()) {
         Ok(a) => json_of(200, &resources::AccountEnvelope::from(&a)),
         Err(e) => failure(404, &e.to_string()),
     }
@@ -344,6 +351,30 @@ mod tests {
         let state = state_for("model-clear", "model-clear@example.com");
         let reply = set_model(&state, "model-clear@example.com", &PinModel { model: String::new() });
         assert_eq!(reply.status, 200);
+    }
+
+    #[test]
+    fn a_model_pin_is_stored_as_the_router_will_read_it() {
+        // The route matched the id case-insensitively but routing reads it by
+        // exact id, so accepting the caller's capitalisation stored a pin that
+        // 503'd every request. Accepted — and written back as the catalogue
+        // spells it, which is the value routing can resolve.
+        let state = state_for("model-case", "model-case@example.com");
+        let reply = set_model(
+            &state,
+            "model-case@example.com",
+            &PinModel {
+                model: "CLAUDE-SONNET-5".to_owned(),
+            },
+        );
+        assert_eq!(reply.status, 200);
+        let stored = state
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .find("model-case@example.com")
+            .and_then(|a| a.model.clone());
+        assert_eq!(stored.as_deref(), Some("claude-sonnet-5"));
     }
 
     // ── compaction ──────────────────────────────────────────────────────────

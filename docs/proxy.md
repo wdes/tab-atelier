@@ -454,11 +454,12 @@ sudo -u tab-atelier-proxy tab-atelier-proxy set-model ada@example.org gpt-5.6-lu
 
 The model pin outranks the provider pin — naming a model names the hop that
 serves it, so a model pin chooses the provider the request leaves by. The id
-must be one the catalogue publishes, matched whatever its case; anything else
-is refused when the pin is set, at the CLI or by the API, rather than becoming
-a 503 on every request. An empty value clears the pin and returns the account
-to class routing. A pin that stops being served later does get the 503 — like
-the provider pin, there is no quiet fall back.
+must be one the catalogue publishes; it is stored as the catalogue spells it,
+whatever its case, and anything else — a typo, or a model that is shipped but
+withdrawn — is refused when the pin is set, at the CLI or by the API, rather
+than becoming a 503 on every request. An empty value clears the pin and returns
+the account to class routing. A pin that stops being served later does get the
+503 — like the provider pin, there is no quiet fall back.
 
 **The pin lives on the account, not on a key** — and an account carries several
 keys, which share it. So **one model per agent means one account per agent**:

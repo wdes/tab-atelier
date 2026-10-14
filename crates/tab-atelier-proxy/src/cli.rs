@@ -51,44 +51,26 @@ pub fn set_provider(who: &str, provider: &str) -> Result<(), String> {
 pub fn set_model(who: &str, model: &str) -> Result<(), String> {
     let mut s = store()?;
     let wanted = model.trim();
-    // Validated here, where the registry is in hand: a pin to a typo would
-    // otherwise be a 503 nobody could explain.
-    if !wanted.is_empty() {
+    // Resolved to the catalogue's own spelling here, where the registry is in
+    // hand: routing reads the pin by EXACT id, so a value merely accepted in
+    // whatever case it arrived would be a 503 nobody could explain — which is
+    // the whole reason this is checked before it is written.
+    let canonical = if wanted.is_empty() {
+        None
+    } else {
         let path = config_dir()?.join("providers.json");
         let reg = tab_atelier_proxy::provider::Registry::load(&path);
-        if !registry_serves(&reg, wanted) {
-            return Err(format!(
-                "no model {wanted:?} in {} — configured: {}",
-                path.display(),
-                reg.providers
-                    .iter()
-                    .flat_map(|p| p.models.iter().map(|m| m.id.as_str()))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
-        }
-    }
-    let a = s
-        .set_model(who, (!wanted.is_empty()).then_some(wanted))
-        .map_err(|e| e.to_string())?;
-    if wanted.is_empty() {
-        println!("{} <{}> — no model pin, routed by class", a.display_name(), a.email);
-    } else {
-        println!("{} <{}> — every request asks for {wanted}", a.display_name(), a.email);
+        let id = reg
+            .canonical_model(wanted)
+            .ok_or_else(|| format!("{} in {}", reg.refuses_model(wanted), path.display()))?;
+        Some(id.to_owned())
+    };
+    let a = s.set_model(who, canonical.as_deref()).map_err(|e| e.to_string())?;
+    match canonical {
+        None => println!("{} <{}> — no model pin, routed by class", a.display_name(), a.email),
+        Some(id) => println!("{} <{}> — every request asks for {id}", a.display_name(), a.email),
     }
     Ok(())
-}
-
-/// Whether any provider in the registry publishes this model id.
-///
-/// Case-insensitive and over EVERY provider, exactly like the HTTP route: the
-/// ids are vendor-written, so a stray capital is a typo rather than another
-/// model, and which hop serves a model can change — the pin is a statement
-/// about the model, not about one provider.
-fn registry_serves(reg: &tab_atelier_proxy::provider::Registry, wanted: &str) -> bool {
-    reg.providers
-        .iter()
-        .any(|p| p.models.iter().any(|m| m.id.eq_ignore_ascii_case(wanted)))
 }
 
 /// How often to ask Anthropic how much of the plan has been used.
@@ -637,21 +619,40 @@ mod tests {
         assert_eq!(usage_poll_delay(u32::MAX), USAGE_POLL_MAX_BACKOFF);
     }
 
-    /// The model pin is checked against every provider, not the account's own.
+    /// The pin is stored as a model the router can actually resolve.
     ///
-    /// Same reasoning as the HTTP route: which hop serves a model can change,
-    /// and the pin is a statement about the model. Catching the typo here means
-    /// a bad pin is refused at the CLI rather than becoming a 503 on every
-    /// request. A shipped id is matched whatever its case, since the ids are
-    /// vendor-written and a stray capital is a typo, not another model.
+    /// The bug this covers: the pin was matched case-insensitively but routing
+    /// resolves it with an exact `==`, so a pin typed `GPT-5.6-LUNA` was accepted
+    /// and then 503'd every request — the very failure the check exists to
+    /// prevent. So the check does not merely accept the case, it writes back the
+    /// catalogue's spelling. A withdrawn id is refused outright, because routing
+    /// skips it and the result would be the same silent 503.
     #[test]
-    fn a_model_pin_is_checked_against_every_provider() {
-        let reg = tab_atelier_proxy::provider::Registry {
-            providers: vec![tab_atelier_proxy::provider::Preset::Openai.provider(std::path::Path::new("/tmp"))],
+    fn a_model_pin_is_stored_as_the_id_the_router_resolves() {
+        use std::path::Path;
+        use tab_atelier_proxy::provider::{Preset, Registry};
+        let reg = Registry {
+            providers: vec![Preset::Openai.provider(Path::new("/tmp"))],
             mappings: Vec::new(),
         };
-        assert!(registry_serves(&reg, "gpt-5.6-luna"));
-        assert!(registry_serves(&reg, "GPT-5.6-LUNA"));
-        assert!(!registry_serves(&reg, "gpt-5.6-lune"));
+        assert_eq!(reg.canonical_model("GPT-5.6-LUNA"), Some("gpt-5.6-luna"));
+        assert_eq!(reg.canonical_model("claude-sonet-5"), None, "a typo is not a model");
+        assert!(reg.refuses_model("claude-sonet-5").contains("no model"));
+
+        // A withdrawn model is listed but not servable: canonicalising it would
+        // store an id routing then refuses, which is the 503 again.
+        let ds = Registry {
+            providers: vec![Preset::Deepseek.provider(Path::new("/tmp"))],
+            mappings: Vec::new(),
+        };
+        assert_eq!(
+            ds.canonical_model("deepseek-v4-pro"),
+            None,
+            "routing skips a deprecated model"
+        );
+        assert!(
+            ds.refuses_model("deepseek-v4-pro").contains("withdrawn"),
+            "the refusal says what is wrong with it, not merely that it is absent"
+        );
     }
 }
