@@ -11,8 +11,9 @@
 <body>
   <header class="topbar">
     <h1>Serveurs</h1>
-    <a class="nav" href="/kiosk">Kiosk</a>
-    <a class="nav" href="/">Accueil</a>
+    <!-- `data-carry-token`: the Kiosk page is behind the token too, so the link
+         must carry `?token=` or coming back loses it. See manage.js. -->
+    <a class="nav" href="/kiosk" data-carry-token>Kiosk</a>
     <span id="status" class="status">prêt</span>
   </header>
 

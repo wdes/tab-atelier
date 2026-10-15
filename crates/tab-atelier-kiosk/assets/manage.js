@@ -178,4 +178,12 @@ const nameWatcher = () => {
 };
 nameWatcher();
 
+// The page's token rides in `?token=`, and the Kiosk page is behind it too, so a
+// link back to it must carry the token or the destination 401s — the "click
+// Servers then Kiosk loses the token" bug, which was this link missing the
+// carry that kiosk.js already did in the other direction.
+for (const link of document.querySelectorAll("[data-carry-token]")) {
+  link.href = link.getAttribute("href") + location.search;
+}
+
 loadRemotes().catch((err) => status(err.message, "err"));
