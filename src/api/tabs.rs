@@ -175,11 +175,25 @@ pub(super) fn create<W: Write>(stream: &mut W, state: &Arc<Mutex<TabSnapshot>>, 
         "API: queueing new tab creation (cwd: {})",
         cwd_hint.as_ref().map_or("inherit", |p| p.to_str().unwrap_or("?"))
     );
+    // What was accepted, captured before the hint is moved into the queue below.
+    let accepted_cwd = cwd_hint.as_ref().map(|p| p.display().to_string());
     state.pending_new_tabs += 1;
-    if let Some(cwd) = cwd_hint {
-        state.pending_new_tab_cwds.push_back(cwd);
-    }
+    // One entry per creation, ALWAYS — including one that names no cwd. The
+    // drains (`app.rs`, `headless.rs`) pop one hint per creation by position,
+    // so a queue shorter than the count does not mean "the surplus inherits":
+    // it means every hint is handed to the wrong tab. An empty `POST` before a
+    // `{"cwd": ...}` one is exactly that, and it put the anonymous tab in the
+    // named one's directory.
+    state.pending_new_tab_cwds.push_back(cwd_hint);
     drop(state);
-    let body = serde_json::to_string(&serde_json::json!({"queued": "new"})).unwrap_or_default();
+    // Echo what was accepted, not merely that something was. `{"queued":"new"}`
+    // alone is indistinguishable from a daemon that dropped the cwd and queued
+    // something else; with the cwd echoed, a caller reads the truth from the
+    // reply instead of discovering it from a tab in the wrong directory.
+    let body = serde_json::to_string(&serde_json::json!({
+        "queued": "new",
+        "cwd": accepted_cwd,
+    }))
+    .unwrap_or_default();
     respond_json(stream, 200, &body);
 }

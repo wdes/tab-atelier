@@ -319,6 +319,20 @@ paths:
     post:
       tags: [tabs]
       summary: Create a tab
+      description: >
+        Queues a new tab. The optional body roots it at a directory; with no
+        body it inherits the active tab's cwd. One cwd entry is queued per
+        creation either way, so the drain pairs hints to tabs by position.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                cwd:
+                  type: string
+                  description: Absolute path to root the new tab at. Omitted ⇒ inherit the active tab's.
       responses:
         "200":
           description: Creation queued
@@ -326,7 +340,11 @@ paths:
             application/json:
               schema:
                 type: object
-                properties: { queued: { type: string, example: new } }
+                properties:
+                  queued: { type: string, example: new }
+                  cwd:
+                    type: [string, "null"]
+                    description: The cwd accepted, or null when none was given (the tab inherits).
         "401": { $ref: "#/components/responses/Unauthorized" }
   /tabs/{idx}/output:
     get:

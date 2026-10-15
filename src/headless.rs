@@ -1980,7 +1980,8 @@ fn drain_pending(
     let env_changes: Vec<crate::api::EnvChange> = s.pending_env_changes.drain(..).collect();
     let meta_changes: Vec<crate::api::MetaChange> = s.pending_meta_changes.drain(..).collect();
     let new_tabs = std::mem::take(&mut s.pending_new_tabs);
-    let new_tab_cwds: std::collections::VecDeque<std::path::PathBuf> = std::mem::take(&mut s.pending_new_tab_cwds);
+    let new_tab_cwds: std::collections::VecDeque<Option<std::path::PathBuf>> =
+        std::mem::take(&mut s.pending_new_tab_cwds);
     drop(s);
     // Whether this drain mutated anything — the caller uses it to force
     // the next snapshot refresh instead of waiting on the heartbeat.
@@ -2470,7 +2471,7 @@ fn drain_pending(
     // New tabs from the API.
     let mut cwd_hint_iter = new_tab_cwds.into_iter();
     for _ in 0..new_tabs {
-        let cwd = cwd_hint_iter.next().filter(|p| p.is_dir()).or_else(|| {
+        let cwd = cwd_hint_iter.next().flatten().filter(|p| p.is_dir()).or_else(|| {
             if *active < tabs.len() {
                 platform::process_cwd(tabs[*active].pid).or_else(|| tabs[*active].last_known_cwd.clone())
             } else {

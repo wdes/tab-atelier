@@ -6397,13 +6397,13 @@ impl Render for AppState {
         // frame contend with whatever an API handler was doing under
         // the same mutex (e.g. the /tabs body rebuild).
         let seq = self.activity_signal.load(std::sync::atomic::Ordering::Relaxed);
-        let (new_tab_count, new_tab_cwds): (usize, Vec<PathBuf>) = if seq == self.render_activity_seen.get() {
+        let (new_tab_count, new_tab_cwds): (usize, Vec<Option<PathBuf>>) = if seq == self.render_activity_seen.get() {
             (0, Vec::new())
         } else {
             self.render_activity_seen.set(seq);
             let mut snap = self.api_state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let n = std::mem::take(&mut snap.pending_new_tabs);
-            let cwds: Vec<PathBuf> = std::mem::take(&mut snap.pending_new_tab_cwds).into_iter().collect();
+            let cwds: Vec<Option<PathBuf>> = std::mem::take(&mut snap.pending_new_tab_cwds).into_iter().collect();
             drop(snap);
             (n, cwds)
         };
@@ -6411,8 +6411,12 @@ impl Render for AppState {
         for _ in 0..new_tab_count {
             // API-created: these come from `dispatch --new` / `tab-atelier
             // add`, so they appear without stealing focus or a colour.
+            // One hint per creation now (see `POST /tabs`), so `.next()` peels
+            // this creation's entry and `.flatten()` yields its cwd or `None`
+            // (inherit) — the pairing can no longer slip.
             let cwd = cwd_iter
                 .next()
+                .flatten()
                 .or_else(|| self.tabs.get(self.active).and_then(|t| t.last_known_cwd.clone()))
                 .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
             self.add_tab_in_background(cwd, window, cx);

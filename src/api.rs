@@ -678,12 +678,13 @@ pub struct TabSnapshot {
     /// shape as `pending_bg_color_changes`.
     pub pending_schedule_changes: Vec<(String, Option<crate::schedule::TabSchedule>)>,
     pub pending_new_tabs: usize,
-    /// Optional explicit cwd hints for the next `pending_new_tabs`
-    /// creations, in FIFO order. Populated by `POST /tabs` with a
-    /// JSON body `{"cwd": "..."}`. Shorter than `pending_new_tabs`
-    /// is fine — the remainder fall back to inheriting from the
-    /// currently-active tab as before.
-    pub pending_new_tab_cwds: std::collections::VecDeque<std::path::PathBuf>,
+    /// One entry per `pending_new_tabs` creation, in FIFO order: `Some(cwd)`
+    /// when the `POST /tabs` body asked for that directory, `None` when it did
+    /// not (the tab inherits the active tab's, as before). Exactly as long as
+    /// `pending_new_tabs`: the drains pair the two **by position**, so a queue
+    /// shorter than the count does not mean "the surplus inherits" — it means
+    /// every hint lands on the wrong creation.
+    pub pending_new_tab_cwds: std::collections::VecDeque<Option<std::path::PathBuf>>,
     /// Per-tab resource-limit changes queued by `POST /tabs/<id>/limits`,
     /// drained by the owner (GUI render loop / headless tick): `(tab uuid,
     /// override, clear)`. `clear == true` lifts every axis; otherwise the
@@ -4513,6 +4514,63 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .pending_new_tabs,
             1
+        );
+    }
+
+    /// Regression: an empty `POST /tabs` before a `{"cwd": ...}` one must not
+    /// shift the cwd onto the wrong tab.
+    ///
+    /// The drains (`app.rs`, `headless.rs`) pair `pending_new_tab_cwds` to
+    /// `pending_new_tabs` **by position**, so the queue must be exactly as long
+    /// as the count. It used to be pushed only when a body carried a cwd, so the
+    /// anonymous tab took the next named tab's directory and the named one fell
+    /// back to inheriting — the two swapped. This pins the invariant (one entry
+    /// per creation), because that is what makes the positional pairing correct.
+    #[test]
+    fn an_empty_post_does_not_shift_the_next_tabs_cwd() {
+        let (port, state, token) = spawn_server();
+        // First: an anonymous creation — it inherits.
+        let empty = request(
+            port,
+            &format!("POST /tabs HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Length: 0\r\n\r\n"),
+        );
+        assert_eq!(status_code(&empty), 200);
+        // Second: a creation that names a directory.
+        let payload = r#"{"cwd":"/projet/x"}"#;
+        let named = request(
+            port,
+            &format!(
+                "POST /tabs HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\
+                 Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
+                payload.len()
+            ),
+        );
+        assert_eq!(status_code(&named), 200);
+        assert!(
+            body(&named).contains("/projet/x"),
+            "the reply echoes the accepted cwd: {}",
+            body(&named)
+        );
+
+        // Scoped so the lock is released before the assertions, not held across
+        // them — clippy's drop-tightening, and simply tidier.
+        let (pending, cwds) = {
+            let state = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            // One entry per creation, in order: the anonymous one first (None →
+            // inherit), the named one second (its cwd). Before the fix this was
+            // a single entry, which the first tab would have taken.
+            let cwds: Vec<Option<String>> = state
+                .pending_new_tab_cwds
+                .iter()
+                .map(|p| p.as_ref().map(|p| p.display().to_string()))
+                .collect();
+            (state.pending_new_tabs, cwds)
+        };
+        assert_eq!(pending, 2);
+        assert_eq!(
+            cwds,
+            vec![None, Some("/projet/x".to_string())],
+            "the queue lines up with the count, so the drains pair by position"
         );
     }
 
