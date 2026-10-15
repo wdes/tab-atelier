@@ -20,11 +20,27 @@ daemon's data — each read and written directly, behind its own token:
 | `GET /reports` | the outbox listing, newest first |
 | `POST /intent` | record an intention as `outbox/intent-<ts>.md` |
 | `GET /catalog/list` | the skills catalogue (`{retired, skills}`) |
+| `GET /kiosk/remotes` | the servers the Kiosk aggregates (tokens redacted) |
+| `POST /kiosk/remotes` | add a server (label, url, token) |
+| `POST /kiosk/remotes/<id>/remove` | forget a server |
+| `GET /kiosk/remotes/<id>/tabs` | a remote's tabs, reached with its token |
+| `POST /kiosk/remotes/<id>/tabs` | open a tab on a remote |
 
 Everything else is the daemon's, relayed unchanged. A path in the table reached
 with the wrong method is a **405** with an `Allow` header — not a relay to the
 daemon, whose auth gate would answer a misleading 401 for what is really "this
 method is not allowed here".
+
+## Several servers
+
+The Kiosk's point is to take advantage of **several resources at once**, so it
+holds a list of remotes — each a daemon it can reach, with the token that opens
+it. The list lives on the Kiosk (`<state>/remotes.json`, `0600`), set from the
+**serveurs** screen (`/kiosk/manage`): add a label, an API URL and a token, and
+the Kiosk reaches that server **server-side**. The browser holds only the Kiosk
+token; a remote's token is never sent to a page, so a cross-site script on the
+Kiosk origin cannot walk off with the fleet's credentials. This mirrors the
+desktop app's `tab-atelier remote add`.
 
 ## Running it
 
@@ -39,6 +55,7 @@ tab-atelier-kiosk serve --listen 127.0.0.1:8282 --upstream http://127.0.0.1:7890
 | `TAB_ATELIER_KIOSK_STATE` | `/var/lib/tab-atelier-kiosk` | state directory |
 | `TAB_ATELIER_DECISIONS` | `<state>/decisions.jsonl` | the journal |
 | `TAB_ATELIER_OUTBOX` | `<state>/outbox` | the tree `/decisions/file` serves from |
+| `TAB_ATELIER_REMOTES` | `<state>/remotes.json` | the servers the Kiosk aggregates |
 | `TAB_ATELIER_KIOSK_TOKEN` | *(generated)* | the token the panes require |
 
 **The token is provisioned on first start.** With no `TAB_ATELIER_KIOSK_TOKEN`,
@@ -61,6 +78,7 @@ the markdown the reports tab lists and the intentions the intent tab writes:
 ```
 <state>/decisions.jsonl     the board
 <state>/token               the pane token (0600)
+<state>/remotes.json        the servers, with their tokens (0600)
 <state>/outbox/*.md         reports, and intent-<ts>.md
 ```
 

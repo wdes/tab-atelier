@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MPL-2.0
 
 //! The Kiosk's own panes: the board of decisions, its two rulings, the outbox
-//! of reports, and the grid that records an intention.
+//! of reports, the grid that records an intention, and the remotes the Kiosk
+//! aggregates.
 //!
 //! Everything here is behind the token. A kiosk with no token answers 401
 //! rather than serving the board — the panes are an operator's view, and the
@@ -11,18 +12,25 @@ use http::{HeaderValue, Response, StatusCode, header};
 
 use crate::body::{BoxBody, full, json_response};
 use crate::decisions::{DecisionError, Journal};
+use crate::remotes::{Remote, RemoteError, Remotes};
 use crate::reports::{self, IntentError};
 
-/// The panes' state: the journal, and the token that opens it.
+/// The panes' state: the journal, the remotes the Kiosk aggregates, and the
+/// token that opens them.
 #[derive(Debug, Clone)]
 pub struct Panes {
     journal: Journal,
     token: Option<String>,
+    remotes: Remotes,
 }
 
 impl Panes {
-    pub const fn new(journal: Journal, token: Option<String>) -> Self {
-        Self { journal, token }
+    pub const fn new(journal: Journal, token: Option<String>, remotes: Remotes) -> Self {
+        Self {
+            journal,
+            token,
+            remotes,
+        }
     }
 
     /// Whether a request's `Authorization` header carries the pane token.
@@ -110,6 +118,59 @@ impl Panes {
         json_response(StatusCode::OK, &serde_json::json!({ "retired": [], "skills": [] }))
     }
 
+    /// `GET /kiosk/remotes` — the configured servers, token redacted.
+    pub fn remotes_list(&self) -> Response<BoxBody> {
+        self.remotes.list().map_or_else(
+            |_| unavailable(),
+            |remotes| {
+                let views: Vec<crate::remotes::RemoteView> = remotes.iter().map(Into::into).collect();
+                json_response(StatusCode::OK, &serde_json::json!({ "remotes": views }))
+            },
+        )
+    }
+
+    /// `POST /kiosk/remotes` — add a server. The token is stored on the Kiosk
+    /// and never echoed back.
+    pub fn remote_add(&self, label: &str, url: &str, token: &str) -> Response<BoxBody> {
+        match self.remotes.add(label, url, token) {
+            Ok(remote) => {
+                let view = crate::remotes::RemoteView::from(&remote);
+                json_response(StatusCode::CREATED, &serde_json::json!({ "remote": view }))
+            }
+            Err(RemoteError::Invalid(why)) => {
+                json_response(StatusCode::BAD_REQUEST, &serde_json::json!({ "error": why }))
+            }
+            Err(error) => Self::remote_error(&error),
+        }
+    }
+
+    /// `POST /kiosk/remotes/<id>/remove` — forget a server.
+    pub fn remote_remove(&self, id: &str) -> Response<BoxBody> {
+        match self.remotes.remove(id) {
+            Ok(remote) => json_response(StatusCode::OK, &serde_json::json!({ "removed": remote.id })),
+            Err(error) => Self::remote_error(&error),
+        }
+    }
+
+    /// The remote with this id, for a route that reaches out to it.
+    ///
+    /// # Errors
+    ///
+    /// [`RemoteError::NotFound`] when no remote carries the id.
+    pub fn remote(&self, id: &str) -> Result<Remote, RemoteError> {
+        self.remotes.get(id)
+    }
+
+    /// The response for a remote lookup that failed.
+    pub fn remote_error(error: &RemoteError) -> Response<BoxBody> {
+        match error {
+            RemoteError::NotFound => {
+                json_response(StatusCode::NOT_FOUND, &serde_json::json!({ "error": "no such remote" }))
+            }
+            _ => unavailable(),
+        }
+    }
+
     /// The 405 for a path the Kiosk serves, reached with the wrong method.
     pub fn method_not_allowed(allow: &'static str) -> Response<BoxBody> {
         Response::builder()
@@ -131,6 +192,14 @@ impl Panes {
     /// The 400 for a body that is not the JSON the pane expects.
     pub fn bad_request() -> Response<BoxBody> {
         json_response(StatusCode::BAD_REQUEST, &serde_json::json!({ "error": "bad_request" }))
+    }
+
+    /// The 502 for a remote that could not be reached, naming nothing internal.
+    pub fn bad_gateway() -> Response<BoxBody> {
+        json_response(
+            StatusCode::BAD_GATEWAY,
+            &serde_json::json!({ "error": "remote_unreachable" }),
+        )
     }
 }
 
@@ -165,6 +234,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 mod tests {
     use super::{Panes, constant_time_eq};
     use crate::decisions::Journal;
+    use crate::remotes::Remotes;
 
     fn panes(token: Option<&str>) -> Panes {
         let dir = std::env::temp_dir().join(format!("ta-kiosk-panes-{}", std::process::id()));
@@ -174,6 +244,9 @@ mod tests {
                 outbox: dir.join("outbox"),
             },
             token.map(str::to_string),
+            Remotes {
+                path: dir.join("remotes.json"),
+            },
         )
     }
 

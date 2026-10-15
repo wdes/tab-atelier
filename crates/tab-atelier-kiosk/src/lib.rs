@@ -29,9 +29,11 @@
 pub(crate) mod assets;
 pub(crate) mod body;
 pub(crate) mod config;
+pub(crate) mod daemon;
 pub(crate) mod decisions;
 pub(crate) mod panes;
 pub(crate) mod proxy;
+pub(crate) mod remotes;
 pub(crate) mod reports;
 pub(crate) mod route;
 pub(crate) mod server;
@@ -41,5 +43,6 @@ mod tests;
 
 pub use config::{Config, DEFAULT_BIND, DEFAULT_STATE_DIR, DEFAULT_UPSTREAM};
 pub use decisions::Decision;
+pub use remotes::{Remote, RemoteView};
 pub use reports::Report;
 pub use server::{run, serve};

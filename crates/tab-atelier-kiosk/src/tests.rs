@@ -72,6 +72,9 @@ fn test_config(upstream: String, state: &Path, token: Option<&str>) -> Config {
         },
         token: token.map(str::to_string),
         token_file: None,
+        remotes: crate::remotes::Remotes {
+            path: state.join("remotes.json"),
+        },
     }
 }
 
@@ -560,4 +563,82 @@ async fn a_wrong_method_on_a_pane_is_a_405_not_a_relay() {
         "POST",
         "the Allow header names what the route does answer"
     );
+}
+
+/// The servers can be added, listed and forgotten through the Kiosk's own API —
+/// and the remote's token never comes back to the browser. The Kiosk is what
+/// holds it, so it is the Kiosk, not a page, that reaches the fleet.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn remotes_are_managed_server_side() {
+    let dir = scratch_dir("remotes");
+    let addr = spawn_kiosk_with(test_config("http://127.0.0.1:1".to_string(), &dir, Some("t"))).await;
+    let auth = ("authorization", "Bearer t");
+
+    assert_eq!(
+        get(addr, "/kiosk/remotes").status(),
+        401,
+        "the remote list is behind the token"
+    );
+
+    // Add a server. Point it at a closed port so the later reach fails fast.
+    let added = send(
+        Method::POST,
+        addr,
+        "/kiosk/remotes",
+        &[auth],
+        br#"{"label":"build-box","url":"http://127.0.0.1:1","token":"remote-secret"}"#.to_vec(),
+    );
+    assert_eq!(added.status(), 201);
+    let added_body = body_string(added);
+    assert!(
+        added_body.contains("build-box"),
+        "the added server comes back: {added_body}"
+    );
+    assert!(
+        !added_body.contains("remote-secret"),
+        "the remote's token must not be echoed: {added_body}"
+    );
+    let added_json: serde_json::Value = serde_json::from_str(&added_body).expect("the reply is JSON");
+    let id = added_json["remote"]["id"]
+        .as_str()
+        .expect("the new remote has an id")
+        .to_string();
+
+    // The list redacts the token; the file on disk holds it.
+    let listed = body_string(send(Method::GET, addr, "/kiosk/remotes", &[auth], vec![]));
+    assert!(listed.contains("build-box"));
+    assert!(
+        listed.contains("\"has_token\":true"),
+        "the list says a token is set: {listed}"
+    );
+    assert!(!listed.contains("remote-secret"), "the list never carries the token");
+    let on_disk = fs::read_to_string(dir.join("remotes.json")).expect("read remotes");
+    assert!(on_disk.contains("remote-secret"), "the token IS stored, server-side");
+
+    // A malformed add is a 400.
+    let bad = send(
+        Method::POST,
+        addr,
+        "/kiosk/remotes",
+        &[auth],
+        br#"{"label":"","url":"not-a-url"}"#.to_vec(),
+    );
+    assert_eq!(bad.status(), 400);
+
+    // Reaching the server fails closed: a 502, naming nothing internal.
+    let unreachable = send(Method::GET, addr, &format!("/kiosk/remotes/{id}/tabs"), &[auth], vec![]);
+    assert_eq!(unreachable.status(), 502, "a down remote is a 502, not a hang");
+    assert!(body_string(unreachable).contains("remote_unreachable"));
+
+    // Forget it.
+    let removed = send(
+        Method::POST,
+        addr,
+        &format!("/kiosk/remotes/{id}/remove"),
+        &[auth],
+        vec![],
+    );
+    assert_eq!(removed.status(), 200);
+    let after = body_string(send(Method::GET, addr, "/kiosk/remotes", &[auth], vec![]));
+    assert!(!after.contains("build-box"), "the server is gone: {after}");
 }

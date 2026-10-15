@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::decisions::Journal;
+use crate::remotes::Remotes;
 
 /// The daemon this crate fronts when `TAB_ATELIER_UPSTREAM` is unset.
 pub const DEFAULT_UPSTREAM: &str = "http://127.0.0.1:7890";
@@ -40,6 +41,13 @@ pub struct Config {
     /// this path at startup so an operator knows what to open the board with
     /// without it ever being printed.
     pub token_file: Option<PathBuf>,
+    /// The servers this Kiosk aggregates.
+    ///
+    /// The Kiosk's point is to take advantage of several resources at once, so
+    /// the tab manager reaches a *set* of daemons rather than one. The list and
+    /// its tokens live here, server-side; the browser sets them but never holds
+    /// them.
+    pub remotes: Remotes,
 }
 
 impl Config {
@@ -63,6 +71,8 @@ impl Config {
         let outbox =
             std::env::var("TAB_ATELIER_OUTBOX").map_or_else(|_| PathBuf::from(&state).join("outbox"), PathBuf::from);
         let state_dir = PathBuf::from(&state);
+        let remotes =
+            std::env::var("TAB_ATELIER_REMOTES").map_or_else(|_| state_dir.join("remotes.json"), PathBuf::from);
         let (token, token_file) = resolve_token(&state_dir, std::env::var("TAB_ATELIER_KIOSK_TOKEN").ok());
         Ok(Self {
             upstream,
@@ -70,6 +80,7 @@ impl Config {
             journal: Journal { path: journal, outbox },
             token,
             token_file,
+            remotes: Remotes { path: remotes },
         })
     }
 
@@ -120,14 +131,7 @@ fn resolve_token(state_dir: &Path, from_env: Option<String>) -> (Option<String>,
 
 /// Writes a fresh 32-byte token to `path`, `0600`, and returns it.
 fn generate_token(path: &Path) -> std::io::Result<String> {
-    use std::io::Read as _;
-    let mut bytes = [0_u8; 32];
-    fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
-    let token: String = bytes.iter().fold(String::with_capacity(64), |mut acc, byte| {
-        use std::fmt::Write as _;
-        let _ = write!(acc, "{byte:02x}");
-        acc
-    });
+    let token = random_hex(32)?;
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
     }
@@ -136,16 +140,32 @@ fn generate_token(path: &Path) -> std::io::Result<String> {
     Ok(token)
 }
 
+/// `bytes` random bytes from the OS, hex-encoded.
+///
+/// Used for the pane token and for remote ids. Both are identifiers that must
+/// not collide or be guessable, which `/dev/urandom` gives and no clock does.
+pub fn random_hex(bytes: usize) -> std::io::Result<String> {
+    use std::io::Read as _;
+    let mut buf = vec![0_u8; bytes];
+    fs::File::open("/dev/urandom")?.read_exact(&mut buf)?;
+    let hex = buf.iter().fold(String::with_capacity(bytes * 2), |mut acc, byte| {
+        use std::fmt::Write as _;
+        let _ = write!(acc, "{byte:02x}");
+        acc
+    });
+    Ok(hex)
+}
+
 /// Restricts a file to its owner, so a token is not world-readable.
 #[cfg(unix)]
-fn set_owner_only(path: &Path) -> std::io::Result<()> {
+pub fn set_owner_only(path: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))
 }
 
 /// No-op off unix, where the kiosk does not run as a service.
 #[cfg(not(unix))]
-fn set_owner_only(_path: &Path) -> std::io::Result<()> {
+pub fn set_owner_only(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 

@@ -1,0 +1,50 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: MPL-2.0 -->
+<!-- Serveurs & onglets: the servers this Kiosk aggregates, and their tabs. -->
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Harness — serveurs</title>
+  <link rel="stylesheet" href="/assets/manage.css">
+</head>
+<body>
+  <header class="topbar">
+    <h1>Serveurs</h1>
+    <a class="nav" href="/kiosk">Kiosk</a>
+    <a class="nav" href="/">Accueil</a>
+    <span id="status" class="status">prêt</span>
+  </header>
+
+  <main>
+    <p class="lede">
+      Le Kiosk agrège plusieurs serveurs. Ajoute-les ici : l'URL de leur API et
+      le jeton qui l'ouvre. Le jeton reste sur le Kiosk — il n'est jamais renvoyé
+      au navigateur.
+    </p>
+
+    <section class="panel">
+      <h2>Serveurs</h2>
+      <ul id="remotes" class="remotes"></ul>
+      <form id="add-remote" class="row" autocomplete="off">
+        <input name="label" placeholder="libellé (build-box)" required>
+        <input name="url" placeholder="http://10.0.0.1:7890" required>
+        <input name="token" type="password" placeholder="jeton" autocomplete="new-password">
+        <button type="submit">Ajouter</button>
+      </form>
+    </section>
+
+    <section class="panel" id="tabs-panel" hidden>
+      <h2>Onglets <span id="remote-name" class="muted"></span></h2>
+      <ul id="tabs" class="tabs"></ul>
+      <form id="add-tab" class="row" autocomplete="off">
+        <input name="name" placeholder="nom (optionnel)">
+        <input name="cmd" placeholder="commande (optionnel)">
+        <button type="submit">Ouvrir un onglet</button>
+      </form>
+    </section>
+  </main>
+
+  <script type="module" src="/assets/manage.js"></script>
+</body>
+</html>

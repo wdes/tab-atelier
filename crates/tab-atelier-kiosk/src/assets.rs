@@ -16,3 +16,12 @@ pub const CSS: &str = include_str!("../assets/kiosk.css");
 
 /// Its script.
 pub const JS: &str = include_str!("../assets/kiosk.js");
+
+/// The serveurs & onglets screen.
+pub const MANAGE_HTML: &str = include_str!("../assets/manage.html");
+
+/// Its stylesheet.
+pub const MANAGE_CSS: &str = include_str!("../assets/manage.css");
+
+/// Its script.
+pub const MANAGE_JS: &str = include_str!("../assets/manage.js");

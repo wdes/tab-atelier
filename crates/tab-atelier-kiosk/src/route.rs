@@ -38,11 +38,42 @@ pub enum Route {
     Intent,
     /// The catalog tab: `GET /catalog/list`, the skills catalogue.
     Catalog,
+    /// `GET /kiosk/remotes` — the servers the Kiosk aggregates.
+    RemotesList,
+    /// `POST /kiosk/remotes` — add a server.
+    RemoteAdd,
+    /// `POST /kiosk/remotes/<id>/remove` — forget a server.
+    RemoteRemove {
+        /// The remote id.
+        id: String,
+    },
+    /// `GET /kiosk/remotes/<id>/tabs` — a remote's tabs, relayed.
+    RemoteTabs {
+        /// The remote id.
+        id: String,
+    },
+    /// `POST /kiosk/remotes/<id>/tabs` — open a tab on a remote.
+    RemoteTabCreate {
+        /// The remote id.
+        id: String,
+    },
     /// A path the Kiosk serves, reached with a method it does not answer. The
     /// string is the value of the `Allow` header.
     MethodNotAllowed(&'static str),
     /// Everything else: hand it to the upstream daemon.
     Proxy,
+}
+
+impl Route {
+    /// Whether the route needs the pane token.
+    ///
+    /// The assets, the daemon relay and a method error do not; every pane and
+    /// the remote API do. The server checks this once, before the match, rather
+    /// than repeating the guard in each arm.
+    #[must_use]
+    pub const fn is_protected(&self) -> bool {
+        !matches!(self, Self::Asset(..) | Self::Proxy | Self::MethodNotAllowed(..))
+    }
 }
 
 /// Classifies a request. The interface and the panes this crate answers itself
@@ -64,6 +95,15 @@ pub fn route(req: &Request<()>) -> Route {
         (&Method::GET | &Method::HEAD, "/assets/kiosk.js") => {
             Route::Asset(assets::JS, "text/javascript; charset=utf-8")
         }
+        (&Method::GET | &Method::HEAD, "/kiosk/manage") => {
+            Route::Asset(assets::MANAGE_HTML, "text/html; charset=utf-8")
+        }
+        (&Method::GET | &Method::HEAD, "/assets/manage.css") => {
+            Route::Asset(assets::MANAGE_CSS, "text/css; charset=utf-8")
+        }
+        (&Method::GET | &Method::HEAD, "/assets/manage.js") => {
+            Route::Asset(assets::MANAGE_JS, "text/javascript; charset=utf-8")
+        }
         (&Method::GET, "/decisions") => Route::Decisions {
             include_archived: query_param(query, "includeArchived").is_some_and(|v| v == "true" || v == "1"),
         },
@@ -76,6 +116,11 @@ pub fn route(req: &Request<()>) -> Route {
         // The catalog tab reads the skills catalogue, which is the Kiosk's to
         // answer: the daemon has no such route (see `crate::panes::catalog`).
         (&Method::GET, "/catalog/list") => Route::Catalog,
+        // The Kiosk's own multi-server API. Distinct from `/kiosk` (the page):
+        // these reach a configured remote with its token, server-side.
+        (&Method::GET, "/kiosk/remotes") => Route::RemotesList,
+        (&Method::POST, "/kiosk/remotes") => Route::RemoteAdd,
+        (method, p) if p.starts_with("/kiosk/remotes/") => remotes_action(method, p),
         (&Method::POST, _) => decision_action(path),
         _ => Route::Proxy,
     };
@@ -98,14 +143,48 @@ pub fn route(req: &Request<()>) -> Route {
 fn allowed_methods(path: &str) -> Option<&'static str> {
     match path {
         "/" | "/kiosk" | "/assets/kiosk.html" | "/assets/kiosk.css" | "/assets/kiosk.js" | "/decisions"
-        | "/decisions/file" | "/reports" | "/catalog/list" => Some("GET, HEAD"),
+        | "/decisions/file" | "/reports" | "/catalog/list" | "/kiosk/manage" | "/assets/manage.css"
+        | "/assets/manage.js" => Some("GET, HEAD"),
         "/intent" => Some("POST"),
+        "/kiosk/remotes" => Some("GET, POST"),
+        _ if path.starts_with("/kiosk/remotes/") => split_remote_path(path).and_then(|(_, verb)| match verb {
+            "remove" => Some("POST"),
+            "tabs" => Some("GET, POST"),
+            _ => None,
+        }),
         // `/decisions/<id>/read|tranch` are POSTs; `decision_action` knows the
         // shape, so reuse it rather than repeat the split.
         _ => match decision_action(path) {
             Route::DecisionRead { .. } | Route::DecisionTranch { .. } => Some("POST"),
             _ => None,
         },
+    }
+}
+
+/// Splits `/kiosk/remotes/<id>/<verb>` into its id and verb, or `None` when the
+/// path is not that shape.
+fn split_remote_path(path: &str) -> Option<(&str, &str)> {
+    let rest = path.strip_prefix("/kiosk/remotes/")?;
+    let mut segments = rest.split('/');
+    let (Some(id), Some(verb), None) = (segments.next(), segments.next(), segments.next()) else {
+        return None;
+    };
+    if id.is_empty() {
+        return None;
+    }
+    Some((id, verb))
+}
+
+/// `GET|POST /kiosk/remotes/<id>/<verb>`, or `Proxy` for anything else.
+fn remotes_action(method: &Method, path: &str) -> Route {
+    let Some((id, verb)) = split_remote_path(path) else {
+        return Route::Proxy;
+    };
+    match (method, verb) {
+        (&Method::POST, "remove") => Route::RemoteRemove { id: id.to_string() },
+        (&Method::GET, "tabs") => Route::RemoteTabs { id: id.to_string() },
+        (&Method::POST, "tabs") => Route::RemoteTabCreate { id: id.to_string() },
+        _ => Route::Proxy,
     }
 }
 
@@ -224,6 +303,28 @@ mod tests {
         assert_eq!(classify(Method::GET, "/reports"), Route::Reports);
         assert_eq!(classify(Method::POST, "/intent"), Route::Intent);
         assert_eq!(classify(Method::GET, "/catalog/list"), Route::Catalog);
+        assert_eq!(
+            classify(Method::GET, "/kiosk/manage"),
+            Route::Asset(assets::MANAGE_HTML, "text/html; charset=utf-8")
+        );
+
+        // The Kiosk's own multi-server API.
+        assert_eq!(classify(Method::GET, "/kiosk/remotes"), Route::RemotesList);
+        assert_eq!(classify(Method::POST, "/kiosk/remotes"), Route::RemoteAdd);
+        assert_eq!(
+            classify(Method::POST, "/kiosk/remotes/abc/remove"),
+            Route::RemoteRemove { id: "abc".to_string() }
+        );
+        assert_eq!(
+            classify(Method::GET, "/kiosk/remotes/abc/tabs"),
+            Route::RemoteTabs { id: "abc".to_string() }
+        );
+        assert_eq!(
+            classify(Method::POST, "/kiosk/remotes/abc/tabs"),
+            Route::RemoteTabCreate { id: "abc".to_string() }
+        );
+        // A remote path that is not a known shape is the daemon's, not a 405.
+        assert_eq!(classify(Method::GET, "/kiosk/remotes/abc/nope"), Route::Proxy);
 
         // A path the Kiosk owns, reached with the wrong method, is a 405 — not a
         // relay. Relayed, the daemon's auth gate answers a misleading 401 for
@@ -237,6 +338,10 @@ mod tests {
         assert_eq!(
             classify(Method::GET, "/decisions/a/read"),
             Route::MethodNotAllowed("POST")
+        );
+        assert_eq!(
+            classify(Method::POST, "/kiosk/manage"),
+            Route::MethodNotAllowed("GET, HEAD")
         );
 
         // What is genuinely not the Kiosk's belongs to the daemon, including an

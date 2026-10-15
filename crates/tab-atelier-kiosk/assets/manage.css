@@ -1,0 +1,109 @@
+/* SPDX-License-Identifier: MPL-2.0 */
+/* The serveurs & onglets screen. Same theme as the kiosk panel. */
+:root {
+  color-scheme: light dark;
+  --bg: #f7f7f8;
+  --fg: #1f2328;
+  --panel: #ffffff;
+  --border: #d0d7de;
+  --muted: #57606a;
+  --accent: #0969da;
+  --ok: #2da44e;
+  --err: #cf222e;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14171c;
+    --fg: #e6edf3;
+    --panel: #1e232b;
+    --border: #30363d;
+    --muted: #9198a1;
+    --accent: #58a6ff;
+    --ok: #3fb950;
+    --err: #f85149;
+  }
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font: 14px/1.5 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  background: var(--bg);
+  color: var(--fg);
+}
+
+.topbar {
+  display: flex;
+  align-items: baseline;
+  gap: 1rem;
+  padding: 0.6rem 1rem;
+  border-bottom: 1px solid var(--border);
+}
+.topbar h1 { font-size: 1rem; margin: 0; font-weight: 600; }
+.nav { color: var(--accent); text-decoration: none; font-size: 0.85rem; }
+.nav:hover { text-decoration: underline; }
+.status { margin-left: auto; font-size: 0.8rem; color: var(--muted); }
+.status.ok { color: var(--ok); }
+.status.err { color: var(--err); }
+
+main { padding: 1rem; max-width: 60rem; margin: 0 auto; display: grid; gap: 1rem; }
+.lede { color: var(--muted); margin: 0; }
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1rem;
+}
+.panel h2 { margin: 0 0 0.75rem; font-size: 0.95rem; font-weight: 600; }
+.muted { color: var(--muted); font-weight: 400; }
+
+.remotes, .tabs { list-style: none; margin: 0 0 0.75rem; padding: 0; display: grid; gap: 0.4rem; }
+.remotes li, .tabs li {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.5rem 0.6rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.remotes .label { font-weight: 600; }
+.remotes .url { color: var(--muted); font-family: ui-monospace, monospace; font-size: 0.85rem; }
+.tabs .name { font-family: ui-monospace, monospace; }
+.tabs .meta { color: var(--muted); font-size: 0.85rem; }
+.spacer { margin-left: auto; }
+
+button {
+  font: inherit;
+  padding: 0.35rem 0.7rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--fg);
+  cursor: pointer;
+}
+button:hover { border-color: var(--accent); color: var(--accent); }
+button.link { border: 0; color: var(--accent); padding: 0.2rem 0.3rem; }
+
+.row { display: flex; flex-wrap: wrap; gap: 0.5rem; }
+.row input {
+  flex: 1 1 12rem;
+  min-width: 8rem;
+  padding: 0.4rem 0.5rem;
+  font: inherit;
+  color: var(--fg);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.row button { flex: 0 0 auto; }
+
+.empty { color: var(--muted); font-style: italic; }
+.badge {
+  font-size: 0.75rem;
+  padding: 0.1rem 0.4rem;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: var(--muted);
+}
+.badge.ok { color: var(--ok); border-color: var(--ok); }

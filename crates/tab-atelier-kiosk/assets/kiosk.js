@@ -1266,6 +1266,11 @@ function bootstrap() {
   });
   // Seed the badge once at load (on-demand, cold source).
   refreshKioskBadge();
+  // The page's token rides in `?token=`, so a link to another page of this Kiosk
+  // (the serveurs screen) must carry it too, or the destination answers 401.
+  for (const link of document.querySelectorAll("[data-carry-token]")) {
+    link.href = link.getAttribute("href") + location.search;
+  }
 }
 
 if (typeof document !== "undefined") {

@@ -30,6 +30,9 @@
     <!-- Kiosk: the cross-project PENDING-DECISIONS panel, a separate cold
          source fetched on-demand. The badge = nb of open decisions; hidden when zero. -->
     <button id="kiosk-toggle" class="kiosk-toggle" aria-controls="kiosk-panel">Kiosk<span id="kiosk-badge" class="kiosk-badge" hidden>0</span></button>
+    <!-- Serveurs: the servers this Kiosk aggregates, and their tabs. A separate
+         page; `data-carry-token` keeps the `?token=` so the link stays authorised. -->
+    <a id="manage-link" class="manage-link" href="/kiosk/manage" data-carry-token>Serveurs</a>
   </header>
 
   <main id="kiosk" aria-label="harness kiosk"></main>
