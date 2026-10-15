@@ -106,6 +106,12 @@ tab-atelier-kiosk restore ~/kiosk-backup --force   # ... over live data
 `--state <dir>` overrides the source and target; `TAB_ATELIER_KIOSK_STATE` sets
 the default.
 
+**What this covers, and what it does not:** the Kiosk's own state — the board,
+the intentions, the reports, the remotes and their tokens. A tab's **meta**, and
+so its agent card, is the *daemon's* data, kept in the daemon's own state
+directory and restored by the daemon on startup; this tool neither reads nor
+writes it. Back that directory up separately if you want it in the same place.
+
 ## The journal
 
 JSON Lines: one decision per line, so the file stays legible and a hand edit is a
