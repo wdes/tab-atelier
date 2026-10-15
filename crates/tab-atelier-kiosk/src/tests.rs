@@ -9,12 +9,10 @@
 //! that only calls the pieces would not see a status line built wrong or a
 //! header dropped somewhere between them.
 
-use std::fmt::Write as _;
 use std::fs;
-use std::io::{Read as _, Write as _};
-use std::net::{SocketAddr, TcpListener as StdListener, TcpStream as StdStream};
+use std::io::Read as _;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
 use std::time::Duration;
 
 use http::{Method, Request, header};
@@ -22,15 +20,12 @@ use tokio::net::TcpListener;
 
 use crate::config::{Config, HopTimeouts};
 use crate::decisions::Journal;
-use crate::proxy::MAX_REQUEST_BODY;
 use crate::server::serve_with;
 
 /// Factor the production deadlines are compressed by in these tests.
 ///
-/// The deadlines exist to bound a peer that has stopped answering; keeping them
-/// at their real values would make every test that trips one wait minutes. The
-/// compression is uniform, so relative timing (a live stream outliving the
-/// others) still means what it means in production.
+/// The deadlines exist to bound a remote that has stopped answering; keeping
+/// them at their real values would make a test that trips one wait minutes.
 const SCALE: u32 = 100;
 
 /// Floor under a scaled deadline, so none becomes too tight to measure.
@@ -61,10 +56,9 @@ fn scratch_dir(name: &str) -> PathBuf {
     dir
 }
 
-/// A config pointed at `upstream`, with the journal under `state`.
-fn test_config(upstream: String, state: &Path, token: Option<&str>) -> Config {
+/// A config with the journal and remotes under `state`.
+fn test_config(state: &Path, token: Option<&str>) -> Config {
     Config {
-        upstream,
         bind: "127.0.0.1:0".parse().expect("a valid bind address"),
         journal: Journal {
             path: state.join("decisions.jsonl"),
@@ -76,7 +70,6 @@ fn test_config(upstream: String, state: &Path, token: Option<&str>) -> Config {
             path: state.join("remotes.json"),
         },
         intentions: crate::intent::Intentions::new(state.join("intentions")).expect("intentions dir"),
-        upstream_token: None,
     }
 }
 
@@ -90,90 +83,14 @@ async fn spawn_kiosk_with(cfg: Config) -> SocketAddr {
     addr
 }
 
-async fn spawn_kiosk(upstream: String) -> SocketAddr {
+/// A kiosk with its own uniquely-named state directory, no token.
+async fn spawn_kiosk() -> SocketAddr {
     // A unique state dir per call: several tests run concurrently and each
     // `scratch_dir` wipes its directory, so a shared name would have one test
     // deleting another's state mid-run.
     static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let name = format!("proxy{}", NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
-    spawn_kiosk_with(test_config(upstream, &scratch_dir(&name), None)).await
-}
-
-/// Reads a request head (through the blank line) off a blocking socket.
-fn read_head(sock: &mut StdStream) -> String {
-    let mut head = Vec::new();
-    let mut byte = [0_u8; 1];
-    while !head.ends_with(b"\r\n\r\n") {
-        match sock.read(&mut byte) {
-            Ok(0) | Err(_) => break,
-            Ok(_) => head.push(byte[0]),
-        }
-    }
-    String::from_utf8_lossy(&head).into_owned()
-}
-
-fn content_length(head: &str) -> usize {
-    head.lines()
-        .find_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            name.eq_ignore_ascii_case("content-length")
-                .then(|| value.trim().parse().ok())?
-        })
-        .unwrap_or(0)
-}
-
-/// A stub "daemon": accepts one connection, echoes `{head}\n--\n{body}` back to
-/// the test, and answers with a fixed status, headers and body.
-fn spawn_upstream(
-    status: &'static str,
-    headers: Vec<(&'static str, &'static str)>,
-    body: &'static [u8],
-) -> (SocketAddr, mpsc::Receiver<String>) {
-    let listener = StdListener::bind("127.0.0.1:0").expect("bind upstream");
-    let addr = listener.local_addr().expect("upstream address");
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let Ok((mut sock, _)) = listener.accept() else {
-            return;
-        };
-        let head = read_head(&mut sock);
-        let mut request_body = vec![0_u8; content_length(&head)];
-        let _ = sock.read_exact(&mut request_body);
-        let _ = tx.send(format!("{head}\n--\n{}", String::from_utf8_lossy(&request_body)));
-
-        let mut out = format!("HTTP/1.1 {status}\r\n");
-        for (name, value) in headers {
-            let _ = write!(out, "{name}: {value}\r\n");
-        }
-        let _ = write!(out, "Content-Length: {}\r\n\r\n", body.len());
-        let mut bytes = out.into_bytes();
-        bytes.extend_from_slice(body);
-        let _ = sock.write_all(&bytes);
-        let _ = sock.flush();
-    });
-    (addr, rx)
-}
-
-/// A stub "daemon" that answers 200 and drips four 4-byte chunks, one per
-/// `gap`, then ends the body — a stand-in for a streamed tab or an SSE feed.
-fn spawn_dripping_upstream(chunks: usize, gap: Duration) -> SocketAddr {
-    let listener = StdListener::bind("127.0.0.1:0").expect("bind upstream");
-    let addr = listener.local_addr().expect("upstream address");
-    std::thread::spawn(move || {
-        let Ok((mut sock, _)) = listener.accept() else {
-            return;
-        };
-        let _ = read_head(&mut sock);
-        let _ = sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\n\r\n");
-        for index in 0..chunks {
-            std::thread::sleep(gap);
-            let data = format!("{index:04}");
-            let _ = sock.write_all(format!("{:x}\r\n{data}\r\n", data.len()).as_bytes());
-        }
-        let _ = sock.write_all(b"0\r\n\r\n");
-        let _ = sock.flush();
-    });
-    addr
+    let name = format!("kiosk{}", NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+    spawn_kiosk_with(test_config(&scratch_dir(&name), None)).await
 }
 
 fn agent() -> ureq::Agent {
@@ -217,7 +134,7 @@ fn body_string(mut resp: http::Response<ureq::Body>) -> String {
 async fn serves_the_embedded_assets_locally() {
     // Port 1: nothing is there, so anything proxied fails. The local fetches
     // must still answer, or the page would not render without a daemon.
-    let addr = spawn_kiosk("http://127.0.0.1:1".to_string()).await;
+    let addr = spawn_kiosk().await;
 
     let page = get(addr, "/");
     assert_eq!(page.status(), 200);
@@ -241,69 +158,6 @@ async fn serves_the_embedded_assets_locally() {
     assert!(body_string(script).len() > 1000);
 }
 
-/// A relayed request reaches the daemon with its path, method and body intact,
-/// its custom headers kept, and the hop-by-hop headers that describe the
-/// browser<->kiosk hop stripped so the daemon<->kiosk hop is described honestly.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn proxies_a_request_and_strips_hop_by_hop_headers() {
-    let (upstream, seen) = spawn_upstream("200 OK", vec![("content-type", "text/plain")], b"pong");
-    let addr = spawn_kiosk(format!("http://{upstream}")).await;
-
-    let resp = send(
-        Method::POST,
-        addr,
-        // Not a Kiosk path: `/decisions` is the board (a GET), so a POST there
-        // is a 405 here rather than a relay. This exercises the plain relay.
-        "/api/echo",
-        &[
-            ("x-probe", "sentinel"),
-            ("connection", "keep-alive"),
-            ("te", "trailers"),
-        ],
-        b"payload".to_vec(),
-    );
-    assert_eq!(resp.status(), 200);
-    assert_eq!(body_string(resp), "pong");
-
-    let relayed = seen
-        .recv_timeout(Duration::from_secs(2))
-        .expect("upstream saw the request");
-    let head = relayed.to_lowercase();
-    assert!(
-        relayed.starts_with("POST /api/echo "),
-        "path and method forwarded: {relayed}"
-    );
-    assert!(head.contains("x-probe: sentinel"), "custom header kept");
-    assert!(
-        !head.contains("\nconnection:"),
-        "connection is hop-by-hop and must not be relayed"
-    );
-    assert!(!head.contains("\nte:"), "te is hop-by-hop and must not be relayed");
-    assert!(relayed.contains("payload"), "request body forwarded");
-}
-
-/// A streamed upstream answer arrives whole, chunk by chunk, and the client
-/// sees the reassembled body. This is the path a live tab or an SSE feed takes.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn relays_a_streamed_response_whole() {
-    let upstream = spawn_dripping_upstream(4, Duration::from_millis(20));
-    let addr = spawn_kiosk(format!("http://{upstream}")).await;
-    let body = body_string(get(addr, "/tabs"));
-    assert_eq!(body, "0000000100020003", "all four chunks, in order, whole");
-}
-
-/// A stream that stays alive past where a fixed total-life deadline would have
-/// cut it still finishes. This is what the unarmed `recv_response` buys: a
-/// timeout armed there would cap the whole body's life and kill a healthy feed.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_slow_but_alive_stream_is_not_cut_short() {
-    let gap = scaled(HopTimeouts::default().recv_body.expect("recv_body is set")) / 8;
-    let upstream = spawn_dripping_upstream(8, gap);
-    let addr = spawn_kiosk(format!("http://{upstream}")).await;
-    let body = body_string(get(addr, "/tabs"));
-    assert_eq!(body.len(), 8 * 4, "every chunk arrived despite the pace");
-}
-
 /// The `recv_response` deadline must stay unarmed. ureq keeps that deadline
 /// armed while the body is being read, so any value caps a stream's TOTAL life;
 /// a body is bounded by the idle `recv_body` deadline instead.
@@ -312,39 +166,6 @@ fn the_response_deadline_is_not_armed() {
     assert!(
         HopTimeouts::default().recv_response.is_none(),
         "recv_response must stay None or it would cap every streamed body's life"
-    );
-}
-
-/// A body over the relay limit is refused at the kiosk, before the daemon is
-/// asked to hold it.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_oversized_body_is_rejected_before_the_daemon() {
-    let (upstream, seen) = spawn_upstream("200 OK", vec![], b"pong");
-    let addr = spawn_kiosk(format!("http://{upstream}")).await;
-
-    let oversized = vec![b'x'; MAX_REQUEST_BODY + 1];
-    let resp = send(Method::POST, addr, "/api/upload", &[], oversized);
-    assert_eq!(resp.status(), 413);
-
-    // The daemon must never have been reached: the refusal happens here.
-    assert!(
-        seen.recv_timeout(Duration::from_millis(300)).is_err(),
-        "the daemon was contacted despite the early refusal"
-    );
-}
-
-/// An upstream that cannot be reached is a 502 for the browser, not a hang and
-/// not the local page.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_unreachable_upstream_answers_502() {
-    let addr = spawn_kiosk("http://127.0.0.1:1".to_string()).await;
-    // A path the kiosk does not own, so it is relayed — and the daemon is absent.
-    let resp = get(addr, "/tabs");
-    assert_eq!(resp.status(), 502);
-    let body = body_string(resp);
-    assert!(
-        body.contains("upstream_unavailable"),
-        "the reason is named, not leaked: {body}"
     );
 }
 
@@ -360,7 +181,7 @@ fn urlencode(raw: &str) -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_decision_pane_requires_the_token() {
     let dir = scratch_dir("pane-auth");
-    let addr = spawn_kiosk_with(test_config("http://127.0.0.1:1".to_string(), &dir, Some("s3cret"))).await;
+    let addr = spawn_kiosk_with(test_config(&dir, Some("s3cret"))).await;
 
     let anon = get(addr, "/decisions");
     assert_eq!(anon.status(), 401, "no token is refused");
@@ -386,7 +207,7 @@ async fn the_decision_pane_requires_the_token() {
 
     // A kiosk with no token configured refuses everyone, not no one.
     let open_dir = scratch_dir("pane-notoken");
-    let open = spawn_kiosk_with(test_config("http://127.0.0.1:1".to_string(), &open_dir, None)).await;
+    let open = spawn_kiosk_with(test_config(&open_dir, None)).await;
     assert_eq!(get(open, "/decisions").status(), 401);
 }
 
@@ -401,7 +222,7 @@ async fn the_board_is_read_and_ruled_through_http() {
     )
     .expect("write journal");
     fs::write(dir.join("outbox/note.md"), "# note\n").expect("write note");
-    let addr = spawn_kiosk_with(test_config("http://127.0.0.1:1".to_string(), &dir, Some("t"))).await;
+    let addr = spawn_kiosk_with(test_config(&dir, Some("t"))).await;
     let auth = ("authorization", "Bearer t");
 
     // Open listed, archived hidden until asked for.
@@ -481,7 +302,7 @@ async fn the_reports_pane_lists_the_outbox() {
     let dir = scratch_dir("reports");
     fs::write(dir.join("outbox/audit-01.md"), "x").expect("write report");
     fs::write(dir.join("outbox/notes.txt"), "x").expect("write a non-report");
-    let addr = spawn_kiosk_with(test_config("http://127.0.0.1:1".to_string(), &dir, Some("t"))).await;
+    let addr = spawn_kiosk_with(test_config(&dir, Some("t"))).await;
     let auth = ("authorization", "Bearer t");
 
     assert_eq!(get(addr, "/reports").status(), 401, "no token is refused");
@@ -500,7 +321,7 @@ async fn the_reports_pane_lists_the_outbox() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_intent_pane_records_and_works_an_intention() {
     let dir = scratch_dir("intent");
-    let addr = spawn_kiosk_with(test_config("http://127.0.0.1:1".to_string(), &dir, Some("t"))).await;
+    let addr = spawn_kiosk_with(test_config(&dir, Some("t"))).await;
     let auth = ("authorization", "Bearer t");
 
     assert_eq!(
@@ -567,7 +388,7 @@ async fn the_intent_pane_records_and_works_an_intention() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_catalog_pane_serves_the_read_model() {
     let dir = scratch_dir("catalog");
-    let addr = spawn_kiosk_with(test_config("http://127.0.0.1:1".to_string(), &dir, Some("t"))).await;
+    let addr = spawn_kiosk_with(test_config(&dir, Some("t"))).await;
     let auth = ("authorization", "Bearer t");
 
     assert_eq!(get(addr, "/catalog/list").status(), 401, "still behind the token");
@@ -584,7 +405,7 @@ async fn the_catalog_pane_serves_the_read_model() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_wrong_method_on_a_pane_is_a_405_not_a_relay() {
     let dir = scratch_dir("405");
-    let addr = spawn_kiosk_with(test_config("http://127.0.0.1:1".to_string(), &dir, Some("t"))).await;
+    let addr = spawn_kiosk_with(test_config(&dir, Some("t"))).await;
 
     // No token needed: a method error is not data, so it is answered before the
     // gate — and never handed to a daemon that is not listening here.
@@ -602,7 +423,7 @@ async fn a_wrong_method_on_a_pane_is_a_405_not_a_relay() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_fleet_lists_every_server_behind_the_token() {
     let dir = scratch_dir("fleet");
-    let addr = spawn_kiosk_with(test_config("http://127.0.0.1:1".to_string(), &dir, Some("t"))).await;
+    let addr = spawn_kiosk_with(test_config(&dir, Some("t"))).await;
     let auth = ("authorization", "Bearer t");
 
     assert_eq!(get(addr, "/kiosk/fleet").status(), 401, "the fleet is behind the token");
@@ -619,7 +440,7 @@ async fn the_fleet_lists_every_server_behind_the_token() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn remotes_are_managed_server_side() {
     let dir = scratch_dir("remotes");
-    let addr = spawn_kiosk_with(test_config("http://127.0.0.1:1".to_string(), &dir, Some("t"))).await;
+    let addr = spawn_kiosk_with(test_config(&dir, Some("t"))).await;
     let auth = ("authorization", "Bearer t");
 
     assert_eq!(

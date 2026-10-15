@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! Runtime configuration, and the upstream hop it configures.
+//! Runtime configuration.
+//!
+//! The Kiosk is a multi-remote aggregator: there is no single daemon it talks
+//! to, only the remotes the operator configures under Serveurs, each with its
+//! own url and token. So there is no `upstream` here — a central one would be a
+//! single daemon by another name, and the whole point is that there is none.
 
 use std::fs;
 use std::net::SocketAddr;
@@ -10,9 +15,6 @@ use std::time::Duration;
 use crate::decisions::Journal;
 use crate::intent::{self, Intentions};
 use crate::remotes::Remotes;
-
-/// The daemon this crate fronts when `TAB_ATELIER_UPSTREAM` is unset.
-pub const DEFAULT_UPSTREAM: &str = "http://127.0.0.1:7890";
 
 /// Address the kiosk listens on when `TAB_ATELIER_KIOSK_ADDR` is unset.
 ///
@@ -29,8 +31,6 @@ pub const DEFAULT_STATE_DIR: &str = "/var/lib/tab-atelier-kiosk";
 /// Runtime knobs, read from the environment.
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// Base URL of the daemon to proxy to, no trailing slash.
-    pub upstream: String,
     /// Address to listen on.
     pub bind: SocketAddr,
     /// The decision journal this crate serves and mutates.
@@ -57,28 +57,15 @@ pub struct Config {
     pub remotes: Remotes,
     /// The intentions the Kiosk holds — its own data, like the board.
     pub intentions: Intentions,
-    /// The upstream daemon's token, when it has one.
-    ///
-    /// The `--upstream` daemon is the one the Kiosk relays the page's calls to;
-    /// this lets the Kiosk also read ITS tabs for the fleet view, so an operator
-    /// sees the local machine's tabs without first adding it as a remote. `None`
-    /// means the upstream is not aggregated — the fleet shows only the
-    /// configured remotes.
-    pub upstream_token: Option<String>,
 }
 
 impl Config {
-    /// Validate a pair of knobs, from the environment or the command line.
+    /// Validate the knobs, from the environment or the command line.
     ///
     /// # Errors
     ///
-    /// Fails when the upstream is not an http(s) URL or the bind address is
-    /// unparseable.
-    pub fn new(upstream: &str, bind: &str) -> Result<Self, String> {
-        let upstream = upstream.trim_end_matches('/').to_string();
-        if !upstream.starts_with("http://") && !upstream.starts_with("https://") {
-            return Err(format!("upstream must be an http(s) URL, got {upstream:?}"));
-        }
+    /// Fails when the bind address is unparseable.
+    pub fn new(bind: &str) -> Result<Self, String> {
         let bind = bind
             .parse()
             .map_err(|err| format!("bind address {bind:?} is not an address: {err}"))?;
@@ -94,31 +81,24 @@ impl Config {
         let intentions_dir = std::env::var("TAB_ATELIER_INTENTIONS")
             .map_or_else(|_| state_dir.join(intent::DEFAULT_INTENTIONS_DIR), PathBuf::from);
         let intentions = Intentions::new(intentions_dir).map_err(|e| format!("intentions: {e}"))?;
-        let upstream_token = std::env::var("TAB_ATELIER_UPSTREAM_TOKEN")
-            .ok()
-            .filter(|token| !token.trim().is_empty());
         Ok(Self {
-            upstream,
             bind,
             journal: Journal { path: journal, outbox },
             token,
             token_file,
             remotes: Remotes { path: remotes },
             intentions,
-            upstream_token,
         })
     }
 
-    /// Read `TAB_ATELIER_UPSTREAM` and `TAB_ATELIER_KIOSK_ADDR`, falling back
-    /// to [`DEFAULT_UPSTREAM`] and [`DEFAULT_BIND`].
+    /// Read `TAB_ATELIER_KIOSK_ADDR`, falling back to [`DEFAULT_BIND`].
     ///
     /// # Errors
     ///
     /// As [`Config::new`].
     pub fn from_env() -> Result<Self, String> {
-        let upstream = std::env::var("TAB_ATELIER_UPSTREAM").unwrap_or_else(|_| DEFAULT_UPSTREAM.to_string());
         let bind = std::env::var("TAB_ATELIER_KIOSK_ADDR").unwrap_or_else(|_| DEFAULT_BIND.to_string());
-        Self::new(&upstream, &bind)
+        Self::new(&bind)
     }
 }
 
@@ -194,10 +174,8 @@ pub fn set_owner_only(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Deadlines for the upstream hop, one per stage that must produce something.
-///
-/// Split out from [`Upstream`] so a test can compress them and still exercise
-/// the real timeout paths instead of waiting out the production values.
+/// Deadlines for the hop to a remote's daemon, one per stage that must produce
+/// something. Used by the [`crate::daemon`] client.
 #[derive(Debug, Clone, Copy)]
 pub struct HopTimeouts {
     pub resolve: Option<Duration>,
@@ -228,37 +206,6 @@ impl Default for HopTimeouts {
             recv_response: None,
             recv_body: Some(Duration::from_mins(5)),
         }
-    }
-}
-
-/// The daemon base URL plus the agent used to reach it.
-///
-/// One agent for the whole process: it owns the connection pool, and it is the
-/// single place the hop's timeouts are configured.
-#[derive(Debug)]
-pub struct Upstream {
-    pub base: String,
-    pub agent: ureq::Agent,
-}
-
-impl Upstream {
-    pub fn new(base: String, timeouts: HopTimeouts) -> Self {
-        let agent = ureq::Agent::config_builder()
-            // A 404 from the daemon is a 404 for the browser, not an upstream
-            // failure to be rewritten into a 502.
-            .http_status_as_error(false)
-            // The browser follows redirects, and its cookie/authorization
-            // handling must see the real target.
-            .max_redirects(0)
-            .timeout_resolve(timeouts.resolve)
-            .timeout_connect(timeouts.connect)
-            .timeout_send_request(timeouts.send_request)
-            .timeout_send_body(timeouts.send_body)
-            .timeout_recv_response(timeouts.recv_response)
-            .timeout_recv_body(timeouts.recv_body)
-            .build()
-            .new_agent();
-        Self { base, agent }
     }
 }
 

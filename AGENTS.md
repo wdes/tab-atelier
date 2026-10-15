@@ -22,6 +22,31 @@ Tab Atelier is a Guake-style drop-down terminal emulator for Linux (X11), built 
 - `src/tracking.rs` — Wakatime integration
 - `src/platform/linux.rs` — Linux-specific platform code (XDG dirs, X11 hotkeys, process info)
 
+## Separate projects, one contract
+
+`crates/` holds projects that are **independent** of this binary and of each
+other: `tab-atelier-proxy` and `tab-atelier-kiosk` are their own `.deb`, their
+own systemd unit and their own port, and are deliberately **not** default
+workspace members (see the comment in `Cargo.toml`). They talk to this daemon —
+and, in the kiosk's case, to several daemons — **over the HTTP API only**, and
+never import this crate's types.
+
+A UI is one of these, not a feature of the daemon. `tab-atelier-kiosk` is a web
+view over several tab-atelier instances at once: it reaches each configured
+remote with that instance's own URL and token, holds no central daemon, and has
+no `--upstream`. Its state (board, intentions, reports, remotes) lives in its
+own directory and is backed up with `tab-atelier-kiosk backup`.
+
+The rule for a change: a project **adds facilities to another so they can
+communicate** — an endpoint on the daemon the kiosk calls, say — rather than
+folding one into the other. Adding a route to `src/api.rs` for a UI to embed is
+the anti-pattern; giving the daemon an endpoint a separate project *calls* is
+the pattern. `POST /tabs`'s `sync`/`meta` are such facilities.
+
+The maintainer's `local/` scratch dashboard (gitignored) is the same idea taken
+to its smallest form: one self-contained page, one narrow proxied path, no repo
+membership.
+
 ## Mobile app (the `android-app` branch)
 
 The Android client is no longer in this repository. It is a **fork of

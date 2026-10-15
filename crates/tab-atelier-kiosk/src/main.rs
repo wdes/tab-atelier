@@ -4,13 +4,13 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
-use tab_atelier_kiosk::{Config, DEFAULT_BIND, DEFAULT_UPSTREAM};
+use tab_atelier_kiosk::{Config, DEFAULT_BIND};
 
 #[derive(Parser)]
 #[command(
     name = "tab-atelier-kiosk",
     version,
-    about = "Web Kiosk: serves the interface and relays the rest to the daemon"
+    about = "Web Kiosk: one view over several tab-atelier instances"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -24,9 +24,6 @@ enum Command {
         /// Address to listen on.
         #[arg(long, default_value = DEFAULT_BIND)]
         listen: String,
-        /// Daemon base URL to relay every other path to.
-        #[arg(long, default_value = DEFAULT_UPSTREAM)]
-        upstream: String,
     },
     /// Copy the whole state directory somewhere safe.
     ///
@@ -56,8 +53,8 @@ enum Command {
 #[tokio::main]
 async fn main() -> Result<(), String> {
     match Cli::parse().command {
-        Command::Serve { listen, upstream } => {
-            let cfg = Config::new(&upstream, &listen)?;
+        Command::Serve { listen } => {
+            let cfg = Config::new(&listen)?;
             println!("tab-atelier-kiosk on http://{}{}", cfg.bind, uri_tail(&cfg));
             match (&cfg.token, &cfg.token_file) {
                 // The path, never the token: console output ends up in logs and

@@ -1,15 +1,17 @@
 # tab-atelier-kiosk
 
-The tab-atelier web Kiosk: a small server that sits in front of the daemon.
+A web Kiosk: one view over **several tab-atelier instances at once**.
 
-It serves the interface it embeds, and relays the paths it does not own back to
-the daemon — the daemon's own API (`/api/*`) and anything the page learns to ask
-for. Same origin is the point: the page and the calls it makes then share one
-origin, so the browser never makes a cross-origin request and CORS never comes
-up.
+It is not a front for one daemon. Each project is independent and its own
+install, and the Kiosk reaches each one over its HTTP API — with that instance's
+own URL and token. There is no central daemon and no `--upstream`: a machine's
+tabs show up because it was added as a remote, which is the same configuration
+that reaches it. The crate never imports another crate's types; the HTTP API is
+the whole contract, which is what lets the pieces talk without being welded
+together.
 
-It owns the panes itself, because they are the operator's view and not the
-daemon's data — each read and written directly, behind its own token:
+It serves the interface it embeds and owns the panes whose data is the
+operator's — each read and written directly, behind its own token:
 
 | Route | What it does |
 |---|---|
@@ -26,30 +28,26 @@ daemon's data — each read and written directly, behind its own token:
 | `POST /intent/<slug>/promote` | move it into `READY-intentions/` |
 | `POST /kiosk/remotes/<id>/intent/<slug>/launch` | open a worker tab on a remote for an intention |
 | `GET /catalog/list` | the skills catalogue (`{retired, skills}`) |
-| `GET /kiosk/remotes` | the servers the Kiosk aggregates (tokens redacted) |
+| `GET /kiosk/remotes` | the servers the Kiosk shows (tokens redacted) |
 | `POST /kiosk/remotes` | add a server (label, url, token) |
 | `POST /kiosk/remotes/<id>/remove` | forget a server |
 | `GET /kiosk/remotes/<id>/tabs` | a remote's tabs, reached with its token |
 | `POST /kiosk/remotes/<id>/tabs` | open a tab on a remote |
+| `GET /kiosk/remotes/<id>/cards` | a remote's agent cards, from its tabs' meta |
 | `GET /kiosk/fleet` | every server and its tabs, aggregated server-side |
 
-**The entry point is the landing page**, which is the fleet: every server the
-Kiosk aggregates and its tabs, each with an "Ouvrir un onglet" form. `local` is
-the daemon the Kiosk fronts (`--upstream`), addressable as a server too, so you
-see and add tabs on this machine without first adding it as a remote — which is
-what requires `TAB_ATELIER_UPSTREAM_TOKEN` (below). Without that token, `local`
-is simply absent and only the configured remotes show.
-
-Everything else is the daemon's, relayed unchanged. A path in the table reached
-with the wrong method is a **405** with an `Allow` header — not a relay to the
-daemon, whose auth gate would answer a misleading 401 for what is really "this
-method is not allowed here".
+**The entry point is the landing page**, which is the fleet: every configured
+server and its tabs, each with an "Ouvrir un onglet" form. To see a machine's
+tabs, add it as a remote — that is the only way and the only place, by design.
+Anything the table does not list is a **404**, not a relay: there is no single
+daemon to fall back to. A path in the table reached with the wrong method is a
+**405** with an `Allow` header.
 
 ## Several servers
 
 The Kiosk's point is to take advantage of **several resources at once**, so it
-holds a list of remotes — each a daemon it can reach, with the token that opens
-it. The list lives on the Kiosk (`<state>/remotes.json`, `0600`), set from the
+holds a list of remotes — each a tab-atelier it can reach, with that instance's
+token. The list lives on the Kiosk (`<state>/remotes.json`, `0600`), set from the
 **serveurs** screen (`/kiosk/manage`): add a label, an API URL and a token, and
 the Kiosk reaches that server **server-side**. The browser holds only the Kiosk
 token; a remote's token is never sent to a page, so a cross-site script on the
@@ -59,18 +57,16 @@ desktop app's `tab-atelier remote add`.
 ## Running it
 
 ```
-tab-atelier-kiosk serve --listen 127.0.0.1:8282 --upstream http://127.0.0.1:7890
+tab-atelier-kiosk serve --listen 0.0.0.0:8282
 ```
 
 | Env | Default | Meaning |
 |---|---|---|
 | `TAB_ATELIER_KIOSK_ADDR` | `0.0.0.0:8282` | where it listens |
-| `TAB_ATELIER_UPSTREAM` | `http://127.0.0.1:7890` | the daemon it relays to |
-| `TAB_ATELIER_UPSTREAM_TOKEN` | *(none)* | that daemon's token, to show its tabs in the fleet |
 | `TAB_ATELIER_KIOSK_STATE` | `/var/lib/tab-atelier-kiosk` | state directory |
 | `TAB_ATELIER_DECISIONS` | `<state>/decisions.jsonl` | the journal |
 | `TAB_ATELIER_OUTBOX` | `<state>/outbox` | the tree `/decisions/file` serves from |
-| `TAB_ATELIER_REMOTES` | `<state>/remotes.json` | the servers the Kiosk aggregates |
+| `TAB_ATELIER_REMOTES` | `<state>/remotes.json` | the servers the Kiosk shows |
 | `TAB_ATELIER_INTENTIONS` | `<state>/intentions` | the intentions directory |
 | `TAB_ATELIER_KIOSK_TOKEN` | *(generated)* | the token the panes require |
 

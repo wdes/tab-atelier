@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! The HTTP server: bind, accept, dispatch to an asset, a pane, or the daemon.
+//! The HTTP server: bind, accept, dispatch to an asset or a pane.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,11 +13,16 @@ use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 
 use crate::body::{BoxBody, full, json_response};
-use crate::config::{Config, HopTimeouts, Upstream};
+use crate::config::{Config, HopTimeouts};
 use crate::daemon::Daemon;
 use crate::panes::Panes;
-use crate::proxy::{MAX_REQUEST_BODY, proxy};
 use crate::route::{self, Route};
+
+/// Largest request body the Kiosk will read from a pane request.
+///
+/// The Kiosk is a browser front door, not an upload service; anything larger is
+/// a mistake or an attack, and the limit is what keeps it out of memory.
+const MAX_REQUEST_BODY: usize = 4 * 1024 * 1024;
 
 /// Bind `cfg.bind` and serve until the process is killed.
 ///
@@ -45,16 +50,8 @@ pub async fn serve(listener: TcpListener, cfg: Config) -> std::io::Result<()> {
 /// [`serve`] with explicit hop deadlines, so a test can compress them and still
 /// exercise the real timeout paths instead of waiting out the production values.
 pub async fn serve_with(listener: TcpListener, cfg: Config, timeouts: HopTimeouts) -> std::io::Result<()> {
-    let upstream = Arc::new(Upstream::new(cfg.upstream.clone(), timeouts));
     let daemon = Arc::new(Daemon::new(timeouts));
-    let panes = Arc::new(Panes::new(
-        cfg.journal,
-        cfg.token,
-        cfg.remotes,
-        cfg.intentions,
-        cfg.upstream,
-        cfg.upstream_token,
-    ));
+    let panes = Arc::new(Panes::new(cfg.journal, cfg.token, cfg.remotes, cfg.intentions));
     loop {
         let (stream, _peer) = match listener.accept().await {
             Ok(pair) => pair,
@@ -66,15 +63,13 @@ pub async fn serve_with(listener: TcpListener, cfg: Config, timeouts: HopTimeout
                 continue;
             }
         };
-        let upstream = Arc::clone(&upstream);
         let panes = Arc::clone(&panes);
         let daemon = Arc::clone(&daemon);
         tokio::spawn(async move {
             let service = service_fn(move |req: Request<Incoming>| {
-                let upstream = Arc::clone(&upstream);
                 let panes = Arc::clone(&panes);
                 let daemon = Arc::clone(&daemon);
-                async move { Ok::<_, std::convert::Infallible>(handle(req, &upstream, &panes, &daemon).await) }
+                async move { Ok::<_, std::convert::Infallible>(handle(req, &panes, &daemon).await) }
             });
             // Connection-level errors (client hung up mid-response) are routine.
             let _ = hyper::server::conn::http1::Builder::new()
@@ -84,8 +79,8 @@ pub async fn serve_with(listener: TcpListener, cfg: Config, timeouts: HopTimeout
     }
 }
 
-/// Serve a local asset, answer a pane, or relay the request to the daemon.
-async fn handle(req: Request<Incoming>, upstream: &Upstream, panes: &Panes, daemon: &Daemon) -> Response<BoxBody> {
+/// Serve a local asset or answer a pane.
+async fn handle(req: Request<Incoming>, panes: &Panes, daemon: &Daemon) -> Response<BoxBody> {
     let (parts, body) = req.into_parts();
     let authorization = parts.headers.get(header::AUTHORIZATION).cloned();
     let route = route::route(&Request::from_parts(parts.clone(), ()));
@@ -107,7 +102,9 @@ async fn handle(req: Request<Incoming>, upstream: &Upstream, panes: &Panes, daem
             .header(header::CACHE_CONTROL, "no-cache")
             .body(full(asset))
             .expect("static response builder"),
-        Route::Proxy => proxy(Request::from_parts(parts, body), upstream).await,
+        // Nothing the Kiosk serves. There is no single daemon to relay to — to
+        // reach a machine's tabs, it is a configured remote, not a fallback.
+        Route::NotFound => json_response(StatusCode::NOT_FOUND, &serde_json::json!({ "error": "not_found" })),
         Route::Decisions { include_archived } => panes.list(include_archived),
         Route::DecisionFile { path } => panes.file(&path),
         Route::DecisionRead { id } => panes.read(&id),
@@ -156,22 +153,19 @@ async fn handle(req: Request<Incoming>, upstream: &Upstream, panes: &Panes, daem
     }
 }
 
-/// `GET /kiosk/fleet` — every server and its tabs, aggregated server-side.
+/// `GET /kiosk/fleet` — every configured server and its tabs.
 ///
-/// The Kiosk reaches each server with ITS token (never the browser's), and
-/// returns only what the landing page shows — each tab's id, name and cwd, not
-/// its scrollback. A server that cannot be reached is reported as
+/// The servers are the ones the operator added in Serveurs and no others — the
+/// Kiosk does not invent a local one. It reaches each with ITS token (never the
+/// browser's) and returns only what the landing page shows — each tab's id, name
+/// and cwd, not its scrollback. A server that cannot be reached is reported as
 /// `{error: unreachable}` rather than failing the whole list: one down server
 /// must not blank the fleet.
 async fn fleet(panes: &Panes, daemon: &Daemon) -> Response<BoxBody> {
     let mut servers = Vec::new();
-    for (id, label, url, token) in panes.fleet_targets() {
-        let remote = crate::remotes::Remote {
-            id: id.clone(),
-            label: label.clone(),
-            url,
-            token,
-        };
+    for remote in panes.fleet_targets() {
+        let id = remote.id.clone();
+        let label = remote.label.clone();
         let daemon = daemon.clone();
         let answered = tokio::task::spawn_blocking(move || daemon.get(&remote, "/tabs")).await;
         let entry = match answered {

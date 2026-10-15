@@ -95,27 +95,27 @@ pub enum Route {
     },
     /// `GET /kiosk/fleet` — every server and its tabs, aggregated server-side.
     Fleet,
-    /// Everything else: hand it to the upstream daemon.
-    Proxy,
+    /// Nothing the Kiosk serves — a 404. There is no relay: the Kiosk is a
+    /// multi-remote aggregator, not a proxy for one daemon.
+    NotFound,
 }
 
 impl Route {
     /// Whether the route needs the pane token.
     ///
-    /// The assets, the daemon relay and a method error do not; every pane and
-    /// the remote API do. The server checks this once, before the match, rather
-    /// than repeating the guard in each arm.
+    /// The assets, a 404 and a method error do not; every pane and the remote
+    /// API do. The server checks this once, before the match, rather than
+    /// repeating the guard in each arm.
     #[must_use]
     pub const fn is_protected(&self) -> bool {
-        !matches!(self, Self::Asset(..) | Self::Proxy | Self::MethodNotAllowed(..))
+        !matches!(self, Self::Asset(..) | Self::NotFound | Self::MethodNotAllowed(..))
     }
 }
 
-/// Classifies a request. The interface and the panes this crate answers itself
-/// — the board, the reports listing, the intention, the catalogue — are ours;
-/// every remaining call the page makes (the daemon's own API under `/api/*`,
-/// and anything else the page learns to ask for) is the daemon's, relayed on
-/// the same origin so the browser never makes a cross-origin request.
+/// Classifies a request. The Kiosk answers the interface and its own panes —
+/// the board, the reports listing, the intentions, the catalogue, and the
+/// multi-server API that reaches the configured remotes. Anything else is a 404:
+/// there is no single daemon to relay to.
 pub fn route(req: &Request<()>) -> Route {
     let uri = req.uri();
     let path = uri.path();
@@ -143,7 +143,7 @@ pub fn route(req: &Request<()>) -> Route {
             include_archived: query_param(query, "includeArchived").is_some_and(|v| v == "true" || v == "1"),
         },
         (&Method::GET, "/decisions/file") => {
-            query_param(query, "path").map_or(Route::Proxy, |path| Route::DecisionFile { path })
+            query_param(query, "path").map_or(Route::NotFound, |path| Route::DecisionFile { path })
         }
         // The reports tab lists the outbox; the intent tab records and works an
         // intention. The exact arms precede the family guard below, so
@@ -164,15 +164,12 @@ pub fn route(req: &Request<()>) -> Route {
         (&Method::GET, "/kiosk/fleet") => Route::Fleet,
         (method, p) if p.starts_with("/kiosk/remotes/") => remotes_action(method, p),
         (&Method::POST, _) => decision_action(path),
-        _ => Route::Proxy,
+        _ => Route::NotFound,
     };
 
     // A path this crate owns, reached with a method it does not answer, is a
-    // 405 — NOT a fall-through to the daemon. Relayed, the daemon's own auth
-    // gate answers 401 first, which reads as "your token is wrong" for what is
-    // really "this method is not allowed here", and names a failure the caller
-    // cannot act on.
-    if resolved == Route::Proxy
+    // 405 — not a 404. The path exists; only the verb is wrong.
+    if resolved == Route::NotFound
         && let Some(allow) = allowed_methods(path)
     {
         return Route::MethodNotAllowed(allow);
@@ -180,20 +177,20 @@ pub fn route(req: &Request<()>) -> Route {
     resolved
 }
 
-/// `GET|POST /intent/<slug>[/<verb>]`, or `Proxy` for anything else.
+/// `GET|POST /intent/<slug>[/<verb>]`, or `NotFound` for anything else.
 fn intent_action(method: &Method, path: &str) -> Route {
     let mut segments = path["/intent/".len()..].split('/');
     let (Some(slug), verb) = (segments.next(), segments.next()) else {
-        return Route::Proxy;
+        return Route::NotFound;
     };
     if slug.is_empty() {
-        return Route::Proxy;
+        return Route::NotFound;
     }
     match (method, verb, segments.next()) {
         (&Method::GET, None, _) => Route::IntentView { slug: slug.to_string() },
         (&Method::POST, Some("promote"), None) => Route::IntentPromote { slug: slug.to_string() },
         (&Method::POST, Some("ask"), None) => Route::IntentAsk { slug: slug.to_string() },
-        _ => Route::Proxy,
+        _ => Route::NotFound,
     }
 }
 
@@ -234,10 +231,10 @@ fn allowed_methods(path: &str) -> Option<&'static str> {
     }
 }
 
-/// `GET|POST /kiosk/remotes/<id>/<verb>`, or `Proxy` for anything else.
+/// `GET|POST /kiosk/remotes/<id>/<verb>`, or `NotFound` for anything else.
 fn remotes_action(method: &Method, path: &str) -> Route {
     let Some(rest) = path.strip_prefix("/kiosk/remotes/") else {
-        return Route::Proxy;
+        return Route::NotFound;
     };
     let segments: Vec<&str> = rest.split('/').collect();
     match (method, segments.as_slice()) {
@@ -253,26 +250,26 @@ fn remotes_action(method: &Method, path: &str) -> Route {
                 slug: slug.to_string(),
             }
         }
-        _ => Route::Proxy,
+        _ => Route::NotFound,
     }
 }
 
-/// `POST /decisions/<id>/read|tranch`, or `Proxy` for anything else.
+/// `POST /decisions/<id>/read|tranch`, or `NotFound` for anything else.
 fn decision_action(path: &str) -> Route {
     let Some(rest) = path.strip_prefix("/decisions/") else {
-        return Route::Proxy;
+        return Route::NotFound;
     };
     let mut segments = rest.split('/');
     let (Some(id), Some(verb), None) = (segments.next(), segments.next(), segments.next()) else {
-        return Route::Proxy;
+        return Route::NotFound;
     };
     if id.is_empty() {
-        return Route::Proxy;
+        return Route::NotFound;
     }
     match verb {
         "read" => Route::DecisionRead { id: id.to_string() },
         "tranch" => Route::DecisionTranch { id: id.to_string() },
-        _ => Route::Proxy,
+        _ => Route::NotFound,
     }
 }
 
@@ -403,7 +400,7 @@ mod tests {
         ] {
             assert_eq!(
                 classify(method.clone(), uri),
-                Route::Proxy,
+                Route::NotFound,
                 "{method} {uri} is the daemon's"
             );
         }
@@ -470,8 +467,8 @@ mod tests {
             }
         );
         // A remote path that is not a known shape is the daemon's, not a 405.
-        assert_eq!(classify(Method::GET, "/kiosk/remotes/abc/nope"), Route::Proxy);
-        assert_eq!(classify(Method::GET, "/kiosk/remotes/abc/intent/x"), Route::Proxy);
+        assert_eq!(classify(Method::GET, "/kiosk/remotes/abc/nope"), Route::NotFound);
+        assert_eq!(classify(Method::GET, "/kiosk/remotes/abc/intent/x"), Route::NotFound);
     }
 
     /// Percent escapes and `+` decode, so a path with a slash survives the trip.

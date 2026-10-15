@@ -1285,7 +1285,7 @@ function bootstrap() {
 function fleetHtml(model) {
   const servers = (model && model.servers) || [];
   if (servers.length === 0) {
-    return `<p class="fleet-empty">Aucun serveur. Ajoute-en un dans <a href="/kiosk/manage${typeof location !== "undefined" ? location.search : ""}">Serveurs</a>.</p>`;
+    return `<p class="fleet-empty">Aucun serveur. Ajoute-en un dans <a href="/kiosk/manage">Serveurs</a>.</p>`;
   }
   return servers.map(fleetServerHtml).join("");
 }

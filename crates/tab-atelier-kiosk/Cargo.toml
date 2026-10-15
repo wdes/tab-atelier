@@ -18,7 +18,6 @@ path = "src/lib.rs"
 [dependencies]
 clap = { version = "4", default-features = false, features = ["derive", "std", "help", "usage", "error-context"] }
 bytes = "1"
-futures-util = { version = "0.3", default-features = false, features = ["std"] }
 http = "1"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["server", "http1"] }
