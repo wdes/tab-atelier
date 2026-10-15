@@ -419,7 +419,7 @@ async fn a_wrong_method_on_a_pane_is_a_405_not_a_relay() {
 }
 
 /// The fleet view — the landing page's data — is behind the token and, with no
-/// upstream token and no remotes, is an empty list rather than an error.
+/// remotes configured, is an empty list rather than an error.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_fleet_lists_every_server_behind_the_token() {
     let dir = scratch_dir("fleet");
