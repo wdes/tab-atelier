@@ -76,6 +76,14 @@ pub enum Route {
         /// The remote id.
         id: String,
     },
+    /// `POST /kiosk/remotes/<id>/intent/<slug>/launch` — open a worker tab on a
+    /// remote for an intention, and remember which tab it was.
+    RemoteIntentLaunch {
+        /// The remote id.
+        id: String,
+        /// The intention slug.
+        slug: String,
+    },
     /// A path the Kiosk serves, reached with a method it does not answer. The
     /// string is the value of the `Allow` header.
     MethodNotAllowed(&'static str),
@@ -196,11 +204,15 @@ fn allowed_methods(path: &str) -> Option<&'static str> {
             }
         }
         "/kiosk/remotes" => Some("GET, POST"),
-        _ if path.starts_with("/kiosk/remotes/") => split_remote_path(path).and_then(|(_, verb)| match verb {
-            "remove" => Some("POST"),
-            "tabs" => Some("GET, POST"),
-            _ => None,
-        }),
+        _ if path.starts_with("/kiosk/remotes/") => {
+            let segments: Vec<&str> = path["/kiosk/remotes/".len()..].split('/').collect();
+            match segments.as_slice() {
+                [id, "remove"] if !id.is_empty() => Some("POST"),
+                [id, "tabs"] if !id.is_empty() => Some("GET, POST"),
+                [id, "intent", slug, "launch"] if !id.is_empty() && !slug.is_empty() => Some("POST"),
+                _ => None,
+            }
+        }
         // `/decisions/<id>/read|tranch` are POSTs; `decision_action` knows the
         // shape, so reuse it rather than repeat the split.
         _ => match decision_action(path) {
@@ -210,29 +222,24 @@ fn allowed_methods(path: &str) -> Option<&'static str> {
     }
 }
 
-/// Splits `/kiosk/remotes/<id>/<verb>` into its id and verb, or `None` when the
-/// path is not that shape.
-fn split_remote_path(path: &str) -> Option<(&str, &str)> {
-    let rest = path.strip_prefix("/kiosk/remotes/")?;
-    let mut segments = rest.split('/');
-    let (Some(id), Some(verb), None) = (segments.next(), segments.next(), segments.next()) else {
-        return None;
-    };
-    if id.is_empty() {
-        return None;
-    }
-    Some((id, verb))
-}
-
 /// `GET|POST /kiosk/remotes/<id>/<verb>`, or `Proxy` for anything else.
 fn remotes_action(method: &Method, path: &str) -> Route {
-    let Some((id, verb)) = split_remote_path(path) else {
+    let Some(rest) = path.strip_prefix("/kiosk/remotes/") else {
         return Route::Proxy;
     };
-    match (method, verb) {
-        (&Method::POST, "remove") => Route::RemoteRemove { id: id.to_string() },
-        (&Method::GET, "tabs") => Route::RemoteTabs { id: id.to_string() },
-        (&Method::POST, "tabs") => Route::RemoteTabCreate { id: id.to_string() },
+    let segments: Vec<&str> = rest.split('/').collect();
+    match (method, segments.as_slice()) {
+        (&Method::POST, [id, "remove"]) if !id.is_empty() => Route::RemoteRemove { id: id.to_string() },
+        (&Method::GET, [id, "tabs"]) if !id.is_empty() => Route::RemoteTabs { id: id.to_string() },
+        (&Method::POST, [id, "tabs"]) if !id.is_empty() => Route::RemoteTabCreate { id: id.to_string() },
+        // The one remote action that is about an intention rather than a plain
+        // tab: it spawns a worker for `slug` and remembers which tab it was.
+        (&Method::POST, [id, "intent", slug, "launch"]) if !id.is_empty() && !slug.is_empty() => {
+            Route::RemoteIntentLaunch {
+                id: id.to_string(),
+                slug: slug.to_string(),
+            }
+        }
         _ => Route::Proxy,
     }
 }
@@ -350,30 +357,11 @@ mod tests {
             Route::DecisionTranch { id: "a".to_string() }
         );
         assert_eq!(classify(Method::GET, "/reports"), Route::Reports);
-        assert_eq!(classify(Method::POST, "/intent"), Route::Intent);
         assert_eq!(classify(Method::GET, "/catalog/list"), Route::Catalog);
         assert_eq!(
             classify(Method::GET, "/kiosk/manage"),
             Route::Asset(assets::MANAGE_HTML, "text/html; charset=utf-8")
         );
-
-        // The Kiosk's own multi-server API.
-        assert_eq!(classify(Method::GET, "/kiosk/remotes"), Route::RemotesList);
-        assert_eq!(classify(Method::POST, "/kiosk/remotes"), Route::RemoteAdd);
-        assert_eq!(
-            classify(Method::POST, "/kiosk/remotes/abc/remove"),
-            Route::RemoteRemove { id: "abc".to_string() }
-        );
-        assert_eq!(
-            classify(Method::GET, "/kiosk/remotes/abc/tabs"),
-            Route::RemoteTabs { id: "abc".to_string() }
-        );
-        assert_eq!(
-            classify(Method::POST, "/kiosk/remotes/abc/tabs"),
-            Route::RemoteTabCreate { id: "abc".to_string() }
-        );
-        // A remote path that is not a known shape is the daemon's, not a 405.
-        assert_eq!(classify(Method::GET, "/kiosk/remotes/abc/nope"), Route::Proxy);
 
         // A path the Kiosk owns, reached with the wrong method, is a 405 — not a
         // relay. Relayed, the daemon's auth gate answers a misleading 401 for
@@ -406,6 +394,66 @@ mod tests {
                 "{method} {uri} is the daemon's"
             );
         }
+    }
+
+    /// The intent family and the multi-server API classify as their own routes.
+    #[test]
+    fn the_intent_and_remote_families_are_classified() {
+        assert_eq!(classify(Method::POST, "/intent"), Route::Intent);
+        assert_eq!(classify(Method::GET, "/intent/list"), Route::IntentList);
+        assert_eq!(classify(Method::POST, "/intent/new"), Route::IntentNew);
+        assert_eq!(
+            classify(Method::GET, "/intent/my-slug"),
+            Route::IntentView {
+                slug: "my-slug".to_string()
+            }
+        );
+        assert_eq!(
+            classify(Method::POST, "/intent/my-slug/promote"),
+            Route::IntentPromote {
+                slug: "my-slug".to_string()
+            }
+        );
+        assert_eq!(
+            classify(Method::POST, "/intent/my-slug/ask"),
+            Route::IntentAsk {
+                slug: "my-slug".to_string()
+            }
+        );
+        // The exact arms win over the `<slug>` family: `/intent/list` is a list,
+        // not an intention named "list".
+        assert_ne!(
+            classify(Method::GET, "/intent/list"),
+            Route::IntentView {
+                slug: "list".to_string()
+            }
+        );
+
+        // The Kiosk's own multi-server API.
+        assert_eq!(classify(Method::GET, "/kiosk/remotes"), Route::RemotesList);
+        assert_eq!(classify(Method::POST, "/kiosk/remotes"), Route::RemoteAdd);
+        assert_eq!(
+            classify(Method::POST, "/kiosk/remotes/abc/remove"),
+            Route::RemoteRemove { id: "abc".to_string() }
+        );
+        assert_eq!(
+            classify(Method::GET, "/kiosk/remotes/abc/tabs"),
+            Route::RemoteTabs { id: "abc".to_string() }
+        );
+        assert_eq!(
+            classify(Method::POST, "/kiosk/remotes/abc/tabs"),
+            Route::RemoteTabCreate { id: "abc".to_string() }
+        );
+        assert_eq!(
+            classify(Method::POST, "/kiosk/remotes/abc/intent/my-slug/launch"),
+            Route::RemoteIntentLaunch {
+                id: "abc".to_string(),
+                slug: "my-slug".to_string()
+            }
+        );
+        // A remote path that is not a known shape is the daemon's, not a 405.
+        assert_eq!(classify(Method::GET, "/kiosk/remotes/abc/nope"), Route::Proxy);
+        assert_eq!(classify(Method::GET, "/kiosk/remotes/abc/intent/x"), Route::Proxy);
     }
 
     /// Percent escapes and `+` decode, so a path with a slash survives the trip.

@@ -224,6 +224,12 @@ impl Panes {
             .expect("static response builder")
     }
 
+    /// The intentions store, for the launch route — it reads the intention to
+    /// brief the worker and records the tab that came back.
+    pub const fn intentions(&self) -> &Intentions {
+        &self.intentions
+    }
+
     /// The 401 for a request without the token.
     pub fn unauthorized() -> Response<BoxBody> {
         json_response(

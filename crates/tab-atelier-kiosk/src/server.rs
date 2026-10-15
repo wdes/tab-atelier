@@ -12,7 +12,7 @@ use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 
-use crate::body::{BoxBody, full};
+use crate::body::{BoxBody, full, json_response};
 use crate::config::{Config, HopTimeouts, Upstream};
 use crate::daemon::Daemon;
 use crate::panes::Panes;
@@ -142,8 +142,56 @@ async fn handle(req: Request<Incoming>, upstream: &Upstream, panes: &Panes, daem
             Ok(spec) => remote_call(panes, daemon, &id, "/tabs", Some(spec)).await,
             Err(response) => response,
         },
+        Route::RemoteIntentLaunch { id, slug } => remote_intent_launch(panes, daemon, &id, &slug).await,
         Route::MethodNotAllowed(allow) => Panes::method_not_allowed(allow),
     }
+}
+
+/// `POST /kiosk/remotes/<id>/intent/<slug>/launch` — open a worker tab on a
+/// remote for an intention, and remember which tab it was.
+///
+/// The Kiosk owns the intention (a local file) and the remote owns the tab. The
+/// tab is asked for `sync` so its uuid comes back rather than being guessed; the
+/// intention is tagged onto it as `meta.intent`, so the worker can tell which
+/// intention it is for, and the tab id is written back to the intention file.
+///
+/// What this does NOT do — because `POST /tabs` has no way to — is hand the
+/// worker the intention's text as a prompt. The brief stays in the file the
+/// operator can read; injecting it is a daemon feature that does not exist yet.
+async fn remote_intent_launch(panes: &Panes, daemon: &Daemon, id: &str, slug: &str) -> Response<BoxBody> {
+    // The intention is ours: read it before reaching out, so an unknown slug is
+    // a 404 and no remote is asked to spawn anything.
+    if panes.intentions().read(slug).is_err() {
+        return json_response(
+            StatusCode::NOT_FOUND,
+            &serde_json::json!({ "error": "no such intention" }),
+        );
+    }
+    let remote = match panes.remote(id) {
+        Ok(remote) => remote,
+        Err(error) => return Panes::remote_error(&error),
+    };
+    let spec = serde_json::json!({ "sync": true, "meta": { "intent": slug } });
+    let daemon = daemon.clone();
+    let answered = tokio::task::spawn_blocking(move || daemon.post(&remote, "/tabs", &spec)).await;
+    let Ok(Ok((status, text))) = answered else {
+        return Panes::bad_gateway();
+    };
+    if !(200..300).contains(&status) {
+        return relay_response(status, text);
+    }
+    // The daemon's `sync` reply carries `{"id": "<uuid>", …}`; record it so the
+    // intention can find its worker again.
+    let tab_id = serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|value| value.get("id").and_then(|id| id.as_str()).map(str::to_string));
+    if let Some(tab_id) = &tab_id {
+        let _ = panes.intentions().set_tab(slug, tab_id);
+    }
+    json_response(
+        StatusCode::OK,
+        &serde_json::json!({ "slug": slug, "tab": tab_id, "launched": tab_id.is_some() }),
+    )
 }
 
 /// Reaches a configured remote with its token, server-side, and relays the

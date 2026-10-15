@@ -24,6 +24,7 @@ daemon's data — each read and written directly, behind its own token:
 | `GET /intent/<slug>` | one intention, whole (front matter and turns) |
 | `POST /intent/<slug>/ask` | append a turn to the intention |
 | `POST /intent/<slug>/promote` | move it into `READY-intentions/` |
+| `POST /kiosk/remotes/<id>/intent/<slug>/launch` | open a worker tab on a remote for an intention |
 | `GET /catalog/list` | the skills catalogue (`{retired, skills}`) |
 | `GET /kiosk/remotes` | the servers the Kiosk aggregates (tokens redacted) |
 | `POST /kiosk/remotes` | add a server (label, url, token) |
