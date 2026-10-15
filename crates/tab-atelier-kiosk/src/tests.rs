@@ -75,6 +75,7 @@ fn test_config(upstream: String, state: &Path, token: Option<&str>) -> Config {
         remotes: crate::remotes::Remotes {
             path: state.join("remotes.json"),
         },
+        intentions: crate::intent::Intentions::new(state.join("intentions")).expect("intentions dir"),
     }
 }
 
@@ -89,7 +90,12 @@ async fn spawn_kiosk_with(cfg: Config) -> SocketAddr {
 }
 
 async fn spawn_kiosk(upstream: String) -> SocketAddr {
-    spawn_kiosk_with(test_config(upstream, &scratch_dir("proxy"), None)).await
+    // A unique state dir per call: several tests run concurrently and each
+    // `scratch_dir` wipes its directory, so a shared name would have one test
+    // deleting another's state mid-run.
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let name = format!("proxy{}", NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+    spawn_kiosk_with(test_config(upstream, &scratch_dir(&name), None)).await
 }
 
 /// Reads a request head (through the blank line) off a blocking socket.
@@ -488,10 +494,10 @@ async fn the_reports_pane_lists_the_outbox() {
     assert!(body.contains("outbox/audit-01.md"), "path is how the page addresses it");
 }
 
-/// The intent tab records an intention as a server-named file, and refuses an
-/// empty one — both behind the token.
+/// The intent tab records an intention and works it: list, view, ask, promote —
+/// all behind the token.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_intent_pane_records_an_intention() {
+async fn the_intent_pane_records_and_works_an_intention() {
     let dir = scratch_dir("intent");
     let addr = spawn_kiosk_with(test_config("http://127.0.0.1:1".to_string(), &dir, Some("t"))).await;
     let auth = ("authorization", "Bearer t");
@@ -502,31 +508,56 @@ async fn the_intent_pane_records_an_intention() {
         "no token is refused"
     );
 
+    // Record one; its first line titles it, and the title becomes the slug.
     let recorded = send(
         Method::POST,
         addr,
         "/intent",
         &[auth],
-        br##"{"content":"# Intention\n\nDo the thing.\n"}"##.to_vec(),
+        r#"{"content":"Décision congés\n\nThe team needs dates.\n"}"#.as_bytes().to_vec(),
     );
-    assert_eq!(recorded.status(), 201, "a new artefact is a 201");
+    assert_eq!(recorded.status(), 201, "a new intention is a 201");
     let body = body_string(recorded);
-    assert!(body.contains("\"name\":\"intent-"), "server-named: {body}");
+    assert!(
+        body.contains("\"slug\":\"decision-conges\""),
+        "slugged from the title: {body}"
+    );
 
-    // It is really on disk, and it is a report the other tab now lists.
-    let written = fs::read_dir(dir.join("outbox"))
-        .expect("read outbox")
-        .flatten()
-        .filter(|e| e.file_name().to_string_lossy().starts_with("intent-"))
-        .count();
-    assert_eq!(written, 1, "exactly one artefact was written");
-    assert!(body_string(send(Method::GET, addr, "/reports", &[auth], vec![])).contains("intent-"));
+    // The list shows it; the view returns the whole file.
+    let listed = body_string(send(Method::GET, addr, "/intent/list", &[auth], vec![]));
+    assert!(listed.contains("decision-conges"), "the list has it: {listed}");
+    let view = send(Method::GET, addr, "/intent/decision-conges", &[auth], vec![]);
+    assert_eq!(view.status(), 200);
+    assert!(
+        body_string(view).contains("The team needs dates."),
+        "the pitch is there"
+    );
 
-    // An empty intention is a 400, and posts nothing.
-    let empty = send(Method::POST, addr, "/intent", &[auth], br#"{"content":"   "}"#.to_vec());
-    assert_eq!(empty.status(), 400);
-    let junk = send(Method::POST, addr, "/intent", &[auth], b"not json".to_vec());
-    assert_eq!(junk.status(), 400);
+    // Ask appends a turn to the same file.
+    let asked = send(
+        Method::POST,
+        addr,
+        "/intent/decision-conges/ask",
+        &[auth],
+        br#"{"text":"what dates?"}"#.to_vec(),
+    );
+    assert_eq!(asked.status(), 200);
+    assert!(body_string(asked).contains("### Question"), "the turn is a heading");
+
+    // Promote moves it to the ready pool — a move, not a flag.
+    let promoted = send(Method::POST, addr, "/intent/decision-conges/promote", &[auth], vec![]);
+    assert_eq!(promoted.status(), 200);
+    assert!(
+        dir.join("intentions/READY-intentions/decision-conges.md").is_file(),
+        "promote moves the file into the ready pool"
+    );
+
+    // An empty intention is a 400; an unknown slug a 404.
+    assert_eq!(
+        send(Method::POST, addr, "/intent", &[auth], br#"{"content":"   "}"#.to_vec()).status(),
+        400
+    );
+    assert_eq!(send(Method::GET, addr, "/intent/nope", &[auth], vec![]).status(), 404);
 }
 
 /// The catalog tab loads: the Kiosk serves the read-model rather than relaying

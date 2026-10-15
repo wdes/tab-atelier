@@ -18,7 +18,12 @@ daemon's data — each read and written directly, behind its own token:
 | `POST /decisions/<id>/read` | mark a decision read |
 | `POST /decisions/<id>/tranch` | rule a decision, with a verdict |
 | `GET /reports` | the outbox listing, newest first |
-| `POST /intent` | record an intention as `outbox/intent-<ts>.md` |
+| `POST /intent` | record an intention (`{"content": …}`) |
+| `GET /intent/list` | the intentions, the ready ones last |
+| `POST /intent/new` | start an intention (`{"title", "repo", "pitch"}`) |
+| `GET /intent/<slug>` | one intention, whole (front matter and turns) |
+| `POST /intent/<slug>/ask` | append a turn to the intention |
+| `POST /intent/<slug>/promote` | move it into `READY-intentions/` |
 | `GET /catalog/list` | the skills catalogue (`{retired, skills}`) |
 | `GET /kiosk/remotes` | the servers the Kiosk aggregates (tokens redacted) |
 | `POST /kiosk/remotes` | add a server (label, url, token) |
@@ -56,6 +61,7 @@ tab-atelier-kiosk serve --listen 127.0.0.1:8282 --upstream http://127.0.0.1:7890
 | `TAB_ATELIER_DECISIONS` | `<state>/decisions.jsonl` | the journal |
 | `TAB_ATELIER_OUTBOX` | `<state>/outbox` | the tree `/decisions/file` serves from |
 | `TAB_ATELIER_REMOTES` | `<state>/remotes.json` | the servers the Kiosk aggregates |
+| `TAB_ATELIER_INTENTIONS` | `<state>/intentions` | the intentions directory |
 | `TAB_ATELIER_KIOSK_TOKEN` | *(generated)* | the token the panes require |
 
 **The token is provisioned on first start.** With no `TAB_ATELIER_KIOSK_TOKEN`,
@@ -79,8 +85,25 @@ the markdown the reports tab lists and the intentions the intent tab writes:
 <state>/decisions.jsonl     the board
 <state>/token               the pane token (0600)
 <state>/remotes.json        the servers, with their tokens (0600)
-<state>/outbox/*.md         reports, and intent-<ts>.md
+<state>/intentions/*.md     intentions, and READY-intentions/ once promoted
+<state>/outbox/*.md         reports
 ```
+
+### Backup and restore
+
+The package never deletes the state directory — not even on purge — but a move to
+new hardware, a reinstall, or a mistake at the terminal still loses data unless it
+can be taken out and put back. That is what these do; the destination is **yours
+to choose**, never defaulted to `/var`:
+
+```bash
+tab-atelier-kiosk backup ~/kiosk-backup            # copy the whole state dir
+tab-atelier-kiosk restore ~/kiosk-backup           # put it back (refuses a non-empty state)
+tab-atelier-kiosk restore ~/kiosk-backup --force   # ... over live data
+```
+
+`--state <dir>` overrides the source and target; `TAB_ATELIER_KIOSK_STATE` sets
+the default.
 
 ## The journal
 

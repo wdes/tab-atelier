@@ -12,24 +12,27 @@ use http::{HeaderValue, Response, StatusCode, header};
 
 use crate::body::{BoxBody, full, json_response};
 use crate::decisions::{DecisionError, Journal};
+use crate::intent::Intentions;
 use crate::remotes::{Remote, RemoteError, Remotes};
-use crate::reports::{self, IntentError};
+use crate::reports;
 
-/// The panes' state: the journal, the remotes the Kiosk aggregates, and the
-/// token that opens them.
+/// The panes' state: the journal, the intentions, the remotes the Kiosk
+/// aggregates, and the token that opens them.
 #[derive(Debug, Clone)]
 pub struct Panes {
     journal: Journal,
     token: Option<String>,
     remotes: Remotes,
+    intentions: Intentions,
 }
 
 impl Panes {
-    pub const fn new(journal: Journal, token: Option<String>, remotes: Remotes) -> Self {
+    pub const fn new(journal: Journal, token: Option<String>, remotes: Remotes, intentions: Intentions) -> Self {
         Self {
             journal,
             token,
             remotes,
+            intentions,
         }
     }
 
@@ -92,18 +95,58 @@ impl Panes {
         json_response(StatusCode::OK, &serde_json::json!({ "reports": reports }))
     }
 
-    /// `POST /intent` — record an intention as a server-named artefact.
+    /// `POST /intent` — record an intention from the grid. The first non-empty
+    /// line titles it; the whole note is the pitch.
     pub fn intent(&self, content: &str) -> Response<BoxBody> {
-        match reports::write_intent(&self.journal.outbox, content) {
-            Ok(report) => json_response(
-                StatusCode::CREATED,
-                &serde_json::json!({ "path": report.path, "name": report.name }),
-            ),
-            Err(IntentError::Empty) => {
-                json_response(StatusCode::BAD_REQUEST, &serde_json::json!({ "error": "empty_intent" }))
-            }
-            Err(IntentError::Unavailable) => unavailable(),
+        if content.trim().is_empty() {
+            return json_response(StatusCode::BAD_REQUEST, &serde_json::json!({ "error": "empty_intent" }));
         }
+        let title = content
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .map_or("intention", |line| line.trim_start_matches('#').trim());
+        self.intent_new(title, "", content)
+    }
+
+    /// `GET /intent/list` — the intentions, the ready ones last.
+    pub fn intents_list(&self) -> Response<BoxBody> {
+        self.intentions.list().map_or_else(
+            |_| unavailable(),
+            |intents| json_response(StatusCode::OK, &serde_json::json!({ "intents": intents })),
+        )
+    }
+
+    /// `POST /intent/new` — start an intention.
+    pub fn intent_new(&self, title: &str, repo: &str, pitch: &str) -> Response<BoxBody> {
+        match self.intentions.create(title, repo, pitch) {
+            Ok(summary) => json_response(StatusCode::CREATED, &serde_json::json!({ "intent": summary })),
+            Err(why) => json_response(StatusCode::BAD_REQUEST, &serde_json::json!({ "error": why })),
+        }
+    }
+
+    /// `GET /intent/<slug>` — one intention, whole (front matter and turns).
+    pub fn intent_view(&self, slug: &str) -> Response<BoxBody> {
+        self.intentions.read(slug).map_or_else(
+            |why| json_response(StatusCode::NOT_FOUND, &serde_json::json!({ "error": why })),
+            |body| json_response(StatusCode::OK, &serde_json::json!({ "slug": slug, "body": body })),
+        )
+    }
+
+    /// `POST /intent/<slug>/promote` — move it to the ready pool.
+    pub fn intent_promote(&self, slug: &str) -> Response<BoxBody> {
+        self.intentions.promote(slug).map_or_else(
+            |why| json_response(StatusCode::NOT_FOUND, &serde_json::json!({ "error": why })),
+            |()| json_response(StatusCode::OK, &serde_json::json!({ "promoted": slug })),
+        )
+    }
+
+    /// `POST /intent/<slug>/ask` — append a turn from the operator.
+    pub fn intent_ask(&self, slug: &str, text: &str) -> Response<BoxBody> {
+        self.intentions.append_turn(slug, "Question", text).map_or_else(
+            |why| json_response(StatusCode::NOT_FOUND, &serde_json::json!({ "error": why })),
+            |body| json_response(StatusCode::OK, &serde_json::json!({ "slug": slug, "body": body })),
+        )
     }
 
     /// `GET /catalog/list` — the skills catalogue.
@@ -234,6 +277,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 mod tests {
     use super::{Panes, constant_time_eq};
     use crate::decisions::Journal;
+    use crate::intent::Intentions;
     use crate::remotes::Remotes;
 
     fn panes(token: Option<&str>) -> Panes {
@@ -247,6 +291,7 @@ mod tests {
             Remotes {
                 path: dir.join("remotes.json"),
             },
+            Intentions::new(dir.join("intentions")).expect("intentions dir"),
         )
     }
 

@@ -36,6 +36,25 @@ pub enum Route {
     Reports,
     /// Record an intention: `POST /intent`.
     Intent,
+    /// `GET /intent/list` — the intentions, ready ones last.
+    IntentList,
+    /// `POST /intent/new` — start an intention.
+    IntentNew,
+    /// `GET /intent/<slug>` — one intention, whole.
+    IntentView {
+        /// The intention slug.
+        slug: String,
+    },
+    /// `POST /intent/<slug>/promote` — move it to the ready pool.
+    IntentPromote {
+        /// The intention slug.
+        slug: String,
+    },
+    /// `POST /intent/<slug>/ask` — append a turn to the intention.
+    IntentAsk {
+        /// The intention slug.
+        slug: String,
+    },
     /// The catalog tab: `GET /catalog/list`, the skills catalogue.
     Catalog,
     /// `GET /kiosk/remotes` — the servers the Kiosk aggregates.
@@ -110,9 +129,14 @@ pub fn route(req: &Request<()>) -> Route {
         (&Method::GET, "/decisions/file") => {
             query_param(query, "path").map_or(Route::Proxy, |path| Route::DecisionFile { path })
         }
-        // The reports tab lists the outbox; the intent tab records one.
+        // The reports tab lists the outbox; the intent tab records and works an
+        // intention. The exact arms precede the family guard below, so
+        // `/intent/list` and `/intent/new` are never read as slugs.
         (&Method::GET, "/reports") => Route::Reports,
         (&Method::POST, "/intent") => Route::Intent,
+        (&Method::GET, "/intent/list") => Route::IntentList,
+        (&Method::POST, "/intent/new") => Route::IntentNew,
+        (method, p) if p.starts_with("/intent/") => intent_action(method, p),
         // The catalog tab reads the skills catalogue, which is the Kiosk's to
         // answer: the daemon has no such route (see `crate::panes::catalog`).
         (&Method::GET, "/catalog/list") => Route::Catalog,
@@ -138,14 +162,39 @@ pub fn route(req: &Request<()>) -> Route {
     resolved
 }
 
+/// `GET|POST /intent/<slug>[/<verb>]`, or `Proxy` for anything else.
+fn intent_action(method: &Method, path: &str) -> Route {
+    let mut segments = path["/intent/".len()..].split('/');
+    let (Some(slug), verb) = (segments.next(), segments.next()) else {
+        return Route::Proxy;
+    };
+    if slug.is_empty() {
+        return Route::Proxy;
+    }
+    match (method, verb, segments.next()) {
+        (&Method::GET, None, _) => Route::IntentView { slug: slug.to_string() },
+        (&Method::POST, Some("promote"), None) => Route::IntentPromote { slug: slug.to_string() },
+        (&Method::POST, Some("ask"), None) => Route::IntentAsk { slug: slug.to_string() },
+        _ => Route::Proxy,
+    }
+}
+
 /// The methods this crate answers for a path it owns, or `None` when the path
 /// is not the Kiosk's at all and is therefore the daemon's to answer.
 fn allowed_methods(path: &str) -> Option<&'static str> {
     match path {
         "/" | "/kiosk" | "/assets/kiosk.html" | "/assets/kiosk.css" | "/assets/kiosk.js" | "/decisions"
         | "/decisions/file" | "/reports" | "/catalog/list" | "/kiosk/manage" | "/assets/manage.css"
-        | "/assets/manage.js" => Some("GET, HEAD"),
-        "/intent" => Some("POST"),
+        | "/assets/manage.js" | "/intent/list" => Some("GET, HEAD"),
+        "/intent" | "/intent/new" => Some("POST"),
+        _ if path.starts_with("/intent/") => {
+            let mut segments = path["/intent/".len()..].split('/');
+            match (segments.next(), segments.next()) {
+                (Some(slug), None) if !slug.is_empty() => Some("GET, HEAD"),
+                (Some(_), Some("promote" | "ask")) => Some("POST"),
+                _ => None,
+            }
+        }
         "/kiosk/remotes" => Some("GET, POST"),
         _ if path.starts_with("/kiosk/remotes/") => split_remote_path(path).and_then(|(_, verb)| match verb {
             "remove" => Some("POST"),

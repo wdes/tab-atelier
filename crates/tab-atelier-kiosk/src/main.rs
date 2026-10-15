@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
+use std::path::PathBuf;
+
 use clap::{Parser, Subcommand};
 
 use tab_atelier_kiosk::{Config, DEFAULT_BIND, DEFAULT_UPSTREAM};
@@ -26,6 +28,29 @@ enum Command {
         #[arg(long, default_value = DEFAULT_UPSTREAM)]
         upstream: String,
     },
+    /// Copy the whole state directory somewhere safe.
+    ///
+    /// The package never deletes state, not even on purge; this is for the move
+    /// it cannot cover — new hardware, a reinstall, a mistake at the terminal.
+    Backup {
+        /// Directory to write the copy into (created if missing).
+        to: PathBuf,
+        /// State directory to copy. Defaults to the configured one.
+        #[arg(long)]
+        state: Option<PathBuf>,
+    },
+    /// Put a backup back, over the state directory.
+    Restore {
+        /// Directory holding a previous backup.
+        from: PathBuf,
+        /// Restore over a non-empty state directory. Without it, a restore that
+        /// would overwrite live data is refused.
+        #[arg(long)]
+        force: bool,
+        /// State directory to restore into. Defaults to the configured one.
+        #[arg(long)]
+        state: Option<PathBuf>,
+    },
 }
 
 #[tokio::main]
@@ -43,6 +68,26 @@ async fn main() -> Result<(), String> {
             }
             tab_atelier_kiosk::run(cfg).await.map_err(|err| err.to_string())
         }
+        Command::Backup { to, state } => {
+            let state = state.unwrap_or_else(tab_atelier_kiosk::state_dir);
+            let n = tab_atelier_kiosk::backup(&state, &to).map_err(describe)?;
+            println!("backed up {n} file(s): {} -> {}", state.display(), to.display());
+            Ok(())
+        }
+        Command::Restore { from, force, state } => {
+            let state = state.unwrap_or_else(tab_atelier_kiosk::state_dir);
+            let n = tab_atelier_kiosk::restore(&state, &from, force).map_err(describe)?;
+            println!("restored {n} file(s): {} -> {}", from.display(), state.display());
+            Ok(())
+        }
+    }
+}
+
+/// A backup failure as a message for the terminal.
+fn describe(error: tab_atelier_kiosk::BackupError) -> String {
+    use tab_atelier_kiosk::BackupError;
+    match error {
+        BackupError::BadPath(why) | BackupError::NotEmpty(why) | BackupError::Io(why) => why,
     }
 }
 

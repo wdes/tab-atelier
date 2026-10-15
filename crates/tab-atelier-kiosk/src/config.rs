@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::decisions::Journal;
+use crate::intent::{self, Intentions};
 use crate::remotes::Remotes;
 
 /// The daemon this crate fronts when `TAB_ATELIER_UPSTREAM` is unset.
@@ -48,6 +49,8 @@ pub struct Config {
     /// its tokens live here, server-side; the browser sets them but never holds
     /// them.
     pub remotes: Remotes,
+    /// The intentions the Kiosk holds — its own data, like the board.
+    pub intentions: Intentions,
 }
 
 impl Config {
@@ -74,6 +77,9 @@ impl Config {
         let remotes =
             std::env::var("TAB_ATELIER_REMOTES").map_or_else(|_| state_dir.join("remotes.json"), PathBuf::from);
         let (token, token_file) = resolve_token(&state_dir, std::env::var("TAB_ATELIER_KIOSK_TOKEN").ok());
+        let intentions_dir = std::env::var("TAB_ATELIER_INTENTIONS")
+            .map_or_else(|_| state_dir.join(intent::DEFAULT_INTENTIONS_DIR), PathBuf::from);
+        let intentions = Intentions::new(intentions_dir).map_err(|e| format!("intentions: {e}"))?;
         Ok(Self {
             upstream,
             bind,
@@ -81,6 +87,7 @@ impl Config {
             token,
             token_file,
             remotes: Remotes { path: remotes },
+            intentions,
         })
     }
 

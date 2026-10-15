@@ -47,7 +47,7 @@ pub async fn serve(listener: TcpListener, cfg: Config) -> std::io::Result<()> {
 pub async fn serve_with(listener: TcpListener, cfg: Config, timeouts: HopTimeouts) -> std::io::Result<()> {
     let upstream = Arc::new(Upstream::new(cfg.upstream, timeouts));
     let daemon = Arc::new(Daemon::new(timeouts));
-    let panes = Arc::new(Panes::new(cfg.journal, cfg.token, cfg.remotes));
+    let panes = Arc::new(Panes::new(cfg.journal, cfg.token, cfg.remotes, cfg.intentions));
     loop {
         let (stream, _peer) = match listener.accept().await {
             Ok(pair) => pair,
@@ -111,6 +111,20 @@ async fn handle(req: Request<Incoming>, upstream: &Upstream, panes: &Panes, daem
         Route::Reports => panes.reports(),
         Route::Intent => match read_field(body, "content").await {
             Ok(content) => panes.intent(&content),
+            Err(response) => response,
+        },
+        Route::IntentList => panes.intents_list(),
+        Route::IntentNew => match read_json(body).await {
+            Ok(value) => {
+                let field = |name: &str| value.get(name).and_then(|v| v.as_str()).unwrap_or("");
+                panes.intent_new(field("title"), field("repo"), field("pitch"))
+            }
+            Err(response) => response,
+        },
+        Route::IntentView { slug } => panes.intent_view(&slug),
+        Route::IntentPromote { slug } => panes.intent_promote(&slug),
+        Route::IntentAsk { slug } => match read_field(body, "text").await {
+            Ok(text) => panes.intent_ask(&slug, &text),
             Err(response) => response,
         },
         Route::Catalog => Panes::catalog(),
