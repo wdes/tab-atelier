@@ -1871,177 +1871,204 @@ fn handle_connection<S: Read + Write>(
         return;
     }
 
-    match (method.as_str(), path.as_str()) {
-        ("GET", "/" | "/tabs") => {
-            tabs::list(stream, state, accept_gzip, if_none_match.as_deref());
-        }
+    // Path first, then method. A path the API serves, reached with the wrong
+    // verb, is a 405 — the routing produces that answer itself, rather than a
+    // second list of paths kept by hand in step with a method-first match, which
+    // drifts the first time a route is added and no one thinks to add it twice.
+    // An unknown path falls to the last arm and is a 404.
+    match path.as_str() {
+        // ---- fixed paths ----
+        "/" | "/tabs" => match method.as_str() {
+            "GET" => tabs::list(stream, state, accept_gzip, if_none_match.as_deref()),
+            "POST" if path == "/tabs" => tabs::create(stream, state, &body_bytes),
+            _ => method_not_allowed(stream),
+        },
         // Lean per-tab consumption projection for a dashboard poller — the
         // same live numbers as `/tabs` but WITHOUT the heavy `output` /
         // `raw_output` scrollback dumps, so it's cheap to poll ~1 s. Same
         // auth gate as `/tabs` (checked upstream of this match).
-        ("GET", "/tabs/usage") => usage::run(stream, state, accept_gzip, if_none_match.as_deref()),
-        #[cfg(feature = "catbus")]
-        ("GET", p) if p.starts_with("/tabs/") && p.ends_with("/catbus") => {
-            catbus::session(stream, state, p);
-        }
-        #[cfg(feature = "catbus")]
-        ("POST", p) if p.starts_with("/tabs/") && p.ends_with("/catbus/message") => {
-            catbus::message(stream, state, p, &body_bytes);
-        }
-        #[cfg(feature = "catbus")]
-        ("GET", p) if p.starts_with("/tabs/") && p.ends_with("/catbus/messages") => {
-            catbus::messages(stream, state, p, query_since);
-        }
-        ("GET", p) if p.starts_with("/tabs/") && p.ends_with("/view") => {
-            view::run(
-                stream,
-                state,
-                p,
-                accept_gzip,
-                if_none_match.as_deref(),
-                had_trailing_slash,
-            );
-        }
-        ("GET", p) if p.starts_with("/tabs/") && p.ends_with("/output") => {
-            output::run(stream, state, p, query_since, query_crc, query_lines, accept_gzip);
-        }
-        ("DELETE", p)
-            if p.starts_with("/tabs/")
-                && (!p[6..].contains('/') || (p[6..].starts_with("by-id/") && p[6..].matches('/').count() == 1)) =>
-        {
-            tabs::close(stream, state, p);
-        }
-        ("POST", "/tabs") => {
-            tabs::create(stream, state, &body_bytes);
-        }
-        ("POST", "/limits/default") => limits::set_default(stream, state, &body_bytes),
-        ("POST", "/claude-only") => claude_only::set(stream, state, &body_bytes),
-        ("POST", "/relay-mode") => relay::mode(stream, state, &body_bytes),
-        ("GET", "/relay-config") => relay::config_get(stream),
-        ("POST", "/relay-config") => relay::config_set(stream, state, &body_bytes),
-        ("GET", "/logs") => {
-            // Loopback only. The ring holds whatever the daemon logged — tab
-            // names, cwds, endpoint labels, error strings — and the API binds
-            // 0.0.0.0 in the default config, so holding the master token from
-            // another host must not be enough to read it. The peer address is
-            // the gate; `X-Forwarded-For` is deliberately NOT consulted, since
-            // a proxy on this host would then let anyone forge it.
-            if !from_loopback {
-                error_json(stream, 403, "logs are readable from 127.0.0.1 only");
-                return;
+        "/tabs/usage" => match method.as_str() {
+            "GET" => usage::run(stream, state, accept_gzip, if_none_match.as_deref()),
+            _ => method_not_allowed(stream),
+        },
+        "/tabs/rotate-tokens" => match method.as_str() {
+            "POST" => tokens::rotate(stream, state),
+            _ => method_not_allowed(stream),
+        },
+        "/master-token/reset" => match method.as_str() {
+            "POST" => tokens::reset_master(stream, state),
+            _ => method_not_allowed(stream),
+        },
+        "/limits/default" => match method.as_str() {
+            "POST" => limits::set_default(stream, state, &body_bytes),
+            _ => method_not_allowed(stream),
+        },
+        "/claude-only" => match method.as_str() {
+            "POST" => claude_only::set(stream, state, &body_bytes),
+            _ => method_not_allowed(stream),
+        },
+        "/relay-mode" => match method.as_str() {
+            "POST" => relay::mode(stream, state, &body_bytes),
+            _ => method_not_allowed(stream),
+        },
+        "/relay-config" => match method.as_str() {
+            "GET" => relay::config_get(stream),
+            "POST" => relay::config_set(stream, state, &body_bytes),
+            _ => method_not_allowed(stream),
+        },
+        "/logs" => match method.as_str() {
+            "GET" => {
+                // Loopback only. The ring holds whatever the daemon logged — tab
+                // names, cwds, endpoint labels, error strings — and the API binds
+                // 0.0.0.0 in the default config, so holding the master token from
+                // another host must not be enough to read it. The peer address is
+                // the gate; `X-Forwarded-For` is deliberately NOT consulted, since
+                // a proxy on this host would then let anyone forge it.
+                if !from_loopback {
+                    error_json(stream, 403, "logs are readable from 127.0.0.1 only");
+                    return;
+                }
+                let n = query_lines.unwrap_or(200).min(crate::log_ring::CAPACITY);
+                let body = serde_json::json!({ "lines": crate::log_ring::tail(n) }).to_string();
+                respond_json(stream, 200, &body);
             }
-            let n = query_lines.unwrap_or(200).min(crate::log_ring::CAPACITY);
-            let body = serde_json::json!({ "lines": crate::log_ring::tail(n) }).to_string();
-            respond_json(stream, 200, &body);
-        }
-        ("GET", "/claims") => {
-            let now = crate::unix_millis();
-            let claims = crate::claims::with_registry(|r| r.active(now));
-            let body = serde_json::json!({ "claims": claims, "now_ms": now }).to_string();
-            respond_json(stream, 200, &body);
-        }
-        ("POST", "/claims") => claims_route::grant(stream, &body_bytes),
-        ("POST", "/claims/release") => claims_route::release(stream, &body_bytes),
-        ("GET", "/fleet") => fleet_route::get(stream, state, from_loopback),
-        ("GET", "/blackboard") => blackboard_route::list(stream, query_since),
-        ("POST", "/blackboard") => blackboard_route::merge(stream, &body_bytes),
-        ("GET", "/env") => env::list_global(stream),
-        ("GET", p) if p.starts_with("/tabs/") && p.ends_with("/env") => env::list_tab(stream, state, p),
-        ("POST", "/env") => env::set_global(stream, state, &body_bytes),
-        ("POST", p) if p.starts_with("/tabs/") && p.ends_with("/env") => env::set_tab(stream, state, p, &body_bytes),
-        ("POST", p) if p.starts_with("/tabs/") && p.ends_with("/meta") => {
-            meta::set(stream, state, p, &body_bytes);
-        }
-        ("POST", p) if p.starts_with("/tabs/") && p.ends_with("/resize") => {
-            resize::run(stream, state, p, &body_bytes);
-        }
-        ("POST", p) if p.starts_with("/tabs/") && p.ends_with("/limits") => {
-            limits::set_tab(stream, state, p, &body_bytes);
-        }
-        ("POST", p) if p.starts_with("/tabs/") && p.ends_with("/rename") => {
-            rename::run(stream, state, p, &body_bytes);
-        }
-        // (Old `POST /tabs/<idx>/activate` route removed — that was
-        // the Android ta-remote app's "tap a tab in the list to make
-        // it the desktop's active one" gesture. The WS frame
-        // `TAG_ACTIVATE` covers the same intent for the web viewer
-        // and no CLI subcommand depends on it.)
-        ("POST", p) if p.starts_with("/tabs/by-id/") && p.ends_with("/status") => {
-            status::run(stream, state, p, &body_bytes);
-        }
-        ("POST", p) if p.starts_with("/tabs/") && p.ends_with("/files") => {
-            files::upload(
-                stream,
-                state,
-                p,
-                &body_bytes,
-                provided_token.as_deref(),
-                query_name.as_deref(),
-            );
-        }
-        ("GET", p) if p.starts_with("/tabs/") && p.ends_with("/files") => {
-            files::download(
-                stream,
-                state,
-                p,
-                query_path.as_deref(),
-                accept_gzip,
-                if_none_match.as_deref(),
-            );
-        }
-        // A named download: `/tabs/<key>/outbox/<name>`. The name is in the
-        // path so the browser's fallback filename is already correct when an
-        // `<a download>` is ignored (it is, cross-origin).
-        ("GET", p) if p.starts_with("/tabs/") && p.contains("/outbox/") => {
-            files::download_by_path(stream, state, p, accept_gzip, if_none_match.as_deref());
-        }
-        // List `outbox/` or `inbox/` contents so the viewer can
-        // render the download / sent-files panels. The panel header
-        // shows `dir` (absolute path) so the user can paste it into
-        // Claude / their agent ("read inbox/foo.txt"). RO + RW
-        // share-tokens both allowed, master token always allowed.
-        ("GET", p) if p.starts_with("/tabs/") && (p.ends_with("/outbox") || p.ends_with("/inbox")) => {
-            outbox::list(stream, state, p);
-        }
-        ("POST", p) if p.starts_with("/tabs/by-id/") && p.ends_with("/lock") => {
-            lock::run(stream, state, p, &body_bytes);
-        }
-        ("POST", p) if p.starts_with("/tabs/by-id/") && p.ends_with("/net") => {
-            net::set(stream, state, p, &body_bytes);
-        }
-        ("POST", p) if p.starts_with("/tabs/by-id/") && p.ends_with("/net-allow") => {
-            net::allow(stream, state, p, &body_bytes);
-        }
-        ("POST", p) if p.starts_with("/tabs/by-id/") && p.ends_with("/ssh-agent") => {
-            ssh_agent::set(stream, state, p, &body_bytes);
-        }
-        ("POST", p) if p.starts_with("/tabs/by-id/") && p.ends_with("/schedule") => {
-            schedule::run(stream, state, p, &body_bytes);
-        }
-        ("POST", "/tabs/rotate-tokens") => tokens::rotate(stream, state),
-        ("POST", "/master-token/reset") => tokens::reset_master(stream, state),
-        ("POST", p) if p.starts_with("/tabs/by-id/") && p.ends_with("/bg-color") => {
-            tab_props::bg_color(stream, state, p, &body_bytes);
-        }
-        ("POST", p) if p.starts_with("/tabs/by-id/") && p.ends_with("/badge") => {
-            tab_props::badge(stream, state, p, &body_bytes);
-        }
-        ("POST", p) if p.starts_with("/tabs/by-id/") && p.ends_with("/context") => {
-            tab_props::context(stream, state, p, &body_bytes);
-        }
-        ("POST", p) if p.starts_with("/tabs/") && p.ends_with("/input") => {
-            input::run(stream, state, p, body_bytes);
-        }
-        (_, "/" | "/tabs") => {
-            error_json(stream, 405, "method not allowed");
-        }
-        (_, p) if p.starts_with("/tabs/") => {
-            error_json(stream, 405, "method not allowed");
-        }
-        _ => {
-            error_json(stream, 404, "not found");
-        }
+            _ => method_not_allowed(stream),
+        },
+        "/claims" => match method.as_str() {
+            "GET" => {
+                let now = crate::unix_millis();
+                let claims = crate::claims::with_registry(|r| r.active(now));
+                let body = serde_json::json!({ "claims": claims, "now_ms": now }).to_string();
+                respond_json(stream, 200, &body);
+            }
+            "POST" => claims_route::grant(stream, &body_bytes),
+            _ => method_not_allowed(stream),
+        },
+        "/claims/release" => match method.as_str() {
+            "POST" => claims_route::release(stream, &body_bytes),
+            _ => method_not_allowed(stream),
+        },
+        "/fleet" => match method.as_str() {
+            "GET" => fleet_route::get(stream, state, from_loopback),
+            _ => method_not_allowed(stream),
+        },
+        "/blackboard" => match method.as_str() {
+            "GET" => blackboard_route::list(stream, query_since),
+            "POST" => blackboard_route::merge(stream, &body_bytes),
+            _ => method_not_allowed(stream),
+        },
+        "/env" => match method.as_str() {
+            "GET" => env::list_global(stream),
+            "POST" => env::set_global(stream, state, &body_bytes),
+            _ => method_not_allowed(stream),
+        },
+        // ---- tab-scoped: `/tabs/<key>/<segment>` and `/tabs/by-id/<uuid>/…` ----
+        // The key is opaque here — the guards key off the trailing segment — so
+        // these are one arm. A tab path matching no segment is a 405 like the
+        // fixed paths, not a 404: the path exists, the segment does not.
+        p if p.starts_with("/tabs/") => match method.as_str() {
+            #[cfg(feature = "catbus")]
+            "GET" if p.ends_with("/catbus") => catbus::session(stream, state, p),
+            #[cfg(feature = "catbus")]
+            "POST" if p.ends_with("/catbus/message") => catbus::message(stream, state, p, &body_bytes),
+            #[cfg(feature = "catbus")]
+            "GET" if p.ends_with("/catbus/messages") => catbus::messages(stream, state, p, query_since),
+            "GET" if p.ends_with("/view") => {
+                view::run(
+                    stream,
+                    state,
+                    p,
+                    accept_gzip,
+                    if_none_match.as_deref(),
+                    had_trailing_slash,
+                );
+            }
+            "GET" if p.ends_with("/output") => {
+                output::run(stream, state, p, query_since, query_crc, query_lines, accept_gzip);
+            }
+            "GET" if p.ends_with("/env") => env::list_tab(stream, state, p),
+            "POST" if p.ends_with("/env") => env::set_tab(stream, state, p, &body_bytes),
+            "DELETE" if !p[6..].contains('/') || (p[6..].starts_with("by-id/") && p[6..].matches('/').count() == 1) => {
+                tabs::close(stream, state, p);
+            }
+            "POST" if p.ends_with("/meta") => meta::set(stream, state, p, &body_bytes),
+            "POST" if p.ends_with("/resize") => resize::run(stream, state, p, &body_bytes),
+            "POST" if p.ends_with("/limits") => limits::set_tab(stream, state, p, &body_bytes),
+            "POST" if p.ends_with("/rename") => rename::run(stream, state, p, &body_bytes),
+            // (Old `POST /tabs/<idx>/activate` route removed — that was
+            // the Android ta-remote app's "tap a tab in the list to make
+            // it the desktop's active one" gesture. The WS frame
+            // `TAG_ACTIVATE` covers the same intent for the web viewer
+            // and no CLI subcommand depends on it.)
+            "POST" if p.starts_with("/tabs/by-id/") && p.ends_with("/status") => {
+                status::run(stream, state, p, &body_bytes);
+            }
+            "POST" if p.ends_with("/files") => {
+                files::upload(
+                    stream,
+                    state,
+                    p,
+                    &body_bytes,
+                    provided_token.as_deref(),
+                    query_name.as_deref(),
+                );
+            }
+            "GET" if p.ends_with("/files") => {
+                files::download(
+                    stream,
+                    state,
+                    p,
+                    query_path.as_deref(),
+                    accept_gzip,
+                    if_none_match.as_deref(),
+                );
+            }
+            // A named download: `/tabs/<key>/outbox/<name>`. The name is in the
+            // path so the browser's fallback filename is already correct when an
+            // `<a download>` is ignored (it is, cross-origin).
+            "GET" if p.contains("/outbox/") => {
+                files::download_by_path(stream, state, p, accept_gzip, if_none_match.as_deref());
+            }
+            // List `outbox/` or `inbox/` contents so the viewer can
+            // render the download / sent-files panels. The panel header
+            // shows `dir` (absolute path) so the user can paste it into
+            // Claude / their agent ("read inbox/foo.txt"). RO + RW
+            // share-tokens both allowed, master token always allowed.
+            "GET" if p.ends_with("/outbox") || p.ends_with("/inbox") => outbox::list(stream, state, p),
+            "POST" if p.starts_with("/tabs/by-id/") && p.ends_with("/lock") => {
+                lock::run(stream, state, p, &body_bytes);
+            }
+            "POST" if p.starts_with("/tabs/by-id/") && p.ends_with("/net") => {
+                net::set(stream, state, p, &body_bytes);
+            }
+            "POST" if p.starts_with("/tabs/by-id/") && p.ends_with("/net-allow") => {
+                net::allow(stream, state, p, &body_bytes);
+            }
+            "POST" if p.starts_with("/tabs/by-id/") && p.ends_with("/ssh-agent") => {
+                ssh_agent::set(stream, state, p, &body_bytes);
+            }
+            "POST" if p.starts_with("/tabs/by-id/") && p.ends_with("/schedule") => {
+                schedule::run(stream, state, p, &body_bytes);
+            }
+            "POST" if p.starts_with("/tabs/by-id/") && p.ends_with("/bg-color") => {
+                tab_props::bg_color(stream, state, p, &body_bytes);
+            }
+            "POST" if p.starts_with("/tabs/by-id/") && p.ends_with("/badge") => {
+                tab_props::badge(stream, state, p, &body_bytes);
+            }
+            "POST" if p.starts_with("/tabs/by-id/") && p.ends_with("/context") => {
+                tab_props::context(stream, state, p, &body_bytes);
+            }
+            "POST" if p.ends_with("/input") => input::run(stream, state, p, body_bytes),
+            _ => method_not_allowed(stream),
+        },
+        _ => error_json(stream, 404, "not found"),
     }
+}
+
+/// The uniform 405 for a path the API serves, reached with the wrong verb.
+fn method_not_allowed<W: Write>(stream: &mut W) {
+    error_json(stream, 405, "method not allowed");
 }
 
 // Async I/O — hyper drives connection setup, ALPN negotiation
@@ -4552,6 +4579,33 @@ mod tests {
         };
         handle_connection(&mut fake, &state, "test-secret-token", false, from_loopback);
         String::from_utf8_lossy(&fake.output).into_owned()
+    }
+
+    /// A path the API serves, reached with the wrong verb, is a 405 — not a 404,
+    /// and not something the auth gate can turn into a misleading 401. The
+    /// dispatch is path-first, so this falls out of the routing rather than a
+    /// second list of paths kept in step by hand.
+    #[test]
+    fn a_wrong_verb_on_a_known_path_is_a_405() {
+        let with = |verb_path: &str| {
+            serve_once(
+                &format!("{verb_path} HTTP/1.1\r\nAuthorization: Bearer test-secret-token\r\n\r\n"),
+                true,
+            )
+        };
+
+        // `POST /master-token/reset`, reached with GET.
+        let get = with("GET /master-token/reset");
+        assert_eq!(status_code(&get), 405, "wrong verb on a real path: {get}");
+
+        // A tab path whose segment the API does not serve: the path exists, the
+        // segment does not, so 405 rather than 404.
+        let tab = with("GET /tabs/0/nonsense");
+        assert_eq!(status_code(&tab), 405, "unknown segment under a served path: {tab}");
+
+        // A path the API does not serve at all is still a 404.
+        let missing = with("GET /no/such/route");
+        assert_eq!(status_code(&missing), 404, "unknown path: {missing}");
     }
 
     #[test]
