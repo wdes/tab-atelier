@@ -32,15 +32,19 @@ pub enum Route {
         /// The decision id.
         id: String,
     },
+    /// The reports tab: `GET /reports`, the outbox listing.
+    Reports,
+    /// Record an intention: `POST /intent`.
+    Intent,
     /// Everything else: hand it to the upstream daemon.
     Proxy,
 }
 
 /// Classifies a request. The interface and the panes this crate answers itself
-/// are ours; every other call the page makes — the rest of the harness routes
-/// (`/reports`, `/intent`, …) and the daemon's own API (`/api/*`) — is the
-/// daemon's, relayed on the same origin so the browser never makes a
-/// cross-origin request.
+/// — the board, the reports listing, the intention — are ours; every remaining
+/// call the page makes (the daemon's own API under `/api/*`, and anything else
+/// the page learns to ask for) is the daemon's, relayed on the same origin so
+/// the browser never makes a cross-origin request.
 pub fn route(req: &Request<()>) -> Route {
     let uri = req.uri();
     let path = uri.path();
@@ -61,6 +65,9 @@ pub fn route(req: &Request<()>) -> Route {
         (&Method::GET, "/decisions/file") => {
             query_param(query, "path").map_or(Route::Proxy, |path| Route::DecisionFile { path })
         }
+        // The reports tab lists the outbox; the intent tab records one.
+        (&Method::GET, "/reports") => Route::Reports,
+        (&Method::POST, "/intent") => Route::Intent,
         (&Method::POST, _) => decision_action(path),
         _ => Route::Proxy,
     }
@@ -178,12 +185,14 @@ mod tests {
             classify(Method::POST, "/decisions/a/tranch"),
             Route::DecisionTranch { id: "a".to_string() }
         );
+        assert_eq!(classify(Method::GET, "/reports"), Route::Reports);
+        assert_eq!(classify(Method::POST, "/intent"), Route::Intent);
 
         // The routes this crate does not answer, and the daemon's own API.
         for (method, uri) in [
-            (Method::GET, "/reports"),
-            (Method::GET, "/intent"),
             (Method::GET, "/api/users"),
+            (Method::GET, "/intent"),   // the intent tab only posts
+            (Method::POST, "/reports"), // the reports tab only lists
             (Method::POST, "/decisions"),
             (Method::POST, "/decisions/a/delete"),
             (Method::GET, "/decisions/a/read"),

@@ -71,6 +71,7 @@ fn test_config(upstream: String, state: &Path, token: Option<&str>) -> Config {
             outbox: state.join("outbox"),
         },
         token: token.map(str::to_string),
+        token_file: None,
     }
 }
 
@@ -275,7 +276,7 @@ async fn proxies_a_request_and_strips_hop_by_hop_headers() {
 async fn relays_a_streamed_response_whole() {
     let upstream = spawn_dripping_upstream(4, Duration::from_millis(20));
     let addr = spawn_kiosk(format!("http://{upstream}")).await;
-    let body = body_string(get(addr, "/reports"));
+    let body = body_string(get(addr, "/tabs"));
     assert_eq!(body, "0000000100020003", "all four chunks, in order, whole");
 }
 
@@ -287,7 +288,7 @@ async fn a_slow_but_alive_stream_is_not_cut_short() {
     let gap = scaled(HopTimeouts::default().recv_body.expect("recv_body is set")) / 8;
     let upstream = spawn_dripping_upstream(8, gap);
     let addr = spawn_kiosk(format!("http://{upstream}")).await;
-    let body = body_string(get(addr, "/reports"));
+    let body = body_string(get(addr, "/tabs"));
     assert_eq!(body.len(), 8 * 4, "every chunk arrived despite the pace");
 }
 
@@ -326,7 +327,7 @@ async fn an_oversized_body_is_rejected_before_the_daemon() {
 async fn an_unreachable_upstream_answers_502() {
     let addr = spawn_kiosk("http://127.0.0.1:1".to_string()).await;
     // A path the kiosk does not own, so it is relayed — and the daemon is absent.
-    let resp = get(addr, "/reports");
+    let resp = get(addr, "/tabs");
     assert_eq!(resp.status(), 502);
     let body = body_string(resp);
     assert!(
@@ -459,5 +460,66 @@ async fn the_board_is_read_and_ruled_through_http() {
     );
     assert_eq!(unknown.status(), 404);
     let junk = send(Method::POST, addr, "/decisions/a/tranch", &[auth], b"not json".to_vec());
+    assert_eq!(junk.status(), 400);
+}
+
+/// The reports tab lists the outbox, newest first, and is behind the token.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_reports_pane_lists_the_outbox() {
+    let dir = scratch_dir("reports");
+    fs::write(dir.join("outbox/audit-01.md"), "x").expect("write report");
+    fs::write(dir.join("outbox/notes.txt"), "x").expect("write a non-report");
+    let addr = spawn_kiosk_with(test_config("http://127.0.0.1:1".to_string(), &dir, Some("t"))).await;
+    let auth = ("authorization", "Bearer t");
+
+    assert_eq!(get(addr, "/reports").status(), 401, "no token is refused");
+
+    let listed = send(Method::GET, addr, "/reports", &[auth], vec![]);
+    assert_eq!(listed.status(), 200);
+    let body = body_string(listed);
+    assert!(body.contains("\"reports\""), "the listing envelope: {body}");
+    assert!(body.contains("audit-01.md"), "the markdown report is listed: {body}");
+    assert!(!body.contains("notes.txt"), "a non-markdown file is not a report");
+    assert!(body.contains("outbox/audit-01.md"), "path is how the page addresses it");
+}
+
+/// The intent tab records an intention as a server-named file, and refuses an
+/// empty one — both behind the token.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_intent_pane_records_an_intention() {
+    let dir = scratch_dir("intent");
+    let addr = spawn_kiosk_with(test_config("http://127.0.0.1:1".to_string(), &dir, Some("t"))).await;
+    let auth = ("authorization", "Bearer t");
+
+    assert_eq!(
+        send(Method::POST, addr, "/intent", &[], br#"{"content":"x"}"#.to_vec()).status(),
+        401,
+        "no token is refused"
+    );
+
+    let recorded = send(
+        Method::POST,
+        addr,
+        "/intent",
+        &[auth],
+        br##"{"content":"# Intention\n\nDo the thing.\n"}"##.to_vec(),
+    );
+    assert_eq!(recorded.status(), 201, "a new artefact is a 201");
+    let body = body_string(recorded);
+    assert!(body.contains("\"name\":\"intent-"), "server-named: {body}");
+
+    // It is really on disk, and it is a report the other tab now lists.
+    let written = fs::read_dir(dir.join("outbox"))
+        .expect("read outbox")
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with("intent-"))
+        .count();
+    assert_eq!(written, 1, "exactly one artefact was written");
+    assert!(body_string(send(Method::GET, addr, "/reports", &[auth], vec![])).contains("intent-"));
+
+    // An empty intention is a 400, and posts nothing.
+    let empty = send(Method::POST, addr, "/intent", &[auth], br#"{"content":"   "}"#.to_vec());
+    assert_eq!(empty.status(), 400);
+    let junk = send(Method::POST, addr, "/intent", &[auth], b"not json".to_vec());
     assert_eq!(junk.status(), 400);
 }

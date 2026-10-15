@@ -2,8 +2,9 @@
 
 //! Runtime configuration, and the upstream hop it configures.
 
+use std::fs;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::decisions::Journal;
@@ -32,6 +33,13 @@ pub struct Config {
     /// unauthenticated door onto the board. A kiosk meant to be looked at gets a
     /// token; one that is not, does not.
     pub token: Option<String>,
+    /// Where the token was read from or written to, when it is file-backed.
+    ///
+    /// `Some` when the token came from the token file or was generated into it,
+    /// `None` when it came from the environment or there is none. The server logs
+    /// this path at startup so an operator knows what to open the board with
+    /// without it ever being printed.
+    pub token_file: Option<PathBuf>,
 }
 
 impl Config {
@@ -54,12 +62,14 @@ impl Config {
             .map_or_else(|_| PathBuf::from(&state).join("decisions.jsonl"), PathBuf::from);
         let outbox =
             std::env::var("TAB_ATELIER_OUTBOX").map_or_else(|_| PathBuf::from(&state).join("outbox"), PathBuf::from);
-        let token = std::env::var("TAB_ATELIER_KIOSK_TOKEN").ok().filter(|t| !t.is_empty());
+        let state_dir = PathBuf::from(&state);
+        let (token, token_file) = resolve_token(&state_dir, std::env::var("TAB_ATELIER_KIOSK_TOKEN").ok());
         Ok(Self {
             upstream,
             bind,
             journal: Journal { path: journal, outbox },
             token,
+            token_file,
         })
     }
 
@@ -74,6 +84,69 @@ impl Config {
         let bind = std::env::var("TAB_ATELIER_KIOSK_ADDR").unwrap_or_else(|_| DEFAULT_BIND.to_string());
         Self::new(&upstream, &bind)
     }
+}
+
+/// Resolves the pane token: the environment wins, then a token file under the
+/// state directory, and failing both, generate one into that file.
+///
+/// This is what gives the kiosk an *initial* token rather than none: an
+/// operator who never sets one would otherwise face a board that answers 401
+/// with no way to open it. Generating it here means the first start leaves a
+/// token behind to read, and every start after reuses it, so a restart does not
+/// silently rotate the secret out from under a bookmarked URL.
+///
+/// Generation fails soft. A state directory the service user cannot write means
+/// no token, which is the fail-closed default rather than a start failure — a
+/// read-only deployment is a deployment that chose not to open the board.
+fn resolve_token(state_dir: &Path, from_env: Option<String>) -> (Option<String>, Option<PathBuf>) {
+    if let Some(token) = from_env.map(|t| t.trim().to_string()).filter(|t| !t.is_empty()) {
+        return (Some(token), None);
+    }
+    let path = state_dir.join("token");
+    if let Ok(existing) = fs::read_to_string(&path) {
+        let token = existing.trim().to_string();
+        if !token.is_empty() {
+            return (Some(token), Some(path));
+        }
+    }
+    match generate_token(&path) {
+        Ok(token) => (Some(token), Some(path)),
+        Err(err) => {
+            eprintln!("kiosk: no token and could not write {}: {err}", path.display());
+            (None, None)
+        }
+    }
+}
+
+/// Writes a fresh 32-byte token to `path`, `0600`, and returns it.
+fn generate_token(path: &Path) -> std::io::Result<String> {
+    use std::io::Read as _;
+    let mut bytes = [0_u8; 32];
+    fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    let token: String = bytes.iter().fold(String::with_capacity(64), |mut acc, byte| {
+        use std::fmt::Write as _;
+        let _ = write!(acc, "{byte:02x}");
+        acc
+    });
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    fs::write(path, &token)?;
+    set_owner_only(path)?;
+    Ok(token)
+}
+
+/// Restricts a file to its owner, so a token is not world-readable.
+#[cfg(unix)]
+fn set_owner_only(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+}
+
+/// No-op off unix, where the kiosk does not run as a service.
+#[cfg(not(unix))]
+fn set_owner_only(_path: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// Deadlines for the upstream hop, one per stage that must produce something.
@@ -141,5 +214,65 @@ impl Upstream {
             .build()
             .new_agent();
         Self { base, agent }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{generate_token, resolve_token};
+    use std::fs;
+    use std::path::PathBuf;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("ta-kiosk-config-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("make state dir");
+        dir
+    }
+
+    /// A first start generates and stores a token; a restart reuses it rather
+    /// than rotating the secret out from under a bookmarked URL.
+    #[test]
+    fn the_token_is_generated_once_and_reused() {
+        let dir = scratch("token");
+        let (token, path) = resolve_token(&dir, None);
+        let token = token.expect("a token is generated");
+        let path = path.expect("the token is file-backed");
+        assert_eq!(token.len(), 64, "32 bytes of hex");
+        assert_eq!(fs::read_to_string(&path).expect("read token").trim(), token);
+
+        let (again, _) = resolve_token(&dir, None);
+        assert_eq!(again.as_deref(), Some(token.as_str()), "the second start reuses it");
+    }
+
+    /// The environment wins, and its token is not written to disk.
+    #[test]
+    fn the_environment_token_wins_and_is_not_stored() {
+        let dir = scratch("env");
+        let (token, path) = resolve_token(&dir, Some("from-env".to_string()));
+        assert_eq!(token.as_deref(), Some("from-env"));
+        assert!(path.is_none(), "an env token is not written to the state dir");
+        assert!(!dir.join("token").exists());
+    }
+
+    /// An unwritable state directory yields no token, not a crash — the panes
+    /// then fail closed, which is the right answer for a read-only deployment.
+    #[test]
+    fn an_unwritable_state_dir_fails_soft() {
+        let (token, path) = resolve_token(&PathBuf::from("/proc/nonexistent/ta-kiosk"), None);
+        assert!(token.is_none());
+        assert!(path.is_none());
+    }
+
+    /// The generated file is owner-only.
+    #[cfg(unix)]
+    #[test]
+    fn the_token_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = scratch("mode");
+        let path = dir.join("token");
+        generate_token(&path).expect("generate");
+        let mode = fs::metadata(&path).expect("stat").permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "a token file is not world-readable");
     }
 }

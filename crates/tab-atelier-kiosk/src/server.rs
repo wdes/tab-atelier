@@ -110,22 +110,39 @@ async fn handle(req: Request<Incoming>, upstream: &Upstream, panes: &Panes) -> R
             if !panes.authorized(authorization.as_ref()) {
                 return Panes::unauthorized();
             }
-            match read_verdict(body).await {
+            match read_field(body, "verdict").await {
                 Ok(verdict) => panes.tranch(&id, &verdict),
+                Err(response) => response,
+            }
+        }
+        Route::Reports => {
+            if !panes.authorized(authorization.as_ref()) {
+                return Panes::unauthorized();
+            }
+            panes.reports()
+        }
+        Route::Intent => {
+            if !panes.authorized(authorization.as_ref()) {
+                return Panes::unauthorized();
+            }
+            match read_field(body, "content").await {
+                Ok(content) => panes.intent(&content),
                 Err(response) => response,
             }
         }
     }
 }
 
-/// Reads the `{ "verdict": "…" }` body of a rule, bounded like any relayed body.
-async fn read_verdict(body: Incoming) -> Result<String, Response<BoxBody>> {
+/// Reads one string field out of a JSON request body, bounded like any relayed
+/// body. A missing field and malformed JSON are the same 400: the pane knows
+/// what it asked for and got neither.
+async fn read_field(body: Incoming, field: &str) -> Result<String, Response<BoxBody>> {
     let bytes = match Limited::new(body, MAX_REQUEST_BODY).collect().await {
         Ok(collected) => collected.to_bytes(),
         Err(_) => return Err(Panes::bad_request()),
     };
     serde_json::from_slice::<serde_json::Value>(&bytes)
         .ok()
-        .and_then(|value| value.get("verdict").and_then(|v| v.as_str()).map(str::to_string))
+        .and_then(|value| value.get(field).and_then(|v| v.as_str()).map(str::to_string))
         .ok_or_else(Panes::bad_request)
 }

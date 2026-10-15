@@ -3,13 +3,13 @@
 The tab-atelier web Kiosk: a small server that sits in front of the daemon.
 
 It serves the interface it embeds, and relays the paths it does not own back to
-the daemon — the rest of the harness routes (`/reports`, `/intent`) and the
-daemon's own API (`/api/*`) alike. Same origin is the point: the page and the
-calls it makes then share one origin, so the browser never makes a cross-origin
-request and CORS never comes up.
+the daemon — the daemon's own API (`/api/*`) and anything the page learns to ask
+for. Same origin is the point: the page and the calls it makes then share one
+origin, so the browser never makes a cross-origin request and CORS never comes
+up.
 
-It owns one pane itself. The decision journal is the Kiosk's own data, so the
-Kiosk reads and writes it directly, behind its own token:
+It owns the panes itself, because they are the operator's view and not the
+daemon's data — each read and written directly, behind its own token:
 
 | Route | What it does |
 |---|---|
@@ -17,6 +17,8 @@ Kiosk reads and writes it directly, behind its own token:
 | `GET /decisions/file?path=…` | one linked file, confined to the outbox |
 | `POST /decisions/<id>/read` | mark a decision read |
 | `POST /decisions/<id>/tranch` | rule a decision, with a verdict |
+| `GET /reports` | the outbox listing, newest first |
+| `POST /intent` | record an intention as `outbox/intent-<ts>.md` |
 
 Everything else is the daemon's, relayed unchanged.
 
@@ -33,10 +35,30 @@ tab-atelier-kiosk serve --listen 127.0.0.1:8282 --upstream http://127.0.0.1:7890
 | `TAB_ATELIER_KIOSK_STATE` | `/var/lib/tab-atelier-kiosk` | state directory |
 | `TAB_ATELIER_DECISIONS` | `<state>/decisions.jsonl` | the journal |
 | `TAB_ATELIER_OUTBOX` | `<state>/outbox` | the tree `/decisions/file` serves from |
-| `TAB_ATELIER_KIOSK_TOKEN` | *(none)* | the token the panes require |
+| `TAB_ATELIER_KIOSK_TOKEN` | *(generated)* | the token the panes require |
 
-**The token fails closed.** With no token configured the panes answer 401 rather
-than serving an unauthenticated board; a kiosk meant to be looked at gets one.
+**The token is provisioned on first start.** With no `TAB_ATELIER_KIOSK_TOKEN`,
+the kiosk generates one into `<state>/token` (`0600`, reused on restart) and logs
+a copy-pasteable `http://…/?token=…` at startup. Set the env var to override it
+(a file is not written). The panes **fail closed**: if a token cannot be resolved
+at all — an unwritable state directory — they answer 401 rather than serving an
+unauthenticated board.
+
+```bash
+sudo cat /var/lib/tab-atelier-kiosk/token          # read the board token
+# then open:  http://127.0.0.1:8282/?token=<that>
+```
+
+### The outbox
+
+Two things live under the state directory. The journal above, and the outbox —
+the markdown the reports tab lists and the intentions the intent tab writes:
+
+```
+<state>/decisions.jsonl     the board
+<state>/token               the pane token (0600)
+<state>/outbox/*.md         reports, and intent-<ts>.md
+```
 
 ## The journal
 

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! The Kiosk's own panes: the board of decisions, and the two rulings on them.
+//! The Kiosk's own panes: the board of decisions, its two rulings, the outbox
+//! of reports, and the grid that records an intention.
 //!
 //! Everything here is behind the token. A kiosk with no token answers 401
 //! rather than serving the board — the panes are an operator's view, and the
@@ -10,6 +11,7 @@ use http::{HeaderValue, Response, StatusCode, header};
 
 use crate::body::{BoxBody, full, json_response};
 use crate::decisions::{DecisionError, Journal};
+use crate::reports::{self, IntentError};
 
 /// The panes' state: the journal, and the token that opens it.
 #[derive(Debug, Clone)]
@@ -73,6 +75,26 @@ impl Panes {
         match self.journal.tranch(id, verdict.trim()) {
             Ok(decision) => json_response(StatusCode::OK, &serde_json::json!({ "decision": decision })),
             Err(error) => decision_error(&error),
+        }
+    }
+
+    /// `GET /reports` — the outbox, newest first.
+    pub fn reports(&self) -> Response<BoxBody> {
+        let reports = reports::list(&self.journal.outbox);
+        json_response(StatusCode::OK, &serde_json::json!({ "reports": reports }))
+    }
+
+    /// `POST /intent` — record an intention as a server-named artefact.
+    pub fn intent(&self, content: &str) -> Response<BoxBody> {
+        match reports::write_intent(&self.journal.outbox, content) {
+            Ok(report) => json_response(
+                StatusCode::CREATED,
+                &serde_json::json!({ "path": report.path, "name": report.name }),
+            ),
+            Err(IntentError::Empty) => {
+                json_response(StatusCode::BAD_REQUEST, &serde_json::json!({ "error": "empty_intent" }))
+            }
+            Err(IntentError::Unavailable) => unavailable(),
         }
     }
 
