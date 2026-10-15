@@ -320,9 +320,10 @@ paths:
       tags: [tabs]
       summary: Create a tab
       description: >
-        Queues a new tab. The optional body roots it at a directory; with no
-        body it inherits the active tab's cwd. One cwd entry is queued per
-        creation either way, so the drain pairs hints to tabs by position.
+        Queues a new tab. The optional body roots it at a directory, applies meta
+        labels at creation, and can ask for the new tab's uuid synchronously. With
+        no body it inherits the active tab's cwd. Each request carries its own
+        hints, so a creation can never be paired with the wrong cwd or labels.
       requestBody:
         required: false
         content:
@@ -333,19 +334,55 @@ paths:
                 cwd:
                   type: string
                   description: Absolute path to root the new tab at. Omitted ⇒ inherit the active tab's.
+                meta:
+                  type: object
+                  additionalProperties: { type: string }
+                  description: >
+                    Labels applied to the tab AT CREATION — the same map
+                    POST /tabs/by-id/{id}/meta writes afterwards. Keys are
+                    lower-cased to [a-z0-9_-] (32 chars max), values 256 chars
+                    max, the map 16 keys max. An invalid map is a 400 and nothing
+                    is queued.
+                sync:
+                  type: boolean
+                  default: false
+                  description: >
+                    true ⇒ the request WAITS for the tab to be created and answers
+                    with its uuid. The wait has NO timeout: it ends when the owner
+                    (desktop render pass / headless drain tick) creates the tab,
+                    when creation fails, or when the server stops. On the desktop
+                    that render pass can be long-delayed while the window is
+                    minimized, so a sync caller should carry its own deadline.
+                    false/absent ⇒ the legacy async reply.
       responses:
         "200":
-          description: Creation queued
+          description: Tab created (sync) or creation queued (async)
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  queued: { type: string, example: new }
-                  cwd:
-                    type: [string, "null"]
-                    description: The cwd accepted, or null when none was given (the tab inherits).
+                oneOf:
+                  - type: object
+                    description: sync true
+                    required: [id]
+                    properties:
+                      id: { type: string, format: uuid }
+                      cwd:
+                        type: [string, "null"]
+                        description: Directory the tab was actually rooted at (null when nothing resolved).
+                      meta:
+                        type: object
+                        additionalProperties: { type: string }
+                        description: The labels accepted, normalised.
+                  - type: object
+                    description: sync false/absent
+                    properties:
+                      queued: { type: string, example: new }
+                      cwd:
+                        type: [string, "null"]
+                        description: The cwd accepted, or null when none was given (the tab inherits).
+        "400": { description: Invalid meta key/value, or meta over the 16-key cap }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "500": { description: Creation failed, or the owner never created the tab }
   /tabs/{idx}/output:
     get:
       tags: [tabs]

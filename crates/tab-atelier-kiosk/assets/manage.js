@@ -152,14 +152,19 @@ $("add-tab").addEventListener("submit", async (event) => {
   event.preventDefault();
   if (!selected) return;
   const form = event.target;
-  const field = (name) => form.elements[name].value;
+  const cwd = form.elements["cwd"].value.trim();
   try {
-    await api(`/kiosk/remotes/${encodeURIComponent(selected)}/tabs`, {
+    // `sync` makes the daemon wait and hand back the new tab's uuid, so the
+    // click reports the tab that was made rather than only that one was asked
+    // for. `cwd` is sent only when given, or the tab inherits the active one.
+    const body = { sync: true };
+    if (cwd) body.cwd = cwd;
+    const created = await api(`/kiosk/remotes/${encodeURIComponent(selected)}/tabs`, {
       method: "POST",
-      body: { name: field("name"), cmd: field("cmd") },
+      body,
     });
     form.reset();
-    status("onglet demandé", "ok");
+    status(created.id ? `onglet ${created.id.slice(0, 8)} créé` : "onglet créé", "ok");
     await loadTabs();
   } catch (err) {
     status(err.message, "err");

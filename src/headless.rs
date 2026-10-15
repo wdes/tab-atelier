@@ -1047,8 +1047,7 @@ pub fn run() -> std::io::Result<()> {
         pending_context_changes: Vec::new(),
         pending_token_rotations: Vec::new(),
         pending_schedule_changes: Vec::new(),
-        pending_new_tabs: 0,
-        pending_new_tab_cwds: std::collections::VecDeque::new(),
+        pending_new_tabs: std::collections::VecDeque::new(),
         pending_limit_changes: Vec::new(),
         pending_default_limits: None,
         pending_resizes: Vec::new(),
@@ -1979,9 +1978,7 @@ fn drain_pending(
     let relay_config_change = s.pending_relay_config.take();
     let env_changes: Vec<crate::api::EnvChange> = s.pending_env_changes.drain(..).collect();
     let meta_changes: Vec<crate::api::MetaChange> = s.pending_meta_changes.drain(..).collect();
-    let new_tabs = std::mem::take(&mut s.pending_new_tabs);
-    let new_tab_cwds: std::collections::VecDeque<Option<std::path::PathBuf>> =
-        std::mem::take(&mut s.pending_new_tab_cwds);
+    let new_tabs: std::collections::VecDeque<crate::api::PendingNewTab> = std::mem::take(&mut s.pending_new_tabs);
     drop(s);
     // Whether this drain mutated anything — the caller uses it to force
     // the next snapshot refresh instead of waiting on the heartbeat.
@@ -2005,8 +2002,7 @@ fn drain_pending(
         && relay_mode_change.is_none()
         && relay_config_change.is_none()
         && env_changes.is_empty()
-        && new_tabs == 0
-        && new_tab_cwds.is_empty());
+        && new_tabs.is_empty());
     // CLI / API lock toggles → runtime HeadlessTab. tabs.json picks
     // it up on the same persist tick a few lines below.
     for (tab_id, locked) in lock_changes {
@@ -2469,9 +2465,8 @@ fn drain_pending(
     }
 
     // New tabs from the API.
-    let mut cwd_hint_iter = new_tab_cwds.into_iter();
-    for _ in 0..new_tabs {
-        let cwd = cwd_hint_iter.next().flatten().filter(|p| p.is_dir()).or_else(|| {
+    for pending in new_tabs {
+        let cwd = pending.cwd.filter(|p| p.is_dir()).or_else(|| {
             if *active < tabs.len() {
                 platform::process_cwd(tabs[*active].pid).or_else(|| tabs[*active].last_known_cwd.clone())
             } else {
@@ -2484,10 +2479,10 @@ fn drain_pending(
         // it launches with colour output off. See `new_tab_env`.
         env.extend(crate::new_tab_env(true));
         let name = format!("Terminal {}", tabs.len());
-        if let Some(t) = spawn_pty_tab(
-            id,
+        if let Some(mut t) = spawn_pty_tab(
+            id.clone(),
             name,
-            cwd,
+            cwd.clone(),
             true,
             env,
             0.0,
@@ -2515,12 +2510,30 @@ fn drain_pending(
             crate::cgroup::apply(&t.id, t.pid, default_limits);
             #[cfg(not(target_os = "linux"))]
             let _ = default_limits;
+            // Creation-time labels, seeded BEFORE the tab is pushed so the
+            // snapshot refresh below can never show it without them. Same map
+            // `set-meta` writes, same caps — the endpoint validated, and
+            // `apply_meta_change` re-clamps.
+            for (key, value) in &pending.meta {
+                crate::apply_meta_change(&mut t.meta, key, Some(value.clone()));
+            }
             // API-created tabs (an agent's `dispatch --new`, `tab-atelier
             // add`) do NOT become active: a fleet spawning workers must not
             // move the user's selection, and the GUI's matching path leaves
             // focus alone for the same reason. An explicit `activate` still
             // works if a caller really wants the switch.
             tabs.push(t);
+            // Answer a `sync: true` caller with the uuid this loop minted. The
+            // reply is `None` for an async POST (the handler already answered);
+            // a caller that gave up first has dropped its receiver, and the send
+            // fails — the tab exists either way, so it is not an error.
+            if let Some(reply) = pending.reply {
+                let _ = reply.send(Ok(crate::api::NewTabCreated { id, cwd }));
+            }
+        } else if let Some(reply) = pending.reply {
+            // Nothing was created: a parked `sync: true` caller must be told,
+            // not left waiting out a tab that will never exist.
+            let _ = reply.send(Err("PTY spawn failed".to_string()));
         }
     }
     did_work

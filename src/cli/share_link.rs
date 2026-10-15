@@ -2276,7 +2276,11 @@ mod tests {
             assert_eq!(rename(&args(&["0", "renamed"])), 0);
             assert_eq!(close(&args(&["1"])), 0);
             let s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            assert_eq!(s.pending_new_tabs, 1);
+            assert_eq!(s.pending_new_tabs.len(), 1);
+            assert!(
+                s.pending_new_tabs.front().is_some_and(|p| p.reply.is_none()),
+                "`add` POSTs async, so nobody is parked on a reply"
+            );
             assert_eq!(s.pending_renames, vec![(0, "renamed".to_string())]);
             assert_eq!(s.pending_closes, vec![1]);
             drop(s);
@@ -2891,12 +2895,12 @@ mod tests {
             // The rename must target index 2 — the tab that just appeared —
             // and not 0 or the pre-POST count.
             assert_eq!(s.pending_renames, vec![(2, "christened".to_string())]);
-            // The cwd from the command line rides along with the creation, or
+            // The cwd from the command line rides along on the creation, or
             // the new tab silently inherits the active tab's directory.
             assert_eq!(
-                s.pending_new_tab_cwds
+                s.pending_new_tabs
                     .front()
-                    .and_then(|p| p.as_ref())
+                    .and_then(|p| p.cwd.as_ref())
                     .map(|p| p.display().to_string()),
                 Some("/tmp/newdir".to_string())
             );

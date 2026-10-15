@@ -9,8 +9,8 @@ use std::sync::{Arc, Mutex};
 use log::info;
 
 use super::{
-    ApiResponse, DnsEntryInfo, HostInfo, TabInfo, TabSnapshot, error_json, parse_tab_key, resolve_tab_idx,
-    respond_json, respond_with_etag, strip_ansi,
+    ApiResponse, DnsEntryInfo, HostInfo, NewTabCreated, PendingNewTab, TabInfo, TabSnapshot, error_json, parse_tab_key,
+    resolve_tab_idx, respond_json, respond_with_etag, strip_ansi,
 };
 
 pub(super) fn list<W: Write>(
@@ -154,46 +154,122 @@ pub(super) fn close<W: Write>(stream: &mut W, state: &Arc<Mutex<TabSnapshot>>, p
     respond_json(stream, 200, &body);
 }
 
-pub(super) fn create<W: Write>(stream: &mut W, state: &Arc<Mutex<TabSnapshot>>, body_bytes: &[u8]) {
-    // Optional JSON body: `{"cwd": "<path>"}` opens the tab
-    // rooted at that path instead of inheriting from the
-    // active tab. Missing or invalid body → falls back to the
-    // legacy inherit-cwd behaviour.
-    let cwd_hint: Option<std::path::PathBuf> = if body_bytes.is_empty() {
-        None
-    } else {
-        serde_json::from_slice::<serde_json::Value>(body_bytes)
-            .ok()
-            .and_then(|v| {
-                v.get("cwd")
-                    .and_then(serde_json::Value::as_str)
-                    .map(std::path::PathBuf::from)
-            })
+/// A parsed `POST /tabs` body.
+struct CreateRequest {
+    cwd: Option<std::path::PathBuf>,
+    meta: std::collections::BTreeMap<String, String>,
+    sync: bool,
+}
+
+/// Parse a `POST /tabs` body.
+///
+/// An empty or unparseable body is NOT an error — it is the legacy "no hints,
+/// inherit the cwd" request that `add`, `dispatch --new` and the kiosk all
+/// send. Only a *present but invalid* `meta` is refused: the caller named
+/// labels it believes exist, and storing something else — or dropping them —
+/// is the silent lie this endpoint already had with `cwd`.
+///
+/// A `null` value inside `meta` is invalid, not a delete: deletion is not a
+/// creation-time concept, so the only thing a null could mean here is a
+/// mistake.
+///
+/// # Errors
+/// A human-readable reason, for a 400.
+fn parse_create_body(body_bytes: &[u8]) -> Result<CreateRequest, String> {
+    let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(body_bytes) else {
+        return Ok(CreateRequest {
+            cwd: None,
+            meta: std::collections::BTreeMap::new(),
+            sync: false,
+        });
     };
-    let mut state = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    info!(
-        "API: queueing new tab creation (cwd: {})",
-        cwd_hint.as_ref().map_or("inherit", |p| p.to_str().unwrap_or("?"))
-    );
+    let cwd = parsed
+        .get("cwd")
+        .and_then(serde_json::Value::as_str)
+        .map(std::path::PathBuf::from);
+    let sync = parsed.get("sync").and_then(serde_json::Value::as_bool).unwrap_or(false);
+    let mut meta = std::collections::BTreeMap::new();
+    if let Some(field) = parsed.get("meta").filter(|value| !value.is_null()) {
+        let Some(object) = field.as_object() else {
+            return Err("meta must be an object of key/value strings".to_string());
+        };
+        for (key, value) in object {
+            let Some(value) = value.as_str() else {
+                return Err(format!("meta value for {key:?} must be a string"));
+            };
+            let (key, value) = crate::sanitize_meta(key, value)?;
+            meta.insert(key, value);
+        }
+        if meta.len() > crate::META_MAX_KEYS {
+            return Err(format!("meta is full ({} keys)", crate::META_MAX_KEYS));
+        }
+    }
+    Ok(CreateRequest { cwd, meta, sync })
+}
+
+pub(super) fn create<W: Write>(stream: &mut W, state: &Arc<Mutex<TabSnapshot>>, body_bytes: &[u8]) {
+    let CreateRequest { cwd, meta, sync } = match parse_create_body(body_bytes) {
+        Ok(parsed) => parsed,
+        Err(reason) => {
+            error_json(stream, 400, &reason);
+            return;
+        }
+    };
     // What was accepted, captured before the hint is moved into the queue below.
-    let accepted_cwd = cwd_hint.as_ref().map(|p| p.display().to_string());
-    state.pending_new_tabs += 1;
-    // One entry per creation, ALWAYS — including one that names no cwd. The
-    // drains (`app.rs`, `headless.rs`) pop one hint per creation by position,
-    // so a queue shorter than the count does not mean "the surplus inherits":
-    // it means every hint is handed to the wrong tab. An empty `POST` before a
-    // `{"cwd": ...}` one is exactly that, and it put the anonymous tab in the
-    // named one's directory.
-    state.pending_new_tab_cwds.push_back(cwd_hint);
-    drop(state);
-    // Echo what was accepted, not merely that something was. `{"queued":"new"}`
-    // alone is indistinguishable from a daemon that dropped the cwd and queued
-    // something else; with the cwd echoed, a caller reads the truth from the
-    // reply instead of discovering it from a tab in the wrong directory.
-    let body = serde_json::to_string(&serde_json::json!({
-        "queued": "new",
-        "cwd": accepted_cwd,
-    }))
-    .unwrap_or_default();
-    respond_json(stream, 200, &body);
+    let accepted_cwd = cwd.as_ref().map(|p| p.display().to_string());
+    info!(
+        "API: queueing new tab creation (cwd: {}, meta: {} key(s), sync: {sync})",
+        cwd.as_ref().map_or("inherit", |p| p.to_str().unwrap_or("?")),
+        meta.len()
+    );
+    let (reply_tx, reply_rx) = std::sync::mpsc::channel::<Result<NewTabCreated, String>>();
+    {
+        let mut state = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // One entry per creation, ALWAYS, carrying THIS request's hints. A bare
+        // counter plus a queue of cwds could drift apart — an entry-less
+        // creation shifted every later hint onto the wrong tab; a queue of
+        // requests cannot.
+        state.pending_new_tabs.push_back(PendingNewTab {
+            cwd,
+            meta: meta.clone(),
+            reply: sync.then_some(reply_tx),
+        });
+        // Re-bump the activity counter AFTER the entry is queued. Auth already
+        // bumped it before we got here, and the GUI's fast tick may have already
+        // consumed that bump — which only makes it NOTICE the request, not act
+        // on it: the new-tab drain runs in render() (it needs a Window), and
+        // only a fresh bump makes that tick ask for the frame. Without it a
+        // `sync` reply waits for whatever unrelated repaint comes next, which on
+        // a quiet or hidden window can be a long time.
+        state.touch();
+    } // released before the wait below — the drains need this mutex to make the tab.
+
+    if !sync {
+        // The legacy reply, unchanged: what was accepted, not merely that
+        // something was.
+        let body = serde_json::to_string(&serde_json::json!({
+            "queued": "new",
+            "cwd": accepted_cwd,
+        }))
+        .unwrap_or_default();
+        respond_json(stream, 200, &body);
+        return;
+    }
+
+    // Blocking wait, no timeout: it ends on the owner's reply, on an error, or
+    // when the sender is dropped (the entry was taken and its drain never
+    // answered). The tab is created either way.
+    match reply_rx.recv() {
+        Ok(Ok(created)) => {
+            let body = serde_json::to_string(&serde_json::json!({
+                "id": created.id,
+                "cwd": created.cwd.map(|p| p.display().to_string()),
+                "meta": meta,
+            }))
+            .unwrap_or_default();
+            respond_json(stream, 200, &body);
+        }
+        Ok(Err(reason)) => error_json(stream, 500, &format!("tab creation failed: {reason}")),
+        Err(_) => error_json(stream, 500, "tab creation aborted (owner went away)"),
+    }
 }

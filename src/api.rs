@@ -609,6 +609,43 @@ pub struct MetaChange {
     pub value: Option<String>,
 }
 
+/// One queued `POST /tabs` creation, in FIFO order.
+///
+/// One entry per creation, ALWAYS — the cwd and the labels belong to *this*
+/// request and travel on it, rather than being paired by position with a
+/// separate counter. A counter plus a queue of hints can drift (an entry-less
+/// creation shifting every later hint onto the wrong tab); a single queue
+/// cannot.
+pub struct PendingNewTab {
+    /// `Some(p)` when the body asked for that directory — the drains still
+    /// `is_dir()`-filter it and fall back to the active tab's cwd. `None` means
+    /// "inherit, as before".
+    pub cwd: Option<std::path::PathBuf>,
+    /// Labels from the body, already normalised by [`crate::sanitize_meta`] and
+    /// checked against [`crate::META_MAX_KEYS`]. Seeded onto the tab AT CREATION,
+    /// never routed through `pending_meta_changes` — which applies by uuid, and
+    /// the uuid does not exist until the drain mints it.
+    pub meta: std::collections::BTreeMap<String, String>,
+    /// `Some` only when the caller asked for `"sync": true` and is parked on the
+    /// receiver. Dropping it is how an abandoned client is handled — the send
+    /// then fails, which the drain ignores (the tab exists either way).
+    pub reply: Option<NewTabReply>,
+}
+
+/// The owner's answer to a `sync: true` `POST /tabs`: the uuid it minted, and
+/// the directory the tab was actually rooted at (which can differ from the
+/// request's `cwd` — a hint that is not a directory is dropped, and the tab
+/// inherits).
+#[derive(Debug)]
+pub struct NewTabCreated {
+    pub id: String,
+    pub cwd: Option<std::path::PathBuf>,
+}
+
+/// The channel a `sync: true` `POST /tabs` parks on. `Err` carries a
+/// human-readable reason for a 500 (a failed PTY spawn).
+pub type NewTabReply = std::sync::mpsc::Sender<Result<NewTabCreated, String>>;
+
 pub struct TabSnapshot {
     pub tabs: Vec<SnapshotTab>,
     /// The live master API token the auth gate validates against.
@@ -677,14 +714,12 @@ pub struct TabSnapshot {
     /// (tab returns to 24/7 unless still manually locked). Same drain
     /// shape as `pending_bg_color_changes`.
     pub pending_schedule_changes: Vec<(String, Option<crate::schedule::TabSchedule>)>,
-    pub pending_new_tabs: usize,
-    /// One entry per `pending_new_tabs` creation, in FIFO order: `Some(cwd)`
-    /// when the `POST /tabs` body asked for that directory, `None` when it did
-    /// not (the tab inherits the active tab's, as before). Exactly as long as
-    /// `pending_new_tabs`: the drains pair the two **by position**, so a queue
-    /// shorter than the count does not mean "the surplus inherits" — it means
-    /// every hint lands on the wrong creation.
-    pub pending_new_tab_cwds: std::collections::VecDeque<Option<std::path::PathBuf>>,
+    /// Creations queued by `POST /tabs`, drained by the GUI render pass
+    /// (`app.rs`) and the headless tick (`headless.rs`). The queue length IS the
+    /// pending count — there is no separate counter to keep in step — and each
+    /// entry carries everything its own creation needs: the cwd hint, the meta
+    /// labels, and (for `"sync": true`) the reply channel the handler is parked on.
+    pub pending_new_tabs: std::collections::VecDeque<PendingNewTab>,
     /// Per-tab resource-limit changes queued by `POST /tabs/<id>/limits`,
     /// drained by the owner (GUI render loop / headless tick): `(tab uuid,
     /// override, clear)`. `clear == true` lifts every axis; otherwise the
@@ -3070,8 +3105,7 @@ pub fn test_snapshot(tabs: Vec<SnapshotTab>) -> TabSnapshot {
         pending_context_changes: vec![],
         pending_token_rotations: vec![],
         pending_schedule_changes: vec![],
-        pending_new_tabs: 0,
-        pending_new_tab_cwds: std::collections::VecDeque::new(),
+        pending_new_tabs: std::collections::VecDeque::new(),
         pending_limit_changes: Vec::new(),
         pending_default_limits: None,
         pending_resizes: Vec::new(),
@@ -4508,35 +4542,40 @@ mod tests {
             &format!("POST /tabs HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Length: 0\r\n\r\n"),
         );
         assert_eq!(status_code(&resp), 200);
-        assert_eq!(
-            state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .pending_new_tabs,
-            1
-        );
+        let (len, no_cwd, no_meta, no_reply) = {
+            let state = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let entry = state.pending_new_tabs.front().expect("one queued");
+            (
+                state.pending_new_tabs.len(),
+                entry.cwd.is_none(),
+                entry.meta.is_empty(),
+                entry.reply.is_none(),
+            )
+        };
+        assert_eq!(len, 1);
+        assert!(no_cwd, "no body ⇒ inherit");
+        assert!(no_meta, "no body ⇒ no labels");
+        assert!(no_reply, "an async POST parks nobody");
     }
 
-    /// Regression: an empty `POST /tabs` before a `{"cwd": ...}` one must not
-    /// shift the cwd onto the wrong tab.
+    /// Each `POST /tabs` carries its own cwd and its own labels.
     ///
-    /// The drains (`app.rs`, `headless.rs`) pair `pending_new_tab_cwds` to
-    /// `pending_new_tabs` **by position**, so the queue must be exactly as long
-    /// as the count. It used to be pushed only when a body carried a cwd, so the
-    /// anonymous tab took the next named tab's directory and the named one fell
-    /// back to inheriting — the two swapped. This pins the invariant (one entry
-    /// per creation), because that is what makes the positional pairing correct.
+    /// The drains used to pair a queue of cwds to a separate count **by
+    /// position**, so an entry-less creation shifted every later hint onto the
+    /// wrong tab — an empty POST before a `{"cwd": ...}` one put the anonymous
+    /// tab in the named one's directory. Each request now carries its hints on
+    /// its own entry, so there is nothing left to pair and nothing to slip.
     #[test]
-    fn an_empty_post_does_not_shift_the_next_tabs_cwd() {
+    fn each_post_carries_its_own_cwd_and_meta() {
         let (port, state, token) = spawn_server();
-        // First: an anonymous creation — it inherits.
+        // First: an anonymous creation — it inherits, and names no labels.
         let empty = request(
             port,
             &format!("POST /tabs HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Length: 0\r\n\r\n"),
         );
         assert_eq!(status_code(&empty), 200);
-        // Second: a creation that names a directory.
-        let payload = r#"{"cwd":"/projet/x"}"#;
+        // Second: a creation that names a directory and two labels.
+        let payload = r#"{"cwd":"/projet/x","meta":{"role":"reviewer","phase":"review"}}"#;
         let named = request(
             port,
             &format!(
@@ -4552,26 +4591,169 @@ mod tests {
             body(&named)
         );
 
-        // Scoped so the lock is released before the assertions, not held across
-        // them — clippy's drop-tightening, and simply tidier.
-        let (pending, cwds) = {
+        let (count, cwds, metas) = {
             let state = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            // One entry per creation, in order: the anonymous one first (None →
-            // inherit), the named one second (its cwd). Before the fix this was
-            // a single entry, which the first tab would have taken.
             let cwds: Vec<Option<String>> = state
-                .pending_new_tab_cwds
+                .pending_new_tabs
                 .iter()
-                .map(|p| p.as_ref().map(|p| p.display().to_string()))
+                .map(|p| p.cwd.as_ref().map(|p| p.display().to_string()))
                 .collect();
-            (state.pending_new_tabs, cwds)
+            let metas: Vec<usize> = state.pending_new_tabs.iter().map(|p| p.meta.len()).collect();
+            (state.pending_new_tabs.len(), cwds, metas)
         };
-        assert_eq!(pending, 2);
+        assert_eq!(count, 2);
         assert_eq!(
             cwds,
             vec![None, Some("/projet/x".to_string())],
-            "the queue lines up with the count, so the drains pair by position"
+            "each entry owns its cwd"
         );
+        assert_eq!(metas, vec![0, 2], "and its own labels");
+    }
+
+    /// `{"sync":true}` parks until the owner hands back a uuid.
+    ///
+    /// Nothing drains in `spawn_server`, so the drain is simulated on a thread —
+    /// and the parked handler is what proves the wait is real: an implementation
+    /// that answered immediately would return the async shape and fail the `id`
+    /// assertion below.
+    #[test]
+    fn post_tabs_sync_returns_the_uuid_the_owner_minted() {
+        let (port, state, token) = spawn_server();
+        let drainer = std::thread::spawn(move || {
+            let reply = loop {
+                {
+                    let mut snapshot = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if let Some(pending) = snapshot.pending_new_tabs.pop_front() {
+                        break pending.reply;
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            };
+            reply
+                .expect("a sync POST carries a reply channel")
+                .send(Ok(crate::api::NewTabCreated {
+                    id: "11111111-2222-3333-4444-555555555555".to_string(),
+                    cwd: Some(std::path::PathBuf::from("/projet/x")),
+                }))
+                .expect("the waiter is still parked");
+        });
+        let payload = r#"{"cwd":"/projet/x","meta":{"role":"reviewer"},"sync":true}"#;
+        let resp = request(
+            port,
+            &format!(
+                "POST /tabs HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\
+                 Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
+                payload.len()
+            ),
+        );
+        assert_eq!(status_code(&resp), 200);
+        let reply_body = body(&resp);
+        assert!(
+            reply_body.contains("11111111-2222-3333-4444-555555555555"),
+            "the owner's uuid comes back: {reply_body}"
+        );
+        assert!(
+            reply_body.contains("/projet/x"),
+            "the effective cwd is reported: {reply_body}"
+        );
+        assert!(
+            reply_body.contains("\"role\":\"reviewer\""),
+            "the accepted labels are echoed: {reply_body}"
+        );
+        drainer.join().expect("drain thread");
+    }
+
+    /// A creation that fails (a PTY that never forked) is a 500 naming the
+    /// reason, not a 200 with a uuid for a tab that is not there.
+    #[test]
+    fn post_tabs_sync_reports_a_failed_creation() {
+        let (port, state, token) = spawn_server();
+        let drainer = std::thread::spawn(move || {
+            let reply = loop {
+                {
+                    let mut snapshot = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if let Some(pending) = snapshot.pending_new_tabs.pop_front() {
+                        break pending.reply;
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            };
+            reply
+                .expect("a sync POST carries a reply channel")
+                .send(Err("PTY spawn failed".to_string()))
+                .expect("the waiter is still parked");
+        });
+        let payload = r#"{"sync":true}"#;
+        let resp = request(
+            port,
+            &format!(
+                "POST /tabs HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\
+                 Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
+                payload.len()
+            ),
+        );
+        assert_eq!(status_code(&resp), 500);
+        assert!(body(&resp).contains("PTY spawn failed"), "{}", body(&resp));
+        drainer.join().expect("drain thread");
+    }
+
+    /// An invalid `meta` is a 400, and queues nothing — a refused body must not
+    /// leave a shell to be spawned.
+    #[test]
+    fn post_tabs_rejects_an_invalid_meta_without_queueing() {
+        let (port, state, token) = spawn_server();
+        let post = |payload: &str| {
+            status_code(&request(
+                port,
+                &format!(
+                    "POST /tabs HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\
+                     Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
+                    payload.len()
+                ),
+            ))
+        };
+        for bad in [
+            r#"{"meta":"nope"}"#,            // not an object
+            r#"{"meta":{"has space":"v"}}"#, // key charset
+            r#"{"meta":{"":"v"}}"#,          // empty key
+            r#"{"meta":{"k":""}}"#,          // empty value
+            r#"{"meta":{"k":42}}"#,          // non-string value
+            r#"{"meta":{"k":null}}"#,        // null is not a delete at creation
+        ] {
+            assert_eq!(post(bad), 400, "should refuse: {bad}");
+        }
+        // 17 keys — one over `META_MAX_KEYS`.
+        let keys: Vec<String> = (0..17).map(|i| format!("\"k{i}\":\"v\"")).collect();
+        let over = format!(r#"{{"meta":{{{}}}}}"#, keys.join(","));
+        assert_eq!(post(&over), 400, "one over the key cap");
+
+        let empty = {
+            let state = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.pending_new_tabs.is_empty()
+        };
+        assert!(empty, "a refused body queues nothing");
+    }
+
+    /// The labels the queue carries are the normalised ones, matching what
+    /// `set-meta` would store.
+    #[test]
+    fn post_tabs_normalises_the_meta_it_queues() {
+        let (port, state, token) = spawn_server();
+        let payload = r#"{"meta":{" Role ":"  reviewer  "}}"#;
+        let resp = request(
+            port,
+            &format!(
+                "POST /tabs HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\
+                 Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
+                payload.len()
+            ),
+        );
+        assert_eq!(status_code(&resp), 200);
+        let meta = {
+            let state = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.pending_new_tabs.front().expect("one queued").meta.clone()
+        };
+        assert_eq!(meta.get("role").map(String::as_str), Some("reviewer"));
     }
 
     #[test]

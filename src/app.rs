@@ -1453,8 +1453,7 @@ impl AppState {
             pending_context_changes: Vec::new(),
             pending_token_rotations: Vec::new(),
             pending_schedule_changes: Vec::new(),
-            pending_new_tabs: 0,
-            pending_new_tab_cwds: std::collections::VecDeque::new(),
+            pending_new_tabs: std::collections::VecDeque::new(),
             pending_limit_changes: Vec::new(),
             pending_default_limits: None,
             pending_resizes: Vec::new(),
@@ -1792,9 +1791,15 @@ impl AppState {
     /// whoever is typing. And an agent's output is read by a program, not a
     /// person: ANSI colour in it is bytes nobody looks at, in a scrollback
     /// another agent may have to read back.
-    fn add_tab_in_background(&mut self, cwd: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+    fn add_tab_in_background(
+        &mut self,
+        cwd: PathBuf,
+        meta: std::collections::BTreeMap<String, String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> String {
         let at = self.tabs.len();
-        self.insert_tab_inner(at, Some(cwd), false, window, cx);
+        self.insert_tab_inner(at, Some(cwd), meta, false, window, cx)
     }
 
     fn add_tab_after_current(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1802,19 +1807,22 @@ impl AppState {
     }
 
     fn insert_tab(&mut self, at: usize, hint: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
-        self.insert_tab_inner(at, hint, true, window, cx);
+        // A user-created tab names no labels; `set-meta` fills them afterwards.
+        let _ = self.insert_tab_inner(at, hint, std::collections::BTreeMap::new(), true, window, cx);
     }
 
     /// `focus` false leaves the active tab where it is and marks the new tab
-    /// [`Tab::plain`].
+    /// [`Tab::plain`]. Returns the uuid this process minted, so a caller that
+    /// needs it — a `sync: true` `POST /tabs` — can answer without polling.
     fn insert_tab_inner(
         &mut self,
         at: usize,
         hint: Option<PathBuf>,
+        meta: std::collections::BTreeMap<String, String>,
         focus: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> String {
         let cwd = hint.filter(|p| p.is_dir()).or_else(|| {
             let pid = self.tabs[self.active].view.read(cx).pid();
             platform::process_cwd(pid).or_else(|| self.tabs[self.active].last_known_cwd.clone())
@@ -1877,8 +1885,13 @@ impl AppState {
             format!("{} {}", self.t().terminal_n, self.tabs.len())
         };
         let seed = TabState {
-            id: new_id,
+            // Cloned, not moved: the caller gets the uuid back (see the return).
+            id: new_id.clone(),
             name,
+            // Labels from the creation body, seeded BEFORE the tab exists so
+            // nothing has to find it again by uuid — the same map `set-meta`
+            // writes, with the same caps (validated at the endpoint).
+            meta,
             ..TabState::default()
         };
         self.tabs
@@ -1896,6 +1909,7 @@ impl AppState {
             self.tabs[self.active].view.read(cx).focus_handle(cx).focus(window);
         }
         cx.notify();
+        new_id
     }
 
     fn move_tab(&mut self, from: usize, to: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -1959,17 +1973,25 @@ impl AppState {
     /// next `persist` tick. The slow persist still drains every
     /// pending queue (a no-op for input once we've cleared it here).
     fn drain_inputs(&mut self, cx: &mut Context<Self>) {
-        let inputs: Vec<(usize, Vec<u8>)> = {
+        let (inputs, new_tabs_waiting): (Vec<(usize, Vec<u8>)>, bool) = {
             let mut snapshot = self.api_state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            if snapshot.pending_input.is_empty() {
-                return;
-            }
-            snapshot.pending_input.drain(..).collect()
+            // The new-tab queue can only be drained in `render()` (it needs a
+            // Window); all this fast tick can do is REQUEST that frame. It must:
+            // `POST /tabs` re-bumps the activity counter precisely so this
+            // closure runs, and a `sync: true` caller is parked until `render()`
+            // creates the tab — so the notify here is what bounds the wait.
+            // Note there is no early return: the empty-input case is exactly the
+            // common one for an API-created tab.
+            let waiting = !snapshot.pending_new_tabs.is_empty();
+            (snapshot.pending_input.drain(..).collect(), waiting)
         };
         for (idx, bytes) in inputs {
             if idx < self.tabs.len() {
                 self.tabs[idx].view.read(cx).send_input_bytes(bytes);
             }
+        }
+        if new_tabs_waiting {
+            cx.notify();
         }
     }
 
@@ -2500,7 +2522,14 @@ impl AppState {
             let relay_config_change = snapshot.pending_relay_config.take();
             let env_changes: Vec<crate::api::EnvChange> = snapshot.pending_env_changes.drain(..).collect();
             let meta_changes: Vec<crate::api::MetaChange> = snapshot.pending_meta_changes.drain(..).collect();
+            // A `POST /tabs` creation is drained in render() (it needs a Window);
+            // this tick only asks for that frame. It is the backstop for a
+            // `sync: true` caller when the fast input tick's notify is missed.
+            let new_tabs_waiting = !snapshot.pending_new_tabs.is_empty();
             drop(snapshot);
+            if new_tabs_waiting {
+                cx.notify();
+            }
             // Relay-mode toggle from the CLI/API (`relay on|off`).
             if let Some(on) = relay_mode_change {
                 self.set_relay_mode_mode(on);
@@ -6393,33 +6422,36 @@ impl Render for AppState {
         // Only touch the global API mutex when the lock-free activity
         // counter moved since the last frame — POST /tabs, like every
         // authenticated request, bumps it, so a quiet counter proves
-        // `pending_new_tabs` is 0. The unconditional lock made every
+        // nothing is queued. The unconditional lock made every
         // frame contend with whatever an API handler was doing under
         // the same mutex (e.g. the /tabs body rebuild).
         let seq = self.activity_signal.load(std::sync::atomic::Ordering::Relaxed);
-        let (new_tab_count, new_tab_cwds): (usize, Vec<Option<PathBuf>>) = if seq == self.render_activity_seen.get() {
-            (0, Vec::new())
+        let new_tabs: Vec<api::PendingNewTab> = if seq == self.render_activity_seen.get() {
+            Vec::new()
         } else {
             self.render_activity_seen.set(seq);
             let mut snap = self.api_state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let n = std::mem::take(&mut snap.pending_new_tabs);
-            let cwds: Vec<Option<PathBuf>> = std::mem::take(&mut snap.pending_new_tab_cwds).into_iter().collect();
-            drop(snap);
-            (n, cwds)
+            snap.pending_new_tabs.drain(..).collect()
         };
-        let mut cwd_iter = new_tab_cwds.into_iter();
-        for _ in 0..new_tab_count {
+        for pending in new_tabs {
             // API-created: these come from `dispatch --new` / `tab-atelier
-            // add`, so they appear without stealing focus or a colour.
-            // One hint per creation now (see `POST /tabs`), so `.next()` peels
-            // this creation's entry and `.flatten()` yields its cwd or `None`
-            // (inherit) — the pairing can no longer slip.
-            let cwd = cwd_iter
-                .next()
-                .flatten()
+            // add`, so they appear without stealing focus or a colour. The cwd
+            // and the labels travel ON the entry, so nothing is paired by
+            // position and nothing can slip.
+            let cwd = pending
+                .cwd
                 .or_else(|| self.tabs.get(self.active).and_then(|t| t.last_known_cwd.clone()))
                 .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-            self.add_tab_in_background(cwd, window, cx);
+            let id = self.add_tab_in_background(cwd.clone(), pending.meta, window, cx);
+            // Answer a `sync: true` caller with the uuid this process minted.
+            // `reply` is `None` for an async POST (the handler already
+            // answered); a caller that gave up first has dropped its receiver
+            // and the send fails — the tab exists either way, so it is not an
+            // error. The GUI cannot fail synchronously (its views are lazy), so
+            // it only ever sends `Ok`.
+            if let Some(reply) = pending.reply {
+                let _ = reply.send(Ok(api::NewTabCreated { id, cwd: Some(cwd) }));
+            }
         }
         // No tab to show yet (transient empty state / future async boot): the
         // reusable centered screen stands in rather than indexing a missing tab.
