@@ -93,6 +93,8 @@ pub enum Route {
         /// The remote id.
         id: String,
     },
+    /// `GET /kiosk/fleet` — every server and its tabs, aggregated server-side.
+    Fleet,
     /// Everything else: hand it to the upstream daemon.
     Proxy,
 }
@@ -158,6 +160,8 @@ pub fn route(req: &Request<()>) -> Route {
         // these reach a configured remote with its token, server-side.
         (&Method::GET, "/kiosk/remotes") => Route::RemotesList,
         (&Method::POST, "/kiosk/remotes") => Route::RemoteAdd,
+        // The landing page: every server and its tabs, in one call.
+        (&Method::GET, "/kiosk/fleet") => Route::Fleet,
         (method, p) if p.starts_with("/kiosk/remotes/") => remotes_action(method, p),
         (&Method::POST, _) => decision_action(path),
         _ => Route::Proxy,
@@ -210,6 +214,7 @@ fn allowed_methods(path: &str) -> Option<&'static str> {
             }
         }
         "/kiosk/remotes" => Some("GET, POST"),
+        "/kiosk/fleet" => Some("GET, HEAD"),
         _ if path.starts_with("/kiosk/remotes/") => {
             let segments: Vec<&str> = path["/kiosk/remotes/".len()..].split('/').collect();
             match segments.as_slice() {
@@ -440,6 +445,7 @@ mod tests {
         // The Kiosk's own multi-server API.
         assert_eq!(classify(Method::GET, "/kiosk/remotes"), Route::RemotesList);
         assert_eq!(classify(Method::POST, "/kiosk/remotes"), Route::RemoteAdd);
+        assert_eq!(classify(Method::GET, "/kiosk/fleet"), Route::Fleet);
         assert_eq!(
             classify(Method::POST, "/kiosk/remotes/abc/remove"),
             Route::RemoteRemove { id: "abc".to_string() }

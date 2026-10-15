@@ -9,13 +9,16 @@ User=tab-atelier-kiosk
 Group=tab-atelier-kiosk
 StateDirectory=tab-atelier-kiosk
 StateDirectoryMode=0700
-ExecStart=/usr/bin/tab-atelier-kiosk serve --listen 127.0.0.1:8282
+ExecStart=/usr/bin/tab-atelier-kiosk serve --listen 0.0.0.0:8282
 Restart=on-failure
 RestartSec=2s
 TimeoutStopSec=10s
 
-# The scaffold only serves HTTP on loopback; unlike the proxy it has no upstream
-# egress, credentials, or TLS-terminator assumption, so network-online is unnecessary.
+# The Kiosk serves HTTP on all interfaces (`--listen 0.0.0.0:8282`): it exists to
+# be reached from another machine, and the token — generated on first start, the
+# panes fail closed without it — is what gates it. It still has no upstream
+# egress of its own and no credentials to a third party, so network-online is
+# unnecessary.
 NoNewPrivileges=yes
 CapabilityBoundingSet=
 AmbientCapabilities=

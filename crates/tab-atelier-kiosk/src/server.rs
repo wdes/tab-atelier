@@ -45,9 +45,16 @@ pub async fn serve(listener: TcpListener, cfg: Config) -> std::io::Result<()> {
 /// [`serve`] with explicit hop deadlines, so a test can compress them and still
 /// exercise the real timeout paths instead of waiting out the production values.
 pub async fn serve_with(listener: TcpListener, cfg: Config, timeouts: HopTimeouts) -> std::io::Result<()> {
-    let upstream = Arc::new(Upstream::new(cfg.upstream, timeouts));
+    let upstream = Arc::new(Upstream::new(cfg.upstream.clone(), timeouts));
     let daemon = Arc::new(Daemon::new(timeouts));
-    let panes = Arc::new(Panes::new(cfg.journal, cfg.token, cfg.remotes, cfg.intentions));
+    let panes = Arc::new(Panes::new(
+        cfg.journal,
+        cfg.token,
+        cfg.remotes,
+        cfg.intentions,
+        cfg.upstream,
+        cfg.upstream_token,
+    ));
     loop {
         let (stream, _peer) = match listener.accept().await {
             Ok(pair) => pair,
@@ -144,8 +151,58 @@ async fn handle(req: Request<Incoming>, upstream: &Upstream, panes: &Panes, daem
         },
         Route::RemoteIntentLaunch { id, slug } => remote_intent_launch(panes, daemon, &id, &slug).await,
         Route::RemoteCards { id } => remote_cards(panes, daemon, &id).await,
+        Route::Fleet => fleet(panes, daemon).await,
         Route::MethodNotAllowed(allow) => Panes::method_not_allowed(allow),
     }
+}
+
+/// `GET /kiosk/fleet` — every server and its tabs, aggregated server-side.
+///
+/// The Kiosk reaches each server with ITS token (never the browser's), and
+/// returns only what the landing page shows — each tab's id, name and cwd, not
+/// its scrollback. A server that cannot be reached is reported as
+/// `{error: unreachable}` rather than failing the whole list: one down server
+/// must not blank the fleet.
+async fn fleet(panes: &Panes, daemon: &Daemon) -> Response<BoxBody> {
+    let mut servers = Vec::new();
+    for (id, label, url, token) in panes.fleet_targets() {
+        let remote = crate::remotes::Remote {
+            id: id.clone(),
+            label: label.clone(),
+            url,
+            token,
+        };
+        let daemon = daemon.clone();
+        let answered = tokio::task::spawn_blocking(move || daemon.get(&remote, "/tabs")).await;
+        let entry = match answered {
+            Ok(Ok((status, text))) if (200..300).contains(&status) => {
+                let tabs = serde_json::from_str::<serde_json::Value>(&text)
+                    .ok()
+                    .and_then(|value| value.get("tabs").cloned())
+                    .unwrap_or_else(|| serde_json::Value::Array(Vec::new()));
+                // Only the fields the fleet shows: a tab's scrollback is heavy
+                // and belongs nowhere near a landing page.
+                let lean: Vec<serde_json::Value> = tabs
+                    .as_array()
+                    .map(|tabs| {
+                        tabs.iter()
+                            .map(|tab| {
+                                serde_json::json!({
+                                    "id": tab.get("id"),
+                                    "name": tab.get("name"),
+                                    "cwd": tab.get("cwd"),
+                                })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                serde_json::json!({ "id": id, "label": label, "tabs": lean })
+            }
+            _ => serde_json::json!({ "id": id, "label": label, "error": "unreachable" }),
+        };
+        servers.push(entry);
+    }
+    json_response(StatusCode::OK, &serde_json::json!({ "servers": servers }))
 }
 
 /// `GET /kiosk/remotes/<id>/cards` — a remote's agent cards, derived from the

@@ -15,7 +15,13 @@ use crate::remotes::Remotes;
 pub const DEFAULT_UPSTREAM: &str = "http://127.0.0.1:7890";
 
 /// Address the kiosk listens on when `TAB_ATELIER_KIOSK_ADDR` is unset.
-pub const DEFAULT_BIND: &str = "127.0.0.1:8282";
+///
+/// All interfaces, deliberately: the Kiosk exists to be looked at from another
+/// machine as much as this one. The token is what gates it, and the package
+/// generates one on first start (the panes fail closed without it), so an open
+/// port is an authenticated door rather than an open one. Set
+/// `TAB_ATELIER_KIOSK_ADDR=127.0.0.1:8282` to keep it loopback-only.
+pub const DEFAULT_BIND: &str = "0.0.0.0:8282";
 
 /// Where the kiosk's own data lives when the state-dir knobs are unset.
 pub const DEFAULT_STATE_DIR: &str = "/var/lib/tab-atelier-kiosk";
@@ -51,6 +57,14 @@ pub struct Config {
     pub remotes: Remotes,
     /// The intentions the Kiosk holds — its own data, like the board.
     pub intentions: Intentions,
+    /// The upstream daemon's token, when it has one.
+    ///
+    /// The `--upstream` daemon is the one the Kiosk relays the page's calls to;
+    /// this lets the Kiosk also read ITS tabs for the fleet view, so an operator
+    /// sees the local machine's tabs without first adding it as a remote. `None`
+    /// means the upstream is not aggregated — the fleet shows only the
+    /// configured remotes.
+    pub upstream_token: Option<String>,
 }
 
 impl Config {
@@ -80,6 +94,9 @@ impl Config {
         let intentions_dir = std::env::var("TAB_ATELIER_INTENTIONS")
             .map_or_else(|_| state_dir.join(intent::DEFAULT_INTENTIONS_DIR), PathBuf::from);
         let intentions = Intentions::new(intentions_dir).map_err(|e| format!("intentions: {e}"))?;
+        let upstream_token = std::env::var("TAB_ATELIER_UPSTREAM_TOKEN")
+            .ok()
+            .filter(|token| !token.trim().is_empty());
         Ok(Self {
             upstream,
             bind,
@@ -88,6 +105,7 @@ impl Config {
             token_file,
             remotes: Remotes { path: remotes },
             intentions,
+            upstream_token,
         })
     }
 

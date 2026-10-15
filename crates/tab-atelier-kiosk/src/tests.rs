@@ -76,6 +76,7 @@ fn test_config(upstream: String, state: &Path, token: Option<&str>) -> Config {
             path: state.join("remotes.json"),
         },
         intentions: crate::intent::Intentions::new(state.join("intentions")).expect("intentions dir"),
+        upstream_token: None,
     }
 }
 
@@ -594,6 +595,22 @@ async fn a_wrong_method_on_a_pane_is_a_405_not_a_relay() {
         "POST",
         "the Allow header names what the route does answer"
     );
+}
+
+/// The fleet view — the landing page's data — is behind the token and, with no
+/// upstream token and no remotes, is an empty list rather than an error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_fleet_lists_every_server_behind_the_token() {
+    let dir = scratch_dir("fleet");
+    let addr = spawn_kiosk_with(test_config("http://127.0.0.1:1".to_string(), &dir, Some("t"))).await;
+    let auth = ("authorization", "Bearer t");
+
+    assert_eq!(get(addr, "/kiosk/fleet").status(), 401, "the fleet is behind the token");
+
+    let listed = send(Method::GET, addr, "/kiosk/fleet", &[auth], vec![]);
+    assert_eq!(listed.status(), 200);
+    let body = body_string(listed);
+    assert!(body.contains("\"servers\""), "the fleet envelope: {body}");
 }
 
 /// The servers can be added, listed and forgotten through the Kiosk's own API —

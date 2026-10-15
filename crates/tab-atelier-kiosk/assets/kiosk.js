@@ -1271,6 +1271,89 @@ function bootstrap() {
   for (const link of document.querySelectorAll("[data-carry-token]")) {
     link.href = link.getAttribute("href") + location.search;
   }
+  // The landing view: the servers and their tabs, so the tabs are the first
+  // thing on screen.
+  loadFleet();
+}
+
+// ---- The fleet: the landing view -------------------------------------------
+//
+// Every server this Kiosk aggregates and its tabs — the first thing on screen,
+// not hidden behind the Serveurs page. This is the entry point: you see your
+// tabs here, and you add one here.
+
+function fleetHtml(model) {
+  const servers = (model && model.servers) || [];
+  if (servers.length === 0) {
+    return `<p class="fleet-empty">Aucun serveur. Ajoute-en un dans <a href="/kiosk/manage${typeof location !== "undefined" ? location.search : ""}">Serveurs</a>.</p>`;
+  }
+  return servers.map(fleetServerHtml).join("");
+}
+
+function fleetServerHtml(server) {
+  const label = escapeHtml(String(server.label || server.id || "serveur"));
+  const head = `<div class="fleet-server-head"><h2>${label}</h2></div>`;
+  if (server.error) {
+    return `<section class="fleet-server" data-server="${escapeHtml(String(server.id))}">
+      ${head}<p class="fleet-error">Injoignable.</p></section>`;
+  }
+  const tabs = server.tabs || [];
+  const rows = tabs.length
+    ? tabs
+        .map(
+          (t) =>
+            `<li class="fleet-tab"><span class="name">${escapeHtml(String(t.name || t.id || "(sans nom)"))}</span><span class="meta">${escapeHtml(String(t.cwd || ""))}</span></li>`,
+        )
+        .join("")
+    : `<li class="fleet-empty-tab">Aucun onglet.</li>`;
+  return `<section class="fleet-server" data-server="${escapeHtml(String(server.id))}">
+    ${head}
+    <ul class="fleet-tabs">${rows}</ul>
+    <form class="fleet-add" data-server="${escapeHtml(String(server.id))}">
+      <input name="cwd" placeholder="répertoire (optionnel)" autocomplete="off">
+      <button type="submit">Ouvrir un onglet</button>
+    </form>
+  </section>`;
+}
+
+async function loadFleet() {
+  const host = typeof document !== "undefined" && document.getElementById("fleet");
+  if (!host) return;
+  try {
+    const res = await fetch("/kiosk/fleet", { headers: { accept: "application/json", ...AUTH_HEADERS } });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    host.innerHTML = fleetHtml(await res.json());
+    document.querySelectorAll(".fleet-add").forEach((form) => {
+      form.addEventListener("submit", (e) => onAddTab(e, form.dataset.server));
+    });
+  } catch (err) {
+    host.innerHTML = `<p class="fleet-error">Flotte indisponible : ${escapeHtml(String(err.message || err))}</p>`;
+  }
+}
+
+async function onAddTab(event, serverId) {
+  event.preventDefault();
+  const form = event.target;
+  const input = form.querySelector('input[name="cwd"]');
+  const cwd = input ? input.value.trim() : "";
+  const body = { sync: true };
+  if (cwd) body.cwd = cwd;
+  try {
+    const res = await fetch(`/kiosk/remotes/${encodeURIComponent(serverId)}/tabs`, {
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "application/json", ...AUTH_HEADERS },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    form.reset();
+    await loadFleet();
+  } catch (err) {
+    // Report without losing the list.
+    const note = document.createElement("p");
+    note.className = "fleet-error";
+    note.textContent = `Onglet non créé : ${err.message || err}`;
+    form.after(note);
+  }
 }
 
 if (typeof document !== "undefined") {

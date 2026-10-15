@@ -35,7 +35,10 @@
     <a id="manage-link" class="manage-link" href="/kiosk/manage" data-carry-token>Serveurs</a>
   </header>
 
-  <main id="kiosk" aria-label="harness kiosk"></main>
+  <!-- The landing view: every server this Kiosk aggregates and its tabs, so the
+       tabs are the first thing on screen rather than behind the Serveurs page.
+       Populated by kiosk.js from GET /kiosk/fleet. -->
+  <main id="fleet" aria-label="serveurs et onglets"></main>
 
   <!-- Catalogue: the cold catalog read-model, opened on-demand from the
        topbar button. Populated by kiosk.js from catalogView(readModel). -->

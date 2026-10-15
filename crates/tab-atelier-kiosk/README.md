@@ -31,6 +31,14 @@ daemon's data — each read and written directly, behind its own token:
 | `POST /kiosk/remotes/<id>/remove` | forget a server |
 | `GET /kiosk/remotes/<id>/tabs` | a remote's tabs, reached with its token |
 | `POST /kiosk/remotes/<id>/tabs` | open a tab on a remote |
+| `GET /kiosk/fleet` | every server and its tabs, aggregated server-side |
+
+**The entry point is the landing page**, which is the fleet: every server the
+Kiosk aggregates and its tabs, each with an "Ouvrir un onglet" form. `local` is
+the daemon the Kiosk fronts (`--upstream`), addressable as a server too, so you
+see and add tabs on this machine without first adding it as a remote — which is
+what requires `TAB_ATELIER_UPSTREAM_TOKEN` (below). Without that token, `local`
+is simply absent and only the configured remotes show.
 
 Everything else is the daemon's, relayed unchanged. A path in the table reached
 with the wrong method is a **405** with an `Allow` header — not a relay to the
@@ -56,8 +64,9 @@ tab-atelier-kiosk serve --listen 127.0.0.1:8282 --upstream http://127.0.0.1:7890
 
 | Env | Default | Meaning |
 |---|---|---|
-| `TAB_ATELIER_KIOSK_ADDR` | `127.0.0.1:8282` | where it listens |
+| `TAB_ATELIER_KIOSK_ADDR` | `0.0.0.0:8282` | where it listens |
 | `TAB_ATELIER_UPSTREAM` | `http://127.0.0.1:7890` | the daemon it relays to |
+| `TAB_ATELIER_UPSTREAM_TOKEN` | *(none)* | that daemon's token, to show its tabs in the fleet |
 | `TAB_ATELIER_KIOSK_STATE` | `/var/lib/tab-atelier-kiosk` | state directory |
 | `TAB_ATELIER_DECISIONS` | `<state>/decisions.jsonl` | the journal |
 | `TAB_ATELIER_OUTBOX` | `<state>/outbox` | the tree `/decisions/file` serves from |

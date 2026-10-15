@@ -340,3 +340,39 @@ kiosk { padding: 1rem; }
   padding: 8px 10px; font-size: 0.78rem; display: none; box-shadow: 0 2px 8px rgba(0,0,0,0.3);
 }
 .mesh-tip .k { color: var(--muted); }
+
+/* The fleet: the landing view. Servers and their tabs, first thing on screen. */
+#fleet {
+  display: grid;
+  gap: 1rem;
+  padding: 1rem;
+  max-width: 64rem;
+  margin: 0 auto;
+  align-content: start;
+}
+.fleet-server {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.75rem 1rem;
+}
+.fleet-server h2 { margin: 0 0 0.5rem; font-size: 0.95rem; font-weight: 600; }
+.fleet-tabs { list-style: none; margin: 0 0 0.75rem; padding: 0; display: grid; gap: 0.35rem; }
+.fleet-tab {
+  display: flex; align-items: baseline; gap: 0.6rem;
+  padding: 0.4rem 0.5rem; border: 1px solid var(--border); border-radius: 6px;
+}
+.fleet-tab .name { font-family: ui-monospace, monospace; }
+.fleet-tab .meta { color: var(--muted); font-size: 0.82rem; }
+.fleet-empty, .fleet-empty-tab, .fleet-error { color: var(--muted); font-style: italic; }
+.fleet-error { color: var(--err); font-style: normal; }
+.fleet-add { display: flex; gap: 0.5rem; flex-wrap: wrap; }
+.fleet-add input {
+  flex: 1 1 14rem; padding: 0.35rem 0.5rem; font: inherit; color: var(--fg);
+  background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+}
+.fleet-add button {
+  font: inherit; padding: 0.35rem 0.7rem; border: 1px solid var(--border);
+  border-radius: 6px; background: transparent; color: var(--fg); cursor: pointer;
+}
+.fleet-add button:hover { border-color: var(--accent); color: var(--accent); }

@@ -14,6 +14,13 @@ use crate::body::{BoxBody, full, json_response};
 use crate::decisions::{DecisionError, Journal};
 use crate::intent::Intentions;
 use crate::remotes::{Remote, RemoteError, Remotes};
+
+/// The id the upstream daemon answers to in the fleet and the remote routes.
+///
+/// It is not a stored remote — it is the `--upstream` the Kiosk fronts — but
+/// giving it a name means the same routes (`/kiosk/remotes/local/tabs`, …) act
+/// on it, so there is one way to add a tab rather than two.
+pub const LOCAL_REMOTE_ID: &str = "local";
 use crate::reports;
 
 /// The panes' state: the journal, the intentions, the remotes the Kiosk
@@ -24,16 +31,78 @@ pub struct Panes {
     token: Option<String>,
     remotes: Remotes,
     intentions: Intentions,
+    /// The upstream daemon, aggregated into the fleet when it has a token.
+    upstream: String,
+    upstream_token: Option<String>,
 }
 
 impl Panes {
-    pub const fn new(journal: Journal, token: Option<String>, remotes: Remotes, intentions: Intentions) -> Self {
+    pub const fn new(
+        journal: Journal,
+        token: Option<String>,
+        remotes: Remotes,
+        intentions: Intentions,
+        upstream: String,
+        upstream_token: Option<String>,
+    ) -> Self {
         Self {
             journal,
             token,
             remotes,
             intentions,
+            upstream,
+            upstream_token,
         }
+    }
+
+    /// The servers the fleet view shows: the upstream first when it has a token,
+    /// then the configured remotes. Each is `(id, label, url, token)` — `id` is
+    /// `None` for the upstream, which is not addressable by a remote id.
+    #[must_use]
+    pub fn fleet_targets(&self) -> Vec<(String, String, String, String)> {
+        let mut targets = Vec::new();
+        if let Some(token) = &self.upstream_token {
+            // The upstream is addressable as `local`, so the same routes that act
+            // on a remote — add a tab, launch a worker — work on the local daemon
+            // too, without the operator first adding it as a remote.
+            targets.push((
+                LOCAL_REMOTE_ID.to_string(),
+                "local".to_string(),
+                self.upstream.clone(),
+                token.clone(),
+            ));
+        }
+        if let Ok(remotes) = self.remotes.list() {
+            for remote in remotes {
+                targets.push((remote.id, remote.label, remote.url, remote.token));
+            }
+        }
+        targets
+    }
+
+    /// The remote behind `id`: the upstream when it is `local`, else a stored
+    /// remote. This is what lets `/kiosk/remotes/local/tabs` mean the daemon the
+    /// Kiosk fronts rather than a 404.
+    ///
+    /// # Errors
+    /// [`RemoteError::NotFound`] when no server carries the id.
+    pub fn resolve_remote(&self, id: &str) -> Result<Remote, RemoteError> {
+        if id == LOCAL_REMOTE_ID {
+            // `local` is only a server when the upstream is aggregated; with no
+            // upstream token there is nothing behind the name.
+            return self
+                .upstream_token
+                .as_ref()
+                .map_or(Err(RemoteError::NotFound), |token| {
+                    Ok(Remote {
+                        id: LOCAL_REMOTE_ID.to_string(),
+                        label: "local".to_string(),
+                        url: self.upstream.clone(),
+                        token: token.clone(),
+                    })
+                });
+        }
+        self.remotes.get(id)
     }
 
     /// Whether a request's `Authorization` header carries the pane token.
@@ -195,13 +264,14 @@ impl Panes {
         }
     }
 
-    /// The remote with this id, for a route that reaches out to it.
+    /// The remote with this id, for a route that reaches out to it — including
+    /// `local`, the upstream daemon.
     ///
     /// # Errors
     ///
-    /// [`RemoteError::NotFound`] when no remote carries the id.
+    /// [`RemoteError::NotFound`] when no server carries the id.
     pub fn remote(&self, id: &str) -> Result<Remote, RemoteError> {
-        self.remotes.get(id)
+        self.resolve_remote(id)
     }
 
     /// The response for a remote lookup that failed.
@@ -298,6 +368,8 @@ mod tests {
                 path: dir.join("remotes.json"),
             },
             Intentions::new(dir.join("intentions")).expect("intentions dir"),
+            "http://127.0.0.1:1".to_string(),
+            None,
         )
     }
 
