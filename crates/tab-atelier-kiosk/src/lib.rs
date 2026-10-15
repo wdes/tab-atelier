@@ -38,6 +38,7 @@
 pub(crate) mod assets;
 pub(crate) mod backup;
 pub(crate) mod body;
+pub(crate) mod card;
 pub(crate) mod config;
 pub(crate) mod daemon;
 pub(crate) mod decisions;
@@ -53,6 +54,7 @@ pub(crate) mod server;
 mod tests;
 
 pub use backup::{BackupError, backup, restore, state_dir};
+pub use card::{AgentCard, CARD_KEYS, card_from_meta};
 pub use config::{Config, DEFAULT_BIND, DEFAULT_STATE_DIR, DEFAULT_UPSTREAM};
 pub use decisions::Decision;
 pub use intent::{Intentions, Summary};

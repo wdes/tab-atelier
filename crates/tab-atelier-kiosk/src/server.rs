@@ -143,8 +143,55 @@ async fn handle(req: Request<Incoming>, upstream: &Upstream, panes: &Panes, daem
             Err(response) => response,
         },
         Route::RemoteIntentLaunch { id, slug } => remote_intent_launch(panes, daemon, &id, &slug).await,
+        Route::RemoteCards { id } => remote_cards(panes, daemon, &id).await,
         Route::MethodNotAllowed(allow) => Panes::method_not_allowed(allow),
     }
+}
+
+/// `GET /kiosk/remotes/<id>/cards` — a remote's agent cards, derived from the
+/// meta labels of its tabs.
+///
+/// The daemon already lists each tab's `meta`; this shapes the conventional set
+/// into a card, so the dashboard reads one shape instead of knowing the keys.
+/// Tabs with no card keys are omitted — a plain tab is not reported as an empty
+/// card.
+async fn remote_cards(panes: &Panes, daemon: &Daemon, id: &str) -> Response<BoxBody> {
+    let remote = match panes.remote(id) {
+        Ok(remote) => remote,
+        Err(error) => return Panes::remote_error(&error),
+    };
+    let daemon = daemon.clone();
+    let answered = tokio::task::spawn_blocking(move || daemon.get(&remote, "/tabs")).await;
+    let Ok(Ok((status, text))) = answered else {
+        return Panes::bad_gateway();
+    };
+    if !(200..300).contains(&status) {
+        return relay_response(status, text);
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return Panes::bad_gateway();
+    };
+    let cards: Vec<serde_json::Value> = value
+        .get("tabs")
+        .and_then(|tabs| tabs.as_array())
+        .map(|tabs| {
+            tabs.iter()
+                .filter_map(|tab| {
+                    let meta: std::collections::BTreeMap<String, String> = tab
+                        .get("meta")
+                        .and_then(|meta| serde_json::from_value(meta.clone()).ok())
+                        .unwrap_or_default();
+                    let card = crate::card::card_from_meta(&meta)?;
+                    Some(serde_json::json!({
+                        "id": tab.get("id"),
+                        "name": tab.get("name"),
+                        "card": card,
+                    }))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    json_response(StatusCode::OK, &serde_json::json!({ "cards": cards }))
 }
 
 /// `POST /kiosk/remotes/<id>/intent/<slug>/launch` — open a worker tab on a

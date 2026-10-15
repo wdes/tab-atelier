@@ -87,6 +87,12 @@ pub enum Route {
     /// A path the Kiosk serves, reached with a method it does not answer. The
     /// string is the value of the `Allow` header.
     MethodNotAllowed(&'static str),
+    /// `GET /kiosk/remotes/<id>/cards` — a remote's agent cards, derived from
+    /// the meta labels of its tabs.
+    RemoteCards {
+        /// The remote id.
+        id: String,
+    },
     /// Everything else: hand it to the upstream daemon.
     Proxy,
 }
@@ -209,6 +215,7 @@ fn allowed_methods(path: &str) -> Option<&'static str> {
             match segments.as_slice() {
                 [id, "remove"] if !id.is_empty() => Some("POST"),
                 [id, "tabs"] if !id.is_empty() => Some("GET, POST"),
+                [id, "cards"] if !id.is_empty() => Some("GET, HEAD"),
                 [id, "intent", slug, "launch"] if !id.is_empty() && !slug.is_empty() => Some("POST"),
                 _ => None,
             }
@@ -232,6 +239,7 @@ fn remotes_action(method: &Method, path: &str) -> Route {
         (&Method::POST, [id, "remove"]) if !id.is_empty() => Route::RemoteRemove { id: id.to_string() },
         (&Method::GET, [id, "tabs"]) if !id.is_empty() => Route::RemoteTabs { id: id.to_string() },
         (&Method::POST, [id, "tabs"]) if !id.is_empty() => Route::RemoteTabCreate { id: id.to_string() },
+        (&Method::GET, [id, "cards"]) if !id.is_empty() => Route::RemoteCards { id: id.to_string() },
         // The one remote action that is about an intention rather than a plain
         // tab: it spawns a worker for `slug` and remembers which tab it was.
         (&Method::POST, [id, "intent", slug, "launch"]) if !id.is_empty() && !slug.is_empty() => {
@@ -443,6 +451,10 @@ mod tests {
         assert_eq!(
             classify(Method::POST, "/kiosk/remotes/abc/tabs"),
             Route::RemoteTabCreate { id: "abc".to_string() }
+        );
+        assert_eq!(
+            classify(Method::GET, "/kiosk/remotes/abc/cards"),
+            Route::RemoteCards { id: "abc".to_string() }
         );
         assert_eq!(
             classify(Method::POST, "/kiosk/remotes/abc/intent/my-slug/launch"),
