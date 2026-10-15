@@ -36,22 +36,27 @@ pub enum Route {
     Reports,
     /// Record an intention: `POST /intent`.
     Intent,
+    /// The catalog tab: `GET /catalog/list`, the skills catalogue.
+    Catalog,
+    /// A path the Kiosk serves, reached with a method it does not answer. The
+    /// string is the value of the `Allow` header.
+    MethodNotAllowed(&'static str),
     /// Everything else: hand it to the upstream daemon.
     Proxy,
 }
 
 /// Classifies a request. The interface and the panes this crate answers itself
-/// — the board, the reports listing, the intention — are ours; every remaining
-/// call the page makes (the daemon's own API under `/api/*`, and anything else
-/// the page learns to ask for) is the daemon's, relayed on the same origin so
-/// the browser never makes a cross-origin request.
+/// — the board, the reports listing, the intention, the catalogue — are ours;
+/// every remaining call the page makes (the daemon's own API under `/api/*`,
+/// and anything else the page learns to ask for) is the daemon's, relayed on
+/// the same origin so the browser never makes a cross-origin request.
 pub fn route(req: &Request<()>) -> Route {
     let uri = req.uri();
     let path = uri.path();
     let query = uri.query();
 
     // Only fetches can be an asset, but the panes are read by both GET and POST.
-    match (req.method(), path) {
+    let resolved = match (req.method(), path) {
         (&Method::GET | &Method::HEAD, "/" | "/kiosk" | "/assets/kiosk.html") => {
             Route::Asset(assets::HTML, "text/html; charset=utf-8")
         }
@@ -68,8 +73,39 @@ pub fn route(req: &Request<()>) -> Route {
         // The reports tab lists the outbox; the intent tab records one.
         (&Method::GET, "/reports") => Route::Reports,
         (&Method::POST, "/intent") => Route::Intent,
+        // The catalog tab reads the skills catalogue, which is the Kiosk's to
+        // answer: the daemon has no such route (see `crate::panes::catalog`).
+        (&Method::GET, "/catalog/list") => Route::Catalog,
         (&Method::POST, _) => decision_action(path),
         _ => Route::Proxy,
+    };
+
+    // A path this crate owns, reached with a method it does not answer, is a
+    // 405 — NOT a fall-through to the daemon. Relayed, the daemon's own auth
+    // gate answers 401 first, which reads as "your token is wrong" for what is
+    // really "this method is not allowed here", and names a failure the caller
+    // cannot act on.
+    if resolved == Route::Proxy
+        && let Some(allow) = allowed_methods(path)
+    {
+        return Route::MethodNotAllowed(allow);
+    }
+    resolved
+}
+
+/// The methods this crate answers for a path it owns, or `None` when the path
+/// is not the Kiosk's at all and is therefore the daemon's to answer.
+fn allowed_methods(path: &str) -> Option<&'static str> {
+    match path {
+        "/" | "/kiosk" | "/assets/kiosk.html" | "/assets/kiosk.css" | "/assets/kiosk.js" | "/decisions"
+        | "/decisions/file" | "/reports" | "/catalog/list" => Some("GET, HEAD"),
+        "/intent" => Some("POST"),
+        // `/decisions/<id>/read|tranch` are POSTs; `decision_action` knows the
+        // shape, so reuse it rather than repeat the split.
+        _ => match decision_action(path) {
+            Route::DecisionRead { .. } | Route::DecisionTranch { .. } => Some("POST"),
+            _ => None,
+        },
     }
 }
 
@@ -187,15 +223,28 @@ mod tests {
         );
         assert_eq!(classify(Method::GET, "/reports"), Route::Reports);
         assert_eq!(classify(Method::POST, "/intent"), Route::Intent);
+        assert_eq!(classify(Method::GET, "/catalog/list"), Route::Catalog);
 
-        // The routes this crate does not answer, and the daemon's own API.
+        // A path the Kiosk owns, reached with the wrong method, is a 405 — not a
+        // relay. Relayed, the daemon's auth gate answers a misleading 401 for
+        // what is really "this method is not allowed here".
+        assert_eq!(classify(Method::GET, "/intent"), Route::MethodNotAllowed("POST"));
+        assert_eq!(classify(Method::POST, "/reports"), Route::MethodNotAllowed("GET, HEAD"));
+        assert_eq!(
+            classify(Method::POST, "/catalog/list"),
+            Route::MethodNotAllowed("GET, HEAD")
+        );
+        assert_eq!(
+            classify(Method::GET, "/decisions/a/read"),
+            Route::MethodNotAllowed("POST")
+        );
+
+        // What is genuinely not the Kiosk's belongs to the daemon, including an
+        // unknown verb under a Kiosk path.
         for (method, uri) in [
             (Method::GET, "/api/users"),
-            (Method::GET, "/intent"),   // the intent tab only posts
-            (Method::POST, "/reports"), // the reports tab only lists
-            (Method::POST, "/decisions"),
+            (Method::GET, "/tabs"),
             (Method::POST, "/decisions/a/delete"),
-            (Method::GET, "/decisions/a/read"),
         ] {
             assert_eq!(
                 classify(method.clone(), uri),

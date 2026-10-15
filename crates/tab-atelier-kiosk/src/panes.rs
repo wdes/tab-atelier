@@ -98,6 +98,28 @@ impl Panes {
         }
     }
 
+    /// `GET /catalog/list` — the skills catalogue.
+    ///
+    /// The read-model the page expects: `{ retired, skills }`. Both empty, and
+    /// that is the honest state, not a stub for a missing feature — the
+    /// catalogue is folded from agents a retire loop distils, and that loop is
+    /// not in this tree, so there is nothing to fold yet. Serving the shape
+    /// rather than 404 is what lets the tab render its empty state ("aucun
+    /// skill") instead of an error the reader cannot act on.
+    pub fn catalog() -> Response<BoxBody> {
+        json_response(StatusCode::OK, &serde_json::json!({ "retired": [], "skills": [] }))
+    }
+
+    /// The 405 for a path the Kiosk serves, reached with the wrong method.
+    pub fn method_not_allowed(allow: &'static str) -> Response<BoxBody> {
+        Response::builder()
+            .status(StatusCode::METHOD_NOT_ALLOWED)
+            .header(header::ALLOW, allow)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(full(serde_json::json!({ "error": "method_not_allowed" }).to_string()))
+            .expect("static response builder")
+    }
+
     /// The 401 for a request without the token.
     pub fn unauthorized() -> Response<BoxBody> {
         json_response(

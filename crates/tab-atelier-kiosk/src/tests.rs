@@ -242,7 +242,9 @@ async fn proxies_a_request_and_strips_hop_by_hop_headers() {
     let resp = send(
         Method::POST,
         addr,
-        "/decisions",
+        // Not a Kiosk path: `/decisions` is the board (a GET), so a POST there
+        // is a 405 here rather than a relay. This exercises the plain relay.
+        "/api/echo",
         &[
             ("x-probe", "sentinel"),
             ("connection", "keep-alive"),
@@ -258,7 +260,7 @@ async fn proxies_a_request_and_strips_hop_by_hop_headers() {
         .expect("upstream saw the request");
     let head = relayed.to_lowercase();
     assert!(
-        relayed.starts_with("POST /decisions "),
+        relayed.starts_with("POST /api/echo "),
         "path and method forwarded: {relayed}"
     );
     assert!(head.contains("x-probe: sentinel"), "custom header kept");
@@ -522,4 +524,40 @@ async fn the_intent_pane_records_an_intention() {
     assert_eq!(empty.status(), 400);
     let junk = send(Method::POST, addr, "/intent", &[auth], b"not json".to_vec());
     assert_eq!(junk.status(), 400);
+}
+
+/// The catalog tab loads: the Kiosk serves the read-model rather than relaying
+/// to a daemon that has no such route — where the daemon's auth gate would
+/// answer 401, reading as "your token is wrong" for a route that is not there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_catalog_pane_serves_the_read_model() {
+    let dir = scratch_dir("catalog");
+    let addr = spawn_kiosk_with(test_config("http://127.0.0.1:1".to_string(), &dir, Some("t"))).await;
+    let auth = ("authorization", "Bearer t");
+
+    assert_eq!(get(addr, "/catalog/list").status(), 401, "still behind the token");
+
+    let listed = send(Method::GET, addr, "/catalog/list", &[auth], vec![]);
+    assert_eq!(listed.status(), 200);
+    let body = body_string(listed);
+    assert!(body.contains("\"retired\""), "the read-model the page expects: {body}");
+    assert!(body.contains("\"skills\""), "the read-model the page expects: {body}");
+}
+
+/// A Kiosk path reached with the wrong method is a 405 with an `Allow` header,
+/// not a relay to the daemon's misleading 401.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_wrong_method_on_a_pane_is_a_405_not_a_relay() {
+    let dir = scratch_dir("405");
+    let addr = spawn_kiosk_with(test_config("http://127.0.0.1:1".to_string(), &dir, Some("t"))).await;
+
+    // No token needed: a method error is not data, so it is answered before the
+    // gate — and never handed to a daemon that is not listening here.
+    let resp = send(Method::GET, addr, "/intent", &[], vec![]);
+    assert_eq!(resp.status(), 405);
+    assert_eq!(
+        resp.headers()[header::ALLOW].to_str().unwrap(),
+        "POST",
+        "the Allow header names what the route does answer"
+    );
 }

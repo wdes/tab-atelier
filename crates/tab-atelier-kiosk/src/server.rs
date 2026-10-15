@@ -130,6 +130,15 @@ async fn handle(req: Request<Incoming>, upstream: &Upstream, panes: &Panes) -> R
                 Err(response) => response,
             }
         }
+        Route::Catalog => {
+            if !panes.authorized(authorization.as_ref()) {
+                return Panes::unauthorized();
+            }
+            Panes::catalog()
+        }
+        // A routing error, not data: answered before the gate, because the
+        // method is wrong whether or not the caller holds the token.
+        Route::MethodNotAllowed(allow) => Panes::method_not_allowed(allow),
     }
 }
 

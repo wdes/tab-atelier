@@ -19,8 +19,12 @@ daemon's data — each read and written directly, behind its own token:
 | `POST /decisions/<id>/tranch` | rule a decision, with a verdict |
 | `GET /reports` | the outbox listing, newest first |
 | `POST /intent` | record an intention as `outbox/intent-<ts>.md` |
+| `GET /catalog/list` | the skills catalogue (`{retired, skills}`) |
 
-Everything else is the daemon's, relayed unchanged.
+Everything else is the daemon's, relayed unchanged. A path in the table reached
+with the wrong method is a **405** with an `Allow` header — not a relay to the
+daemon, whose auth gate would answer a misleading 401 for what is really "this
+method is not allowed here".
 
 ## Running it
 
