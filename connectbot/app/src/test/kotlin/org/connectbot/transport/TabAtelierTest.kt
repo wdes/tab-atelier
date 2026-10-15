@@ -24,7 +24,9 @@
 package org.connectbot.transport
 
 import okio.ByteString.Companion.encodeUtf8
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -297,6 +299,113 @@ class TabAtelierTest {
             TabAtelier.Reconnect.Action.GIVE_UP,
             TabAtelier.Reconnect.decide(established = true, closed = true),
         )
+    }
+
+    /**
+     * A tab switch that could not open its socket does **not** end the session.
+     *
+     * This is the one assertion that pins the bug the user reported twice: "switching
+     * tabs sometimes shows another one, and only a disconnect restores the feed". The
+     * cause was a failed switch setting `closed` — which is the *session's* death, not
+     * its connection's. `closed` makes `read()` return -1, -1 ends the Relay, and the
+     * Relay is the only thing that will ever read the socket a later switch opens. So
+     * a single failed switch froze the terminal on the previous tab's content for the
+     * rest of the session, and force-disconnecting "fixed" it only because that builds
+     * a fresh transport with a fresh Relay.
+     *
+     * Asserted as "not GIVE_UP" rather than "== RETRY_AND_REPORT": the failure mode
+     * being guarded against is specifically the session being ended, and spelling it
+     * that way keeps the test meaningful if the recovery action is ever renamed.
+     */
+    @Test
+    fun aFailedTabSwitch_doesNotEndTheSession() {
+        assertNotEquals(
+            TabAtelier.Reconnect.Action.GIVE_UP,
+            TabAtelier.Reconnect.decideSwitchFailure(established = true),
+        )
+        assertEquals(
+            TabAtelier.Reconnect.Action.RETRY_AND_REPORT,
+            TabAtelier.Reconnect.decideSwitchFailure(established = true),
+        )
+    }
+
+    /**
+     * A tab switch on a session that never had a socket *does* end, because there is
+     * nothing behind it to keep: no socket has ever opened, so no Relay exists, and a
+     * retry would open a socket that nothing reads.
+     */
+    @Test
+    fun aFailedTabSwitchBeforeAnySocketOpened_endsTheSession() {
+        assertEquals(
+            TabAtelier.Reconnect.Action.GIVE_UP,
+            TabAtelier.Reconnect.decideSwitchFailure(established = false),
+        )
+    }
+
+    /**
+     * A frame arriving on a socket whose screen state is unknown is preceded by an
+     * erase, and its own bytes are untouched.
+     *
+     * The daemon replays a tab's ring from offset 0 with nothing at the front saying
+     * "erase what you have", so without this the new tab is drawn *into* the old one's
+     * screen — the two interleaved, which is what "switching tabs displays another one"
+     * looks like. Asserting the tail as well as the head because the failure mode of a
+     * naive `frame + erase` (or of dropping the frame) is exactly as bad as no erase
+     * at all.
+     */
+    @Test
+    fun aFrameOnAnUnknownScreen_isPresentedAfterAnErase() {
+        val frame = "prompt$ ".toByteArray(Charsets.US_ASCII)
+        val erase = "\u001b[2J\u001b[H\u001b[3J"
+
+        val presented = TabAtelier.Reconnect.presentedFrame(frame, screenStateUnknown = true)
+        val text = presented.decodeToString()
+
+        assertTrue(
+            "the erase must come first, not last: ${presented.toList()}",
+            text.startsWith(erase),
+        )
+        assertEquals(
+            "the frame must follow the erase untouched",
+            frame.decodeToString(),
+            text.substring(erase.length),
+        )
+    }
+
+    /**
+     * A frame arriving on a socket that already has the screen is passed through
+     * unchanged.
+     *
+     * Every frame after the first goes through this path, so an erase that leaked into
+     * them would clear the terminal on every packet — a screen that flickers empty
+     * continuously, which is a much louder failure than the one being fixed.
+     */
+    @Test
+    fun aFrameOnAKnownScreen_isPassedThroughUnchanged() {
+        val frame = "later output".toByteArray(Charsets.US_ASCII)
+
+        val presented = TabAtelier.Reconnect.presentedFrame(frame, screenStateUnknown = false)
+
+        assertArrayEquals(frame, presented)
+    }
+
+    /**
+     * The erase includes the scrollback, not just the display.
+     *
+     * `CSI 3 J` and not only `CSI 2 J`: with the display erased but the scrollback
+     * kept, the user could scroll up out of the tab they are on and into the previous
+     * tab's output — the same bug one gesture away. Asserted as "contains 3J" and not
+     * as an equality against a literal, so reordering or adding to the sequence does
+     * not fail a test that is about what it must include.
+     */
+    @Test
+    fun theEraseDiscardsTheScrollbackToo() {
+        val presented = TabAtelier.Reconnect.presentedFrame(ByteArray(0), screenStateUnknown = true)
+        val text = presented.decodeToString()
+
+        assertTrue("must erase the display: $text", text.contains("\u001b[2J"))
+        assertTrue("must home the cursor: $text", text.contains("\u001b[H"))
+        assertTrue("must erase the scrollback: $text", text.contains("\u001b[3J"))
     }
 
     /**

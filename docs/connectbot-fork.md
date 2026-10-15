@@ -616,22 +616,60 @@ ended.
 
 Three details are load-bearing and easy to get backwards:
 
-- **`isConnected()`/`isSessionOpen()` stay true while a redial is in flight.** This is not
-  "is a socket open" — that is `socket != null && open`, which is false in exactly the case
-  being handled. It has to be the weaker question because of who asks:
+- **`closed` is the session's death, not its connection's.** It makes `read()` return
+  -1, and -1 ends the Relay — the only thing that will ever read the socket a later
+  switch or redial opens. So it is set by `close()`, and by the one failure path where
+  no Relay exists to lose (a first dial that never opened), and by **nothing else**.
+  A *failed tab switch* on an established session is a drop, not an ending: it goes
+  through the same retry, aimed at the tab the user asked for. This was got wrong
+  once, and it produced both symptoms it was reported for — one failed switch froze
+  the terminal on the previous tab's content for the rest of the session, and only a
+  force-disconnect revived it, because that builds a fresh transport with a fresh
+  Relay. The rule is now `TabAtelier.Reconnect.decideSwitchFailure`, unit-tested.
+- **`isConnected()`/`isSessionOpen()` stay true while a redial is in flight.** This is
+  not "is a socket open" — that is `socket != null && open`, which is false in exactly
+  the case being handled. It has to be the weaker question because of who asks:
   `TerminalBridge.dispatchDisconnect` closes the transport *only* `if (it.isConnected())`,
-  so a false here would make the user's own Disconnect silently fail to stop the retry, and
-  `ConsoleScreen` uses `isSessionOpen` to detect the session being *newly* open in order to
-  raise the software keyboard — true throughout a reconnect would pop the keyboard over the
-  terminal the user is reading. Both go through a single `established` flag, set only in
-  `onOpen` and cleared in `connect`/`close`.
+  so a false here would make the user's own Disconnect silently fail to stop the retry,
+  and `ConsoleScreen` uses `isSessionOpen` to detect the session being *newly* open in
+  order to raise the software keyboard — true throughout a reconnect would pop the
+  keyboard over the terminal the user is reading. Both go through a single `established`
+  flag, set only in `onOpen` and cleared in `connect`/`close`.
 - **A drop reports 0 from `read()`, never -1.** `-1` ends the Relay's read loop, and the
-  Relay is the only thing that will ever read the socket the redial opens: a reconnect that
-  destroys its own reader is not a reconnect. `-1` is now reserved for `close()`.
-- **The drop message goes to the console's snackbar, not into the terminal.** The daemon
-  replays the tab's scrollback when the redial lands, so a line printed into the screen
-  would be overwritten moments later — and until then it would sit among the remote
-  program's output looking like something the server said.
+  Relay is the only thing that will ever read the socket the redial opens: a reconnect
+  that destroys its own reader is not a reconnect. `-1` is now reserved for `close()`.
+
+### A new socket's first frame is preceded by an erase, because the replay is not a repaint
+
+The daemon replays a tab's scrollback from the **start of its ring** whenever a socket
+attaches without a `since` (`api_ws.rs` treats a missing `since` as `0`). That replay is
+the raw byte stream from an arbitrary offset, with **nothing at the front saying "erase
+what you have"** — and the emulator, holding the previous tab's screen, renders it *into*
+that screen. The two interleave, and the user sees one tab's content with another's
+written over it: "switching tabs displays another one", and the earlier "renders all tabs
+at once, except the repainted prompt line", which are the same defect.
+
+So `TabAtelier.Reconnect.presentedFrame` prefixes `CSI 2 J` / `CSI H` / `CSI 3 J` to the
+first real frame after any socket is created — first dial, tab switch, or redial. The
+scrollback erase (`3 J`) is there because the user can otherwise scroll up out of the tab
+they are on and into the previous tab's output, which is the same bug one gesture away.
+
+Two things about *where* this is done:
+
+- **In `read()`, not `switchTab()`** — it is terminal output, so it belongs in the stream,
+  in order, written on the thread the Relay reads on. Clearing the emulator from elsewhere
+  would race that thread.
+- **On every socket, not every tab change** — a redial replays from offset 0 too, onto a
+  screen that already shows its tail, so the content would otherwise double up.
+
+The flag is set in `openSocket` *before* the socket is created, so there is no window in
+which the daemon's first bytes could land on a screen that still holds something else.
+
+### The drop message goes to the console's snackbar, not into the terminal
+
+The daemon replays the tab's scrollback when the redial lands, so a line printed into the
+screen would be overwritten moments later — and until then it would sit among the remote
+program's output looking like something the server said.
 
 The decision itself (`what a lost socket means`) and the backoff schedule are pure
 functions on `TabAtelier.Reconnect`, and both are unit-tested and mutation-checked. That is

@@ -94,13 +94,41 @@ class TabAtelier : AbsTransport() {
     @Volatile
     private var socket: WebSocket? = null
 
-    /** Bytes the daemon sent, waiting to be handed to the terminal emulator. */
+    /**
+     * Whether the terminal screen still holds something a fresh socket is about to
+     * invalidate.
+     *
+     * Set by [openSocket] whenever a socket is created — the first dial, a tab switch
+     * or a redial — and cleared by [read] once the first real bytes have been given
+     * the screen-erase that goes with them. See [Reconnect.presentedFrame] for why
+     * this exists at all.
+     */
+    @Volatile
+    private var screenStateUnknown = false
+
+    /**
+     * Bytes the daemon sent, waiting to be handed to the terminal emulator.
+     */
     private val inbound = LinkedBlockingQueue<ByteArray>()
 
     @Volatile
     private var open = false
 
-    /** Set once the daemon has gone away, so `read` can report it. */
+    /**
+     * Set once the session is over for good, so `read` can report it.
+     *
+     * **This is the session's death, not its connection's.** Setting it makes `read`
+     * return -1, and -1 ends the Relay — which is the only thing that will ever read
+     * a socket this transport opens afterwards. So it is set by [close], and by the
+     * one failure path where no Relay exists to lose, and by nothing else: a socket
+     * that dropped, or a tab switch whose socket would not open, must leave the Relay
+     * running so the retry has something to feed.
+     *
+     * It is also what [isConnected] and [isSessionOpen] test, so a stray write here
+     * does not merely stop the feed: it takes the session out of the app's own view
+     * of itself, which is how a failed tab switch used to end up looking like a
+     * closed session that only a force-disconnect could revive.
+     */
     @Volatile
     private var closed = false
 
@@ -310,6 +338,11 @@ class TabAtelier : AbsTransport() {
         currentAttempt = attempt
         open = false
 
+        // Set before the socket is created, so there is no window in which the
+        // daemon's first bytes could be rendered onto a screen that still holds
+        // something else. See [screenStateUnknown].
+        screenStateUnknown = true
+
         val opened = CountDownLatch(1)
         Timber.d("Opening tab-atelier session for host %d at %s", host.id, base.origin)
         val webSocket = client.clientFor(host.id, base).newWebSocket(request, Listener(opened, attempt))
@@ -413,28 +446,59 @@ class TabAtelier : AbsTransport() {
         // The old socket's failure, if it had one, is not this socket's.
         failure = null
 
+        // The tab the user asked for becomes the session's tab *before* the socket for
+        // it is opened, not after.
+        //
+        // Set here rather than on success because the failure path below redials, and
+        // the redial dials [currentTabKey]: leaving it on the tab being left would send
+        // the retry back to the tab the user just moved away from. It also makes a
+        // second tap on the same tab during that retry a no-op, which is right — the
+        // retry is already on it.
+        currentTabKey = tabKey
+
         return try {
             openSocket(tabKey)
-            currentTabKey = tabKey
-            // The whole session, not just this socket: a later drop has to redial
-            // the tab that is on screen now. (The socket itself reports CONNECTED
-            // from its own onOpen.)
+            // The socket reports CONNECTED from its own onOpen; nothing to do here.
             Timber.d("Moved the tab-atelier session to tab %s", tabKey)
             true
         } catch (e: IOException) {
-            // The move failed and the session has no socket left. Reported the way a
-            // lost connection is reported, rather than leaving a terminal that looks
-            // alive and never updates again.
-            //
-            // No retry: the tab being moved to was just refused, and by the time a
-            // retry could land the user would have no way to tell which of the two
-            // tabs they were looking at.
             Timber.w(e, "Could not move the tab-atelier session to tab %s", tabKey)
-            cancelRetry()
             failure = e
-            closed = true
-            setSocketState(ConnectionState.DISCONNECTED)
-            inbound.offer(END_OF_STREAM)
+
+            when (Reconnect.decideSwitchFailure(established)) {
+                Reconnect.Action.RETRY_AND_REPORT -> {
+                    // **The move failing is a drop, not the end of the session.** The
+                    // socket is gone but the session is not: the Relay is still
+                    // running, and the same retry that recovers a dropped socket
+                    // recovers this — to [currentTabKey], which is the tab the user
+                    // chose.
+                    //
+                    // This is what the previous version got wrong, and it produced
+                    // both of the symptoms it was reported for. It set `closed = true`,
+                    // which is permanent: `read` then returns -1, -1 ends the Relay,
+                    // and the Relay is the only thing that will ever read the socket a
+                    // later switch opens. So one failed switch killed the feed for the
+                    // rest of the session and left the terminal frozen on the
+                    // *previous* tab's content — one tab shown, another one asked for —
+                    // until the user force-disconnected, which builds a fresh
+                    // transport with a fresh Relay. That is why disconnecting
+                    // "restored the terminal feed".
+                    setSocketState(ConnectionState.RECONNECTING)
+                    manager?.let { service ->
+                        bridge?.emitSessionStatus(service.getString(R.string.tabatelier_connection_lost))
+                    }
+                    retrying()
+                }
+
+                else -> {
+                    // Nothing was ever established, so no Relay exists to feed and
+                    // there is nothing to keep alive. Ending it is the honest outcome;
+                    // a retry here would open a socket that nothing reads.
+                    closed = true
+                    setSocketState(ConnectionState.DISCONNECTED)
+                    inbound.offer(END_OF_STREAM)
+                }
+            }
             true
         }
     }
@@ -705,6 +769,28 @@ class TabAtelier : AbsTransport() {
         }
 
         /**
+         * What a *failed tab switch* means, which is not quite what a dropped socket
+         * means — hence a second function rather than a flag.
+         *
+         * An established session that could not open a socket for the tab it was asked
+         * for has not ended; it is the same situation as a socket dropping, and the
+         * same retry recovers it. A session that had no socket to begin with has no
+         * Relay either, so there is nothing for a retry to feed and ending it is the
+         * honest outcome.
+         *
+         * **The established case must never be [Action.GIVE_UP].** GIVE_UP is what sets
+         * `closed`, and `closed` is the session's death, not its connection's: it makes
+         * `read` return -1, which ends the Relay, which is the only thing that will
+         * ever read the socket a later switch opens. Getting this wrong means one
+         * failed switch freezes the terminal on the previous tab's content for the rest
+         * of the session and only a force-disconnect revives it. That is not a
+         * hypothetical — it is the bug this function was extracted from, and it is
+         * why this is a named, tested rule rather than an `if` in a catch block.
+         */
+        fun decideSwitchFailure(established: Boolean): Action =
+            if (established) Action.RETRY_AND_REPORT else Action.GIVE_UP
+
+        /**
          * How long to wait before the next dial, given how many have already failed.
          *
          * A backoff and not a fixed interval, because the two cases are different: a
@@ -721,6 +807,48 @@ class TabAtelier : AbsTransport() {
          */
         fun delayMillis(attempts: Int): Long =
             DELAYS_SECONDS[attempts.coerceIn(0, DELAYS_SECONDS.lastIndex)] * 1000L
+
+        /**
+         * The frame as the terminal should receive it, given that the screen's present
+         * contents cannot be trusted.
+         *
+         * **This is what stops a switched-to tab from being drawn on top of the tab
+         * that was left.** The daemon replays a tab's scrollback from the *start of its
+         * ring* whenever a socket attaches with no `since` (`api_ws.rs`: `since=0`),
+         * and that replay is not a repaint — it is the raw byte stream from an
+         * arbitrary offset, with nothing at the front saying "erase what you have". So
+         * a terminal that already holds content renders the replay *into* it: the old
+         * tab's screen stays, the new tab's output is written over the top, and the two
+         * are interleaved. That is the whole of "switching tabs displays another one"
+         * — and of the earlier "renders all tabs at once, except the repainted prompt
+         * line", which is the same defect seen before the tab switch stopped rebuilding
+         * the session.
+         *
+         * The same applies after a drop, which redials with no `since` either: the
+         * ring is replayed onto a screen that already shows its tail, so the content
+         * would otherwise double up. Hence "whenever a socket is created", not "whenever
+         * the tab changes".
+         *
+         * Erasing the scrollback (`CSI 3 J`) as well as the display matters here: this
+         * app is a viewer, the daemon keeps the tab, and its ring is what the user
+         * scrolls back through — so discarding the client's stale copy loses nothing
+         * that a screenful of replayed output does not restore. Leaving it would let
+         * the user scroll up out of one tab's output into another's.
+         *
+         * Applied in [read] rather than [switchTab] deliberately: it is terminal
+         * *output*, so it belongs in the stream, in order, on the thread the Relay
+         * reads on. Clearing the emulator from elsewhere would race that thread.
+         */
+        fun presentedFrame(frame: ByteArray, screenStateUnknown: Boolean): ByteArray =
+            if (screenStateUnknown) SCREEN_ERASE + frame else frame
+
+        /**
+         * Erase display, home the cursor, erase the scrollback.
+         *
+         * `CSI 2 J` alone would leave old lines above the cursor where the replay is
+         * shorter than the screen had been, so the home is not decoration.
+         */
+        private val SCREEN_ERASE = "\u001b[2J\u001b[H\u001b[3J".toByteArray(Charsets.US_ASCII)
 
         /** The escalating waits, in seconds; the last one is the cap. */
         private val DELAYS_SECONDS = longArrayOf(2, 5, 10, 20, 30)
@@ -784,7 +912,8 @@ class TabAtelier : AbsTransport() {
                 }
                 continue
             }
-            leftover = frame
+            leftover = Reconnect.presentedFrame(frame, screenStateUnknown)
+            screenStateUnknown = false
             leftoverOffset = 0
         }
     }
