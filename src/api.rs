@@ -709,6 +709,13 @@ pub struct TabSnapshot {
     /// 401s); a fresh token is minted on the next "Remote control" /
     /// `share-link`. Drained like `pending_bg_color_changes`.
     pub pending_token_rotations: Vec<String>,
+    /// `(tab_id, rw_token)` pairs queued by `POST /tabs/by-id/{id}/share`: a
+    /// share token the API minted for a tab, for the owner loop to adopt onto
+    /// the runtime Tab so the persist tick keeps it. The API sets it on the
+    /// snapshot immediately (so the caller can use it that instant) and queues
+    /// it here; without the queue the next snapshot rebuild — which reads the
+    /// runtime Tab — would drop it. Drained like `pending_token_rotations`.
+    pub pending_share_mints: Vec<(String, String)>,
     /// (`tab_id`, schedule-or-None) queued by
     /// `POST /tabs/by-id/{id}/schedule`. `None` clears the schedule
     /// (tab returns to 24/7 unless still manually locked). Same drain
@@ -2028,6 +2035,12 @@ fn handle_connection<S: Read + Write>(
                 tabs::close(stream, state, p);
             }
             "POST" if p.ends_with("/meta") => meta::set(stream, state, p, &body_bytes),
+            // Mint (or return) this tab's RW share token, so a caller that is
+            // not the GUI — the Kiosk — can build a terminal link without ever
+            // holding the master token. The share token authorises one tab.
+            "POST" if p.starts_with("/tabs/by-id/") && p.ends_with("/share") => {
+                tokens::mint_share(stream, state, p);
+            }
             "POST" if p.ends_with("/resize") => resize::run(stream, state, p, &body_bytes),
             "POST" if p.ends_with("/limits") => limits::set_tab(stream, state, p, &body_bytes),
             "POST" if p.ends_with("/rename") => rename::run(stream, state, p, &body_bytes),
@@ -3104,6 +3117,7 @@ pub fn test_snapshot(tabs: Vec<SnapshotTab>) -> TabSnapshot {
         pending_bg_color_changes: vec![],
         pending_context_changes: vec![],
         pending_token_rotations: vec![],
+        pending_share_mints: vec![],
         pending_schedule_changes: vec![],
         pending_new_tabs: std::collections::VecDeque::new(),
         pending_limit_changes: Vec::new(),

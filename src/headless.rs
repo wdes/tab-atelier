@@ -1046,6 +1046,7 @@ pub fn run() -> std::io::Result<()> {
         pending_bg_color_changes: Vec::new(),
         pending_context_changes: Vec::new(),
         pending_token_rotations: Vec::new(),
+        pending_share_mints: Vec::new(),
         pending_schedule_changes: Vec::new(),
         pending_new_tabs: std::collections::VecDeque::new(),
         pending_limit_changes: Vec::new(),
@@ -1968,6 +1969,7 @@ fn drain_pending(
     let badge_changes: Vec<(String, Option<String>)> = s.pending_badge_changes.drain(..).collect();
     let context_changes: Vec<(String, Option<String>)> = s.pending_context_changes.drain(..).collect();
     let token_rotations: Vec<String> = s.pending_token_rotations.drain(..).collect();
+    let share_mints: Vec<(String, String)> = s.pending_share_mints.drain(..).collect();
     let schedule_changes: Vec<(String, Option<crate::schedule::TabSchedule>)> =
         s.pending_schedule_changes.drain(..).collect();
     let limit_changes: Vec<(String, crate::TabResourceLimits, bool)> = s.pending_limit_changes.drain(..).collect();
@@ -1994,6 +1996,7 @@ fn drain_pending(
         && bg_color_changes.is_empty()
         && context_changes.is_empty()
         && token_rotations.is_empty()
+        && share_mints.is_empty()
         && schedule_changes.is_empty()
         && limit_changes.is_empty()
         && default_limit_change.is_none()
@@ -2097,6 +2100,14 @@ fn drain_pending(
         if let Some(t) = tabs.iter_mut().find(|t| *t.id == tab_id) {
             t.share_token_rw = "".into();
             t.share_token_ro = "".into();
+        }
+    }
+    // A share token the API minted (`POST /tabs/by-id/<id>/share`): adopt it so
+    // the next snapshot refresh keeps it. The API already set it on the
+    // snapshot for the caller's instant use; this is what makes it survive.
+    for (tab_id, token) in share_mints {
+        if let Some(t) = tabs.iter_mut().find(|t| *t.id == tab_id) {
+            t.share_token_rw = token.into();
         }
     }
     // Same path for the bg-color override.

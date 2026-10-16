@@ -1452,6 +1452,7 @@ impl AppState {
             pending_bg_color_changes: Vec::new(),
             pending_context_changes: Vec::new(),
             pending_token_rotations: Vec::new(),
+            pending_share_mints: Vec::new(),
             pending_schedule_changes: Vec::new(),
             pending_new_tabs: std::collections::VecDeque::new(),
             pending_limit_changes: Vec::new(),
@@ -2511,6 +2512,7 @@ impl AppState {
             let badge_changes: Vec<(String, Option<String>)> = snapshot.pending_badge_changes.drain(..).collect();
             let context_changes: Vec<(String, Option<String>)> = snapshot.pending_context_changes.drain(..).collect();
             let token_rotations: Vec<String> = snapshot.pending_token_rotations.drain(..).collect();
+            let share_mints: Vec<(String, String)> = snapshot.pending_share_mints.drain(..).collect();
             let schedule_changes: Vec<(String, Option<crate::schedule::TabSchedule>)> =
                 snapshot.pending_schedule_changes.drain(..).collect();
             let limit_changes: Vec<(String, crate::TabResourceLimits, bool)> =
@@ -2641,6 +2643,15 @@ impl AppState {
                 if let Some(tab) = self.tabs.iter_mut().find(|t| *t.id == tab_id) {
                     tab.share_token_rw = "".into();
                     tab.share_token_ro = "".into();
+                }
+            }
+            // A share token the API minted for a tab (`POST /tabs/by-id/<id>/share`):
+            // adopt it onto the runtime Tab so the next persist tick keeps it in
+            // tabs.json. The API already put it on the snapshot for the caller's
+            // instant use; this is what makes it survive.
+            for (tab_id, token) in share_mints {
+                if let Some(tab) = self.tabs.iter_mut().find(|t| *t.id == tab_id) {
+                    tab.share_token_rw = token.into();
                 }
             }
             for (tab_id, context) in context_changes {
