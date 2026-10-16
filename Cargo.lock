@@ -7125,6 +7125,7 @@ dependencies = [
  "sha2 0.10.9",
  "tab-atelier-briefs",
  "tab-atelier-pace",
+ "tab-atelier-web",
  "tempfile",
  "time",
  "tokio",
@@ -7187,6 +7188,19 @@ dependencies = [
  "tokio",
  "ureq",
  "uuid",
+]
+
+[[package]]
+name = "tab-atelier-web"
+version = "0.5.0-dev"
+dependencies = [
+ "bytes",
+ "http 1.4.2",
+ "http-body-util",
+ "hyper 1.10.1",
+ "hyper-util",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
