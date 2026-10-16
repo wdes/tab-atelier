@@ -3,6 +3,7 @@
 //! An account's compaction level.
 
 use crate::compact::Compact;
+use tab_atelier_api::schemars;
 
 use super::{Rejection, Validated};
 
@@ -13,7 +14,7 @@ use super::{Rejection, Validated};
 /// level names are a wire format the UI and `providers.json` share, and an
 /// unrecognised one should be refused with the name the caller actually sent —
 /// which is the one thing a serde derive cannot put in the message.
-#[derive(Debug, Default, serde::Deserialize)]
+#[derive(Debug, Default, serde::Deserialize, tab_atelier_api::schemars::JsonSchema)]
 pub struct SetCompact {
     #[serde(default)]
     pub compact: String,

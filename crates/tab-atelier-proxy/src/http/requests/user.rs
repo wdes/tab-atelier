@@ -3,6 +3,7 @@
 //! Accounts: creating one, and the four per-account switches.
 
 use super::{Rejection, Validated, loose_bool};
+use tab_atelier_api::schemars;
 
 /// Creating an account.
 ///
@@ -10,7 +11,7 @@ use super::{Rejection, Validated, loose_bool};
 /// `Store::add` accepts the empty string for any of them and folds an empty
 /// email into an internal id. Refusing an incomplete person would be a
 /// policy the store does not have.
-#[derive(Debug, Default, serde::Deserialize)]
+#[derive(Debug, Default, serde::Deserialize, tab_atelier_api::schemars::JsonSchema)]
 pub struct AddUser {
     #[serde(default)]
     pub first_name: String,
@@ -31,7 +32,7 @@ impl Validated for AddUser {
 }
 
 /// Pinning an account to one provider, or clearing the pin.
-#[derive(Debug, Default, serde::Deserialize)]
+#[derive(Debug, Default, serde::Deserialize, tab_atelier_api::schemars::JsonSchema)]
 pub struct PinProvider {
     /// Empty clears the pin, which is why an absent field is not an error.
     #[serde(default)]
@@ -49,7 +50,7 @@ impl Validated for PinProvider {
 }
 
 /// Pinning an account to one model name, or clearing the pin.
-#[derive(Debug, Default, serde::Deserialize)]
+#[derive(Debug, Default, serde::Deserialize, tab_atelier_api::schemars::JsonSchema)]
 pub struct PinModel {
     #[serde(default)]
     pub model: String,
@@ -66,7 +67,7 @@ impl Validated for PinModel {
 }
 
 /// Switching an account off, or back on.
-#[derive(Debug, Default, serde::Deserialize)]
+#[derive(Debug, Default, serde::Deserialize, tab_atelier_api::schemars::JsonSchema)]
 pub struct SetDisabled {
     #[serde(default, deserialize_with = "loose_bool::optional")]
     pub disabled: Option<bool>,
@@ -96,7 +97,7 @@ impl Validated for SetDisabled {
 /// script tends to send the policy bare. The envelope is checked first, because
 /// a bare policy deserialises from `{"tools": ...}` too — to all defaults —
 /// which would silently discard everything the caller asked for.
-#[derive(Debug)]
+#[derive(Debug, tab_atelier_api::schemars::JsonSchema)]
 pub struct SetTools {
     pub policy: crate::tools::Policy,
 }
@@ -122,7 +123,7 @@ impl Validated for SetTools {
 ///
 /// The weight is clamped by the store, not here, so that the floor lives in one
 /// place no matter which caller writes it.
-#[derive(Debug, Default, serde::Deserialize)]
+#[derive(Debug, Default, serde::Deserialize, tab_atelier_api::schemars::JsonSchema)]
 pub struct SetWeight {
     #[serde(default)]
     pub weight: Option<u32>,

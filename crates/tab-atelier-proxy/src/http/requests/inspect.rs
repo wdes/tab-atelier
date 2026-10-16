@@ -3,6 +3,7 @@
 //! Arming request inspection.
 
 use super::{Rejection, Validated};
+use tab_atelier_api::schemars;
 
 /// How long to capture requests for.
 ///
@@ -11,7 +12,7 @@ use super::{Rejection, Validated};
 /// an inspection left on is a log of other people's prompts. `minutes` is
 /// clamped by [`crate::inspect`] as well, so a hand-rolled request cannot
 /// outlive the ceiling the UI respects.
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, tab_atelier_api::schemars::JsonSchema)]
 pub struct ArmInspect {
     #[serde(default = "default_minutes")]
     pub minutes: u64,

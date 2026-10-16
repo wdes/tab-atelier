@@ -3,6 +3,7 @@
 //! Saving a provider: adding one, editing one, or copying one.
 
 use crate::provider::Preset;
+use tab_atelier_api::schemars;
 
 use super::{Rejection, Validated, loose_bool};
 
@@ -18,7 +19,7 @@ use super::{Rejection, Validated, loose_bool};
 /// distinction is load-bearing: an absent `enabled` means *leave the current
 /// value alone* while `false` means *switch it off*. Collapsing the two is the
 /// bug this route already had once — see `save_provider`.
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, tab_atelier_api::schemars::JsonSchema)]
 pub struct SaveProvider {
     /// One of [`Preset::ALL`], or empty for a hand-written provider.
     #[serde(default)]
@@ -86,7 +87,7 @@ impl Validated for SaveProvider {
 }
 
 /// Replacing one provider's key, and nothing else.
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, tab_atelier_api::schemars::JsonSchema)]
 pub struct RotateProviderKey {
     #[serde(default)]
     pub key: String,

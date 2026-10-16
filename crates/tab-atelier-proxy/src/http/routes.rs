@@ -36,6 +36,12 @@ use std::sync::Arc;
 use rocket::http::Status;
 use rocket::{Route, State, catch, delete, get, head, options, post, routes};
 
+// The OpenAPI half of the shared API crate. `openapi` is the attribute that
+// makes a route's response and body appear in the document; the crate is the
+// document's one author, so this is the only handle a route needs on it.
+use tab_atelier_api::rocket_okapi::openapi;
+use tab_atelier_api::rocket_okapi::openapi_get_routes_spec;
+
 use crate::http::body::Json;
 use crate::http::controllers::{account, hello, inspect, key, mapping, me, models, provider, relay, usage, web};
 use crate::http::guards::{Admin, Arrival, ClientKey};
@@ -65,6 +71,7 @@ use rocket::http::Method;
 /// forwarding and translates the answer when the client asked for the `OpenAI`
 /// shape, so two routes would differ only in a string — and the admission,
 /// shaping and capture logic they share is the part worth keeping in one place.
+#[openapi]
 #[post("/relay/anthropic/<sub..>", data = "<body>")]
 pub(crate) async fn relay_post(
     state: &State<Arc<AppState>>,
@@ -92,6 +99,7 @@ pub(crate) async fn relay_post(
 /// this hop is configured against does not serve the route at all, so forwarding
 /// it returned 404 and left the agent's turns counted but unpriced. The registry
 /// holds the rates, so that one path is answered from here.
+#[openapi]
 #[get("/relay/anthropic/<sub..>")]
 pub(crate) async fn relay_get(state: &State<Arc<AppState>>, arrival: Arrival, who: ClientKey, sub: PathBuf) -> Reply {
     if models::is_price_list(&sub) {
@@ -109,12 +117,14 @@ pub(crate) async fn relay_get(state: &State<Arc<AppState>>, arrival: Arrival, wh
 /// Answered from memory rather than forwarded. This is the endpoint a client
 /// probes before it starts, and a probe that costs an upstream round trip is a
 /// probe that fails precisely when the upstream is the thing being diagnosed.
+#[openapi]
 #[get("/relay/anthropic/api/hello")]
 pub(crate) fn relay_hello() -> Reply {
     hello::hello("GET")
 }
 
 /// The same probe, for the checkers that use `HEAD`.
+#[openapi]
 #[head("/relay/anthropic/api/hello")]
 pub(crate) fn relay_hello_head() -> Reply {
     hello::hello("HEAD")
@@ -123,12 +133,14 @@ pub(crate) fn relay_hello_head() -> Reply {
 // ── the per-user paths ──────────────────────────────────────────────────────
 
 /// What this key's account has spent.
+#[openapi]
 #[get("/me/usage?<window>")]
 pub(crate) fn me_usage(state: &State<Arc<AppState>>, who: ClientKey, window: Option<String>) -> Reply {
     me::me_usage(state, &who.account, window.as_deref())
 }
 
 /// Repair this account's credential, in place.
+#[openapi]
 #[post("/me/credentials", data = "<body>")]
 pub(crate) async fn me_credentials(state: &State<Arc<AppState>>, arrival: Arrival, who: ClientKey, body: Raw) -> Reply {
     me::me_credentials(state, &who.account, &arrival, body).await
@@ -140,12 +152,14 @@ pub(crate) async fn me_credentials(state: &State<Arc<AppState>>, arrival: Arriva
 ///
 /// Unauthenticated on purpose: the question is whether the process is up, and a
 /// probe needing a credential cannot be sent before the caller has one.
+#[openapi]
 #[get("/api/hello")]
 pub(crate) fn hello_get() -> Reply {
     hello::hello("GET")
 }
 
 /// The same, for the checkers that use `HEAD`.
+#[openapi]
 #[head("/api/hello")]
 pub(crate) fn hello_head() -> Reply {
     hello::hello("HEAD")
@@ -154,24 +168,28 @@ pub(crate) fn hello_head() -> Reply {
 // ── the operator API: accounts ──────────────────────────────────────────────
 
 /// Every account, with its keys.
+#[openapi]
 #[get("/api/users")]
 pub(crate) fn list_users(state: &State<Arc<AppState>>, _admin: Admin) -> Reply {
     account::list(state)
 }
 
 /// Create one.
+#[openapi]
 #[post("/api/users", data = "<body>")]
 pub(crate) fn add_user(state: &State<Arc<AppState>>, _admin: Admin, body: Json<AddUser>) -> Reply {
     account::add(state, &body.0)
 }
 
 /// Delete one.
+#[openapi]
 #[delete("/api/users/<account>")]
 pub(crate) fn remove_user(state: &State<Arc<AppState>>, _admin: Admin, account: &str) -> Reply {
     account::remove(state, account)
 }
 
 /// Switch an account off, or back on.
+#[openapi]
 #[post("/api/users/<account>/disabled", data = "<body>")]
 pub(crate) fn set_user_disabled(
     state: &State<Arc<AppState>>,
@@ -183,6 +201,7 @@ pub(crate) fn set_user_disabled(
 }
 
 /// How much of the pool this account may take.
+#[openapi]
 #[post("/api/users/<account>/weight", data = "<body>")]
 pub(crate) fn set_user_weight(
     state: &State<Arc<AppState>>,
@@ -194,6 +213,7 @@ pub(crate) fn set_user_weight(
 }
 
 /// Which provider this account relays through.
+#[openapi]
 #[post("/api/users/<account>/provider", data = "<body>")]
 pub(crate) fn set_user_provider(
     state: &State<Arc<AppState>>,
@@ -205,6 +225,7 @@ pub(crate) fn set_user_provider(
 }
 
 /// Pin this account to one model on its provider.
+#[openapi]
 #[post("/api/users/<account>/model", data = "<body>")]
 pub(crate) fn set_user_model(
     state: &State<Arc<AppState>>,
@@ -216,6 +237,7 @@ pub(crate) fn set_user_model(
 }
 
 /// How much history this account keeps before a conversation is compacted.
+#[openapi]
 #[post("/api/users/<account>/compact", data = "<body>")]
 pub(crate) fn set_user_compact(
     state: &State<Arc<AppState>>,
@@ -227,6 +249,7 @@ pub(crate) fn set_user_compact(
 }
 
 /// The tools this account may call.
+#[openapi]
 #[post("/api/users/<account>/tools", data = "<body>")]
 pub(crate) fn set_user_tools(
     state: &State<Arc<AppState>>,
@@ -240,12 +263,14 @@ pub(crate) fn set_user_tools(
 // ── the operator API: keys ──────────────────────────────────────────────────
 
 /// Mint a key for an account.
+#[openapi]
 #[post("/api/users/<account>/keys", data = "<body>")]
 pub(crate) fn add_key(state: &State<Arc<AppState>>, _admin: Admin, account: &str, body: Json<AddKey>) -> Reply {
     key::add(state, account, &body.0)
 }
 
 /// Disable one key, or bring it back.
+#[openapi]
 #[post("/api/users/<account>/keys/<key>", data = "<body>")]
 pub(crate) fn set_key_disabled(
     state: &State<Arc<AppState>>,
@@ -258,6 +283,7 @@ pub(crate) fn set_key_disabled(
 }
 
 /// Revoke one key.
+#[openapi]
 #[delete("/api/users/<account>/keys/<key>")]
 pub(crate) fn remove_key(state: &State<Arc<AppState>>, _admin: Admin, account: &str, key: &str) -> Reply {
     key::remove(state, account, key)
@@ -266,18 +292,21 @@ pub(crate) fn remove_key(state: &State<Arc<AppState>>, _admin: Admin, account: &
 // ── the operator API: providers ─────────────────────────────────────────────
 
 /// The provider catalogue, and the providers that are configured.
+#[openapi]
 #[get("/api/providers")]
 pub(crate) fn list_providers(state: &State<Arc<AppState>>, _admin: Admin) -> Reply {
     crate::transport::json_of(200, &crate::http::resources::providers_json(state.inner()))
 }
 
 /// Add or change a provider.
+#[openapi]
 #[post("/api/providers", data = "<body>")]
 pub(crate) fn save_provider(state: &State<Arc<AppState>>, _admin: Admin, body: Json<SaveProvider>) -> Reply {
     provider::save(&body.0, state)
 }
 
 /// Replace a provider's key without changing anything else.
+#[openapi]
 #[post("/api/providers/<id>/key", data = "<body>")]
 pub(crate) fn rotate_provider_key(
     state: &State<Arc<AppState>>,
@@ -289,6 +318,7 @@ pub(crate) fn rotate_provider_key(
 }
 
 /// Remove a provider.
+#[openapi]
 #[delete("/api/providers/<id>")]
 pub(crate) fn remove_provider(state: &State<Arc<AppState>>, _admin: Admin, id: &str) -> Reply {
     provider::remove(id, state)
@@ -297,18 +327,21 @@ pub(crate) fn remove_provider(state: &State<Arc<AppState>>, _admin: Admin, id: &
 // ── the operator API: mappings, usage, pressure ─────────────────────────────
 
 /// Rename a model on the way through.
+#[openapi]
 #[post("/api/mappings", data = "<body>")]
 pub(crate) fn add_mapping(state: &State<Arc<AppState>>, _admin: Admin, body: Json<AddMapping>) -> Reply {
     mapping::add(state, &body.0)
 }
 
 /// Stop renaming it.
+#[openapi]
 #[delete("/api/mappings/<from>")]
 pub(crate) fn remove_mapping(state: &State<Arc<AppState>>, _admin: Admin, from: &str) -> Reply {
     mapping::remove(state, from)
 }
 
 /// What everyone has spent, over a window.
+#[openapi]
 #[get("/api/usage?<window>")]
 pub(crate) fn usage_report(state: &State<Arc<AppState>>, _admin: Admin, window: Option<String>) -> Reply {
     let query = window.map_or_else(String::new, |w| format!("window={w}"));
@@ -316,6 +349,7 @@ pub(crate) fn usage_report(state: &State<Arc<AppState>>, _admin: Admin, window: 
 }
 
 /// How much of the budget is left, and who is waiting on it.
+#[openapi]
 #[get("/api/pressure")]
 pub(crate) fn pressure(state: &State<Arc<AppState>>, _admin: Admin) -> Reply {
     // Whether to report on the plan at all is the router's own judgement, asked
@@ -338,18 +372,21 @@ pub(crate) fn pressure(state: &State<Arc<AppState>>, _admin: Admin) -> Reply {
 // ── the operator API: capture ───────────────────────────────────────────────
 
 /// What the recorder is doing, and everything it has caught.
+#[openapi]
 #[get("/api/inspect")]
 pub(crate) fn read_inspect(state: &State<Arc<AppState>>, _admin: Admin) -> Reply {
     inspect::status(state)
 }
 
 /// Start recording the next exchange, verbatim.
+#[openapi]
 #[post("/api/inspect", data = "<body>")]
 pub(crate) fn arm_inspect(state: &State<Arc<AppState>>, _admin: Admin, body: Json<ArmInspect>) -> Reply {
     inspect::arm(&body.0, state)
 }
 
 /// Stop recording.
+#[openapi]
 #[delete("/api/inspect")]
 pub(crate) fn disarm_inspect(state: &State<Arc<AppState>>, _admin: Admin) -> Reply {
     inspect::disarm(state)
@@ -532,8 +569,17 @@ pub(crate) fn unavailable() -> Reply {
 /// so the set of paths a client can reach is one screen long, and a route
 /// accidentally left unmounted is visible rather than silent.
 #[must_use]
-pub fn all() -> Vec<Route> {
-    routes![
+/// Every route the proxy mounts, in mount order, and the document derived from
+/// the ones that carry `#[openapi]`.
+///
+/// The two lists are separate because okapi's macro insists every route handed
+/// to it be `#[openapi]` — the UI shell and the preflight answer a body they
+/// shape themselves or none at all, and describe every path under the root, so
+/// neither has a resource to document. Handing them to `routes!` and listing
+/// them in [`exempt`] keeps them out of the document without hiding them from
+/// the mount; the coverage test proves the two lists together are everything.
+pub fn all_and_spec() -> (Vec<Route>, tab_atelier_api::rocket_okapi::okapi::openapi3::OpenApi) {
+    let (mut documented, spec) = openapi_get_routes_spec![
         relay_post,
         relay_get,
         relay_hello,
@@ -565,8 +611,46 @@ pub fn all() -> Vec<Route> {
         read_inspect,
         arm_inspect,
         disarm_inspect,
-        ui,
-        preflight,
+    ];
+    let opaque = routes![ui, preflight];
+    documented.extend(opaque);
+    (documented, spec)
+}
+
+/// The routes alone, for a caller that mounts them without the document.
+///
+/// The socket tests build a client from the route list; the server mounts
+/// [`all_and_spec`] so it also gets the document. Both go through one definition
+/// of the list, so a test cannot pass against routes the server does not mount.
+#[must_use]
+pub fn all() -> Vec<Route> {
+    all_and_spec().0
+}
+
+/// The routes kept out of the document, each with the reason a reader judges.
+///
+/// The point of `assert_covers` is that this list can only shrink: an entry
+/// naming a route that no longer exists fails, and a mounted route matching no
+/// entry and no document path fails too.
+#[must_use]
+pub fn exempt() -> Vec<tab_atelier_api::Exempt> {
+    use rocket::http::Method;
+    vec![
+        tab_atelier_api::Exempt {
+            method: Method::Get,
+            path: "/<path..>",
+            reason: "the UI shell and its assets; a path space, not one resource, and also the 405 for a GET at a write-only path",
+        },
+        tab_atelier_api::Exempt {
+            method: Method::Options,
+            path: "/<_path..>",
+            reason: "the CORS preflight; it answers headers and no body",
+        },
+        tab_atelier_api::Exempt {
+            method: Method::Get,
+            path: "/openapi.json",
+            reason: "the document itself, added by the mount",
+        },
     ]
 }
 

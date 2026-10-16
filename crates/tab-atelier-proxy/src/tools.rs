@@ -26,6 +26,7 @@
 //! byte-identical body.
 
 use std::collections::BTreeMap;
+use tab_atelier_api::schemars;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -65,7 +66,7 @@ pub const ALWAYS_KEPT: [&str; 1] = ["ToolSearch"];
 ///
 /// So the modes below are static on purpose. A policy that wants fewer tools
 /// says so once, in `allow`/`disable`, and gets the same array every turn.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, tab_atelier_api::schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Mode {
     /// Everything the client sent, minus `disable`. The default.
@@ -148,7 +149,7 @@ impl Mode {
 /// loads as the no-op, and `deny_unknown_fields` is deliberately *not* set:
 /// an unrecognized key is a typo, but failing the whole load over one would
 /// take the proxy down rather than the tool.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, tab_atelier_api::schemars::JsonSchema)]
 #[serde(default)]
 pub struct Policy {
     pub mode: Mode,
@@ -208,7 +209,7 @@ impl Refusal {
 /// rule that is subtly wrong is both a correctness bug and a silent cache
 /// invalidator. A closed set can be tested against the text it will actually
 /// meet; a regex cannot, and the crate carries none.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, tab_atelier_api::schemars::JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum Normalise {
     /// Drop sentences asserting the current date.

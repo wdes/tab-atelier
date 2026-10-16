@@ -47,9 +47,14 @@ futures-util = { version = "0.3", default-features = false, features = ["std", "
 # Rocket; the OpenAPI document is derived from the same structs by okapi, so the
 # spec cannot drift from the handlers the way a hand-written one does.
 #
-# rocket_okapi pins rocket to exactly 0.5.1, so this is a three-crate lockstep:
-# bumping one means bumping all of them together.
+# `rocket` and `rocket_okapi` are named here only because their attribute macros
+# expand to absolute paths (`::rocket::`, `::rocket_okapi::`) that resolve
+# against the extern prelude, not against a re-export — `#[get]` needs the one,
+# `#[openapi]` the other. Every *type* still comes through `tab-atelier-api`,
+# which owns the lockstep; bumping the three together is its business, not this
+# crate's.
 rocket = { version = "0.5.1", features = ["json"] }
+rocket_okapi = "0.9"
 sha2 = { version = "0.10", default-features = false }
 # Subresource Integrity, which mandates base64 — hex cannot stand in for it.
 # Already in this crate's graph via ureq, so declaring it costs no compile unit.

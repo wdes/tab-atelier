@@ -25,6 +25,10 @@ use rocket::Request;
 use rocket::data::{Data, FromData, ToByteUnit};
 use rocket::http::Status;
 use rocket::outcome::Outcome;
+use tab_atelier_api::rocket_okapi::r#gen::OpenApiGenerator;
+use tab_atelier_api::rocket_okapi::okapi::Map;
+use tab_atelier_api::rocket_okapi::okapi::openapi3::{MediaType, RequestBody};
+use tab_atelier_api::rocket_okapi::request::OpenApiFromData;
 
 use crate::http::refusal::Refusal;
 
@@ -89,6 +93,25 @@ impl<'r> FromData<'r> for Raw {
 #[must_use]
 pub const fn empty() -> Raw {
     Raw(Bytes::new())
+}
+
+/// Documenting the raw body, so a route taking one may carry `#[openapi]`.
+///
+/// The guard's whole point is that it does not look inside: the relay forwards
+/// the payload to an upstream untouched, and the credential install reads its
+/// own envelope. There is no struct to describe, so the body is documented as
+/// JSON with no schema — accurate about the shape a client sends, silent about
+/// fields this end never inspects.
+impl OpenApiFromData<'_> for Raw {
+    fn request_body(_g: &mut OpenApiGenerator) -> tab_atelier_api::rocket_okapi::Result<RequestBody> {
+        let mut content = Map::new();
+        content.insert("application/json".to_owned(), MediaType::default());
+        Ok(RequestBody {
+            content,
+            required: true,
+            ..RequestBody::default()
+        })
+    }
 }
 
 #[cfg(test)]

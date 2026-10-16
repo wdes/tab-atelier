@@ -26,6 +26,8 @@ use std::sync::Arc;
 use rocket::Request;
 use rocket::http::Status;
 use rocket::request::{FromRequest, Outcome};
+use tab_atelier_api::rocket_okapi::r#gen::OpenApiGenerator;
+use tab_atelier_api::rocket_okapi::request::{OpenApiFromRequest, RequestHeaderInput};
 
 use crate::http::middleware::{admin_token, arrival, authenticate_and_stamp};
 use crate::http::refusal::{Refusal, remember};
@@ -163,6 +165,33 @@ impl<'r> FromRequest<'r> for Admin {
         }
     }
 }
+
+/// Documenting the middleware, so a guarded route may carry `#[openapi]`.
+///
+/// `Arrival` reads the request, `ClientKey` and `Admin` refuse it, but none of
+/// them is a *parameter* of the route — the credential is one header the whole
+/// API shares, described once in the document's security section, and the
+/// client's address is not something a caller sends on purpose. So each
+/// declares no per-route input. What okapi needs is only to know the guard
+/// exists: without these impls `#[openapi]` refuses any handler that takes one,
+/// which is every route behind a check.
+macro_rules! documents_itself {
+    ($($guard:ty),+ $(,)?) => {
+        $(
+            impl OpenApiFromRequest<'_> for $guard {
+                fn from_request_input(
+                    _g: &mut OpenApiGenerator,
+                    _name: String,
+                    _required: bool,
+                ) -> tab_atelier_api::rocket_okapi::Result<RequestHeaderInput> {
+                    Ok(RequestHeaderInput::None)
+                }
+            }
+        )+
+    };
+}
+
+documents_itself!(Arrival, ClientKey, Admin);
 
 /// The application state, if it was mounted.
 ///

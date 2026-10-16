@@ -3,6 +3,7 @@
 //! Model-name mappings.
 
 use super::{Rejection, Validated};
+use tab_atelier_api::schemars;
 
 /// A mapping from a name a client asks for to the name the provider serves.
 ///
@@ -10,7 +11,7 @@ use super::{Rejection, Validated};
 /// gets. The emptiness of either end is a rule about the pair, and it is
 /// checked here rather than in the handler because a mapping with a blank half
 /// has no meaning to hand downstream at all.
-#[derive(Debug, Default, serde::Deserialize)]
+#[derive(Debug, Default, serde::Deserialize, tab_atelier_api::schemars::JsonSchema)]
 pub struct AddMapping {
     #[serde(default)]
     pub from: String,

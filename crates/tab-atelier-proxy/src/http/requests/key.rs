@@ -3,6 +3,7 @@
 //! Keys: minting one, and switching one off.
 
 use super::{Rejection, Validated, loose_bool};
+use tab_atelier_api::schemars;
 
 /// Minting a named key.
 ///
@@ -12,7 +13,7 @@ use super::{Rejection, Validated, loose_bool};
 ///
 /// An unnamed key is called `new`: the name is the operator's handle for the
 /// key, and an empty one leaves a row they cannot tell apart from the next.
-#[derive(Debug, Default, serde::Deserialize)]
+#[derive(Debug, Default, serde::Deserialize, tab_atelier_api::schemars::JsonSchema)]
 pub struct AddKey {
     #[serde(default)]
     pub name: String,
@@ -46,7 +47,7 @@ impl Validated for AddKey {
 /// disable a key, so a body that does not say otherwise means it — and that is
 /// why the field is an [`Option`] rather than a defaulted `false`, which would
 /// silently mean the opposite.
-#[derive(Debug, Default, serde::Deserialize)]
+#[derive(Debug, Default, serde::Deserialize, tab_atelier_api::schemars::JsonSchema)]
 pub struct SetKeyDisabled {
     #[serde(default, deserialize_with = "loose_bool::optional")]
     pub disabled: Option<bool>,

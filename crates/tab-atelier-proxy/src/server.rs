@@ -117,14 +117,30 @@ pub fn now_ms() -> u64 {
 /// that are genuinely ours — the state the routes read and the reply type they
 /// return.
 ///
+/// Build the proxy's Rocket: the routes, the document derived from them, the
+/// catchers, and the state they read.
+///
+/// One definition of the app, shared by [`serve`] and [`serve_on`]: a route
+/// mounted in one and not the other would be a difference no test could see.
+fn build(addr: SocketAddr, state: Arc<State>) -> rocket::Rocket<rocket::Build> {
+    let mounted = tab_atelier_api::mount(crate::http::routes::all_and_spec(), "/");
+    let rocket = rocket::custom(crate::http::config(addr))
+        .mount("/", mounted.routes)
+        .register("/", crate::http::routes::catchers())
+        .manage(state);
+    // Every route is documented or exempt, checked on every build — a route
+    // added without either panics here rather than shipping an API whose
+    // document has quietly stopped matching it. This is the whole reason the
+    // document is derived: the check is the point, not the JSON.
+    tab_atelier_api::assert_covers(&rocket, &mounted.spec, &crate::http::routes::exempt());
+    rocket
+}
+
 /// # Errors
 /// If the address cannot be bound — a port already in use, or one below 1024
 /// without the privilege for it.
 pub async fn serve(addr: SocketAddr, state: Arc<State>) -> Result<(), String> {
-    let rocket = rocket::custom(crate::http::config(addr))
-        .mount("/", crate::http::routes::all())
-        .register("/", crate::http::routes::catchers())
-        .manage(state);
+    let rocket = build(addr, state);
     rocket.launch().await.map(|_| ()).map_err(|e| format!("rocket: {e}"))
 }
 
@@ -151,15 +167,74 @@ pub async fn serve_on(addr: SocketAddr, state: Arc<State>) -> Result<SocketAddr,
         addr
     };
     log::info!("tab-atelier-proxy listening on http://{addr}");
-    let rocket = rocket::custom(crate::http::config(addr))
-        .mount("/", crate::http::routes::all())
-        .register("/", crate::http::routes::catchers())
-        .manage(state);
+    let rocket = build(addr, state);
     rocket.launch().await.map(|_| addr).map_err(|e| format!("rocket: {e}"))
 }
 
 #[cfg(test)]
 mod tests {
-    //! The socket-level tests live beside the handlers they drive; this
-    //! module keeps only what is still in this file.
+    //! The socket-level tests live beside the handlers they drive; this module
+    //! keeps the two checks that belong to the app as a whole — that every route
+    //! is mounted, and that the document derived from them is served.
+
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::sync::Arc;
+
+    use rocket::http::Status;
+    use rocket::local::blocking::Client;
+
+    use super::State;
+
+    fn app() -> Client {
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        Client::tracked(super::build(addr, Arc::new(State::for_tests("t".to_owned())))).expect("a valid rocket")
+    }
+
+    /// Every route is mounted and covered.
+    ///
+    /// `build` already asserts coverage — a route added without a document path
+    /// or an exempt entry panics there — so this drives that build and pins that
+    /// the routes really are mounted, not merely listed.
+    #[test]
+    fn every_route_is_mounted_and_covered() {
+        let client = app();
+        assert!(
+            client.rocket().routes().count() >= 33,
+            "the documented and exempt routes are all mounted"
+        );
+    }
+
+    /// How many responses are still untyped, pinned so the number can only fall.
+    ///
+    /// A route that could carry a typed resource and still returns a bare
+    /// `Reply` shows up as an `x-dynamic-body` in the document. The count today
+    /// is every documented route — rung one annotates and mounts, rung two types
+    /// the payloads and lowers this. It is a ceiling, not a target: re-pinned
+    /// downward when a payload is typed, never raised to quiet a new route.
+    /// `usize::MAX` reads the current count out of the failure.
+    #[test]
+    fn untyped_responses_do_not_grow() {
+        let client = app();
+        let body = client.get("/openapi.json").dispatch().into_string().expect("a body");
+        let count = body.matches("x-dynamic-body").count();
+        assert!(
+            count <= 31,
+            "x-dynamic-body responses: {count} (was 31; lower the pin when a payload is typed)"
+        );
+    }
+
+    /// The document is reachable, and it is the derived one.
+    ///
+    /// It names a real path and the `openapi` key, so an empty document or a
+    /// hand-written stub would fail — which is the whole claim: the spec comes
+    /// from the routes, and cannot lag them.
+    #[test]
+    fn the_openapi_document_is_served() {
+        let client = app();
+        let response = client.get("/openapi.json").dispatch();
+        assert_eq!(response.status(), Status::Ok);
+        let body = response.into_string().expect("a body");
+        assert!(body.contains("/api/users"), "the document names a real route: {body}");
+        assert!(body.contains("\"openapi\""), "and it is an OpenAPI document");
+    }
 }
