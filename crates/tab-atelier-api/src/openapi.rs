@@ -86,12 +86,17 @@ pub fn assert_covers(rocket: &rocket::Rocket<rocket::Build>, spec: &okapi::opena
 
     // The mounted (method, path) pairs, normalised the way okapi normalises a
     // route into a document path: Rocket's `<x>`/`<x..>` become `{x}`.
+    //
+    // `route.uri.path()` is already the canonical mounted path — the origin,
+    // which is the base and the route concatenated. Prefixing `route.uri.base()`
+    // as well double-counts the mount point, and a root mount (`"/"`) shows it
+    // as a leading `//` that matches no document path.
     let mounted: BTreeSet<(String, String)> = rocket
         .routes()
         .map(|route| {
             (
                 route.method.to_string().to_ascii_uppercase(),
-                normalise(&format!("{}{}", route.uri.base(), route.uri.path())),
+                normalise(route.uri.path()),
             )
         })
         .collect();

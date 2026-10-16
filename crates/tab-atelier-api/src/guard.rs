@@ -23,6 +23,8 @@ use rocket::request::{FromRequest, Outcome, Request};
 
 use crate::auth::{Authenticator, Presented};
 use crate::refusal::{Refusal, remember};
+use rocket_okapi::r#gen::OpenApiGenerator;
+use rocket_okapi::request::{OpenApiFromRequest, RequestHeaderInput};
 
 /// The credential a request presented, read from every form this API accepts.
 ///
@@ -128,6 +130,34 @@ impl<'r, A: Authenticator> FromRequest<'r> for Admin<A> {
                 Outcome::Error((status, refuse(req, refusal)))
             }
         }
+    }
+}
+
+/// Documenting the guard so a route may carry `#[openapi]`.
+///
+/// The credential is a request header the whole API shares — described once, in
+/// the document's security section — not a per-route parameter, so a guarded
+/// route declares no input of its own here. Okapi only needs to know the guard
+/// exists; without this impl `#[openapi]` refuses any handler that takes an
+/// `Actor` or an `Admin`, which is every guarded route.
+impl<A: Authenticator> OpenApiFromRequest<'_> for Actor<A> {
+    fn from_request_input(
+        _gen: &mut OpenApiGenerator,
+        _name: String,
+        _required: bool,
+    ) -> rocket_okapi::Result<RequestHeaderInput> {
+        Ok(RequestHeaderInput::None)
+    }
+}
+
+/// Documenting the operator guard, as [`Actor`] is documented.
+impl<A: Authenticator> OpenApiFromRequest<'_> for Admin<A> {
+    fn from_request_input(
+        _gen: &mut OpenApiGenerator,
+        _name: String,
+        _required: bool,
+    ) -> rocket_okapi::Result<RequestHeaderInput> {
+        Ok(RequestHeaderInput::None)
     }
 }
 

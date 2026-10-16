@@ -20,9 +20,14 @@ use rocket::Request;
 use rocket::data::{Data, FromData, ToByteUnit};
 use rocket::http::Status;
 use rocket::outcome::Outcome;
+use rocket_okapi::r#gen::OpenApiGenerator;
+use rocket_okapi::okapi::Map;
+use rocket_okapi::okapi::openapi3::{MediaType, RequestBody};
+use rocket_okapi::request::OpenApiFromData;
 
 use crate::refusal::{Refusal, remember};
 use crate::request::Validated;
+use crate::schemars::JsonSchema;
 
 /// How large a request body may be by default.
 ///
@@ -44,6 +49,17 @@ const _: () = assert!(MAX_BODY_BYTES >= 32 * 1024 * 1024);
 /// has to ask whether what it is holding is acceptable.
 #[derive(Debug)]
 pub struct Json<T>(pub T);
+
+/// So a handler reads `body.field`, as it would from Rocket's own `Json` — the
+/// guard is transparent, and the `Validated` impl behind it is the only thing
+/// that made it worth not using Rocket's.
+impl<T> std::ops::Deref for Json<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
 
 /// Turn a refusal's numeric status into Rocket's.
 ///
@@ -88,6 +104,32 @@ where
                 Outcome::Error((status, refusal))
             }
         }
+    }
+}
+
+/// Documenting the body, so a route may carry `#[openapi]`.
+///
+/// `Json<T>` is this crate's own guard, not Rocket's, so okapi has no impl for
+/// it: without this, a documented route that takes a validated body would refuse
+/// to compile, and the only way around — falling back to Rocket's `Json` —
+/// would skip the `Validated` contract entirely and answer a malformed body with
+/// a 422 the API does not speak. The body is described by `T`'s schema, as JSON.
+impl<'r, T: Validated + JsonSchema + 'r> OpenApiFromData<'r> for Json<T> {
+    fn request_body(g: &mut OpenApiGenerator) -> rocket_okapi::Result<RequestBody> {
+        let schema = g.json_schema::<T>();
+        let mut content = Map::new();
+        content.insert(
+            "application/json".to_owned(),
+            MediaType {
+                schema: Some(schema),
+                ..MediaType::default()
+            },
+        );
+        Ok(RequestBody {
+            content,
+            required: true,
+            ..RequestBody::default()
+        })
     }
 }
 
