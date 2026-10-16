@@ -476,3 +476,28 @@ kiosk { padding: 1rem; }
 /* The refresh button spins while a refresh is in flight. */
 .fleet-refresh.spinning { animation: fleet-spin 0.8s linear infinite; }
 @keyframes fleet-spin { to { transform: rotate(360deg); } }
+
+/* The two-view switch, in the topbar. */
+.view-switch { display: inline-flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+.view-btn {
+  font: inherit; font-size: 0.82rem; padding: 0.2rem 0.7rem; border: 0;
+  background: transparent; color: var(--muted); cursor: pointer;
+}
+.view-btn + .view-btn { border-left: 1px solid var(--border); }
+.view-btn:hover { color: var(--accent); }
+.view-btn.active { background: var(--accent); color: #fff; }
+
+/* The dashboard: a board of phase lanes, scrolling sideways on a narrow screen. */
+#fleet { display: block; }
+.board-bar { display: flex; justify-content: flex-end; padding: 0 1rem 0.5rem; }
+.board { display: flex; gap: 1rem; padding: 0 1rem 1rem; align-items: flex-start; overflow-x: auto; }
+.lane { flex: 0 0 20rem; display: grid; gap: 0.5rem; align-content: start; }
+.lane h2 {
+  margin: 0; font-size: 0.82rem; font-weight: 600; text-transform: uppercase;
+  letter-spacing: 0.04em; color: var(--muted);
+}
+.lane-count {
+  font-weight: 400; border: 1px solid var(--border); border-radius: 999px;
+  padding: 0 0.4rem; margin-left: 0.3rem;
+}
+.lane .cards { grid-template-columns: 1fr; }

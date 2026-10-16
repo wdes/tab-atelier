@@ -1273,6 +1273,10 @@ function bootstrap() {
   }
   // The landing view: the servers and their tabs, so the tabs are the first
   // thing on screen. Then the heartbeat keeps it current.
+  paintViewSwitch();
+  for (const button of document.querySelectorAll(".view-btn")) {
+    button.addEventListener("click", () => setView(button.dataset.view));
+  }
   loadFleet();
   startHeartbeat();
 }
@@ -1282,6 +1286,77 @@ function bootstrap() {
 // Every server this Kiosk aggregates and its tabs — the first thing on screen,
 // not hidden behind the Serveurs page. This is the entry point: you see your
 // tabs here, and you add one here.
+
+// ---- The two views over one fleet ------------------------------------------
+//
+// Both read the same `/kiosk/fleet` model; only the layout differs. The
+// Dashboard groups the cards into a lane per phase (a kanban-style board, the
+// default); Flotte lists them per server, which is where you manage (add a tab,
+// refresh, ask the agents). The phase is a `meta` label the operator sets — the
+// kiosk owns that vocabulary, the daemon does not (see the crate README).
+
+const VIEW_KEY = "kiosk-view";
+/// The canonical phases, in flow order — the columns, left to right. Anything
+/// else is an operator-invented label and sorts after these, alpha.
+export const PHASES = ["scope", "plan", "build", "review", "verify", "sweep", "done"];
+export const NO_PHASE = "sans phase";
+
+/** The active view: `?view=` wins, then the saved choice, then Dashboard. */
+function currentView() {
+  if (typeof location !== "undefined") {
+    const fromUrl = new URLSearchParams(location.search).get("view");
+    if (fromUrl === "dashboard" || fromUrl === "fleet") return fromUrl;
+  }
+  const saved = typeof localStorage !== "undefined" ? localStorage.getItem(VIEW_KEY) : null;
+  return saved === "fleet" ? "fleet" : "dashboard";
+}
+
+function setView(view) {
+  if (typeof localStorage !== "undefined") localStorage.setItem(VIEW_KEY, view);
+  paintViewSwitch();
+  loadFleet();
+}
+
+function paintViewSwitch() {
+  if (typeof document === "undefined") return;
+  const view = currentView();
+  for (const button of document.querySelectorAll(".view-btn")) {
+    button.classList.toggle("active", button.dataset.view === view);
+  }
+}
+
+/** The Dashboard: every tab's card, in a lane per phase.
+ *
+ *  A tab with no `meta.phase` is not dropped — it lands in a final "sans phase"
+ *  lane, so nothing silently disappears. */
+export function dashboardHtml(model) {
+  const byPhase = new Map();
+  for (const server of (model && model.servers) || []) {
+    if (server.error) continue;
+    for (const tab of server.tabs || []) {
+      const phase = (tab.meta && tab.meta.phase) || NO_PHASE;
+      if (!byPhase.has(phase)) byPhase.set(phase, []);
+      byPhase.get(phase).push({ serverId: server.id, tab });
+    }
+  }
+  if (byPhase.size === 0) {
+    return `<p class="fleet-empty">Aucun onglet. Ajoute-en un dans <a href="/kiosk/manage">Serveurs</a>.</p>`;
+  }
+  const known = PHASES.filter((phase) => byPhase.has(phase));
+  const invented = [...byPhase.keys()].filter((p) => !PHASES.includes(p) && p !== NO_PHASE).sort();
+  const order = [...known, ...invented, ...(byPhase.has(NO_PHASE) ? [NO_PHASE] : [])];
+  const lanes = order
+    .map((phase) => {
+      const items = byPhase.get(phase);
+      const cards = items.map(({ serverId, tab }) => tabCardHtml(serverId, tab)).join("");
+      return `<section class="lane" data-phase="${escapeHtml(phase)}">
+        <h2>${escapeHtml(phase)} <span class="lane-count">${items.length}</span></h2>
+        <div class="cards">${cards}</div>
+      </section>`;
+    })
+    .join("");
+  return `<div class="board-bar"><button class="fleet-refresh" title="rafraîchir">⟳</button></div><div class="board">${lanes}</div>`;
+}
 
 function fleetHtml(model) {
   const servers = (model && model.servers) || [];
@@ -1437,7 +1512,11 @@ async function loadFleet() {
   try {
     const res = await fetch("/kiosk/fleet", { headers: { accept: "application/json", ...AUTH_HEADERS } });
     if (!res.ok) throw new Error("HTTP " + res.status);
-    host.innerHTML = fleetHtml(await res.json());
+    const model = await res.json();
+    // Same data, two layouts: the dashboard (lanes by phase) or the fleet
+    // (per server). The handlers below fit both — a view without a given element
+    // simply has none to wire.
+    host.innerHTML = currentView() === "fleet" ? fleetHtml(model) : dashboardHtml(model);
     for (const form of host.querySelectorAll(".fleet-add")) {
       form.addEventListener("submit", (e) => onAddTab(e, form.dataset.server));
     }

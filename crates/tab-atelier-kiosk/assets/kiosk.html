@@ -23,6 +23,13 @@
 <body>
   <header class="topbar">
     <h1>Harness</h1>
+    <!-- Two views over the same fleet data: the Dashboard (cards grouped into
+         phase lanes) is the default; Flotte is the per-server list you manage
+         from. Remembered in localStorage, overridable with `?view=`. -->
+    <nav id="view-switch" class="view-switch" aria-label="vue">
+      <button class="view-btn" data-view="dashboard">Dashboard</button>
+      <button class="view-btn" data-view="fleet">Flotte</button>
+    </nav>
     <span id="status" class="status" aria-live="polite">prêt</span>
     <!-- Catalogue: opens the cold catalog read-model in a separate overlay
          (a skill is NOT a live tab — distinct visual vocabulary). -->
