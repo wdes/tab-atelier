@@ -33,16 +33,20 @@
 
 #![deny(missing_docs)]
 
+pub mod auth;
 pub mod body;
 pub mod catcher;
+pub mod guard;
 pub mod marshal;
 pub mod refusal;
 pub mod request;
 pub mod resource;
 pub mod respond;
 
+pub use auth::{Authenticator, DenyAll, Presented};
 pub use body::{Json, MAX_BODY_BYTES};
 pub use catcher::catchers;
+pub use guard::{Actor, Admin, presented};
 pub use marshal::{Body, Reply, ReplyBody, json, json_of, text};
 pub use refusal::{Refusal, recall, remember, tokens_match};
 pub use request::{Rejection, Validated, loose_bool, parse};
