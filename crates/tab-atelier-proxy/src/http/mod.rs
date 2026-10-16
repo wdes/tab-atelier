@@ -34,7 +34,6 @@ pub mod raw;
 pub mod refusal;
 pub mod requests;
 pub mod resources;
-pub mod responder;
 pub mod routes;
 
 use std::path::PathBuf;

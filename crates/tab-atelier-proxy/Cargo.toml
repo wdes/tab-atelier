@@ -19,6 +19,9 @@ path = "src/lib.rs"
 # Every Anthropic endpoint, header and credential. Shared with the desktop
 # crate so the two cannot drift apart again.
 claude-api = { path = "../claude-api" }
+# The shared HTTP rules: the Reply type, the request/resource contracts, the
+# Rocket scaffold. Shared with the kiosk so both servers speak one dialect.
+tab-atelier-api = { path = "../tab-atelier-api" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 log = "0.4"
