@@ -1,0 +1,44 @@
+[package]
+name = "tab-atelier-api"
+version = "0.5.0-dev"
+edition = "2024"
+license = "MPL-2.0"
+description = "The HTTP API a tab-atelier server writes to: a Rocket scaffold, and the Request/Response/Resource rules, with a derived OpenAPI"
+repository = "https://github.com/wdes/tab-atelier"
+publish = false
+
+# The shared rules of the shop's HTTP surface — the proxy's own best practices,
+# with the proxy's business left out. Built on `tab-atelier-web` (assets,
+# responses, the token gate) and on Rocket, whose routes/guards/responders it
+# standardises.
+#
+# `rocket_okapi` pins `rocket = 0.5.1` and `schemars = 0.8`, so this is a
+# lockstep: bumping one means bumping all of them. `schemars = "0.8"` is
+# deliberate — the workspace lock also carries `schemars 1.2` (pulled by gpui,
+# the desktop GUI), and the two majors coexist. Both crates are re-exported
+# below so an app names ONE dependency (`tab-atelier-api`) and this pin lives in
+# exactly one place.
+[dependencies]
+tab-atelier-web = { path = "../tab-atelier-web" }
+rocket = { version = "0.5.1", features = ["json"] }
+rocket_okapi = "0.9"
+schemars = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+bytes = "1"
+http = "1"
+http-body = "1"
+http-body-util = "0.1"
+tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "net", "signal", "time", "macros"] }
+
+[dev-dependencies]
+rocket = { version = "0.5.1", features = ["json"] }
+# One fixture needs a multi-frame body; `http_body_util::StreamBody` wants a
+# stream and std has none.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }

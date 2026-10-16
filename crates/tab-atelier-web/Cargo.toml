@@ -7,17 +7,15 @@ description = "The web-serving layer the proxy and kiosk UIs share"
 repository = "https://github.com/wdes/tab-atelier"
 publish = false
 
-# hyper + tokio only: the crate IS the HTTP server both UIs were each writing by
-# hand. Everything else (the UI itself) is served from a web root, so there is
-# no embedding and no asset dependency here.
+# Pure `http`/`bytes`: this crate only *builds* responses and reads files — it
+# does not run a server (the servers are `tab-atelier-api`'s Rocket apps, or the
+# kiosk's, and neither reaches for a transport here). An earlier draft pulled
+# hyper and tokio and used neither.
 [dependencies]
 bytes = "1"
 http = "1"
 http-body-util = "0.1"
-hyper = { version = "1", features = ["server", "http1"] }
-hyper-util = { version = "0.1", features = ["tokio"] }
 serde_json = "1"
-tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "net", "signal", "time", "macros"] }
 
 [lints.clippy]
 all = { level = "deny", priority = -1 }
