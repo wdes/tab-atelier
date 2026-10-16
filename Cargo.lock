@@ -7124,6 +7124,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tab-atelier-briefs",
+ "tab-atelier-pace",
  "tempfile",
  "time",
  "tokio",
@@ -7155,9 +7156,14 @@ dependencies = [
  "hyper-util",
  "serde",
  "serde_json",
+ "tab-atelier-pace",
  "tokio",
  "ureq",
 ]
+
+[[package]]
+name = "tab-atelier-pace"
+version = "0.5.0-dev"
 
 [[package]]
 name = "tab-atelier-proxy"

@@ -1,0 +1,18 @@
+[package]
+name = "tab-atelier-pace"
+version = "0.5.0-dev"
+edition = "2024"
+license = "MPL-2.0"
+description = "Round-robin pacing: spread a fan-out over time instead of one herd"
+repository = "https://github.com/wdes/tab-atelier"
+publish = false
+
+# No dependencies, like tab-atelier-briefs: this is two index arithmetic
+# functions, and every consumer already has what it needs. A crate that added
+# weight to the binaries that share it would be a poor trade for so little.
+[dependencies]
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }

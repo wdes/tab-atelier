@@ -21,6 +21,8 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
+use tab_atelier_pace::{pick_round_robin, scan_order};
+
 use crate::cli::share_link::{Endpoint, agent, discover_endpoint};
 
 const DEFAULT_INTERVAL_SECS: u64 = 5;
@@ -578,31 +580,10 @@ fn nudge_ready(last_at: &mut Option<Instant>, now: Instant, min_interval: Durati
     true
 }
 
-/// Indices `0..n` starting at `cursor % n` and wrapping — the scan order for a
-/// budget-truncated tick that resumes where the previous one stopped.
-fn scan_order(n: usize, cursor: usize) -> Vec<usize> {
-    if n == 0 {
-        return Vec::new();
-    }
-    let start = cursor % n;
-    (0..n).map(|i| (start + i) % n).collect()
-}
-
-/// Round-robin pick from a slice. Advances `cursor` mod `len()` and
-/// returns the chosen element (a reference into the slice, since the
-/// caller still owns the Vec). `None` on empty input — caller treats
-/// that as "nothing to do this tick" without advancing the cursor.
-///
-/// Extracted as a pure fn so tests can exercise the wrap-around +
-/// monotonic-advance behaviour without mocking HTTP.
-fn pick_round_robin<'a, T>(items: &'a [T], cursor: &mut usize) -> Option<&'a T> {
-    if items.is_empty() {
-        return None;
-    }
-    let idx = *cursor % items.len();
-    *cursor = cursor.wrapping_add(1);
-    items.get(idx)
-}
+// The pacing primitives — `pick_round_robin` and `scan_order` — now live in the
+// shared `tab-atelier-pace` crate (imported at the top of this file), so the
+// Kiosk's agent broadcast paces the same way without copying them. Extracting
+// them here is why Brain's nudge cadence and the Kiosk's fan-out stay one idea.
 
 /// Everything that survives between ticks.
 #[derive(Default)]
@@ -1070,74 +1051,8 @@ mod tests {
         assert!(p.is_online());
     }
 
-    #[test]
-    fn round_robin_empty_returns_none_without_advancing_cursor() {
-        // No work this tick → cursor must NOT advance, otherwise a
-        // long quiet period would slide the start index past every
-        // possible "first" of the next non-empty eligible set and
-        // we'd skip tabs unfairly.
-        let items: [&str; 0] = [];
-        let mut cursor = 7;
-        assert!(pick_round_robin(&items, &mut cursor).is_none());
-        assert_eq!(cursor, 7);
-    }
-
-    #[test]
-    fn round_robin_single_item_always_picks_it() {
-        let items = ["only-tab"];
-        let mut cursor = 0;
-        assert_eq!(pick_round_robin(&items, &mut cursor), Some(&"only-tab"));
-        assert_eq!(pick_round_robin(&items, &mut cursor), Some(&"only-tab"));
-        assert_eq!(pick_round_robin(&items, &mut cursor), Some(&"only-tab"));
-    }
-
-    #[test]
-    fn round_robin_rotates_through_set() {
-        // The shape of the actual behaviour the user asked for: 3
-        // stuck tabs fire in order A, B, C, A, B, C, …
-        let items = ["A", "B", "C"];
-        let mut cursor = 0;
-        let picks: Vec<&str> = (0..7)
-            .map(|_| *pick_round_robin(&items, &mut cursor).unwrap())
-            .collect();
-        assert_eq!(picks, vec!["A", "B", "C", "A", "B", "C", "A"]);
-    }
-
-    #[test]
-    fn round_robin_starting_cursor_offsets_the_first_pick() {
-        // Cursor 4 in a 3-item set hits idx 4 % 3 = 1 = "B".
-        let items = ["A", "B", "C"];
-        let mut cursor = 4;
-        assert_eq!(pick_round_robin(&items, &mut cursor), Some(&"B"));
-        assert_eq!(cursor, 5);
-        assert_eq!(pick_round_robin(&items, &mut cursor), Some(&"C"));
-    }
-
-    #[test]
-    fn round_robin_survives_wrap_around() {
-        // wrapping_add at usize::MAX shouldn't panic. The cursor
-        // wraps to 0 and the next pick goes to idx 0.
-        let items = ["A", "B", "C"];
-        let mut cursor = usize::MAX;
-        // (usize::MAX) % 3 = 0 → "A". Then cursor wraps to 0.
-        assert_eq!(pick_round_robin(&items, &mut cursor), Some(&"A"));
-        assert_eq!(cursor, 0);
-    }
-
-    #[test]
-    fn round_robin_set_shrinks_between_ticks() {
-        // Realistic shape: this tick sees 3 eligible tabs, next tick
-        // only 1 (the other 2 are now in cooldown). Cursor advanced
-        // to 1 last tick; the new set's len is 1 so idx = 1 % 1 = 0
-        // — we pick the lone remaining tab without panic.
-        let mut cursor = 1;
-        let three = ["A", "B", "C"];
-        assert_eq!(pick_round_robin(&three, &mut cursor), Some(&"B"));
-        // Now only one eligible left.
-        let one = ["Z"];
-        assert_eq!(pick_round_robin(&one, &mut cursor), Some(&"Z"));
-        assert_eq!(cursor, 3);
-    }
+    // The round-robin and scan-order pacing tests moved with the functions to
+    // the `tab-atelier-pace` crate, which both this and the Kiosk depend on.
 
     #[test]
     fn eligible_label_distinguishes_pattern_from_agent_error() {
@@ -1564,16 +1479,6 @@ mod tests {
         let later = t0 + Duration::from_secs(30);
         assert!(evaluate_tab(&mut watch, frozen, None, later).is_some());
         assert_eq!(watch.stable_since, started_at, "freeze clock untouched by deferral");
-    }
-
-    #[test]
-    fn scan_order_rotates_and_wraps_for_resumable_scans() {
-        assert!(scan_order(0, 3).is_empty());
-        assert_eq!(scan_order(3, 0), vec![0, 1, 2]);
-        assert_eq!(scan_order(3, 1), vec![1, 2, 0]);
-        assert_eq!(scan_order(3, 4), vec![1, 2, 0]);
-        // usize::MAX % 3 == 0 — must not panic on the wrapped cursor.
-        assert_eq!(scan_order(3, usize::MAX), vec![0, 1, 2]);
     }
 
     #[test]
