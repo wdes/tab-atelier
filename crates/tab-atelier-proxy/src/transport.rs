@@ -23,6 +23,11 @@ use bytes::Bytes;
 use http::HeaderMap;
 
 pub use tab_atelier_api::marshal::{Body, Reply, ReplyBody, json, json_of, text};
+// The typed counterpart of `Reply`: a response carrying a named resource, which
+// okapi documents with that resource's schema. A handler that answers one shape
+// returns this instead of building the JSON itself; the status is in the type,
+// so `Doc<NewThing, 201>` documents and answers a 201.
+pub use tab_atelier_api::respond::Doc;
 
 /// A request, with its body already in memory.
 #[derive(Debug)]

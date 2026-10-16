@@ -13,13 +13,13 @@ use crate::http::requests::compact::SetCompact;
 use crate::http::requests::user::{AddUser, PinModel, PinProvider, SetDisabled, SetTools, SetWeight};
 use crate::http::resources;
 use crate::server::State;
-use crate::transport::{Reply, json_of};
+use crate::transport::{Doc, Reply, json_of};
 use crate::users::Store;
 
 /// Every account, for the operator's table.
-pub(crate) fn list(state: &Arc<State>) -> Reply {
+pub(crate) fn list(state: &Arc<State>) -> Doc<resources::AccountsResource> {
     let store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    json_of(200, &resources::AccountsResource::of(store.accounts()))
+    Doc::ok(resources::AccountsResource::of(store.accounts()))
 }
 
 /// Creating an account.

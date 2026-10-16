@@ -8,6 +8,7 @@
 //! strings on an admin route and buy a resource that outlives its borrow.
 
 use serde::Serialize;
+use tab_atelier_api::schemars;
 
 use crate::users;
 
@@ -15,7 +16,7 @@ use crate::users;
 ///
 /// The hash is not a usable secret, but it is the input to an offline guess,
 /// and the UI has no reason to hold it.
-#[derive(Serialize)]
+#[derive(Serialize, tab_atelier_api::schemars::JsonSchema)]
 pub(crate) struct KeyResource {
     pub id: String,
     pub name: String,
@@ -35,7 +36,7 @@ pub(crate) struct KeyResource {
 /// shortening — a prefix is enough to tell two sessions apart in a list, but
 /// not enough to match one against the client's own logs, which is what this
 /// is for in the first place. The UI decides how much of it to draw.
-#[derive(Serialize)]
+#[derive(Serialize, tab_atelier_api::schemars::JsonSchema)]
 pub(crate) struct SessionResource {
     pub session_id: String,
     pub device_id: Option<String>,
@@ -70,7 +71,7 @@ impl From<&users::Session> for SessionResource {
 }
 
 /// A person, with every key they hold.
-#[derive(Serialize)]
+#[derive(Serialize, tab_atelier_api::schemars::JsonSchema)]
 pub(crate) struct AccountResource {
     pub id: String,
     pub first_name: String,
@@ -129,7 +130,7 @@ impl From<&users::Account> for AccountResource {
 ///
 /// Same shape as [`SessionResource`] plus the credentials it arrived on, which
 /// is the only thing the merged view can say that the per-key lists cannot.
-#[derive(Serialize)]
+#[derive(Serialize, tab_atelier_api::schemars::JsonSchema)]
 pub(crate) struct AccountSessionResource {
     pub session_id: String,
     pub device_id: Option<String>,
@@ -186,7 +187,7 @@ fn merge_sessions(keys: &[users::Key]) -> Vec<AccountSessionResource> {
 /// The envelope is a struct rather than a `json!` wrapper so the response shape
 /// is one definition: the handler serializes it, okapi reads it, and neither
 /// can drift from the other.
-#[derive(Serialize)]
+#[derive(Serialize, tab_atelier_api::schemars::JsonSchema)]
 pub(crate) struct AccountEnvelope {
     pub user: AccountResource,
 }
@@ -200,7 +201,7 @@ impl From<&users::Account> for AccountEnvelope {
 }
 
 /// `{"removed": …}`, for a deletion that reports what it removed.
-#[derive(Serialize)]
+#[derive(Serialize, tab_atelier_api::schemars::JsonSchema)]
 pub(crate) struct RemovedAccountEnvelope {
     pub removed: AccountResource,
 }
@@ -214,7 +215,7 @@ impl From<&users::Account> for RemovedAccountEnvelope {
 }
 
 /// `{"users": […]}`, for the list route.
-#[derive(Serialize)]
+#[derive(Serialize, tab_atelier_api::schemars::JsonSchema)]
 pub(crate) struct AccountsResource {
     pub users: Vec<AccountResource>,
 }
@@ -229,7 +230,7 @@ impl AccountsResource {
 }
 
 /// `{"key": …}`, which is how a key is reported.
-#[derive(Serialize)]
+#[derive(Serialize, tab_atelier_api::schemars::JsonSchema)]
 pub(crate) struct KeyEnvelope {
     pub key: KeyResource,
 }
@@ -243,7 +244,7 @@ impl From<&users::Key> for KeyEnvelope {
 }
 
 /// `{"removed": …}`, for a key deletion.
-#[derive(Serialize)]
+#[derive(Serialize, tab_atelier_api::schemars::JsonSchema)]
 pub(crate) struct RemovedKeyEnvelope {
     pub removed: KeyResource,
 }
@@ -261,7 +262,7 @@ impl From<&users::Key> for RemovedKeyEnvelope {
 /// `secret` is a separate field from the [`KeyResource`], not a property of it,
 /// because a key never carries its own secret afterwards — keeping them in one
 /// struct would mean every other response had to remember to omit it.
-#[derive(Serialize)]
+#[derive(Serialize, tab_atelier_api::schemars::JsonSchema)]
 pub(crate) struct NewKeyResource {
     pub key: KeyResource,
     pub secret: String,

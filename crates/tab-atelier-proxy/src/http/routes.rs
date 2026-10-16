@@ -170,7 +170,10 @@ pub(crate) fn hello_head() -> Reply {
 /// Every account, with its keys.
 #[openapi]
 #[get("/api/users")]
-pub(crate) fn list_users(state: &State<Arc<AppState>>, _admin: Admin) -> Reply {
+pub(crate) fn list_users(
+    state: &State<Arc<AppState>>,
+    _admin: Admin,
+) -> crate::transport::Doc<crate::http::resources::AccountsResource> {
     account::list(state)
 }
 
