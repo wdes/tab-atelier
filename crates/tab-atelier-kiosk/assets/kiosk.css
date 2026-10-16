@@ -356,13 +356,29 @@ kiosk { padding: 1rem; }
   border-radius: 8px;
   padding: 0.75rem 1rem;
 }
-.fleet-server h2 { margin: 0 0 0.75rem; font-size: 0.95rem; font-weight: 600; }
+.fleet-server-head { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.75rem; }
+.fleet-server h2 { margin: 0; font-size: 0.95rem; font-weight: 600; }
+.fleet-refresh {
+  margin-left: auto; font: inherit; line-height: 1;
+  padding: 0.15rem 0.45rem; border: 1px solid var(--border); border-radius: 6px;
+  background: transparent; color: var(--muted); cursor: pointer;
+}
+.fleet-refresh:hover { border-color: var(--accent); color: var(--accent); }
+/* "cartes": ask every agent to publish its card, next to the refresh button. */
+.fleet-ask {
+  margin-left: auto; font: inherit; font-size: 0.8rem; line-height: 1;
+  padding: 0.2rem 0.5rem; border: 1px solid var(--border); border-radius: 6px;
+  background: transparent; color: var(--muted); cursor: pointer;
+}
+.fleet-ask:hover { border-color: var(--accent); color: var(--accent); }
+.fleet-ask + .fleet-refresh { margin-left: 0; }
+.fleet-ok { color: var(--ok); font-style: normal; }
 
-/* The cards: a tab's name, its cwd, and its labels — the agent card. */
+/* The cards: one per row, full width, so fields line up across tabs. */
 .cards {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(18rem, 1fr));
-  gap: 0.75rem;
+  grid-template-columns: 1fr;
+  gap: 0.6rem;
   margin-bottom: 0.75rem;
 }
 .agent-card {
@@ -373,8 +389,9 @@ kiosk { padding: 1rem; }
   gap: 0.4rem;
   align-content: start;
 }
-.agent-card header { display: flex; flex-direction: column; gap: 0.1rem; }
-.agent-card h3 { margin: 0; font-size: 0.9rem; font-weight: 600; }
+.agent-card header { display: flex; align-items: center; gap: 0.5rem; }
+.card-title { display: inline-flex; align-items: center; gap: 0.1rem; font-weight: 600; font-size: 0.9rem; }
+.card-actions { margin-left: auto; display: inline-flex; align-items: center; gap: 0.3rem; }
 .agent-card .cwd {
   color: var(--muted); font-size: 0.75rem;
   font-family: ui-monospace, monospace;
@@ -394,13 +411,35 @@ kiosk { padding: 1rem; }
   font-size: 0.72rem; color: var(--muted);
   border: 1px solid var(--border); border-radius: 999px; padding: 0.05rem 0.4rem;
 }
-.agent-card footer { display: flex; justify-content: flex-end; }
-.card-close {
-  font: inherit; font-size: 0.8rem; padding: 0.2rem 0.5rem;
-  border: 1px solid var(--border); border-radius: 6px;
-  background: transparent; color: var(--muted); cursor: pointer;
+/* The two card actions, top-right: open the terminal (↗) and close (×). */
+.card-open, .card-close {
+  font: inherit; line-height: 1; padding: 0.15rem 0.4rem; border: 1px solid var(--border);
+  border-radius: 6px; background: transparent; color: var(--muted); cursor: pointer; text-decoration: none;
 }
+.card-open:hover { border-color: var(--accent); color: var(--accent); }
+.card-close { font-size: 1rem; }
 .card-close:hover { border-color: var(--err); color: var(--err); }
+
+/* The per-tab led: the daemon's health indicator, on the card header. The five
+   colours mirror `TabLed::rgb` in the daemon — it is the single source of truth,
+   so the kiosk does not invent its own. */
+.led {
+  width: 0.6rem; height: 0.6rem; border-radius: 50%; display: inline-block;
+  margin-right: 0.45rem; vertical-align: middle; background: #737373;
+}
+.led-dead { background: #8c2929; }       /* dim red  */
+.led-error { background: #ef4444; }      /* red      */
+.led-working { background: #4ec9b0; animation: led-pulse 1s ease-in-out infinite; } /* green */
+.led-unreviewed { background: #5c99ff; } /* blue     */
+.led-idle { background: #737373; }       /* grey     */
+@keyframes led-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+
+/* "Is an agent in this tab?" — the durable agent kind, when a session is attached. */
+.card-agent {
+  margin-left: 0.4rem; font-size: 0.68rem; font-weight: 400; vertical-align: middle;
+  color: var(--accent); border: 1px solid var(--accent); border-radius: 999px;
+  padding: 0 0.35rem; text-transform: none;
+}
 
 .fleet-empty, .fleet-empty-tab, .fleet-error { color: var(--muted); font-style: italic; }
 .fleet-error { color: var(--err); font-style: normal; }
@@ -414,3 +453,25 @@ kiosk { padding: 1rem; }
   border-radius: 6px; background: transparent; color: var(--fg); cursor: pointer;
 }
 .fleet-add button:hover { border-color: var(--accent); color: var(--accent); }
+
+/* The confirm modal: our own dialog, not the browser's confirm(). */
+.confirm-modal {
+  border: 1px solid var(--border); border-radius: 10px;
+  padding: 1rem 1.1rem; max-width: 24rem;
+  background: var(--panel); color: var(--fg);
+  box-shadow: 0 10px 40px rgb(0 0 0 / 0.25);
+}
+.confirm-modal::backdrop { background: rgb(0 0 0 / 0.45); }
+.confirm-modal p { margin: 0 0 1rem; font-size: 0.9rem; }
+.confirm-actions { display: flex; justify-content: flex-end; gap: 0.5rem; margin: 0; }
+.confirm-actions button {
+  font: inherit; padding: 0.35rem 0.8rem; border-radius: 6px; cursor: pointer;
+  border: 1px solid var(--border); background: transparent; color: var(--fg);
+}
+.confirm-cancel:hover { border-color: var(--accent); color: var(--accent); }
+.confirm-ok { border-color: var(--err); color: var(--err); }
+.confirm-ok:hover { background: var(--err); color: #fff; }
+
+/* The refresh button spins while a refresh is in flight. */
+.fleet-refresh.spinning { animation: fleet-spin 0.8s linear infinite; }
+@keyframes fleet-spin { to { transform: rotate(360deg); } }

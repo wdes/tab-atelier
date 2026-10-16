@@ -24,16 +24,29 @@ pub struct Panes {
     token: Option<String>,
     remotes: Remotes,
     intentions: Intentions,
+    /// Where the last agent broadcast started. Each broadcast begins at the
+    /// next tab rather than always at the first, so repeated fan-outs do not
+    /// hammer whichever tab happens to be first.
+    broadcast_cursor: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Panes {
-    pub const fn new(journal: Journal, token: Option<String>, remotes: Remotes, intentions: Intentions) -> Self {
+    pub fn new(journal: Journal, token: Option<String>, remotes: Remotes, intentions: Intentions) -> Self {
         Self {
             journal,
             token,
             remotes,
             intentions,
+            broadcast_cursor: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
+    }
+
+    /// The cursor for the next broadcast, advanced past the whole set so the
+    /// following one starts at a different tab.
+    pub fn next_broadcast_cursor(&self, len: usize) -> usize {
+        use std::sync::atomic::Ordering;
+        let cursor = self.broadcast_cursor.fetch_add(1, Ordering::Relaxed);
+        if len == 0 { cursor } else { cursor % len }
     }
 
     /// The servers the fleet view shows: the ones the operator configured in
@@ -45,21 +58,26 @@ impl Panes {
         self.remotes.list().unwrap_or_default()
     }
 
-    /// Whether a request's `Authorization` header carries the pane token.
+    /// Whether a request carries the pane token — in `Authorization: Bearer`, or
+    /// in a `?token=` query.
+    ///
+    /// The query is accepted because some callers cannot set a header: a plain
+    /// `<a href>` opening the terminal viewer in a new tab, and any seasoned
+    /// operator who pastes `?token=` into the address bar. A page that only
+    /// worked when JavaScript attached a header would be a page you cannot open
+    /// by URL, which is how a browser is actually used.
     ///
     /// No token configured → nobody is authorized, so the panes fail closed
     /// instead of standing open.
-    pub fn authorized(&self, authorization: Option<&HeaderValue>) -> bool {
+    pub fn authorized(&self, authorization: Option<&HeaderValue>, query_token: Option<&str>) -> bool {
         let Some(expected) = self.token.as_deref() else {
             return false;
         };
-        let Some(provided) = authorization
+        let from_header = authorization
             .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.strip_prefix("Bearer "))
-        else {
-            return false;
-        };
-        constant_time_eq(provided.as_bytes(), expected.as_bytes())
+            .and_then(|value| value.strip_prefix("Bearer "));
+        let provided = from_header.or(query_token);
+        provided.is_some_and(|provided| constant_time_eq(provided.as_bytes(), expected.as_bytes()))
     }
 
     /// `GET /decisions` — the board.
@@ -315,17 +333,19 @@ mod tests {
     #[test]
     fn the_token_gate_fails_closed() {
         let open = panes(Some("s3cret"));
-        assert!(open.authorized(Some(&"Bearer s3cret".parse().unwrap())));
-        assert!(!open.authorized(Some(&"Bearer wrong".parse().unwrap())));
-        assert!(!open.authorized(Some(&"s3cret".parse().unwrap())), "scheme is required");
-        assert!(!open.authorized(None));
+        assert!(open.authorized(Some(&"Bearer s3cret".parse().unwrap()), None));
+        assert!(open.authorized(None, Some("s3cret")), "the query token is accepted too");
+        assert!(!open.authorized(Some(&"Bearer wrong".parse().unwrap()), None));
+        assert!(
+            !open.authorized(Some(&"s3cret".parse().unwrap()), None),
+            "scheme is required"
+        );
+        assert!(!open.authorized(None, Some("wrong")), "a wrong query token is refused");
+        assert!(!open.authorized(None, None));
 
         let closed = panes(None);
-        assert!(!closed.authorized(None));
-        assert!(
-            !closed.authorized(Some(&"Bearer anything".parse().unwrap())),
-            "no token = nobody in"
-        );
+        assert!(!closed.authorized(None, None));
+        assert!(!closed.authorized(None, Some("anything")), "no token = nobody in");
     }
 
     /// The comparison is length-checked and content-checked.

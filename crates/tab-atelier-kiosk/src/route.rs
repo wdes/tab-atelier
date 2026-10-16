@@ -90,6 +90,20 @@ pub enum Route {
         /// The tab's uuid.
         tab: String,
     },
+    /// `GET /kiosk/remotes/<id>/tabs/<uuid>/view` — mint a share token for the
+    /// tab and redirect to its terminal viewer, where the operator can type.
+    RemoteTabView {
+        /// The remote id.
+        id: String,
+        /// The tab's uuid.
+        tab: String,
+    },
+    /// `POST /kiosk/remotes/<id>/broadcast` — type the same message into every
+    /// agent tab on a remote (they publish their card in response).
+    RemoteBroadcast {
+        /// The remote id.
+        id: String,
+    },
     /// `POST /kiosk/remotes/<id>/intent/<slug>/launch` — open a worker tab on a
     /// remote for an intention, and remember which tab it was.
     RemoteIntentLaunch {
@@ -232,6 +246,8 @@ fn allowed_methods(path: &str) -> Option<&'static str> {
                 [id, "remove"] if !id.is_empty() => Some("POST"),
                 [id, "tabs"] if !id.is_empty() => Some("GET, POST"),
                 [id, "tabs", tab, "close" | "meta"] if !id.is_empty() && !tab.is_empty() => Some("POST"),
+                [id, "tabs", tab, "view"] if !id.is_empty() && !tab.is_empty() => Some("GET, HEAD"),
+                [id, "broadcast"] if !id.is_empty() => Some("POST"),
                 [id, "cards"] if !id.is_empty() => Some("GET, HEAD"),
                 [id, "intent", slug, "launch"] if !id.is_empty() && !slug.is_empty() => Some("POST"),
                 _ => None,
@@ -264,6 +280,11 @@ fn remotes_action(method: &Method, path: &str) -> Route {
             id: id.to_string(),
             tab: tab.to_string(),
         },
+        (&Method::GET, [id, "tabs", tab, "view"]) if !id.is_empty() && !tab.is_empty() => Route::RemoteTabView {
+            id: id.to_string(),
+            tab: tab.to_string(),
+        },
+        (&Method::POST, [id, "broadcast"]) if !id.is_empty() => Route::RemoteBroadcast { id: id.to_string() },
         (&Method::GET, [id, "cards"]) if !id.is_empty() => Route::RemoteCards { id: id.to_string() },
         // The one remote action that is about an intention rather than a plain
         // tab: it spawns a worker for `slug` and remembers which tab it was.

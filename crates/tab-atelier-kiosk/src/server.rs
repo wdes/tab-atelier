@@ -16,6 +16,7 @@ use crate::body::{BoxBody, full, json_response};
 use crate::config::{Config, HopTimeouts};
 use crate::daemon::Daemon;
 use crate::panes::Panes;
+use crate::remotes::Remote;
 use crate::route::{self, Route};
 
 /// Largest request body the Kiosk will read from a pane request.
@@ -83,12 +84,21 @@ pub async fn serve_with(listener: TcpListener, cfg: Config, timeouts: HopTimeout
 async fn handle(req: Request<Incoming>, panes: &Panes, daemon: &Daemon) -> Response<BoxBody> {
     let (parts, body) = req.into_parts();
     let authorization = parts.headers.get(header::AUTHORIZATION).cloned();
+    // The token may also arrive as `?token=` — a plain `<a href>` (the terminal
+    // link) cannot set a header, and neither can an operator pasting a URL.
+    let query_token = parts.uri.query().and_then(|query| {
+        query
+            .split('&')
+            .filter_map(|pair| pair.split_once('='))
+            .find(|(name, _)| *name == "token")
+            .map(|(_, value)| value.to_string())
+    });
     let route = route::route(&Request::from_parts(parts.clone(), ()));
 
     // One gate for every pane and the remote API, before the match, rather than
     // the same check repeated in each arm. A method error is answered before it:
     // the verb is wrong whether or not the caller holds the token.
-    if route.is_protected() && !panes.authorized(authorization.as_ref()) {
+    if route.is_protected() && !panes.authorized(authorization.as_ref(), query_token.as_deref()) {
         return Panes::unauthorized();
     }
 
@@ -151,6 +161,8 @@ async fn handle(req: Request<Incoming>, panes: &Panes, daemon: &Daemon) -> Respo
             Ok(change) => remote_tab_meta(panes, daemon, &id, &tab, &change).await,
             Err(response) => response,
         },
+        Route::RemoteTabView { id, tab } => remote_tab_view(panes, daemon, &id, &tab).await,
+        Route::RemoteBroadcast { id } => remote_broadcast(panes, daemon, &id).await,
         Route::RemoteIntentLaunch { id, slug } => remote_intent_launch(panes, daemon, &id, &slug).await,
         Route::RemoteCards { id } => remote_cards(panes, daemon, &id).await,
         Route::Fleet => fleet(panes, daemon).await,
@@ -205,6 +217,185 @@ async fn remote_tab_meta(
     }
 }
 
+/// `GET /kiosk/remotes/<id>/tabs/<uuid>/view` — mint a share token for the tab
+/// on the remote, then redirect the browser to that remote's terminal viewer.
+///
+/// The viewer is served by the remote daemon, which owns the tab, so this 302s
+/// to `<remote>/tabs/by-id/<uuid>/view?token=<share>`. The token is the tab's
+/// own per-tab RW share token, minted via the daemon's
+/// `POST /tabs/by-id/<uuid>/share` — never the remote's master, so the browser
+/// tab holds a credential good for one tab and rotatable with `rotate-tokens`.
+/// The operator lands in edit mode and can type.
+async fn remote_tab_view(panes: &Panes, daemon: &Daemon, id: &str, tab: &str) -> Response<BoxBody> {
+    let remote = match panes.remote(id) {
+        Ok(remote) => remote,
+        Err(error) => return Panes::remote_error(&error),
+    };
+    let daemon = daemon.clone();
+    let base = remote.url.clone();
+    let share_path = format!("/tabs/by-id/{tab}/share");
+    let answered = tokio::task::spawn_blocking(move || daemon.post(&remote, &share_path, &serde_json::json!({}))).await;
+    let token = match answered {
+        Ok(Ok((status, text))) if (200..300).contains(&status) => serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|value| value.get("rw").and_then(|t| t.as_str()).map(str::to_string)),
+        _ => None,
+    };
+    let Some(token) = token else {
+        return json_response(
+            StatusCode::BAD_GATEWAY,
+            &serde_json::json!({ "error": "could not mint a share token" }),
+        );
+    };
+    Response::builder()
+        .status(StatusCode::FOUND)
+        .header(header::LOCATION, format!("{base}/tabs/by-id/{tab}/view?token={token}"))
+        .body(full(""))
+        .expect("static redirect")
+}
+
+/// The message the "ask all agents" button types into every agent tab: it tells
+/// the agent it is part of tab-atelier and how to publish its card, so the
+/// dashboard can show what it does. One line per field, in the card's own keys.
+const BROADCAST_MESSAGE: &str = "You are part of an agent system named tab-atelier. \
+Please publish your agent card so the dashboard can show what you do - run each, with your own value:\n\
+  tab-atelier set-meta assignment <what you are assigned to>\n\
+  tab-atelier set-meta specialty <your role>\n\
+  tab-atelier set-meta objective <what you are trying to achieve>\n\
+  tab-atelier set-meta current_task <what you are doing right now>\n\
+(a blank value clears a field.)";
+
+/// The pause between two agents in a broadcast. Enough that N agents are a
+/// trickle rather than a herd — they do not all wake and call the model at the
+/// same instant — while a fleet of a few dozen still finishes in a few seconds.
+const BROADCAST_GAP: Duration = Duration::from_millis(350);
+
+/// `POST /kiosk/remotes/<id>/broadcast` — type the same message into every agent
+/// tab on a remote, so each agent publishes its card.
+///
+/// Only the tabs the daemon reports an `agent_kind` for get it: a plain shell
+/// has no agent to answer, and a locked tab refuses input (counted, not forced).
+/// The reply says how many of how many were reached.
+async fn remote_broadcast(panes: &Panes, daemon: &Daemon, id: &str) -> Response<BoxBody> {
+    let remote = match panes.remote(id) {
+        Ok(remote) => remote,
+        Err(error) => return Panes::remote_error(&error),
+    };
+    let lister = daemon.clone();
+    let listing = {
+        let remote = remote.clone();
+        tokio::task::spawn_blocking(move || lister.get(&remote, "/tabs")).await
+    };
+    let agent_ids: Vec<String> = match listing {
+        Ok(Ok((status, text))) if (200..300).contains(&status) => serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|value| {
+                value.get("tabs").and_then(serde_json::Value::as_array).map(|tabs| {
+                    tabs.iter()
+                        // An agent is present when the daemon says so.
+                        .filter(|tab| tab.get("agent_kind").and_then(serde_json::Value::as_str).is_some())
+                        .filter_map(|tab| tab.get("id").and_then(serde_json::Value::as_str).map(str::to_string))
+                        .collect()
+                })
+            })
+            .unwrap_or_default(),
+        _ => return Panes::bad_gateway(),
+    };
+    let total = agent_ids.len();
+    // Round-robin the START: each broadcast begins at the next tab, so repeated
+    // fan-outs do not all hammer whichever tab sorts first. `scan_order` is the
+    // same sweep `brain.rs` uses, shared through `tab-atelier-pace`.
+    let order = tab_atelier_pace::scan_order(total, panes.next_broadcast_cursor(total));
+    let ordered: Vec<String> = order.into_iter().map(|i| agent_ids[i].clone()).collect();
+    // Send in the BACKGROUND, one tab at a time with a gap between them. Hitting
+    // N agents in the same instant is a thundering herd — they wake together and
+    // contend for the model at once. The request returns immediately; the
+    // fan-out drains behind it, spread out.
+    let daemon = daemon.clone();
+    let remote = remote.clone();
+    tokio::spawn(async move {
+        for tab in ordered {
+            let _ = submit_to_tab(&daemon, &remote, &tab, BROADCAST_MESSAGE).await;
+            tokio::time::sleep(BROADCAST_GAP).await;
+        }
+    });
+    json_response(StatusCode::OK, &serde_json::json!({ "started": total }))
+}
+
+/// Type `message` into a tab and submit it — the way `tab-atelier dispatch`
+/// does, not the way a naive paste does.
+///
+/// A prompt and a trailing `\r` that arrive in the SAME write are treated by
+/// `claude` as pasted multiline text: the `\r` becomes a newline inside the
+/// paste, the tab shows `[Pasted text #1]` and sits idle waiting for a real
+/// Enter. So: send the paste, watch the screen until it stops changing (the
+/// paste has finished rendering), then send the `\r` as a SEPARATE write — the
+/// same settle dance as `src/cli/delegate.rs`, with a floor and a cap so a
+/// silent-but-busy tab still gets its Enter.
+///
+/// Returns whether the Enter was sent.
+async fn submit_to_tab(daemon: &Daemon, remote: &Remote, tab: &str, message: &str) -> bool {
+    const FLOOR: Duration = Duration::from_millis(400);
+    const QUIET: Duration = Duration::from_millis(300);
+    const POLL: Duration = Duration::from_millis(80);
+    const CAP: Duration = Duration::from_secs(5);
+    let input = format!("/tabs/by-id/{tab}/input");
+    let output = format!("/tabs/by-id/{tab}/output");
+
+    // 1. The paste — WITHOUT the carriage return.
+    if !post_bytes(daemon, remote, &input, message.as_bytes().to_vec()).await {
+        return false;
+    }
+    // 2. Wait for the paste to settle: an unconditional floor, then poll the
+    //    screen until it has been unchanged for QUIET, capped at CAP.
+    tokio::time::sleep(FLOOR).await;
+    let start = std::time::Instant::now();
+    let mut last = read_screen(daemon, remote, &output).await;
+    let mut stable = std::time::Instant::now();
+    while start.elapsed() < CAP {
+        if stable.elapsed() >= QUIET {
+            break;
+        }
+        tokio::time::sleep(POLL).await;
+        let now = read_screen(daemon, remote, &output).await;
+        if now != last {
+            last = now;
+            stable = std::time::Instant::now();
+        }
+    }
+    // 3. The Enter — a SEPARATE write, so it submits rather than joining the
+    //    paste. Sent TWICE: a multi-line paste can consume the first Enter to
+    //    insert the block (the "[Pasted text]" marker) and only need the second
+    //    to send it. Two Enters on an already-sent line submit an empty one,
+    //    which is harmless — the message was already delivered.
+    let sent = post_bytes(daemon, remote, &input, b"\r".to_vec()).await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    post_bytes(daemon, remote, &input, b"\r".to_vec()).await;
+    sent
+}
+
+/// POST raw bytes to a remote tab path; true on a 2xx.
+async fn post_bytes(daemon: &Daemon, remote: &Remote, path: &str, bytes: Vec<u8>) -> bool {
+    let daemon = daemon.clone();
+    let remote = remote.clone();
+    let path = path.to_string();
+    matches!(
+        tokio::task::spawn_blocking(move || daemon.post_raw(&remote, &path, bytes)).await,
+        Ok(Ok((status, _))) if (200..300).contains(&status)
+    )
+}
+
+/// GET a remote tab path, returning the body (the screen) or empty.
+async fn read_screen(daemon: &Daemon, remote: &Remote, path: &str) -> String {
+    let daemon = daemon.clone();
+    let remote = remote.clone();
+    let path = path.to_string();
+    match tokio::task::spawn_blocking(move || daemon.get(&remote, &path)).await {
+        Ok(Ok((status, text))) if (200..300).contains(&status) => text,
+        _ => String::new(),
+    }
+}
+
 /// `GET /kiosk/fleet` — every configured server and its tabs, with their cards.
 ///
 /// The servers are the ones the operator added in Serveurs and no others — the
@@ -231,6 +422,10 @@ async fn fleet(panes: &Panes, daemon: &Daemon) -> Response<BoxBody> {
                     .as_array()
                     .map(|tabs| {
                         tabs.iter()
+                            // The daemon's own auto-injector tab ("brain") is not
+                            // the operator's: it is a session-less harness tab with
+                            // no led, and it does not belong in the user's list.
+                            .filter(|tab| tab.get("agent_kind").and_then(serde_json::Value::as_str) != Some("brain"))
                             .map(|tab| {
                                 serde_json::json!({
                                     "id": tab.get("id"),
@@ -238,6 +433,11 @@ async fn fleet(panes: &Panes, daemon: &Daemon) -> Response<BoxBody> {
                                     "cwd": tab.get("cwd"),
                                     // The card: the operator's labels for this tab.
                                     "meta": tab.get("meta"),
+                                    // And how it is doing — the led the card shows,
+                                    // plus the agent kind ("is a claude in it?").
+                                    "led": tab.get("led"),
+                                    "agent_kind": tab.get("agent_kind"),
+                                    "agent_state": tab.get("agent_state"),
                                 })
                             })
                             .collect()

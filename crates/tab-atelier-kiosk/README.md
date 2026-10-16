@@ -130,3 +130,36 @@ feature-detects the rest.
 
 `state` is one of `open`, `read`, `tranched`, `archived`; an omitted `state` is
 `open`. `tranch` sets `state` to `tranched` and records the `verdict`.
+
+## Developing it
+
+The Kiosk is a standalone server, so you test your own edit without packaging it:
+
+```bash
+crates/tab-atelier-kiosk/scripts/hotswap.sh            # build, test, install, restart
+crates/tab-atelier-kiosk/scripts/hotswap.sh --no-test  # skip the tests, for a quick look
+```
+
+It builds the release binary, runs the kiosk tests, installs it over
+`/usr/bin/tab-atelier-kiosk`, and restarts the unit. It uses sudo (it writes
+`/usr/bin` and restarts the system service), so it asks for your password. A
+change is live in seconds; a `.deb` is only for shipping the Kiosk to someone
+else (`apt install` overwrites the hotswapped binary — just run the script again
+after pulling).
+
+The crate is laid out by what changes for its own reason:
+
+| Module | What it owns |
+|---|---|
+| `assets.rs` | the interface, compiled in with `include_str!` |
+| `config.rs` | the bind address, the state directory, the pane token |
+| `route.rs` | where a request goes — its assets, its panes, or a 404 |
+| `panes.rs` | the pane handlers and the token that opens them |
+| `decisions.rs` · `reports.rs` · `intent.rs` · `card.rs` | the data the panes read and write |
+| `remotes.rs` · `daemon.rs` | the servers it reaches, and the client that speaks their API |
+| `server.rs` | the socket loop |
+| `backup.rs` | copy the state directory out, and back |
+| `assets/kiosk.{html,css,js}` · `assets/manage.*` | the interface itself |
+
+The daemon it talks to is untouched by a kiosk change; the two share only the
+HTTP API.

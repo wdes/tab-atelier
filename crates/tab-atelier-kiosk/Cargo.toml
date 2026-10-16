@@ -24,6 +24,9 @@ hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# The shared round-robin pacing: the same sweep brain.rs uses, so a fan-out
+# (the agent broadcast) is spread over time instead of arriving as a herd.
+tab-atelier-pace = { path = "../tab-atelier-pace" }
 tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "net", "sync", "time", "io-util", "macros", "signal"] }
 ureq = { version = "3", features = ["json"] }
 

@@ -48,6 +48,17 @@
        on-demand from the topbar. Populated by kiosk.js from kioskView(readModel). -->
   <div id="kiosk-panel" class="kiosk-panel" role="dialog" aria-label="décisions en attente" hidden></div>
 
+  <!-- Confirm for destructive actions (closing a tab). OUR markup, styled with
+       the page — not the browser's window.confirm(). The native <dialog> gives
+       the modal semantics (backdrop, focus trap, Esc) without a library. -->
+  <dialog id="confirm-modal" class="confirm-modal">
+    <p id="confirm-message"></p>
+    <form method="dialog" class="confirm-actions">
+      <button value="cancel" class="confirm-cancel">Annuler</button>
+      <button value="ok" class="confirm-ok">Confirmer</button>
+    </form>
+  </dialog>
+
   <script type="module" src="/assets/kiosk.js"></script>
 </body>
 </html>

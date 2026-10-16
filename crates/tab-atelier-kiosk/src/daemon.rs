@@ -67,6 +67,18 @@ impl Daemon {
         self.request(remote, "POST", path, Some(encoded))
     }
 
+    /// `POST <remote><path>` with a RAW body, returning the status and body.
+    ///
+    /// The input route (`POST /tabs/by-id/<uuid>/input`) takes the keystrokes as
+    /// the request body itself, not JSON — so this sends bytes verbatim.
+    ///
+    /// # Errors
+    ///
+    /// [`DaemonError::Unreachable`] when the remote does not answer.
+    pub fn post_raw(&self, remote: &Remote, path: &str, bytes: Vec<u8>) -> Result<(u16, String), DaemonError> {
+        self.request(remote, "POST", path, Some(bytes))
+    }
+
     /// `DELETE <remote><path>`, returning the status and body.
     ///
     /// # Errors

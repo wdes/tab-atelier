@@ -1272,8 +1272,9 @@ function bootstrap() {
     link.href = link.getAttribute("href") + location.search;
   }
   // The landing view: the servers and their tabs, so the tabs are the first
-  // thing on screen.
+  // thing on screen. Then the heartbeat keeps it current.
   loadFleet();
+  startHeartbeat();
 }
 
 // ---- The fleet: the landing view -------------------------------------------
@@ -1305,7 +1306,7 @@ const CARD_FIELDS = [
 function fleetServerHtml(server) {
   const sid = escapeHtml(String(server.id));
   const label = escapeHtml(String(server.label || server.id || "serveur"));
-  const head = `<div class="fleet-server-head"><h2>${label}</h2></div>`;
+  const head = `<div class="fleet-server-head"><h2>${label}</h2><button class="fleet-ask" data-server="${sid}" title="demander à chaque agent de publier sa carte (rôle, objectif…)">Identifier les agents</button><button class="fleet-refresh" data-server="${sid}" title="rafraîchir les onglets">⟳</button></div>`;
   if (server.error) {
     return `<section class="fleet-server" data-server="${sid}">
       ${head}<p class="fleet-error">Injoignable.</p></section>`;
@@ -1321,11 +1322,42 @@ function fleetServerHtml(server) {
   </section>`;
 }
 
-/** One tab as an agent card: its name, its cwd, and its labels — each editable. */
+// The daemon's five tab LEDs (src/lib.rs `TabLed`), slug → class. The daemon is
+// the single source of truth for the colours; the kiosk mirrors them exactly.
+const LED_CLASS = {
+  dead: "led-dead",
+  error: "led-error",
+  working: "led-working",
+  unreviewed: "led-unreviewed",
+  idle: "led-idle",
+};
+const LED_TITLE = {
+  dead: "session terminée — à relancer",
+  error: "l'agent a signalé une erreur",
+  working: "en cours",
+  unreviewed: "à revoir",
+  idle: "au repos",
+};
+
+/** A tab's led — the daemon's `led` slug, or `null` when the daemon shows none.
+ *
+ *  The daemon omits the led for a tab it does not mark: `compute_tab_led`
+ *  returns `None` unless the agent is dead, a transient state exists, or a
+ *  session is attached and alive-or-unreviewed. A brain tab has no long-lived
+ *  process, so it has NO led. `null` here means the card draws no dot — not a
+ *  grey one we made up. */
+function ledOf(tab) {
+  if (typeof tab.led !== "string") return null;
+  return { cls: LED_CLASS[tab.led] || "led-idle", title: LED_TITLE[tab.led] || "au repos" };
+}
+
+/** One tab as an agent card: its led, its name, its labels — each editable —
+ *  and an icon that opens its terminal (edit mode) in a new browser tab. */
 function tabCardHtml(serverId, tab) {
   const sid = escapeHtml(String(serverId));
   const tid = escapeHtml(String(tab.id || ""));
   const meta = tab.meta || {};
+  const led = ledOf(tab);
   const fields = CARD_FIELDS.map(([key, label]) => {
     const value = meta[key];
     const shown = value ? escapeHtml(String(value)) : `<span class="unset">—</span>`;
@@ -1336,12 +1368,67 @@ function tabCardHtml(serverId, tab) {
     .filter((k) => !CARD_FIELDS.some(([f]) => f === k))
     .map((k) => `<span class="card-tag">${escapeHtml(k)}=${escapeHtml(String(meta[k]))}</span>`)
     .join("");
+  // A real link, not a fetch: the terminal viewer is served by the REMOTE and is
+  // interactive. `target=_blank` opens it in our own browser tab. The Kiosk's
+  // /view route is behind the Kiosk token, and an `<a href>` sends no header —
+  // so the token rides in the query, exactly as the page's own `?token=` works.
+  const open =
+    `<a class="card-open" title="ouvrir le terminal (édition)" target="_blank" rel="noopener" ` +
+    `href="/kiosk/remotes/${encodeURIComponent(serverId)}/tabs/${encodeURIComponent(String(tab.id || ""))}/view?token=${encodeURIComponent(TOKEN)}">↗</a>`;
   return `<article class="agent-card" data-server="${sid}" data-tab="${tid}">
-    <header><h3>${escapeHtml(String(tab.name || tab.id || "(sans nom)"))}</h3><span class="cwd">${escapeHtml(String(tab.cwd || ""))}</span></header>
+    <header>
+      <span class="card-title">${led ? `<span class="led ${led.cls}" title="${led.title}"></span>` : ""}<span class="card-name">${escapeHtml(String(tab.name || tab.id || "(sans nom)"))}</span>${tab.agent_kind ? `<span class="card-agent" title="agent présent">${escapeHtml(String(tab.agent_kind))}</span>` : ""}</span>
+      <span class="card-actions">${open}<button class="card-close" title="fermer l'onglet" aria-label="fermer l'onglet">×</button></span>
+    </header>
+    <span class="cwd">${escapeHtml(String(tab.cwd || ""))}</span>
     <dl class="card-fields">${fields}</dl>
     ${extras ? `<p class="card-tags">${extras}</p>` : ""}
-    <footer><button class="card-close">Fermer</button></footer>
   </article>`;
+}
+
+// A heartbeat: the tab list refreshes on its own so the view stays current
+// without a click. The refresh button shows the countdown ("⟳ (dans 12s)") and
+// is disabled while a refresh is in flight, so a manual click and the beat can
+// never stack two fetches.
+const REFRESH_SECONDS = 15;
+let refreshCountdown = REFRESH_SECONDS;
+let refreshing = false;
+
+/** Redraw every refresh button: disabled + spinning while loading, else the countdown. */
+function paintRefresh() {
+  if (typeof document === "undefined") return;
+  for (const button of document.querySelectorAll(".fleet-refresh")) {
+    button.disabled = refreshing;
+    button.classList.toggle("spinning", refreshing);
+    button.textContent = refreshing ? "⟳" : `⟳ (dans ${refreshCountdown}s)`;
+  }
+}
+
+/** Reload the fleet now, resetting the countdown. */
+async function refreshFleet() {
+  if (refreshing) return;
+  refreshing = true;
+  paintRefresh();
+  try {
+    await loadFleet();
+  } finally {
+    refreshing = false;
+    refreshCountdown = REFRESH_SECONDS;
+    paintRefresh();
+  }
+}
+
+/** Tick once a second: count down, and at zero ask for a refresh. */
+function startHeartbeat() {
+  setInterval(() => {
+    if (refreshing) return;
+    if (refreshCountdown <= 1) {
+      refreshFleet();
+      return;
+    }
+    refreshCountdown -= 1;
+    paintRefresh();
+  }, 1000);
 }
 
 async function loadFleet() {
@@ -1362,6 +1449,16 @@ async function loadFleet() {
         field.addEventListener("click", () => onEditField(card, field.dataset.key));
       }
     }
+    // A refresh button per server, next to its name, and a heartbeat that
+    // refreshes the list on its own so the view stays current without a click.
+    for (const button of host.querySelectorAll(".fleet-refresh")) {
+      button.addEventListener("click", () => refreshFleet());
+    }
+    paintRefresh();
+    // "cartes": ask every agent tab on this server to publish its card.
+    for (const button of host.querySelectorAll(".fleet-ask")) {
+      button.addEventListener("click", () => onBroadcast(button.dataset.server, button));
+    }
   } catch (err) {
     host.innerHTML = `<p class="fleet-error">Flotte indisponible : ${escapeHtml(String(err.message || err))}</p>`;
   }
@@ -1378,14 +1475,31 @@ async function remotePost(path, body) {
   return res.json().catch(() => ({}));
 }
 
-/** Show an error next to the fleet, without wiping the cards. */
-function fleetNote(message) {
+/** Show a note next to the fleet, without wiping the cards. */
+function fleetNote(message, ok = false) {
   const host = typeof document !== "undefined" && document.getElementById("fleet");
   if (!host) return;
   const note = document.createElement("p");
-  note.className = "fleet-error";
+  note.className = ok ? "fleet-ok" : "fleet-error";
   note.textContent = message;
   host.prepend(note);
+}
+
+/** Ask every agent tab on a server to publish its card. */
+async function onBroadcast(serverId, button) {
+  if (!(await confirmModal("Demander à tous les agents de ce serveur de publier leur carte ?"))) return;
+  button.disabled = true;
+  try {
+    const { started } = await remotePost(`/kiosk/remotes/${encodeURIComponent(serverId)}/broadcast`);
+    fleetNote(
+      started ? `Demande envoyée à ${started} agent(s), étalée dans le temps.` : "Aucun agent à qui demander.",
+      true,
+    );
+  } catch (err) {
+    fleetNote(`Envoi impossible : ${err.message || err}`);
+  } finally {
+    button.disabled = false;
+  }
 }
 
 async function onAddTab(event, serverId) {
@@ -1404,12 +1518,47 @@ async function onAddTab(event, serverId) {
   }
 }
 
+/** A confirm in the page's own markup, resolving true on confirm.
+ *
+ *  A `<dialog>` in kiosk.html — not `window.confirm()`, which is the browser's
+ *  chrome and cannot be styled or trusted to render the same everywhere. Falls
+ *  back to allowing the action if the dialog is somehow absent, so a missing
+ *  node never silently blocks the operator. */
+function confirmModal(message, okLabel = "Confirmer") {
+  return new Promise((resolve) => {
+    const dialog = typeof document !== "undefined" && document.getElementById("confirm-modal");
+    const messageEl = typeof document !== "undefined" && document.getElementById("confirm-message");
+    if (!dialog || !messageEl) {
+      resolve(true);
+      return;
+    }
+    messageEl.textContent = message;
+    // The confirm button says what it does — "Confirmer" — not a repeat of the
+    // action's own verb, which the message already spells out.
+    const ok = dialog.querySelector(".confirm-ok");
+    if (ok) ok.textContent = okLabel;
+    const done = () => {
+      dialog.removeEventListener("close", done);
+      resolve(dialog.returnValue === "ok");
+    };
+    dialog.addEventListener("close", done);
+    dialog.showModal();
+  });
+}
+
 async function onCloseTab(card) {
   const { server, tab } = card.dataset;
+  const nameEl = card.querySelector(".card-name");
+  const name = nameEl ? nameEl.textContent.trim() : tab;
+  // A confirm, because a terminal dies with the tab and cannot be undone.
+  if (!(await confirmModal(`Fermer l'onglet « ${name} » ?`))) return;
+  const button = card.querySelector(".card-close");
+  if (button) button.disabled = true; // no double-send while the request is out
   try {
     await remotePost(`/kiosk/remotes/${encodeURIComponent(server)}/tabs/${encodeURIComponent(tab)}/close`);
-    await loadFleet();
+    await loadFleet(); // the closed tab disappears, so the list reloads
   } catch (err) {
+    if (button) button.disabled = false;
     fleetNote(`Fermeture impossible : ${err.message || err}`);
   }
 }
@@ -1421,13 +1570,19 @@ async function onEditField(card, key) {
   const label = (CARD_FIELDS.find(([f]) => f === key) || [key, key])[1];
   const value = prompt(`${label} :`, current);
   if (value === null) return;
+  const trimmed = value.trim();
   try {
     await remotePost(`/kiosk/remotes/${encodeURIComponent(server)}/tabs/${encodeURIComponent(tab)}/meta`, {
       key,
       // An emptied field clears the label; the daemon takes null as "remove".
-      value: value.trim() === "" ? null : value.trim(),
+      value: trimmed === "" ? null : trimmed,
     });
-    await loadFleet();
+    // Patch THIS field in place — no `loadFleet()`, so the page does not reflow
+    // and the operator keeps their place. The one value that changed is the one
+    // value redrawn.
+    if (shown) {
+      shown.innerHTML = trimmed === "" ? `<span class="unset">—</span>` : escapeHtml(trimmed);
+    }
   } catch (err) {
     fleetNote(`Carte non modifiée : ${err.message || err}`);
   }
