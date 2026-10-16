@@ -58,6 +58,7 @@ pub async fn serve_with(listener: TcpListener, cfg: Config, timeouts: HopTimeout
         cfg.remotes,
         cfg.intentions,
         cfg.web_root,
+        cfg.catalog,
     ));
     loop {
         let (stream, _peer) = match listener.accept().await {
@@ -151,7 +152,13 @@ async fn handle(req: Request<Incoming>, panes: &Panes, daemon: &Daemon) -> Respo
             Ok(text) => panes.intent_ask(&slug, &text),
             Err(response) => response,
         },
-        Route::Catalog => Panes::catalog(),
+        Route::Catalog { include_deleted } => panes.catalog(include_deleted),
+        Route::CatalogEdit { skill } => match read_json(body).await {
+            Ok(value) => panes.catalog_edit(&skill, &value),
+            Err(response) => response,
+        },
+        Route::CatalogDelete { skill } => panes.catalog_visibility(&skill, true),
+        Route::CatalogRestore { skill } => panes.catalog_visibility(&skill, false),
         Route::RemotesList => panes.remotes_list(),
         Route::RemoteAdd => match read_json(body).await {
             Ok(value) => {

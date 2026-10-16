@@ -70,6 +70,9 @@ fn test_config(state: &Path, token: Option<&str>) -> Config {
             path: state.join("remotes.json"),
         },
         intentions: crate::intent::Intentions::new(state.join("intentions")).expect("intentions dir"),
+        catalog: crate::catalog::Catalog {
+            path: state.join("catalog.jsonl"),
+        },
         // The UI is served from disk, so the tests point at the crate's own
         // assets — the same files the packaged install ships.
         web_root: std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets"),
@@ -393,14 +396,76 @@ async fn the_catalog_pane_serves_the_read_model() {
     let dir = scratch_dir("catalog");
     let addr = spawn_kiosk_with(test_config(&dir, Some("t"))).await;
     let auth = ("authorization", "Bearer t");
+    let json = [("authorization", "Bearer t"), ("content-type", "application/json")];
 
     assert_eq!(get(addr, "/catalog/list").status(), 401, "still behind the token");
 
-    let listed = send(Method::GET, addr, "/catalog/list", &[auth], vec![]);
-    assert_eq!(listed.status(), 200);
-    let body = body_string(listed);
-    assert!(body.contains("\"retired\""), "the read-model the page expects: {body}");
-    assert!(body.contains("\"skills\""), "the read-model the page expects: {body}");
+    // Empty to start: the read-model the page expects, both keys present.
+    let listed = body_string(send(Method::GET, addr, "/catalog/list", &[auth], vec![]));
+    assert!(listed.contains("\"retired\":[]"), "the read-model: {listed}");
+    assert!(listed.contains("\"skills\":[]"), "empty but shaped: {listed}");
+
+    // Add a skill — this is the whole point: authoring by hand.
+    let edit = send(
+        Method::POST,
+        addr,
+        "/catalog/review/edit",
+        &json,
+        br#"{"prompt":"review the diff","specialty":"reviewer"}"#.to_vec(),
+    );
+    assert_eq!(edit.status(), 200, "{}", body_string(edit));
+    let body = body_string(send(Method::GET, addr, "/catalog/list", &[auth], vec![]));
+    assert!(body.contains("\"skill\":\"review\""), "the skill is listed: {body}");
+    assert!(body.contains("\"promptVersion\":1"), "at version 1: {body}");
+
+    // A stale promptVersion is a 409 (two editors cannot silently clobber).
+    let stale = send(
+        Method::POST,
+        addr,
+        "/catalog/review/edit",
+        &json,
+        br#"{"prompt":"x","promptVersion":0}"#.to_vec(),
+    );
+    assert_eq!(stale.status(), 409, "a stale version conflicts");
+
+    // An empty prompt is a 409 too.
+    let blank = send(
+        Method::POST,
+        addr,
+        "/catalog/review/edit",
+        &json,
+        br#"{"prompt":"   "}"#.to_vec(),
+    );
+    assert_eq!(blank.status(), 409, "no prompt is not a skill");
+
+    // Delete hides it; includeDeleted shows the tombstone; restore brings it back.
+    assert_eq!(
+        send(Method::POST, addr, "/catalog/review/delete", &[auth], vec![]).status(),
+        200
+    );
+    assert!(!body_string(send(Method::GET, addr, "/catalog/list", &[auth], vec![])).contains("review"));
+    assert!(
+        body_string(send(
+            Method::GET,
+            addr,
+            "/catalog/list?includeDeleted=true",
+            &[auth],
+            vec![]
+        ))
+        .contains("\"deleted\":true"),
+        "the tombstone shows when asked for"
+    );
+    assert_eq!(
+        send(Method::POST, addr, "/catalog/review/restore", &[auth], vec![]).status(),
+        200
+    );
+    assert!(body_string(send(Method::GET, addr, "/catalog/list", &[auth], vec![])).contains("review"));
+
+    // An unknown skill is a 404.
+    assert_eq!(
+        send(Method::POST, addr, "/catalog/nope/delete", &[auth], vec![]).status(),
+        404
+    );
 }
 
 /// A Kiosk path reached with the wrong method is a 405 with an `Allow` header,

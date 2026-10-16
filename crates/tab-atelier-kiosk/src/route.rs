@@ -58,7 +58,25 @@ pub enum Route {
         slug: String,
     },
     /// The catalog tab: `GET /catalog/list`, the skills catalogue.
-    Catalog,
+    Catalog {
+        /// Whether tombstoned skills are included.
+        include_deleted: bool,
+    },
+    /// `POST /catalog/<skill>/edit` — write a skill's profile.
+    CatalogEdit {
+        /// The skill name.
+        skill: String,
+    },
+    /// `POST /catalog/<skill>/delete` — tombstone a skill.
+    CatalogDelete {
+        /// The skill name.
+        skill: String,
+    },
+    /// `POST /catalog/<skill>/restore` — un-tombstone a skill.
+    CatalogRestore {
+        /// The skill name.
+        skill: String,
+    },
     /// `GET /kiosk/remotes` — the servers the Kiosk aggregates.
     RemotesList,
     /// `POST /kiosk/remotes` — add a server.
@@ -177,8 +195,13 @@ pub fn route(req: &Request<()>) -> Route {
         (&Method::POST, "/intent/new") => Route::IntentNew,
         (method, p) if p.starts_with("/intent/") => intent_action(method, p),
         // The catalog tab reads the skills catalogue, which is the Kiosk's to
-        // answer: the daemon has no such route (see `crate::panes::catalog`).
-        (&Method::GET, "/catalog/list") => Route::Catalog,
+        // answer: the daemon has no such route (see `crate::panes::catalog`). The
+        // exact `/list` arm must win over the family guard below, or it would
+        // read as a skill named "list".
+        (&Method::GET, "/catalog/list") => Route::Catalog {
+            include_deleted: query_param(query, "includeDeleted").is_some_and(|v| v == "true" || v == "1"),
+        },
+        (method, p) if p.starts_with("/catalog/") => catalog_action(method, p),
         // The Kiosk's own multi-server API. Distinct from `/kiosk` (the page):
         // these reach a configured remote with its token, server-side.
         (&Method::GET, "/kiosk/remotes") => Route::RemotesList,
@@ -217,6 +240,28 @@ fn intent_action(method: &Method, path: &str) -> Route {
     }
 }
 
+/// `POST /catalog/<skill>/<verb>`, or `NotFound` for anything else.
+///
+/// The skill segment arrives percent-encoded (`encodeURIComponent` in the page),
+/// so it is decoded before use — a skill with a space or a dot would otherwise
+/// never resolve.
+fn catalog_action(method: &Method, path: &str) -> Route {
+    let mut segments = path["/catalog/".len()..].split('/');
+    let (Some(skill), Some(verb), None) = (segments.next(), segments.next(), segments.next()) else {
+        return Route::NotFound;
+    };
+    if skill.is_empty() {
+        return Route::NotFound;
+    }
+    let skill = percent_decode(skill);
+    match (method, verb) {
+        (&Method::POST, "edit") => Route::CatalogEdit { skill },
+        (&Method::POST, "delete") => Route::CatalogDelete { skill },
+        (&Method::POST, "restore") => Route::CatalogRestore { skill },
+        _ => Route::NotFound,
+    }
+}
+
 /// The methods this crate answers for a path it owns, or `None` when the path
 /// is not the Kiosk's at all and is therefore the daemon's to answer.
 fn allowed_methods(path: &str) -> Option<&'static str> {
@@ -231,6 +276,14 @@ fn allowed_methods(path: &str) -> Option<&'static str> {
             match (segments.next(), segments.next()) {
                 (Some(slug), None) if !slug.is_empty() => Some("GET, HEAD"),
                 (Some(_), Some("promote" | "ask")) => Some("POST"),
+                _ => None,
+            }
+        }
+        // `/catalog/list` is claimed above as a GET; this covers the mutations.
+        _ if path.starts_with("/catalog/") => {
+            let mut segments = path["/catalog/".len()..].split('/');
+            match (segments.next(), segments.next()) {
+                (Some(skill), Some("edit" | "delete" | "restore")) if !skill.is_empty() => Some("POST"),
                 _ => None,
             }
         }
@@ -400,7 +453,38 @@ mod tests {
             Route::DecisionTranch { id: "a".to_string() }
         );
         assert_eq!(classify(Method::GET, "/reports"), Route::Reports);
-        assert_eq!(classify(Method::GET, "/catalog/list"), Route::Catalog);
+        assert_eq!(
+            classify(Method::GET, "/catalog/list"),
+            Route::Catalog { include_deleted: false }
+        );
+        assert_eq!(
+            classify(Method::GET, "/catalog/list?includeDeleted=true"),
+            Route::Catalog { include_deleted: true }
+        );
+        assert_eq!(
+            classify(Method::POST, "/catalog/review/edit"),
+            Route::CatalogEdit {
+                skill: "review".to_string()
+            }
+        );
+        assert_eq!(
+            classify(Method::POST, "/catalog/review/delete"),
+            Route::CatalogDelete {
+                skill: "review".to_string()
+            }
+        );
+        assert_eq!(
+            classify(Method::POST, "/catalog/review%20v2/restore"),
+            Route::CatalogRestore {
+                skill: "review v2".to_string()
+            },
+            "the skill segment is percent-decoded"
+        );
+        // A wrong verb on the family is a 405, not a 404.
+        assert_eq!(
+            classify(Method::GET, "/catalog/review/edit"),
+            Route::MethodNotAllowed("POST")
+        );
         assert_eq!(
             classify(Method::GET, "/kiosk/manage"),
             Route::Asset("manage.html".to_string())

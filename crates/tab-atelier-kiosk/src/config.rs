@@ -12,6 +12,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::catalog::Catalog;
 use crate::decisions::Journal;
 use crate::intent::{self, Intentions};
 use crate::remotes::Remotes;
@@ -65,6 +66,8 @@ pub struct Config {
     /// missing. Not compiled in: a rebuilt page is a copy, not a rebuild of the
     /// server.
     pub web_root: PathBuf,
+    /// The skills catalogue — the Kiosk's own store, like the board.
+    pub catalog: Catalog,
 }
 
 impl Config {
@@ -90,6 +93,8 @@ impl Config {
             .map_or_else(|_| state_dir.join(intent::DEFAULT_INTENTIONS_DIR), PathBuf::from);
         let intentions = Intentions::new(intentions_dir).map_err(|e| format!("intentions: {e}"))?;
         let web_root = resolve_web_root();
+        let catalog =
+            std::env::var("TAB_ATELIER_CATALOG").map_or_else(|_| state_dir.join("catalog.jsonl"), PathBuf::from);
         Ok(Self {
             bind,
             journal: Journal { path: journal, outbox },
@@ -98,6 +103,7 @@ impl Config {
             remotes: Remotes { path: remotes },
             intentions,
             web_root,
+            catalog: Catalog { path: catalog },
         })
     }
 

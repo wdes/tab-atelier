@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use http::{HeaderValue, Response, StatusCode, header};
 
 use crate::body::{BoxBody, full, json_response};
+use crate::catalog::{Catalog, CatalogError, EditRequest};
 use crate::decisions::{DecisionError, Journal};
 use crate::intent::Intentions;
 use crate::remotes::{Remote, RemoteError, Remotes};
@@ -30,6 +31,8 @@ pub struct Panes {
     /// The directory the UI is served from. Not embedded: a rebuilt page is a
     /// copy on disk, not a rebuild of the server.
     web_root: PathBuf,
+    /// The skills catalogue — the Kiosk's own store, like the board.
+    catalog: Catalog,
     /// Where the last agent broadcast started. Each broadcast begins at the
     /// next tab rather than always at the first, so repeated fan-outs do not
     /// hammer whichever tab happens to be first.
@@ -43,6 +46,7 @@ impl Panes {
         remotes: Remotes,
         intentions: Intentions,
         web_root: PathBuf,
+        catalog: Catalog,
     ) -> Self {
         Self {
             journal,
@@ -50,6 +54,7 @@ impl Panes {
             remotes,
             intentions,
             web_root,
+            catalog,
             broadcast_cursor: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
@@ -197,14 +202,53 @@ impl Panes {
 
     /// `GET /catalog/list` — the skills catalogue.
     ///
-    /// The read-model the page expects: `{ retired, skills }`. Both empty, and
-    /// that is the honest state, not a stub for a missing feature — the
-    /// catalogue is folded from agents a retire loop distils, and that loop is
-    /// not in this tree, so there is nothing to fold yet. Serving the shape
-    /// rather than 404 is what lets the tab render its empty state ("aucun
-    /// skill") instead of an error the reader cannot act on.
-    pub fn catalog() -> Response<BoxBody> {
-        json_response(StatusCode::OK, &serde_json::json!({ "retired": [], "skills": [] }))
+    /// The read-model the page expects: `{ retired, skills }`. `retired` is
+    /// always empty — that was the legacy v1 fold, and this store has no v1
+    /// records, so the page's "category" mode simply groups the active skills.
+    /// `skills` is what the operator authored; tombstoned skills are hidden
+    /// unless `include_deleted` (the page's "afficher les supprimés").
+    pub fn catalog(&self, include_deleted: bool) -> Response<BoxBody> {
+        self.catalog.list(include_deleted).map_or_else(
+            |_| unavailable(),
+            |skills| json_response(StatusCode::OK, &serde_json::json!({ "retired": [], "skills": skills })),
+        )
+    }
+
+    /// `POST /catalog/<skill>/edit` — write a skill's profile, creating it if it
+    /// is new. This is how a skill is **added**; the version guard is a 409.
+    pub fn catalog_edit(&self, skill: &str, body: &serde_json::Value) -> Response<BoxBody> {
+        let Ok(request) = serde_json::from_value::<EditRequest>(body.clone()) else {
+            return Self::bad_request();
+        };
+        match self.catalog.edit(skill, &request) {
+            Ok(edited) => json_response(
+                StatusCode::OK,
+                &serde_json::json!({ "edited": edited.skill, "promptVersion": edited.prompt_version }),
+            ),
+            Err(CatalogError::EmptyProfile) => json_response(
+                StatusCode::CONFLICT,
+                &serde_json::json!({ "error": "le prompt ne peut pas être vide" }),
+            ),
+            Err(CatalogError::Conflict) => json_response(
+                StatusCode::CONFLICT,
+                &serde_json::json!({ "error": "promptVersion périmée" }),
+            ),
+            Err(_) => unavailable(),
+        }
+    }
+
+    /// `POST /catalog/<skill>/delete` or `/restore` — the tombstone toggle.
+    pub fn catalog_visibility(&self, skill: &str, deleted: bool) -> Response<BoxBody> {
+        match self.catalog.set_deleted(skill, deleted) {
+            Ok(_) => {
+                let verb = if deleted { "delete" } else { "restore" };
+                json_response(StatusCode::OK, &serde_json::json!({ verb: skill }))
+            }
+            Err(CatalogError::NotFound) => {
+                json_response(StatusCode::NOT_FOUND, &serde_json::json!({ "error": "no such skill" }))
+            }
+            Err(_) => unavailable(),
+        }
     }
 
     /// `GET /kiosk/remotes` — the configured servers, token redacted.
@@ -334,6 +378,9 @@ mod tests {
             },
             Intentions::new(dir.join("intentions")).expect("intentions dir"),
             std::path::PathBuf::new(),
+            crate::catalog::Catalog {
+                path: dir.join("catalog.jsonl"),
+            },
         )
     }
 
