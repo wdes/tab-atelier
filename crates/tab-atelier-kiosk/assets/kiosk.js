@@ -1266,10 +1266,18 @@ function bootstrap() {
   });
   // Seed the badge once at load (on-demand, cold source).
   refreshKioskBadge();
-  // The page's token rides in `?token=`, so a link to another page of this Kiosk
-  // (the serveurs screen) must carry it too, or the destination answers 401.
-  for (const link of document.querySelectorAll("[data-carry-token]")) {
-    link.href = link.getAttribute("href") + location.search;
+  // Serveurs: a button now, so the navigation is ours rather than the browser's
+  // — which is also what lets the page's `?token=` ride along.
+  const manageToggle = document.getElementById("manage-toggle");
+  if (manageToggle) manageToggle.addEventListener("click", openServeurs);
+  // The same action from an empty state ("Ajoute-en un dans Serveurs"). Those
+  // sentences are re-rendered on every fetch, so this is one delegated listener
+  // rather than one per render.
+  const fleetHost = document.getElementById("fleet");
+  if (fleetHost) {
+    fleetHost.addEventListener("click", (e) => {
+      if (e.target.closest("[data-manage]")) openServeurs();
+    });
   }
   // The landing view: the servers and their tabs, so the tabs are the first
   // thing on screen. Then the heartbeat keeps it current.
@@ -1279,6 +1287,16 @@ function bootstrap() {
   }
   loadFleet();
   startHeartbeat();
+}
+
+// ---- The Serveurs page -----------------------------------------------------
+//
+// One entry point, from the topbar button and from the empty-state sentences.
+// The page's token arrives in `?token=` and the serveurs screen is behind the
+// same gate, so it is carried onto the URL — without it the destination 401s.
+
+function openServeurs() {
+  location.href = "/kiosk/manage" + location.search;
 }
 
 // ---- The fleet: the landing view -------------------------------------------
@@ -1340,7 +1358,7 @@ export function dashboardHtml(model) {
     }
   }
   if (byPhase.size === 0) {
-    return `<p class="fleet-empty">Aucun onglet. Ajoute-en un dans <a href="/kiosk/manage">Serveurs</a>.</p>`;
+    return `<p class="fleet-empty">Aucun onglet. Ajoute-en un dans <button class="manage-inline" data-manage>Serveurs</button>.</p>`;
   }
   const known = PHASES.filter((phase) => byPhase.has(phase));
   const invented = [...byPhase.keys()].filter((p) => !PHASES.includes(p) && p !== NO_PHASE).sort();
@@ -1361,7 +1379,7 @@ export function dashboardHtml(model) {
 function fleetHtml(model) {
   const servers = (model && model.servers) || [];
   if (servers.length === 0) {
-    return `<p class="fleet-empty">Aucun serveur. Ajoute-en un dans <a href="/kiosk/manage">Serveurs</a>.</p>`;
+    return `<p class="fleet-empty">Aucun serveur. Ajoute-en un dans <button class="manage-inline" data-manage>Serveurs</button>.</p>`;
   }
   return servers.map(fleetServerHtml).join("");
 }

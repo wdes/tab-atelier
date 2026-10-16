@@ -194,6 +194,27 @@ kiosk { padding: 1rem; }
 }
 .kiosk-badge[hidden] { display: none; }
 
+/* --- Serveurs: opens the servers page. A button like its neighbours — an
+   unstyled <a> rendered as a browser-default blue link in a row of chrome. --- */
+.manage-toggle {
+  margin-left: 0.4rem;
+  padding: 0.25rem 0.7rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--fg);
+  font: inherit; font-size: 0.82rem; cursor: pointer;
+}
+.manage-toggle:hover { background: color-mix(in srgb, var(--fg) 6%, transparent); }
+
+/* The inline "Serveurs" call to action inside an empty-state sentence. It acts,
+   so it is a button, but styled to read as part of the sentence it sits in. */
+.manage-inline {
+  font: inherit; padding: 0; border: 0; background: none; cursor: pointer;
+  color: var(--led-working-stroke); text-decoration: underline;
+}
+.manage-inline:hover { opacity: 0.8; }
+
 .kiosk-panel {
   position: fixed;
   top: 50%; left: 50%;
