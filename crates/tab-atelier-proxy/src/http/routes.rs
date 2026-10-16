@@ -151,7 +151,7 @@ pub(crate) async fn me_credentials(
     arrival: Arrival,
     who: ClientKey,
     body: Raw,
-) -> Result<crate::transport::Doc<crate::http::resources::CredentialsResource>, crate::transport::Reply> {
+) -> Result<crate::transport::Doc<crate::http::resources::CredentialsResource>, crate::transport::Failure> {
     me::me_credentials(state, &who.account, &arrival, body).await
 }
 
@@ -193,7 +193,7 @@ pub(crate) fn add_user(
     state: &State<Arc<AppState>>,
     _admin: Admin,
     body: Json<AddUser>,
-) -> Result<crate::transport::Doc<crate::http::resources::AccountEnvelope, 201>, crate::transport::Reply> {
+) -> Result<crate::transport::Doc<crate::http::resources::AccountEnvelope, 201>, crate::transport::Failure> {
     account::add(state, &body.0)
 }
 
@@ -204,7 +204,7 @@ pub(crate) fn remove_user(
     state: &State<Arc<AppState>>,
     _admin: Admin,
     account: &str,
-) -> Result<crate::transport::Doc<crate::http::resources::RemovedAccountEnvelope>, crate::transport::Reply> {
+) -> Result<crate::transport::Doc<crate::http::resources::RemovedAccountEnvelope>, crate::transport::Failure> {
     account::remove(state, account)
 }
 
@@ -216,7 +216,7 @@ pub(crate) fn set_user_disabled(
     _admin: Admin,
     account: &str,
     body: Json<SetDisabled>,
-) -> Result<crate::transport::Doc<crate::http::resources::AccountEnvelope>, crate::transport::Reply> {
+) -> Result<crate::transport::Doc<crate::http::resources::AccountEnvelope>, crate::transport::Failure> {
     account::set_disabled(state, account, &body.0)
 }
 
@@ -228,7 +228,7 @@ pub(crate) fn set_user_weight(
     _admin: Admin,
     account: &str,
     body: Json<SetWeight>,
-) -> Result<crate::transport::Doc<crate::http::resources::AccountEnvelope>, crate::transport::Reply> {
+) -> Result<crate::transport::Doc<crate::http::resources::AccountEnvelope>, crate::transport::Failure> {
     account::set_weight(state, account, &body.0)
 }
 
@@ -240,7 +240,7 @@ pub(crate) fn set_user_provider(
     _admin: Admin,
     account: &str,
     body: Json<PinProvider>,
-) -> Result<crate::transport::Doc<crate::http::resources::AccountEnvelope>, crate::transport::Reply> {
+) -> Result<crate::transport::Doc<crate::http::resources::AccountEnvelope>, crate::transport::Failure> {
     account::set_provider(state, account, &body.0)
 }
 
@@ -252,7 +252,7 @@ pub(crate) fn set_user_model(
     _admin: Admin,
     account: &str,
     body: Json<PinModel>,
-) -> Result<crate::transport::Doc<crate::http::resources::AccountEnvelope>, crate::transport::Reply> {
+) -> Result<crate::transport::Doc<crate::http::resources::AccountEnvelope>, crate::transport::Failure> {
     account::set_model(state, account, &body.0)
 }
 
@@ -264,7 +264,7 @@ pub(crate) fn set_user_compact(
     _admin: Admin,
     account: &str,
     body: Json<SetCompact>,
-) -> Result<crate::transport::Doc<crate::http::resources::AccountEnvelope>, crate::transport::Reply> {
+) -> Result<crate::transport::Doc<crate::http::resources::AccountEnvelope>, crate::transport::Failure> {
     account::set_compact(state, account, &body.0)
 }
 
@@ -276,7 +276,7 @@ pub(crate) fn set_user_tools(
     _admin: Admin,
     account: &str,
     body: Json<SetTools>,
-) -> Result<crate::transport::Doc<crate::http::resources::AccountEnvelope>, crate::transport::Reply> {
+) -> Result<crate::transport::Doc<crate::http::resources::AccountEnvelope>, crate::transport::Failure> {
     account::set_tools(state, account, &body.0)
 }
 
@@ -290,7 +290,7 @@ pub(crate) fn add_key(
     _admin: Admin,
     account: &str,
     body: Json<AddKey>,
-) -> Result<crate::transport::Doc<crate::http::resources::NewKeyResource, 201>, crate::transport::Reply> {
+) -> Result<crate::transport::Doc<crate::http::resources::NewKeyResource, 201>, crate::transport::Failure> {
     key::add(state, account, &body.0)
 }
 
@@ -303,7 +303,7 @@ pub(crate) fn set_key_disabled(
     account: &str,
     key: &str,
     body: Json<SetKeyDisabled>,
-) -> Result<crate::transport::Doc<crate::http::resources::KeyEnvelope>, crate::transport::Reply> {
+) -> Result<crate::transport::Doc<crate::http::resources::KeyEnvelope>, crate::transport::Failure> {
     key::set_disabled(state, account, key, &body.0)
 }
 
@@ -315,7 +315,7 @@ pub(crate) fn remove_key(
     _admin: Admin,
     account: &str,
     key: &str,
-) -> Result<crate::transport::Doc<crate::http::resources::RemovedKeyEnvelope>, crate::transport::Reply> {
+) -> Result<crate::transport::Doc<crate::http::resources::RemovedKeyEnvelope>, crate::transport::Failure> {
     key::remove(state, account, key)
 }
 
@@ -338,7 +338,7 @@ pub(crate) fn save_provider(
     state: &State<Arc<AppState>>,
     _admin: Admin,
     body: Json<SaveProvider>,
-) -> Result<crate::transport::Doc<crate::http::resources::IdResource>, crate::transport::Reply> {
+) -> Result<crate::transport::Doc<crate::http::resources::IdResource>, crate::transport::Failure> {
     provider::save(&body.0, state)
 }
 
@@ -350,7 +350,7 @@ pub(crate) fn rotate_provider_key(
     _admin: Admin,
     id: &str,
     body: Json<RotateProviderKey>,
-) -> Result<crate::transport::Doc<crate::http::resources::OkResource>, crate::transport::Reply> {
+) -> Result<crate::transport::Doc<crate::http::resources::OkResource>, crate::transport::Failure> {
     provider::rotate_key(id, &body.0, state)
 }
 
@@ -361,7 +361,7 @@ pub(crate) fn remove_provider(
     state: &State<Arc<AppState>>,
     _admin: Admin,
     id: &str,
-) -> Result<crate::transport::Doc<crate::http::resources::OkResource>, crate::transport::Reply> {
+) -> Result<crate::transport::Doc<crate::http::resources::OkResource>, crate::transport::Failure> {
     provider::remove(id, state)
 }
 
@@ -374,7 +374,7 @@ pub(crate) fn add_mapping(
     state: &State<Arc<AppState>>,
     _admin: Admin,
     body: Json<AddMapping>,
-) -> Result<crate::transport::Doc<crate::http::resources::OkResource>, crate::transport::Reply> {
+) -> Result<crate::transport::Doc<crate::http::resources::OkResource>, crate::transport::Failure> {
     mapping::add(state, &body.0)
 }
 
@@ -385,7 +385,7 @@ pub(crate) fn remove_mapping(
     state: &State<Arc<AppState>>,
     _admin: Admin,
     from: &str,
-) -> Result<crate::transport::Doc<crate::http::resources::OkResource>, crate::transport::Reply> {
+) -> Result<crate::transport::Doc<crate::http::resources::OkResource>, crate::transport::Failure> {
     mapping::remove(state, from)
 }
 
@@ -455,7 +455,7 @@ pub(crate) fn arm_inspect(
 pub(crate) fn disarm_inspect(
     state: &State<Arc<AppState>>,
     _admin: Admin,
-) -> Result<crate::transport::Doc<crate::http::resources::OkResource>, crate::transport::Reply> {
+) -> Result<crate::transport::Doc<crate::http::resources::OkResource>, crate::transport::Failure> {
     inspect::disarm(state)
 }
 

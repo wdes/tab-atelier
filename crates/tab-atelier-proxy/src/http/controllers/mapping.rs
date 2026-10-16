@@ -11,17 +11,17 @@ use std::sync::Arc;
 
 use crate::http::requests::mapping::AddMapping;
 use crate::server::State;
-use crate::transport::{Doc, Reply};
+use crate::transport::{Doc, Failure};
 
 /// Add or replace a mapping.
 ///
 /// A from-to pair where both ends are the same is refused rather than stored: it
 /// is not an error in the arithmetic, it is a row in the table that looks like a
 /// decision somebody made and changes nothing.
-pub(crate) fn add(state: &Arc<State>, req: &AddMapping) -> Result<Doc<crate::http::resources::OkResource>, Reply> {
+pub(crate) fn add(state: &Arc<State>, req: &AddMapping) -> Result<Doc<crate::http::resources::OkResource>, Failure> {
     let (from, to) = (req.from.trim(), req.to.trim());
     if from == to {
-        return Err(crate::http::problem(
+        return Err(Failure::problem(
             400,
             "a mapping from a name to itself does nothing".to_owned(),
         ));
@@ -39,7 +39,7 @@ pub(crate) fn add(state: &Arc<State>, req: &AddMapping) -> Result<Doc<crate::htt
 
 /// Delete a mapping. A name that was not mapped is a 404, so a typo in an
 /// automated call is visible rather than silently fine.
-pub(crate) fn remove(state: &Arc<State>, from: &str) -> Result<Doc<crate::http::resources::OkResource>, Reply> {
+pub(crate) fn remove(state: &Arc<State>, from: &str) -> Result<Doc<crate::http::resources::OkResource>, Failure> {
     let mut reg = state.registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if !reg.remove_mapping(from) {
         return Err(failure(404, "no such mapping"));
@@ -53,8 +53,8 @@ pub(crate) fn remove(state: &Arc<State>, from: &str) -> Result<Doc<crate::http::
 }
 
 /// An error as the API reports it, with the wording the registry chose.
-fn failure(status: u16, why: &str) -> Reply {
-    crate::http::problem(status, why.to_owned())
+fn failure(status: u16, why: &str) -> Failure {
+    Failure::problem(status, why)
 }
 
 #[cfg(test)]
@@ -89,7 +89,7 @@ mod tests {
     ///
     /// An acknowledgement body is a `Doc` now and a refusal still a `Reply`, so
     /// the two arrive through one type and a test reads the status.
-    fn answered<T, const CODE: u16>(reply: Result<Doc<T, CODE>, Reply>) -> u16 {
+    fn answered<T, const CODE: u16>(reply: Result<Doc<T, CODE>, Failure>) -> u16 {
         match reply {
             Ok(doc) => doc.status,
             Err(refusal) => refusal.status,

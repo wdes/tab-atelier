@@ -12,7 +12,7 @@ use std::sync::Arc;
 use crate::http::requests::inspect::ArmInspect;
 use crate::http::resources::{InspectStateResource, InspectStatusResource, OkResource};
 use crate::server::State;
-use crate::transport::{Doc, Reply};
+use crate::transport::{Doc, Failure};
 
 /// One snapshot of the recorder, as the status body reports it.
 ///
@@ -83,7 +83,7 @@ fn until(req: &ArmInspect, state: &Arc<State>) -> u64 {
 ///
 /// One button, because "stop recording" and "and delete what you recorded" are
 /// the same intention in practice.
-pub(crate) fn disarm(state: &Arc<State>) -> Result<Doc<OkResource>, Reply> {
+pub(crate) fn disarm(state: &Arc<State>) -> Result<Doc<OkResource>, Failure> {
     let cleared = {
         let mut ins = state.inspect.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         ins.disarm();
@@ -94,7 +94,7 @@ pub(crate) fn disarm(state: &Arc<State>) -> Result<Doc<OkResource>, Reply> {
             log::info!("proxy: request inspection disarmed and captures cleared");
             Ok(Doc::ok(OkResource::yes()))
         }
-        Err(e) => Err(crate::http::problem(500, e)),
+        Err(e) => Err(Failure::problem(500, e)),
     }
 }
 
@@ -104,7 +104,7 @@ mod tests {
     use crate::server::State;
 
     /// The status a `Result`-returning handler answered, whichever side it is.
-    fn answered<T, const CODE: u16>(reply: Result<Doc<T, CODE>, Reply>) -> u16 {
+    fn answered<T, const CODE: u16>(reply: Result<Doc<T, CODE>, Failure>) -> u16 {
         match reply {
             Ok(doc) => doc.status,
             Err(refusal) => refusal.status,

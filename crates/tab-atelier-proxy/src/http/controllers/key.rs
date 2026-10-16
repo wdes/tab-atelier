@@ -14,11 +14,11 @@ use std::sync::Arc;
 use crate::http::requests::key::{AddKey, SetKeyDisabled};
 use crate::http::resources;
 use crate::server::State;
-use crate::transport::{Doc, Reply};
+use crate::transport::{Doc, Failure};
 
 /// An error as the API reports it, with the wording the store chose.
-fn failure(status: u16, why: &str) -> Reply {
-    crate::http::problem(status, why)
+fn failure(status: u16, why: &str) -> Failure {
+    Failure::problem(status, why)
 }
 
 /// Mint a key for an account.
@@ -27,7 +27,7 @@ fn failure(status: u16, why: &str) -> Reply {
 /// learn the secret. This is the only response that ever contains the key's
 /// plaintext — the store keeps a hash — so a client that loses it must mint
 /// another.
-pub(crate) fn add(state: &Arc<State>, who: &str, req: &AddKey) -> Result<Doc<resources::NewKeyResource, 201>, Reply> {
+pub(crate) fn add(state: &Arc<State>, who: &str, req: &AddKey) -> Result<Doc<resources::NewKeyResource, 201>, Failure> {
     let mut store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     match store.add_key(who, &req.name) {
         Ok((key, secret)) => Ok(Doc::<resources::NewKeyResource, 201>::ok(
@@ -49,7 +49,7 @@ pub(crate) fn set_disabled(
     who: &str,
     key: &str,
     req: &SetKeyDisabled,
-) -> Result<Doc<resources::KeyEnvelope>, Reply> {
+) -> Result<Doc<resources::KeyEnvelope>, Failure> {
     let mut store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     match store.set_key_disabled(who, key, req.disabled()) {
         Ok(k) => Ok(Doc::ok(resources::KeyEnvelope::from(&k))),
@@ -61,7 +61,7 @@ pub(crate) fn set_disabled(
 ///
 /// Answers with what was removed, so the operator can confirm it was the key
 /// they meant rather than one whose name they mistyped.
-pub(crate) fn remove(state: &Arc<State>, who: &str, key: &str) -> Result<Doc<resources::RemovedKeyEnvelope>, Reply> {
+pub(crate) fn remove(state: &Arc<State>, who: &str, key: &str) -> Result<Doc<resources::RemovedKeyEnvelope>, Failure> {
     let mut store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     match store.remove_key(who, key) {
         Ok(k) => Ok(Doc::ok(resources::RemovedKeyEnvelope::from(&k))),
@@ -102,7 +102,7 @@ mod tests {
     /// Names are unique per account — that is how a key is revoked — so a test
     /// reusing a name has to clear it, and doing that here keeps the
     /// arrangement out of the assertions.
-    fn mint(state: &Arc<State>, who: &str, name: &str) -> Result<Doc<resources::NewKeyResource, 201>, Reply> {
+    fn mint(state: &Arc<State>, who: &str, name: &str) -> Result<Doc<resources::NewKeyResource, 201>, Failure> {
         let _ = remove(state, who, name);
         add(state, who, &AddKey { name: name.to_owned() })
     }
@@ -111,7 +111,7 @@ mod tests {
     ///
     /// A creation, a revocation and a refusal all come back through one type
     /// now, so a test reads the status instead of the `Reply` it used to hold.
-    fn answered<T, const CODE: u16>(reply: Result<Doc<T, CODE>, Reply>) -> u16 {
+    fn answered<T, const CODE: u16>(reply: Result<Doc<T, CODE>, Failure>) -> u16 {
         match reply {
             Ok(doc) => doc.status,
             Err(refusal) => refusal.status,

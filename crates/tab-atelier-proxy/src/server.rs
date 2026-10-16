@@ -206,35 +206,56 @@ mod tests {
 
     /// How many responses are still untyped, pinned so the number can only fall.
     ///
-    /// A route that could carry a typed resource and still returns a bare
-    /// `Reply` shows up as an `x-dynamic-body` in the document. The count today
-    /// is every documented route — rung one annotates and mounts, rung two types
-    /// the payloads and lowers this. It is a ceiling, not a target: re-pinned
-    /// downward when a payload is typed, never raised to quiet a new route.
-    /// `usize::MAX` reads the current count out of the failure.
+    /// A route that answers a body nobody named — the relay passing an upstream
+    /// answer through — shows up as an `x-dynamic-body` in the document. The
+    /// count started at 31 (rung one: every route a bare `Reply`) and every
+    /// payload that can be typed has been; the **6** that remain are the relay
+    /// (`relay_post`, `relay_get`, `relay_hello`, `relay_hello_head`,
+    /// `hello_get`, `hello_head`), whose body is genuinely the upstream's and so
+    /// has no schema to write. That is the floor, not a backlog: a route added
+    /// here that answers a `Reply` it *could* have typed raises this number and
+    /// fails the test. Only re-pin downward, and only when a payload is typed.
     #[test]
     fn untyped_responses_do_not_grow() {
         let client = app();
         let body = client.get("/openapi.json").dispatch().into_string().expect("a body");
         let count = body.matches("x-dynamic-body").count();
         assert!(
-            count <= 24,
-            "x-dynamic-body responses: {count} (was 31; lower the pin when a payload is typed)"
+            count <= 6,
+            "x-dynamic-body responses: {count} (the floor is the 6 relay routes; was 31)"
         );
     }
 
-    /// The document is reachable, and it is the derived one.
+    /// The document is reachable, and it is the derived, well-formed one.
     ///
-    /// It names a real path and the `openapi` key, so an empty document or a
-    /// hand-written stub would fail — which is the whole claim: the spec comes
-    /// from the routes, and cannot lag them.
+    /// It parses as JSON, names the routes, and carries the component schemas
+    /// the resources generated — so an empty document, a hand-written stub, or
+    /// a derivation that silently dropped its types would all fail. That is the
+    /// whole claim: the spec comes from the routes and the structs, and cannot
+    /// lag either.
     #[test]
     fn the_openapi_document_is_served() {
         let client = app();
         let response = client.get("/openapi.json").dispatch();
         assert_eq!(response.status(), Status::Ok);
         let body = response.into_string().expect("a body");
-        assert!(body.contains("/api/users"), "the document names a real route: {body}");
-        assert!(body.contains("\"openapi\""), "and it is an OpenAPI document");
+        let document: serde_json::Value = serde_json::from_str(&body).expect("the document is JSON");
+        assert_eq!(document["openapi"], "3.0.0", "the version okapi writes");
+        assert!(
+            document["paths"]["/api/users"]["get"].is_object(),
+            "the document names a real route, with its methods"
+        );
+        // A converted route answers a named resource, so the schema it came from
+        // is in the components — proof the derivation reached the structs, not
+        // just the paths.
+        assert!(
+            document["components"]["schemas"]["AccountsResource"].is_object(),
+            "a typed response's schema is in the document"
+        );
+        // And a refusal is documented as the `default` response, not lost.
+        assert!(
+            document["components"]["schemas"]["ProblemResource"].is_object(),
+            "the refusal shape is in the document"
+        );
     }
 }

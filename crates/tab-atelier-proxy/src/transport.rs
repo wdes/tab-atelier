@@ -28,6 +28,10 @@ pub use tab_atelier_api::marshal::{Body, Reply, ReplyBody, json, json_of, text};
 // returns this instead of building the JSON itself; the status is in the type,
 // so `Doc<NewThing, 201>` documents and answers a 201.
 pub use tab_atelier_api::respond::Doc;
+// The typed refusal a route's error arm answers: the `{"error": …}` body,
+// documented as the document's `default` response rather than left as the
+// untyped marker `Reply` would carry.
+pub use tab_atelier_api::respond::Failure;
 
 /// A request, with its body already in memory.
 #[derive(Debug)]

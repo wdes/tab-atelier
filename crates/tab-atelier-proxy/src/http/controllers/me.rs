@@ -21,7 +21,7 @@ use crate::http::guards::Arrival;
 use crate::http::raw::Raw;
 use crate::http::resources;
 use crate::server::State;
-use crate::transport::{Doc, Reply};
+use crate::transport::{Doc, Failure};
 use crate::users::Account;
 use crate::{egress, usage};
 
@@ -76,10 +76,10 @@ pub(crate) async fn me_credentials(
     who: &Account,
     arrival: &Arrival,
     body: Raw,
-) -> Result<Doc<resources::CredentialsResource>, Reply> {
+) -> Result<Doc<resources::CredentialsResource>, Failure> {
     let _ = state;
     let Ok(raw) = String::from_utf8(body.bytes().to_vec()) else {
-        return Err(crate::http::problem(400, "body is not UTF-8"));
+        return Err(Failure::problem(400, "body is not UTF-8"));
     };
     let ip = arrival.ip.clone();
     let outcome = tokio::task::spawn_blocking(move || egress::repair_credentials(&raw)).await;
@@ -99,9 +99,9 @@ pub(crate) async fn me_credentials(
                 who.display_name(),
                 who.email,
             );
-            Err(crate::http::problem(409, e))
+            Err(Failure::problem(409, e))
         }
-        Err(_) => Err(crate::http::problem(500, "credential repair panicked")),
+        Err(_) => Err(Failure::problem(500, "credential repair panicked")),
     }
 }
 
@@ -115,7 +115,7 @@ mod tests {
     ///
     /// An installed credential is a `Doc` now and a refusal still a `Reply`, so
     /// the two arrive through one type and a test reads the status.
-    fn answered<T, const CODE: u16>(reply: Result<Doc<T, CODE>, Reply>) -> u16 {
+    fn answered<T, const CODE: u16>(reply: Result<Doc<T, CODE>, Failure>) -> u16 {
         match reply {
             Ok(doc) => doc.status,
             Err(refusal) => refusal.status,

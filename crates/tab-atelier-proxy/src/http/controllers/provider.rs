@@ -13,14 +13,14 @@ use crate::http::requests::provider::{RotateProviderKey, SaveProvider};
 use crate::http::resources::status::{IdResource, OkResource};
 use crate::provider;
 use crate::server::State;
-use crate::transport::{Doc, Reply};
+use crate::transport::{Doc, Failure};
 
 /// Add a provider, edit one, or copy one beside itself.
 ///
 /// The three intentions share a body because they share a form. Which one is
 /// meant falls out of the values: a preset names a provider outright, `dup`
 /// asks for a second row beside an existing one, and anything else is a save.
-pub(crate) fn save(request: &SaveProvider, state: &Arc<State>) -> Result<Doc<IdResource>, Reply> {
+pub(crate) fn save(request: &SaveProvider, state: &Arc<State>) -> Result<Doc<IdResource>, Failure> {
     let dir = registry_dir(state);
     let mut reg = state.registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
@@ -39,7 +39,7 @@ pub(crate) fn save(request: &SaveProvider, state: &Arc<State>) -> Result<Doc<IdR
     } else {
         let id = request.id.trim();
         let Ok(models) = provider::parse_models(&request.models) else {
-            return Err(crate::http::problem(400, "models: one name per line, no blanks"));
+            return Err(Failure::problem(400, "models: one name per line, no blanks"));
         };
         provider::Provider {
             user_id: None,
@@ -113,7 +113,7 @@ pub(crate) fn save(request: &SaveProvider, state: &Arc<State>) -> Result<Doc<IdR
     if !key.is_empty() {
         let path = provider::provider_key_path(&dir, &id);
         if let Err(e) = provider::write_provider_key(&path, key) {
-            return Err(crate::http::problem(500, format!("key file: {e}")));
+            return Err(Failure::problem(500, format!("key file: {e}")));
         }
     }
 
@@ -122,14 +122,18 @@ pub(crate) fn save(request: &SaveProvider, state: &Arc<State>) -> Result<Doc<IdR
     // Scoped: the lock must not be held across the log line below.
     drop(reg);
     if let Err(e) = saved {
-        return Err(crate::http::problem(500, format!("registry: {e}")));
+        return Err(Failure::problem(500, format!("registry: {e}")));
     }
     log::info!("proxy: provider {id} saved");
     Ok(Doc::ok(IdResource::of(id)))
 }
 
 /// Replace one provider's key, and nothing else.
-pub(crate) fn rotate_key(id: &str, request: &RotateProviderKey, state: &Arc<State>) -> Result<Doc<OkResource>, Reply> {
+pub(crate) fn rotate_key(
+    id: &str,
+    request: &RotateProviderKey,
+    state: &Arc<State>,
+) -> Result<Doc<OkResource>, Failure> {
     let auth = {
         let reg = state.registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         reg.get(id).map(|p| p.auth.clone())
@@ -144,17 +148,17 @@ pub(crate) fn rotate_key(id: &str, request: &RotateProviderKey, state: &Arc<Stat
     // Worse than useless: an operator who later changed the auth kind would
     // find a key they had forgotten they pasted, suddenly in use.
     let Some(auth) = auth else {
-        return Err(crate::http::problem(404, "no such provider"));
+        return Err(Failure::problem(404, "no such provider"));
     };
     // Refused BEFORE anything is written, and refused on the server as well as
     // in the UI: a disabled button is a hint, and the API is reachable without
     // one.
     if let Some(reason) = auth.no_key_reason(id) {
-        return Err(crate::http::problem(400, reason));
+        return Err(Failure::problem(400, reason));
     }
     let path = provider::provider_key_path(&registry_dir(state), id);
     if let Err(e) = provider::write_provider_key(&path, &request.key) {
-        return Err(crate::http::problem(500, format!("key file: {e}")));
+        return Err(Failure::problem(500, format!("key file: {e}")));
     }
     // No restart: the credential is read per request, which is the whole
     // reason it lives in a file rather than in the service's environment.
@@ -167,7 +171,7 @@ pub(crate) fn rotate_key(id: &str, request: &RotateProviderKey, state: &Arc<Stat
 /// The unpinning happens first and is not optional. A pin is a person saying
 /// "send me there"; leaving one behind after the destination is gone is how a
 /// working account becomes a 502 that no page explains.
-pub(crate) fn remove(id: &str, state: &Arc<State>) -> Result<Doc<OkResource>, Reply> {
+pub(crate) fn remove(id: &str, state: &Arc<State>) -> Result<Doc<OkResource>, Failure> {
     let pinned_here: Vec<String> = {
         let mut store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let names: Vec<String> = store
@@ -192,12 +196,12 @@ pub(crate) fn remove(id: &str, state: &Arc<State>) -> Result<Doc<OkResource>, Re
 
     let mut reg = state.registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if !reg.remove(id) {
-        return Err(crate::http::problem(404, "no such provider"));
+        return Err(Failure::problem(404, "no such provider"));
     }
     let saved = reg.save(&state.registry_path);
     drop(reg);
     if let Err(e) = saved {
-        return Err(crate::http::problem(500, format!("registry: {e}")));
+        return Err(Failure::problem(500, format!("registry: {e}")));
     }
     Ok(Doc::ok(OkResource::yes()))
 }
@@ -240,7 +244,7 @@ mod tests {
     ///
     /// A saved provider body is a `Doc` now and a refusal still a `Reply`, so
     /// the two arrive through one type and a test reads the status.
-    fn answered<T, const CODE: u16>(reply: Result<Doc<T, CODE>, Reply>) -> u16 {
+    fn answered<T, const CODE: u16>(reply: Result<Doc<T, CODE>, Failure>) -> u16 {
         match reply {
             Ok(doc) => doc.status,
             Err(refusal) => refusal.status,

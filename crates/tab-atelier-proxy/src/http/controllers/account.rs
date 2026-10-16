@@ -13,7 +13,7 @@ use crate::http::requests::compact::SetCompact;
 use crate::http::requests::user::{AddUser, PinModel, PinProvider, SetDisabled, SetTools, SetWeight};
 use crate::http::resources;
 use crate::server::State;
-use crate::transport::{Doc, Reply};
+use crate::transport::{Doc, Failure};
 use crate::users::Store;
 
 /// Every account, for the operator's table.
@@ -23,7 +23,7 @@ pub(crate) fn list(state: &Arc<State>) -> Doc<resources::AccountsResource> {
 }
 
 /// Creating an account.
-pub(crate) fn add(state: &Arc<State>, req: &AddUser) -> Result<Doc<resources::AccountEnvelope, 201>, Reply> {
+pub(crate) fn add(state: &Arc<State>, req: &AddUser) -> Result<Doc<resources::AccountEnvelope, 201>, Failure> {
     let mut store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     match store.add(&req.first_name, &req.last_name, &req.email) {
         Ok(a) => Ok(Doc::<resources::AccountEnvelope, 201>::ok(
@@ -34,7 +34,7 @@ pub(crate) fn add(state: &Arc<State>, req: &AddUser) -> Result<Doc<resources::Ac
 }
 
 /// Deleting an account, and with it everything only that account could explain.
-pub(crate) fn remove(state: &Arc<State>, who: &str) -> Result<Doc<resources::RemovedAccountEnvelope>, Reply> {
+pub(crate) fn remove(state: &Arc<State>, who: &str) -> Result<Doc<resources::RemovedAccountEnvelope>, Failure> {
     let mut store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     match store.remove(who) {
         Ok(a) => {
@@ -57,7 +57,7 @@ pub(crate) fn set_provider(
     state: &Arc<State>,
     who: &str,
     req: &PinProvider,
-) -> Result<Doc<resources::AccountEnvelope>, Reply> {
+) -> Result<Doc<resources::AccountEnvelope>, Failure> {
     let wanted = req.provider.trim();
     // Validated HERE, where the registry is in hand, rather than in users.rs
     // which knows about people and not about destinations. A pin to a typo
@@ -74,7 +74,7 @@ pub(crate) fn set_provider(
             )
         };
         if let Some(why) = why {
-            return Err(crate::http::problem(400, why));
+            return Err(Failure::problem(400, why));
         }
     }
     let mut store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -92,7 +92,7 @@ pub(crate) fn set_model(
     state: &Arc<State>,
     who: &str,
     req: &PinModel,
-) -> Result<Doc<resources::AccountEnvelope>, Reply> {
+) -> Result<Doc<resources::AccountEnvelope>, Failure> {
     let wanted = req.model.trim();
     // Canonicalised to the catalogue's own spelling before it is stored, for the
     // reason the CLI does the same: routing resolves the pin by EXACT id, so a
@@ -130,7 +130,7 @@ pub(crate) fn set_compact(
     state: &Arc<State>,
     who: &str,
     req: &SetCompact,
-) -> Result<Doc<resources::AccountEnvelope>, Reply> {
+) -> Result<Doc<resources::AccountEnvelope>, Failure> {
     let Some(level) = crate::compact::Compact::ALL
         .into_iter()
         .find(|c| c.as_str() == req.compact.trim())
@@ -177,7 +177,7 @@ pub(crate) fn set_tools(
     state: &Arc<State>,
     who: &str,
     req: &SetTools,
-) -> Result<Doc<resources::AccountEnvelope>, Reply> {
+) -> Result<Doc<resources::AccountEnvelope>, Failure> {
     let mut store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     match store.set_tools(who, req.policy.clone()) {
         Ok(a) => Ok(Doc::ok(resources::AccountEnvelope::from(&a))),
@@ -190,7 +190,7 @@ pub(crate) fn set_disabled(
     state: &Arc<State>,
     who: &str,
     req: &SetDisabled,
-) -> Result<Doc<resources::AccountEnvelope>, Reply> {
+) -> Result<Doc<resources::AccountEnvelope>, Failure> {
     let mut store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     match store.set_disabled(who, req.disabled()) {
         Ok(a) => Ok(Doc::ok(resources::AccountEnvelope::from(&a))),
@@ -203,7 +203,7 @@ pub(crate) fn set_weight(
     state: &Arc<State>,
     who: &str,
     req: &SetWeight,
-) -> Result<Doc<resources::AccountEnvelope>, Reply> {
+) -> Result<Doc<resources::AccountEnvelope>, Failure> {
     let mut store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     match store.set_weight(who, req.weight()) {
         Ok(a) => Ok(Doc::ok(resources::AccountEnvelope::from(&a))),
@@ -212,8 +212,8 @@ pub(crate) fn set_weight(
 }
 
 /// An error as the API reports it, with the wording the store chose.
-fn failure(status: u16, why: &str) -> Reply {
-    crate::http::problem(status, why.to_owned())
+fn failure(status: u16, why: &str) -> Failure {
+    Failure::problem(status, why)
 }
 
 #[cfg(test)]
@@ -247,7 +247,7 @@ mod tests {
     ///
     /// A creation cannot be a bare `Doc`: the same handler also answers 400, so
     /// it returns a `Result` and the test reads through it.
-    fn answered<T, const CODE: u16>(reply: &Result<Doc<T, CODE>, Reply>) -> u16 {
+    fn answered<T, const CODE: u16>(reply: &Result<Doc<T, CODE>, Failure>) -> u16 {
         match reply {
             Ok(doc) => doc.status,
             Err(refusal) => refusal.status,
