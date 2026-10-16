@@ -5,13 +5,15 @@
 
 use http::{Method, Request};
 
-use crate::assets;
-
 /// What a request resolves to.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Route {
-    /// Serve an embedded asset: `(body, content-type)`.
-    Asset(&'static str, &'static str),
+    /// Serve a file from the web root — the path relative to it (e.g.
+    /// `kiosk.js`). Not embedded bytes: the UI is files on disk, so a rebuilt
+    /// page is a copy and not a rebuild of the server. A `String` because a
+    /// built UI ships its own modules (`kiosk/app.js`), whose path is known only
+    /// at request time.
+    Asset(String),
     /// The board: `GET /decisions`.
     Decisions {
         /// Whether archived decisions are included.
@@ -151,21 +153,14 @@ pub fn route(req: &Request<()>) -> Route {
 
     // Only fetches can be an asset, but the panes are read by both GET and POST.
     let resolved = match (req.method(), path) {
-        (&Method::GET | &Method::HEAD, "/" | "/kiosk" | "/assets/kiosk.html") => {
-            Route::Asset(assets::HTML, "text/html; charset=utf-8")
-        }
-        (&Method::GET | &Method::HEAD, "/assets/kiosk.css") => Route::Asset(assets::CSS, "text/css; charset=utf-8"),
-        (&Method::GET | &Method::HEAD, "/assets/kiosk.js") => {
-            Route::Asset(assets::JS, "text/javascript; charset=utf-8")
-        }
-        (&Method::GET | &Method::HEAD, "/kiosk/manage") => {
-            Route::Asset(assets::MANAGE_HTML, "text/html; charset=utf-8")
-        }
-        (&Method::GET | &Method::HEAD, "/assets/manage.css") => {
-            Route::Asset(assets::MANAGE_CSS, "text/css; charset=utf-8")
-        }
-        (&Method::GET | &Method::HEAD, "/assets/manage.js") => {
-            Route::Asset(assets::MANAGE_JS, "text/javascript; charset=utf-8")
+        (&Method::GET | &Method::HEAD, "/" | "/kiosk" | "/assets/kiosk.html") => Route::Asset("kiosk.html".into()),
+        (&Method::GET | &Method::HEAD, "/kiosk/manage") => Route::Asset("manage.html".into()),
+        // Anything else under `/assets/` is a UI file served from the web root —
+        // the fixed pages above, and a built UI's own modules
+        // (`/assets/kiosk/app.js`). The name comes straight from the URL; the
+        // web crate's own guard is what keeps it inside the root.
+        (&Method::GET | &Method::HEAD, p) if p.starts_with("/assets/") => {
+            Route::Asset(p["/assets/".len()..].to_string())
         }
         (&Method::GET, "/decisions") => Route::Decisions {
             include_archived: query_param(query, "includeArchived").is_some_and(|v| v == "true" || v == "1"),
@@ -226,9 +221,10 @@ fn intent_action(method: &Method, path: &str) -> Route {
 /// is not the Kiosk's at all and is therefore the daemon's to answer.
 fn allowed_methods(path: &str) -> Option<&'static str> {
     match path {
-        "/" | "/kiosk" | "/assets/kiosk.html" | "/assets/kiosk.css" | "/assets/kiosk.js" | "/decisions"
-        | "/decisions/file" | "/reports" | "/catalog/list" | "/kiosk/manage" | "/assets/manage.css"
-        | "/assets/manage.js" | "/intent/list" => Some("GET, HEAD"),
+        "/" | "/kiosk" | "/kiosk/manage" | "/decisions" | "/decisions/file" | "/reports" | "/catalog/list"
+        | "/intent/list" => Some("GET, HEAD"),
+        // The whole `/assets/` tree is a GET.
+        _ if path.starts_with("/assets/") => Some("GET, HEAD"),
         "/intent" | "/intent/new" => Some("POST"),
         _ if path.starts_with("/intent/") => {
             let mut segments = path["/intent/".len()..].split('/');
@@ -361,7 +357,6 @@ fn percent_decode(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{Route, percent_decode, route};
-    use crate::assets;
     use http::{Method, Request};
 
     fn classify(method: Method, uri: &str) -> Route {
@@ -373,17 +368,11 @@ mod tests {
     /// panes are ours, and every other call is the daemon's.
     #[test]
     fn routes_are_classified_locally_or_proxied() {
-        assert_eq!(
-            classify(Method::GET, "/"),
-            Route::Asset(assets::HTML, "text/html; charset=utf-8")
-        );
-        assert_eq!(
-            classify(Method::GET, "/kiosk"),
-            Route::Asset(assets::HTML, "text/html; charset=utf-8")
-        );
+        assert_eq!(classify(Method::GET, "/"), Route::Asset("kiosk.html".to_string()));
+        assert_eq!(classify(Method::GET, "/kiosk"), Route::Asset("kiosk.html".to_string()));
         assert_eq!(
             classify(Method::GET, "/assets/kiosk.js"),
-            Route::Asset(assets::JS, "text/javascript; charset=utf-8")
+            Route::Asset("kiosk.js".to_string())
         );
 
         assert_eq!(
@@ -414,7 +403,7 @@ mod tests {
         assert_eq!(classify(Method::GET, "/catalog/list"), Route::Catalog);
         assert_eq!(
             classify(Method::GET, "/kiosk/manage"),
-            Route::Asset(assets::MANAGE_HTML, "text/html; charset=utf-8")
+            Route::Asset("manage.html".to_string())
         );
 
         // A path the Kiosk owns, reached with the wrong method, is a 405 — not a

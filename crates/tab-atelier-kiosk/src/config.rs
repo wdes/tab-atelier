@@ -28,6 +28,10 @@ pub const DEFAULT_BIND: &str = "0.0.0.0:8282";
 /// Where the kiosk's own data lives when the state-dir knobs are unset.
 pub const DEFAULT_STATE_DIR: &str = "/var/lib/tab-atelier-kiosk";
 
+/// Where the UI is served from when `TAB_ATELIER_KIOSK_WEB` is unset: the
+/// packaged location, which is also what the `.deb` installs to.
+pub const DEFAULT_WEB_ROOT: &str = "/usr/share/tab-atelier-kiosk/web";
+
 /// Runtime knobs, read from the environment.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -57,6 +61,10 @@ pub struct Config {
     pub remotes: Remotes,
     /// The intentions the Kiosk holds — its own data, like the board.
     pub intentions: Intentions,
+    /// The directory the UI is served from — resolved at startup, logged once if
+    /// missing. Not compiled in: a rebuilt page is a copy, not a rebuild of the
+    /// server.
+    pub web_root: PathBuf,
 }
 
 impl Config {
@@ -81,6 +89,7 @@ impl Config {
         let intentions_dir = std::env::var("TAB_ATELIER_INTENTIONS")
             .map_or_else(|_| state_dir.join(intent::DEFAULT_INTENTIONS_DIR), PathBuf::from);
         let intentions = Intentions::new(intentions_dir).map_err(|e| format!("intentions: {e}"))?;
+        let web_root = resolve_web_root();
         Ok(Self {
             bind,
             journal: Journal { path: journal, outbox },
@@ -88,6 +97,7 @@ impl Config {
             token_file,
             remotes: Remotes { path: remotes },
             intentions,
+            web_root,
         })
     }
 
@@ -100,6 +110,34 @@ impl Config {
         let bind = std::env::var("TAB_ATELIER_KIOSK_ADDR").unwrap_or_else(|_| DEFAULT_BIND.to_string());
         Self::new(&bind)
     }
+}
+
+/// The directory the UI is served from.
+///
+/// `TAB_ATELIER_KIOSK_WEB` wins. Otherwise the packaged location, unless it is
+/// absent and this is a debug build — then the crate's own `assets/`, so
+/// `cargo run` serves the UI from the checkout without an install. The path is
+/// not required to exist: the server reports a missing UI once at startup, which
+/// is more useful than refusing to boot over a directory that may be mounted
+/// later.
+fn resolve_web_root() -> PathBuf {
+    if let Ok(dir) = std::env::var("TAB_ATELIER_KIOSK_WEB") {
+        return PathBuf::from(dir);
+    }
+    let packaged = PathBuf::from(DEFAULT_WEB_ROOT);
+    if packaged.is_dir() {
+        return packaged;
+    }
+    // The checkout's assets, for `cargo run` — never in a release binary, where
+    // the manifest path does not exist on the target machine.
+    #[cfg(debug_assertions)]
+    {
+        let dev = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets");
+        if dev.is_dir() {
+            return dev;
+        }
+    }
+    packaged
 }
 
 /// Resolves the pane token: the environment wins, then a token file under the

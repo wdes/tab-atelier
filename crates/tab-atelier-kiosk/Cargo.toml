@@ -27,6 +27,9 @@ serde_json = "1"
 # The shared round-robin pacing: the same sweep brain.rs uses, so a fan-out
 # (the agent broadcast) is spread over time instead of arriving as a herd.
 tab-atelier-pace = { path = "../tab-atelier-pace" }
+# The shared serving layer: serve the UI from a web root, the JSON response
+# shapes, the token gate.
+tab-atelier-web = { path = "../tab-atelier-web" }
 tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "net", "sync", "time", "io-util", "macros", "signal"] }
 ureq = { version = "3", features = ["json"] }
 
@@ -53,6 +56,12 @@ assets = [
     ["target/release/tab-atelier-kiosk", "/usr/bin/", "755"],
     ["systemd/tab-atelier-kiosk.service", "/usr/lib/systemd/system/", "644"],
     ["README.md", "/usr/share/doc/tab-atelier-kiosk/", "644"],
+    # The UI is served from a web root, not compiled in, so the package ships
+    # it. Globs, so the only files here are the ones a browser loads — the
+    # `tests/`, `run-tests.sh` and `package.json` beside them are not matched.
+    ["assets/*.html", "/usr/share/tab-atelier-kiosk/web/", "644"],
+    ["assets/*.css", "/usr/share/tab-atelier-kiosk/web/", "644"],
+    ["assets/*.js", "/usr/share/tab-atelier-kiosk/web/", "644"],
 ]
 maintainer-scripts = "debian/"
 systemd-units = { unit-name = "tab-atelier-kiosk", enable = true, start = true }

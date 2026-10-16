@@ -70,6 +70,9 @@ fn test_config(state: &Path, token: Option<&str>) -> Config {
             path: state.join("remotes.json"),
         },
         intentions: crate::intent::Intentions::new(state.join("intentions")).expect("intentions dir"),
+        // The UI is served from disk, so the tests point at the crate's own
+        // assets — the same files the packaged install ships.
+        web_root: std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets"),
     }
 }
 

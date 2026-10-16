@@ -64,6 +64,14 @@ bin="$target/release/tab-atelier-kiosk"
 echo "== install $bin -> /usr/bin/tab-atelier-kiosk =="
 sudo install -m 0755 "$bin" /usr/bin/tab-atelier-kiosk
 
+# The UI is served from a web root, not compiled in, so the files go beside the
+# install too — the package does this with its asset list; a hotswap copies them.
+echo "== install the UI -> /usr/share/tab-atelier-kiosk/web =="
+sudo install -d -m 0755 /usr/share/tab-atelier-kiosk/web
+sudo cp "$crate"/assets/kiosk.html "$crate"/assets/kiosk.css "$crate"/assets/kiosk.js \
+        "$crate"/assets/manage.html "$crate"/assets/manage.css "$crate"/assets/manage.js \
+        /usr/share/tab-atelier-kiosk/web/
+
 echo "== restart the unit =="
 sudo systemctl restart tab-atelier-kiosk
 if systemctl is-active --quiet tab-atelier-kiosk; then

@@ -52,7 +52,13 @@ pub async fn serve(listener: TcpListener, cfg: Config) -> std::io::Result<()> {
 /// exercise the real timeout paths instead of waiting out the production values.
 pub async fn serve_with(listener: TcpListener, cfg: Config, timeouts: HopTimeouts) -> std::io::Result<()> {
     let daemon = Arc::new(Daemon::new(timeouts));
-    let panes = Arc::new(Panes::new(cfg.journal, cfg.token, cfg.remotes, cfg.intentions));
+    let panes = Arc::new(Panes::new(
+        cfg.journal,
+        cfg.token,
+        cfg.remotes,
+        cfg.intentions,
+        cfg.web_root,
+    ));
     loop {
         let (stream, _peer) = match listener.accept().await {
             Ok(pair) => pair,
@@ -80,19 +86,29 @@ pub async fn serve_with(listener: TcpListener, cfg: Config, timeouts: HopTimeout
     }
 }
 
+/// Serve one UI file from the web root.
+///
+/// `no-cache` on everything: the page names the other assets by path and a
+/// built UI has no content hashes in its filenames, so a cached page paired
+/// with a rebuilt script is the failure to avoid.
+fn serve_asset(panes: &Panes, rel: &str) -> Response<BoxBody> {
+    tab_atelier_web::assets::serve(panes.web_root(), rel).map_or_else(Panes::not_found, |mut response| {
+        // Both a missing file and a rebuilt page want the same answer: send it
+        // fresh, so a cached page is never paired with a script that changed.
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, header::HeaderValue::from_static("no-cache"));
+        response
+    })
+}
+
 /// Serve a local asset or answer a pane.
 async fn handle(req: Request<Incoming>, panes: &Panes, daemon: &Daemon) -> Response<BoxBody> {
     let (parts, body) = req.into_parts();
     let authorization = parts.headers.get(header::AUTHORIZATION).cloned();
     // The token may also arrive as `?token=` — a plain `<a href>` (the terminal
     // link) cannot set a header, and neither can an operator pasting a URL.
-    let query_token = parts.uri.query().and_then(|query| {
-        query
-            .split('&')
-            .filter_map(|pair| pair.split_once('='))
-            .find(|(name, _)| *name == "token")
-            .map(|(_, value)| value.to_string())
-    });
+    let query_token = tab_atelier_web::query_token(parts.uri.query());
     let route = route::route(&Request::from_parts(parts.clone(), ()));
 
     // One gate for every pane and the remote API, before the match, rather than
@@ -103,18 +119,12 @@ async fn handle(req: Request<Incoming>, panes: &Panes, daemon: &Daemon) -> Respo
     }
 
     match route {
-        Route::Asset(asset, content_type) => Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, content_type)
-            // The page is embedded in the binary and changes on deploy only, but
-            // it names the assets by path: no-cache keeps a rebuilt deploy from
-            // pairing a stale page with fresh JS.
-            .header(header::CACHE_CONTROL, "no-cache")
-            .body(full(asset))
-            .expect("static response builder"),
+        // A UI file, read from the web root on disk. Not embedded: a rebuilt
+        // page is a copy, not a rebuild of the server.
+        Route::Asset(rel) => serve_asset(panes, &rel),
         // Nothing the Kiosk serves. There is no single daemon to relay to — to
         // reach a machine's tabs, it is a configured remote, not a fallback.
-        Route::NotFound => json_response(StatusCode::NOT_FOUND, &serde_json::json!({ "error": "not_found" })),
+        Route::NotFound => Panes::not_found(),
         Route::Decisions { include_archived } => panes.list(include_archived),
         Route::DecisionFile { path } => panes.file(&path),
         Route::DecisionRead { id } => panes.read(&id),

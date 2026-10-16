@@ -7158,6 +7158,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tab-atelier-pace",
+ "tab-atelier-web",
  "tokio",
  "ureq",
 ]

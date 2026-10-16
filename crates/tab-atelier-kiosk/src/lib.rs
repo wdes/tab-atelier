@@ -32,7 +32,6 @@
 //! - [`server`] — the socket loop that ties them together.
 //! - [`backup`] — a copy of the whole state directory, and a copy back.
 
-pub(crate) mod assets;
 pub(crate) mod backup;
 pub(crate) mod body;
 pub(crate) mod card;

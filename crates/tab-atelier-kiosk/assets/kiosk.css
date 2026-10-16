@@ -346,8 +346,8 @@ kiosk { padding: 1rem; }
   display: grid;
   gap: 1rem;
   padding: 1rem;
-  max-width: 64rem;
-  margin: 0 auto;
+  /* Full window, not a 64rem column: the page is the width of the screen, and
+     the cards are what keeps a sane size (below), not the page. */
   align-content: start;
 }
 .fleet-server {
@@ -374,10 +374,11 @@ kiosk { padding: 1rem; }
 .fleet-ask + .fleet-refresh { margin-left: 0; }
 .fleet-ok { color: var(--ok); font-style: normal; }
 
-/* The cards: one per row, full width, so fields line up across tabs. */
+/* The cards: as many per row as fit, each a readable width — so a wider page
+   shows MORE cards, not bigger ones. */
 .cards {
   display: grid;
-  grid-template-columns: 1fr;
+  grid-template-columns: repeat(auto-fill, minmax(20rem, 1fr));
   gap: 0.6rem;
   margin-bottom: 0.75rem;
 }

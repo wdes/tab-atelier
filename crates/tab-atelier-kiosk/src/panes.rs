@@ -8,6 +8,8 @@
 //! rather than serving the board — the panes are an operator's view, and the
 //! absence of a token is not a licence to read them.
 
+use std::path::{Path, PathBuf};
+
 use http::{HeaderValue, Response, StatusCode, header};
 
 use crate::body::{BoxBody, full, json_response};
@@ -17,13 +19,17 @@ use crate::remotes::{Remote, RemoteError, Remotes};
 use crate::reports;
 
 /// The panes' state: the journal, the intentions, the remotes the Kiosk
-/// aggregates, and the token that opens them.
+/// aggregates, the token that opens them, and the directory the UI is served
+/// from.
 #[derive(Debug, Clone)]
 pub struct Panes {
     journal: Journal,
     token: Option<String>,
     remotes: Remotes,
     intentions: Intentions,
+    /// The directory the UI is served from. Not embedded: a rebuilt page is a
+    /// copy on disk, not a rebuild of the server.
+    web_root: PathBuf,
     /// Where the last agent broadcast started. Each broadcast begins at the
     /// next tab rather than always at the first, so repeated fan-outs do not
     /// hammer whichever tab happens to be first.
@@ -31,14 +37,31 @@ pub struct Panes {
 }
 
 impl Panes {
-    pub fn new(journal: Journal, token: Option<String>, remotes: Remotes, intentions: Intentions) -> Self {
+    pub fn new(
+        journal: Journal,
+        token: Option<String>,
+        remotes: Remotes,
+        intentions: Intentions,
+        web_root: PathBuf,
+    ) -> Self {
         Self {
             journal,
             token,
             remotes,
             intentions,
+            web_root,
             broadcast_cursor: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
+    }
+
+    /// The directory the UI is served from.
+    pub fn web_root(&self) -> &Path {
+        &self.web_root
+    }
+
+    /// A 404 in the Kiosk's JSON shape.
+    pub fn not_found() -> Response<BoxBody> {
+        json_response(StatusCode::NOT_FOUND, &serde_json::json!({ "error": "not_found" }))
     }
 
     /// The cursor for the next broadcast, advanced past the whole set so the
@@ -70,14 +93,10 @@ impl Panes {
     /// No token configured → nobody is authorized, so the panes fail closed
     /// instead of standing open.
     pub fn authorized(&self, authorization: Option<&HeaderValue>, query_token: Option<&str>) -> bool {
-        let Some(expected) = self.token.as_deref() else {
-            return false;
-        };
-        let from_header = authorization
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.strip_prefix("Bearer "));
-        let provided = from_header.or(query_token);
-        provided.is_some_and(|provided| constant_time_eq(provided.as_bytes(), expected.as_bytes()))
+        // The gate lives in the shared web crate, so the kiosk and the proxy
+        // compare tokens the same way — Bearer or ?token=, constant-time,
+        // fail-closed when no token is set.
+        tab_atelier_web::token_matches(self.token.as_deref(), authorization, query_token)
     }
 
     /// `GET /decisions` — the board.
@@ -295,20 +314,9 @@ fn unavailable() -> Response<BoxBody> {
     )
 }
 
-/// Compares two byte strings without leaking where they first differ.
-///
-/// A token check that returns early on the first wrong byte tells an attacker
-/// how many leading bytes were right; comparing all of them does not.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    a.iter().zip(b).fold(0_u8, |acc, (x, y)| acc | (x ^ y)) == 0
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{Panes, constant_time_eq};
+    use super::Panes;
     use crate::decisions::Journal;
     use crate::intent::Intentions;
     use crate::remotes::Remotes;
@@ -325,6 +333,7 @@ mod tests {
                 path: dir.join("remotes.json"),
             },
             Intentions::new(dir.join("intentions")).expect("intentions dir"),
+            std::path::PathBuf::new(),
         )
     }
 
@@ -347,13 +356,6 @@ mod tests {
         assert!(!closed.authorized(None, None));
         assert!(!closed.authorized(None, Some("anything")), "no token = nobody in");
     }
-
-    /// The comparison is length-checked and content-checked.
-    #[test]
-    fn constant_time_equality_is_exact() {
-        assert!(constant_time_eq(b"abc", b"abc"));
-        assert!(!constant_time_eq(b"abc", b"abd"));
-        assert!(!constant_time_eq(b"abc", b"abcd"));
-        assert!(constant_time_eq(b"", b""));
-    }
+    // The constant-time comparison itself is tested in `tab-atelier-web`, where
+    // it now lives.
 }
