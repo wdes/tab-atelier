@@ -13,12 +13,19 @@ case "$1" in
                     tab-atelier-kiosk >/dev/null
         fi
         install -d -o tab-atelier-kiosk -g tab-atelier-kiosk -m 0700 /var/lib/tab-atelier-kiosk
-        # First install remains stopped for operator configuration; upgrades
-        # restart the running service so its process uses the newly installed binary.
-        if [ -n "$2" ] && [ -d /run/systemd/system ]; then
+        # Enable on install, start it, and restart on an upgrade so the running
+        # process is the new binary — but only while the operator has not
+        # disabled the unit. `deb-systemd-helper was-enabled` is true for a
+        # fresh install and false once someone runs `systemctl disable`, which
+        # is how a disable survives every upgrade after it.
+        if [ -d /run/systemd/system ] &&
+           deb-systemd-helper --quiet was-enabled 'tab-atelier-kiosk.service'; then
+            deb-systemd-helper enable 'tab-atelier-kiosk.service' >/dev/null || true
             deb-systemd-invoke restart 'tab-atelier-kiosk.service' >/dev/null || true
         fi
         ;;
 esac
+
 #DEBHELPER#
+
 exit 0

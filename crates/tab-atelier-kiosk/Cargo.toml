@@ -52,4 +52,4 @@ assets = [
     ["README.md", "/usr/share/doc/tab-atelier-kiosk/", "644"],
 ]
 maintainer-scripts = "debian/"
-systemd-units = { unit-name = "tab-atelier-kiosk", enable = false, start = false }
+systemd-units = { unit-name = "tab-atelier-kiosk", enable = true, start = true }

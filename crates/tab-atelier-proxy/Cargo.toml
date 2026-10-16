@@ -116,4 +116,4 @@ assets = [
     ["README.md", "/usr/share/doc/tab-atelier-proxy/", "644"],
 ]
 maintainer-scripts = "debian/"
-systemd-units = { unit-name = "tab-atelier-proxy", enable = false, start = false }
+systemd-units = { unit-name = "tab-atelier-proxy", enable = true, start = true }
