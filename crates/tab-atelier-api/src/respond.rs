@@ -29,9 +29,11 @@ use rocket::response::Responder;
 use rocket::{Response, response};
 
 use crate::marshal::{Reply, ReplyBody};
+use crate::resource::ProblemResource;
 use crate::schemars::JsonSchema;
 use rocket_okapi::r#gen::OpenApiGenerator;
-use rocket_okapi::okapi::openapi3::{Response as DocResponse, Responses};
+use rocket_okapi::okapi::Map;
+use rocket_okapi::okapi::openapi3::{MediaType, Response as DocResponse, Responses};
 use rocket_okapi::response::OpenApiResponderInner;
 use serde::Serialize;
 
@@ -49,13 +51,13 @@ use serde::Serialize;
 /// that matter most.
 impl OpenApiResponderInner for Reply {
     fn responses(_gen: &mut OpenApiGenerator) -> rocket_okapi::Result<Responses> {
-        let mut response = DocResponse {
+        let mut extensions = Map::new();
+        extensions.insert("x-dynamic-body".to_owned(), serde_json::Value::Bool(true));
+        let response = DocResponse {
             description: "a body shaped at run time; see the handler".to_owned(),
+            extensions,
             ..DocResponse::default()
         };
-        response
-            .extensions
-            .insert("x-dynamic-body".to_owned(), serde_json::Value::Bool(true));
         let mut responses = Responses::default();
         responses.responses.insert("200".to_owned(), response.into());
         Ok(responses)
@@ -160,6 +162,80 @@ impl<T: JsonSchema, const CODE: u16> OpenApiResponderInner for Doc<T, CODE> {
         // read — because the code is part of the type the route returns.
         rocket_okapi::util::add_schema_response(&mut responses, CODE, "application/json", schema)?;
         Ok(responses)
+    }
+}
+
+/// A typed refusal: the `{"error": …}` body, documented as `default`.
+///
+/// The counterpart of [`Doc`] for the failure side. A refusal's status is a
+/// run-time choice — the same handler answers 400 for a bad field, 404 for a
+/// missing one, 409 for a clash — so no `const CODE` can name it, and a bare
+/// [`Reply`] would leave the `x-dynamic-body` marker where a real schema
+/// belongs. `Failure` documents `ProblemResource` under the document's
+/// `default` response — the honest description of "this may fail, and here is
+/// the shape when it does" — while carrying the real status at run time.
+///
+/// A route that may refuse answers `Result<Doc<T>, Failure>`, and now both arms
+/// are typed.
+#[derive(Debug)]
+pub struct Failure {
+    /// The status it will answer with.
+    pub status: u16,
+    problem: ProblemResource,
+}
+
+impl Failure {
+    /// A refusal with a status and a reason.
+    ///
+    /// Takes anything string-like, as the handlers pass both literals and
+    /// `format!`-built messages.
+    #[must_use]
+    pub fn problem(status: u16, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            problem: ProblemResource { error: message.into() },
+        }
+    }
+
+    /// The problem body it carries — for a test that reads the reason without
+    /// dispatching the whole request.
+    #[must_use]
+    pub const fn body(&self) -> &ProblemResource {
+        &self.problem
+    }
+}
+
+impl Responder<'_, 'static> for Failure {
+    fn respond_to(self, _req: &Request<'_>) -> response::Result<'static> {
+        let body = serde_json::to_vec(&self.problem).map_err(|_| Status::InternalServerError)?;
+        let mut builder = Response::build();
+        builder.status(Status::new(self.status));
+        builder.header(Header::new("content-type", "application/json"));
+        builder.sized_body(body.len(), std::io::Cursor::new(body));
+        builder.ok()
+    }
+}
+
+impl OpenApiResponderInner for Failure {
+    fn responses(g: &mut OpenApiGenerator) -> rocket_okapi::Result<Responses> {
+        let schema = g.json_schema::<ProblemResource>();
+        let mut content = Map::new();
+        content.insert(
+            "application/json".to_owned(),
+            MediaType {
+                schema: Some(schema),
+                ..MediaType::default()
+            },
+        );
+        let response = DocResponse {
+            description: "a refusal; `error` is the reason".to_owned(),
+            content,
+            ..DocResponse::default()
+        };
+        Ok(Responses {
+            default: Some(response.into()),
+            ..Responses::default()
+        })
     }
 }
 
