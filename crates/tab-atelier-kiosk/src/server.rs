@@ -283,9 +283,11 @@ const BROADCAST_GAP: Duration = Duration::from_millis(350);
 /// `POST /kiosk/remotes/<id>/broadcast` — type the same message into every agent
 /// tab on a remote, so each agent publishes its card.
 ///
-/// Only the tabs the daemon reports an `agent_kind` for get it: a plain shell
-/// has no agent to answer, and a locked tab refuses input (counted, not forced).
-/// The reply says how many of how many were reached.
+/// Only the tabs that are a **live external agent** get it — `agent_of`, not
+/// merely "has an `agent_kind`": a bash shell has a kind too, and the brief was
+/// once typed into bash sessions. A dead agent ("early try", agent gone) is
+/// skipped as well. A locked tab refuses input (counted, not forced). The reply
+/// says how many of how many were reached.
 async fn remote_broadcast(panes: &Panes, daemon: &Daemon, id: &str) -> Response<BoxBody> {
     let remote = match panes.remote(id) {
         Ok(remote) => remote,
@@ -300,13 +302,10 @@ async fn remote_broadcast(panes: &Panes, daemon: &Daemon, id: &str) -> Response<
         Ok(Ok((status, text))) if (200..300).contains(&status) => serde_json::from_str::<serde_json::Value>(&text)
             .ok()
             .and_then(|value| {
-                value.get("tabs").and_then(serde_json::Value::as_array).map(|tabs| {
-                    tabs.iter()
-                        // An agent is present when the daemon says so.
-                        .filter(|tab| tab.get("agent_kind").and_then(serde_json::Value::as_str).is_some())
-                        .filter_map(|tab| tab.get("id").and_then(serde_json::Value::as_str).map(str::to_string))
-                        .collect()
-                })
+                value
+                    .get("tabs")
+                    .and_then(serde_json::Value::as_array)
+                    .map(|tabs| crate::agent::broadcast_targets(tabs))
             })
             .unwrap_or_default(),
         _ => return Panes::bad_gateway(),
@@ -446,7 +445,9 @@ async fn fleet(panes: &Panes, daemon: &Daemon) -> Response<BoxBody> {
                                     // And how it is doing — the led the card shows,
                                     // plus the agent kind ("is a claude in it?").
                                     "led": tab.get("led"),
-                                    "agent_kind": tab.get("agent_kind"),
+                                    // Only a real external agent — a shell's kind
+                                    // is not an agent, so no badge for it.
+                                    "agent_kind": crate::agent::agent_of(tab),
                                     "agent_state": tab.get("agent_state"),
                                 })
                             })
