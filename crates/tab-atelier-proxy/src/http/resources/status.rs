@@ -1,7 +1,12 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! The two replies every API needs and no domain owns: a refusal and an
-//! acknowledgement.
+//! The replies that carry no fields of their own.
+//!
+//! The two every API needs — a refusal and an acknowledgement — are
+//! `tab-atelier-api`'s, shared with the kiosk, and re-exported here so the
+//! controllers keep naming one module. What is left in this file is the
+//! proxy's own pair: a creation that returns the id it was assigned, and a
+//! credential repair that returns whose login it replaced.
 //!
 //! They are structs rather than `json!` literals so the shape is one
 //! definition that okapi can read, and so a route that returns one is not the
@@ -9,37 +14,7 @@
 
 use serde::Serialize;
 
-/// `{"error": "…"}`, the body of every 4xx and 5xx this API produces.
-///
-/// One field, because the caller's next move is always the same: show it. A
-/// code would be for a machine, and the machine is already reading the status
-/// line.
-#[derive(Serialize)]
-pub(crate) struct ProblemResource {
-    pub error: String,
-}
-
-impl ProblemResource {
-    /// The body for a refusal.
-    #[must_use]
-    pub fn of(error: impl Into<String>) -> Self {
-        Self { error: error.into() }
-    }
-}
-
-/// `{"ok": true}`, for a mutation whose whole result is that it happened.
-#[derive(Serialize)]
-pub(crate) struct OkResource {
-    pub ok: bool,
-}
-
-impl OkResource {
-    /// The body for an acknowledgement.
-    #[must_use]
-    pub const fn yes() -> Self {
-        Self { ok: true }
-    }
-}
+pub(crate) use tab_atelier_api::resource::{OkResource, ProblemResource};
 
 /// `{"id": "…"}`, for a creation that has nothing else worth returning.
 ///
