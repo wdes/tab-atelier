@@ -29,9 +29,11 @@ use rocket::response::Responder;
 use rocket::{Response, response};
 
 use crate::marshal::{Reply, ReplyBody};
+use crate::schemars::JsonSchema;
 use rocket_okapi::r#gen::OpenApiGenerator;
 use rocket_okapi::okapi::openapi3::{Response as DocResponse, Responses};
 use rocket_okapi::response::OpenApiResponderInner;
+use serde::Serialize;
 
 /// Documenting a `Reply` — as a body the handler shaped at run time.
 ///
@@ -102,6 +104,62 @@ impl<'r> Responder<'r, 'static> for Reply {
                 builder.ok()
             }
         }
+    }
+}
+
+/// A typed resource, answered as JSON — and documented by its type.
+///
+/// Where [`Reply`] carries bytes the handler already shaped, `Doc` carries the
+/// *value*, so okapi documents the response with the value's schema instead of
+/// the `x-dynamic-body` marker. A handler that answers a named resource returns
+/// one of these, and each conversion lowers the untyped count the ratchet holds.
+///
+/// The status is a **type parameter**, not a field, because okapi documents a
+/// responder by its *type*: `Doc<T, 201>` and `Doc<T>` are different types, and
+/// only a type-level code can be written into the document. The default is
+/// `200`; a creation says `Doc<NewThing, 201>` and a deletion `Doc<(), 204>`,
+/// and the run-time status follows the type so the two can never disagree.
+///
+/// Named `Doc` and not `Json` because `Json` is already this crate's request
+/// body; one name for a request and a response would be a trap.
+#[derive(Debug)]
+pub struct Doc<T, const CODE: u16 = 200> {
+    /// The status, as the plain number [`Reply`] carries — `CODE` is written
+    /// into the type so okapi can document it, and mirrored in this field so a
+    /// caller reads a `Doc` and a `Reply` the same way.
+    pub status: u16,
+    value: T,
+}
+
+impl<T, const CODE: u16> Doc<T, CODE> {
+    /// The resource, answered with this type's status.
+    #[must_use]
+    pub const fn ok(value: T) -> Self {
+        Self { status: CODE, value }
+    }
+}
+
+impl<T: Serialize, const CODE: u16> Responder<'_, 'static> for Doc<T, CODE> {
+    fn respond_to(self, _req: &Request<'_>) -> response::Result<'static> {
+        // A `Serialize` that fails is a bug in the resource, not a bad request,
+        // so it answers 500 rather than panicking inside a request.
+        let body = serde_json::to_vec(&self.value).map_err(|_| Status::InternalServerError)?;
+        let mut builder = Response::build();
+        builder.status(Status::new(self.status));
+        builder.header(Header::new("content-type", "application/json"));
+        builder.sized_body(body.len(), std::io::Cursor::new(body));
+        builder.ok()
+    }
+}
+
+impl<T: JsonSchema, const CODE: u16> OpenApiResponderInner for Doc<T, CODE> {
+    fn responses(g: &mut OpenApiGenerator) -> rocket_okapi::Result<Responses> {
+        let schema = g.json_schema::<T>();
+        let mut responses = Responses::default();
+        // Documented under this type's own code — 201 for a creation, 200 for a
+        // read — because the code is part of the type the route returns.
+        rocket_okapi::util::add_schema_response(&mut responses, CODE, "application/json", schema)?;
+        Ok(responses)
     }
 }
 
