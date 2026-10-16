@@ -63,21 +63,33 @@ pub fn safe_rel(rel: &str) -> Option<PathBuf> {
     (!out.as_os_str().is_empty()).then_some(out)
 }
 
+/// Read `rel` under `root`: its content type and its bytes, or `None`.
+///
+/// The half of [`serve`] that is about *finding* a UI file rather than about
+/// shaping an HTTP response. A server whose framework builds its own response —
+/// Rocket, say — takes this and still gets the one traversal guard and the one
+/// content-type table, instead of re-deriving both and drifting.
+#[must_use]
+pub fn read(root: &Path, rel: &str) -> Option<(&'static str, Bytes)> {
+    let safe = safe_rel(rel)?;
+    let path = root.join(safe);
+    let data = std::fs::read(&path).ok()?;
+    Some((content_type(&path), Bytes::from(data)))
+}
+
 /// Read `rel` under `root` and answer with it.
 ///
 /// `None` when the path is not a safe relative one, or the file is not there —
 /// the caller turns that into a 404.
 #[must_use]
 pub fn serve(root: &Path, rel: &str) -> Option<Response<Body>> {
-    let safe = safe_rel(rel)?;
-    let path = root.join(safe);
-    let data = std::fs::read(&path).ok()?;
-    Some(response::bytes(StatusCode::OK, content_type(&path), Bytes::from(data)))
+    let (content_type, data) = read(root, rel)?;
+    Some(response::bytes(StatusCode::OK, content_type, data))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{content_type, safe_rel, serve};
+    use super::{content_type, read, safe_rel, serve};
     use std::fs;
     use std::path::{Path, PathBuf};
 
@@ -125,5 +137,21 @@ mod tests {
 
         assert!(serve(&root, "missing.js").is_none(), "a missing file is a 404");
         assert!(serve(&root, "../secret.txt").is_none(), "and so is an escape");
+    }
+
+    /// The primitive under [`serve`]: the same guard and the same table, without
+    /// shaping a response — what a framework-driven server builds on.
+    #[test]
+    fn read_gives_the_type_and_the_bytes_under_the_same_guard() {
+        let root = scratch("read");
+        fs::write(root.join("page.html"), "<html></html>").expect("write");
+
+        let (content_type, bytes) = read(&root, "page.html").expect("read");
+        assert_eq!(content_type, "text/html; charset=utf-8");
+        assert_eq!(bytes, "<html></html>");
+
+        // The guard is `serve`'s, because it is the same call.
+        assert!(read(&root, "../page.html").is_none(), "an escape is refused");
+        assert!(read(&root, "").is_none(), "and so is an empty path");
     }
 }
