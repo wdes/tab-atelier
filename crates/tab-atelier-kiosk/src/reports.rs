@@ -9,6 +9,7 @@
 use std::fs;
 use std::path::Path;
 use std::time::UNIX_EPOCH;
+use tab_atelier_api::schemars::{self, JsonSchema};
 
 use serde::Serialize;
 
@@ -16,7 +17,7 @@ use serde::Serialize;
 ///
 /// Only the three fields the filesystem has. The tab folds repo and task out of
 /// the name itself, so inventing them here would be a second opinion it ignores.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, JsonSchema)]
 pub struct Report {
     /// File name, e.g. `audit-01.md`.
     pub name: String,

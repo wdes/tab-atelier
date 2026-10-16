@@ -10,8 +10,8 @@
 //! The calls are blocking (ureq); the caller runs each on a blocking thread so
 //! the reactor keeps serving other connections while a slow remote answers.
 
-use http::Request;
 use serde_json::Value;
+use ureq::http::Request;
 
 use crate::config::HopTimeouts;
 use crate::remotes::Remote;
@@ -98,9 +98,9 @@ impl Daemon {
         let url = format!("{}{}", remote.url, path_and_query);
         let mut builder = Request::builder().method(method).uri(&url);
         if !remote.token.is_empty() {
-            builder = builder.header(http::header::AUTHORIZATION, format!("Bearer {}", remote.token));
+            builder = builder.header(ureq::http::header::AUTHORIZATION, format!("Bearer {}", remote.token));
         }
-        builder = builder.header(http::header::CONTENT_TYPE, "application/json");
+        builder = builder.header(ureq::http::header::CONTENT_TYPE, "application/json");
         let request = builder
             .body(body.unwrap_or_default())
             .map_err(|err| DaemonError::Unreachable(err.to_string()))?;

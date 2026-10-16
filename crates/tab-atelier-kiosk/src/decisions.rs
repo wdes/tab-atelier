@@ -14,6 +14,7 @@ use std::fmt::Write as _;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use tab_atelier_api::schemars::{self, JsonSchema};
 
 use serde::{Deserialize, Serialize};
 
@@ -36,7 +37,7 @@ pub const STATE_ARCHIVED: &str = "archived";
 /// Every field but `id` is optional: the interface feature-detects each one and
 /// renders what is there, so a decision written by hand with just a title is a
 /// decision, not a parse error.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 pub struct Decision {
     /// Stable handle. Also what `/decisions/<id>/<verb>` addresses.
     pub id: String,

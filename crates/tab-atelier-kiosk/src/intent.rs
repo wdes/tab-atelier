@@ -23,6 +23,7 @@
 //! field inside a file.
 
 use std::path::{Path, PathBuf};
+use tab_atelier_api::schemars::{self, JsonSchema};
 
 use serde::Serialize;
 
@@ -33,7 +34,7 @@ pub const READY_DIR: &str = "READY-intentions";
 pub const DEFAULT_INTENTIONS_DIR: &str = "intentions";
 
 /// One intention, as much as a list needs to render it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct Summary {
     /// File stem — the handle the routes use.
     pub slug: String,

@@ -15,12 +15,11 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use http::{Method, Request, header};
-use tokio::net::TcpListener;
+use ureq::http::{Method, Request, Response, header};
 
 use crate::config::{Config, HopTimeouts};
 use crate::decisions::Journal;
-use crate::server::serve_with;
+use crate::server::build;
 
 /// Factor the production deadlines are compressed by in these tests.
 ///
@@ -79,14 +78,32 @@ fn test_config(state: &Path, token: Option<&str>) -> Config {
     }
 }
 
-/// Bind the kiosk on an ephemeral port and return where it landed.
-async fn spawn_kiosk_with(cfg: Config) -> SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind kiosk");
-    let addr = listener.local_addr().expect("kiosk address");
+/// Launch the kiosk on a free port and return where it landed.
+///
+/// Rocket binds the port itself, so the port is picked first — a throwaway
+/// listener on `:0`, read its number, let it go — and handed over through the
+/// config. The small window where another process could take it is fine for a
+/// test, and cheaper than threading a pre-bound listener into Rocket, which it
+/// does not accept. The loop then waits for Rocket to answer, so a test never
+/// races the server's own startup.
+async fn spawn_kiosk_with(mut cfg: Config) -> SocketAddr {
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("find a free port")
+        .local_addr()
+        .expect("a port")
+        .port();
+    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().expect("a bind address");
+    cfg.bind = addr;
     tokio::spawn(async move {
-        let _ = serve_with(listener, cfg, scaled_timeouts()).await;
+        let _ = build(cfg, scaled_timeouts()).launch().await;
     });
-    addr
+    for _ in 0..500 {
+        if tokio::net::TcpStream::connect(addr).await.is_ok() {
+            return addr;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the kiosk never came up at {addr}");
 }
 
 /// A kiosk with its own uniquely-named state directory, no token.
@@ -108,13 +125,7 @@ fn agent() -> ureq::Agent {
 }
 
 /// One request through a fresh agent (so a test never reuses a pooled socket).
-fn send(
-    method: Method,
-    addr: SocketAddr,
-    path: &str,
-    headers: &[(&str, &str)],
-    body: Vec<u8>,
-) -> http::Response<ureq::Body> {
+fn send(method: Method, addr: SocketAddr, path: &str, headers: &[(&str, &str)], body: Vec<u8>) -> Response<ureq::Body> {
     let mut builder = Request::builder().method(method).uri(format!("http://{addr}{path}"));
     for (name, value) in headers {
         builder = builder.header(*name, *value);
@@ -124,11 +135,11 @@ fn send(
         .expect("kiosk answered")
 }
 
-fn get(addr: SocketAddr, path: &str) -> http::Response<ureq::Body> {
+fn get(addr: SocketAddr, path: &str) -> Response<ureq::Body> {
     send(Method::GET, addr, path, &[], Vec::new())
 }
 
-fn body_string(mut resp: http::Response<ureq::Body>) -> String {
+fn body_string(mut resp: Response<ureq::Body>) -> String {
     let mut out = String::new();
     resp.body_mut().as_reader().read_to_string(&mut out).expect("read body");
     out
@@ -173,6 +184,43 @@ fn the_response_deadline_is_not_armed() {
         HopTimeouts::default().recv_response.is_none(),
         "recv_response must stay None or it would cap every streamed body's life"
     );
+}
+
+/// Every mounted route is either documented or explicitly exempt, and the
+/// document is served.
+///
+/// This is the drift test, not a coverage percentage: a route added without an
+/// `#[openapi]` and without an entry in `exempt` fails here, so the document
+/// cannot silently fall behind the router. The server runs the same check at
+/// boot; running it here means a broken document is a test failure with a
+/// readable diff rather than a panic in production.
+#[test]
+fn the_openapi_document_covers_every_route() {
+    let dir = scratch_dir("openapi");
+    let cfg = test_config(&dir, Some("t"));
+    let (routes, spec) = crate::routes::all();
+    // `all()` returns the same route list the server mounts; build the rocket
+    // from it so the check sees exactly what ships. The mount adds the document
+    // route itself, so the mounted count is one more than `all()` returns.
+    let rocket = crate::server::build(cfg, scaled_timeouts());
+    assert_eq!(
+        rocket.routes().count(),
+        routes.len() + 1,
+        "every route in all() is mounted, plus the document"
+    );
+    tab_atelier_api::assert_covers(&rocket, &spec, &crate::routes::exempt());
+}
+
+/// The document is reachable over HTTP, and it is the derived one — it names a
+/// documented path, so a hand-written stub or an empty document would fail.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_openapi_document_is_served() {
+    let addr = spawn_kiosk().await;
+    let document = get(addr, "/openapi.json");
+    assert_eq!(document.status(), 200);
+    let body = body_string(document);
+    assert!(body.contains("/kiosk/fleet"), "the document names a real route: {body}");
+    assert!(body.contains("\"openapi\""), "and it is an OpenAPI document");
 }
 
 /// Encode a path for a query, the way a browser would.

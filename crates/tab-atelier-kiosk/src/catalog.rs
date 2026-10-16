@@ -19,6 +19,7 @@
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use tab_atelier_api::schemars::{self, JsonSchema};
 
 use serde::{Deserialize, Serialize};
 
@@ -27,7 +28,7 @@ use serde::{Deserialize, Serialize};
 /// `skill` is the fold key and the display name; every other field is optional.
 /// `deleted` is the tombstone — emitted only when true, so the normal shape is
 /// stable and the page's `deleted === true` check is exact.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct Skill {
     /// The fold key — also the display name. Required.

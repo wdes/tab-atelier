@@ -17,6 +17,7 @@
 use std::fs;
 use std::io::ErrorKind;
 use std::path::PathBuf;
+use tab_atelier_api::schemars::{self, JsonSchema};
 
 use serde::{Deserialize, Serialize};
 
@@ -42,7 +43,7 @@ pub struct Remote {
 /// The token is needed to reach the server, not to list the server, so the list
 /// route hands back this and the browser never receives a secret it does not
 /// already own.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, JsonSchema)]
 pub struct RemoteView {
     /// See [`Remote::id`].
     pub id: String,

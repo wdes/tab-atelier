@@ -18,17 +18,31 @@ path = "src/lib.rs"
 [dependencies]
 clap = { version = "4", default-features = false, features = ["derive", "std", "help", "usage", "error-context"] }
 bytes = "1"
-http = "1"
-http-body-util = "0.1"
-hyper = { version = "1", features = ["server", "http1"] }
-hyper-util = { version = "0.1", features = ["tokio"] }
+# Named here, not re-exported through `-api`, because the attribute macros are
+# not re-exportable: `rocket_codegen` hardcodes `::rocket::` into every `#[get]`,
+# `#[catch]` and `routes!` it expands, and an absolute path only resolves against
+# a crate in this crate's own extern prelude. The re-export still carries okapi
+# and schemars, whose macros use relative paths.
+rocket = { version = "0.5.1", features = ["json"] }
+# Same reason as `rocket`: `#[openapi]` and `routes_spec!` expand to absolute
+# `::rocket_okapi::…` paths, which only resolve against a crate in this crate's
+# extern prelude. The re-export through `-api` carries the types; it cannot
+# carry the macro's absolute path.
+rocket_okapi = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# The shared HTTP rules: the Rocket scaffold, the request/response/resource
+# contracts, the guards, the derived OpenAPI. `rocket` and `rocket_okapi` are
+# named above only because their attribute macros expand to absolute paths;
+# every type the Kiosk uses — the guards, the `Reply`, the resources, the
+# spec — comes from here, and hyper, http and schemars the app never names at
+# all.
+tab-atelier-api = { path = "../tab-atelier-api" }
 # The shared round-robin pacing: the same sweep brain.rs uses, so a fan-out
 # (the agent broadcast) is spread over time instead of arriving as a herd.
 tab-atelier-pace = { path = "../tab-atelier-pace" }
-# The shared serving layer: serve the UI from a web root, the JSON response
-# shapes, the token gate.
+# The shared serving layer: serve the UI from a web root. Its Own
+# types come back through it.
 tab-atelier-web = { path = "../tab-atelier-web" }
 tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "net", "sync", "time", "io-util", "macros", "signal"] }
 ureq = { version = "3", features = ["json"] }
