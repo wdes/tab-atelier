@@ -341,7 +341,7 @@ kiosk { padding: 1rem; }
 }
 .mesh-tip .k { color: var(--muted); }
 
-/* The fleet: the landing view. Servers and their tabs, first thing on screen. */
+/* The fleet: the landing view. Server headings, then each tab as an agent card. */
 #fleet {
   display: grid;
   gap: 1rem;
@@ -356,14 +356,52 @@ kiosk { padding: 1rem; }
   border-radius: 8px;
   padding: 0.75rem 1rem;
 }
-.fleet-server h2 { margin: 0 0 0.5rem; font-size: 0.95rem; font-weight: 600; }
-.fleet-tabs { list-style: none; margin: 0 0 0.75rem; padding: 0; display: grid; gap: 0.35rem; }
-.fleet-tab {
-  display: flex; align-items: baseline; gap: 0.6rem;
-  padding: 0.4rem 0.5rem; border: 1px solid var(--border); border-radius: 6px;
+.fleet-server h2 { margin: 0 0 0.75rem; font-size: 0.95rem; font-weight: 600; }
+
+/* The cards: a tab's name, its cwd, and its labels — the agent card. */
+.cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(18rem, 1fr));
+  gap: 0.75rem;
+  margin-bottom: 0.75rem;
 }
-.fleet-tab .name { font-family: ui-monospace, monospace; }
-.fleet-tab .meta { color: var(--muted); font-size: 0.82rem; }
+.agent-card {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.6rem 0.7rem;
+  display: grid;
+  gap: 0.4rem;
+  align-content: start;
+}
+.agent-card header { display: flex; flex-direction: column; gap: 0.1rem; }
+.agent-card h3 { margin: 0; font-size: 0.9rem; font-weight: 600; }
+.agent-card .cwd {
+  color: var(--muted); font-size: 0.75rem;
+  font-family: ui-monospace, monospace;
+  overflow-wrap: anywhere;
+}
+.card-fields { margin: 0; display: grid; gap: 0.2rem; }
+.card-field {
+  display: grid; grid-template-columns: 7rem 1fr; gap: 0.4rem;
+  align-items: baseline; cursor: text; border-radius: 4px; padding: 0.1rem 0.2rem;
+}
+.card-field:hover { background: var(--bg); }
+.card-field dt { color: var(--muted); font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.03em; }
+.card-field dd { margin: 0; font-size: 0.82rem; overflow-wrap: anywhere; }
+.card-field .unset { color: var(--muted); }
+.card-tags { margin: 0; display: flex; flex-wrap: wrap; gap: 0.3rem; }
+.card-tag {
+  font-size: 0.72rem; color: var(--muted);
+  border: 1px solid var(--border); border-radius: 999px; padding: 0.05rem 0.4rem;
+}
+.agent-card footer { display: flex; justify-content: flex-end; }
+.card-close {
+  font: inherit; font-size: 0.8rem; padding: 0.2rem 0.5rem;
+  border: 1px solid var(--border); border-radius: 6px;
+  background: transparent; color: var(--muted); cursor: pointer;
+}
+.card-close:hover { border-color: var(--err); color: var(--err); }
+
 .fleet-empty, .fleet-empty-tab, .fleet-error { color: var(--muted); font-style: italic; }
 .fleet-error { color: var(--err); font-style: normal; }
 .fleet-add { display: flex; gap: 0.5rem; flex-wrap: wrap; }

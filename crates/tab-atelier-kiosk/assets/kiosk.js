@@ -1290,30 +1290,58 @@ function fleetHtml(model) {
   return servers.map(fleetServerHtml).join("");
 }
 
+// The card fields, in display order, with their French labels. A card is a
+// conventional set of meta keys (see card.rs), and this is the one place the
+// convention is shown to the reader.
+const CARD_FIELDS = [
+  ["assignment", "assignation"],
+  ["specialty", "spécialité"],
+  ["orchestrator", "orchestrateur"],
+  ["objective", "objectif"],
+  ["conventions", "conventions"],
+  ["current_task", "tâche"],
+];
+
 function fleetServerHtml(server) {
+  const sid = escapeHtml(String(server.id));
   const label = escapeHtml(String(server.label || server.id || "serveur"));
   const head = `<div class="fleet-server-head"><h2>${label}</h2></div>`;
   if (server.error) {
-    return `<section class="fleet-server" data-server="${escapeHtml(String(server.id))}">
+    return `<section class="fleet-server" data-server="${sid}">
       ${head}<p class="fleet-error">Injoignable.</p></section>`;
   }
-  const tabs = server.tabs || [];
-  const rows = tabs.length
-    ? tabs
-        .map(
-          (t) =>
-            `<li class="fleet-tab"><span class="name">${escapeHtml(String(t.name || t.id || "(sans nom)"))}</span><span class="meta">${escapeHtml(String(t.cwd || ""))}</span></li>`,
-        )
-        .join("")
-    : `<li class="fleet-empty-tab">Aucun onglet.</li>`;
-  return `<section class="fleet-server" data-server="${escapeHtml(String(server.id))}">
+  const cards = (server.tabs || []).map((t) => tabCardHtml(server.id, t)).join("");
+  return `<section class="fleet-server" data-server="${sid}">
     ${head}
-    <ul class="fleet-tabs">${rows}</ul>
-    <form class="fleet-add" data-server="${escapeHtml(String(server.id))}">
+    <div class="cards">${cards || `<p class="fleet-empty-tab">Aucun onglet.</p>`}</div>
+    <form class="fleet-add" data-server="${sid}">
       <input name="cwd" placeholder="répertoire (optionnel)" autocomplete="off">
       <button type="submit">Ouvrir un onglet</button>
     </form>
   </section>`;
+}
+
+/** One tab as an agent card: its name, its cwd, and its labels — each editable. */
+function tabCardHtml(serverId, tab) {
+  const sid = escapeHtml(String(serverId));
+  const tid = escapeHtml(String(tab.id || ""));
+  const meta = tab.meta || {};
+  const fields = CARD_FIELDS.map(([key, label]) => {
+    const value = meta[key];
+    const shown = value ? escapeHtml(String(value)) : `<span class="unset">—</span>`;
+    return `<div class="card-field" data-key="${key}" title="modifier ${label}"><dt>${label}</dt><dd>${shown}</dd></div>`;
+  }).join("");
+  // Labels that are not card fields (project, phase, …) shown as raw tags.
+  const extras = Object.keys(meta)
+    .filter((k) => !CARD_FIELDS.some(([f]) => f === k))
+    .map((k) => `<span class="card-tag">${escapeHtml(k)}=${escapeHtml(String(meta[k]))}</span>`)
+    .join("");
+  return `<article class="agent-card" data-server="${sid}" data-tab="${tid}">
+    <header><h3>${escapeHtml(String(tab.name || tab.id || "(sans nom)"))}</h3><span class="cwd">${escapeHtml(String(tab.cwd || ""))}</span></header>
+    <dl class="card-fields">${fields}</dl>
+    ${extras ? `<p class="card-tags">${extras}</p>` : ""}
+    <footer><button class="card-close">Fermer</button></footer>
+  </article>`;
 }
 
 async function loadFleet() {
@@ -1323,12 +1351,41 @@ async function loadFleet() {
     const res = await fetch("/kiosk/fleet", { headers: { accept: "application/json", ...AUTH_HEADERS } });
     if (!res.ok) throw new Error("HTTP " + res.status);
     host.innerHTML = fleetHtml(await res.json());
-    document.querySelectorAll(".fleet-add").forEach((form) => {
+    for (const form of host.querySelectorAll(".fleet-add")) {
       form.addEventListener("submit", (e) => onAddTab(e, form.dataset.server));
-    });
+    }
+    // Each card can be acted on: close the tab, or click a field to edit it.
+    for (const card of host.querySelectorAll(".agent-card")) {
+      const close = card.querySelector(".card-close");
+      if (close) close.addEventListener("click", () => onCloseTab(card));
+      for (const field of card.querySelectorAll(".card-field")) {
+        field.addEventListener("click", () => onEditField(card, field.dataset.key));
+      }
+    }
   } catch (err) {
     host.innerHTML = `<p class="fleet-error">Flotte indisponible : ${escapeHtml(String(err.message || err))}</p>`;
   }
+}
+
+/** POST to a remote through the Kiosk, reporting failure without losing the view. */
+async function remotePost(path, body) {
+  const res = await fetch(path, {
+    method: "POST",
+    headers: { "content-type": "application/json", accept: "application/json", ...AUTH_HEADERS },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error("HTTP " + res.status);
+  return res.json().catch(() => ({}));
+}
+
+/** Show an error next to the fleet, without wiping the cards. */
+function fleetNote(message) {
+  const host = typeof document !== "undefined" && document.getElementById("fleet");
+  if (!host) return;
+  const note = document.createElement("p");
+  note.className = "fleet-error";
+  note.textContent = message;
+  host.prepend(note);
 }
 
 async function onAddTab(event, serverId) {
@@ -1339,20 +1396,40 @@ async function onAddTab(event, serverId) {
   const body = { sync: true };
   if (cwd) body.cwd = cwd;
   try {
-    const res = await fetch(`/kiosk/remotes/${encodeURIComponent(serverId)}/tabs`, {
-      method: "POST",
-      headers: { "content-type": "application/json", accept: "application/json", ...AUTH_HEADERS },
-      body: JSON.stringify(body),
-    });
-    if (!res.ok) throw new Error("HTTP " + res.status);
+    await remotePost(`/kiosk/remotes/${encodeURIComponent(serverId)}/tabs`, body);
     form.reset();
     await loadFleet();
   } catch (err) {
-    // Report without losing the list.
-    const note = document.createElement("p");
-    note.className = "fleet-error";
-    note.textContent = `Onglet non créé : ${err.message || err}`;
-    form.after(note);
+    fleetNote(`Onglet non créé : ${err.message || err}`);
+  }
+}
+
+async function onCloseTab(card) {
+  const { server, tab } = card.dataset;
+  try {
+    await remotePost(`/kiosk/remotes/${encodeURIComponent(server)}/tabs/${encodeURIComponent(tab)}/close`);
+    await loadFleet();
+  } catch (err) {
+    fleetNote(`Fermeture impossible : ${err.message || err}`);
+  }
+}
+
+async function onEditField(card, key) {
+  const { server, tab } = card.dataset;
+  const shown = card.querySelector(`.card-field[data-key="${key}"] dd`);
+  const current = shown && !shown.querySelector(".unset") ? shown.textContent : "";
+  const label = (CARD_FIELDS.find(([f]) => f === key) || [key, key])[1];
+  const value = prompt(`${label} :`, current);
+  if (value === null) return;
+  try {
+    await remotePost(`/kiosk/remotes/${encodeURIComponent(server)}/tabs/${encodeURIComponent(tab)}/meta`, {
+      key,
+      // An emptied field clears the label; the daemon takes null as "remove".
+      value: value.trim() === "" ? null : value.trim(),
+    });
+    await loadFleet();
+  } catch (err) {
+    fleetNote(`Carte non modifiée : ${err.message || err}`);
   }
 }
 

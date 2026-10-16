@@ -76,6 +76,20 @@ pub enum Route {
         /// The remote id.
         id: String,
     },
+    /// `POST /kiosk/remotes/<id>/tabs/<uuid>/close` — close a tab on a remote.
+    RemoteTabClose {
+        /// The remote id.
+        id: String,
+        /// The tab's uuid.
+        tab: String,
+    },
+    /// `POST /kiosk/remotes/<id>/tabs/<uuid>/meta` — set a tab's card labels.
+    RemoteTabMeta {
+        /// The remote id.
+        id: String,
+        /// The tab's uuid.
+        tab: String,
+    },
     /// `POST /kiosk/remotes/<id>/intent/<slug>/launch` — open a worker tab on a
     /// remote for an intention, and remember which tab it was.
     RemoteIntentLaunch {
@@ -217,6 +231,7 @@ fn allowed_methods(path: &str) -> Option<&'static str> {
             match segments.as_slice() {
                 [id, "remove"] if !id.is_empty() => Some("POST"),
                 [id, "tabs"] if !id.is_empty() => Some("GET, POST"),
+                [id, "tabs", tab, "close" | "meta"] if !id.is_empty() && !tab.is_empty() => Some("POST"),
                 [id, "cards"] if !id.is_empty() => Some("GET, HEAD"),
                 [id, "intent", slug, "launch"] if !id.is_empty() && !slug.is_empty() => Some("POST"),
                 _ => None,
@@ -241,6 +256,14 @@ fn remotes_action(method: &Method, path: &str) -> Route {
         (&Method::POST, [id, "remove"]) if !id.is_empty() => Route::RemoteRemove { id: id.to_string() },
         (&Method::GET, [id, "tabs"]) if !id.is_empty() => Route::RemoteTabs { id: id.to_string() },
         (&Method::POST, [id, "tabs"]) if !id.is_empty() => Route::RemoteTabCreate { id: id.to_string() },
+        (&Method::POST, [id, "tabs", tab, "close"]) if !id.is_empty() && !tab.is_empty() => Route::RemoteTabClose {
+            id: id.to_string(),
+            tab: tab.to_string(),
+        },
+        (&Method::POST, [id, "tabs", tab, "meta"]) if !id.is_empty() && !tab.is_empty() => Route::RemoteTabMeta {
+            id: id.to_string(),
+            tab: tab.to_string(),
+        },
         (&Method::GET, [id, "cards"]) if !id.is_empty() => Route::RemoteCards { id: id.to_string() },
         // The one remote action that is about an intention rather than a plain
         // tab: it spawns a worker for `slug` and remembers which tab it was.
@@ -454,6 +477,20 @@ mod tests {
         assert_eq!(
             classify(Method::POST, "/kiosk/remotes/abc/tabs"),
             Route::RemoteTabCreate { id: "abc".to_string() }
+        );
+        assert_eq!(
+            classify(Method::POST, "/kiosk/remotes/abc/tabs/t1/close"),
+            Route::RemoteTabClose {
+                id: "abc".to_string(),
+                tab: "t1".to_string()
+            }
+        );
+        assert_eq!(
+            classify(Method::POST, "/kiosk/remotes/abc/tabs/t1/meta"),
+            Route::RemoteTabMeta {
+                id: "abc".to_string(),
+                tab: "t1".to_string()
+            }
         );
         assert_eq!(
             classify(Method::GET, "/kiosk/remotes/abc/cards"),

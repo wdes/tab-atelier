@@ -67,6 +67,15 @@ impl Daemon {
         self.request(remote, "POST", path, Some(encoded))
     }
 
+    /// `DELETE <remote><path>`, returning the status and body.
+    ///
+    /// # Errors
+    ///
+    /// [`DaemonError::Unreachable`] when the remote does not answer.
+    pub fn delete(&self, remote: &Remote, path: &str) -> Result<(u16, String), DaemonError> {
+        self.request(remote, "DELETE", path, None)
+    }
+
     fn request(
         &self,
         remote: &Remote,

@@ -146,6 +146,11 @@ async fn handle(req: Request<Incoming>, panes: &Panes, daemon: &Daemon) -> Respo
             Ok(spec) => remote_call(panes, daemon, &id, "/tabs", Some(spec)).await,
             Err(response) => response,
         },
+        Route::RemoteTabClose { id, tab } => remote_tab_close(panes, daemon, &id, &tab).await,
+        Route::RemoteTabMeta { id, tab } => match read_json(body).await {
+            Ok(change) => remote_tab_meta(panes, daemon, &id, &tab, &change).await,
+            Err(response) => response,
+        },
         Route::RemoteIntentLaunch { id, slug } => remote_intent_launch(panes, daemon, &id, &slug).await,
         Route::RemoteCards { id } => remote_cards(panes, daemon, &id).await,
         Route::Fleet => fleet(panes, daemon).await,
@@ -153,14 +158,62 @@ async fn handle(req: Request<Incoming>, panes: &Panes, daemon: &Daemon) -> Respo
     }
 }
 
-/// `GET /kiosk/fleet` — every configured server and its tabs.
+/// `POST /kiosk/remotes/<id>/tabs/<uuid>/close` — close a tab on a remote.
+///
+/// The Kiosk knows the tab by uuid (that is what the fleet reports and what
+/// `/tabs/by-id/` addresses), so the close is by uuid and survives a tab that
+/// moved position.
+async fn remote_tab_close(panes: &Panes, daemon: &Daemon, id: &str, tab: &str) -> Response<BoxBody> {
+    let remote = match panes.remote(id) {
+        Ok(remote) => remote,
+        Err(error) => return Panes::remote_error(&error),
+    };
+    let daemon = daemon.clone();
+    let path = format!("/tabs/by-id/{tab}");
+    let answered = tokio::task::spawn_blocking(move || daemon.delete(&remote, &path)).await;
+    match answered {
+        Ok(Ok((status, _))) if (200..300).contains(&status) => {
+            json_response(StatusCode::OK, &serde_json::json!({ "closed": tab }))
+        }
+        Ok(Ok((status, text))) => relay_response(status, text),
+        _ => Panes::bad_gateway(),
+    }
+}
+
+/// `POST /kiosk/remotes/<id>/tabs/<uuid>/meta` — set one card label on a tab.
+///
+/// One key per call, matching the daemon's own `/tabs/by-id/<uuid>/meta`: the
+/// card is a set of keys, and the operator edits one field at a time.
+async fn remote_tab_meta(
+    panes: &Panes,
+    daemon: &Daemon,
+    id: &str,
+    tab: &str,
+    change: &serde_json::Value,
+) -> Response<BoxBody> {
+    let remote = match panes.remote(id) {
+        Ok(remote) => remote,
+        Err(error) => return Panes::remote_error(&error),
+    };
+    let daemon = daemon.clone();
+    let path = format!("/tabs/by-id/{tab}/meta");
+    let body = change.clone();
+    let answered = tokio::task::spawn_blocking(move || daemon.post(&remote, &path, &body)).await;
+    match answered {
+        Ok(Ok((status, text))) => relay_response(status, text),
+        _ => Panes::bad_gateway(),
+    }
+}
+
+/// `GET /kiosk/fleet` — every configured server and its tabs, with their cards.
 ///
 /// The servers are the ones the operator added in Serveurs and no others — the
 /// Kiosk does not invent a local one. It reaches each with ITS token (never the
-/// browser's) and returns only what the landing page shows — each tab's id, name
-/// and cwd, not its scrollback. A server that cannot be reached is reported as
-/// `{error: unreachable}` rather than failing the whole list: one down server
-/// must not blank the fleet.
+/// browser's) and returns what the landing page shows per tab: its id, name,
+/// cwd, and its **meta** — which is the agent card (assignment, specialty,
+/// orchestrator, …). The scrollback is left out; a landing page does not need
+/// it. A server that cannot be reached is reported as `{error: unreachable}`
+/// rather than failing the whole list: one down server must not blank the fleet.
 async fn fleet(panes: &Panes, daemon: &Daemon) -> Response<BoxBody> {
     let mut servers = Vec::new();
     for remote in panes.fleet_targets() {
@@ -174,8 +227,6 @@ async fn fleet(panes: &Panes, daemon: &Daemon) -> Response<BoxBody> {
                     .ok()
                     .and_then(|value| value.get("tabs").cloned())
                     .unwrap_or_else(|| serde_json::Value::Array(Vec::new()));
-                // Only the fields the fleet shows: a tab's scrollback is heavy
-                // and belongs nowhere near a landing page.
                 let lean: Vec<serde_json::Value> = tabs
                     .as_array()
                     .map(|tabs| {
@@ -185,6 +236,8 @@ async fn fleet(panes: &Panes, daemon: &Daemon) -> Response<BoxBody> {
                                     "id": tab.get("id"),
                                     "name": tab.get("name"),
                                     "cwd": tab.get("cwd"),
+                                    // The card: the operator's labels for this tab.
+                                    "meta": tab.get("meta"),
                                 })
                             })
                             .collect()
