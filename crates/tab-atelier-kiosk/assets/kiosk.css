@@ -484,8 +484,13 @@ kiosk { padding: 1rem; }
   background: transparent; color: var(--muted); cursor: pointer;
 }
 .view-btn + .view-btn { border-left: 1px solid var(--border); }
-.view-btn:hover { color: var(--accent); }
-.view-btn.active { background: var(--accent); color: #fff; }
+.view-btn:hover { color: var(--fg); }
+/* The selected view: darker and bold, with a faint fill — a text toggle, not a
+   loud coloured pill. */
+.view-btn.active {
+  color: var(--fg); font-weight: 600;
+  background: color-mix(in srgb, var(--fg) 7%, transparent);
+}
 
 /* The dashboard: a board of phase lanes, scrolling sideways on a narrow screen. */
 #fleet { display: block; }
