@@ -29,6 +29,36 @@ use rocket::response::Responder;
 use rocket::{Response, response};
 
 use crate::marshal::{Reply, ReplyBody};
+use rocket_okapi::r#gen::OpenApiGenerator;
+use rocket_okapi::okapi::openapi3::{Response as DocResponse, Responses};
+use rocket_okapi::response::OpenApiResponderInner;
+
+/// Documenting a `Reply` — as a body the handler shaped at run time.
+///
+/// A `Reply` is deliberately untyped: the relay passes an upstream answer
+/// through with whatever status and body it came with, and the asset routes
+/// carry a file they read. There is no `T` for okapi to describe, so a route
+/// returning one is documented with no schema and marked `x-dynamic-body`.
+///
+/// The marker is a ratchet, not a shrug: a route that could carry a typed
+/// resource and still returns a bare `Reply` shows up as a `x-dynamic-body`
+/// count a test can assert on, so the number can only be made to fall. Without
+/// it, "every response is documented" would be quietly false for the routes
+/// that matter most.
+impl OpenApiResponderInner for Reply {
+    fn responses(_gen: &mut OpenApiGenerator) -> rocket_okapi::Result<Responses> {
+        let mut response = DocResponse {
+            description: "a body shaped at run time; see the handler".to_owned(),
+            ..DocResponse::default()
+        };
+        response
+            .extensions
+            .insert("x-dynamic-body".to_owned(), serde_json::Value::Bool(true));
+        let mut responses = Responses::default();
+        responses.responses.insert("200".to_owned(), response.into());
+        Ok(responses)
+    }
+}
 
 impl<'r> Responder<'r, 'static> for Reply {
     fn respond_to(self, _req: &'r Request<'_>) -> response::Result<'static> {
