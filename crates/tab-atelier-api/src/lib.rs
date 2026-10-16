@@ -18,18 +18,21 @@
 //!   carry no fields are [`OkResource`]'s bare acknowledgement and
 //!   [`ProblemResource`], the shape of every 4xx and 5xx this API produces.
 //!
-//! # Transport-neutral, then Rocket
+//! # Transport-neutral, then the two edges
 //!
-//! [`marshal`], [`resource`] and [`request`] name no Rocket type, so a server
-//! that does not use Rocket can still speak this dialect. [`body`] and
-//! [`refusal`] are the boundary where a Rocket data guard and a Rocket responder
-//! meet those types; the catcher set and the `OpenAPI` figure build on them.
+//! [`marshal`], [`resource`] and [`request`] name no server type, so a server
+//! that does not use Rocket can still speak this dialect. Two modules are the
+//! edges where a concrete server meets those types — [`respond`] for Rocket,
+//! [`hyper_response`] for an app that keeps hyper — and [`body`], [`refusal`],
+//! [`guard`], [`catcher`] and [`openapi`] build on the Rocket side.
+//!
+//! A handler is the same on either edge: it returns a [`Reply`] and names
+//! neither framework.
 //!
 //! # Re-exports
 //!
-//! [`rocket`], [`rocket_okapi`] and [`schemars`] are re-exported so an app
-//! depends on this crate alone rather than pinning the three-crate lockstep
-//! itself.
+//! [`rocket`], [`rocket_okapi`], [`schemars`] and [`hyper`] are re-exported so an
+//! app depends on this crate alone rather than pinning the lockstep itself.
 
 #![deny(missing_docs)]
 
@@ -37,6 +40,9 @@ pub mod auth;
 pub mod body;
 pub mod catcher;
 pub mod guard;
+// The second edge: `Reply` → a hyper response, for a server that keeps its own
+// listener. Named for the framework it renders to, as `respond` is.
+pub mod hyper_response;
 pub mod marshal;
 pub mod openapi;
 pub mod refusal;
@@ -59,6 +65,9 @@ pub use rocket_okapi::openapi_get_routes_spec as routes_spec;
 pub use rocket;
 pub use rocket_okapi;
 pub use schemars;
+// Re-exported so an app that keeps hyper renders a `Reply` through
+// `tab_atelier_api::hyper` without naming the dependency itself.
+pub use hyper;
 
 /// Rocket's configuration for a tab-atelier server.
 ///

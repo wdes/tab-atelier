@@ -30,6 +30,12 @@ bytes = "1"
 http = "1"
 http-body = "1"
 http-body-util = "0.1"
+# The second edge. A server that keeps its own hyper listener — the daemon
+# does, because its viewer arrives as a WebSocket upgrade and its relay leaves
+# as an SSE stream, and Rocket's listener hands over to neither — still answers
+# with the same `Reply`, and `hyper_response` renders it. Named here rather than
+# in that app for the same reason Rocket is: an app names this crate alone.
+hyper = { version = "1", default-features = false }
 tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "net", "signal", "time", "macros"] }
 
 [dev-dependencies]
