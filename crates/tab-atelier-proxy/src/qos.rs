@@ -62,6 +62,8 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use tab_atelier_api::schemars;
+
 /// How long a call may wait for its turn before being turned away.
 ///
 /// Past this, a 429 with an honest `Retry-After` beats a connection held open
@@ -386,7 +388,7 @@ impl Sched {
 }
 
 /// The scheduler's state, as the dashboard sees it.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, tab_atelier_api::schemars::JsonSchema)]
 pub struct SchedSnapshot {
     /// Tokens upstream says are left; `null` until it has said.
     pub budget_tokens: Option<u64>,
@@ -400,7 +402,7 @@ pub struct SchedSnapshot {
 }
 
 /// One account's standing in the scheduler.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, tab_atelier_api::schemars::JsonSchema)]
 pub struct SchedAccountSnapshot {
     pub id: String,
     /// The weight from the routing table, as a number, not the name for it.

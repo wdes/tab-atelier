@@ -14,7 +14,7 @@ use std::sync::Arc;
 use crate::http::requests::key::{AddKey, SetKeyDisabled};
 use crate::http::resources;
 use crate::server::State;
-use crate::transport::{Reply, json_of};
+use crate::transport::{Doc, Reply};
 
 /// An error as the API reports it, with the wording the store chose.
 fn failure(status: u16, why: &str) -> Reply {
@@ -27,13 +27,15 @@ fn failure(status: u16, why: &str) -> Reply {
 /// learn the secret. This is the only response that ever contains the key's
 /// plaintext — the store keeps a hash — so a client that loses it must mint
 /// another.
-pub(crate) fn add(state: &Arc<State>, who: &str, req: &AddKey) -> Reply {
+pub(crate) fn add(state: &Arc<State>, who: &str, req: &AddKey) -> Result<Doc<resources::NewKeyResource, 201>, Reply> {
     let mut store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     match store.add_key(who, &req.name) {
-        Ok((key, secret)) => json_of(201, &resources::NewKeyResource::new(&key, secret)),
+        Ok((key, secret)) => Ok(Doc::<resources::NewKeyResource, 201>::ok(
+            resources::NewKeyResource::new(&key, secret),
+        )),
         // 400, not 404: the account exists and the request is what is wrong,
         // so a client should fix its body rather than its path.
-        Err(e) => failure(400, &e.to_string()),
+        Err(e) => Err(failure(400, &e.to_string())),
     }
 }
 
@@ -42,11 +44,16 @@ pub(crate) fn add(state: &Arc<State>, who: &str, req: &AddKey) -> Reply {
 /// Disabling is the reversible half of revoking: the key stays in the account
 /// and keeps its history, so a key turned off by mistake can be turned back on
 /// without the owner having to reconfigure anything.
-pub(crate) fn set_disabled(state: &Arc<State>, who: &str, key: &str, req: &SetKeyDisabled) -> Reply {
+pub(crate) fn set_disabled(
+    state: &Arc<State>,
+    who: &str,
+    key: &str,
+    req: &SetKeyDisabled,
+) -> Result<Doc<resources::KeyEnvelope>, Reply> {
     let mut store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     match store.set_key_disabled(who, key, req.disabled()) {
-        Ok(k) => json_of(200, &resources::KeyEnvelope::from(&k)),
-        Err(e) => failure(404, &e.to_string()),
+        Ok(k) => Ok(Doc::ok(resources::KeyEnvelope::from(&k))),
+        Err(e) => Err(failure(404, &e.to_string())),
     }
 }
 
@@ -54,11 +61,11 @@ pub(crate) fn set_disabled(state: &Arc<State>, who: &str, key: &str, req: &SetKe
 ///
 /// Answers with what was removed, so the operator can confirm it was the key
 /// they meant rather than one whose name they mistyped.
-pub(crate) fn remove(state: &Arc<State>, who: &str, key: &str) -> Reply {
+pub(crate) fn remove(state: &Arc<State>, who: &str, key: &str) -> Result<Doc<resources::RemovedKeyEnvelope>, Reply> {
     let mut store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     match store.remove_key(who, key) {
-        Ok(k) => json_of(200, &resources::RemovedKeyEnvelope::from(&k)),
-        Err(e) => failure(404, &e.to_string()),
+        Ok(k) => Ok(Doc::ok(resources::RemovedKeyEnvelope::from(&k))),
+        Err(e) => Err(failure(404, &e.to_string())),
     }
 }
 
@@ -95,9 +102,20 @@ mod tests {
     /// Names are unique per account — that is how a key is revoked — so a test
     /// reusing a name has to clear it, and doing that here keeps the
     /// arrangement out of the assertions.
-    fn mint(state: &Arc<State>, who: &str, name: &str) -> Reply {
+    fn mint(state: &Arc<State>, who: &str, name: &str) -> Result<Doc<resources::NewKeyResource, 201>, Reply> {
         let _ = remove(state, who, name);
         add(state, who, &AddKey { name: name.to_owned() })
+    }
+
+    /// The status a `Result`-returning handler answered, whichever side it is.
+    ///
+    /// A creation, a revocation and a refusal all come back through one type
+    /// now, so a test reads the status instead of the `Reply` it used to hold.
+    fn answered<T, const CODE: u16>(reply: Result<Doc<T, CODE>, Reply>) -> u16 {
+        match reply {
+            Ok(doc) => doc.status,
+            Err(refusal) => refusal.status,
+        }
     }
 
     #[test]
@@ -106,8 +124,7 @@ mod tests {
         // secret is ever readable — the store keeps a hash.
         let state = state_with_account("key-mint@example.com");
         let r = mint(&state, "key-mint@example.com", KEY);
-        eprintln!("STATUS={} BODY={:?}", r.status, r.body);
-        assert_eq!(r.status, 201);
+        assert_eq!(answered(r), 201);
     }
 
     #[test]
@@ -115,9 +132,9 @@ mod tests {
         // Names are how a key is revoked, so two on one account would make
         // "delete the laptop key" ambiguous.
         let state = state_with_account("key-dup@example.com");
-        assert_eq!(mint(&state, "key-dup@example.com", KEY).status, 201);
+        assert_eq!(answered(mint(&state, "key-dup@example.com", KEY)), 201);
         let again = add(&state, "key-dup@example.com", &AddKey { name: KEY.to_owned() });
-        assert_ne!(again.status, 201, "a duplicate name must not mint a second key");
+        assert_ne!(answered(again), 201, "a duplicate name must not mint a second key");
     }
 
     #[test]
@@ -126,17 +143,17 @@ mod tests {
         // success here would let one account revoke another's credential by
         // guessing its name.
         let state = state_with_account("key-wrong-acct@example.com");
-        assert_eq!(mint(&state, "key-wrong-acct@example.com", KEY).status, 201);
-        assert_eq!(remove(&state, "nobody@example.com", KEY).status, 404);
+        assert_eq!(answered(mint(&state, "key-wrong-acct@example.com", KEY)), 201);
+        assert_eq!(answered(remove(&state, "nobody@example.com", KEY)), 404);
     }
 
     #[test]
     fn revoking_a_key_answers_with_what_was_removed() {
         // The operator should be able to confirm it was the key they meant.
         let state = state_with_account("key-revoke@example.com");
-        assert_eq!(mint(&state, "key-revoke@example.com", KEY).status, 201);
+        assert_eq!(answered(mint(&state, "key-revoke@example.com", KEY)), 201);
         let gone = remove(&state, "key-revoke@example.com", KEY);
-        assert_eq!(gone.status, 200);
+        assert_eq!(answered(gone), 200);
     }
 
     #[test]
@@ -144,7 +161,7 @@ mod tests {
         // Disabling is the reversible half of revoking: a key turned off by
         // mistake can be turned back on without reconfiguring anyone.
         let state = state_with_account("key-disable@example.com");
-        assert_eq!(mint(&state, "key-disable@example.com", KEY).status, 201);
+        assert_eq!(answered(mint(&state, "key-disable@example.com", KEY)), 201);
 
         let off = set_disabled(
             &state,
@@ -152,13 +169,13 @@ mod tests {
             KEY,
             &SetKeyDisabled { disabled: Some(true) },
         );
-        assert_eq!(off.status, 200);
+        assert_eq!(answered(off), 200);
         let on = set_disabled(
             &state,
             "key-disable@example.com",
             KEY,
             &SetKeyDisabled { disabled: Some(false) },
         );
-        assert_eq!(on.status, 200);
+        assert_eq!(answered(on), 200);
     }
 }

@@ -13,14 +13,14 @@ use crate::http::requests::provider::{RotateProviderKey, SaveProvider};
 use crate::http::resources::status::{IdResource, OkResource};
 use crate::provider;
 use crate::server::State;
-use crate::transport::{Reply, json_of};
+use crate::transport::{Doc, Reply};
 
 /// Add a provider, edit one, or copy one beside itself.
 ///
 /// The three intentions share a body because they share a form. Which one is
 /// meant falls out of the values: a preset names a provider outright, `dup`
 /// asks for a second row beside an existing one, and anything else is a save.
-pub(crate) fn save(request: &SaveProvider, state: &Arc<State>) -> Reply {
+pub(crate) fn save(request: &SaveProvider, state: &Arc<State>) -> Result<Doc<IdResource>, Reply> {
     let dir = registry_dir(state);
     let mut reg = state.registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
@@ -39,7 +39,7 @@ pub(crate) fn save(request: &SaveProvider, state: &Arc<State>) -> Reply {
     } else {
         let id = request.id.trim();
         let Ok(models) = provider::parse_models(&request.models) else {
-            return crate::http::problem(400, "models: one name per line, no blanks");
+            return Err(crate::http::problem(400, "models: one name per line, no blanks"));
         };
         provider::Provider {
             user_id: None,
@@ -113,7 +113,7 @@ pub(crate) fn save(request: &SaveProvider, state: &Arc<State>) -> Reply {
     if !key.is_empty() {
         let path = provider::provider_key_path(&dir, &id);
         if let Err(e) = provider::write_provider_key(&path, key) {
-            return crate::http::problem(500, format!("key file: {e}"));
+            return Err(crate::http::problem(500, format!("key file: {e}")));
         }
     }
 
@@ -122,14 +122,14 @@ pub(crate) fn save(request: &SaveProvider, state: &Arc<State>) -> Reply {
     // Scoped: the lock must not be held across the log line below.
     drop(reg);
     if let Err(e) = saved {
-        return crate::http::problem(500, format!("registry: {e}"));
+        return Err(crate::http::problem(500, format!("registry: {e}")));
     }
     log::info!("proxy: provider {id} saved");
-    json_of(200, &IdResource::of(id))
+    Ok(Doc::ok(IdResource::of(id)))
 }
 
 /// Replace one provider's key, and nothing else.
-pub(crate) fn rotate_key(id: &str, request: &RotateProviderKey, state: &Arc<State>) -> Reply {
+pub(crate) fn rotate_key(id: &str, request: &RotateProviderKey, state: &Arc<State>) -> Result<Doc<OkResource>, Reply> {
     let auth = {
         let reg = state.registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         reg.get(id).map(|p| p.auth.clone())
@@ -144,22 +144,22 @@ pub(crate) fn rotate_key(id: &str, request: &RotateProviderKey, state: &Arc<Stat
     // Worse than useless: an operator who later changed the auth kind would
     // find a key they had forgotten they pasted, suddenly in use.
     let Some(auth) = auth else {
-        return crate::http::problem(404, "no such provider");
+        return Err(crate::http::problem(404, "no such provider"));
     };
     // Refused BEFORE anything is written, and refused on the server as well as
     // in the UI: a disabled button is a hint, and the API is reachable without
     // one.
     if let Some(reason) = auth.no_key_reason(id) {
-        return crate::http::problem(400, reason);
+        return Err(crate::http::problem(400, reason));
     }
     let path = provider::provider_key_path(&registry_dir(state), id);
     if let Err(e) = provider::write_provider_key(&path, &request.key) {
-        return crate::http::problem(500, format!("key file: {e}"));
+        return Err(crate::http::problem(500, format!("key file: {e}")));
     }
     // No restart: the credential is read per request, which is the whole
     // reason it lives in a file rather than in the service's environment.
     log::info!("proxy: provider {id} key rotated");
-    json_of(200, &OkResource::yes())
+    Ok(Doc::ok(OkResource::yes()))
 }
 
 /// Remove a provider, and unpin whoever had been routed to it.
@@ -167,7 +167,7 @@ pub(crate) fn rotate_key(id: &str, request: &RotateProviderKey, state: &Arc<Stat
 /// The unpinning happens first and is not optional. A pin is a person saying
 /// "send me there"; leaving one behind after the destination is gone is how a
 /// working account becomes a 502 that no page explains.
-pub(crate) fn remove(id: &str, state: &Arc<State>) -> Reply {
+pub(crate) fn remove(id: &str, state: &Arc<State>) -> Result<Doc<OkResource>, Reply> {
     let pinned_here: Vec<String> = {
         let mut store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let names: Vec<String> = store
@@ -192,14 +192,14 @@ pub(crate) fn remove(id: &str, state: &Arc<State>) -> Reply {
 
     let mut reg = state.registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if !reg.remove(id) {
-        return crate::http::problem(404, "no such provider");
+        return Err(crate::http::problem(404, "no such provider"));
     }
     let saved = reg.save(&state.registry_path);
     drop(reg);
     if let Err(e) = saved {
-        return crate::http::problem(500, format!("registry: {e}"));
+        return Err(crate::http::problem(500, format!("registry: {e}")));
     }
-    json_of(200, &OkResource::yes())
+    Ok(Doc::ok(OkResource::yes()))
 }
 
 #[cfg(test)]
@@ -233,6 +233,17 @@ mod tests {
             preference: None,
             dup: None,
             enabled: None,
+        }
+    }
+
+    /// The status a `Result`-returning handler answered, whichever side it is.
+    ///
+    /// A saved provider body is a `Doc` now and a refusal still a `Reply`, so
+    /// the two arrive through one type and a test reads the status.
+    fn answered<T, const CODE: u16>(reply: Result<Doc<T, CODE>, Reply>) -> u16 {
+        match reply {
+            Ok(doc) => doc.status,
+            Err(refusal) => refusal.status,
         }
     }
 
@@ -276,7 +287,7 @@ mod tests {
     fn a_hand_configured_provider_is_saved_and_named_back() {
         let state = state_for("custom");
         let reply = save(&custom("my-hop"), &state);
-        assert_eq!(reply.status, 200);
+        assert_eq!(answered(reply), 200);
         assert!(ids(&state).contains(&"my-hop".to_owned()));
     }
 
@@ -291,7 +302,7 @@ mod tests {
         let state = state_for("blank-model");
         let mut req = custom("blank-hop");
         req.models = "model-a:fast\n\n  \nmodel-b:balanced\n".to_owned();
-        assert_eq!(save(&req, &state).status, 200);
+        assert_eq!(answered(save(&req, &state)), 200);
 
         let models = state
             .registry
@@ -314,11 +325,11 @@ mod tests {
         let state = state_for("no-models");
         let mut req = custom("empty-hop");
         req.models = "\n  \n".to_owned();
-        assert_eq!(save(&req, &state).status, 400);
+        assert_eq!(answered(save(&req, &state)), 400);
 
         let mut blank = custom("empty-hop");
         blank.models = String::new();
-        assert_eq!(save(&blank, &state).status, 400, "and so is an absent list");
+        assert_eq!(answered(save(&blank, &state)), 400, "and so is an absent list");
     }
 
     /// A class that is not one of the three is refused, by name.
@@ -331,11 +342,11 @@ mod tests {
         let state = state_for("bad-class");
         let mut req = custom("bad-class-hop");
         req.models = "model-a:sprightly".to_owned();
-        assert_eq!(save(&req, &state).status, 400);
+        assert_eq!(answered(save(&req, &state)), 400);
 
         let mut missing = custom("bad-class-hop");
         missing.models = "model-a".to_owned();
-        assert_eq!(save(&missing, &state).status, 400, "the class is not optional");
+        assert_eq!(answered(save(&missing, &state)), 400, "the class is not optional");
     }
 
     /// The cost is optional and defaults to one.
@@ -347,7 +358,7 @@ mod tests {
         let state = state_for("cost-default");
         let mut req = custom("cost-hop");
         req.models = "model-a:fast".to_owned();
-        assert_eq!(save(&req, &state).status, 200);
+        assert_eq!(answered(save(&req, &state)), 200);
 
         let cost = state
             .registry
@@ -367,7 +378,7 @@ mod tests {
         let state = state_for("bad-cost");
         let mut req = custom("bad-cost-hop");
         req.models = "model-a:fast:half".to_owned();
-        assert_eq!(save(&req, &state).status, 400);
+        assert_eq!(answered(save(&req, &state)), 400);
     }
 
     #[test]
@@ -378,14 +389,14 @@ mod tests {
         // credential at all, out of the candidate list, and the proxy falling
         // back to nothing. A partial view must save partially.
         let state = state_for("preserve-auth");
-        assert_eq!(save(&custom("shared"), &state).status, 200);
+        assert_eq!(answered(save(&custom("shared"), &state)), 200);
 
         seed(&state, host_login(&state, "shared", 10));
 
         // A second save through the form, carrying a key the way the UI would.
         let mut again = custom("shared");
         again.key = "sk-ant-something".to_owned();
-        assert_eq!(save(&again, &state).status, 200);
+        assert_eq!(answered(save(&again, &state)), 200);
 
         let kept = state
             .registry
@@ -408,7 +419,7 @@ mod tests {
         // distributed across providers by editing something else.
         let state = state_for("preserve-weight");
         seed(&state, host_login(&state, "weighted", 42));
-        assert_eq!(save(&custom("weighted"), &state).status, 200);
+        assert_eq!(answered(save(&custom("weighted"), &state)), 200);
 
         let weight = state
             .registry
@@ -453,7 +464,7 @@ mod tests {
         // A save exactly as the panel sends one: every model it lists, in text.
         let mut req = custom("mine");
         req.models = "bespoke-model:balanced:7".to_owned();
-        assert_eq!(save(&req, &state).status, 200);
+        assert_eq!(answered(save(&req, &state)), 200);
 
         let price = state
             .registry
@@ -488,7 +499,7 @@ mod tests {
         let mut req = custom("deepseek");
         req.base_url = "https://api.deepseek.com/anthropic".to_owned();
         req.models = "deepseek-flash:balanced:15".to_owned();
-        assert_eq!(save(&req, &state).status, 200);
+        assert_eq!(answered(save(&req, &state)), 200);
 
         let price = state
             .registry
@@ -508,11 +519,11 @@ mod tests {
     fn a_save_that_names_enabled_is_taken_at_its_word() {
         // The table DOES show this one, so an explicit value wins.
         let state = state_for("enabled-explicit");
-        assert_eq!(save(&custom("toggled"), &state).status, 200);
+        assert_eq!(answered(save(&custom("toggled"), &state)), 200);
 
         let mut off = custom("toggled");
         off.enabled = Some(false);
-        assert_eq!(save(&off, &state).status, 200);
+        assert_eq!(answered(save(&off, &state)), 200);
 
         let enabled = state
             .registry
@@ -529,14 +540,14 @@ mod tests {
         // This is what keeps the older form working: a client that predates the
         // field must not silently re-enable a provider the operator turned off.
         let state = state_for("enabled-preserved");
-        assert_eq!(save(&custom("kept-off"), &state).status, 200);
+        assert_eq!(answered(save(&custom("kept-off"), &state)), 200);
         {
             let mut off = custom("kept-off");
             off.enabled = Some(false);
-            assert_eq!(save(&off, &state).status, 200);
+            assert_eq!(answered(save(&off, &state)), 200);
         }
         // Now a save with no opinion at all.
-        assert_eq!(save(&custom("kept-off"), &state).status, 200);
+        assert_eq!(answered(save(&custom("kept-off"), &state)), 200);
 
         let enabled = state
             .registry
@@ -555,7 +566,7 @@ mod tests {
         let state = state_for("preset");
         let mut req = custom("ignored");
         req.preset = Preset::Deepseek.id().to_owned();
-        assert_eq!(save(&req, &state).status, 200);
+        assert_eq!(answered(save(&req, &state)), 200);
         assert!(ids(&state).contains(&Preset::Deepseek.id().to_owned()));
     }
 
@@ -568,13 +579,13 @@ mod tests {
         let state = state_for("dup");
         let mut first = custom("ignored");
         first.preset = Preset::Deepseek.id().to_owned();
-        assert_eq!(save(&first, &state).status, 200);
+        assert_eq!(answered(save(&first, &state)), 200);
 
         let mut second = custom("ignored");
         second.preset = Preset::Deepseek.id().to_owned();
         second.dup = Some(true);
         second.key = "a-second-key".to_owned();
-        assert_eq!(save(&second, &state).status, 200);
+        assert_eq!(answered(save(&second, &state)), 200);
 
         let all = ids(&state);
         let copies = all.iter().filter(|id| *id != "openai").count();
@@ -592,7 +603,7 @@ mod tests {
     fn rotating_the_key_of_a_provider_that_is_not_there_is_a_404() {
         let state = state_for("rotate-missing");
         let reply = rotate_key("nobody", &RotateProviderKey { key: "k".to_owned() }, &state);
-        assert_eq!(reply.status, 404);
+        assert_eq!(answered(reply), 404);
     }
 
     #[test]
@@ -612,7 +623,7 @@ mod tests {
             },
             &state,
         );
-        assert_eq!(reply.status, 400, "refused rather than silently ignored");
+        assert_eq!(answered(reply), 400, "refused rather than silently ignored");
 
         // And nothing was written: the point of refusing is that no credential
         // is left on disk.
@@ -625,7 +636,7 @@ mod tests {
     #[test]
     fn removing_a_provider_that_is_not_there_is_a_404() {
         let state = state_for("remove-missing");
-        assert_eq!(remove("nobody", &state).status, 404);
+        assert_eq!(answered(remove("nobody", &state)), 404);
     }
 
     #[test]
@@ -634,7 +645,7 @@ mod tests {
         // there"; leaving one behind after the destination is gone is how a
         // working account becomes a 502 that no page explains.
         let state = state_for("unpin");
-        assert_eq!(save(&custom("doomed"), &state).status, 200);
+        assert_eq!(answered(save(&custom("doomed"), &state)), 200);
 
         {
             let mut store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -642,7 +653,7 @@ mod tests {
             store.set_provider("unpin@example.com", Some("doomed")).expect("pin");
         }
 
-        assert_eq!(remove("doomed", &state).status, 200);
+        assert_eq!(answered(remove("doomed", &state)), 200);
 
         let pinned = state
             .store
@@ -663,8 +674,8 @@ mod tests {
         // Only the accounts routed at the one being removed are touched;
         // unpinning everybody would silently undo somebody else's choice.
         let state = state_for("unpin-others");
-        assert_eq!(save(&custom("doomed"), &state).status, 200);
-        assert_eq!(save(&custom("survivor"), &state).status, 200);
+        assert_eq!(answered(save(&custom("doomed"), &state)), 200);
+        assert_eq!(answered(save(&custom("survivor"), &state)), 200);
         {
             let mut store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             store.add("Ada", "Lovelace", "elsewhere@example.com").expect("add");
@@ -673,7 +684,7 @@ mod tests {
                 .expect("pin");
         }
 
-        assert_eq!(remove("doomed", &state).status, 200);
+        assert_eq!(answered(remove("doomed", &state)), 200);
 
         let pinned = state
             .store

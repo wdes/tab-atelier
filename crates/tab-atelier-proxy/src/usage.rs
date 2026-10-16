@@ -32,6 +32,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+use tab_atelier_api::schemars;
 
 /// Roughly 90 days. Long enough to see a quarter's shape, short enough that
 /// the file stays small even with a large team.
@@ -44,7 +45,7 @@ const HOUR: u64 = 3600;
 /// Cache reads and cache writes are priced differently from ordinary input, so
 /// collapsing them into one "input" number would misreport the thing people
 /// actually want to know.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, tab_atelier_api::schemars::JsonSchema)]
 pub struct Tokens {
     #[serde(default)]
     pub input: u64,
@@ -76,7 +77,7 @@ pub struct Tokens {
 }
 
 /// The `service_tier` an upstream billed a call under.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, tab_atelier_api::schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Tier {
     Standard,

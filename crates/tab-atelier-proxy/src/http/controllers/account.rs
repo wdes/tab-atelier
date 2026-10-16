@@ -13,7 +13,7 @@ use crate::http::requests::compact::SetCompact;
 use crate::http::requests::user::{AddUser, PinModel, PinProvider, SetDisabled, SetTools, SetWeight};
 use crate::http::resources;
 use crate::server::State;
-use crate::transport::{Doc, Reply, json_of};
+use crate::transport::{Doc, Reply};
 use crate::users::Store;
 
 /// Every account, for the operator's table.
@@ -23,16 +23,18 @@ pub(crate) fn list(state: &Arc<State>) -> Doc<resources::AccountsResource> {
 }
 
 /// Creating an account.
-pub(crate) fn add(state: &Arc<State>, req: &AddUser) -> Reply {
+pub(crate) fn add(state: &Arc<State>, req: &AddUser) -> Result<Doc<resources::AccountEnvelope, 201>, Reply> {
     let mut store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     match store.add(&req.first_name, &req.last_name, &req.email) {
-        Ok(a) => json_of(201, &resources::AccountEnvelope::from(&a)),
-        Err(e) => failure(400, &e.to_string()),
+        Ok(a) => Ok(Doc::<resources::AccountEnvelope, 201>::ok(
+            resources::AccountEnvelope::from(&a),
+        )),
+        Err(e) => Err(failure(400, &e.to_string())),
     }
 }
 
 /// Deleting an account, and with it everything only that account could explain.
-pub(crate) fn remove(state: &Arc<State>, who: &str) -> Reply {
+pub(crate) fn remove(state: &Arc<State>, who: &str) -> Result<Doc<resources::RemovedAccountEnvelope>, Reply> {
     let mut store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     match store.remove(who) {
         Ok(a) => {
@@ -44,14 +46,18 @@ pub(crate) fn remove(state: &Arc<State>, who: &str) -> Reply {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .forget(&a.id);
-            json_of(200, &resources::RemovedAccountEnvelope::from(&a))
+            Ok(Doc::ok(resources::RemovedAccountEnvelope::from(&a)))
         }
-        Err(e) => failure(404, &e.to_string()),
+        Err(e) => Err(failure(404, &e.to_string())),
     }
 }
 
 /// Pin an account to a provider, or clear the pin with an empty name.
-pub(crate) fn set_provider(state: &Arc<State>, who: &str, req: &PinProvider) -> Reply {
+pub(crate) fn set_provider(
+    state: &Arc<State>,
+    who: &str,
+    req: &PinProvider,
+) -> Result<Doc<resources::AccountEnvelope>, Reply> {
     let wanted = req.provider.trim();
     // Validated HERE, where the registry is in hand, rather than in users.rs
     // which knows about people and not about destinations. A pin to a typo
@@ -68,13 +74,13 @@ pub(crate) fn set_provider(state: &Arc<State>, who: &str, req: &PinProvider) -> 
             )
         };
         if let Some(why) = why {
-            return crate::http::problem(400, why);
+            return Err(crate::http::problem(400, why));
         }
     }
     let mut store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     match store.set_provider(who, (!wanted.is_empty()).then_some(wanted)) {
-        Ok(a) => json_of(200, &resources::AccountEnvelope::from(&a)),
-        Err(e) => failure(404, &e.to_string()),
+        Ok(a) => Ok(Doc::ok(resources::AccountEnvelope::from(&a))),
+        Err(e) => Err(failure(404, &e.to_string())),
     }
 }
 
@@ -82,7 +88,11 @@ pub(crate) fn set_provider(state: &Arc<State>, who: &str, req: &PinProvider) -> 
 ///
 /// The model pin outranks the provider pin: choosing a model chooses the hop
 /// that serves it.
-pub(crate) fn set_model(state: &Arc<State>, who: &str, req: &PinModel) -> Reply {
+pub(crate) fn set_model(
+    state: &Arc<State>,
+    who: &str,
+    req: &PinModel,
+) -> Result<Doc<resources::AccountEnvelope>, Reply> {
     let wanted = req.model.trim();
     // Canonicalised to the catalogue's own spelling before it is stored, for the
     // reason the CLI does the same: routing resolves the pin by EXACT id, so a
@@ -99,13 +109,13 @@ pub(crate) fn set_model(state: &Arc<State>, who: &str, req: &PinModel) -> Reply 
         };
         match canonical {
             Ok(id) => Some(id),
-            Err(why) => return failure(400, &why),
+            Err(why) => return Err(failure(400, &why)),
         }
     };
     let mut store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     match store.set_model(who, canonical.as_deref()) {
-        Ok(a) => json_of(200, &resources::AccountEnvelope::from(&a)),
-        Err(e) => failure(404, &e.to_string()),
+        Ok(a) => Ok(Doc::ok(resources::AccountEnvelope::from(&a))),
+        Err(e) => Err(failure(404, &e.to_string())),
     }
 }
 
@@ -116,12 +126,16 @@ pub(crate) fn set_model(state: &Arc<State>, who: &str, req: &PinModel) -> Reply 
 /// provider silently means something else the moment that provider stops being
 /// where the traffic goes. The hop still gets a say, because the harm is a
 /// property of the hop; see [`compact_refusal_for`].
-pub(crate) fn set_compact(state: &Arc<State>, who: &str, req: &SetCompact) -> Reply {
+pub(crate) fn set_compact(
+    state: &Arc<State>,
+    who: &str,
+    req: &SetCompact,
+) -> Result<Doc<resources::AccountEnvelope>, Reply> {
     let Some(level) = crate::compact::Compact::ALL
         .into_iter()
         .find(|c| c.as_str() == req.compact.trim())
     else {
-        return failure(400, &format!("unknown compaction level {:?}", req.compact));
+        return Err(failure(400, &format!("unknown compaction level {:?}", req.compact)));
     };
     // Refused on the SERVER, not only by the option the UI disables. A setting
     // that cannot be correct should not be offerable, and the browser is not
@@ -129,13 +143,13 @@ pub(crate) fn set_compact(state: &Arc<State>, who: &str, req: &SetCompact) -> Re
     if !level.is_none() {
         let store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(why) = compact_refusal_for(state, &store, who) {
-            return failure(400, &why);
+            return Err(failure(400, &why));
         }
     }
     let mut store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     match store.set_compact(who, level) {
-        Ok(a) => json_of(200, &resources::AccountEnvelope::from(&a)),
-        Err(e) => failure(404, &e.to_string()),
+        Ok(a) => Ok(Doc::ok(resources::AccountEnvelope::from(&a))),
+        Err(e) => Err(failure(404, &e.to_string())),
     }
 }
 
@@ -159,29 +173,41 @@ pub(crate) fn compact_refusal_for(state: &Arc<State>, store: &Store, who: &str) 
 /// Whole-object rather than merged field by field: the policy decides what an
 /// agent may do, and a partial write would leave a shape that nobody chose and
 /// that no version of the UI would have produced.
-pub(crate) fn set_tools(state: &Arc<State>, who: &str, req: &SetTools) -> Reply {
+pub(crate) fn set_tools(
+    state: &Arc<State>,
+    who: &str,
+    req: &SetTools,
+) -> Result<Doc<resources::AccountEnvelope>, Reply> {
     let mut store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     match store.set_tools(who, req.policy.clone()) {
-        Ok(a) => json_of(200, &resources::AccountEnvelope::from(&a)),
-        Err(e) => failure(404, &e.to_string()),
+        Ok(a) => Ok(Doc::ok(resources::AccountEnvelope::from(&a))),
+        Err(e) => Err(failure(404, &e.to_string())),
     }
 }
 
 /// Switching an account off, or back on.
-pub(crate) fn set_disabled(state: &Arc<State>, who: &str, req: &SetDisabled) -> Reply {
+pub(crate) fn set_disabled(
+    state: &Arc<State>,
+    who: &str,
+    req: &SetDisabled,
+) -> Result<Doc<resources::AccountEnvelope>, Reply> {
     let mut store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     match store.set_disabled(who, req.disabled()) {
-        Ok(a) => json_of(200, &resources::AccountEnvelope::from(&a)),
-        Err(e) => failure(404, &e.to_string()),
+        Ok(a) => Ok(Doc::ok(resources::AccountEnvelope::from(&a))),
+        Err(e) => Err(failure(404, &e.to_string())),
     }
 }
 
 /// How many times this account's key is drawn in the rotation.
-pub(crate) fn set_weight(state: &Arc<State>, who: &str, req: &SetWeight) -> Reply {
+pub(crate) fn set_weight(
+    state: &Arc<State>,
+    who: &str,
+    req: &SetWeight,
+) -> Result<Doc<resources::AccountEnvelope>, Reply> {
     let mut store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     match store.set_weight(who, req.weight()) {
-        Ok(a) => json_of(200, &resources::AccountEnvelope::from(&a)),
-        Err(e) => failure(404, &e.to_string()),
+        Ok(a) => Ok(Doc::ok(resources::AccountEnvelope::from(&a))),
+        Err(e) => Err(failure(404, &e.to_string())),
     }
 }
 
@@ -217,6 +243,17 @@ mod tests {
         state
     }
 
+    /// The status a handler answered, whichever side of the result it is.
+    ///
+    /// A creation cannot be a bare `Doc`: the same handler also answers 400, so
+    /// it returns a `Result` and the test reads through it.
+    fn answered<T, const CODE: u16>(reply: &Result<Doc<T, CODE>, Reply>) -> u16 {
+        match reply {
+            Ok(doc) => doc.status,
+            Err(refusal) => refusal.status,
+        }
+    }
+
     fn add_user(first: &str, last: &str, email: &str) -> AddUser {
         AddUser {
             first_name: first.to_owned(),
@@ -244,7 +281,7 @@ mod tests {
         // account that is *not* there.
         let _ = remove(&state, "create@example.com");
         let reply = add(&state, &add_user("Grace", "Hopper", "create@example.com"));
-        assert_eq!(reply.status, 201);
+        assert_eq!(answered(&reply), 201);
     }
 
     #[test]
@@ -253,7 +290,7 @@ mod tests {
         // the operator fixes it by sending a different one.
         let state = state_for("dup", "dup@example.com");
         let reply = add(&state, &add_user("Ada", "Lovelace", "dup@example.com"));
-        assert_eq!(reply.status, 400);
+        assert_eq!(answered(&reply), 400);
     }
 
     // ── deleting ────────────────────────────────────────────────────────────
@@ -264,7 +301,7 @@ mod tests {
         // whose email they mistyped.
         let state = state_for("delete", "delete@example.com");
         let reply = remove(&state, "delete@example.com");
-        assert_eq!(reply.status, 200);
+        assert_eq!(answered(&reply), 200);
         assert!(
             state
                 .store
@@ -279,7 +316,7 @@ mod tests {
     #[test]
     fn deleting_an_account_that_is_not_there_is_a_404() {
         let state = state_for("delete-missing", "delete-missing@example.com");
-        assert_eq!(remove(&state, "nobody@example.com").status, 404);
+        assert_eq!(answered(&remove(&state, "nobody@example.com")), 404);
     }
 
     // ── the provider pin ────────────────────────────────────────────────────
@@ -297,7 +334,7 @@ mod tests {
                 provider: "not-a-provider".to_owned(),
             },
         );
-        assert_eq!(reply.status, 400);
+        assert_eq!(answered(&reply), 400);
     }
 
     #[test]
@@ -312,7 +349,7 @@ mod tests {
                 provider: String::new(),
             },
         );
-        assert_eq!(reply.status, 200);
+        assert_eq!(answered(&reply), 200);
     }
 
     #[test]
@@ -325,7 +362,7 @@ mod tests {
                 provider: String::new(),
             },
         );
-        assert_eq!(reply.status, 404);
+        assert_eq!(answered(&reply), 404);
     }
 
     // ── the model pin ───────────────────────────────────────────────────────
@@ -343,14 +380,14 @@ mod tests {
                 model: "not-a-model".to_owned(),
             },
         );
-        assert_eq!(reply.status, 400);
+        assert_eq!(answered(&reply), 400);
     }
 
     #[test]
     fn an_empty_model_pin_clears_the_override() {
         let state = state_for("model-clear", "model-clear@example.com");
         let reply = set_model(&state, "model-clear@example.com", &PinModel { model: String::new() });
-        assert_eq!(reply.status, 200);
+        assert_eq!(answered(&reply), 200);
     }
 
     #[test]
@@ -367,7 +404,7 @@ mod tests {
                 model: "CLAUDE-SONNET-5".to_owned(),
             },
         );
-        assert_eq!(reply.status, 200);
+        assert_eq!(answered(&reply), 200);
         let stored = state
             .store
             .lock()
@@ -391,7 +428,7 @@ mod tests {
                 compact: "maximum".to_owned(),
             },
         );
-        assert_eq!(reply.status, 400);
+        assert_eq!(answered(&reply), 400);
     }
 
     #[test]
@@ -407,7 +444,7 @@ mod tests {
                 compact: "none".to_owned(),
             },
         );
-        assert_eq!(reply.status, 200);
+        assert_eq!(answered(&reply), 200);
     }
 
     #[test]
@@ -435,7 +472,7 @@ mod tests {
                     disabled: Some(disabled),
                 },
             );
-            assert_eq!(reply.status, 200, "disabled={disabled}");
+            assert_eq!(answered(&reply), 200, "disabled={disabled}");
         }
     }
 
@@ -447,19 +484,21 @@ mod tests {
         let missing = "nobody@example.com";
 
         assert_eq!(
-            set_disabled(&state, missing, &SetDisabled { disabled: Some(true) }).status,
+            answered(&set_disabled(&state, missing, &SetDisabled { disabled: Some(true) })),
             404
         );
-        assert_eq!(set_weight(&state, missing, &SetWeight { weight: Some(3) }).status, 404);
         assert_eq!(
-            set_tools(
+            answered(&set_weight(&state, missing, &SetWeight { weight: Some(3) })),
+            404
+        );
+        assert_eq!(
+            answered(&set_tools(
                 &state,
                 missing,
                 &SetTools {
                     policy: crate::tools::Policy::default()
                 }
-            )
-            .status,
+            )),
             404
         );
     }
@@ -470,7 +509,7 @@ mod tests {
         // else would make the operator doubt which one is in force.
         let state = state_for("weight", "weight@example.com");
         let reply = set_weight(&state, "weight@example.com", &SetWeight { weight: Some(4) });
-        assert_eq!(reply.status, 200);
+        assert_eq!(answered(&reply), 200);
 
         let weight = state
             .store

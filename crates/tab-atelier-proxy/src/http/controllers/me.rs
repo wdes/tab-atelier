@@ -21,7 +21,7 @@ use crate::http::guards::Arrival;
 use crate::http::raw::Raw;
 use crate::http::resources;
 use crate::server::State;
-use crate::transport::{Reply, json_of};
+use crate::transport::{Doc, Reply};
 use crate::users::Account;
 use crate::{egress, usage};
 
@@ -31,7 +31,7 @@ use crate::{egress, usage};
 /// polling this is exactly the traffic somebody reviewing access wants to see —
 /// which is why it goes through the same guard as a relayed request rather than
 /// a cheaper read-only path.
-pub(crate) fn me_usage(state: &Arc<State>, who: &Account, window: Option<&str>) -> Reply {
+pub(crate) fn me_usage(state: &Arc<State>, who: &Account, window: Option<&str>) -> Doc<resources::MeUsageResource> {
     let now = usage::now_secs();
     // The query arrives as Rocket's typed parameter; the parser wants the raw
     // form. Rebuilding the one key it looks for keeps a single parser rather
@@ -50,16 +50,13 @@ pub(crate) fn me_usage(state: &Arc<State>, who: &Account, window: Option<&str>) 
         let u = state.usage.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         resources::UsageResource::of(&u, &who.id, span, now, rate.as_ref())
     };
-    json_of(
-        200,
-        &resources::MeUsageResource {
-            account: resources::AccountSummary {
-                name: who.display_name(),
-                email: who.email.clone(),
-            },
-            usage,
+    Doc::ok(resources::MeUsageResource {
+        account: resources::AccountSummary {
+            name: who.display_name(),
+            email: who.email.clone(),
         },
-    )
+        usage,
+    })
 }
 
 /// Install a repaired credential, on behalf of the caller.
@@ -74,10 +71,15 @@ pub(crate) fn me_usage(state: &Arc<State>, who: &Account, window: Option<&str>) 
 /// written. 409 is for the state not permitting it (a working proxy, somebody
 /// else's account) as distinct from 400, "you sent rubbish" — a client can then
 /// tell "nothing to fix" from "try again properly".
-pub(crate) async fn me_credentials(state: &Arc<State>, who: &Account, arrival: &Arrival, body: Raw) -> Reply {
+pub(crate) async fn me_credentials(
+    state: &Arc<State>,
+    who: &Account,
+    arrival: &Arrival,
+    body: Raw,
+) -> Result<Doc<resources::CredentialsResource>, Reply> {
     let _ = state;
     let Ok(raw) = String::from_utf8(body.bytes().to_vec()) else {
-        return crate::http::problem(400, "body is not UTF-8");
+        return Err(crate::http::problem(400, "body is not UTF-8"));
     };
     let ip = arrival.ip.clone();
     let outcome = tokio::task::spawn_blocking(move || egress::repair_credentials(&raw)).await;
@@ -89,7 +91,7 @@ pub(crate) async fn me_credentials(state: &Arc<State>, who: &Account, arrival: &
                 who.email,
             );
             let installed_for = imported.identity.map(|i| i.email).unwrap_or_default();
-            json_of(200, &resources::CredentialsResource::installed(installed_for))
+            Ok(Doc::ok(resources::CredentialsResource::installed(installed_for)))
         }
         Ok(Err(e)) => {
             log::warn!(
@@ -97,9 +99,9 @@ pub(crate) async fn me_credentials(state: &Arc<State>, who: &Account, arrival: &
                 who.display_name(),
                 who.email,
             );
-            crate::http::problem(409, e)
+            Err(crate::http::problem(409, e))
         }
-        Err(_) => crate::http::problem(500, "credential repair panicked"),
+        Err(_) => Err(crate::http::problem(500, "credential repair panicked")),
     }
 }
 
@@ -109,6 +111,17 @@ mod tests {
 
     /// The seeded account, made if it is not there.
     ///
+    /// The status a `Result`-returning handler answered, whichever side it is.
+    ///
+    /// An installed credential is a `Doc` now and a refusal still a `Reply`, so
+    /// the two arrive through one type and a test reads the status.
+    fn answered<T, const CODE: u16>(reply: Result<Doc<T, CODE>, Reply>) -> u16 {
+        match reply {
+            Ok(doc) => doc.status,
+            Err(refusal) => refusal.status,
+        }
+    }
+
     /// The store the tests share is persisted to disk and never cleared, so a
     /// helper that always added would start failing on the second run. Finding
     /// first makes these tests order- and history-independent.
@@ -169,6 +182,6 @@ mod tests {
                 &arrival,
                 Raw(bytes::Bytes::from_static(&[0xff, 0xfe])),
             ));
-        assert_eq!(reply.status, 400);
+        assert_eq!(answered(reply), 400);
     }
 }

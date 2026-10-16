@@ -9,6 +9,7 @@
 //! provider cannot leave the UI or the spec behind.
 
 use serde::Serialize;
+use tab_atelier_api::schemars;
 
 use crate::compact::Compact;
 use crate::provider::{self, Mapping, Peak, Provider};
@@ -20,7 +21,7 @@ use crate::usage;
 /// `cost_now` is resolved rather than sent as `relative_cost` alone, because
 /// the multiplier changes at the peak boundary and a client recomputing it
 /// would need the same schedule arithmetic the server already has.
-#[derive(Serialize)]
+#[derive(Serialize, tab_atelier_api::schemars::JsonSchema)]
 pub(crate) struct ModelResource {
     pub id: String,
     pub class: provider::Class,
@@ -40,7 +41,7 @@ pub(crate) struct ModelResource {
 /// One hop, as the panel sees it.
 ///
 /// Never a credential — only whether one resolves.
-#[derive(Serialize)]
+#[derive(Serialize, tab_atelier_api::schemars::JsonSchema)]
 pub(crate) struct ProviderResource {
     pub id: String,
     pub base_url: String,
@@ -100,7 +101,7 @@ fn model_resource(p: &Provider, m: &provider::Model, now: u64) -> ModelResource 
 }
 
 /// A preset, as offered before anyone commits to adding it.
-#[derive(Serialize)]
+#[derive(Serialize, tab_atelier_api::schemars::JsonSchema)]
 pub(crate) struct PresetResource {
     pub id: &'static str,
     pub label: &'static str,
@@ -112,14 +113,14 @@ pub(crate) struct PresetResource {
 ///
 /// Sent so the wording lives in one place: the enum the routing reads is the
 /// same one the UI renders.
-#[derive(Serialize)]
+#[derive(Serialize, tab_atelier_api::schemars::JsonSchema)]
 pub(crate) struct CompactLevelResource {
     pub value: &'static str,
     pub label: &'static str,
 }
 
 /// Everything the providers panel needs, and no credential anywhere in it.
-#[derive(Serialize)]
+#[derive(Serialize, tab_atelier_api::schemars::JsonSchema)]
 pub(crate) struct CatalogResource {
     pub providers: Vec<ProviderResource>,
     pub presets: Vec<PresetResource>,

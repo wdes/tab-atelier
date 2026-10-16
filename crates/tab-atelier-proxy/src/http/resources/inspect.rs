@@ -7,6 +7,7 @@
 //! summary that a caller could mistake for harmless.
 
 use serde::Serialize;
+use tab_atelier_api::schemars;
 
 use crate::inspect::Capture;
 
@@ -15,7 +16,7 @@ use crate::inspect::Capture;
 /// `seconds_left` is computed rather than left to the caller: the page that
 /// shows it is a browser, and making it subtract two clocks is how a countdown
 /// drifts.
-#[derive(Serialize)]
+#[derive(Serialize, tab_atelier_api::schemars::JsonSchema)]
 pub(crate) struct InspectStatusResource {
     /// Whether the recorder is on right now.
     pub armed: bool,
@@ -30,7 +31,7 @@ pub(crate) struct InspectStatusResource {
 }
 
 /// The reply to an arm: when it will turn itself off.
-#[derive(Serialize)]
+#[derive(Serialize, tab_atelier_api::schemars::JsonSchema)]
 pub(crate) struct InspectStateResource {
     /// The Unix second at which the recorder disarms itself.
     pub armed_until: u64,

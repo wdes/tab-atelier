@@ -45,6 +45,7 @@
 //! that stays true.
 
 use serde::{Deserialize, Serialize};
+use tab_atelier_api::schemars;
 
 /// The tag the classifier's output is terminated by, and the one string that
 /// identifies the request beyond doubt: it appears in `stop_sequences` only
@@ -59,7 +60,7 @@ const SYSTEM_MARKER: &str = "You are a security monitor for autonomous AI coding
 ///
 /// Deliberately narrow. It exists so that a mapping, a compaction level and a
 /// tool policy — all statements about work — can be held to work alone.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, tab_atelier_api::schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Kind {
     /// Ordinary model traffic: the conversation, and the tools run for it.

@@ -25,6 +25,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tab_atelier_api::schemars;
 
 /// Prefix on every minted key, so one is recognisable in a log or an env var
 /// and greppable when it leaks.
@@ -63,7 +64,7 @@ pub const SESSION_TTL_SECS: u64 = 24 * 60 * 60;
 /// All three fields are optional and an empty string counts as absent: the
 /// client sends `account_uuid: ""` when nobody is logged in, and rendering that
 /// as a value would state something the wire did not.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, tab_atelier_api::schemars::JsonSchema)]
 pub struct Client {
     /// Stable per install. Answers "same machine, or two?".
     #[serde(default, skip_serializing_if = "Option::is_none")]

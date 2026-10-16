@@ -52,6 +52,7 @@
 use std::collections::HashSet;
 
 use serde::Serialize;
+use tab_atelier_api::schemars;
 
 use crate::provider::{Model, Provider, Registry};
 
@@ -66,7 +67,7 @@ const UNIT_TOKENS: u32 = 1_000_000;
 const CURRENCY: &str = "USD";
 
 /// The whole list.
-#[derive(Serialize)]
+#[derive(Serialize, tab_atelier_api::schemars::JsonSchema)]
 pub(crate) struct PriceListResource {
     /// Always `"list"`, the envelope the provider's own list uses.
     pub object: &'static str,
@@ -78,7 +79,7 @@ pub(crate) struct PriceListResource {
 }
 
 /// One model: how to name it, and what it costs.
-#[derive(Serialize)]
+#[derive(Serialize, tab_atelier_api::schemars::JsonSchema)]
 pub(crate) struct ModelEntryResource {
     /// `"model"`, as the Anthropic wire spells this field.
     #[serde(rename = "type")]
@@ -101,7 +102,7 @@ pub(crate) struct ModelEntryResource {
 }
 
 /// One rate, in the shape a client scales a token count by.
-#[derive(Serialize)]
+#[derive(Serialize, tab_atelier_api::schemars::JsonSchema)]
 pub(crate) struct AmountResource {
     pub currency: &'static str,
     pub unit_tokens: u32,

@@ -53,7 +53,7 @@ use crate::http::requests::mapping::AddMapping;
 use crate::http::requests::provider::{RotateProviderKey, SaveProvider};
 use crate::http::requests::user::{AddUser, PinModel, PinProvider, SetDisabled, SetTools, SetWeight};
 use crate::server::State as AppState;
-use crate::transport::Reply;
+use crate::transport::{Doc, Reply};
 use rocket::http::Method;
 
 // ── the relay ───────────────────────────────────────────────────────────────
@@ -135,14 +135,23 @@ pub(crate) fn relay_hello_head() -> Reply {
 /// What this key's account has spent.
 #[openapi]
 #[get("/me/usage?<window>")]
-pub(crate) fn me_usage(state: &State<Arc<AppState>>, who: ClientKey, window: Option<String>) -> Reply {
+pub(crate) fn me_usage(
+    state: &State<Arc<AppState>>,
+    who: ClientKey,
+    window: Option<String>,
+) -> crate::transport::Doc<crate::http::resources::MeUsageResource> {
     me::me_usage(state, &who.account, window.as_deref())
 }
 
 /// Repair this account's credential, in place.
 #[openapi]
 #[post("/me/credentials", data = "<body>")]
-pub(crate) async fn me_credentials(state: &State<Arc<AppState>>, arrival: Arrival, who: ClientKey, body: Raw) -> Reply {
+pub(crate) async fn me_credentials(
+    state: &State<Arc<AppState>>,
+    arrival: Arrival,
+    who: ClientKey,
+    body: Raw,
+) -> Result<crate::transport::Doc<crate::http::resources::CredentialsResource>, crate::transport::Reply> {
     me::me_credentials(state, &who.account, &arrival, body).await
 }
 
@@ -180,14 +189,22 @@ pub(crate) fn list_users(
 /// Create one.
 #[openapi]
 #[post("/api/users", data = "<body>")]
-pub(crate) fn add_user(state: &State<Arc<AppState>>, _admin: Admin, body: Json<AddUser>) -> Reply {
+pub(crate) fn add_user(
+    state: &State<Arc<AppState>>,
+    _admin: Admin,
+    body: Json<AddUser>,
+) -> Result<crate::transport::Doc<crate::http::resources::AccountEnvelope, 201>, crate::transport::Reply> {
     account::add(state, &body.0)
 }
 
 /// Delete one.
 #[openapi]
 #[delete("/api/users/<account>")]
-pub(crate) fn remove_user(state: &State<Arc<AppState>>, _admin: Admin, account: &str) -> Reply {
+pub(crate) fn remove_user(
+    state: &State<Arc<AppState>>,
+    _admin: Admin,
+    account: &str,
+) -> Result<crate::transport::Doc<crate::http::resources::RemovedAccountEnvelope>, crate::transport::Reply> {
     account::remove(state, account)
 }
 
@@ -199,7 +216,7 @@ pub(crate) fn set_user_disabled(
     _admin: Admin,
     account: &str,
     body: Json<SetDisabled>,
-) -> Reply {
+) -> Result<crate::transport::Doc<crate::http::resources::AccountEnvelope>, crate::transport::Reply> {
     account::set_disabled(state, account, &body.0)
 }
 
@@ -211,7 +228,7 @@ pub(crate) fn set_user_weight(
     _admin: Admin,
     account: &str,
     body: Json<SetWeight>,
-) -> Reply {
+) -> Result<crate::transport::Doc<crate::http::resources::AccountEnvelope>, crate::transport::Reply> {
     account::set_weight(state, account, &body.0)
 }
 
@@ -223,7 +240,7 @@ pub(crate) fn set_user_provider(
     _admin: Admin,
     account: &str,
     body: Json<PinProvider>,
-) -> Reply {
+) -> Result<crate::transport::Doc<crate::http::resources::AccountEnvelope>, crate::transport::Reply> {
     account::set_provider(state, account, &body.0)
 }
 
@@ -235,7 +252,7 @@ pub(crate) fn set_user_model(
     _admin: Admin,
     account: &str,
     body: Json<PinModel>,
-) -> Reply {
+) -> Result<crate::transport::Doc<crate::http::resources::AccountEnvelope>, crate::transport::Reply> {
     account::set_model(state, account, &body.0)
 }
 
@@ -247,7 +264,7 @@ pub(crate) fn set_user_compact(
     _admin: Admin,
     account: &str,
     body: Json<SetCompact>,
-) -> Reply {
+) -> Result<crate::transport::Doc<crate::http::resources::AccountEnvelope>, crate::transport::Reply> {
     account::set_compact(state, account, &body.0)
 }
 
@@ -259,7 +276,7 @@ pub(crate) fn set_user_tools(
     _admin: Admin,
     account: &str,
     body: Json<SetTools>,
-) -> Reply {
+) -> Result<crate::transport::Doc<crate::http::resources::AccountEnvelope>, crate::transport::Reply> {
     account::set_tools(state, account, &body.0)
 }
 
@@ -268,7 +285,12 @@ pub(crate) fn set_user_tools(
 /// Mint a key for an account.
 #[openapi]
 #[post("/api/users/<account>/keys", data = "<body>")]
-pub(crate) fn add_key(state: &State<Arc<AppState>>, _admin: Admin, account: &str, body: Json<AddKey>) -> Reply {
+pub(crate) fn add_key(
+    state: &State<Arc<AppState>>,
+    _admin: Admin,
+    account: &str,
+    body: Json<AddKey>,
+) -> Result<crate::transport::Doc<crate::http::resources::NewKeyResource, 201>, crate::transport::Reply> {
     key::add(state, account, &body.0)
 }
 
@@ -281,14 +303,19 @@ pub(crate) fn set_key_disabled(
     account: &str,
     key: &str,
     body: Json<SetKeyDisabled>,
-) -> Reply {
+) -> Result<crate::transport::Doc<crate::http::resources::KeyEnvelope>, crate::transport::Reply> {
     key::set_disabled(state, account, key, &body.0)
 }
 
 /// Revoke one key.
 #[openapi]
 #[delete("/api/users/<account>/keys/<key>")]
-pub(crate) fn remove_key(state: &State<Arc<AppState>>, _admin: Admin, account: &str, key: &str) -> Reply {
+pub(crate) fn remove_key(
+    state: &State<Arc<AppState>>,
+    _admin: Admin,
+    account: &str,
+    key: &str,
+) -> Result<crate::transport::Doc<crate::http::resources::RemovedKeyEnvelope>, crate::transport::Reply> {
     key::remove(state, account, key)
 }
 
@@ -297,14 +324,21 @@ pub(crate) fn remove_key(state: &State<Arc<AppState>>, _admin: Admin, account: &
 /// The provider catalogue, and the providers that are configured.
 #[openapi]
 #[get("/api/providers")]
-pub(crate) fn list_providers(state: &State<Arc<AppState>>, _admin: Admin) -> Reply {
-    crate::transport::json_of(200, &crate::http::resources::providers_json(state.inner()))
+pub(crate) fn list_providers(
+    state: &State<Arc<AppState>>,
+    _admin: Admin,
+) -> crate::transport::Doc<crate::http::resources::CatalogResource> {
+    crate::transport::Doc::ok(crate::http::resources::providers_json(state.inner()))
 }
 
 /// Add or change a provider.
 #[openapi]
 #[post("/api/providers", data = "<body>")]
-pub(crate) fn save_provider(state: &State<Arc<AppState>>, _admin: Admin, body: Json<SaveProvider>) -> Reply {
+pub(crate) fn save_provider(
+    state: &State<Arc<AppState>>,
+    _admin: Admin,
+    body: Json<SaveProvider>,
+) -> Result<crate::transport::Doc<crate::http::resources::IdResource>, crate::transport::Reply> {
     provider::save(&body.0, state)
 }
 
@@ -316,14 +350,18 @@ pub(crate) fn rotate_provider_key(
     _admin: Admin,
     id: &str,
     body: Json<RotateProviderKey>,
-) -> Reply {
+) -> Result<crate::transport::Doc<crate::http::resources::OkResource>, crate::transport::Reply> {
     provider::rotate_key(id, &body.0, state)
 }
 
 /// Remove a provider.
 #[openapi]
 #[delete("/api/providers/<id>")]
-pub(crate) fn remove_provider(state: &State<Arc<AppState>>, _admin: Admin, id: &str) -> Reply {
+pub(crate) fn remove_provider(
+    state: &State<Arc<AppState>>,
+    _admin: Admin,
+    id: &str,
+) -> Result<crate::transport::Doc<crate::http::resources::OkResource>, crate::transport::Reply> {
     provider::remove(id, state)
 }
 
@@ -332,21 +370,33 @@ pub(crate) fn remove_provider(state: &State<Arc<AppState>>, _admin: Admin, id: &
 /// Rename a model on the way through.
 #[openapi]
 #[post("/api/mappings", data = "<body>")]
-pub(crate) fn add_mapping(state: &State<Arc<AppState>>, _admin: Admin, body: Json<AddMapping>) -> Reply {
+pub(crate) fn add_mapping(
+    state: &State<Arc<AppState>>,
+    _admin: Admin,
+    body: Json<AddMapping>,
+) -> Result<crate::transport::Doc<crate::http::resources::OkResource>, crate::transport::Reply> {
     mapping::add(state, &body.0)
 }
 
 /// Stop renaming it.
 #[openapi]
 #[delete("/api/mappings/<from>")]
-pub(crate) fn remove_mapping(state: &State<Arc<AppState>>, _admin: Admin, from: &str) -> Reply {
+pub(crate) fn remove_mapping(
+    state: &State<Arc<AppState>>,
+    _admin: Admin,
+    from: &str,
+) -> Result<crate::transport::Doc<crate::http::resources::OkResource>, crate::transport::Reply> {
     mapping::remove(state, from)
 }
 
 /// What everyone has spent, over a window.
 #[openapi]
 #[get("/api/usage?<window>")]
-pub(crate) fn usage_report(state: &State<Arc<AppState>>, _admin: Admin, window: Option<String>) -> Reply {
+pub(crate) fn usage_report(
+    state: &State<Arc<AppState>>,
+    _admin: Admin,
+    window: Option<String>,
+) -> crate::transport::Doc<crate::http::resources::UsageReportResource> {
     let query = window.map_or_else(String::new, |w| format!("window={w}"));
     usage::usage_report(state, &query)
 }
@@ -354,7 +404,10 @@ pub(crate) fn usage_report(state: &State<Arc<AppState>>, _admin: Admin, window: 
 /// How much of the budget is left, and who is waiting on it.
 #[openapi]
 #[get("/api/pressure")]
-pub(crate) fn pressure(state: &State<Arc<AppState>>, _admin: Admin) -> Reply {
+pub(crate) fn pressure(
+    state: &State<Arc<AppState>>,
+    _admin: Admin,
+) -> crate::transport::Doc<crate::http::resources::PressureResource> {
     // Whether to report on the plan at all is the router's own judgement, asked
     // here rather than inferred by the dashboard: a subscription switched off,
     // or left without a credential file, spends nothing and so has nothing to
@@ -366,10 +419,11 @@ pub(crate) fn pressure(state: &State<Arc<AppState>>, _admin: Admin) -> Reply {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .subscription_usable();
-    crate::transport::json_of(
-        200,
-        &crate::http::resources::PressureResource::of(state.inner(), crate::server::now_ms(), subscription_usable),
-    )
+    Doc::ok(crate::http::resources::PressureResource::of(
+        state.inner(),
+        crate::server::now_ms(),
+        subscription_usable,
+    ))
 }
 
 // ── the operator API: capture ───────────────────────────────────────────────
@@ -377,21 +431,31 @@ pub(crate) fn pressure(state: &State<Arc<AppState>>, _admin: Admin) -> Reply {
 /// What the recorder is doing, and everything it has caught.
 #[openapi]
 #[get("/api/inspect")]
-pub(crate) fn read_inspect(state: &State<Arc<AppState>>, _admin: Admin) -> Reply {
+pub(crate) fn read_inspect(
+    state: &State<Arc<AppState>>,
+    _admin: Admin,
+) -> crate::transport::Doc<crate::http::resources::InspectStatusResource> {
     inspect::status(state)
 }
 
 /// Start recording the next exchange, verbatim.
 #[openapi]
 #[post("/api/inspect", data = "<body>")]
-pub(crate) fn arm_inspect(state: &State<Arc<AppState>>, _admin: Admin, body: Json<ArmInspect>) -> Reply {
+pub(crate) fn arm_inspect(
+    state: &State<Arc<AppState>>,
+    _admin: Admin,
+    body: Json<ArmInspect>,
+) -> crate::transport::Doc<crate::http::resources::InspectStateResource> {
     inspect::arm(&body.0, state)
 }
 
 /// Stop recording.
 #[openapi]
 #[delete("/api/inspect")]
-pub(crate) fn disarm_inspect(state: &State<Arc<AppState>>, _admin: Admin) -> Reply {
+pub(crate) fn disarm_inspect(
+    state: &State<Arc<AppState>>,
+    _admin: Admin,
+) -> Result<crate::transport::Doc<crate::http::resources::OkResource>, crate::transport::Reply> {
     inspect::disarm(state)
 }
 

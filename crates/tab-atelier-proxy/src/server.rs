@@ -218,7 +218,7 @@ mod tests {
         let body = client.get("/openapi.json").dispatch().into_string().expect("a body");
         let count = body.matches("x-dynamic-body").count();
         assert!(
-            count <= 31,
+            count <= 24,
             "x-dynamic-body responses: {count} (was 31; lower the pin when a payload is typed)"
         );
     }

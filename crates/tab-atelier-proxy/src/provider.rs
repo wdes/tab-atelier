@@ -39,6 +39,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use tab_atelier_api::schemars;
 
 /// The host part of a URL, lowercased.
 ///
@@ -68,7 +69,9 @@ const MAX_MAPPING_HOPS: usize = 8;
 /// Routing happens within a class: a request that arrived asking for Opus is a
 /// request for something in [`Class::Heavy`], and any heavy model with
 /// capacity can serve it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, tab_atelier_api::schemars::JsonSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum Class {
     /// Cheap and quick. Classification, formatting, short answers.
@@ -95,7 +98,7 @@ impl Class {
 }
 
 /// The request/response shape a provider speaks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, tab_atelier_api::schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Wire {
     /// The Anthropic Messages API — passed through untouched.
@@ -209,7 +212,7 @@ impl Auth {
 /// **A missing price is not a zero price.** Only models whose rates are
 /// actually recorded get one; see [`Registry::billing_price`] on what that
 /// means for the ones that do not.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, tab_atelier_api::schemars::JsonSchema)]
 pub struct Price {
     /// Cached input, per 1M tokens.
     pub cache_hit: u32,
@@ -395,7 +398,7 @@ impl Model {
 /// whose price doubles for seven hours of every weekday is a genuinely
 /// different deal during those hours — `DeepSeek`'s off-peak input is half its
 /// peak input, which is enough to reorder a preference list.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, tab_atelier_api::schemars::JsonSchema)]
 pub struct Peak {
     /// Percentage of the off-peak price charged during these windows.
     /// 200 = double.
@@ -422,10 +425,15 @@ pub struct Peak {
 /// observed across a moving bridge (Spring Festival, National Day) is one
 /// holiday with several days off, and naming it once is how the operator reads
 /// it back on the panel.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, tab_atelier_api::schemars::JsonSchema)]
 pub struct Holiday {
     pub name: String,
     /// The days themselves, as dates in the provider's own civil calendar.
+    ///
+    /// Documented as strings because that is what a `jiff` civil date is on the
+    /// wire — `collect_str`, an ISO 8601 date — and the schema crate has no
+    /// knowledge of the calendar type.
+    #[schemars(with = "Vec<String>")]
     pub dates: Vec<jiff::civil::Date>,
 }
 
@@ -434,7 +442,7 @@ pub struct Holiday {
 /// Everything here is UTC because the provider states its own schedule that
 /// way, and a local-time copy would be wrong twice a year in exactly the way
 /// nobody notices until a bill arrives.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, tab_atelier_api::schemars::JsonSchema)]
 pub struct PeakWindow {
     /// ISO weekday numbers, 1 = Monday .. 7 = Sunday.
     pub weekdays: Vec<u8>,
@@ -631,7 +639,7 @@ impl Provider {
 /// A mapping rewrites the NAME. Everything downstream — health, preference,
 /// the degrade ladder — still applies, so a mapping cannot quietly become a
 /// hard pin that survives an outage.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, tab_atelier_api::schemars::JsonSchema)]
 pub struct Mapping {
     /// The name a client asks for. Matched exactly, then case-insensitively.
     pub from: String,

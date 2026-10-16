@@ -26,8 +26,8 @@ pub(crate) use account::{
 pub(crate) use inspect::{InspectStateResource, InspectStatusResource};
 pub(crate) use models::PriceListResource;
 pub(crate) use pressure::PressureResource;
-pub(crate) use provider::providers_json;
-pub(crate) use status::{CredentialsResource, OkResource};
+pub(crate) use provider::{CatalogResource, providers_json};
+pub(crate) use status::{CredentialsResource, IdResource, OkResource};
 pub(crate) use usage::{
     AccountSummary, MeUsageResource, UsageReportResource, UsageResource, UserUsageResource, path_window,
 };

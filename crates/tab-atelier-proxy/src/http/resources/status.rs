@@ -13,6 +13,7 @@
 //! only place its field names are written down.
 
 use serde::Serialize;
+use tab_atelier_api::schemars;
 
 pub(crate) use tab_atelier_api::resource::{OkResource, ProblemResource};
 
@@ -21,7 +22,7 @@ pub(crate) use tab_atelier_api::resource::{OkResource, ProblemResource};
 /// The id is echoed rather than the object because the caller already has the
 /// object — it just sent it. What it does not know is what the server named the
 /// thing.
-#[derive(Serialize)]
+#[derive(Serialize, tab_atelier_api::schemars::JsonSchema)]
 pub(crate) struct IdResource {
     pub id: String,
 }
@@ -38,7 +39,7 @@ impl IdResource {
 ///
 /// The account is the identity the new credential belongs to, so the client can
 /// show whose login it just installed rather than assuming it was its own.
-#[derive(Serialize)]
+#[derive(Serialize, tab_atelier_api::schemars::JsonSchema)]
 pub(crate) struct CredentialsResource {
     pub installed: bool,
     pub account: String,

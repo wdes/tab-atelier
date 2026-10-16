@@ -37,6 +37,7 @@
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use tab_atelier_api::schemars;
 
 use crate::users::Client;
 
@@ -87,7 +88,7 @@ const KEEP_HEADERS: &[&str] = &[
 ];
 
 /// One recorded call.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, tab_atelier_api::schemars::JsonSchema)]
 pub struct Capture {
     /// RFC3339.
     pub ts: String,
@@ -175,7 +176,7 @@ pub struct Capture {
 }
 
 /// What one compaction pass removed, recorded on the capture.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, tab_atelier_api::schemars::JsonSchema)]
 pub struct Compaction {
     /// The level that ran, as `providers.json` spells it.
     pub level: String,
@@ -339,7 +340,7 @@ fn server_tool(body: &serde_json::Value) -> Option<String> {
 /// Both the resolved answer and the raw inputs, deliberately. Showing only the
 /// resolved IP answers "what did we record" and not "why" — and the why is the
 /// whole question when it is wrong.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, tab_atelier_api::schemars::JsonSchema)]
 pub struct Origin {
     /// The socket peer, before any header is believed.
     pub peer: String,

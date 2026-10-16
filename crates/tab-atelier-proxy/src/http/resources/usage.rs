@@ -9,12 +9,13 @@
 use std::collections::BTreeMap;
 
 use serde::Serialize;
+use tab_atelier_api::schemars;
 
 use crate::provider;
 use crate::usage;
 
 /// A window's tokens, flattened beside its call counts.
-#[derive(Serialize)]
+#[derive(Serialize, tab_atelier_api::schemars::JsonSchema)]
 pub(crate) struct TokenResource {
     pub input: u64,
     pub output: u64,
@@ -58,7 +59,7 @@ impl From<&usage::Tokens> for TokenResource {
 /// Micro-USD rather than a float: this is a sum of many small per-request
 /// costs, and binary floating point accumulates the error in the direction
 /// nobody looks. Shown as dollars only at the last moment, by the UI.
-#[derive(Serialize)]
+#[derive(Serialize, tab_atelier_api::schemars::JsonSchema)]
 pub(crate) struct CostResource {
     /// Cache reads and misses, each at its own published rate, plus cache
     /// writes at the miss rate — a write is a first read that pays full price.
@@ -87,7 +88,7 @@ impl CostResource {
 }
 
 /// Calls and tokens over one span.
-#[derive(Serialize)]
+#[derive(Serialize, tab_atelier_api::schemars::JsonSchema)]
 pub(crate) struct WindowResource {
     /// Calls served, including the ones that failed — a failure is still a
     /// call against the rate limit.
@@ -128,7 +129,7 @@ impl WindowResource {
 /// A narrower shape than [`TokenResource`] on purpose: the chart plots these
 /// four series and nothing else, and the cache-write TTL split would be four
 /// more legend entries for one bar.
-#[derive(Serialize)]
+#[derive(Serialize, tab_atelier_api::schemars::JsonSchema)]
 pub(crate) struct BucketResource {
     pub hour: u64,
     pub calls: u64,
@@ -174,7 +175,7 @@ impl BucketResource {
 ///
 /// Both clients format from these and neither re-derives them, so the range the
 /// charts draw is the range the server measured.
-#[derive(Serialize)]
+#[derive(Serialize, tab_atelier_api::schemars::JsonSchema)]
 pub(crate) struct SpanResource {
     pub start: String,
     pub end: String,
@@ -182,7 +183,7 @@ pub(crate) struct SpanResource {
 }
 
 /// What `/api/usage` and `/me/usage` return.
-#[derive(Serialize)]
+#[derive(Serialize, tab_atelier_api::schemars::JsonSchema)]
 pub(crate) struct UsageResource {
     pub window: SpanResource,
     /// The two fixed windows stay: they are what the account table and the
@@ -261,7 +262,7 @@ pub(crate) fn path_window(query: &str) -> Option<usage::Window> {
 ///
 /// The account is flattened in beside the numbers rather than nested, so a
 /// dashboard row reads `row.first_name` and `row.last_24h` at the same level.
-#[derive(Serialize)]
+#[derive(Serialize, tab_atelier_api::schemars::JsonSchema)]
 pub(crate) struct UserUsageResource {
     pub user: crate::http::resources::account::AccountResource,
     #[serde(flatten)]
@@ -269,7 +270,7 @@ pub(crate) struct UserUsageResource {
 }
 
 /// Every account's usage, for the operator view.
-#[derive(Serialize)]
+#[derive(Serialize, tab_atelier_api::schemars::JsonSchema)]
 pub(crate) struct UsageReportResource {
     /// The window asked for, as given. Kept as the caller's word for it
     /// because "24h" and "7d" are not the same string as their hour counts.
@@ -281,7 +282,7 @@ pub(crate) struct UsageReportResource {
 }
 
 /// The caller's own identity, beside their usage.
-#[derive(Serialize)]
+#[derive(Serialize, tab_atelier_api::schemars::JsonSchema)]
 pub(crate) struct AccountSummary {
     pub name: String,
     pub email: String,
@@ -292,7 +293,7 @@ pub(crate) struct AccountSummary {
 /// The account is flattened in beside the numbers for the same reason as in
 /// [`UserUsageResource`]: the caller already knows who they are, and a nested
 /// object would only make the agent reading it unwrap one more level.
-#[derive(Serialize)]
+#[derive(Serialize, tab_atelier_api::schemars::JsonSchema)]
 pub(crate) struct MeUsageResource {
     pub account: AccountSummary,
     #[serde(flatten)]

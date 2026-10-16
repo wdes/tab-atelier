@@ -40,6 +40,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use tab_atelier_api::schemars;
 
 /// How far the weekly fraction must fall between two readings to count as a
 /// reset rather than the window merely ageing.
@@ -50,7 +51,7 @@ use serde::{Deserialize, Serialize};
 const RESET_DROP: f64 = 0.20;
 
 /// One reading of the shared plan's utilisation.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, tab_atelier_api::schemars::JsonSchema)]
 pub struct Sample {
     /// RFC3339, matching the .mjs monitor's `ts`.
     pub ts: String,
@@ -379,7 +380,7 @@ impl Monitor {
 pub const STALE_AFTER_SECS: u64 = 20 * 60;
 
 /// What the dashboard needs to say about the monitor rather than the plan.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, tab_atelier_api::schemars::JsonSchema)]
 pub struct Health {
     /// A reading exists but is too old to act on.
     pub stale: bool,

@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use crate::http::resources;
 use crate::server::State;
-use crate::transport::{Reply, json_of};
+use crate::transport::Doc;
 use crate::usage;
 
 /// Every account's tokens over a window, as one page.
@@ -14,7 +14,17 @@ use crate::usage;
 /// `query` is the raw query string, because the window is a presentation choice
 /// — `?window=…` — and belongs to the resource layer that already knows how to
 /// spell one, not to the route table.
-pub(crate) fn usage_report(state: &Arc<State>, query: &str) -> Reply {
+pub(crate) fn usage_report(state: &Arc<State>, query: &str) -> Doc<resources::UsageReportResource> {
+    Doc::ok(report(state, query))
+}
+
+/// Build the page itself.
+///
+/// Split out of [`usage_report`] so a test can look at the assembled row: the
+/// handler answers a typed [`Doc`], which does not hand its value back, and the
+/// join between the account table and the usage log is exactly what is worth
+/// asserting on.
+fn report(state: &Arc<State>, query: &str) -> resources::UsageReportResource {
     let now = usage::now_secs();
     // One resolution for the whole response. Calling `span` again inside
     // `UsageResource::of` would re-read the clock, and a response that straddled
@@ -38,7 +48,7 @@ pub(crate) fn usage_report(state: &Arc<State>, query: &str) -> Reply {
             .map(|a| registry.billing_price(a.provider.as_deref(), a.model.as_deref()))
             .collect()
     };
-    let body = {
+    {
         let u = state.usage.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         resources::UsageReportResource {
             window: window.token(),
@@ -55,8 +65,7 @@ pub(crate) fn usage_report(state: &Arc<State>, query: &str) -> Reply {
                 })
                 .collect(),
         }
-    };
-    json_of(200, &body)
+    }
 }
 
 #[cfg(test)]
@@ -154,12 +163,7 @@ mod tests {
                 None,
             );
 
-        let reply = usage_report(&state, "window=24h");
-        let crate::transport::ReplyBody::Bytes(bytes) = reply.body else {
-            panic!("a report is a buffered body");
-        };
-        let text = String::from_utf8(bytes.to_vec()).expect("utf-8");
-        let value: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
+        let value = serde_json::to_value(report(&state, "window=24h")).expect("a report is JSON");
         assert_eq!(value["users"][0]["user"]["email"], "usage-join@example.com");
         assert_eq!(
             value["users"][0]["last_24h"]["tokens"]["total"], 10,

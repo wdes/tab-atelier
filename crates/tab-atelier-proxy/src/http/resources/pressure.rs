@@ -5,13 +5,14 @@
 use std::sync::{Arc, MutexGuard};
 
 use serde::Serialize;
+use tab_atelier_api::schemars;
 
 use crate::account::{Health, Monitor, Sample};
 use crate::server::State;
 use crate::{routing, usage};
 
 /// Upstream's own report about the shared plan, plus our scheduler's response.
-#[derive(Serialize)]
+#[derive(Serialize, tab_atelier_api::schemars::JsonSchema)]
 pub(crate) struct PressureResource {
     pub plan: PlanResource,
     pub scheduler: crate::qos::SchedSnapshot,
@@ -23,7 +24,7 @@ pub(crate) struct PressureResource {
 }
 
 /// What the plan says about itself, and what we watched it do.
-#[derive(Serialize)]
+#[derive(Serialize, tab_atelier_api::schemars::JsonSchema)]
 pub(crate) struct PlanResource {
     /// Whether there is a subscription in play at all. When this is false every
     /// figure below is meaningless rather than merely empty — there is no plan
@@ -47,7 +48,7 @@ pub(crate) struct PlanResource {
 }
 
 /// The last time the weekly counter was seen to fall, and by how much.
-#[derive(Serialize)]
+#[derive(Serialize, tab_atelier_api::schemars::JsonSchema)]
 pub(crate) struct WeeklyDropResource {
     pub ts: String,
     pub from: f64,

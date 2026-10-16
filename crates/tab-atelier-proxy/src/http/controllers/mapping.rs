@@ -11,17 +11,20 @@ use std::sync::Arc;
 
 use crate::http::requests::mapping::AddMapping;
 use crate::server::State;
-use crate::transport::Reply;
+use crate::transport::{Doc, Reply};
 
 /// Add or replace a mapping.
 ///
 /// A from-to pair where both ends are the same is refused rather than stored: it
 /// is not an error in the arithmetic, it is a row in the table that looks like a
 /// decision somebody made and changes nothing.
-pub(crate) fn add(state: &Arc<State>, req: &AddMapping) -> Reply {
+pub(crate) fn add(state: &Arc<State>, req: &AddMapping) -> Result<Doc<crate::http::resources::OkResource>, Reply> {
     let (from, to) = (req.from.trim(), req.to.trim());
     if from == to {
-        return crate::http::problem(400, "a mapping from a name to itself does nothing".to_owned());
+        return Err(crate::http::problem(
+            400,
+            "a mapping from a name to itself does nothing".to_owned(),
+        ));
     }
     let note = req.note.trim();
     let mut reg = state.registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -29,23 +32,23 @@ pub(crate) fn add(state: &Arc<State>, req: &AddMapping) -> Reply {
     let saved = reg.save(&state.registry_path);
     drop(reg);
     match saved {
-        Ok(()) => crate::http::acknowledged(),
-        Err(e) => failure(500, &e),
+        Ok(()) => Ok(crate::http::acknowledged()),
+        Err(e) => Err(failure(500, &e)),
     }
 }
 
 /// Delete a mapping. A name that was not mapped is a 404, so a typo in an
 /// automated call is visible rather than silently fine.
-pub(crate) fn remove(state: &Arc<State>, from: &str) -> Reply {
+pub(crate) fn remove(state: &Arc<State>, from: &str) -> Result<Doc<crate::http::resources::OkResource>, Reply> {
     let mut reg = state.registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if !reg.remove_mapping(from) {
-        return failure(404, "no such mapping");
+        return Err(failure(404, "no such mapping"));
     }
     let saved = reg.save(&state.registry_path);
     drop(reg);
     match saved {
-        Ok(()) => crate::http::acknowledged(),
-        Err(e) => failure(500, &e),
+        Ok(()) => Ok(crate::http::acknowledged()),
+        Err(e) => Err(failure(500, &e)),
     }
 }
 
@@ -82,6 +85,17 @@ mod tests {
         }
     }
 
+    /// The status a `Result`-returning handler answered, whichever side it is.
+    ///
+    /// An acknowledgement body is a `Doc` now and a refusal still a `Reply`, so
+    /// the two arrive through one type and a test reads the status.
+    fn answered<T, const CODE: u16>(reply: Result<Doc<T, CODE>, Reply>) -> u16 {
+        match reply {
+            Ok(doc) => doc.status,
+            Err(refusal) => refusal.status,
+        }
+    }
+
     /// A mapping from a name to itself changes nothing, so it is refused rather
     /// than stored — the table is a record of decisions somebody made.
     #[test]
@@ -89,7 +103,7 @@ mod tests {
         let state = state_for("self");
         // `from == to` is the only rule `AddMapping::validate` cannot state: it
         // is about the PAIR, not about either value, so it is refused here.
-        assert_eq!(add(&state, &mapping("gpt-4o", "gpt-4o", "")).status, 400);
+        assert_eq!(answered(add(&state, &mapping("gpt-4o", "gpt-4o", ""))), 400);
     }
 
     /// Leading and trailing space does not make two names different.
@@ -99,7 +113,7 @@ mod tests {
     #[test]
     fn whitespace_does_not_hide_a_mapping_to_itself() {
         let state = state_for("whitespace");
-        assert_eq!(add(&state, &mapping("  gpt-4o ", "gpt-4o", "")).status, 400);
+        assert_eq!(answered(add(&state, &mapping("  gpt-4o ", "gpt-4o", ""))), 400);
     }
 
     /// Read back through `resolve`, which is what routing actually calls.
@@ -110,7 +124,7 @@ mod tests {
     #[test]
     fn a_stored_mapping_is_the_one_routing_resolves_to() {
         let state = state_for("accept");
-        assert_eq!(add(&state, &mapping("fast", "claude-haiku-4", "cheap")).status, 200);
+        assert_eq!(answered(add(&state, &mapping("fast", "claude-haiku-4", "cheap"))), 200);
 
         let resolved = state
             .registry
@@ -129,8 +143,8 @@ mod tests {
     #[test]
     fn re_mapping_a_name_replaces_the_previous_target() {
         let state = state_for("replace");
-        assert_eq!(add(&state, &mapping("fast", "claude-haiku-4", "")).status, 200);
-        assert_eq!(add(&state, &mapping("fast", "claude-sonnet-4", "")).status, 200);
+        assert_eq!(answered(add(&state, &mapping("fast", "claude-haiku-4", ""))), 200);
+        assert_eq!(answered(add(&state, &mapping("fast", "claude-sonnet-4", ""))), 200);
         let resolved = state
             .registry
             .lock()
@@ -143,8 +157,8 @@ mod tests {
     #[test]
     fn deleting_a_mapping_that_is_there_works_and_then_it_is_gone() {
         let state = state_for("delete");
-        assert_eq!(add(&state, &mapping("fast", "claude-haiku-4", "")).status, 200);
-        assert_eq!(remove(&state, "fast").status, 200);
+        assert_eq!(answered(add(&state, &mapping("fast", "claude-haiku-4", ""))), 200);
+        assert_eq!(answered(remove(&state, "fast")), 200);
 
         let resolved = state
             .registry
@@ -163,16 +177,16 @@ mod tests {
     #[test]
     fn deleting_a_mapping_that_is_not_there_is_a_404() {
         let state = state_for("delete-missing");
-        assert_eq!(remove(&state, "never-mapped").status, 404);
+        assert_eq!(answered(remove(&state, "never-mapped")), 404);
     }
 
     #[test]
     fn a_note_is_optional_and_does_not_block_the_mapping() {
         // It is documentation for the next operator, not a requirement.
         let state = state_for("note");
-        assert_eq!(add(&state, &mapping("fast", "claude-haiku-4", "")).status, 200);
+        assert_eq!(answered(add(&state, &mapping("fast", "claude-haiku-4", ""))), 200);
         assert_eq!(
-            add(&state, &mapping("slow", "claude-opus-4", "for reviews")).status,
+            answered(add(&state, &mapping("slow", "claude-opus-4", "for reviews"))),
             200
         );
     }
