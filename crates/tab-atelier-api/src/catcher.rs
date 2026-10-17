@@ -15,9 +15,11 @@
 //! can recover and one that can only retry.
 
 use rocket::Request;
-use rocket::http::Status;
+use rocket::http::{Method, Status};
 
+use crate::marshal::{Reply, json_of};
 use crate::refusal::{Refusal, recall};
+use crate::resource::ProblemResource;
 
 /// The body reader could not read the request body.
 #[rocket::catch(400)]
@@ -37,11 +39,109 @@ pub fn forbidden(req: &Request<'_>) -> Refusal {
     recall(req, Status::Forbidden, "this credential may not do that")
 }
 
-/// No route matches. Rocket reports this by trying the following route, so by
-/// the time it reaches here every candidate has been exhausted.
+/// No route matches — or the path exists under another verb.
+///
+/// Rocket answers a wrong method with a 404: its router matches the method
+/// first, so it cannot tell "no such path" from "that path, another verb", and
+/// its matcher is not public. A client probing a path deserves to be told the
+/// path exists, and `Allow` says which verbs do — so the distinction is made
+/// here, against the mounted routes read back from the running Rocket rather
+/// than a second table that could drift.
+///
+/// Erring towards 404 when unsure is deliberate: a spurious 405 would claim a
+/// path exists, a worse lie than the one this fixes. A catch-all is excluded
+/// from the scan for the same reason — it matches every path, so counting it
+/// would make every unknown path answer 405.
 #[rocket::catch(404)]
-pub fn not_found(req: &Request<'_>) -> Refusal {
-    recall(req, Status::NotFound, "no route matches this path")
+pub fn not_found(req: &Request<'_>) -> Reply {
+    let path = req.uri().path().as_str();
+    let mut methods: Vec<String> = req
+        .rocket()
+        .routes()
+        .filter(|route| !is_catch_all(route.uri.path()) && path_shape_matches(route.uri.path(), path))
+        .map(|route| route.method.to_string())
+        .collect();
+    methods.sort();
+    methods.dedup();
+    if methods.is_empty() {
+        let refusal = recall(req, Status::NotFound, "no route matches this path");
+        json_of(404, &ProblemResource { error: refusal.message })
+    } else {
+        json_of(
+            405,
+            &ProblemResource {
+                error: format!(
+                    "a {} is not served here; see the OpenAPI document for the verbs",
+                    req.method()
+                ),
+            },
+        )
+        .with_header("allow", methods.join(", "))
+    }
+}
+
+/// The refusal a path deserves when it exists under other verbs only.
+///
+/// `None` means the path is genuinely unknown and the caller decides what that
+/// means — a JSON API answers 404, an SPA serves its shell. Exposed because a
+/// server's front-end catch-all needs the same judgement as [`not_found`] but
+/// holds the routes it mounts rather than a request to read them from, so the
+/// matching lives here once.
+#[must_use]
+pub fn wrong_verb(routes: &[rocket::Route], path: &str, method: Method) -> Option<Reply> {
+    let elsewhere = routes.iter().any(|route| {
+        route.method != method && !is_catch_all(route.uri.path()) && path_shape_matches(route.uri.path(), path)
+    });
+    elsewhere.then(|| {
+        json_of(
+            405,
+            &ProblemResource {
+                error: format!("a {method} is not served here; see the OpenAPI document for the verbs"),
+            },
+        )
+        .with_header(
+            "allow",
+            routes
+                .iter()
+                .filter(|route| path_shape_matches(route.uri.path(), path))
+                .map(|route| route.method.to_string())
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+                .join(", "),
+        )
+    })
+}
+
+/// Whether a route pattern is a catch-all — one that matches every path.
+///
+/// Recognised by its tail wildcard, which is the only form these tables use.
+#[must_use]
+pub fn is_catch_all(pattern: &str) -> bool {
+    pattern
+        .split('/')
+        .any(|segment| segment.starts_with('<') && segment.ends_with("..>"))
+}
+
+/// Whether a route pattern covers a concrete path, ignoring the verb.
+///
+/// A segment starting with `<` is a parameter, and one ending in `..>` swallows
+/// the rest of the path. Both are Rocket's forms; anything else is compared
+/// literally.
+#[must_use]
+pub fn path_shape_matches(pattern: &str, path: &str) -> bool {
+    let mut pattern = pattern.split('/');
+    let mut path = path.split('/');
+    loop {
+        match (pattern.next(), path.next()) {
+            (None, None) => return true,
+            // `<name..>` takes every remaining segment, including none.
+            (Some(segment), Some(_)) if segment.starts_with('<') && segment.ends_with("..>") => return true,
+            (Some(segment), Some(_)) if segment.starts_with('<') && segment.ends_with('>') => {}
+            (Some(a), Some(b)) if a == b => {}
+            _ => return false,
+        }
+    }
 }
 
 /// The path exists but not for this verb.

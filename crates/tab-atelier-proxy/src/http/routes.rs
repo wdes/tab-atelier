@@ -498,134 +498,46 @@ pub(crate) fn preflight(_path: PathBuf) -> Reply {
 
 // ── the catchers ────────────────────────────────────────────────────────────
 
-/// The path was not served, or not under that verb.
+/// The refusals the client sees when a request never reaches a handler.
 ///
-/// Rocket answers a wrong method with a 404 — its router matches on the method
-/// first, so it cannot tell "no such path" from "that path, another verb", and
-/// its own matcher is not public. This API promised 405 for the second case
-/// before, and a client probing a path deserves to be told the path exists, so
-/// the distinction is made here against this file's own table.
+/// Every one comes from [`tab_atelier_api`] and reads back the message the guard
+/// left in the request, so a client is told *what* to change rather than only
+/// the status. The proxy used to answer these itself with fixed sentences, which
+/// threw the guard's wording away — that was the bug this replaces.
 ///
-/// Erring towards 404 when unsure is deliberate: a spurious 405 would claim a
-/// path exists, which is a worse lie than the one this is fixing.
-#[catch(404)]
-pub(crate) fn not_found(req: &rocket::Request<'_>) -> Reply {
-    wrong_verb(req.uri().path().as_str(), req.method()).unwrap_or_else(|| crate::http::problem(404, "no such route"))
-}
-
-/// The refusal a path deserves when it exists under other verbs only.
-///
-/// `None` means the path is genuinely unknown, and the caller decides what that
-/// means — the SPA serves its shell, an API request gets a 404.
-///
-/// Rocket cannot make this distinction itself: its router matches the method
-/// first, so a wrong verb looks exactly like a missing path, and its own matcher
-/// is not public. This API promised 405 for the second case before, and a client
-/// probing a path deserves to be told the path exists rather than that it does
-/// not.
-///
-/// Catch-alls are excluded on purpose. The SPA route matches every path, so
-/// counting it would make every unknown path answer 405 — claiming a whole
-/// namespace exists, which is a worse lie than the 404 this is fixing.
-fn wrong_verb(path: &str, method: Method) -> Option<Reply> {
-    let elsewhere = all().iter().any(|r| {
-        let pattern = r.uri.path().to_string();
-        r.method != method && !is_catch_all(&pattern) && path_shape_matches(&pattern, path)
-    });
-    elsewhere.then(|| {
-        crate::http::problem(
-            405,
-            format!("a {method} is not served here; see the OpenAPI document for the verbs"),
-        )
-    })
-}
-
-/// Whether a route pattern is a catch-all — one that matches every path.
-///
-/// Recognised by its tail wildcard, which is the only form this table uses for
-/// one.
-#[must_use]
-fn is_catch_all(pattern: &str) -> bool {
-    pattern
-        .split('/')
-        .any(|seg| seg.starts_with('<') && seg.ends_with("..>"))
-}
-
-/// Whether a route pattern covers a concrete path, ignoring the verb.
-///
-/// A segment starting with `<` is a parameter, and one ending in `..>` swallows
-/// the rest of the path. Both forms are the ones this table uses; anything else
-/// is compared literally.
-#[must_use]
-fn path_shape_matches(pattern: &str, path: &str) -> bool {
-    let mut pattern = pattern.split('/');
-    let mut path = path.split('/');
-    loop {
-        match (pattern.next(), path.next()) {
-            (None, None) => return true,
-            // `<name..>` takes every remaining segment, including none.
-            (Some(seg), Some(_)) if seg.starts_with('<') && seg.ends_with("..>") => return true,
-            (Some(seg), Some(_)) if seg.starts_with('<') && seg.ends_with('>') => {}
-            (Some(a), Some(b)) if a == b => {}
-            _ => return false,
-        }
-    }
-}
-
-/// A body that arrived malformed or too large.
-#[catch(422)]
-pub(crate) fn unprocessable() -> Reply {
-    crate::http::problem(422, "the request body could not be read")
-}
-
-/// A guard that refused: bad key, bad token, no token configured.
-///
-/// One catcher for all of them, because a guard picks its own status and the
-/// reason it left behind is more specific than the status alone. Without this
-/// Rocket would answer with its own page and the sentence explaining the actual
-/// problem would never reach the operator.
-#[catch(400)]
-pub(crate) fn bad_request() -> Reply {
-    crate::http::problem(400, "the request could not be read")
-}
-
-/// Nothing signed in, or the wrong key.
-///
-/// Nothing presented a valid credential.
-///
-/// The guard works out which of several things went wrong and leaves its
-/// sentence in the request; this puts that sentence in the body and in the log,
-/// because the log is the only place an operator can read it — a client shows
-/// the body, but a journal entry would otherwise be `Error(401 Unauthorized)`
-/// with no indication of which reason applied.
-///
-/// No `WWW-Authenticate` is sent. This API is called by programs holding a
-/// token, not by a browser that could answer a prompt.
+/// A 401 is the one local member, and only to log: the credential itself is
+/// never logged, but *why* it was refused is, because that line is the only
+/// place an operator can read it — a journal otherwise shows `Error(401 …)` and
+/// no reason. The body is still the shared one.
 #[catch(401)]
 pub(crate) fn unauthorized(req: &rocket::Request<'_>) -> Reply {
-    let refusal = crate::http::refusal::recall(req, Status::Unauthorized, "no valid credential");
+    let refusal = tab_atelier_api::refusal::recall(req, Status::Unauthorized, "this credential is not accepted");
     // The credential is never logged, only why it was refused: this line ends up
     // in a journal that operators paste into bug reports.
     log::warn!("401 {} {} — {}", req.method(), req.uri(), refusal.message);
     crate::http::problem(401, refusal.message)
 }
 
-/// A request the account is not allowed to make.
-#[catch(403)]
-pub(crate) fn forbidden() -> Reply {
-    crate::http::problem(403, "this account may not do that")
+/// The refusal a path deserves when it exists under other verbs only.
+///
+/// The matching lives in [`tab_atelier_api::catcher`] so every server draws the
+/// same 404/405 line; this is the proxy's call into it, against the mounted
+/// routes. Those are read once and cached — the previous version rebuilt the
+/// whole `OpenAPI` document on every request that reached the UI catch-all, which
+/// was a cost paid per page load for a table that never changes.
+fn wrong_verb(path: &str, method: Method) -> Option<Reply> {
+    tab_atelier_api::catcher::wrong_verb(&mounted_routes().0, path, method)
 }
 
-/// A body over the limit.
-#[catch(413)]
-pub(crate) fn too_large() -> Reply {
-    crate::http::problem(413, "the request body is larger than the limit")
-}
-
-/// No provider available to take the request.
-#[catch(503)]
-pub(crate) fn unavailable() -> Reply {
-    crate::http::problem(503, "no provider is available right now")
+/// The routes and the document, built once.
+///
+/// `all_and_spec` derives the `OpenAPI` figure from the route list, which is real
+/// work; the result never changes, so it is built on first use and kept. The
+/// server mounts it and the UI catch-all consults it.
+fn mounted_routes() -> &'static (Vec<Route>, tab_atelier_api::rocket_okapi::okapi::openapi3::OpenApi) {
+    static BUILT: std::sync::OnceLock<(Vec<Route>, tab_atelier_api::rocket_okapi::okapi::openapi3::OpenApi)> =
+        std::sync::OnceLock::new();
+    BUILT.get_or_init(all_and_spec)
 }
 
 // ── the table ───────────────────────────────────────────────────────────────
@@ -724,14 +636,15 @@ pub fn exempt() -> Vec<tab_atelier_api::Exempt> {
 /// The catchers, in one list, for the same reason.
 #[must_use]
 pub fn catchers() -> Vec<rocket::Catcher> {
+    use tab_atelier_api::catcher;
     rocket::catchers![
-        not_found,
-        unprocessable,
-        bad_request,
+        catcher::not_found,
         unauthorized,
-        forbidden,
-        too_large,
-        unavailable,
+        catcher::bad_request,
+        catcher::forbidden,
+        catcher::payload_too_large,
+        catcher::unprocessable,
+        catcher::unavailable,
     ]
 }
 
@@ -823,23 +736,38 @@ mod tests {
         // handler that compares the raw value sees "me/credentials" and never
         // matches the pattern "/me/credentials". Pinned because the symptom is a
         // silent 404 rather than a crash.
-        assert!(!path_shape_matches("/me/credentials", "me/credentials"));
-        assert!(path_shape_matches("/me/credentials", "/me/credentials"));
+        assert!(!tab_atelier_api::catcher::path_shape_matches(
+            "/me/credentials",
+            "me/credentials"
+        ));
+        assert!(tab_atelier_api::catcher::path_shape_matches(
+            "/me/credentials",
+            "/me/credentials"
+        ));
     }
 
     #[test]
     fn a_literal_path_matches_only_itself() {
-        assert!(path_shape_matches("/api/users", "/api/users"));
-        assert!(!path_shape_matches("/api/users", "/api/keys"));
-        assert!(!path_shape_matches("/api/users", "/api/users/ada"));
+        assert!(tab_atelier_api::catcher::path_shape_matches("/api/users", "/api/users"));
+        assert!(!tab_atelier_api::catcher::path_shape_matches("/api/users", "/api/keys"));
+        assert!(!tab_atelier_api::catcher::path_shape_matches(
+            "/api/users",
+            "/api/users/ada"
+        ));
     }
 
     #[test]
     fn a_parameter_segment_matches_exactly_one_segment() {
-        assert!(path_shape_matches("/api/users/<account>", "/api/users/ada"));
-        assert!(!path_shape_matches("/api/users/<account>", "/api/users"));
+        assert!(tab_atelier_api::catcher::path_shape_matches(
+            "/api/users/<account>",
+            "/api/users/ada"
+        ));
+        assert!(!tab_atelier_api::catcher::path_shape_matches(
+            "/api/users/<account>",
+            "/api/users"
+        ));
         // One segment, not a tail: `/keys/laptop` must not satisfy `<account>`.
-        assert!(!path_shape_matches(
+        assert!(!tab_atelier_api::catcher::path_shape_matches(
             "/api/users/<account>",
             "/api/users/ada/keys/laptop"
         ));
@@ -848,20 +776,26 @@ mod tests {
     #[test]
     fn a_tail_parameter_swallows_the_rest_of_the_path() {
         // The relay and the SPA catch-all both rely on this.
-        assert!(path_shape_matches("/<path..>", "/anything/at/all"));
-        assert!(path_shape_matches(
+        assert!(tab_atelier_api::catcher::path_shape_matches(
+            "/<path..>",
+            "/anything/at/all"
+        ));
+        assert!(tab_atelier_api::catcher::path_shape_matches(
             "/relay/anthropic/<sub..>",
             "/relay/anthropic/v1/messages"
         ));
-        assert!(path_shape_matches("/<path..>", "/"));
+        assert!(tab_atelier_api::catcher::path_shape_matches("/<path..>", "/"));
     }
 
     #[test]
     fn an_unrelated_path_is_not_a_shape_match() {
         // This is the case that must stay a 404: claiming a path exists when it
         // does not is worse than the 405 this is trying to preserve.
-        assert!(!path_shape_matches("/api/users", "/nope"));
-        assert!(!path_shape_matches("/relay/anthropic/<sub..>", "/api/users"));
+        assert!(!tab_atelier_api::catcher::path_shape_matches("/api/users", "/nope"));
+        assert!(!tab_atelier_api::catcher::path_shape_matches(
+            "/relay/anthropic/<sub..>",
+            "/api/users"
+        ));
     }
 
     /// The routes that can prove a path exists: everything but the catch-alls.
@@ -869,7 +803,7 @@ mod tests {
         all()
             .iter()
             .map(|r| r.uri.path().to_string())
-            .filter(|p| !is_catch_all(p))
+            .filter(|p| !tab_atelier_api::catcher::is_catch_all(p))
             .collect()
     }
 
@@ -878,11 +812,15 @@ mod tests {
         // The whole reason the helper exists: `/me/credentials` is POST only, so
         // a GET must be answered 405 rather than 404.
         assert!(
-            concrete().iter().any(|p| path_shape_matches(p, "/me/credentials")),
+            concrete()
+                .iter()
+                .any(|p| tab_atelier_api::catcher::path_shape_matches(p, "/me/credentials")),
             "/me/credentials is mounted"
         );
         assert!(
-            !concrete().iter().any(|p| path_shape_matches(p, "/me/nonexistent")),
+            !concrete()
+                .iter()
+                .any(|p| tab_atelier_api::catcher::path_shape_matches(p, "/me/nonexistent")),
             "an unmounted path must not be claimed"
         );
     }
@@ -891,10 +829,10 @@ mod tests {
     fn the_spa_catch_all_does_not_make_every_path_look_served() {
         // The trap this guards: the SPA route matches everything, so counting it
         // would turn every 404 into a 405 claiming the path exists.
-        assert!(is_catch_all("/<path..>"));
-        assert!(is_catch_all("/relay/anthropic/<sub..>"));
-        assert!(!is_catch_all("/api/users"));
-        assert!(!is_catch_all("/api/users/<account>"));
+        assert!(tab_atelier_api::catcher::is_catch_all("/<path..>"));
+        assert!(tab_atelier_api::catcher::is_catch_all("/relay/anthropic/<sub..>"));
+        assert!(!tab_atelier_api::catcher::is_catch_all("/api/users"));
+        assert!(!tab_atelier_api::catcher::is_catch_all("/api/users/<account>"));
     }
 
     #[test]

@@ -12,9 +12,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use rocket::catchers;
 use rocket::http::Status;
-use rocket::request::Request;
-use rocket::{catch, catchers};
 use serde_json::Value;
 
 use tab_atelier_api::{ProblemResource, Reply};
@@ -111,68 +110,22 @@ pub async fn serve(cfg: Config) -> std::io::Result<()> {
 // Catchers
 // ---------------------------------------------------------------------------
 
-/// The error pages, off [`tab_atelier_api`] except the 404.
+/// The error pages, every one of them the shared answer.
 ///
-/// Every code but one is the shared answer. The 404 is this crate's because
-/// Rocket folds a method mismatch into a 404 and never raises a 405, and the
-/// `Allow` list is the part an operator needs — see [`not_found`]. The shared
-/// `not_found` is therefore not registered: two `#[catch(404)]` is not a thing.
+/// Including the 404: Rocket folds a method mismatch into a 404 and never
+/// raises a 405, so the distinction and its `Allow` list are drawn in
+/// `tab-atelier-api` once, for every server that meets the same problem.
 fn catchers() -> Vec<rocket::Catcher> {
     use tab_atelier_api::catcher;
     catchers![
         catcher::bad_request,
         catcher::unauthorized,
         catcher::forbidden,
-        not_found,
+        catcher::not_found,
         catcher::payload_too_large,
         catcher::unprocessable,
         catcher::unavailable,
     ]
-}
-
-/// A 404, or a 405 when the path is a route's but the method is not.
-///
-/// Rocket raises no 405 of its own: a request whose path matches a route but
-/// whose method does not falls through to 404. The difference matters to an
-/// operator — "this pane is not here" and "you paged the wrong verb" are
-/// different mistakes — so it is drawn here. The `Allow` list is read back out
-/// of the mounted routes rather than kept as a second table, so it cannot drift.
-#[catch(404)]
-fn not_found(req: &Request<'_>) -> Reply {
-    let path = req.uri().path().as_str();
-    let mut methods: Vec<String> = req
-        .rocket()
-        .routes()
-        .filter(|route| path_matches(route.uri.path(), path))
-        .map(|route| route.method.to_string())
-        .collect();
-    methods.sort();
-    methods.dedup();
-    if methods.is_empty() {
-        return tab_atelier_api::problem(404, "not found");
-    }
-    tab_atelier_api::problem(405, "method not allowed").with_header("allow", methods.join(", "))
-}
-
-/// Whether a mounted route's templated path matches a concrete request path.
-///
-/// Segment-wise: `<id>` matches any one segment, `<rest..>` matches the
-/// remainder. The same shape Rocket matched, read back out of the mount table.
-fn path_matches(template: &str, path: &str) -> bool {
-    let template: Vec<&str> = template.trim_matches('/').split('/').collect();
-    let path: Vec<&str> = path.trim_matches('/').split('/').collect();
-    let mut at = 0;
-    for segment in &template {
-        if segment.starts_with('<') && segment.contains("..") {
-            return true;
-        }
-        let Some(got) = path.get(at) else { return false };
-        if !segment.starts_with('<') && segment != got {
-            return false;
-        }
-        at += 1;
-    }
-    at == path.len()
 }
 
 // ---------------------------------------------------------------------------
