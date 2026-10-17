@@ -37,6 +37,70 @@ use crate::users::Account;
 /// The state, as the routes hold it.
 type Held = Arc<State>;
 
+/// The proxy's rule for who may call it — the one place it is written.
+///
+/// Everything structural about authentication (which header to read, how a
+/// refusal is remembered, the guard that turns it into a response) is
+/// `tab-atelier-api`'s, shared with the kiosk. What is the proxy's own business
+/// is the *rule*, and it is here once.
+impl tab_atelier_api::auth::Authenticator for State {
+    /// The account and key the credential belongs to.
+    type Principal = (Account, String);
+
+    fn authenticate(&self, presented: &tab_atelier_api::auth::Presented<'_>) -> Result<Self::Principal, Refusal> {
+        // `header.or(bearer)`, and NOT the shared `any()` — which also reads
+        // `?token=`. The kiosk accepts a query credential because a plain
+        // `<a href>` cannot set a header and its terminal view is opened that
+        // way; the proxy must not, because its keys open a paid upstream and a
+        // credential in a URL lands in history, logs and `Referer` headers.
+        // Sharing the *shape* is not sharing the *rule*.
+        let offered = presented.header.or(presented.bearer).unwrap_or_default();
+        let store = self.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        store
+            .authenticate_key(offered)
+            .map(|(account, key)| (account.clone(), key.id.clone()))
+            .ok_or_else(|| {
+                Refusal::new(
+                    Status::Unauthorized,
+                    "no valid key: nothing arrived, or the key is unknown or disabled. Check the \
+                     x-api-key header, and that the key is enabled for this account",
+                )
+            })
+    }
+
+    /// Whether the credential opens the operator surface.
+    ///
+    /// Two refusals, because they have two different fixes: 503 when the
+    /// installation has no admin token at all — a deployment problem, and the
+    /// message says how to fix it — and 401 when the presented one is missing
+    /// or wrong.
+    fn allows_admin(&self, presented: &tab_atelier_api::auth::Presented<'_>) -> Result<(), Refusal> {
+        if !admin_token::configured(self) {
+            return Err(Refusal::new(
+                Status::ServiceUnavailable,
+                "no admin token configured — run `tab-atelier-proxy admin-token` on the server, \
+                 as the service user, before using this API",
+            ));
+        }
+        // As above: the admin token is a header credential, never a query one.
+        let offered = presented.header.or(presented.bearer).unwrap_or_default();
+        admin_token::guard_token(self, offered).map_err(|why| Refusal::new(Status::Unauthorized, &why))
+    }
+}
+
+/// The operator guard, as the shared crate defines it.
+///
+/// An alias, not a type of its own: every route keeps writing `_admin: Admin`,
+/// and the check behind it is the shared guard driving
+/// [`Authenticator::allows_admin`] above — so the proxy and the kiosk refuse an
+/// operator the same way.
+/// Note the parameter: `State`, not `Held`. The shared guard wraps the
+/// authenticator in an `Arc` itself (`&State<Arc<A>>`), and the proxy manages
+/// exactly that — so `Admin<State>` reads the managed `Arc<State>`. Spelling it
+/// `Admin<Held>` asks for an `Arc<Arc<State>>` and every guarded route answers
+/// 500 "unmanaged".
+pub type Admin = tab_atelier_api::guard::Admin<State>;
+
 /// Who is calling, and from where.
 ///
 /// Never refuses. A request that arrives is a fact, and every handler that
@@ -127,45 +191,6 @@ impl<'r> FromRequest<'r> for ClientKey {
     }
 }
 
-/// The administrative credential.
-///
-/// Two ways to refuse, because they have two different fixes: 503 when the
-/// installation has no admin token at all — a deployment problem, and the
-/// message says how to fix it — and 401 when the presented one is missing or
-/// wrong.
-#[derive(Debug, Clone, Copy)]
-pub struct Admin;
-
-#[rocket::async_trait]
-impl<'r> FromRequest<'r> for Admin {
-    type Error = Refusal;
-
-    async fn from_request(req: &'r Request<'_>) -> Outcome<Self, Self::Error> {
-        let Some(state) = state_of(req).await else {
-            return Outcome::Error((Status::InternalServerError, Refusal::unmanaged()));
-        };
-        if !admin_token::configured(&state) {
-            return refuse(
-                req,
-                Status::ServiceUnavailable,
-                "no admin token configured — run `tab-atelier-proxy admin-token` on the server, \
-                 as the service user, before using this API",
-            );
-        }
-        // `Arrival` cannot refuse — it only reads the request — so its error
-        // type is `Infallible` and the `else` is unreachable. It is written out
-        // rather than unwrapped so that giving this guard an error later is a
-        // compile error here instead of a panic at runtime.
-        let Outcome::Success(arrival) = req.guard::<Arrival>().await else {
-            return Outcome::Error((Status::InternalServerError, Refusal::unmanaged()));
-        };
-        match admin_token::guard_token(&state, &arrival.presented) {
-            Ok(()) => Outcome::Success(Self),
-            Err(why) => refuse(req, Status::Unauthorized, &why),
-        }
-    }
-}
-
 /// Documenting the middleware, so a guarded route may carry `#[openapi]`.
 ///
 /// `Arrival` reads the request, `ClientKey` and `Admin` refuse it, but none of
@@ -191,7 +216,9 @@ macro_rules! documents_itself {
     };
 }
 
-documents_itself!(Arrival, ClientKey, Admin);
+// `Admin` is not here: it is the shared crate's guard now, and okapi's impl
+// for it lives there, once, for every server.
+documents_itself!(Arrival, ClientKey);
 
 /// The application state, if it was mounted.
 ///

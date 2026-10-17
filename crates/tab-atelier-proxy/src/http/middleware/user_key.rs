@@ -21,6 +21,16 @@ use crate::users::Account;
 /// differently.
 #[must_use]
 pub fn authenticate_and_stamp(state: &State, key: &str, ip: &str) -> Option<(Account, String)> {
+    // WHO is `Authenticator::authenticate`'s judgement, in one place for the
+    // whole proxy; the stamp below is this function's own job, because only it
+    // knows the client address.
+    use tab_atelier_api::auth::{Authenticator as _, Presented};
+    let presented = Presented {
+        header: Some(key),
+        bearer: None,
+        query: None,
+    };
+    let (account, key_id) = state.authenticate(&presented).ok()?;
     // The KEY is stamped, not the account: "last used from here" says nothing
     // when several keys share an account, which is the whole reason they are
     // named separately.
@@ -29,12 +39,11 @@ pub fn authenticate_and_stamp(state: &State, key: &str, ip: &str) -> Option<(Acc
     // has been read, and the session lives in the body. The relay adds it once
     // it has one, which is also why `touch` takes an `Option` client: this call
     // and that one describe the same sighting, one field at a time.
-    let mut store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let found = store.authenticate_key(key).map(|(a, k)| (a.clone(), k.id.clone()));
-    if let Some((_, key_id)) = &found {
-        store.touch(key_id, Some(ip), None);
+    {
+        let mut store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        store.touch(&key_id, Some(ip), None);
     }
-    found
+    Some((account, key_id))
 }
 
 #[cfg(test)]

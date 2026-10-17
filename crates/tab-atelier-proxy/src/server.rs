@@ -124,7 +124,7 @@ pub fn now_ms() -> u64 {
 /// mounted in one and not the other would be a difference no test could see.
 fn build(addr: SocketAddr, state: Arc<State>) -> rocket::Rocket<rocket::Build> {
     let mounted = tab_atelier_api::mount(crate::http::routes::all_and_spec(), "/");
-    let rocket = rocket::custom(crate::http::config(addr))
+    let rocket = rocket::custom(tab_atelier_api::config(addr, crate::http::body::MAX_BODY_BYTES as u64))
         .mount("/", mounted.routes)
         .register("/", crate::http::routes::catchers())
         .manage(state);
@@ -223,6 +223,56 @@ mod tests {
         assert!(
             count <= 6,
             "x-dynamic-body responses: {count} (the floor is the 6 relay routes; was 31)"
+        );
+    }
+
+    /// A guard's own refusal reaches the client — the bug the shared catchers
+    /// fixed.
+    ///
+    /// The proxy used to answer a 401 with a fixed sentence, so the guard's
+    /// careful "nothing arrived in Authorization: Bearer or x-api-key, which
+    /// usually means something in front of the proxy stripped it" was thrown
+    /// away and the operator had a status and no lead. The guard now leaves its
+    /// message in the request and the catcher returns it; this asserts the
+    /// wording, not merely the status, because the wording is the point.
+    #[test]
+    fn a_guard_refusal_says_what_was_actually_wrong() {
+        let client = app();
+        let response = client.get("/api/users").dispatch();
+        assert_eq!(response.status(), Status::Unauthorized);
+        let body = response.into_string().expect("a body");
+        assert!(
+            body.contains("no credential presented"),
+            "the guard's own reason survives to the client: {body}"
+        );
+        assert!(
+            body.contains("Authorization: Bearer"),
+            "and it names what to look at: {body}"
+        );
+    }
+
+    /// A different refusal produces a different body.
+    ///
+    /// The first test alone would pass if the catcher returned one fixed
+    /// sentence that happened to answer the empty case. This drives a second
+    /// guard outcome — a credential that arrived and is simply wrong — and the
+    /// message has to change with it.
+    #[test]
+    fn each_refusal_carries_its_own_reason() {
+        let client = app();
+        let response = client
+            .get("/api/users")
+            .header(rocket::http::Header::new("authorization", "Bearer not-the-token"))
+            .dispatch();
+        assert_eq!(response.status(), Status::Unauthorized);
+        let body = response.into_string().expect("a body");
+        assert!(
+            body.contains("token mismatch"),
+            "a wrong credential is its own message: {body}"
+        );
+        assert!(
+            !body.contains("no credential presented"),
+            "and not the empty-credential one: {body}"
         );
     }
 

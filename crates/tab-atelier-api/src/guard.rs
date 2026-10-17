@@ -38,11 +38,17 @@ use rocket_okapi::request::{OpenApiFromRequest, RequestHeaderInput};
 #[must_use]
 pub fn presented<'r>(req: &'r Request<'_>) -> Presented<'r> {
     let header = req.headers().get_one("x-api-key");
+    // The scheme is compared case-insensitively: HTTP defines it that way, and
+    // clients disagree in practice — a lowercase `bearer` is what several
+    // libraries send. A case-sensitive match silently treated those as no
+    // credential at all, which reads as "you forgot the header" when the caller
+    // did not.
     let bearer = req
         .headers()
         .get_one("authorization")
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .map(str::trim);
+        .and_then(|value| value.split_once(' '))
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+        .map(|(_, credentials)| credentials.trim());
     let query = req.uri().query().and_then(|query| {
         query
             .as_str()

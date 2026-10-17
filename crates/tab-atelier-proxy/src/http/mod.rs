@@ -69,24 +69,3 @@ pub(crate) fn problem(status: u16, message: impl Into<String>) -> Reply {
 pub(crate) const fn acknowledged() -> crate::transport::Doc<resources::status::OkResource> {
     crate::transport::Doc::ok(resources::status::OkResource::yes())
 }
-
-/// Rocket's configuration for this proxy.
-///
-/// Built here rather than read from a `Rocket.toml` so that the address and
-/// port the process binds are the ones the caller passed on the command line —
-/// a config file is a second source of truth for the same fact, and the two
-/// disagree the first time somebody edits one.
-///
-/// The body limit is raised to match [`body::MAX_BODY_BYTES`]: Rocket's own
-/// default is 1 MiB, and a prompt carrying a few files is larger than that. The
-/// guards do their own limiting from the same constant, so the number a caller
-/// is refused at does not depend on which route they chose.
-#[must_use]
-pub(crate) fn config(addr: std::net::SocketAddr) -> rocket::Config {
-    rocket::Config {
-        address: addr.ip(),
-        port: addr.port(),
-        limits: rocket::data::Limits::default().limit("json", rocket::data::ByteUnit::from(body::MAX_BODY_BYTES)),
-        ..rocket::Config::default()
-    }
-}
