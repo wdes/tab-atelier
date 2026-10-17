@@ -67,4 +67,8 @@
 
 	<!-- The console title while a tab is open: the server, then the tab. -->
 	<string name="tabatelier_console_title_with_tab">%1$s - %2$s</string>
+	<string name="tabatelier_urls_title">Adresses de secours</string>
+	<string name="tabatelier_urls_hint">http://192.168.1.10:8443, https://maison.example:8443</string>
+	<string name="tabatelier_urls_summary">Facultatif. Essayées dans l\'ordre quand l\'adresse ci-dessus ne répond pas — et essayées en premier quand votre téléphone est sur le même réseau local que l\'une d\'elles. Séparez-les par des virgules.</string>
+	<string name="tabatelier_urls_error">Chaque adresse doit commencer par http:// ou https://, par exemple http://192.168.1.10:8443</string>
 </resources>

@@ -676,6 +676,88 @@ functions on `TabAtelier.Reconnect`, and both are unit-tested and mutation-check
 deliberate: they are the substance of the behaviour, and a rule that can only be exercised
 by reproducing a real network drop is a rule that will not be exercised.
 
+### Fallback addresses, and why the LAN one goes first
+
+A host row carries a primary address (`tabatelier_url`) and any number of fallbacks
+(`tabatelier_urls`, comma-separated). `TabAtelierAddresses` is the ordered set plus the rule
+for reordering it, and it exists because one daemon is normally reachable two ways — a LAN
+address and a remote one — and which is right depends on where the phone is, not on anything
+the user wants to think about.
+
+**The LAN preference is an ordering, never a filter.** On a private network the local
+addresses are tried first; off one the configured order stands. A local address that has
+stopped answering still falls through to the remote one, so "the LAN is down" needs no case
+of its own — it is the same code path one step further along. The alternative (choose *one*
+address from the network) is the tempting simplification and it is wrong: it fails exactly
+when the LAN is up but its daemon is not.
+
+**"Local" is about the phone's own address, not the link type.** A private IPv4 range, a
+`.local` mDNS name, loopback or link-local. Not "is it Wi-Fi" — hotel Wi-Fi is not the
+user's LAN — and a plain hostname is never guessed, because `nas.example` resolves to
+whatever the current network says and guessing would pin a public name to the front of the
+list everywhere. The flag reaches the transport through `TerminalManager.isOnLocalNetwork`,
+written by the connection policy; reading link properties in the transport would be a
+platform call on every dial, including from a retry coroutine.
+
+The address that last worked is remembered and kept at the front, or a redial from the
+phone would re-walk an unreachable primary and pay a connect timeout before reaching the
+address that works. Moving to a network where a local address is available re-orders ahead
+of it again, so a session does not stay pinned to the address it happened to come up on.
+
+### Ten minutes idle, and no network, let go of the socket
+
+`TabAtelierConnectionPolicy` **suspends** tab-atelier sessions — `TabAtelier.suspendSession`
+— after ten minutes without the app being touched, and immediately when there is no
+validated default network. Airplane mode needs no case of its own: it is one way to have no
+network, so Wi-Fi to a captive portal is treated the same, which is right, because a
+WebSocket cannot be kept alive over either.
+
+**Suspended, not closed, and the distinction is the whole feature.** `close` ends the
+session: the Relay stops, the bridge is disposed, and the user is back to tapping the tab in
+the list. A suspended session keeps the transport, the Relay (parked on `read` returning 0)
+and the tab key, so coming back is one redial. That is what makes a ten-minute idle timeout
+acceptable rather than infuriating, and it is only defensible because the daemon holds the
+tab and replays its scrollback: the cost of being idle is a reconnect, and the cost of the
+reconnect is nothing.
+
+Three details:
+
+- **The poll interval has to follow it.** `read` polls every 250ms so a disconnect is
+  responsive; a *suspended* session has no socket to be responsive about, so parking one
+  would have cost **four wake-ups a second forever** — worse than the socket it released.
+  It now polls every 30s when suspended, and `close`/`resumeSession` push onto the queue so
+  waking is still immediate. This was the bug in the first version of the feature.
+- **A resume dials at once**, rather than waiting out a backoff it did not earn, and
+  `suspendSession` resets the attempt counter. What parked it is already over.
+- **Only tab-atelier sessions.** Parking somebody's SSH session is a change to behaviour
+  upstream never agreed to; these are the rules of the protocol this fork adds.
+
+### The border is covered, not clipped and not shifted
+
+termlib draws a 2dp green outline inside its terminal's own bounds, with no parameter to
+turn it off. Two attempts failed before this one, and both are worth knowing about:
+
+- **Clipping** the edge removed the outline and the 2dp of the session's text under it
+  together — the text being what a reader actually notices.
+- **Growing the node by 4dp and placing it at -2dp** put the outline outside the view, and
+  laid the grid out 4dp *wider than the screen*, because termlib fits its columns to the
+  size it is measured at. The outer sliver of the first and last column was then drawn past
+  the physical edge. That is what "the pixels are still drawn outside my screen" was seeing,
+  and it was worse than the outline it hid.
+
+The node is now **exactly the available size and is not moved**, so its layout — and the font
+it fits its grid to — is what it would have been with no outline at all. The ring is painted
+over in the session's own background colour, which is the colour termlib is already painting
+in, so there is nothing to see. Covering needs to know that colour, which is why it works for
+a tab-atelier tab: the background comes from the daemon and is already in hand
+(`backgroundColor`). The topmost 2dp of the first row and the leftmost 2dp of the first
+column stay under the ring — but they were already under a 60%-opaque green line, so nothing
+legible is lost that was legible before.
+
+The general lesson, which cost two attempts: **when a library draws something you have to
+move, check whether moving it changes what the library computes.** Here it did, and the
+symptom (pixels off-screen) looked nothing like the cause (a re-measured grid).
+
 ## Current state
 
 The app is a working ConnectBot under our package id, plus the tab-atelier type:

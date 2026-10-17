@@ -140,6 +140,25 @@ data class Host(
      */
     @ColumnInfo(name = "tabatelier_url")
     val tabAtelierUrl: String? = null,
+
+    /**
+     * Further tab-atelier addresses to try, in order, when [tabAtelierUrl] does not
+     * answer — and, more usefully, the ones that get tried *first* when the phone is
+     * on the same network as one of them.
+     *
+     * Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): one daemon is normally
+     * reachable two ways, a LAN address and a remote one, and which is right depends on
+     * where the phone is rather than on anything the user wants to think about. Storing
+     * them together in one comma-separated column rather than a child table is a
+     * deliberate simplification: the list is short, ordered, and never queried across
+     * hosts, so a table would buy nothing but a join and a migration.
+     *
+     * [tabAtelierUrl] stays the primary — it is what the rest of the app calls "this
+     * host's address", and keeping it as a field of its own means nothing had to change
+     * shape when this arrived.
+     */
+    @ColumnInfo(name = "tabatelier_urls")
+    val tabAtelierUrls: String? = null,
 ) {
     /**
      * Check if this host is temporary (not saved to database).

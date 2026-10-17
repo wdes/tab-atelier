@@ -92,6 +92,26 @@ class TerminalManager :
     private val _bridgesFlow = MutableStateFlow<List<TerminalBridge>>(emptyList())
     val bridgesFlow: StateFlow<List<TerminalBridge>> = _bridgesFlow.asStateFlow()
 
+    /**
+     * Whether the phone is on a private network, as far as the tab-atelier transport is
+     * concerned.
+     *
+     * Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): this is what decides
+     * whether a host's LAN address is tried before its remote one. It means "the phone's
+     * own address is in a private range", which is the honest signal for "I am probably on
+     * the same LAN as my daemon" — not merely "I have a network", which is also true on
+     * cellular and would put the LAN address first from a train.
+     *
+     * Written by [TabAtelierConnectionPolicy] and read here, rather than computed on
+     * demand: reading a link's properties is a platform call, and the transport asks on
+     * every dial, including from a retry coroutine.
+     *
+     * Defaults to false so that an app that has not started the policy behaves exactly as
+     * it did before this existed — primary address first.
+     */
+    @Volatile
+    var isOnLocalNetwork: Boolean = false
+
     private val hostBridgeMap: MutableMap<Host, WeakReference<TerminalBridge>> = HashMap()
     private val nicknameBridgeMap: MutableMap<String, WeakReference<TerminalBridge>> = HashMap()
 

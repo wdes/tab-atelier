@@ -50,6 +50,8 @@ import org.connectbot.data.entity.Host
 import org.connectbot.service.ConnectionState
 import org.connectbot.service.DisconnectReason
 import org.connectbot.tabatelier.TabAtelierBase
+import org.connectbot.tabatelier.TabAtelierAddresses
+import org.connectbot.service.TerminalManager
 import org.connectbot.tabatelier.TabAtelierClient
 import org.connectbot.util.SecurePasswordStorage
 import org.json.JSONException
@@ -151,6 +153,21 @@ class TabAtelier : AbsTransport() {
     @Volatile
     private var currentTabKey: String? = null
 
+    /** Every address this server can be reached at. Set in [connect]. */
+    @Volatile
+    private var addresses: TabAtelierAddresses = TabAtelierAddresses(primary = null, fallbacks = emptyList())
+
+    /**
+     * Every address this server can be reached at, parsed, in the same order as
+     * [addresses].
+     *
+     * Parsed once in [connect] rather than per dial so that a redial cannot start
+     * honouring a different set of addresses than the session came up with — the user
+     * editing the host mid-session would otherwise move the session without saying so.
+     */
+    @Volatile
+    private var bases: List<TabAtelierBase> = emptyList()
+
     /**
      * The token this session's sockets authenticate with, taken once in [connect].
      *
@@ -245,8 +262,16 @@ class TabAtelier : AbsTransport() {
         }
 
         val client = TabAtelierClient(service, SecurePasswordStorage(service))
-        val base = client.base(host.tabAtelierUrl?.takeIf { it.isNotBlank() })
-        if (base == null) {
+        val addresses = TabAtelierAddresses(
+            primary = host.tabAtelierUrl,
+            fallbacks = TabAtelierAddresses.parseFallbacks(host.tabAtelierUrls),
+        )
+        // Every address has to be parseable, or the session would come up on whichever
+        // one happened to work and quietly ignore the rest. Reporting it as "no address"
+        // rather than connecting to half of them is the honest answer: the user has a
+        // typo in a fallback, and the way to fix it is the editor.
+        val bases = addresses.all.mapNotNull { TabAtelierBase.parse(it) }
+        if (bases.isEmpty()) {
             bridge?.outputLine(service.getString(R.string.tabatelier_url_missing))
             bridge?.dispatchDisconnect(DisconnectReason.REMOTE_EOF)
             return
@@ -254,7 +279,12 @@ class TabAtelier : AbsTransport() {
         // Kept for switchTab, which has to reach the same server again long after
         // this has returned, and for the redials, which reach it many times more.
         this.client = client
-        this.base = base
+        this.addresses = addresses
+        this.bases = bases
+        // The address to start on. A LAN address goes first when the phone is on the same
+        // network as one, which is the whole point of having several; `candidates` decides
+        // and is a pure function.
+        this.base = bases.first { it.origin == addresses.candidates(onLocalNetwork(service)).firstOrNull() }
         this.token = client.token(host.id)
 
         // The tab this session is on is read once and then held, because whoever
@@ -322,7 +352,82 @@ class TabAtelier : AbsTransport() {
     private fun openSocket(tabKey: String) {
         val host = host ?: throw IOException("No host to open a tab-atelier session for")
         val client = client ?: throw IOException("No connection to open a tab-atelier session on")
-        val base = base ?: throw IOException("No address to reach ${host.nickname} at")
+        val reachable = bases
+        if (reachable.isEmpty()) throw IOException("No address to reach ${host.nickname} at")
+
+        // Which address to start on, and therefore the order to try the rest in. A LAN
+        // address goes first when the phone is on the same network as one, so being at
+        // home costs no round trip to the remote address before falling back.
+        val candidates = addresses.candidates(onLocalNetwork(manager))
+        val ordered = walkActiveFirst(reachable, candidates, activeBase)
+
+        var lastFailure: IOException? = null
+        for (base in ordered) {
+            try {
+                openSocketAt(base, tabKey)
+                // Remembered so the next dial — a tab switch, or a redial after a drop —
+                // starts where this one succeeded rather than re-walking a list whose
+                // first entries have just proved unreachable. Moving between networks
+                // changes [candidates] and so re-orders the rest, but the address that
+                // works keeps its place at the front.
+                activeBase = base
+                return
+            } catch (e: IOException) {
+                // One address being down is the expected case, not an error: it is why
+                // there is more than one. The last one's reason is the one reported, as
+                // that is the address the user is most likely to think of as "the"
+                // server — the primary, when every address failed.
+                lastFailure = e
+                Timber.d(e, "tab-atelier address %s did not answer; trying the next", base.origin)
+            }
+        }
+        throw lastFailure ?: IOException("No address to reach ${host.nickname} at")
+    }
+
+    /**
+     * The order to walk the parsed addresses in: the one that last worked, then the rest
+     * in [TabAtelierAddresses.candidates] order.
+     *
+     * The first part is what stops a fallback being re-walked every dial. Without it,
+     * a redial after a drop would try the unreachable primary first every time, so
+     * reconnecting from the phone would cost a full connect timeout per failed address
+     * before reaching the one that works.
+     *
+     * The second part is the LAN preference, applied on top: when the phone has moved to
+     * a network with a local address available, that address is a candidate again and the
+     * active one drops to its place, so a session does not stay pinned to the remote
+     * address it happened to come up on.
+     */
+    private fun walkActiveFirst(
+        reachable: List<TabAtelierBase>,
+        candidates: List<String>,
+        active: TabAtelierBase?,
+    ): List<TabAtelierBase> {
+        val ordered = candidates.mapNotNull { origin ->
+            reachable.firstOrNull { it.origin == origin.trim() }
+        } + reachable.filter { base -> candidates.none { it.trim() == base.origin } }
+
+        if (active == null || active !in ordered) return ordered
+        return listOf(active) + ordered.filter { it !== active }
+    }
+
+    /**
+     * Opening a socket has to know the phone's networks, which is a platform call, so it
+     * is a seam rather than a direct call: the tests for the ordering are about
+     * [TabAtelierAddresses], which is pure.
+     */
+    private fun onLocalNetwork(service: TerminalManager?): Boolean = service?.isOnLocalNetwork == true
+
+    /**
+     * Opens one socket, at one address, and waits for the daemon to accept it.
+     *
+     * [openSocket] decides *which* address; this does the dialling and throws so that the
+     * caller can move on to the next address. Splitting them is what makes a fallback a
+     * fallback rather than a retry of the same thing.
+     */
+    private fun openSocketAt(base: TabAtelierBase, tabKey: String) {
+        val host = host ?: throw IOException("No host to open a tab-atelier session for")
+        val client = client ?: throw IOException("No connection to open a tab-atelier session on")
 
         // The token rides in the query string, not an Authorization header: the
         // daemon refuses the header alone on a WS upgrade. See
@@ -361,6 +466,10 @@ class TabAtelier : AbsTransport() {
             throw IOException("The tab-atelier session at $url closed before it opened")
         }
     }
+
+    /** The address this session last established a socket on, if any. */
+    @Volatile
+    private var activeBase: TabAtelierBase? = null
 
     /**
      * Moves this session to another tab of the same server.
@@ -687,27 +796,53 @@ class TabAtelier : AbsTransport() {
      * screen is still worth having, and a server that comes back an hour later comes
      * back to a viewer that is waiting for it.
      */
-    private suspend fun retryLoop() {
+    private suspend fun retryLoop(
+        tabKey: String? = currentTabKey,
+        reportFailure: Boolean = true,
+        dialFirst: Boolean = false,
+    ) {
+        // A resume supplies the tab explicitly: it was read off [currentTabKey] before the
+        // call, and re-reading it inside the loop would let a switch that landed in
+        // between redirect it.
+        var target = tabKey
+        // A resumed session dials at once instead of waiting out a backoff it did not
+        // earn: the reason it was parked is known and is already over — the network came
+        // back, or the user picked the phone up — so making them watch a two-second pause
+        // would be an artefact of the retry design rather than a fact about the network.
+        var waitFirst = !dialFirst
         try {
             while (true) {
-                delay(Reconnect.delayMillis(attempts))
+                if (waitFirst) delay(Reconnect.delayMillis(attempts))
+                waitFirst = true
 
-                val tabKey = currentTabKey ?: return
                 // Closed while we were waiting — the user is done with this session.
                 if (closed) return
+                // Suspended while we were waiting — the phone lost its network, or the app
+                // went idle. [resumeSession] will start a fresh loop.
+                if (suspended) return
+
+                val attemptKey = target ?: currentTabKey ?: return
 
                 attempts++
                 try {
-                    openSocket(tabKey)
+                    openSocket(attemptKey)
+                    target = currentTabKey
                     Timber.i("Reconnected the tab-atelier session for tab %s after %d tr%s",
-                        tabKey, attempts, if (attempts == 1) "y" else "ies")
+                        attemptKey, attempts, if (attempts == 1) "y" else "ies")
                     failure = null
                     return
                 } catch (e: IOException) {
                     // Expected while the server is down, and not the user's news:
                     // the state is already RECONNECTING and saying so again every
                     // few seconds would be noise on the terminal they came to read.
-                    Timber.d(e, "Tab-atelier redial %d did not connect", attempts)
+                    //
+                    // [reportFailure] is false for a resume, where the reason the socket
+                    // was down is known and was chosen by the app rather than the network.
+                    if (reportFailure) {
+                        Timber.d(e, "Tab-atelier redial %d did not connect", attempts)
+                    } else {
+                        Timber.d(e, "Tab-atelier resume attempt %d did not connect", attempts)
+                    }
                 }
             }
         } catch (e: CancellationException) {
@@ -725,6 +860,66 @@ class TabAtelier : AbsTransport() {
         retryJob?.cancel()
         retryJob = null
     }
+
+    /**
+     * Lets go of the socket while keeping the session, so it can be picked up again.
+     *
+     * **This is how the app saves battery, and it is deliberately not [close].** `close`
+     * ends the session: `read` returns -1, the Relay stops, the bridge is disposed, and
+     * getting back in means opening the tab from the list again. Suspending keeps all of
+     * that — the transport, the Relay (parked on `read` returning 0), the tab key — so
+     * [resume] is one redial and nothing else. For a viewer that distinction is the whole
+     * feature: the tab never stops running on the daemon, so there is nothing to lose by
+     * dropping the socket, and nothing to rebuild either.
+     *
+     * Applied when the phone has no network, and when the app has gone this long without
+     * being touched — see [org.connectbot.service.TabAtelierConnectionPolicy].
+     */
+    internal fun suspendSession() {
+        if (!established) return
+        cancelRetry()
+        open = false
+        closeSocketQuietly()
+        // A redial started before the suspend could still be in flight; its socket is
+        // closed by closeSocketQuietly because it is the current attempt.
+        suspended = true
+        // The outage the session was in is over as far as the next attempt is concerned:
+        // when it is resumed, the failure count that belonged to whatever happened before
+        // would otherwise start it at a thirty-second wait.
+        attempts = 0
+        setSocketState(ConnectionState.DISCONNECTED)
+    }
+
+    /**
+     * Redials a session that [suspendSession] let go of.
+     *
+     * A no-op unless there is a suspended session with a tab to open, so it is safe to
+     * call on every interaction rather than only on the edge where it is needed.
+     */
+    internal fun resumeSession() {
+        if (!suspended || closed) return
+        val tabKey = currentTabKey ?: return
+        suspended = false
+        setSocketState(ConnectionState.RECONNECTING)
+        // Dialled at once rather than after a backoff: what parked it — no network, or
+        // nobody looking — has just stopped being true.
+        retryJob = scope.launch { retryLoop(tabKey = tabKey, reportFailure = false, dialFirst = true) }
+    }
+
+    /** Whether [suspendSession] has parked this session. */
+    internal val isSuspended: Boolean get() = suspended
+
+    /**
+     * Whether this session is parked because the app or the phone went away, rather than
+     * because something failed.
+     *
+     * Set only by [suspendSession] and cleared only by [resumeSession]. Its purpose is to
+     * make the difference between "nothing is happening on purpose" and "a redial is
+     * in flight" — the two look identical from [read] (no socket, empty queue) and mean
+     * opposite things to the retry loop.
+     */
+    @Volatile
+    private var suspended = false
 
     /**
      * What this transport does about a socket it lost: whether the user is told, and
@@ -888,7 +1083,20 @@ class TabAtelier : AbsTransport() {
             }
 
             val frame = try {
-                inbound.poll(READ_POLL_MILLIS, TimeUnit.MILLISECONDS)
+                // **A suspended session polls slowly, and that is the point of it.**
+                // The poll is what makes a disconnect responsive, but it is also a
+                // wake-up: at [READ_POLL_MILLIS] this loop would wake four times a
+                // second for as long as the session stayed parked, which would burn more
+                // battery than the socket it just gave up. Nobody is waiting for these
+                // bytes — the session was suspended precisely because nobody is looking
+                // — so the interval stretches to something that costs nothing.
+                //
+                // Waking up is not delayed by it: `close` and `resumeSession` both push
+                // onto [inbound], which returns from the poll immediately.
+                inbound.poll(
+                    if (suspended) SUSPENDED_POLL_MILLIS else READ_POLL_MILLIS,
+                    TimeUnit.MILLISECONDS,
+                )
             } catch (e: InterruptedException) {
                 Thread.currentThread().interrupt()
                 throw IOException("interrupted while reading from the tab-atelier session", e)
@@ -1258,6 +1466,17 @@ class TabAtelier : AbsTransport() {
 
         /** How long a read waits before reporting "nothing yet" to the caller. */
         private const val READ_POLL_MILLIS = 250L
+
+        /**
+         * How long a read waits while the session is suspended.
+         *
+         * Half a minute, which is the difference between a parked session costing nothing
+         * and a parked session costing four CPU wake-ups a second — the latter being worse
+         * than the socket it replaced, since a socket at least does something. The interval
+         * does not delay anything the user can see: `close` and `resumeSession` both push
+         * onto the queue and return from the poll at once.
+         */
+        private const val SUSPENDED_POLL_MILLIS = 30_000L
 
         /** Queued to wake a parked read when the session ends. */
         private val END_OF_STREAM = ByteArray(0)

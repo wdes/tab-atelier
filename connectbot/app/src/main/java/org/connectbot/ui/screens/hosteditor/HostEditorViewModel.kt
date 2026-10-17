@@ -39,7 +39,9 @@ import org.connectbot.data.entity.Profile
 import org.connectbot.data.entity.Pubkey
 import org.connectbot.di.CoroutineDispatchers
 import org.connectbot.tabatelier.TabAtelierClient
+import org.connectbot.tabatelier.TabAtelierAddresses
 import org.connectbot.transport.TabAtelier
+import org.connectbot.tabatelier.TabAtelierBase
 import org.connectbot.transport.Transport
 import org.connectbot.util.InstallMosh
 import org.connectbot.util.SecurePasswordStorage
@@ -76,6 +78,8 @@ data class HostEditorUiState(
     // server is entered as one URL, which is the only field that can carry a
     // scheme or a path prefix. Blank for every other protocol.
     val tabAtelierUrl: String = "",
+    /** Fallback addresses, comma-separated, exactly as typed — see TabAtelierAddresses. */
+    val tabAtelierUrls: String = "",
     val hasUnsavedChanges: Boolean = false,
     val isSaving: Boolean = false,
     // Mosh-specific fields
@@ -228,6 +232,11 @@ class HostEditorViewModel @Inject constructor(
                             } else {
                                 ""
                             },
+                            tabAtelierUrls = if (host.protocol == TabAtelier.PROTOCOL) {
+                                host.tabAtelierUrls.orEmpty()
+                            } else {
+                                ""
+                            },
                             isLoading = false,
                         )
                     }
@@ -322,6 +331,18 @@ class HostEditorViewModel @Inject constructor(
     fun updateTabAtelierUrl(value: String) {
         nicknameAutofillEnabled = false
         _uiState.update { it.copy(tabAtelierUrl = value, hasUnsavedChanges = true) }
+    }
+
+    /**
+     * The fallback addresses, as the user types them.
+     *
+     * Stored as the raw string and parsed on save rather than normalised here: a comma
+     * being typed must not delete the address after it, and the field has to show back
+     * what was typed.
+     */
+    fun updateTabAtelierUrls(value: String) {
+        nicknameAutofillEnabled = false
+        _uiState.update { it.copy(tabAtelierUrls = value, hasUnsavedChanges = true) }
     }
 
     fun cancelMoshInstall() {
@@ -513,6 +534,16 @@ class HostEditorViewModel @Inject constructor(
                 // canonical URL, and null for every other protocol so a host
                 // switched away from tab-atelier does not keep one.
                 tabAtelierUrl = tabAtelierBase?.toString(),
+                // Renormalised through the parser and rejoined, so what is stored is
+                // exactly what a dial will read back: blanks dropped, whitespace trimmed,
+                // order kept. Anything that does not parse is dropped rather than saved —
+                // the screen already refuses to save with an invalid entry, so this only
+                // catches the case of a field edited elsewhere.
+                tabAtelierUrls = TabAtelierAddresses
+                    .parseFallbacks(state.tabAtelierUrls)
+                    .mapNotNull { TabAtelierBase.parse(it)?.toString() }
+                    .takeIf { it.isNotEmpty() }
+                    ?.joinToString(","),
             )
 
             val savedHost = repository.saveHost(host)

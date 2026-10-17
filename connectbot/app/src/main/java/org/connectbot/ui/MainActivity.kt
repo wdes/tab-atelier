@@ -56,6 +56,7 @@ import kotlinx.coroutines.launch
 import org.connectbot.R
 import org.connectbot.data.entity.Host
 import org.connectbot.service.TerminalManager
+import org.connectbot.service.TabAtelierConnectionPolicy
 import org.connectbot.ui.components.DisconnectAllDialog
 import org.connectbot.ui.navigation.NavArgs
 import org.connectbot.ui.navigation.NavDestinations
@@ -130,6 +131,15 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * Parks tab-atelier sessions that have gone untouched, or whose network has gone.
+     *
+     * Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): owned by the activity
+     * rather than by the service because its idle clock is "the user has not touched the
+     * app", which is a fact only an activity can observe.
+     */
+    private var connectionPolicy: TabAtelierConnectionPolicy? = null
+
     private val connection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
             val binder = service as? TerminalManager.TerminalBinder
@@ -137,6 +147,8 @@ class MainActivity : AppCompatActivity() {
             Timber.d("onServiceConnected: manager=$manager")
             appViewModel.setTerminalManager(manager)
             bound = true
+            // Only now are there bridges to park, and only now does the manager exist.
+            manager?.let { startConnectionPolicy(it) }
         }
 
         override fun onServiceDisconnected(name: ComponentName?) {
@@ -383,11 +395,42 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         Timber.d("onDestroy")
+        connectionPolicy?.stop()
+        connectionPolicy = null
         if (bound) {
             unbindService(connection)
             bound = false
         }
         super.onDestroy()
+    }
+
+    /**
+     * Tells the tab-atelier policy that the user is here.
+     *
+     * Changed for Tab Atelier Remote (Apache-2.0 section 4(b)). `onUserInteraction` fires
+     * for every touch, scroll and key press, which is what makes an idle timeout honest:
+     * the session is let go only when nothing at all has happened for ten minutes, and is
+     * taken back on the first thing that does.
+     *
+     * Cheap on purpose — the whole body is two field writes and, only when a session is
+     * actually parked, a redial — because this runs on the touch dispatch path.
+     */
+    override fun onUserInteraction() {
+        super.onUserInteraction()
+        connectionPolicy?.onUserInteraction()
+    }
+
+    /**
+     * Starts watching for tab-atelier sessions to park.
+     *
+     * Called once, when the service is bound — before that there are no bridges to park,
+     * and the manager it needs does not exist yet.
+     */
+    private fun startConnectionPolicy(manager: TerminalManager) {
+        if (connectionPolicy?.isStarted == true) return
+        val policy = TabAtelierConnectionPolicy(lifecycleScope, manager)
+        connectionPolicy = policy
+        policy.start(this)
     }
 
     private fun handleConnectionUri(uri: Uri, controller: NavController) {

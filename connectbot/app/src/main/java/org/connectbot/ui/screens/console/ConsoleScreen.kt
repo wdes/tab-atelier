@@ -95,8 +95,10 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEvent
@@ -329,26 +331,44 @@ internal fun terminalColorOrNull(hex: String): Color? =
 private val HEX_COLOR = Regex("^#[0-9a-fA-F]{6}$")
 
 /**
- * How far the terminal is inset from its own bounds, which is how its library's green
- * outline is kept off the screen — see the modifier that uses it.
+ * How thick a ring around the terminal is painted over to hide its library's green
+ * outline.
  *
  * **Two dp, because that is exactly the library's border.** `TERMINAL_BORDER_WIDTH` is not
  * a compile-time constant, so it does not appear beside its colour; it is assigned in
  * `TerminalKt`'s static initializer as `Dp(2)`.
  *
- * The terminal is measured `2 * this` larger than the space available and drawn at
- * `-this`, so the border lands in the strip outside the view and is clipped away with it
- * — the mechanism, and why an offset needs the extra size to go with it, is explained at
- * the modifier. What matters here is the value: termlib draws its border over the
- * terminal's own outermost pixels, so nothing narrower than this hides it, and anything
- * wider hides session text along with it.
- *
- * A clip alone could not avoid that second part, which is why this is not a clip any more:
- * clipping the edge takes the border and the text under it together. Growing first is what
- * separates them, and the cost is that the grid now fits into four dp more than the screen
- * — a tenth of a percent smaller font at a 193-column fit.
+ * Nothing narrower hides it; anything much wider starts covering text the border did not
+ * reach. The ring is drawn *inside* the terminal's own bounds, so no amount of it moves
+ * anything off-screen — which is the failure this constant used to cause, when it was an
+ * offset that grew the terminal past the display. See [coverTerminalOutline].
  */
-private const val TERMINAL_EDGE_CLIP_DP = 2
+private const val TERMINAL_OUTLINE_COVER_DP = 2
+
+/**
+ * Paints over the ring where [org.connectbot.terminal.Terminal] draws its own border.
+ *
+ * The terminal's node is left the size it was given and is not moved, so its layout — and
+ * therefore the font size it fits its grid to — is exactly what it would have been with no
+ * outline at all. That is the point: an earlier attempt to hide the border by growing the
+ * node and shifting it made termlib fit the grid to a width four dp wider than the screen,
+ * so the outer sliver of the first and last column was laid out past the physical edge.
+ *
+ * [background] must be the colour the terminal itself is painted in. It is passed to the
+ * terminal as `backgroundColor`, and for a tab-atelier session it is the tab's own colour
+ * as reported by its daemon, so it cannot be a constant here.
+ */
+private fun Modifier.coverTerminalOutline(background: Color): Modifier = drawWithContent {
+    drawContent()
+    val thickness = TERMINAL_OUTLINE_COVER_DP.dp.toPx()
+    if (thickness <= 0f) return@drawWithContent
+    // Four edges rather than a stroked rounded rect: the outline termlib draws is a plain
+    // rectangle, and corners are the part most likely to show if this ever mismatches.
+    drawRect(background, Offset(0f, 0f), Size(size.width, thickness))
+    drawRect(background, Offset(0f, size.height - thickness), Size(size.width, thickness))
+    drawRect(background, Offset(0f, 0f), Size(thickness, size.height))
+    drawRect(background, Offset(size.width - thickness, 0f), Size(thickness, size.height))
+}
 
 @VisibleForTesting
 internal fun shouldPreserveSoftwareKeyboardForBridgeChange(
@@ -510,75 +530,32 @@ private fun ConsoleTerminalPage(
                 .then(terminalModifier)
                 // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): termlib draws
                 // a Material-green outline around its terminal — `Color(0xFF4CAF50)` at
-                // 0.6 alpha, hardcoded in the library with no parameter to turn it off —
-                // and this clips it away.
+                // 0.6 alpha, hardcoded in the library with no parameter to turn it off.
+                // It is painted over, in this session's own background.
                 //
-                // Clipped rather than painted over, and that is the point: a mask would
-                // have to be the terminal's own background, which for a tab-atelier
-                // session is the tab's colour and for a profile is whatever scheme that
-                // profile uses, so a mask would need to know both or it would draw a
-                // frame of the wrong colour around a session. Clipping needs to know
-                // neither: nothing is drawn where the border was, so the console's own
-                // backdrop shows through, which is already correct for every transport.
+                // Painted over rather than clipped or shifted, and both of the earlier
+                // attempts are why. Clipping the edge removed the outline and the 2dp of
+                // text beneath it together. Enlarging the terminal by 4dp and placing it
+                // at -2dp then *laid the grid out 4dp wider than the screen* — termlib
+                // fits its columns to the size it is measured at — so the outer sliver of
+                // the first and last column was drawn past the screen edge and clipped
+                // away. That was worse than the outline it hid, which is what "the pixels
+                // are still drawn outside my screen" was seeing.
                 //
-                // The cost is that the outline's width is a private constant in the
-                // library, so how much to clip is a judgement rather than a value read
-                // from it. Three dp is comfortably more than such an outline is usually
-                // drawn at, and under half a character wide at the font size a 193-column
-                // grid fits — see [TERMINAL_EDGE_CLIP_DP].
-                // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): the terminal
-                // is given a little more room than it can show, and shifted by that same
-                // amount, so termlib's green outline falls outside the visible area
-                // instead of over the session's first row and column.
+                // Covering needs none of that: the node stays exactly the available size,
+                // nothing is moved, no layout is re-measured, so nothing can be drawn past
+                // an edge. The only thing painted over is the ring the outline already
+                // occupies, and it is painted in the colour the terminal itself is painted
+                // in, so there is nothing to see. That colour is known here — it is the
+                // same `backgroundColor` handed to the terminal below — which is what makes
+                // covering viable at all: the ring cannot be a fixed colour, because a
+                // tab-atelier tab's background comes from its daemon.
                 //
-                // This replaces a clip, and the difference is the whole point. A clip
-                // removes the border by removing everything at the edge — the border is
-                // inside the terminal's own bounds, so two dp of border and the two dp of
-                // the session's text beneath it go together, and the text is what a
-                // reader notices. **Enlarging cannot separate them, but it does not have
-                // to: the border stays exactly where the library drew it, and the view is
-                // moved so that "where it drew it" is off-screen.**
-                //
-                // So the terminal measures `width + 2 * inset` square and is placed at
-                // `-inset`, which puts its 2dp border on all four sides in the strip
-                // outside these bounds; `clipToBounds` then discards that strip. What
-                // shows is the terminal's interior — every character of it, none eaten,
-                // and no green line on any of the four sides rather than three.
-                //
-                // I argued this could not work before implementing it, on the reasoning
-                // that the border moves with the drawing. It does — which is why moving
-                // it is only useful together with the extra size. An offset alone slides
-                // the outline to a new place inside the view; an offset plus four dp of
-                // growth puts it past the edge.
-                //
-                // The cost is that the terminal now fits its grid into four dp more than
-                // the screen, so the font is a hair smaller — a tenth of a percent at a
-                // 193-column fit, which is why this is worth it.
-                .clipToBounds()
-                .layout { measurable, constraints ->
-                    val inset = TERMINAL_EDGE_CLIP_DP.dp.roundToPx()
-                    // Unbounded constraints would make the growth meaningless and the
-                    // placement arbitrary, so they are left alone if they ever arrive.
-                    val growable = constraints.maxWidth != Constraints.Infinity &&
-                        constraints.maxHeight != Constraints.Infinity
-                    if (!growable) {
-                        val placeable = measurable.measure(constraints)
-                        return@layout layout(placeable.width, placeable.height) {
-                            placeable.place(0, 0)
-                        }
-                    }
-                    val placeable = measurable.measure(
-                        constraints.copy(
-                            minWidth = 0,
-                            minHeight = 0,
-                            maxWidth = constraints.maxWidth + inset * 2,
-                            maxHeight = constraints.maxHeight + inset * 2,
-                        ),
-                    )
-                    layout(constraints.maxWidth, constraints.maxHeight) {
-                        placeable.place(-inset, -inset)
-                    }
-                }
+                // The topmost 2dp of the first row and the leftmost 2dp of the first
+                // column are still underneath the ring — but they were already underneath
+                // a 60%-opaque green line, so nothing legible is lost that was legible
+                // before.
+                .coverTerminalOutline(terminalBackground)
                 .testTag("terminal"),
             typeface = fontResult.typeface,
             initialFontSize = fontSize.sp,

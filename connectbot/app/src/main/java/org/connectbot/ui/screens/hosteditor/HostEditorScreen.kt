@@ -76,6 +76,7 @@ import org.connectbot.data.entity.ColorScheme
 import org.connectbot.data.entity.Host
 import org.connectbot.data.entity.Profile
 import org.connectbot.data.entity.Pubkey
+import org.connectbot.tabatelier.TabAtelierAddresses
 import org.connectbot.tabatelier.TabAtelierBase
 import org.connectbot.transport.TabAtelier
 import org.connectbot.ui.PreviewScreen
@@ -128,6 +129,7 @@ fun HostEditorScreen(
         onTabAtelierTokenChange = viewModel::updateTabAtelierToken,
         onClearTabAtelierToken = viewModel::clearSavedToken,
         onTabAtelierUrlChange = viewModel::updateTabAtelierUrl,
+        onTabAtelierUrlsChange = viewModel::updateTabAtelierUrls,
         onMoshPortChange = viewModel::updateMoshPort,
         onMoshServerChange = viewModel::updateMoshServer,
         onLocaleChange = viewModel::updateLocale,
@@ -167,6 +169,7 @@ fun HostEditorScreenContent(
     onTabAtelierTokenChange: (String) -> Unit = {},
     onClearTabAtelierToken: () -> Unit = {},
     onTabAtelierUrlChange: (String) -> Unit = {},
+    onTabAtelierUrlsChange: (String) -> Unit = {},
     onMoshPortChange: (String) -> Unit = {},
     onMoshServerChange: (String) -> Unit = {},
     onLocaleChange: (String) -> Unit = {},
@@ -191,6 +194,12 @@ fun HostEditorScreenContent(
     val isTabAtelier = uiState.protocol == TabAtelier.PROTOCOL
     val tabAtelierBase = remember(uiState.tabAtelierUrl, isTabAtelier) {
         if (isTabAtelier) TabAtelierBase.parse(uiState.tabAtelierUrl) else null
+    }
+    // Every fallback has to parse, or the field says so — the alternative is a session
+    // that silently ignores the addresses the user thought they had configured.
+    val tabAtelierUrlsValid = remember(uiState.tabAtelierUrls, isTabAtelier) {
+        !isTabAtelier || TabAtelierAddresses.parseFallbacks(uiState.tabAtelierUrls)
+            .all { TabAtelierBase.parse(it) != null }
     }
     val canSave = when {
         uiState.protocol == "local" -> true
@@ -316,6 +325,37 @@ fun HostEditorScreenContent(
                             .fillMaxWidth()
                             .padding(top = 8.dp),
                         singleLine = true,
+                    )
+
+                    // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): further
+                    // addresses for the same daemon, tried in order when the one above
+                    // does not answer — and tried *first* when the phone is on the same
+                    // network as one of them, which is what makes being at home cost no
+                    // round trip to the remote address.
+                    //
+                    // Comma-separated rather than a repeater of fields: the list is
+                    // ordered, usually two long, and one line shows the whole order at
+                    // once, which is the thing the user needs to see.
+                    OutlinedTextField(
+                        value = uiState.tabAtelierUrls,
+                        onValueChange = onTabAtelierUrlsChange,
+                        label = { Text(stringResource(R.string.tabatelier_urls_title)) },
+                        placeholder = { Text(stringResource(R.string.tabatelier_urls_hint)) },
+                        isError = uiState.tabAtelierUrls.isNotBlank() && !tabAtelierUrlsValid,
+                        supportingText = {
+                            Text(
+                                if (uiState.tabAtelierUrls.isNotBlank() && !tabAtelierUrlsValid) {
+                                    stringResource(R.string.tabatelier_urls_error)
+                                } else {
+                                    stringResource(R.string.tabatelier_urls_summary)
+                                },
+                            )
+                        },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(top = 8.dp),
+                        maxLines = 3,
                     )
                 } else {
                     OutlinedTextField(

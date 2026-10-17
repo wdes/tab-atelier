@@ -82,7 +82,7 @@ import java.util.UUID
         Profile::class,
         AutomationAction::class,
     ],
-    version = 12,
+    version = 13,
     exportSchema = true,
     autoMigrations = [
         AutoMigration(from = 1, to = 2),
@@ -97,6 +97,9 @@ import java.util.UUID
         // a nullable tabatelier_url, which is exactly the additive change Room
         // can migrate without a hand-written MIGRATION.
         AutoMigration(from = 11, to = 12),
+        // Also ours: hosts gains a nullable tabatelier_urls, the fallback addresses.
+        // Additive and nullable for the same reason, so Room migrates it unaided.
+        AutoMigration(from = 12, to = 13),
     ],
 )
 @TypeConverters(Converters::class)
