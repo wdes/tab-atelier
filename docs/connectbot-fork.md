@@ -722,11 +722,16 @@ reconnect is nothing.
 
 Three details:
 
-- **The poll interval has to follow it.** `read` polls every 250ms so a disconnect is
+- **The poll interval has to follow it.** `read` polls once a second so a disconnect is
   responsive; a *suspended* session has no socket to be responsive about, so parking one
-  would have cost **four wake-ups a second forever** — worse than the socket it released.
-  It now polls every 30s when suspended, and `close`/`resumeSession` push onto the queue so
-  waking is still immediate. This was the bug in the first version of the feature.
+  would have kept that wake-up running for as long as the session stayed parked — more than
+  the nothing it replaced. It now polls every 30s when suspended, and
+  `close`/`resumeSession` push onto the queue so waking is still immediate.
+- **The poll is a wake-up budget, not latency.** Nothing the user can perceive waits on it:
+  bytes wake `read` the instant the listener queues them, and a keystroke never waits. It
+  only sets how often an idle session looks up to notice it should stop — which is why one
+  second is the right order of magnitude and a quarter of one is not. It was 250ms, and
+  that was four wake-ups a second forever on a phone that is otherwise asleep.
 - **A resume dials at once**, rather than waiting out a backoff it did not earn, and
   `suspendSession` resets the attempt counter. What parked it is already over.
 - **Only tab-atelier sessions.** Parking somebody's SSH session is a change to behaviour

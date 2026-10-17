@@ -1085,11 +1085,12 @@ class TabAtelier : AbsTransport() {
             val frame = try {
                 // **A suspended session polls slowly, and that is the point of it.**
                 // The poll is what makes a disconnect responsive, but it is also a
-                // wake-up: at [READ_POLL_MILLIS] this loop would wake four times a
-                // second for as long as the session stayed parked, which would burn more
-                // battery than the socket it just gave up. Nobody is waiting for these
-                // bytes — the session was suspended precisely because nobody is looking
-                // — so the interval stretches to something that costs nothing.
+                // wake-up, and a suspended session has no socket to be responsive about.
+                // Left at [READ_POLL_MILLIS] this loop would keep waking once a second
+                // for as long as the session stayed parked — which is more than the
+                // nothing it replaced. Nobody is waiting for these bytes, because the
+                // session was suspended precisely because nobody is looking, so the
+                // interval stretches to something that costs nothing.
                 //
                 // Waking up is not delayed by it: `close` and `resumeSession` both push
                 // onto [inbound], which returns from the poll immediately.
@@ -1464,17 +1465,31 @@ class TabAtelier : AbsTransport() {
          */
         private const val CONNECT_TIMEOUT_SECONDS = 15L
 
-        /** How long a read waits before reporting "nothing yet" to the caller. */
-        private const val READ_POLL_MILLIS = 250L
+        /**
+         * How long a read waits before reporting "nothing yet" to the caller.
+         *
+         * **This is a wake-up budget, not a latency figure.** The poll does not pace
+         * anything the user can perceive: bytes wake [read] the instant the listener
+         * queues them, and a keystroke never waits on it. All it sets is how often an idle
+         * session looks up to notice that it should stop — so one second is the right order
+         * of magnitude, and a quarter of one is not.
+         *
+         * It is not free, either: the loop runs for as long as the app does, so this
+         * divided into a second is how many times it wakes per second while nothing is
+         * happening, on a phone that is otherwise asleep. One is enough for a disconnect
+         * or a suspend to land within a second of being asked for, which no user can
+         * distinguish from immediately.
+         */
+        private const val READ_POLL_MILLIS = 1_000L
 
         /**
          * How long a read waits while the session is suspended.
          *
          * Half a minute, which is the difference between a parked session costing nothing
-         * and a parked session costing four CPU wake-ups a second — the latter being worse
-         * than the socket it replaced, since a socket at least does something. The interval
-         * does not delay anything the user can see: `close` and `resumeSession` both push
-         * onto the queue and return from the poll at once.
+         * and a parked session costing a wake-up a second for as long as it stays parked —
+         * the latter being worse than the socket it replaced, since a socket at least does
+         * something. The interval does not delay anything the user can see: `close` and
+         * `resumeSession` both push onto the queue and return from the poll at once.
          */
         private const val SUSPENDED_POLL_MILLIS = 30_000L
 
