@@ -1041,6 +1041,24 @@ pub fn build_agent_resume_command(kind: &str, session_id: &str, plan: Option<boo
     }
 }
 
+/// Whether a status report may replace the tab's recorded agent kind.
+///
+/// Kinds nest. `catbus` is a wrapping agent that runs `claude` *inside itself*,
+/// so claude's own hooks fire in a catbus session and report `claude` — the
+/// wrapped agent, not the tab. Letting that report win relabels the tab
+/// `claude`, and on the next daemon restart it comes back as a bare
+/// `claude --resume`: the catbus wrapper is gone, and with it the comms and
+/// tracing that made the tab a catbus in the first place. A wrapper is
+/// therefore never downgraded by the kind it wraps.
+///
+/// Every other report wins, because a fresh report is better news than what the
+/// tab already held — including `claude` → `catbus`, which is the upgrade a
+/// catbus tab makes when it announces itself after its shell started.
+#[must_use]
+pub fn kind_report_wins(current: Option<&str>, incoming: &str) -> bool {
+    !(current == Some("catbus") && incoming == "claude")
+}
+
 /// How a (re)spawn brings an agent tab back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentRelaunch {
@@ -6460,6 +6478,73 @@ mod state_writer_tests {
             compute_tab_led(None, true, false, false, false, true, false),
             Some(TabLed::Unreviewed)
         );
+    }
+
+    /// An unreviewed dot needs a session to point at.
+    ///
+    /// `unreviewed_work` means "a session left work nobody has looked at". Once
+    /// the agent is gone the sweep clears the session, the kind and this flag
+    /// together; even a flag that somehow survived cannot draw a dot, because
+    /// the dot is gated on a session being attached. Before that pairing was
+    /// fixed the amber LED outlived its agent — a tab whose catbus had died
+    /// showed "unreviewed" indefinitely, with no agent info behind it.
+    #[test]
+    fn an_unreviewed_dot_needs_a_session_to_point_at() {
+        use crate::{TabLed, compute_tab_led};
+        // No session attached, no agent alive, no reported state — only the
+        // stale flag: nothing to show.
+        assert_eq!(
+            compute_tab_led(None, false, false, false, true, true, false),
+            None,
+            "a review reminder with no session must not draw a dot"
+        );
+        // The same tab while the session is still attached does show it: that
+        // is the idle-agent case, where the work is still reviewable.
+        assert_eq!(
+            compute_tab_led(None, true, false, false, false, true, false),
+            Some(TabLed::Unreviewed)
+        );
+    }
+
+    /// A catbus tab stays a catbus when claude reports in.
+    ///
+    /// catbus wraps claude, so claude's hooks fire inside every catbus session
+    /// and announce `claude`. Before this rule the report overwrote the kind,
+    /// and the next daemon restart relaunched the tab as a bare
+    /// `claude --resume` — catbus, and its comms, gone. The regression needs a
+    /// reboot to be *seen*, so it is pinned here instead.
+    #[test]
+    fn a_wrapping_kind_is_not_downgraded_by_the_kind_it_wraps() {
+        use crate::kind_report_wins;
+        assert!(
+            !kind_report_wins(Some("catbus"), "claude"),
+            "claude reporting inside a catbus session is the wrapped agent"
+        );
+        assert!(
+            kind_report_wins(Some("claude"), "catbus"),
+            "and catbus announcing itself upgrades the tab"
+        );
+        assert!(kind_report_wins(None, "claude"), "a fresh tab takes its first kind");
+        assert!(
+            kind_report_wins(Some("codex"), "claude"),
+            "an unrelated previous kind yields"
+        );
+        assert!(kind_report_wins(Some("claude"), "codex"), "and so does a real handover");
+    }
+
+    /// A catbus tab comes back as catbus, not as the claude it wraps.
+    ///
+    /// The visible half of the rule above: what the relaunch actually runs.
+    #[test]
+    fn a_restored_catbus_tab_relaunches_catbus() {
+        let cmd = crate::build_agent_resume_command("catbus", "sess-1", None).expect("catbus resumes");
+        assert!(
+            cmd.contains("catbus"),
+            "a catbus tab must relaunch through catbus, not the claude it wraps: {cmd}"
+        );
+        // And the contrast that makes it meaningful: the bare kind is claude.
+        let claude = crate::build_agent_resume_command("claude", "sess-1", None).expect("claude resumes");
+        assert!(!claude.contains("catbus"), "a claude tab is a plain claude: {claude}");
     }
 
     #[test]

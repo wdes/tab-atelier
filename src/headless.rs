@@ -2280,8 +2280,15 @@ fn drain_pending(
             if upd.session_id.is_some() {
                 tab.agent_session_id = upd.session_id.map(Arc::from);
             }
-            if upd.agent_kind.is_some() {
-                tab.agent_kind = upd.agent_kind.map(Arc::from);
+            if let Some(kind) = upd.agent_kind.as_deref() {
+                // A claude hook firing inside a catbus session reports
+                // `claude` — the wrapped agent, not this tab's kind. Taking it
+                // would relabel the tab, and the next restart would bring it
+                // back as a bare `claude --resume`, the catbus wrapper gone.
+                // See `kind_report_wins`.
+                if crate::kind_report_wins(tab.agent_kind.as_deref(), kind) {
+                    tab.agent_kind = Some(Arc::from(kind));
+                }
             }
             if upd.plan_mode.is_some() {
                 tab.agent_plan_mode = upd.plan_mode;
@@ -2369,6 +2376,30 @@ fn drain_pending(
                 tab.agent_session_id = None;
                 tab.agent_kind = None;
                 tab.agent_plan_mode = None;
+            }
+        }
+
+        // An agent that is gone takes its whole record with it: the session
+        // anchor, the kind badge, and the review reminder.
+        //
+        // The reminder is the point of this pass. `unreviewed_work` is a dot
+        // saying "a session left work nobody has looked at", and it used to
+        // outlive its agent — the sweep cleared the session and the kind but
+        // left the flag, so a tab whose catbus or claude had died kept an amber
+        // LED forever with no agent behind it. A reminder about a session that
+        // no longer exists points at nothing.
+        //
+        // Guarded on `agent_pid` being gone, not merely on the state being
+        // empty: an idle agent reports nothing for minutes at a time, and
+        // clearing a *live* agent's session would cost the `--resume` the next
+        // restart needs. So a stale snapshot alone still drops by itself, below.
+        #[cfg(feature = "catbus")]
+        for tab in tabs.iter_mut() {
+            if tab.agent_state.is_none() && tab.agent_pid.is_none() {
+                tab.agent_session_id = None;
+                tab.agent_kind = None;
+                tab.agent_plan_mode = None;
+                tab.unreviewed_work = false;
             }
         }
 
