@@ -204,6 +204,24 @@ class TabAtelierClient @Inject constructor(
     private val clients = ConcurrentHashMap<ClientKey, OkHttpClient>()
 
     /**
+     * The progress reporter belonging to the dial happening *now*, per host.
+     *
+     * A client is cached and its `eventListenerFactory` is built once, so the factory cannot
+     * capture a [ConnectionProgress] — that one would be finished and stopped by the time the
+     * next dial reuses the client, and every dial after the first would report into nothing.
+     * That is a silent failure: the phases simply never appear, on exactly the reconnects and
+     * retries this feature exists to make legible.
+     *
+     * So the factory reads the current entry for its host when the call starts, and the entry
+     * is replaced at every dial. [ConcurrentHashMap] because a retry coroutine and a tab
+     * switch can both be dialling.
+     */
+    private val progressByHost = ConcurrentHashMap<Long, ConnectionProgress>()
+
+    /** The progress reporter for [hostId], if one is dialling right now. */
+    internal fun progressFor(hostId: Long): ConnectionProgress? = progressByHost[hostId]
+
+    /**
      * Keys accepted as first use, before they have earned being pinned.
      *
      * The trust manager is where a key is actually seen and verified, so it is
@@ -292,13 +310,45 @@ class TabAtelierClient @Inject constructor(
      * configured for that server alone. Stage 2 reuses it for the WebSocket,
      * which is what carries the User-Agent and the pin there too.
      */
-    fun clientFor(hostId: Long, base: TabAtelierBase): OkHttpClient {
+    /**
+     * The client for one host at one address.
+     *
+     * [progress] is per dial and not per client — a client is cached and reused, a dial
+     * happens once — so it is attached here rather than being part of the cached client's
+     * identity. That is what [okhttp3.OkHttpClient.Builder.eventListenerFactory] is for: the
+     * cached client holds a factory, and each call it makes gets the listener belonging to
+     * *that* call.
+     *
+     * A dial with no progress still needs a listener, because the cached client has a
+     * factory that asks for one; [ConnectionEventListener] handles a null progress by doing
+     * nothing.
+     */
+    fun clientFor(hostId: Long, base: TabAtelierBase, progress: ConnectionProgress? = null): OkHttpClient {
         val key = ClientKey(hostId, base.origin)
         // The address is part of the key, so editing a host's URL leaves the
         // client built for its old address unused; drop it, the way the address
         // it was built for was dropped.
         clients.keys.filter { it.hostId == hostId && it != key }.forEach(clients::remove)
-        return clients.computeIfAbsent(key) { buildClient(hostId, base) }
+
+        // Published before the client is fetched, so the factory below — which may run on
+        // the very next line, inside newWebSocket — finds this dial's reporter and not the
+        // previous one's.
+        if (progress != null) progressByHost[hostId] = progress else progressByHost.remove(hostId)
+
+        return clients.computeIfAbsent(key) {
+            buildClient(hostId, base).newBuilder()
+                // Reads the map on every call rather than capturing a reporter, so the
+                // cached client serves whichever dial is happening. See [progressByHost].
+                .eventListenerFactory { ConnectionEventListener(progressFor(hostId), base) }
+                .build()
+        }
+    }
+
+    /** Forgets the dial's reporter once it is over, so a later call does not report into it. */
+    internal fun clearProgress(hostId: Long, progress: ConnectionProgress) {
+        // Only if it is still *this* dial's: a retry may already have replaced the entry, and
+        // removing that one would silence the running dial.
+        progressByHost.remove(hostId, progress)
     }
 
     private fun buildClient(hostId: Long, base: TabAtelierBase): OkHttpClient {

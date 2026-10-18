@@ -50,6 +50,7 @@ import org.connectbot.data.entity.Host
 import org.connectbot.service.ConnectionState
 import org.connectbot.service.DisconnectReason
 import org.connectbot.tabatelier.TabAtelierBase
+import org.connectbot.tabatelier.ConnectionProgress
 import org.connectbot.tabatelier.TabAtelierAddresses
 import org.connectbot.service.TerminalManager
 import org.connectbot.tabatelier.TabAtelierClient
@@ -450,21 +451,61 @@ class TabAtelier : AbsTransport() {
 
         val opened = CountDownLatch(1)
         Timber.d("Opening tab-atelier session for host %d at %s", host.id, base.origin)
-        val webSocket = client.clientFor(host.id, base).newWebSocket(request, Listener(opened, attempt))
-        socket = webSocket
 
-        if (!opened.await(CONNECT_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
-            webSocket.cancel()
-            if (socket === webSocket) socket = null
-            throw IOException("Timed out connecting to $url")
+        // The phases the dialling goes through are reported as they happen, so a slow or
+        // stuck connection says *where* it is slow instead of going quiet after one line.
+        // The listener is OkHttp's own, so these are real events rather than a guess at
+        // what the client is probably doing.
+        val progress = startProgress(base)
+        try {
+            val webSocket = client.clientFor(host.id, base, progress)
+                .newWebSocket(request, Listener(opened, attempt))
+            socket = webSocket
+
+            if (!opened.await(CONNECT_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+                webSocket.cancel()
+                if (socket === webSocket) socket = null
+                throw IOException("Timed out connecting to $url")
+            }
+            // A socket that failed or closed before opening is a failed connection, not
+            // a session that ends immediately: the bridge has to hear about it as such,
+            // so the user gets the reason instead of an empty terminal.
+            failure?.let { throw it }
+            if (!open) {
+                throw IOException("The tab-atelier session at $url closed before it opened")
+            }
+        } finally {
+            // Stopped on every path: a ticker left running would outlive the connection and
+            // keep writing dots into a terminal that has since started showing real output.
+            progress.finish()
+            progress.stop()
+            // And forgotten, so a later call on the cached client cannot find a stopped
+            // reporter and write somewhere that no longer shows anything.
+            client?.clearProgress(host.id, progress)
         }
-        // A socket that failed or closed before opening is a failed connection, not
-        // a session that ends immediately: the bridge has to hear about it as such,
-        // so the user gets the reason instead of an empty terminal.
-        failure?.let { throw it }
-        if (!open) {
-            throw IOException("The tab-atelier session at $url closed before it opened")
-        }
+    }
+
+    /**
+     * Starts reporting what a dial is doing, into the terminal.
+     *
+     * Only while connecting: once the session is up the terminal belongs to the remote
+     * program, and this must never write into it again — see [ConnectionProgress] for why
+     * the dots are dots, and [TerminalBridge.writeProgress] for why whole lines would not do.
+     *
+     * A null bridge means there is nowhere to write, which happens in tests and in a session
+     * that was torn down between the caller deciding to dial and getting here. The progress
+     * still ticks, harmlessly — stopping it is the caller's job either way, and making this
+     * conditional would mean two shutdown paths.
+     */
+    private fun startProgress(base: TabAtelierBase): ConnectionProgress {
+        val progress = ConnectionProgress(
+            write = { text -> bridge?.writeProgress(text) },
+        )
+        progress.start()
+        // Named before any event arrives, so the first thing on screen is that a connection
+        // is being attempted at all rather than silence followed by dots.
+        progress.phase(manager?.getString(R.string.tabatelier_phase_starting, base.host) ?: base.host)
+        return progress
     }
 
     /** The address this session last established a socket on, if any. */

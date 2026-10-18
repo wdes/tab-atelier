@@ -771,7 +771,18 @@ class TerminalBridge {
             )
         }
 
-        outputLine(manager.res.getString(R.string.terminal_connecting, host.hostname, host.port, host.protocol))
+        // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): a tab-atelier session
+        // does not say "Connecting to host:port via tabatelier" and then go quiet. It says
+        // which phase it is in and how long that phase has taken, because the thing the
+        // user needs to know when a connection is slow is *where* it is slow — and because
+        // this transport is the one that can tell them: OkHttp reports DNS, TCP and TLS
+        // separately, so the answer is available rather than guessed.
+        //
+        // Every other protocol keeps the upstream line, which is still what they can
+        // honestly say.
+        if (host.protocol != TabAtelier.PROTOCOL) {
+            outputLine(manager.res.getString(R.string.terminal_connecting, host.hostname, host.port, host.protocol))
+        }
 
         scope.launch(dispatchers.io) {
             try {
@@ -847,6 +858,25 @@ class TerminalBridge {
 
                 terminalEmulator.writeInput(s.encodeToByteArray())
             }
+        }
+    }
+
+    /**
+     * Appends to the terminal exactly as given, without a newline.
+     *
+     * The counterpart to [outputLine] for text that is written *in pieces* rather than in
+     * whole lines — a connection phase and then one dot per second, so the dots land on the
+     * line that names the phase. [outputLine] splits on newlines and adds `\r\n` to each,
+     * which would put every dot on its own line.
+     *
+     * It touches the emulator directly, like [outputLine], so it is only correct before the
+     * session is established and before anything else is reading — which is exactly when a
+     * connection is being described.
+     */
+    internal fun writeProgress(text: String) {
+        if (text.isEmpty()) return
+        synchronized(localOutput) {
+            terminalEmulator.writeInput(text.encodeToByteArray())
         }
     }
 
