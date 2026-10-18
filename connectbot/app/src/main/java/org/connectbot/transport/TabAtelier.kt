@@ -159,15 +159,22 @@ class TabAtelier : AbsTransport() {
     private var addresses: TabAtelierAddresses = TabAtelierAddresses(primary = null, fallbacks = emptyList())
 
     /**
-     * Every address this server can be reached at, parsed, in the same order as
-     * [addresses].
+     * Every address this server can be reached at, parsed, **keyed by the address exactly as
+     * it was typed**.
+     *
+     * Keyed by the typed string and not by the parsed origin, and that is not a detail: an
+     * earlier version looked a base up with `bases.first { it.origin == candidate }`, where
+     * the candidate is raw text and the origin is normalised. Any host whose address differed
+     * between the two — a trailing slash, an uppercase scheme — made `first` throw
+     * `NoSuchElementException` and the connection crash. Keeping the typed string as the key
+     * means the lookup is a map access that cannot fail.
      *
      * Parsed once in [connect] rather than per dial so that a redial cannot start
      * honouring a different set of addresses than the session came up with — the user
      * editing the host mid-session would otherwise move the session without saying so.
      */
     @Volatile
-    private var bases: List<TabAtelierBase> = emptyList()
+    private var bases: Map<String, TabAtelierBase> = emptyMap()
 
     /**
      * The token this session's sockets authenticate with, taken once in [connect].
@@ -271,8 +278,8 @@ class TabAtelier : AbsTransport() {
         // one happened to work and quietly ignore the rest. Reporting it as "no address"
         // rather than connecting to half of them is the honest answer: the user has a
         // typo in a fallback, and the way to fix it is the editor.
-        val bases = addresses.all.mapNotNull { TabAtelierBase.parse(it) }
-        if (bases.isEmpty()) {
+        val parsed = addresses.parsed()
+        if (parsed.isEmpty()) {
             bridge?.outputLine(service.getString(R.string.tabatelier_url_missing))
             bridge?.dispatchDisconnect(DisconnectReason.REMOTE_EOF)
             return
@@ -281,11 +288,12 @@ class TabAtelier : AbsTransport() {
         // this has returned, and for the redials, which reach it many times more.
         this.client = client
         this.addresses = addresses
-        this.bases = bases
-        // The address to start on. A LAN address goes first when the phone is on the same
-        // network as one, which is the whole point of having several; `candidates` decides
-        // and is a pure function.
-        this.base = bases.first { it.origin == addresses.candidates(onLocalNetwork(service)).firstOrNull() }
+        this.bases = parsed
+        // The address [openSocket] starts on is decided there, from [addresses] and the
+        // current network. This is only the one [switchTab] falls back to when it has to
+        // rebuild the transport, and the first address as typed is the right default for
+        // that: it is the one the user calls the server.
+        this.base = parsed.values.first()
         this.token = client.token(host.id)
 
         // The tab this session is on is read once and then held, because whoever
@@ -400,13 +408,14 @@ class TabAtelier : AbsTransport() {
      * address it happened to come up on.
      */
     private fun walkActiveFirst(
-        reachable: List<TabAtelierBase>,
+        reachable: Map<String, TabAtelierBase>,
         candidates: List<String>,
         active: TabAtelierBase?,
     ): List<TabAtelierBase> {
-        val ordered = candidates.mapNotNull { origin ->
-            reachable.firstOrNull { it.origin == origin.trim() }
-        } + reachable.filter { base -> candidates.none { it.trim() == base.origin } }
+        // A map access per candidate, so a candidate that was not parsed simply does not
+        // appear — no lookup can fail, which is what the previous version got wrong.
+        val ordered = candidates.mapNotNull { reachable[it] } +
+            reachable.filterKeys { it !in candidates }.values
 
         if (active == null || active !in ordered) return ordered
         return listOf(active) + ordered.filter { it !== active }
@@ -562,7 +571,15 @@ class TabAtelier : AbsTransport() {
             val host = host ?: return false
             val service = manager ?: return false
             val rebuilt = TabAtelierClient(service, SecurePasswordStorage(service))
-            val rebuiltBase = rebuilt.base(host.tabAtelierUrl?.takeIf { it.isNotBlank() })
+            // Rebuilt from the host, and all three fields together: leaving [bases] empty
+            // would send [openSocket] down its "no address" path, so the switch would fail
+            // with a message about a missing address that the host plainly has.
+            val rebuiltAddresses = TabAtelierAddresses(
+                primary = host.tabAtelierUrl,
+                fallbacks = TabAtelierAddresses.parseFallbacks(host.tabAtelierUrls),
+            )
+            val rebuiltParsed = rebuiltAddresses.parsed()
+            val rebuiltBase = rebuiltParsed.values.firstOrNull()
             if (rebuiltBase == null) {
                 // There is nothing to switch *with*, and saying so is the whole point:
                 // the address the user gave cannot be reached, and the silence here is
@@ -572,7 +589,10 @@ class TabAtelier : AbsTransport() {
                 return false
             }
             client = rebuilt
+            addresses = rebuiltAddresses
+            bases = rebuiltParsed
             base = rebuiltBase
+            token = rebuilt.token(host.id)
             Timber.d("Rebuilt the tab-atelier client to switch %d to tab %s", host.id, tabKey)
         }
 

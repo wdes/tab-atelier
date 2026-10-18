@@ -74,6 +74,27 @@ data class TabAtelierAddresses(
             all.filter { it in local } + all.filter { it !in local }
         }
 
+    /**
+     * Every address that parses, paired with **the address exactly as typed**.
+     *
+     * The pairing exists so callers can order parsed addresses by the strings the user typed,
+     * without ever comparing a parsed origin to a raw string. That comparison was a real
+     * defect: `bases.first { it.origin == candidate }` threw `NoSuchElementException` — and
+     * took the connection down with it — for any host whose address normalises differently
+     * from how it was written, which is as ordinary as a trailing slash or an uppercase
+     * scheme. A map keyed by the typed string cannot fail that way.
+     *
+     * Insertion order is kept because the configured order is meaningful.
+     */
+    fun parsed(): LinkedHashMap<String, TabAtelierBase> {
+        val result = LinkedHashMap<String, TabAtelierBase>()
+        for (address in all) {
+            val base = TabAtelierBase.parse(address) ?: continue
+            result[address] = base
+        }
+        return result
+    }
+
     companion object {
         /**
          * Splits the stored fallback column into addresses.

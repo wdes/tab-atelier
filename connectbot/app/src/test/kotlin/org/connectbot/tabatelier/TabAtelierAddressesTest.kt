@@ -184,6 +184,56 @@ class TabAtelierAddressesTest {
     }
 
     /**
+     * An address that normalises differently from how it was typed is still keyed by what was
+     * typed — and nothing throws.
+     *
+     * This is a regression test for a crash, not a style assertion. An earlier version looked
+     * a parsed address up with `bases.first { it.origin == candidate }`, comparing a
+     * *normalised* origin against the *raw* string the user typed. Any host written with a
+     * trailing slash, an uppercase scheme or a default port made that `first` throw
+     * `NoSuchElementException`, and the connection died with it — so the app was unusable for
+     * exactly the addresses that are most natural to type.
+     *
+     * Asserted on the keys, because the keys are what the ordering code walks.
+     */
+    @Test
+    fun addressesAreKeyedByWhatWasTypedEvenWhenTheyNormalise() {
+        val typed = listOf(
+            "https://Home.Example:8443/",
+            "HTTPS://192.168.1.10:8443/",
+            "http://nas.local:80",
+        )
+        val addresses = TabAtelierAddresses(primary = typed[0], fallbacks = typed.drop(1))
+
+        val parsed = addresses.parsed()
+
+        assertEquals(typed, parsed.keys.toList())
+        // And every one of them parsed, so none is silently dropped from the ordering.
+        assertEquals(typed.size, parsed.size)
+        // The parsed forms are normalised, which is precisely why they were the wrong thing
+        // to compare the typed strings against.
+        assertTrue(parsed.values.first().origin != typed[0])
+    }
+
+    /**
+     * An address that cannot be parsed is dropped from the pairing but does not throw.
+     *
+     * The editor refuses to save one, so this is the case of a row written by an older
+     * version or edited behind the app's back: skipping it is right, crashing is not.
+     */
+    @Test
+    fun unparseableAddressesAreSkippedWhenPairing() {
+        val addresses = TabAtelierAddresses(
+            primary = "https://192.168.1.10:8443",
+            fallbacks = listOf("not a url", "https://home.example:8443"),
+        )
+
+        val parsed = addresses.parsed()
+
+        assertEquals(listOf("https://192.168.1.10:8443", "https://home.example:8443"), parsed.keys.toList())
+    }
+
+    /**
      * A hostname is never guessed to be local, because it cannot be known.
      *
      * `nas.example` resolves to whatever the current network says it does, so the honest
