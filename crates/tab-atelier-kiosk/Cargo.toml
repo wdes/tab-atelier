@@ -41,6 +41,8 @@ tab-atelier-api = { path = "../tab-atelier-api" }
 # The decision journal: the kiosk serves it, the daemon appends to it, and
 # both need the same file format and the same two mutations.
 tab-atelier-decisions = { path = "../tab-atelier-decisions" }
+# The skills catalogue, shared with the CLI.
+tab-atelier-catalog = { path = "../tab-atelier-catalog" }
 # The shared round-robin pacing: the same sweep brain.rs uses, so a fan-out
 # (the agent broadcast) is spread over time instead of arriving as a herd.
 tab-atelier-pace = { path = "../tab-atelier-pace" }

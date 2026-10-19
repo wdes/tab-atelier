@@ -17,6 +17,7 @@ pub mod bench_lag;
 pub mod brain;
 /// `tab-atelier brief` — what a Claude session starting here would be told.
 pub mod brief;
+pub mod catalog;
 /// `tab-atelier --check` — preflight the GUI's runtime libraries.
 pub mod check;
 pub mod claude_hook;

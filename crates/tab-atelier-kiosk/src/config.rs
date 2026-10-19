@@ -12,9 +12,9 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::catalog::Catalog;
 use crate::intent::{self, Intentions};
 use crate::remotes::Remotes;
+use tab_atelier_catalog::Catalog;
 use tab_atelier_decisions::Journal;
 
 /// Address the kiosk listens on when `TAB_ATELIER_KIOSK_ADDR` is unset.

@@ -1,6 +1,6 @@
 [workspace]
 members = [
-    "crates/tab-atelier-decisions", "crates/catbus-agent", "crates/claude-api", "crates/tab-atelier-briefs", "crates/tab-atelier-pace", "crates/tab-atelier-web", "crates/tab-atelier-api", "crates/tab-atelier-proxy", "crates/tab-atelier-kiosk"]
+    "crates/tab-atelier-catalog", "crates/tab-atelier-decisions", "crates/catbus-agent", "crates/claude-api", "crates/tab-atelier-briefs", "crates/tab-atelier-pace", "crates/tab-atelier-web", "crates/tab-atelier-api", "crates/tab-atelier-proxy", "crates/tab-atelier-kiosk"]
 # tab-atelier-proxy and tab-atelier-kiosk are deliberately NOT default members: they are
 # servers shipped as separate .debs, and building the desktop should not build them.
 # `cargo build -p <server-crate>` when you want one.
@@ -201,6 +201,8 @@ tab-atelier-api = { path = "crates/tab-atelier-api" }
 # project can post a decision without going through the UI — and both agree on the
 # format because there is one implementation of it.
 tab-atelier-decisions = { path = "crates/tab-atelier-decisions" }
+# The skills catalogue: the CLI retires and restores, the Kiosk renders, one implementation.
+tab-atelier-catalog = { path = "crates/tab-atelier-catalog" }
 # Named directly for the same reason the servers name `rocket`: the
 # `JsonSchema` derive expands a bare `schemars::…` path, which resolves against
 # this crate's own extern prelude and not against a re-export. The version lives

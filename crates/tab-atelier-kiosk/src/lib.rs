@@ -22,7 +22,6 @@ pub(crate) mod agent;
 pub(crate) mod auth;
 pub(crate) mod backup;
 pub(crate) mod card;
-pub(crate) mod catalog;
 pub(crate) mod config;
 pub(crate) mod daemon;
 pub(crate) mod intent;
@@ -44,7 +43,6 @@ pub use tab_atelier_api::{rocket, rocket_okapi, schemars};
 
 pub use backup::{BackupError, backup, restore, state_dir};
 pub use card::{AgentCard, CARD_KEYS, card_from_meta};
-pub use catalog::Skill;
 pub use config::{Config, DEFAULT_BIND, DEFAULT_STATE_DIR};
 // The journal now lives in its own crate, because the daemon needs the same
 // file format and the same two mutations. Re-exported here so every existing
@@ -54,3 +52,6 @@ pub use remotes::{Remote, RemoteView};
 pub use reports::Report;
 pub use server::{run, serve};
 pub use tab_atelier_decisions::Decision;
+// The catalogue moved to its own crate: the Kiosk serves it, the CLI edits it on a box
+// with no browser, and both go through this one implementation of the retire rule.
+pub use tab_atelier_catalog::{Catalog, CatalogError, EditRequest, Skill};

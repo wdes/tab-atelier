@@ -1,0 +1,24 @@
+[package]
+name = "tab-atelier-catalog"
+version = "0.5.0-dev"
+edition = "2024"
+license = "MPL-2.0"
+description = "The skills catalogue: reusable agent profiles, with an optimistic-concurrency edit and a tombstone"
+repository = "https://github.com/wdes/tab-atelier"
+publish = false
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# From the workspace table and not a version: `rocket_okapi` pins schemars 0.8,
+# and the derive expands a bare `schemars::…` path that resolves against this
+# crate's own extern prelude, so a re-export would not do.
+schemars = { workspace = true }
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+
+[lints.rust]
+unsafe_code = "forbid"

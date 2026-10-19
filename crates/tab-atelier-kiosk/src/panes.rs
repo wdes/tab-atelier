@@ -17,7 +17,6 @@ use std::path::{Path, PathBuf};
 use tab_atelier_api::marshal::Reply;
 use tab_atelier_api::problem;
 
-use crate::catalog::{Catalog, CatalogError, EditRequest};
 use crate::intent::Intentions;
 use crate::remotes::{Remote, RemoteError, Remotes};
 use crate::reports;
@@ -25,6 +24,7 @@ use crate::resources::{
     Answer, CatalogEdited, CatalogList, CatalogVisibility, DecisionOne, Decisions, Doc, IntentBody, IntentList,
     IntentOne, IntentPromoted, RemoteAdded, RemoteRemoved, Remotes as RemotesResource, Reports,
 };
+use tab_atelier_catalog::{Catalog, CatalogError, EditRequest};
 use tab_atelier_decisions::{DecisionError, Journal};
 
 /// The panes' state: the journal, the intentions, the remotes the Kiosk

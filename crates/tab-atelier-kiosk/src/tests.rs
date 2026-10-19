@@ -17,6 +17,8 @@ use std::time::Duration;
 
 use ureq::http::{Method, Request, Response, header};
 
+use tab_atelier_catalog::Catalog;
+
 use crate::config::{Config, HopTimeouts};
 use crate::server::build;
 use tab_atelier_decisions::Journal;
@@ -69,7 +71,7 @@ fn test_config(state: &Path, token: Option<&str>) -> Config {
             path: state.join("remotes.json"),
         },
         intentions: crate::intent::Intentions::new(state.join("intentions")).expect("intentions dir"),
-        catalog: crate::catalog::Catalog {
+        catalog: Catalog {
             path: state.join("catalog.jsonl"),
         },
         // The UI is served from disk, so the tests point at the crate's own

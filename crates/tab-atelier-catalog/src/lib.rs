@@ -1,11 +1,16 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! The skills catalogue — the Kiosk's own store of reusable agent profiles.
+//! The skills catalogue — the workspace's store of reusable agent profiles.
 //!
 //! A *skill* is a distilled agent: a prompt, a specialty, some conventions, and
-//! a running prompt version. The daemon does not own this (it is the operator's
-//! view of what their agents have become), so the Kiosk keeps it — one JSON
-//! object per skill, the file rewritten on each edit. The append-only JSONL the
+//! a running prompt version. It is the operator's view of what their agents have
+//! become, so it lives in a file rather than in the daemon's state — one JSON
+//! object per skill, rewritten on each edit.
+//!
+//! It is a crate rather than a Kiosk internal because the catalogue stopped
+//! belonging to one reader: the Kiosk serves it, and the CLI edits it on a box
+//! with no browser. Two implementations of "retire a skill" would agree until the
+//! first fix. The append-only JSONL the
 //! dashboard branch used earns its keep only with a retire loop that appends
 //! data-points; with authoring by hand, a rewritten file is the honest model.
 //!
@@ -16,10 +21,10 @@
 //! verdict are **derived elsewhere** and omitted here, so the UI renders its own
 //! "no data yet" state rather than a zero the store invented.
 
+use schemars::{self, JsonSchema};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use tab_atelier_api::schemars::{self, JsonSchema};
 
 use serde::{Deserialize, Serialize};
 
@@ -91,6 +96,25 @@ pub enum CatalogError {
     Unavailable,
 }
 
+impl std::fmt::Display for CatalogError {
+    /// What a person is told. Each arm says what to *do*, not what went wrong
+    /// internally: a caller printing this is a CLI or a page, and "unavailable"
+    /// on its own would send an operator looking in the wrong place.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound => write!(f, "no skill by that name"),
+            Self::Conflict => write!(
+                f,
+                "the skill was edited by someone else in the meantime — re-read it and try again"
+            ),
+            Self::EmptyProfile => write!(f, "a skill needs a prompt"),
+            Self::Unavailable => write!(f, "the catalogue file could not be read or written"),
+        }
+    }
+}
+
+impl std::error::Error for CatalogError {}
+
 /// The catalogue on disk.
 #[derive(Debug, Clone)]
 pub struct Catalog {
@@ -99,6 +123,16 @@ pub struct Catalog {
 }
 
 impl Catalog {
+    /// A catalogue backed by `path`.
+    ///
+    /// Nothing is created here: a fresh install has no catalogue, and [`Self::list`]
+    /// treats a missing file as empty rather than as a failure. Creating the file
+    /// on construction would mean a read-only command left a file behind.
+    #[must_use]
+    pub const fn new(path: std::path::PathBuf) -> Self {
+        Self { path }
+    }
+
     /// Every skill, tombstones excluded unless `include_deleted`.
     ///
     /// A missing file is an empty catalogue, not an error — a fresh Kiosk has no
@@ -206,7 +240,7 @@ impl Catalog {
             out.push('\n');
         }
         write_atomic(&self.path, &out).map_err(|_| CatalogError::Unavailable)?;
-        crate::config::set_owner_only(&self.path).map_err(|_| CatalogError::Unavailable)
+        set_owner_only(&self.path).map_err(|_| CatalogError::Unavailable)
     }
 }
 
@@ -229,6 +263,30 @@ fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
     fs::rename(&tmp, path).inspect_err(|_| {
         let _ = fs::remove_file(&tmp);
     })
+}
+
+/// Keep the catalogue file readable by its owner alone.
+///
+/// A skill holds a prompt and the conventions an agent was told to follow; it is
+/// not secret in the way a token is, but it is the operator's notes about their
+/// own fleet and there is no reason for a neighbouring account to read it.
+///
+/// This is the eighth copy of "chmod 0600 a state file" in the workspace (the
+/// daemon, the kiosk, the proxy, catbus-agent and the ssh-agent all have one).
+/// They could share a helper, and a security-shaped rule is a good candidate for
+/// one — but consolidating seven call sites is a separate change with its own
+/// blast radius, and doing it inside this extraction would hide it in a commit
+/// about a catalogue.
+#[cfg(unix)]
+fn set_owner_only(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+}
+
+/// No-op off unix, where the service does not run.
+#[cfg(not(unix))]
+fn set_owner_only(_path: &std::path::Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 #[cfg(test)]

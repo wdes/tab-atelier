@@ -29,10 +29,10 @@ use tab_atelier_api::rocket_okapi::response::OpenApiResponderInner;
 use tab_atelier_api::rocket_okapi::util;
 use tab_atelier_api::schemars::{self, JsonSchema};
 
-use crate::catalog::Skill;
 use crate::intent::Summary;
 use crate::remotes::RemoteView;
 use crate::reports::Report;
+use tab_atelier_catalog::Skill;
 use tab_atelier_decisions::Decision;
 
 /// A JSON resource and the status it is answered with.
