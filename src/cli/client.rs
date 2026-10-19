@@ -26,7 +26,7 @@
 use std::time::Duration;
 
 use super::{bench, bench_lag, brain, claude_hook, delegate, flags, logging, remote};
-use super::{set_assignment, set_context, set_font, set_meta, set_status, share_link, team, tokens};
+use super::{decision, set_assignment, set_context, set_font, set_meta, set_status, share_link, team, tokens};
 
 // ── the local API endpoint ──────────────────────────────────────────
 //
@@ -237,6 +237,10 @@ pub fn dispatch(name: &str, rest: &[String]) -> Option<i32> {
         // Agent state / identity plumbing.
         "set-status" => set_status::run(rest),
         "set-font" => set_font::run(rest),
+        // Not `set-context`-style silent-0 when there is no daemon: this verb is asked for
+        // by a producer that needs the board to have the decision, so a quiet success on a
+        // missing daemon would be the one failure nobody notices.
+        "decision" => decision::run(rest),
         "set-context" => set_context::run(rest),
         "set-assignment" => set_assignment::run(rest),
         "set-meta" => set_meta::run(rest),

@@ -140,6 +140,24 @@ impl<T, const CODE: u16> Doc<T, CODE> {
         Self { status: CODE, value }
     }
 
+    /// The resource itself.
+    ///
+    /// The `status` field is public and the value was not, which made a `Doc`
+    /// readable by a transport and opaque to its own producer's tests — a test
+    /// could assert the code and had to serialize the body to see the value. It
+    /// is also what a caller that is not a transport needs: a handler that
+    /// returns this and a caller that then wants the resource back.
+    #[must_use]
+    pub const fn body(&self) -> &T {
+        &self.value
+    }
+
+    /// Take the resource, leaving the status behind.
+    #[must_use]
+    pub fn into_body(self) -> T {
+        self.value
+    }
+
     /// The same resource, answered with a different status.
     ///
     /// For the routes whose *body* is one thing but whose status carries the

@@ -23,6 +23,7 @@ pub mod claude_hook;
 /// The single shared client-subcommand router used by both the GUI
 /// (`src/main.rs`) and the headless daemon ([`dispatch`]).
 pub mod client;
+pub mod decision;
 pub mod delegate;
 pub mod dispatch;
 pub mod doctor;

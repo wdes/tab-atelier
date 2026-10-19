@@ -182,6 +182,83 @@ paths:
                   edges:
                     type: array
                     items: { $ref: "#/components/schemas/FleetEdge" }
+  /decisions:
+    get:
+      tags: [decisions]
+      summary: The decisions waiting for a person
+      description: >
+        The decision journal, as the Kiosk renders it: things a person has to
+        rule on, read from the same file the Kiosk serves.
+
+
+        Reachable by remote peers, who may read what another machine is waiting
+        on. Appending is not: an append can replace an open decision, so a peer
+        that could write here would be editing our queue rather than merging
+        into it.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: includeArchived
+          in: query
+          required: false
+          schema: { type: boolean }
+          description: >
+            Include archived decisions. Ruled ones are always listed — they carry the
+            verdict, which is the record. `archived` is the state that means "done
+            being looked at".
+      responses:
+        "200":
+          description: The decisions, oldest first
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  decisions:
+                    type: array
+                    items: { type: object }
+    post:
+      tags: [decisions]
+      summary: Put a decision on the board
+      description: >
+        Idempotent by `id`, because a producer that re-runs — a cron, a crashed
+        hook, a retry after a timeout — will post the same decision more than
+        once and cannot know whether the last attempt landed.
+
+
+        The answer says which of four things happened: `appended` (new),
+        `already-present` (byte-identical), `already-ruled` (the id was settled,
+        and the verdict was left alone) or `updated` (an open decision whose
+        content changed, replaced rather than duplicated).
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id]
+              properties:
+                id: { type: string }
+                state: { type: string }
+                title: { type: string }
+                project: { type: string }
+                whyGated: { type: string }
+                reco: { type: string }
+      responses:
+        "200":
+          description: What the append did
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  result:
+                    type: string
+                    enum: [appended, already-present, already-ruled, updated]
+                  wrote: { type: boolean }
+                  id: { type: string }
   /blackboard:
     get:
       tags: [blackboard]

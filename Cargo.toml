@@ -197,6 +197,10 @@ tab-atelier-briefs = { path = "crates/tab-atelier-briefs" }
 tab-atelier-pace = { path = "crates/tab-atelier-pace" }
 tab-atelier-web = { path = "crates/tab-atelier-web" }
 tab-atelier-api = { path = "crates/tab-atelier-api" }
+# The decision journal: the daemon appends to the same file the Kiosk serves, so a
+# project can post a decision without going through the UI — and both agree on the
+# format because there is one implementation of it.
+tab-atelier-decisions = { path = "crates/tab-atelier-decisions" }
 # Named directly for the same reason the servers name `rocket`: the
 # `JsonSchema` derive expands a bare `schemars::…` path, which resolves against
 # this crate's own extern prelude and not against a re-export. The version lives

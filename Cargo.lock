@@ -7262,6 +7262,7 @@ dependencies = [
  "sha2 0.10.9",
  "tab-atelier-api",
  "tab-atelier-briefs",
+ "tab-atelier-decisions",
  "tab-atelier-pace",
  "tab-atelier-web",
  "tempfile",

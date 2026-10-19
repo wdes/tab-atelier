@@ -14,6 +14,9 @@ mod blackboard_route;
 mod catbus;
 mod claims_route;
 mod claude_only;
+// The decision journal, appended to from here and read by the Kiosk — the same crate,
+// so the two cannot drift on the format or on what a re-post is allowed to change.
+mod decisions_route;
 mod env;
 mod files;
 mod fleet_route;
@@ -159,6 +162,19 @@ fn sidecar_route(method: &str, path: &str) -> bool {
     // mean trusting its clock.
     if path == "/blackboard" {
         return method == "GET" || method == "POST";
+    }
+    // Decisions: a sidecar peer may *read* the journal — that is how one machine
+    // shows what another is waiting on — but not append to it.
+    //
+    // The difference from the blackboard is the merge rule. A blackboard merge is
+    // a set union: a peer can add, and nothing of ours is lost or rewritten. An
+    // append with an id we already hold can *replace* an open decision and, by
+    // design, refuses to touch a ruled one — so a peer that could append would be
+    // editing our queue. Reading is enough for the use that exists; a fleet that
+    // needs peer-authored decisions should say so, and the rule can change then
+    // with the reason written down.
+    if path == "/decisions" {
+        return method == "GET";
     }
     let Some(rest) = path.strip_prefix("/tabs/") else {
         return false;
@@ -2001,6 +2017,14 @@ fn handle_connection<S: Read + Write>(
         "/blackboard" => match method.as_str() {
             "GET" => write_reply(stream, blackboard_route::list(&envelope).into()),
             "POST" => write_reply(stream, blackboard_route::merge(&envelope).into()),
+            _ => method_not_allowed(stream),
+        },
+        // The decision journal: a project puts a question in front of a person without needing the
+        // Kiosk UI, and reads back what is waiting. Appending is idempotent by id, so a re-running
+        // producer is safe — see `Appended` for what a repeat is allowed to change.
+        "/decisions" => match method.as_str() {
+            "GET" => write_reply(stream, decisions_route::list(&envelope).into()),
+            "POST" => write_reply(stream, decisions_route::append(&envelope).into()),
             _ => method_not_allowed(stream),
         },
         "/env" => match method.as_str() {

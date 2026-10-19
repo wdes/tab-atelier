@@ -10,7 +10,6 @@
 //! journal is the Kiosk's own data, and a pane that only worked while the daemon
 //! was up would be the daemon's pane wearing the Kiosk's name.
 
-use std::fmt::Write as _;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -208,14 +207,26 @@ impl Journal {
     /// Rewrites the one line for `id` with `edit` applied, leaving the rest byte
     /// for byte. Rewriting in place keeps the journal the single source: a
     /// separate index would be a second thing to keep in step.
-    fn update(&self, id: &str, mut edit: impl FnMut(&mut Decision)) -> Result<Decision, DecisionError> {
+    ///
+    /// Public because it is the general form of the two mutations below — and
+    /// because a process that *produces* decisions can need it too, to mark one
+    /// settled when the condition it asked about resolves on its own. Anything
+    /// with a narrower meaning should be a named wrapper around this, not a
+    /// second rewriter.
+    ///
+    /// # Errors
+    ///
+    /// [`DecisionError::NotFound`] when no line carries `id`,
+    /// [`DecisionError::Unavailable`] when the file cannot be read or written.
+    pub fn update(&self, id: &str, mut edit: impl FnMut(&mut Decision)) -> Result<Decision, DecisionError> {
         let raw = fs::read_to_string(&self.path).map_err(|_| DecisionError::Unavailable)?;
         let mut out = String::with_capacity(raw.len());
         let mut updated = None;
         for line in raw.lines() {
             let trimmed = line.trim();
             if trimmed.is_empty() || trimmed.starts_with('#') {
-                writeln!(out, "{line}").expect("writing to a String cannot fail");
+                out.push_str(line);
+                out.push('\n');
                 continue;
             }
             let mut decision: Decision = serde_json::from_str(trimmed).map_err(|_| DecisionError::Unavailable)?;
@@ -223,12 +234,11 @@ impl Journal {
                 edit(&mut decision);
                 updated = Some(decision.clone());
             }
-            writeln!(
-                out,
-                "{}",
-                serde_json::to_string(&decision).expect("a parsed decision re-serializes")
-            )
-            .expect("writing to a String cannot fail");
+            // `to_string` on a parsed decision is the only fallible step here, and it is reported
+            // rather than unwrapped: this is public API now, so a panic would be a way for a
+            // caller to take down a daemon over one malformed line.
+            out.push_str(&serde_json::to_string(&decision).map_err(|_| DecisionError::Unavailable)?);
+            out.push('\n');
         }
         let updated = updated.ok_or(DecisionError::NotFound)?;
         fs::write(&self.path, out).map_err(|_| DecisionError::Unavailable)?;
