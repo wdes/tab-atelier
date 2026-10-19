@@ -2046,10 +2046,20 @@ fn read_or_mint_token(path: &std::path::Path) -> String {
     if std::fs::write(path, &minted).is_ok() {
         // Owner-only, same as api.token — a world-readable token would hand
         // every local user the capability it carries.
+        //
+        // The failure is reported, not discarded: a share token left at the umask
+        // default is exactly the hole this line exists to close, and silently
+        // ignoring the chmod means it is left open with nothing in the log to say
+        // so. The token still works in memory for this run.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+            if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+                log::warn!(
+                    "could not restrict {} to its owner: {e} — the share token in it is readable by other local accounts",
+                    path.display()
+                );
+            }
         }
     }
     minted
@@ -3774,7 +3784,14 @@ pub fn save_preferences_at(path: &std::path::Path, prefs: &Preferences) {
     #[cfg(unix)]
     if path.exists() {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        // Reported rather than ignored: this file carries a bearer token per
+        // configured remote, and a silent failure leaves all of them readable.
+        if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+            log::warn!(
+                "could not restrict {} to its owner: {e} — the remote tokens in it are readable by other local accounts",
+                path.display()
+            );
+        }
     }
 }
 
@@ -3846,10 +3863,23 @@ fn write_atomic_raw_with_rotation(dir: &std::path::Path, path: &std::path::Path,
     // world-readable, even briefly. The final file inherits these
     // perms through the rename, and each `.bak*` rotation is a rename
     // of an already-0600 file, so the backups are protected too.
+    //
+    // A failure aborts the write rather than being ignored. This is the one
+    // ordering that can keep the secret off the disk entirely: if the chmod did
+    // not take, the very next thing would be to write the body world-readable,
+    // and the old file is still intact and still correct on disk. Losing one save
+    // is recoverable; leaking every share and relay token in the fleet is not.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
+        if let Err(e) = f.set_permissions(std::fs::Permissions::from_mode(0o600)) {
+            log::error!(
+                "refusing to write {}: could not make it owner-only ({e}) — the credential in it would be world-readable",
+                tmp.display()
+            );
+            let _ = std::fs::remove_file(&tmp);
+            return;
+        }
     }
     if f.write_all(data.as_bytes()).is_err() || f.sync_all().is_err() {
         let _ = std::fs::remove_file(&tmp);

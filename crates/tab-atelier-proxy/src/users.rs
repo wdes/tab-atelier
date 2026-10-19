@@ -1044,10 +1044,16 @@ impl Store {
         std::fs::write(&tmp, json).map_err(|e| Error::Io(format!("write {}: {e}", tmp.display())))?;
         // Permissions BEFORE the rename: between rename and chmod the real file
         // would briefly be world-readable, and it holds every key hash.
+        //
+        // The failure is propagated rather than discarded. A discarded chmod here
+        // means the account store — every key hash on the relay — is left readable
+        // by any local account, and nothing would ever say so. Refusing the write is
+        // the safe direction: the previous file is untouched.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| Error::Io(format!("chmod {}: {e}", tmp.display())))?;
         }
         std::fs::rename(&tmp, &self.path).map_err(|e| Error::Io(format!("rename into {}: {e}", self.path.display())))
     }

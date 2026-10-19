@@ -44,10 +44,16 @@ pub async fn serve(agent: Arc<Agent>, path: PathBuf, once: bool) -> Result<(), S
         std::fs::create_dir_all(parent)?;
     }
     let listener = UnixListener::bind(&path)?;
+    // The socket IS the authorisation for this agent: anything that can connect
+    // can drive the session. Left at the umask default (0755 on a typical box)
+    // that means every local account. Propagated rather than discarded — unlike
+    // the other chmods in this workspace, this one guards a live capability
+    // rather than a file that merely holds a secret, so a failure to restrict it
+    // must not leave the agent listening.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
     }
     log::info!("listening on {}", path.display());
 

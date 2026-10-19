@@ -198,10 +198,14 @@ pub fn admin_token(dir: &std::path::Path) -> Result<String, String> {
     let minted = users::mint_key();
     std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     std::fs::write(&path, &minted).map_err(|e| format!("write {}: {e}", path.display()))?;
+    // Propagated, not ignored: this is a freshly minted API key, and a chmod that
+    // silently failed would leave it readable by every local account on the relay.
+    // The caller gets a refusal rather than a key it believes is private.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("chmod {}: {e}", path.display()))?;
     }
     Ok(minted)
 }

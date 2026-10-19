@@ -948,13 +948,23 @@ pub fn load_or_generate_token() -> String {
     }
     let token = generate_token();
     if std::fs::create_dir_all(&dir).is_ok() {
-        // Best-effort write; ignore failures so a read-only home
-        // doesn't keep the API server from starting.
-        let _ = std::fs::write(&path, &token);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        // Through `write_private_file`, not `write` + `set_permissions`.
+        //
+        // The old form created the file with the process umask (0644 on a default
+        // box) and chmod'd it afterwards, so the master token was briefly
+        // world-readable on every regeneration — and *permanently* so when the
+        // chmod failed, because that result was discarded along with the write's.
+        //
+        // `write_private_file` opens with `O_EXCL` and `mode(0o600)`, so there is no
+        // window and nothing to ignore. A read-only home still must not stop the
+        // server from starting, so the failure is logged rather than returned: the
+        // in-memory token works either way, and a warning that names the path is
+        // what lets an operator fix it.
+        if let Err(e) = write_private_file(&path, token.as_bytes()) {
+            log::warn!(
+                "api: could not persist the master token to {}: {e} — it is live for this run only",
+                path.display()
+            );
         }
     }
     token
@@ -3496,6 +3506,51 @@ mod tests {
         let mut buf = String::new();
         let _ = stream.read_to_string(&mut buf);
         buf
+    }
+
+    /// A file that holds a credential must never be readable by anyone else.
+    ///
+    /// Nothing asserted this before, which is how the master token came to be written
+    /// with a plain `write` (umask default, 0644) and chmod'd afterwards with the result
+    /// discarded — briefly world-readable on every regeneration, and permanently so when
+    /// the chmod failed. `O_EXCL` + `mode(0o600)` means the bytes never exist under any
+    /// other mode, so it is the mode *after a write* that is checked here.
+    #[cfg(unix)]
+    #[test]
+    fn a_credential_file_is_never_readable_by_anyone_but_its_owner() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let path = dir.path().join("api.token");
+        super::write_private_file(&path, b"a-secret").expect("write");
+
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the token file is {mode:o}, not 0600");
+        // And the content survived — a chmod that truncated the file would pass a
+        // permissions check while destroying the token it protects.
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), "a-secret");
+    }
+
+    /// Re-writing an existing token file must not leave the *old* mode in place.
+    ///
+    /// `O_EXCL` fails on an existing path, so `write_private_file` has to remove it
+    /// first; if that removal were ever dropped, the second write would either fail or
+    /// reuse a file whose mode nobody set — which is the same hole in a different shape.
+    #[cfg(unix)]
+    #[test]
+    fn rewriting_a_credential_file_keeps_it_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let path = dir.path().join("api.token");
+        std::fs::write(&path, b"old").expect("seed");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("loosen");
+
+        super::write_private_file(&path, b"new-secret").expect("rewrite");
+
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the rewritten token file is {mode:o}, not 0600");
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), "new-secret");
     }
 
     /// POST a JSON body, with the length computed rather than counted.
