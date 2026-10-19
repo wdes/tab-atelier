@@ -934,6 +934,337 @@ function intentFormHtml() {
   </div>`;
 }
 
+// ─── Intentions: the pane (list · transcript · split) ────────────────────────────────────────
+//
+// The grille above *creates* an intention. This pane is what you do with one afterwards: see them
+// all, open one, read the worker's transcript, answer it, promote it, launch its worker. The
+// grille is not replaced — it is what the right-hand column shows until an intention is open.
+//
+// The two columns are resizable and the ratio is remembered: a transcript is long and a list is
+// short, so the split a reader wants is theirs rather than a fixed 50/50.
+
+const INTENT_SPLIT_KEY = "ta-kiosk-intent-split";
+const INTENT_SPLIT_MIN = 20;
+const INTENT_SPLIT_MAX = 80;
+
+/** The summaries from the last list fetch, by slug — the detail route answers only `{slug, body}`. */
+const INTENT_SUMMARIES = new Map();
+/** The configured remotes, fetched once; a launch needs one. */
+let INTENT_REMOTES = [];
+
+/** The split a first visit gets: wide enough for a transcript, narrow enough to keep the list usable. */
+const INTENT_SPLIT_DEFAULT = 38;
+
+/** Clamp a stored or dragged split percentage to something both columns can survive. */
+function clampIntentSplit(pct) {
+  // `null` first, and deliberately: `Number(null)` is 0, not NaN, so a missing localStorage entry
+  // (which is exactly `null`) would otherwise clamp to the minimum and open every first visit with a
+  // collapsed list. Same for `""` and `false`, both of which coerce to 0.
+  if (pct === null || pct === undefined || pct === "" || pct === false) return INTENT_SPLIT_DEFAULT;
+  const n = Math.round(Number(pct));
+  if (!Number.isFinite(n)) return INTENT_SPLIT_DEFAULT;
+  return Math.min(INTENT_SPLIT_MAX, Math.max(INTENT_SPLIT_MIN, n));
+}
+
+/** The remembered left-column width, as a percentage. */
+function readIntentSplit() {
+  try {
+    return clampIntentSplit(localStorage.getItem(INTENT_SPLIT_KEY));
+  } catch {
+    return INTENT_SPLIT_DEFAULT;
+  }
+}
+
+/** Remember the left-column width. A storage failure is not worth reporting — the pane still works. */
+function writeIntentSplit(pct) {
+  try { localStorage.setItem(INTENT_SPLIT_KEY, String(clampIntentSplit(pct))); } catch { /* ignore */ }
+}
+
+/** Move the divider. Applied to the live grid, so dragging never re-renders and never re-fetches. */
+function applyIntentSplit(el, pct) {
+  const grid = el.querySelector(".kk-intents");
+  if (!grid) return;
+  grid.style.gridTemplateColumns = `${clampIntentSplit(pct)}% 6px 1fr`;
+}
+
+/** One intention in the list. */
+function intentItemHtml(it) {
+  const slug = escapeHtml(String(it.slug || ""));
+  const title = escapeHtml(String(it.title || it.slug || "(sans titre)"));
+  const repo = it.repo ? `<span class="kk-intent-repo">${escapeHtml(String(it.repo))}</span>` : "";
+  // "prête" is the worker saying it has nothing left to ask. It is the one state a reader needs
+  // before choosing what to pick up, so it is a word and not a colour alone.
+  const ready = it.ready ? `<span class="kk-intent-ready">prête</span>` : "";
+  const worker = it.tab_id
+    ? `<span class="kk-intent-worker" title="onglet worker">${escapeHtml(String(it.tab_id).slice(0, 8))}</span>`
+    : "";
+  return `<li><button type="button" class="kk-intent-open" data-slug="${slug}">
+      <span class="kk-intent-title">${title}</span>
+      <span class="kk-intent-tags">${repo}${ready}${worker}</span>
+    </button></li>`;
+}
+
+/** The pane skeleton: list on the left, whatever is open on the right. */
+function intentPaneHtml() {
+  return `<div class="kk-intents" style="grid-template-columns: ${readIntentSplit()}% 6px 1fr">
+    <section class="kk-intent-side">
+      <header class="kk-intent-side-head">
+        <h3>Intentions</h3>
+        <button type="button" class="kk-intent-refresh" title="rafraîchir" aria-label="rafraîchir">↻</button>
+      </header>
+      <ul class="kk-intent-list"><li class="kk-intent-empty">chargement…</li></ul>
+    </section>
+    <div class="kk-intent-grip" role="separator" aria-orientation="vertical" tabindex="0"
+         title="glisser pour redimensionner" aria-label="redimensionner les colonnes"></div>
+    <section class="kk-intent-main">${intentFormHtml()}</section>
+  </div>`;
+}
+
+/** The right-hand column for an open intention: transcript, composer, and what can be done with it. */
+function intentPaneBodyHtml(slug, body) {
+  const it = INTENT_SUMMARIES.get(slug) || { slug };
+  const safeSlug = escapeHtml(String(slug));
+  const title = escapeHtml(String(it.title || slug));
+  // Promote only when the worker says it has nothing left to ask; a promote button on an unfinished
+  // intention would turn a half-formed idea into a plan.
+  const promote = it.ready ? `<button type="button" class="kk-intent-promote" data-slug="${safeSlug}">promouvoir en plan</button>` : "";
+  // A launch needs a worker tab and somewhere to put it; with neither the button would be a promise
+  // the kiosk cannot keep, so it is absent rather than disabled.
+  const launch = it.tab_id
+    ? `<button type="button" class="kk-intent-launch" data-slug="${safeSlug}">ouvrir le worker</button>`
+    : "";
+  return `<div class="kk-intent-detail">
+    <header class="kk-intent-detail-head">
+      <button type="button" class="kk-intent-back" title="revenir à la grille" aria-label="revenir à la grille">←</button>
+      <h3>${title}</h3>
+      <span class="kk-intent-detail-actions">${promote}${launch}</span>
+    </header>
+    <pre class="kk-intent-body">${escapeHtml(body || "")}</pre>
+    <div class="kk-intent-compose">
+      <textarea class="kk-intent-ask kk-autogrow" rows="2"
+        placeholder="répondre au worker sur cette intention…"></textarea>
+      <button type="button" class="kk-intent-send" data-slug="${safeSlug}">envoyer</button>
+      <span class="kk-intent-ask-msg" role="status"></span>
+    </div>
+  </div>`;
+}
+
+/** Fill the list from the server. */
+async function loadIntentions(el) {
+  const list = el.querySelector(".kk-intent-list");
+  if (!list) return;
+  try {
+    const res = await fetch("/intent/list", { headers: { accept: "application/json", ...AUTH_HEADERS } });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const model = await res.json();
+    INTENT_SUMMARIES.clear();
+    for (const it of model.intents || []) INTENT_SUMMARIES.set(it.slug, it);
+    const intents = model.intents || [];
+    list.innerHTML = intents.length
+      ? intents.map(intentItemHtml).join("")
+      : `<li class="kk-intent-empty">aucune intention</li>`;
+  } catch (err) {
+    list.innerHTML = `<li class="kk-intent-empty err">échec : ${escapeHtml(err.message)}</li>`;
+  }
+}
+
+/** Open one intention: fetch its transcript and show it on the right. */
+async function openIntention(el, slug) {
+  const main = el.querySelector(".kk-intent-main");
+  if (!main) return;
+  try {
+    const res = await fetch(`/intent/${encodeURIComponent(slug)}`, {
+      headers: { accept: "application/json", ...AUTH_HEADERS },
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const out = await res.json();
+    main.innerHTML = intentPaneBodyHtml(String(out.slug || slug), out.body || "");
+    for (const b of el.querySelectorAll(".kk-intent-open")) {
+      b.setAttribute("aria-current", String(b.dataset.slug === slug));
+    }
+    initAutogrow(el);
+  } catch (err) {
+    main.innerHTML = `<p class="kk-intent-empty err">échec : ${escapeHtml(err.message)}</p>`;
+  }
+}
+
+/** Send a message to the worker and re-render with the transcript it appends. */
+async function sendIntentMessage(el) {
+  const detail = el.querySelector(".kk-intent-detail");
+  if (!detail) return;
+  const slug = detail.querySelector(".kk-intent-send")?.dataset.slug || "";
+  const box = detail.querySelector(".kk-intent-ask");
+  const msg = detail.querySelector(".kk-intent-ask-msg");
+  const say = (text, cls) => {
+    if (!msg) return;
+    msg.textContent = text;
+    msg.className = `kk-intent-ask-msg ${cls}`;
+  };
+  const text = (box?.value || "").trim();
+  if (!text) { say("écrire un message", "err"); return; }
+  // Disabled while in flight: the worker appends one turn per request, and a double-click that
+  // queued two asks would read as the agent repeating itself.
+  const send = detail.querySelector(".kk-intent-send");
+  if (send) send.disabled = true;
+  try {
+    const res = await fetch(`/intent/${encodeURIComponent(slug)}/ask`, {
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "application/json", ...AUTH_HEADERS },
+      body: JSON.stringify({ text }),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const out = await res.json();
+    // The server answers the whole updated transcript, so it is replaced rather than appended
+    // client-side: two sources for the same text drift the moment one path is fixed.
+    const main = el.querySelector(".kk-intent-main");
+    if (main) {
+      main.innerHTML = intentPaneBodyHtml(String(out.slug || slug), out.body || "");
+      initAutogrow(el);
+    }
+  } catch (err) {
+    say(`échec : ${escapeHtml(err.message)}`, "err");
+    if (send) send.disabled = false;
+  }
+}
+
+/** The remotes, for a launch. Fetched lazily: most visits never launch anything. */
+async function loadIntentRemotes() {
+  if (INTENT_REMOTES.length) return INTENT_REMOTES;
+  try {
+    const res = await fetch("/kiosk/remotes", { headers: { accept: "application/json", ...AUTH_HEADERS } });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const model = await res.json();
+    INTENT_REMOTES = (model.remotes || []).map((r) => ({ id: r.id, label: r.label || r.id }));
+  } catch {
+    INTENT_REMOTES = [];
+  }
+  return INTENT_REMOTES;
+}
+
+/** Promote a ready intention into a plan, or open its worker's terminal. */
+async function intentAction(el, verb, slug) {
+  const say = el.querySelector(".kk-intent-ask-msg");
+  if (verb === "launch") {
+    const remotes = await loadIntentRemotes();
+    // One remote is the normal case and needs no question. Several is a choice only the reader can
+    // make — spawning a worker on the wrong machine is not undoable from here.
+    let remote = remotes[0];
+    if (remotes.length > 1) {
+      const byLabel = remotes.map((r) => `${r.label} (${r.id})`).join("\n");
+      const picked = window.prompt(`Lancer le worker sur quel serveur ?\n${byLabel}`, remotes[0].label);
+      remote = remotes.find((r) => r.label === picked || r.id === picked) || null;
+    }
+    if (!remote) {
+      if (say) { say.textContent = "aucun serveur configuré"; say.className = "kk-intent-ask-msg err"; }
+      return;
+    }
+    const res = await fetch(
+      `/kiosk/remotes/${encodeURIComponent(remote.id)}/intent/${encodeURIComponent(slug)}/launch`,
+      { method: "POST", headers: { accept: "application/json", ...AUTH_HEADERS } },
+    );
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const out = await res.json();
+    if (out.tab) {
+      // The launch records the tab; the viewer is a page, so it opens in its own window rather than
+      // replacing the kiosk.
+      window.open(
+        `/kiosk/remotes/${encodeURIComponent(remote.id)}/tabs/${encodeURIComponent(out.tab)}/view`,
+        "_blank",
+        "noopener",
+      );
+    }
+    return out;
+  }
+  const res = await fetch(`/intent/${encodeURIComponent(slug)}/${verb}`, {
+    method: "POST",
+    headers: { accept: "application/json", ...AUTH_HEADERS },
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+
+/** Wire the pane's own controls. Delegated, so a re-render never needs re-wiring. */
+function wireIntent(el) {
+  // Idempotent on purpose: `#kiosk-panel` survives a re-render of its innerHTML, so a listener added
+  // here twice would run twice per click — and a promote that fired twice is a second plan.
+  if (el.dataset.intentWired === "1") return;
+  el.dataset.intentWired = "1";
+  el.addEventListener("click", async (e) => {
+    const open = e.target.closest(".kk-intent-open");
+    if (open) { await openIntention(el, open.dataset.slug); return; }
+    if (e.target.closest(".kk-intent-refresh")) { await loadIntentions(el); return; }
+    if (e.target.closest(".kk-intent-back")) {
+      el.querySelector(".kk-intent-main").innerHTML = intentFormHtml();
+      initAutogrow(el);
+      for (const b of el.querySelectorAll(".kk-intent-open")) b.removeAttribute("aria-current");
+      return;
+    }
+    if (e.target.closest(".kk-intent-send")) { await sendIntentMessage(el); return; }
+    const promote = e.target.closest(".kk-intent-promote");
+    if (promote) {
+      // A failure leaves the transcript as it was: the reader can retry, and a half-applied promote
+      // would be worse than a refused one.
+      try {
+        await intentAction(el, "promote", promote.dataset.slug);
+        await loadIntentions(el);
+        await openIntention(el, promote.dataset.slug);
+      } catch (err) {
+        const say = el.querySelector(".kk-intent-ask-msg");
+        if (say) { say.textContent = `échec : ${escapeHtml(err.message)}`; say.className = "kk-intent-ask-msg err"; }
+      }
+      return;
+    }
+    const launch = e.target.closest(".kk-intent-launch");
+    if (launch) {
+      try { await intentAction(el, "launch", launch.dataset.slug); }
+      catch (err) {
+        const say = el.querySelector(".kk-intent-ask-msg");
+        if (say) { say.textContent = `échec : ${escapeHtml(err.message)}`; say.className = "kk-intent-ask-msg err"; }
+      }
+    }
+  });
+  // Ctrl/Cmd+Enter sends, matching the composer's placeholder expectation and every chat box the
+  // reader already uses.
+  el.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && (e.ctrlKey || e.metaKey) && e.target.classList.contains("kk-intent-ask")) {
+      e.preventDefault();
+      void sendIntentMessage(el);
+    }
+  });
+  wireIntentSplit(el);
+}
+
+/** Drag (or arrow-key) the divider. */
+function wireIntentSplit(el) {
+  const grip = el.querySelector(".kk-intent-grip");
+  const grid = el.querySelector(".kk-intents");
+  if (!grip || !grid) return;
+  const setFromX = (clientX) => {
+    const box = grid.getBoundingClientRect();
+    if (box.width <= 0) return;
+    const pct = clampIntentSplit(((clientX - box.left) / box.width) * 100);
+    applyIntentSplit(el, pct);
+    writeIntentSplit(pct);
+  };
+  grip.addEventListener("pointerdown", (e) => {
+    e.preventDefault();
+    grip.setPointerCapture?.(e.pointerId);
+    const move = (ev) => setFromX(ev.clientX);
+    const up = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+  });
+  // Keyboard too: a divider that only answers a drag is unreachable without a mouse.
+  grip.addEventListener("keydown", (e) => {
+    const current = readIntentSplit();
+    if (e.key === "ArrowLeft") { applyIntentSplit(el, current - 4); writeIntentSplit(current - 4); }
+    if (e.key === "ArrowRight") { applyIntentSplit(el, current + 4); writeIntentSplit(current + 4); }
+  });
+}
+
 // The 3-tab Kiosk shell: (a) Décisions, (b) Rapports, (c) Grille d'intention. The active tab
 // (persisted) is baked into the markup; a global close button lives in the header. Reports load
 // lazily on activation; the intent form is static. kioskDecisionsHtml keeps the cards intact.
@@ -954,7 +1285,7 @@ export function kioskHtml(readModel) {
     </div>
     ${panel("decisions", kioskDecisionsHtml(readModel))}
     ${panel("reports", `<div class="kk-reports"><div class="kk-loading">chargement…</div></div>`)}
-    ${panel("intent", intentFormHtml())}`;
+    ${panel("intent", intentPaneHtml())}`;
 }
 
 // The badge = nb of OPEN decisions, from any decisions fetch (a cold source —
@@ -1000,7 +1331,11 @@ async function openKiosk() {
 function afterKioskRender(el) {
   const active = readKioskTab();
   if (active === "reports") loadReports(el);
-  if (active === "intent") initAutogrow(el);
+  if (active === "intent") {
+    initAutogrow(el);
+    wireIntent(el);
+    void loadIntentions(el);
+  }
 }
 
 // Onglet (a↔b↔c) — switch the visible panel, persist the choice, lazy-load reports, size the
@@ -1011,7 +1346,10 @@ function switchKioskTab(el, tabId) {
   el.querySelectorAll(".kk-tab").forEach((b) => b.setAttribute("aria-selected", String(b.dataset.tab === tabId)));
   el.querySelectorAll(".kk-tabpanel").forEach((p) => { p.hidden = p.dataset.panel !== tabId; });
   if (tabId === "reports") loadReports(el);
-  if (tabId === "intent") initAutogrow(el);
+  if (tabId === "intent") {
+    initAutogrow(el);
+    void loadIntentions(el);
+  }
 }
 
 // Onglet (b) — the active ranging mode + the last fetched model/canRule, so switching the sort

@@ -279,6 +279,50 @@ kiosk { padding: 1rem; }
 .kk-intent-msg.ok { color: var(--led-ok-stroke, #6c6); }
 .kk-intent-msg.err { color: var(--led-error-stroke, #e66); }
 
+/* The intentions pane: list · divider · transcript. Two columns because a transcript is read while
+   scanning the list, and the divider is draggable because how much of each a reader wants is theirs.
+   `min-height: 0` on both columns is what lets the transcript scroll instead of stretching the panel. */
+.kk-intents { display: grid; grid-template-columns: 38% 6px 1fr; align-items: stretch; gap: 0; min-height: 16rem; }
+.kk-intent-side { display: flex; flex-direction: column; min-width: 0; min-height: 0; border-right: 0; }
+.kk-intent-side-head { display: flex; align-items: center; justify-content: space-between; gap: 0.4rem; padding: 0.35rem 0.5rem; border-bottom: 1px solid var(--border); }
+.kk-intent-side-head h3 { margin: 0; font-size: 0.78rem; font-weight: 600; letter-spacing: 0.02em; color: var(--muted); text-transform: uppercase; }
+.kk-intent-refresh { font: inherit; background: none; border: 1px solid var(--border); border-radius: 5px; color: var(--muted); cursor: pointer; padding: 0 0.35rem; line-height: 1.4; }
+.kk-intent-refresh:hover { color: var(--fg); }
+.kk-intent-list { list-style: none; margin: 0; padding: 0.3rem; overflow-y: auto; flex: 1 1 auto; min-height: 0; }
+.kk-intent-list li { margin: 0 0 0.2rem; }
+.kk-intent-open { display: flex; flex-direction: column; gap: 0.15rem; width: 100%; text-align: left; font: inherit; font-size: 0.8rem; background: none; border: 1px solid transparent; border-radius: 6px; padding: 0.3rem 0.45rem; color: var(--fg); cursor: pointer; }
+.kk-intent-open:hover { background: var(--panel); }
+/* aria-current is the selected intention, and it is the only state that needs to be visible at a
+   glance — the rest of the row is title plus tags. */
+.kk-intent-open[aria-current="true"] { background: var(--panel); border-color: var(--led-working-stroke); }
+.kk-intent-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.kk-intent-tags { display: flex; gap: 0.4rem; flex-wrap: wrap; font-size: 0.7rem; color: var(--muted); }
+.kk-intent-ready { color: var(--led-ok-stroke, #6c6); }
+.kk-intent-worker { font-family: var(--mono, monospace); opacity: 0.8; }
+.kk-intent-empty { color: var(--muted); font-size: 0.78rem; padding: 0.4rem 0.5rem; }
+.kk-intent-empty.err { color: var(--led-error-stroke, #e66); }
+
+/* The grip. 6px wide, invisible until hovered, and it shows the resize cursor across its whole
+   height so the target matches what it does. */
+.kk-intent-grip { cursor: col-resize; background: var(--border); border-radius: 2px; align-self: stretch; }
+.kk-intent-grip:hover, .kk-intent-grip:focus-visible { background: var(--led-working-stroke); outline: none; }
+
+.kk-intent-main { min-width: 0; min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
+.kk-intent-detail { display: flex; flex-direction: column; min-height: 0; flex: 1 1 auto; }
+.kk-intent-detail-head { display: flex; align-items: center; gap: 0.5rem; padding: 0.35rem 0.5rem; border-bottom: 1px solid var(--border); }
+.kk-intent-detail-head h3 { margin: 0; font-size: 0.85rem; font-weight: 600; flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.kk-intent-detail-actions { display: flex; gap: 0.4rem; flex: 0 0 auto; }
+.kk-intent-back, .kk-intent-promote, .kk-intent-launch, .kk-intent-send { font: inherit; font-size: 0.78rem; padding: 0.2rem 0.6rem; border-radius: 5px; border: 1px solid var(--border); background: var(--panel); color: var(--fg); cursor: pointer; }
+.kk-intent-promote { border-color: var(--led-ok-stroke, #6c6); color: var(--led-ok-stroke, #6c6); }
+.kk-intent-send:disabled { opacity: 0.55; cursor: default; }
+/* The transcript keeps its own shape — it is the worker's text, not ours, so it is never wrapped
+   into prose styling. It scrolls, which is why it owns the only overflow in the column. */
+.kk-intent-body { flex: 1 1 auto; min-height: 0; overflow: auto; margin: 0; padding: 0.5rem 0.6rem; font-family: var(--mono, monospace); font-size: 0.76rem; line-height: 1.45; white-space: pre-wrap; word-break: break-word; }
+.kk-intent-compose { display: flex; align-items: flex-end; gap: 0.4rem; padding: 0.4rem 0.5rem; border-top: 1px solid var(--border); flex: 0 0 auto; }
+.kk-intent-compose textarea { flex: 1 1 auto; }
+.kk-intent-ask-msg { font-size: 0.74rem; color: var(--muted); }
+.kk-intent-ask-msg.err { color: var(--led-error-stroke, #e66); }
+
 .kk-group { margin-top: 0.5rem; }
 .kk-project { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); margin: 0.6rem 0 0.3rem; }
 .kk-card { border: 1px solid var(--border); border-radius: 8px; padding: 0.5rem 0.7rem; margin-bottom: 0.5rem; }
