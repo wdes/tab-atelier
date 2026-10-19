@@ -1,0 +1,29 @@
+[package]
+name = "tab-atelier-decisions"
+version = "0.5.0-dev"
+edition = "2024"
+license = "MPL-2.0"
+description = "The decision journal: a log of decisions waiting on a person, and the two mutations on them"
+repository = "https://github.com/wdes/tab-atelier"
+publish = false
+
+[dependencies]
+# The journal serves the files its entries reference, so it needs the one
+# content-type table the workspace uses. Depending on the crate is what keeps
+# this module from growing a second, narrower copy that disagrees about `.md` —
+# which is what it had while it lived inside the kiosk.
+tab-atelier-web = { path = "../tab-atelier-web" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# `workspace = true` and not a version: `rocket_okapi` pins schemars 0.8, and a
+# second major version in the tree would make the derive here incompatible with
+# the documents the servers generate.
+schemars = { workspace = true }
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+
+[lints.rust]
+unsafe_code = "forbid"

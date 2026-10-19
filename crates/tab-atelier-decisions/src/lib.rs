@@ -14,7 +14,11 @@ use std::fmt::Write as _;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use tab_atelier_api::schemars::{self, JsonSchema};
+// Declared directly, not through `tab-atelier-api`'s re-export: the `JsonSchema`
+// derive expands a bare `schemars::…` path, which resolves against this crate's
+// own extern prelude. The version comes from the workspace table either way, so
+// this adds no pin to keep in step.
+use schemars::{self, JsonSchema};
 
 use serde::{Deserialize, Serialize};
 
@@ -195,7 +199,7 @@ impl Journal {
             return Err(DecisionError::NotFound);
         }
         let bytes = fs::read(&resolved).map_err(|_| DecisionError::NotFound)?;
-        Ok((bytes, content_type_for(&resolved)))
+        Ok((bytes, tab_atelier_web::assets::content_type(&resolved)))
     }
 
     /// Turns a path as a journal writes it into one on disk.
@@ -236,18 +240,6 @@ fn expand_with(raw: &str, home: Option<&Path>) -> PathBuf {
 }
 
 /// The content type for a served file, by extension.
-fn content_type_for(path: &Path) -> &'static str {
-    match path.extension().and_then(std::ffi::OsStr::to_str) {
-        Some("md" | "markdown") => "text/markdown; charset=utf-8",
-        Some("txt") => "text/plain; charset=utf-8",
-        Some("json") => "application/json",
-        Some("html" | "htm") => "text/html; charset=utf-8",
-        Some("png") => "image/png",
-        Some("svg") => "image/svg+xml",
-        _ => "application/octet-stream",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{Decision, DecisionError, Journal, STATE_OPEN, STATE_READ, STATE_TRANCHED, expand_with};

@@ -38,6 +38,9 @@ serde_json = "1"
 # spec — comes from here, and hyper, http and schemars the app never names at
 # all.
 tab-atelier-api = { path = "../tab-atelier-api" }
+# The decision journal: the kiosk serves it, the daemon appends to it, and
+# both need the same file format and the same two mutations.
+tab-atelier-decisions = { path = "../tab-atelier-decisions" }
 # The shared round-robin pacing: the same sweep brain.rs uses, so a fan-out
 # (the agent broadcast) is spread over time instead of arriving as a herd.
 tab-atelier-pace = { path = "../tab-atelier-pace" }

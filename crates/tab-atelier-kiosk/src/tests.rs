@@ -18,8 +18,8 @@ use std::time::Duration;
 use ureq::http::{Method, Request, Response, header};
 
 use crate::config::{Config, HopTimeouts};
-use crate::decisions::Journal;
 use crate::server::build;
+use tab_atelier_decisions::Journal;
 
 /// Factor the production deadlines are compressed by in these tests.
 ///

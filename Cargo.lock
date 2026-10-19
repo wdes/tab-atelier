@@ -7305,6 +7305,16 @@ name = "tab-atelier-briefs"
 version = "0.5.0-dev"
 
 [[package]]
+name = "tab-atelier-decisions"
+version = "0.5.0-dev"
+dependencies = [
+ "schemars 0.8.22",
+ "serde",
+ "serde_json",
+ "tab-atelier-web",
+]
+
+[[package]]
 name = "tab-atelier-kiosk"
 version = "0.1.0-dev"
 dependencies = [
@@ -7315,6 +7325,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tab-atelier-api",
+ "tab-atelier-decisions",
  "tab-atelier-pace",
  "tab-atelier-web",
  "tokio",

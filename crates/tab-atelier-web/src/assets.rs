@@ -36,6 +36,12 @@ pub fn content_type(path: &Path) -> &'static str {
         Some("png") => "image/png",
         Some("ico") => "image/x-icon",
         Some("woff2") => "font/woff2",
+        // A decision journal and the files it references are prose, and a browser
+        // that is told `application/octet-stream` downloads them instead of showing
+        // them. These two are here rather than in a second table beside the journal
+        // because a content type is a content type wherever it is served from.
+        Some("md" | "markdown") => "text/markdown; charset=utf-8",
+        Some("txt") => "text/plain; charset=utf-8",
         _ => "application/octet-stream",
     }
 }
