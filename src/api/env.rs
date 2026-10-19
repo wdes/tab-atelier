@@ -4,86 +4,78 @@
 //! queued `env set/unset` changes drained by the main loop.
 
 use std::collections::BTreeMap;
-use std::io::Write;
 use std::sync::{Arc, Mutex};
 
-use super::{EnvChange, TabSnapshot, error_json, parse_tab_key, resolve_tab_idx, respond_json};
+use tab_atelier_api::{Doc, Failure, Request};
 
-pub(super) fn list_global<W: Write>(stream: &mut W) {
+use super::{EnvChange, TabSnapshot, parse_tab_key, resolve_tab_idx};
+
+/// The masked env map, exactly as this route has always sent it.
+///
+/// A bare `{KEY: VALUE}` object, NOT a wrapper with a name around it: `env list`
+/// and every script that parses it read the map at the top level, and dressing
+/// it up while migrating the writer would be a wire change disguised as a
+/// refactor. Masked on the server (see [`mask_env_value`]) is the part that
+/// matters — a secret never leaves the daemon.
+type EnvMap = BTreeMap<String, String>;
+
+pub(super) fn list_global() -> Doc<EnvMap> {
     // The GLOBAL tab-env map (the CLI `env list`). Values are MASKED
     // server-side (see `mask_env_value`): a secret never leaves the
     // daemon; only boolean-ish flags (0/1/true/false) come through in
     // the clear. Keeps the wire clean of API keys / tokens.
-    let map = mask_env_map(&crate::tab_env_global());
-    match serde_json::to_string(&map) {
-        Ok(j) => respond_json(stream, 200, &j),
-        Err(e) => error_json(stream, 500, &format!("serialize: {e}")),
-    }
+    Doc::ok(mask_env_map(&crate::tab_env_global()))
 }
 
-pub(super) fn list_tab<W: Write>(stream: &mut W, state: &Arc<Mutex<TabSnapshot>>, p: &str) {
+pub(super) fn list_tab(request: &Request<'_>, state: &Arc<Mutex<TabSnapshot>>) -> Result<Doc<EnvMap>, Failure> {
     // Per-tab env map (`env list --tab <id>`), values masked the same way
     // as `GET /env` above. Mirrored from the runtime tab into the
     // snapshot, so it reflects queued changes as soon as the next
     // snapshot rebuild lands (same cadence as `/tabs`).
-    let Some((key_raw, is_uuid)) = parse_tab_key(p, "/env") else {
-        error_json(stream, 404, "missing tab id");
-        return;
+    let Some((key_raw, is_uuid)) = parse_tab_key(request.path, "/env") else {
+        return Err(Failure::problem(404, "missing tab id"));
     };
     let snap = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let Some(idx) = resolve_tab_idx(&snap, key_raw, is_uuid) else {
-        drop(snap);
-        error_json(stream, 404, "tab not found");
-        return;
+        return Err(Failure::problem(404, "tab not found"));
     };
-    let map = mask_env_map(&snap.tabs[idx].tab_env);
+    let vars = mask_env_map(&snap.tabs[idx].tab_env);
     drop(snap);
-    match serde_json::to_string(&map) {
-        Ok(j) => respond_json(stream, 200, &j),
-        Err(e) => error_json(stream, 500, &format!("serialize: {e}")),
-    }
+    Ok(Doc::ok(vars))
 }
 
-pub(super) fn set_global<W: Write>(stream: &mut W, state: &Arc<Mutex<TabSnapshot>>, body_bytes: &[u8]) {
+pub(super) fn set_global(request: &Request<'_>, state: &Arc<Mutex<TabSnapshot>>) -> Result<Doc<Queued>, Failure> {
     // Global env change (`env set/unset --global`). Body:
     // {"set":{"K":"V"},"unset":["K"],"respawn":bool}.
-    match parse_env_body(body_bytes) {
-        Ok(change) => {
-            let mut snap = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            snap.pending_env_changes.push(change);
-            drop(snap);
-            respond_json(stream, 200, r#"{"queued":"env"}"#);
-        }
-        Err(e) => error_json(stream, 400, &e),
-    }
+    let change = parse_env_body(request.body).map_err(|e| Failure::problem(400, e))?;
+    let mut snap = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    snap.pending_env_changes.push(change);
+    drop(snap);
+    Ok(Doc::ok(Queued { queued: "env" }))
 }
 
-pub(super) fn set_tab<W: Write>(stream: &mut W, state: &Arc<Mutex<TabSnapshot>>, p: &str, body_bytes: &[u8]) {
+pub(super) fn set_tab(request: &Request<'_>, state: &Arc<Mutex<TabSnapshot>>) -> Result<Doc<Queued>, Failure> {
     // Per-tab env change (`env set/unset --tab <id>`).
-    let Some((key_raw, is_uuid)) = parse_tab_key(p, "/env") else {
-        error_json(stream, 404, "missing tab id");
-        return;
+    let Some((key_raw, is_uuid)) = parse_tab_key(request.path, "/env") else {
+        return Err(Failure::problem(404, "missing tab id"));
     };
-    let parsed = parse_env_body(body_bytes);
+    let parsed = parse_env_body(request.body);
     let mut snap = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let Some(idx) = resolve_tab_idx(&snap, key_raw, is_uuid) else {
-        drop(snap);
-        error_json(stream, 404, "tab not found");
-        return;
+        return Err(Failure::problem(404, "tab not found"));
     };
     let id = snap.tabs[idx].id.to_string();
-    match parsed {
-        Ok(mut change) => {
-            change.tab = Some(id);
-            snap.pending_env_changes.push(change);
-            drop(snap);
-            respond_json(stream, 200, r#"{"queued":"env"}"#);
-        }
-        Err(e) => {
-            drop(snap);
-            error_json(stream, 400, &e);
-        }
-    }
+    let mut change = parsed.map_err(|e| Failure::problem(400, e))?;
+    change.tab = Some(id);
+    snap.pending_env_changes.push(change);
+    drop(snap);
+    Ok(Doc::ok(Queued { queued: "env" }))
+}
+
+/// The acknowledgement a queued change answers.
+#[derive(Debug, serde::Serialize, tab_atelier_api::schemars::JsonSchema)]
+pub(super) struct Queued {
+    queued: &'static str,
 }
 
 /// Mask a single env value for the `env list` API.

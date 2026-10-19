@@ -11,29 +11,44 @@
 //! anyone else's, which is precisely why the fleet can span hosts without a
 //! consensus protocol.
 
-use std::io::Write;
-
-use super::{error_json, respond_json};
+use serde::Serialize;
+use tab_atelier_api::schemars;
+use tab_atelier_api::schemars::JsonSchema;
+use tab_atelier_api::{Doc, Failure, Request};
 
 /// Cap on a single merge batch. Gossip is anti-entropy, not bulk transfer —
 /// an oversized push is either a bug or an attempt to fill the disk.
 pub const MAX_MERGE: usize = 5_000;
+
+/// A slice of the board, with where the next pull should resume.
+#[derive(Debug, Serialize, JsonSchema)]
+pub(super) struct Slice {
+    entries: Vec<crate::cli::team::Note>,
+    next: usize,
+    origin: String,
+}
+
+/// What a merge changed: how much arrived, and how much of it was new.
+#[derive(Debug, Serialize, JsonSchema)]
+pub(super) struct Merged {
+    merged: usize,
+    received: usize,
+}
 
 /// `GET /blackboard?since=N` — entries from position `N` on.
 ///
 /// `since` is a position in *this host's* file, which is all a puller needs to
 /// resume; it is deliberately not a logical clock, because the merge is a set
 /// union and does not need one.
-pub(super) fn list<W: Write>(stream: &mut W, since: Option<usize>) {
+pub(super) fn list(request: &Request<'_>) -> Doc<Slice> {
+    let since: Option<usize> = request.query_value("since").and_then(|v| v.trim().parse().ok());
     let notes = crate::cli::team::read_blackboard();
     let from = since.unwrap_or(0).min(notes.len());
-    let body = serde_json::json!({
-        "entries": &notes[from..],
-        "next": notes.len(),
-        "origin": crate::cli::team::origin_id(),
+    Doc::ok(Slice {
+        entries: notes[from..].to_vec(),
+        next: notes.len(),
+        origin: crate::cli::team::origin_id(),
     })
-    .to_string();
-    respond_json(stream, 200, &body);
 }
 
 /// `POST /blackboard` — merge a peer's entries, returning how many were new.
@@ -41,25 +56,21 @@ pub(super) fn list<W: Write>(stream: &mut W, since: Option<usize>) {
 /// Idempotent by construction: entries we already hold are dropped by id, so a
 /// peer that re-sends its whole log (after a restart, say) costs one scan and
 /// changes nothing.
-pub(super) fn merge<W: Write>(stream: &mut W, body_bytes: &[u8]) {
-    let parsed: serde_json::Value = serde_json::from_slice(body_bytes).unwrap_or(serde_json::Value::Null);
+pub(super) fn merge(request: &Request<'_>) -> Result<Doc<Merged>, Failure> {
+    let parsed: serde_json::Value = serde_json::from_slice(request.body).unwrap_or(serde_json::Value::Null);
     let Some(entries) = parsed.get("entries").and_then(|v| v.as_array()) else {
-        error_json(stream, 400, "expected {\"entries\":[…]}");
-        return;
+        return Err(Failure::problem(400, "expected {\"entries\":[…]}"));
     };
     if entries.len() > MAX_MERGE {
-        error_json(stream, 413, &format!("batch larger than {MAX_MERGE} entries"));
-        return;
+        return Err(Failure::problem(413, format!("batch larger than {MAX_MERGE} entries")));
     }
     let incoming: Vec<crate::cli::team::Note> = entries
         .iter()
         .filter_map(|v| serde_json::from_value(v.clone()).ok())
         .collect();
-    match crate::cli::team::merge_into_blackboard(&incoming) {
-        Ok(added) => {
-            let body = serde_json::json!({ "merged": added, "received": incoming.len() }).to_string();
-            respond_json(stream, 200, &body);
-        }
-        Err(e) => error_json(stream, 500, &e),
-    }
+    let added = crate::cli::team::merge_into_blackboard(&incoming).map_err(|e| Failure::problem(500, e))?;
+    Ok(Doc::ok(Merged {
+        merged: added,
+        received: incoming.len(),
+    }))
 }

@@ -256,7 +256,7 @@ pub fn peek(tab: &str, lines: usize, raw: bool) -> i32 {
 ///
 /// Persisted as one JSON line in `<state>/tab-atelier/blackboard.jsonl` — an
 /// append-only log every tab reads.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, tab_atelier_api::schemars::JsonSchema)]
 pub struct Note {
     /// Unix seconds when posted.
     pub ts: u64,
@@ -309,7 +309,7 @@ pub struct Note {
 /// Keeping them as entries on the existing append-only log means the whole
 /// protocol inherits the log's properties for free — durable, readable by
 /// every tab, and mergeable across hosts.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, tab_atelier_api::schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum NoteKind {
     /// A plain broadcast — what `note` has always written.

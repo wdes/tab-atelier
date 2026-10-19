@@ -41,7 +41,7 @@ pub const MAX_KEY: usize = 200;
 pub const MAX_HOLDER: usize = 100;
 
 /// One granted lease.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, tab_atelier_api::schemars::JsonSchema)]
 pub struct Claim {
     pub key: String,
     /// Whoever asked — by convention a tab name or uuid, but the registry

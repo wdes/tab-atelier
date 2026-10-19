@@ -1539,6 +1539,21 @@ fn respond_json<W: Write>(stream: &mut W, status: u16, body: &str) {
     .ok();
 }
 
+/// Let a `file://` page read this reply, when the request came from loopback.
+///
+/// `/fleet` only. A local dashboard is a `file://` page, whose origin is `null`,
+/// so a browser will not let it read a same-origin-less response unless the
+/// reply says so — and it must only say so to a caller already on this machine.
+/// Applied to the `Reply` rather than kept as a second writer, so the route
+/// still answers one typed resource.
+fn allow_local_page(reply: tab_atelier_api::Reply, from_loopback: bool) -> tab_atelier_api::Reply {
+    if from_loopback {
+        reply.with_header("access-control-allow-origin", "*".to_owned())
+    } else {
+        reply
+    }
+}
+
 /// Render a [`tab_atelier_api::Reply`] onto the raw writer.
 ///
 /// The bridge the migration is built on. A module that has moved to `-api`
@@ -1597,26 +1612,13 @@ fn write_reply<W: Write>(stream: &mut W, reply: tab_atelier_api::Reply) {
     let _ = stream.write_all(&body);
 }
 
-/// Like [`respond_json`], plus `Access-Control-Allow-Origin: *`.
+/// Like [`respond_json`], plus `Access-Control-Allow-Origin: *` — gone.
 ///
-/// Used only for `/fleet`, and only for requests that arrived on loopback, so
-/// a local dashboard can be a plain `file://` page instead of an asset served
-/// by the daemon — which is the point: fetching the viewer's fonts and scripts
-/// from a busy daemon is exactly what is slow when the box is loaded.
-///
-/// The route still requires the token; CORS only decides whether a browser
-/// lets a page READ the reply. A page that already has the token has already
-/// won, and a non-loopback caller gets no header at all.
-fn respond_json_cors<W: Write>(stream: &mut W, status: u16, body: &str) {
-    let _ = write!(
-        stream,
-        "HTTP/1.1 {} OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\n{ROBOTS_TAG}Content-Length: {}\r\n\r\n{}",
-        status,
-        body.len(),
-        body
-    );
-}
-
+/// `/fleet` was its only caller, and that route now answers a typed resource
+/// whose loopback-only CORS header is added to the `Reply` by
+/// [`allow_local_page`]. One writer fewer, and the rule ("a `file://` page on
+/// this machine may read it") is stated once instead of being implied by a
+/// second copy of the status line.
 use crate::strip_ansi;
 
 fn error_json<W: Write>(stream: &mut W, status: u16, msg: &str) {
@@ -2049,15 +2051,15 @@ fn handle_connection<S: Read + Write>(
             _ => method_not_allowed(stream),
         },
         "/tabs/rotate-tokens" => match method.as_str() {
-            "POST" => tokens::rotate(stream, state),
+            "POST" => write_reply(stream, tokens::rotate(state).into()),
             _ => method_not_allowed(stream),
         },
         "/master-token/reset" => match method.as_str() {
-            "POST" => tokens::reset_master(stream, state),
+            "POST" => write_reply(stream, tokens::reset_master(state).into()),
             _ => method_not_allowed(stream),
         },
         "/limits/default" => match method.as_str() {
-            "POST" => limits::set_default(stream, state, &body_bytes),
+            "POST" => write_reply(stream, limits::set_default(&envelope, state).into()),
             _ => method_not_allowed(stream),
         },
         "/claude-only" => match method.as_str() {
@@ -2098,25 +2100,28 @@ fn handle_connection<S: Read + Write>(
                 let body = serde_json::json!({ "claims": claims, "now_ms": now }).to_string();
                 respond_json(stream, 200, &body);
             }
-            "POST" => claims_route::grant(stream, &body_bytes),
+            "POST" => write_reply(stream, claims_route::grant(&envelope).into()),
             _ => method_not_allowed(stream),
         },
         "/claims/release" => match method.as_str() {
-            "POST" => claims_route::release(stream, &body_bytes),
+            "POST" => write_reply(stream, claims_route::release(&envelope).into()),
             _ => method_not_allowed(stream),
         },
         "/fleet" => match method.as_str() {
-            "GET" => fleet_route::get(stream, state, from_loopback),
+            "GET" => write_reply(
+                stream,
+                allow_local_page(fleet_route::get(&envelope, state).into(), from_loopback),
+            ),
             _ => method_not_allowed(stream),
         },
         "/blackboard" => match method.as_str() {
-            "GET" => blackboard_route::list(stream, query_since),
-            "POST" => blackboard_route::merge(stream, &body_bytes),
+            "GET" => write_reply(stream, blackboard_route::list(&envelope).into()),
+            "POST" => write_reply(stream, blackboard_route::merge(&envelope).into()),
             _ => method_not_allowed(stream),
         },
         "/env" => match method.as_str() {
-            "GET" => env::list_global(stream),
-            "POST" => env::set_global(stream, state, &body_bytes),
+            "GET" => write_reply(stream, env::list_global().into()),
+            "POST" => write_reply(stream, env::set_global(&envelope, state).into()),
             _ => method_not_allowed(stream),
         },
         // ---- tab-scoped: `/tabs/<key>/<segment>` and `/tabs/by-id/<uuid>/…` ----
@@ -2143,8 +2148,8 @@ fn handle_connection<S: Read + Write>(
             "GET" if p.ends_with("/output") => {
                 output::run(stream, state, p, query_since, query_crc, query_lines, accept_gzip);
             }
-            "GET" if p.ends_with("/env") => env::list_tab(stream, state, p),
-            "POST" if p.ends_with("/env") => env::set_tab(stream, state, p, &body_bytes),
+            "GET" if p.ends_with("/env") => write_reply(stream, env::list_tab(&envelope, state).into()),
+            "POST" if p.ends_with("/env") => write_reply(stream, env::set_tab(&envelope, state).into()),
             "DELETE" if !p[6..].contains('/') || (p[6..].starts_with("by-id/") && p[6..].matches('/').count() == 1) => {
                 tabs::close(stream, state, p);
             }
@@ -2153,10 +2158,10 @@ fn handle_connection<S: Read + Write>(
             // not the GUI — the Kiosk — can build a terminal link without ever
             // holding the master token. The share token authorises one tab.
             "POST" if p.starts_with("/tabs/by-id/") && p.ends_with("/share") => {
-                tokens::mint_share(stream, state, p);
+                write_reply(stream, tokens::mint_share(&envelope, state).into());
             }
             "POST" if p.ends_with("/resize") => write_reply(stream, resize::run(&envelope, state).into()),
-            "POST" if p.ends_with("/limits") => limits::set_tab(stream, state, p, &body_bytes),
+            "POST" if p.ends_with("/limits") => write_reply(stream, limits::set_tab(&envelope, state).into()),
             "POST" if p.ends_with("/rename") => write_reply(stream, rename::run(&envelope, state).into()),
             // (Old `POST /tabs/<idx>/activate` route removed — that was
             // the Android ta-remote app's "tap a tab in the list to make
@@ -2202,10 +2207,10 @@ fn handle_connection<S: Read + Write>(
                 write_reply(stream, lock::run(&envelope, state).into());
             }
             "POST" if p.starts_with("/tabs/by-id/") && p.ends_with("/net") => {
-                net::set(stream, state, p, &body_bytes);
+                write_reply(stream, net::set(&envelope, state).into());
             }
             "POST" if p.starts_with("/tabs/by-id/") && p.ends_with("/net-allow") => {
-                net::allow(stream, state, p, &body_bytes);
+                write_reply(stream, net::allow(&envelope, state).into());
             }
             "POST" if p.starts_with("/tabs/by-id/") && p.ends_with("/ssh-agent") => {
                 ssh_agent::set(stream, state, p, &body_bytes);

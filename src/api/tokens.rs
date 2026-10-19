@@ -3,11 +3,32 @@
 //! Token administration: revoke every tab's share tokens, and hot-swap the
 //! master API token. Master token only.
 
-use super::{
-    TabSnapshot, error_json, generate_token, parse_tab_key, resolve_tab_idx, respond_json, write_private_file,
-};
-use std::io::Write;
 use std::sync::{Arc, Mutex};
+
+use serde::Serialize;
+use tab_atelier_api::schemars;
+use tab_atelier_api::schemars::JsonSchema;
+use tab_atelier_api::{Doc, Failure, Request};
+
+use super::{TabSnapshot, generate_token, parse_tab_key, resolve_tab_idx, write_private_file};
+
+/// A tab's RW share token.
+#[derive(Debug, Serialize, JsonSchema)]
+pub(super) struct ShareToken {
+    rw: String,
+}
+
+/// How many tabs had tokens revoked.
+#[derive(Debug, Serialize, JsonSchema)]
+pub(super) struct Revoked {
+    revoked: usize,
+}
+
+/// The new master token, returned once so `tab-atelier token` can re-read it.
+#[derive(Debug, Serialize, JsonSchema)]
+pub(super) struct NewMaster {
+    token: String,
+}
 
 /// `POST /tabs/by-id/{id}/share` — return a tab's RW share token, minting one
 /// if it has none.
@@ -18,15 +39,13 @@ use std::sync::{Arc, Mutex};
 /// lets a caller that is not the GUI — the Kiosk, say — build a terminal link
 /// without ever handling the master token. Master token only: a share token
 /// must not be able to mint another.
-pub(super) fn mint_share<W: Write>(stream: &mut W, state: &Arc<Mutex<TabSnapshot>>, path: &str) {
-    let Some((key, is_uuid)) = parse_tab_key(path, "/share") else {
-        error_json(stream, 400, "bad tab path");
-        return;
+pub(super) fn mint_share(request: &Request<'_>, state: &Arc<Mutex<TabSnapshot>>) -> Result<Doc<ShareToken>, Failure> {
+    let Some((key, is_uuid)) = parse_tab_key(request.path, "/share") else {
+        return Err(Failure::problem(400, "bad tab path"));
     };
     let mut state = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let Some(idx) = resolve_tab_idx(&state, key, is_uuid) else {
-        error_json(stream, 404, "tab not found");
-        return;
+        return Err(Failure::problem(404, "tab not found"));
     };
     let token = if state.tabs[idx].share_token_rw.is_empty() {
         let token = crate::mint_share_token();
@@ -42,10 +61,11 @@ pub(super) fn mint_share<W: Write>(stream: &mut W, state: &Arc<Mutex<TabSnapshot
     } else {
         state.tabs[idx].share_token_rw.to_string()
     };
-    respond_json(stream, 200, &format!(r#"{{"rw":"{token}"}}"#));
+    drop(state);
+    Ok(Doc::ok(ShareToken { rw: token }))
 }
 
-pub(super) fn rotate<W: Write>(stream: &mut W, state: &Arc<Mutex<TabSnapshot>>) {
+pub(super) fn rotate(state: &Arc<Mutex<TabSnapshot>>) -> Doc<Revoked> {
     // Revoke every tab's per-tab share tokens so all outstanding
     // share links 401. Cleared on the snapshot immediately
     // (instant effect) and queued so the owner loop clears the
@@ -67,10 +87,10 @@ pub(super) fn rotate<W: Write>(stream: &mut W, state: &Arc<Mutex<TabSnapshot>>) 
     state.pending_token_rotations.extend(ids);
     state.invalidate_tabs();
     drop(state);
-    respond_json(stream, 200, &format!(r#"{{"revoked":{revoked}}}"#));
+    Doc::ok(Revoked { revoked })
 }
 
-pub(super) fn reset_master<W: Write>(stream: &mut W, state: &Arc<Mutex<TabSnapshot>>) {
+pub(super) fn reset_master(state: &Arc<Mutex<TabSnapshot>>) -> Result<Doc<NewMaster>, Failure> {
     // Hot-swap the master API token: generate a fresh one, persist
     // it to api.token (so `tab-atelier token` and saved configs
     // re-read it), and publish it onto the snapshot the auth gate
@@ -80,14 +100,12 @@ pub(super) fn reset_master<W: Write>(stream: &mut W, state: &Arc<Mutex<TabSnapsh
     let new = generate_token();
     let dir = crate::platform::state_base_dir().join(crate::APP_DIR);
     let _ = std::fs::create_dir_all(&dir);
-    if let Err(e) = write_private_file(&dir.join("api.token"), new.as_bytes()) {
-        error_json(stream, 500, &format!("could not persist token: {e}"));
-        return;
-    }
+    write_private_file(&dir.join("api.token"), new.as_bytes())
+        .map_err(|e| Failure::problem(500, format!("could not persist token: {e}")))?;
     state
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .master_token
         .clone_from(&new);
-    respond_json(stream, 200, &format!(r#"{{"token":"{new}"}}"#));
+    Ok(Doc::ok(NewMaster { token: new }))
 }

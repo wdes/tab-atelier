@@ -7256,6 +7256,7 @@ dependencies = [
  "roxmltree",
  "rustls",
  "rustls-pemfile",
+ "schemars 0.8.22",
  "serde",
  "serde_json",
  "sha2 0.10.9",

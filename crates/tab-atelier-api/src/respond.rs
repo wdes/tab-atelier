@@ -139,6 +139,24 @@ impl<T, const CODE: u16> Doc<T, CODE> {
     pub const fn ok(value: T) -> Self {
         Self { status: CODE, value }
     }
+
+    /// The same resource, answered with a different status.
+    ///
+    /// For the routes whose *body* is one thing but whose status carries the
+    /// answer — a lease grant is 200 and a lease refusal is 409, and both are
+    /// the same `{granted, claim, now_ms}`. Splitting those into two types would
+    /// duplicate the resource to change one number, and returning a bare
+    /// [`Reply`] would lose the schema.
+    ///
+    /// `CODE` stays what the document says the operation answers with; the
+    /// caller is responsible for that being true in the common case. A route
+    /// that varies its status this way should also document a `default`
+    /// response, so the exceptional code is described rather than invented at
+    /// run time.
+    #[must_use]
+    pub const fn at(status: u16, value: T) -> Self {
+        Self { status, value }
+    }
 }
 
 impl<T: Serialize, const CODE: u16> Responder<'_, 'static> for Doc<T, CODE> {
