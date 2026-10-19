@@ -1489,26 +1489,112 @@ fn respond_with_etag_precomputed<W: Write>(
     }
 }
 
-fn respond_json<W: Write>(stream: &mut W, status: u16, body: &str) {
-    let reason = match status {
+/// The reason phrase for a status code.
+///
+/// One table for both writers below, so a status the API can produce never
+/// reaches the wire as the bare `"Error"` a `match` with a catch-all arm used to
+/// fall back to. Anything unlisted still renders — a reason phrase is
+/// decorative, and a missing one must not change the status.
+const fn reason_phrase(status: u16) -> &'static str {
+    match status {
         200 => "OK",
+        201 => "Created",
+        202 => "Accepted",
+        204 => "No Content",
+        206 => "Partial Content",
+        301 => "Moved Permanently",
+        302 => "Found",
+        304 => "Not Modified",
+        307 => "Temporary Redirect",
+        308 => "Permanent Redirect",
         400 => "Bad Request",
         401 => "Unauthorized",
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        406 => "Not Acceptable",
+        408 => "Request Timeout",
+        409 => "Conflict",
         413 => "Payload Too Large",
+        415 => "Unsupported Media Type",
         423 => "Locked",
         429 => "Too Many Requests",
+        500 => "Internal Server Error",
         501 => "Not Implemented",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        504 => "Gateway Timeout",
         _ => "Error",
-    };
-    let _ = write!(
+    }
+}
+
+fn respond_json<W: Write>(stream: &mut W, status: u16, body: &str) {
+    write!(
         stream,
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\n{ROBOTS_TAG}Content-Length: {}\r\n\r\n{}",
+        "HTTP/1.1 {status} {}\r\nContent-Type: application/json\r\n{ROBOTS_TAG}Content-Length: {}\r\n\r\n{}",
+        reason_phrase(status),
         body.len(),
         body
-    );
+    )
+    .ok();
+}
+
+/// Render a [`tab_atelier_api::Reply`] onto the raw writer.
+///
+/// The bridge the migration is built on. A module that has moved to `-api`
+/// returns a `Reply`, and this writes it in the exact shape the daemon's own
+/// writers produced — status line, the reply's headers, the robots tag, an
+/// explicit `Content-Length` — so a migrated route and an unmigrated one are
+/// indistinguishable to a client. That is what lets the modules move one at a
+/// time instead of in a single unbuildable commit.
+///
+/// A `304` is written without a `Content-Length` and without a body: the status
+/// forbids a body, and sending `Content-Length: 0` invites a client to look for
+/// one. A *streamed* body is refused rather than buffered — this edge writes
+/// synchronously, and the routes that stream keep their own writers until the
+/// listener itself moves. A 500 with the reason in the log beats half-writing an
+/// event stream.
+fn write_reply<W: Write>(stream: &mut W, reply: tab_atelier_api::Reply) {
+    let tab_atelier_api::ReplyBody::Bytes(body) = reply.body else {
+        error!(
+            "api: a migrated route answered with a streamed body; this edge writes synchronously, so the route keeps its own writer"
+        );
+        let msg = "this route cannot stream on the legacy edge";
+        let _ = write!(
+            stream,
+            "HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain; charset=utf-8\r\n{ROBOTS_TAG}Content-Length: {}\r\n\r\n{msg}",
+            msg.len()
+        );
+        return;
+    };
+    let mut head = format!("HTTP/1.1 {} {}\r\n", reply.status, reason_phrase(reply.status));
+    let mut typed = false;
+    for (name, value) in &reply.headers {
+        if name.eq_ignore_ascii_case("content-type") {
+            typed = true;
+        }
+        // The reply layer builds every name and value itself — no client input
+        // reaches this — so the only failure is an allocation, and there is
+        // nothing to do but let the write below fail too.
+        head.push_str(name);
+        head.push_str(": ");
+        head.push_str(value);
+        head.push_str("\r\n");
+    }
+    if !typed {
+        head.push_str("Content-Type: application/json\r\n");
+    }
+    head.push_str(ROBOTS_TAG);
+    if reply.status == 304 {
+        head.push_str("\r\n");
+        let _ = stream.write_all(head.as_bytes());
+        return;
+    }
+    // `write!` into the head rather than `format!` into a temporary: the
+    // latter allocates a second string per response on a hot path.
+    let _ = write!(head, "Content-Length: {}\r\n\r\n", body.len());
+    let _ = stream.write_all(head.as_bytes());
+    let _ = stream.write_all(&body);
 }
 
 /// Like [`respond_json`], plus `Access-Control-Allow-Origin: *`.
@@ -1688,8 +1774,15 @@ fn handle_connection<S: Read + Write>(
     };
     let raw_path = parts[1].to_string();
 
+    // The raw query string, kept whole for `tab_atelier_api::Request` while the
+    // named values below are pulled out of it. Both views are needed: the
+    // migration's handlers read `query_value("name")`, and the unmigrated ones
+    // take the already-parsed `usize`s. Owned, not borrowed from `raw_path`,
+    // which `path` below replaces by value.
+    let mut query_raw = String::new();
     let (path, query_token, query_lines, query_since, query_crc, query_name, query_path) =
         if let Some((p, q)) = raw_path.split_once('?') {
+            q.clone_into(&mut query_raw);
             let qt = q
                 .split('&')
                 .find_map(|pair| pair.strip_prefix("token="))
@@ -1764,6 +1857,12 @@ fn handle_connection<S: Read + Write>(
         Vec::new()
     };
     drop(reader);
+    // As a `Bytes` from here on — zero-copy from the `Vec` — because
+    // `tab_atelier_api::Request` and every `Validated` body take one, and a
+    // migrated handler must be able to read the body without a second buffer.
+    // The one handler that *owns* the bytes (the keystroke queue) copies them
+    // back out; every other one only reads.
+    let body_bytes = bytes::Bytes::from(body_bytes);
 
     // Public vendor-asset routes bypass auth entirely. They serve
     // a fixed pinned copy of xterm.js + xterm.css that the share
@@ -1914,6 +2013,21 @@ fn handle_connection<S: Read + Write>(
         return;
     }
 
+    // The envelope a migrated handler is given. Borrows the parsed request, so
+    // building it costs nothing and the dispatch below stays allocation-free
+    // until a route is actually reached. `if_none_match` was stripped of its
+    // quotes while the headers were read, which is the form `Conditional` wants.
+    let envelope = tab_atelier_api::Request {
+        method: method.as_str(),
+        path: path.as_str(),
+        query: query_raw.as_str(),
+        body: &body_bytes,
+        conditional: tab_atelier_api::Conditional {
+            accept_gzip,
+            if_none_match: if_none_match.as_deref(),
+        },
+    };
+
     // Path first, then method. A path the API serves, reached with the wrong
     // verb, is a 405 — the routing produces that answer itself, rather than a
     // second list of paths kept by hand in step with a method-first match, which
@@ -1947,7 +2061,7 @@ fn handle_connection<S: Read + Write>(
             _ => method_not_allowed(stream),
         },
         "/claude-only" => match method.as_str() {
-            "POST" => claude_only::set(stream, state, &body_bytes),
+            "POST" => write_reply(stream, claude_only::set(&envelope, state).into()),
             _ => method_not_allowed(stream),
         },
         "/relay-mode" => match method.as_str() {
@@ -2034,16 +2148,16 @@ fn handle_connection<S: Read + Write>(
             "DELETE" if !p[6..].contains('/') || (p[6..].starts_with("by-id/") && p[6..].matches('/').count() == 1) => {
                 tabs::close(stream, state, p);
             }
-            "POST" if p.ends_with("/meta") => meta::set(stream, state, p, &body_bytes),
+            "POST" if p.ends_with("/meta") => write_reply(stream, meta::set(&envelope, state)),
             // Mint (or return) this tab's RW share token, so a caller that is
             // not the GUI — the Kiosk — can build a terminal link without ever
             // holding the master token. The share token authorises one tab.
             "POST" if p.starts_with("/tabs/by-id/") && p.ends_with("/share") => {
                 tokens::mint_share(stream, state, p);
             }
-            "POST" if p.ends_with("/resize") => resize::run(stream, state, p, &body_bytes),
+            "POST" if p.ends_with("/resize") => write_reply(stream, resize::run(&envelope, state).into()),
             "POST" if p.ends_with("/limits") => limits::set_tab(stream, state, p, &body_bytes),
-            "POST" if p.ends_with("/rename") => rename::run(stream, state, p, &body_bytes),
+            "POST" if p.ends_with("/rename") => write_reply(stream, rename::run(&envelope, state).into()),
             // (Old `POST /tabs/<idx>/activate` route removed — that was
             // the Android ta-remote app's "tap a tab in the list to make
             // it the desktop's active one" gesture. The WS frame
@@ -2085,7 +2199,7 @@ fn handle_connection<S: Read + Write>(
             // share-tokens both allowed, master token always allowed.
             "GET" if p.ends_with("/outbox") || p.ends_with("/inbox") => outbox::list(stream, state, p),
             "POST" if p.starts_with("/tabs/by-id/") && p.ends_with("/lock") => {
-                lock::run(stream, state, p, &body_bytes);
+                write_reply(stream, lock::run(&envelope, state).into());
             }
             "POST" if p.starts_with("/tabs/by-id/") && p.ends_with("/net") => {
                 net::set(stream, state, p, &body_bytes);
@@ -2097,18 +2211,18 @@ fn handle_connection<S: Read + Write>(
                 ssh_agent::set(stream, state, p, &body_bytes);
             }
             "POST" if p.starts_with("/tabs/by-id/") && p.ends_with("/schedule") => {
-                schedule::run(stream, state, p, &body_bytes);
+                write_reply(stream, schedule::run(&envelope, state).into());
             }
             "POST" if p.starts_with("/tabs/by-id/") && p.ends_with("/bg-color") => {
-                tab_props::bg_color(stream, state, p, &body_bytes);
+                write_reply(stream, tab_props::bg_color(&envelope, state).into());
             }
             "POST" if p.starts_with("/tabs/by-id/") && p.ends_with("/badge") => {
-                tab_props::badge(stream, state, p, &body_bytes);
+                write_reply(stream, tab_props::badge(&envelope, state).into());
             }
             "POST" if p.starts_with("/tabs/by-id/") && p.ends_with("/context") => {
-                tab_props::context(stream, state, p, &body_bytes);
+                write_reply(stream, tab_props::context(&envelope, state).into());
             }
-            "POST" if p.ends_with("/input") => input::run(stream, state, p, body_bytes),
+            "POST" if p.ends_with("/input") => input::run(stream, state, p, body_bytes.to_vec()),
             _ => method_not_allowed(stream),
         },
         _ => error_json(stream, 404, "not found"),
@@ -3726,6 +3840,88 @@ mod tests {
         // The master still does everything, and a wrong token still nothing.
         assert_eq!(status_code(&get("/env", &master)), 200);
         assert_eq!(status_code(&get("/tabs", "nope")), 401);
+    }
+
+    #[test]
+    fn a_migrated_reply_renders_the_same_status_and_body_as_the_legacy_writer() {
+        // The whole migration rests on this: a module moved to `-api` must be
+        // indistinguishable to a client from one that has not moved yet, or the
+        // modules could only move in one unbuildable commit.
+        let legacy = {
+            let mut out = Vec::new();
+            super::respond_json(&mut out, 200, r#"{"queued":"meta"}"#);
+            String::from_utf8(out).expect("ascii")
+        };
+        let migrated = {
+            let mut out = Vec::new();
+            super::write_reply(&mut out, tab_atelier_api::json(200, r#"{"queued":"meta"}"#));
+            String::from_utf8(out).expect("ascii")
+        };
+        let status_line = |s: &str| s.lines().next().unwrap_or_default().to_owned();
+        assert_eq!(status_line(&legacy), status_line(&migrated));
+        assert_eq!(body(&legacy), body(&migrated));
+        // Header *names* are case-insensitive on the wire, so the strings are not
+        // compared; the presence of the type and the length is what a client
+        // depends on.
+        for head in [&legacy, &migrated] {
+            let lower = head.to_ascii_lowercase();
+            assert!(lower.contains("content-type: application/json"), "{head}");
+            assert!(lower.contains("content-length: 17"), "{head}");
+        }
+    }
+
+    #[test]
+    fn a_migrated_304_carries_no_body_and_no_content_length() {
+        // A 304 forbids a body. Sending `Content-Length: 0` invites a client to
+        // look for one, and sending a length at all contradicts the status.
+        let mut out = Vec::new();
+        super::write_reply(&mut out, tab_atelier_api::Reply::empty(304));
+        let text = String::from_utf8(out).expect("ascii");
+        assert!(status_code(&text) == 304);
+        assert_eq!(body(&text), "", "a 304 has no body");
+        assert!(
+            !text.to_ascii_lowercase().contains("content-length"),
+            "a 304 carries no length: {text}"
+        );
+    }
+
+    #[test]
+    fn the_migrated_meta_route_still_answers_what_it_promised() {
+        // The route moved from a raw writer to `Request`/`Reply`; the contract
+        // it offers a client did not move with it.
+        let (port, state, master) = spawn_server();
+        let response = request(
+            port,
+            &format!(
+                "POST /tabs/by-id/tab-a/meta HTTP/1.1\r\nAuthorization: Bearer {master}\r\nContent-Type: application/json\r\nContent-Length: 28\r\n\r\n{{\"key\":\"role\",\"value\":\"rev\"}}"
+            ),
+        );
+        assert_eq!(status_code(&response), 200);
+        assert_eq!(body(&response), r#"{"queued":"meta"}"#);
+        let queued = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pending_meta_changes
+            .clone();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].key, "role");
+        assert_eq!(queued[0].value.as_deref(), Some("rev"));
+    }
+
+    #[test]
+    fn a_migrated_refusal_keeps_the_problem_shape_and_its_status() {
+        // The refusal path moved too: a `Failure` must still look like every
+        // other error this API produces — `{"error": …}` — and keep its code.
+        let (port, _state, master) = spawn_server();
+        let response = request(
+            port,
+            &format!(
+                "POST /tabs/by-id/no-such-tab/meta HTTP/1.1\r\nAuthorization: Bearer {master}\r\nContent-Length: 28\r\n\r\n{{\"key\":\"role\",\"value\":\"rev\"}}"
+            ),
+        );
+        assert_eq!(status_code(&response), 404);
+        let parsed: serde_json::Value = serde_json::from_str(body(&response)).expect("json");
+        assert_eq!(parsed["error"], "tab not found");
     }
 
     #[test]

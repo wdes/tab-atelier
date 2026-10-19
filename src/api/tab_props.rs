@@ -4,21 +4,56 @@
 //! free-text agent context. Each reflects into the snapshot and queues the
 //! runtime sync drained by the main loop.
 
-use std::io::Write;
 use std::sync::{Arc, Mutex};
 
-use super::{TabSnapshot, error_json, respond_json};
+use serde::Serialize;
+use tab_atelier_api::schemars;
+use tab_atelier_api::schemars::JsonSchema;
+use tab_atelier_api::{Doc, Failure, Request};
 
-pub(super) fn bg_color<W: Write>(stream: &mut W, state: &Arc<Mutex<TabSnapshot>>, p: &str, body_bytes: &[u8]) {
+use super::TabSnapshot;
+
+/// The colour that was stored, or `null` when it was cleared.
+///
+/// A separate type per route rather than one struct with three optional fields:
+/// the answer to a `bg-color` call is always about the colour, and a caller that
+/// had to work out which key to read would be reading a union it never asked
+/// for. Each field is `Option` because clearing is a real answer distinct from
+/// "unchanged", and `null` is how the API has always spelled a clear.
+#[derive(Debug, Serialize, JsonSchema)]
+pub(super) struct ColorApplied {
+    color: Option<String>,
+}
+
+/// The badge that was stored, after `sanitize_badge` normalised it.
+#[derive(Debug, Serialize, JsonSchema)]
+pub(super) struct BadgeApplied {
+    badge: Option<String>,
+}
+
+/// The context that was stored, after the length cap and the blank trim.
+#[derive(Debug, Serialize, JsonSchema)]
+pub(super) struct ContextApplied {
+    context: Option<String>,
+}
+
+/// The tab a `/tabs/by-id/<uuid>/<suffix>` path names.
+fn tab_of<'a>(path: &'a str, suffix: &str) -> Option<&'a str> {
+    path.strip_prefix("/tabs/by-id/")?.strip_suffix(suffix)
+}
+
+pub(super) fn bg_color(request: &Request<'_>, state: &Arc<Mutex<TabSnapshot>>) -> Result<Doc<ColorApplied>, Failure> {
     // Set or clear the per-tab background color override.
     // Master token only. Body: {"color": "#RRGGBB"} to set,
     // {"color": null} to clear (tab falls back to global
     // default). Validates the hex before accepting.
-    let inner = &p["/tabs/by-id/".len()..p.len() - "/bg-color".len()];
-    let parsed: Option<Option<String>> = if body_bytes.is_empty() {
+    let Some(inner) = tab_of(request.path, "/bg-color") else {
+        return Err(Failure::problem(404, "tab not found"));
+    };
+    let parsed: Option<Option<String>> = if request.body.is_empty() {
         None
     } else {
-        serde_json::from_slice::<serde_json::Value>(body_bytes)
+        serde_json::from_slice::<serde_json::Value>(request.body)
             .ok()
             .and_then(|v| {
                 let c = v.get("color")?;
@@ -30,21 +65,20 @@ pub(super) fn bg_color<W: Write>(stream: &mut W, state: &Arc<Mutex<TabSnapshot>>
             })
     };
     let Some(color_opt) = parsed else {
-        error_json(stream, 400, "missing {\"color\": \"#RRGGBB\"} or {\"color\": null}");
-        return;
+        return Err(Failure::problem(
+            400,
+            "missing {\"color\": \"#RRGGBB\"} or {\"color\": null}",
+        ));
     };
     // Validate hex if Some.
     if let Some(ref c) = color_opt
         && (c.len() != 7 || !c.starts_with('#') || !c[1..].chars().all(|x| x.is_ascii_hexdigit()))
     {
-        error_json(stream, 400, "color must be #RRGGBB");
-        return;
+        return Err(Failure::problem(400, "color must be #RRGGBB"));
     }
     let mut state = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let Some(idx) = state.tabs.iter().position(|t| &*t.id == inner) else {
-        drop(state);
-        error_json(stream, 404, "tab not found");
-        return;
+        return Err(Failure::problem(404, "tab not found"));
     };
     let tab_id = state.tabs[idx].id.to_string();
     // Reflect immediately in the snapshot so the next /output
@@ -53,44 +87,32 @@ pub(super) fn bg_color<W: Write>(stream: &mut W, state: &Arc<Mutex<TabSnapshot>>
     state.tabs[idx].bg_color = color_opt.as_deref().unwrap_or_default().into();
     state.pending_bg_color_changes.push((tab_id, color_opt.clone()));
     drop(state);
-    let body = serde_json::to_string(&serde_json::json!({
-        "color": color_opt
-    }))
-    .unwrap_or_default();
-    respond_json(stream, 200, &body);
+    Ok(Doc::ok(ColorApplied { color: color_opt }))
 }
 
-pub(super) fn badge<W: Write>(stream: &mut W, state: &Arc<Mutex<TabSnapshot>>, p: &str, body_bytes: &[u8]) {
+pub(super) fn badge(request: &Request<'_>, state: &Arc<Mutex<TabSnapshot>>) -> Result<Doc<BadgeApplied>, Failure> {
     // Set or clear this tab's badge override — the short tag the
     // desktop draws on the tab. Body: {"badge":"KAL"} to set,
     // {"badge":null} to clear (the tab falls back to the folder rule
     // for its cwd). Master token only, like /bg-color.
-    let inner = &p["/tabs/by-id/".len()..p.len() - "/badge".len()];
-    let parsed = serde_json::from_slice::<serde_json::Value>(body_bytes).ok();
+    let Some(inner) = tab_of(request.path, "/badge") else {
+        return Err(Failure::problem(404, "tab not found"));
+    };
+    let parsed = serde_json::from_slice::<serde_json::Value>(request.body).ok();
     let Some(field) = parsed.as_ref().and_then(|v| v.get("badge")) else {
-        error_json(stream, 400, "missing {\"badge\": \"…\"} or {\"badge\": null}");
-        return;
+        return Err(Failure::problem(400, "missing {\"badge\": \"…\"} or {\"badge\": null}"));
     };
     let badge_opt = if field.is_null() {
         None
     } else {
         let Some(raw) = field.as_str() else {
-            error_json(stream, 400, "badge must be a string or null");
-            return;
+            return Err(Failure::problem(400, "badge must be a string or null"));
         };
-        match crate::sanitize_badge(raw) {
-            Ok(b) => Some(b),
-            Err(e) => {
-                error_json(stream, 400, &e);
-                return;
-            }
-        }
+        Some(crate::sanitize_badge(raw).map_err(|e| Failure::problem(400, e))?)
     };
     let mut state = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let Some(idx) = state.tabs.iter().position(|t| &*t.id == inner) else {
-        drop(state);
-        error_json(stream, 404, "tab not found");
-        return;
+        return Err(Failure::problem(404, "tab not found"));
     };
     let tab_id = state.tabs[idx].id.to_string();
     // Reflect immediately so the next /tabs poll already shows it; the
@@ -98,19 +120,20 @@ pub(super) fn badge<W: Write>(stream: &mut W, state: &Arc<Mutex<TabSnapshot>>, p
     state.tabs[idx].badge = badge_opt.as_deref().map(Into::into);
     state.pending_badge_changes.push((tab_id, badge_opt.clone()));
     drop(state);
-    let body = serde_json::to_string(&serde_json::json!({ "badge": badge_opt })).unwrap_or_default();
-    respond_json(stream, 200, &body);
+    Ok(Doc::ok(BadgeApplied { badge: badge_opt }))
 }
 
-pub(super) fn context<W: Write>(stream: &mut W, state: &Arc<Mutex<TabSnapshot>>, p: &str, body_bytes: &[u8]) {
+pub(super) fn context(request: &Request<'_>, state: &Arc<Mutex<TabSnapshot>>) -> Result<Doc<ContextApplied>, Failure> {
     // Set or clear this tab's free-text context (the PR/task an
     // in-tab agent is working on). Body: {"context":"…"} to set,
     // {"context":null} or empty body to clear. RW token only.
-    let inner = &p["/tabs/by-id/".len()..p.len() - "/context".len()];
-    let context_opt: Option<String> = if body_bytes.is_empty() {
+    let Some(inner) = tab_of(request.path, "/context") else {
+        return Err(Failure::problem(404, "tab not found"));
+    };
+    let context_opt: Option<String> = if request.body.is_empty() {
         None
     } else {
-        serde_json::from_slice::<serde_json::Value>(body_bytes)
+        serde_json::from_slice::<serde_json::Value>(request.body)
             .ok()
             .and_then(|v| v.get("context").cloned())
             .and_then(|c| {
@@ -128,14 +151,11 @@ pub(super) fn context<W: Write>(stream: &mut W, state: &Arc<Mutex<TabSnapshot>>,
         .filter(|s| !s.trim().is_empty());
     let mut state = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let Some(idx) = state.tabs.iter().position(|t| &*t.id == inner) else {
-        drop(state);
-        error_json(stream, 404, "tab not found");
-        return;
+        return Err(Failure::problem(404, "tab not found"));
     };
     let tab_id = state.tabs[idx].id.to_string();
     state.tabs[idx].context = context_opt.as_deref().map(std::sync::Arc::from);
     state.pending_context_changes.push((tab_id, context_opt.clone()));
     drop(state);
-    let body = serde_json::to_string(&serde_json::json!({ "context": context_opt })).unwrap_or_default();
-    respond_json(stream, 200, &body);
+    Ok(Doc::ok(ContextApplied { context: context_opt }))
 }

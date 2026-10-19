@@ -248,6 +248,52 @@ pub const fn status_of(code: u16) -> Status {
     Status::new(code)
 }
 
+/// A typed resource, flattened to the transport-neutral [`Reply`].
+///
+/// The bridge a server migrates across. A handler that answers `Doc<T>` is
+/// documented by `T` when a Rocket route serves it, and the same handler is
+/// still renderable by a server that has not moved its listener yet: `.into()`
+/// gives the `Reply` that edge already knows how to write. Without this, every
+/// migrated handler would have to choose between being typed and being callable
+/// from the old edge — which would mean the migration could only happen in one
+/// big commit.
+impl<T: Serialize, const CODE: u16> From<Doc<T, CODE>> for Reply {
+    fn from(doc: Doc<T, CODE>) -> Self {
+        // Serializing a resource of plain fields cannot fail; a custom
+        // `Serialize` that does yields a 500 carrying the reason rather than a
+        // panic inside a request.
+        serde_json::to_string(&doc.value).map_or_else(
+            |e| crate::marshal::json(500, &format!(r#"{{"error":"could not serialize: {e}"}}"#)),
+            |body| crate::marshal::json(doc.status, &body),
+        )
+    }
+}
+
+/// A refusal, flattened to the [`Reply`] the old edge writes.
+///
+/// The same bridge as [`Doc`]'s, so a migrated handler can answer
+/// `Result<Doc<T>, Failure>` — both arms typed, both renderable either way.
+impl From<Failure> for Reply {
+    fn from(failure: Failure) -> Self {
+        serde_json::to_string(&failure.problem).map_or_else(
+            |e| crate::marshal::json(500, &format!(r#"{{"error":"could not serialize: {e}"}}"#)),
+            |body| crate::marshal::json(failure.status, &body),
+        )
+    }
+}
+
+/// A handler that may refuse, flattened to the [`Reply`] the old edge writes.
+///
+/// The shape most migrated handlers have: `Result<Doc<T>, Failure>`. Both arms
+/// are already typed — the success by `T`, the refusal by `ProblemResource` —
+/// so this is the one conversion that makes the whole `?`-chain of a migrated
+/// handler usable before its listener has moved.
+impl<T: Serialize, const CODE: u16> From<Result<Doc<T, CODE>, Failure>> for Reply {
+    fn from(outcome: Result<Doc<T, CODE>, Failure>) -> Self {
+        outcome.map_or_else(Into::into, Into::into)
+    }
+}
+
 /// A body that is still being produced, as something Rocket can read.
 ///
 /// Adapter rather than a buffer. The producer arrives as a sequence of frames,

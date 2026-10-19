@@ -3,58 +3,68 @@
 //! The per-tab lock toggle (`lock`/`unlock`), refused outside a schedule's
 //! open windows, queued to the owner.
 
-use std::io::Write;
 use std::sync::{Arc, Mutex};
 
-use super::{TabSnapshot, error_json, respond_json};
+use serde::Serialize;
+use tab_atelier_api::schemars::JsonSchema;
+use tab_atelier_api::{Doc, Failure, Request};
+// The derive emits `schemars::` paths, so the name itself has to be in scope.
+use tab_atelier_api::schemars;
 
-pub(super) fn run<W: Write>(stream: &mut W, state: &Arc<Mutex<TabSnapshot>>, p: &str, body_bytes: &[u8]) {
-    // Flip the per-tab lock from the CLI / API. Master token
-    // only (share-token gate above does not allow `/lock`).
-    // ?on=1/0 takes precedence; absent → toggle.
-    let inner = &p["/tabs/by-id/".len()..p.len() - "/lock".len()];
-    // Pull `?on=` from the original path. `path` here is the
-    // already-stripped form; the original is `raw_path` but
-    // it's already been moved by this point — re-derive from
-    // the body for the body-driven form, or accept the URL
-    // form by looking at the request line earlier captures.
-    // Simplest: accept `{"on": true|false}` in the JSON body.
-    let on_body: Option<bool> = if body_bytes.is_empty() {
+use super::TabSnapshot;
+
+/// The new lock state, echoed so a caller can see the toggle it did not name.
+#[derive(Debug, Serialize, JsonSchema)]
+pub(super) struct Locked {
+    locked: bool,
+}
+
+pub(super) fn run(request: &Request<'_>, state: &Arc<Mutex<TabSnapshot>>) -> Result<Doc<Locked>, Failure> {
+    // Flip the per-tab lock from the CLI / API. Master token only (the
+    // share-token gate above does not allow `/lock`).
+    //
+    // `{"on": true|false}` in the body decides; absent toggles. The body is the
+    // only form: the `?on=` query spelling this used to document never worked —
+    // the query was already consumed into typed variables by the time routing
+    // reached here, and reading it back from a path that had been stripped was
+    // not possible. A caller that sends no body gets the toggle, which is what
+    // `tab-atelier lock` sends.
+    let Some(inner) = request
+        .path
+        .strip_prefix("/tabs/by-id/")
+        .and_then(|rest| rest.strip_suffix("/lock"))
+    else {
+        return Err(Failure::problem(404, "tab not found"));
+    };
+    let on_body: Option<bool> = if request.body.is_empty() {
         None
     } else {
-        serde_json::from_slice::<serde_json::Value>(body_bytes)
+        serde_json::from_slice::<serde_json::Value>(request.body)
             .ok()
             .and_then(|v| v.get("on").and_then(serde_json::Value::as_bool))
     };
     let mut state = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let Some(idx) = state.tabs.iter().position(|t| &*t.id == inner) else {
-        drop(state);
-        error_json(stream, 404, "tab not found");
-        return;
+        return Err(Failure::problem(404, "tab not found"));
     };
     let tab_id = state.tabs[idx].id.to_string();
     let current_locked = state.tabs[idx].locked;
     let new_val = on_body.unwrap_or(!current_locked);
-    // Manual unlock OUTSIDE the schedule's open windows is
-    // refused — the schedule is the boundary, not a polite
-    // suggestion. The user can still lock during open hours
-    // (manual lock beats schedule open). If they want to
-    // unlock outside hours, they remove the schedule first.
+    // Manual unlock OUTSIDE the schedule's open windows is refused — the
+    // schedule is the boundary, not a polite suggestion. The user can still
+    // lock during open hours (manual lock beats schedule open). To unlock
+    // outside hours they remove the schedule first.
     //
-    // Probe the post-unlock state — pass `false` to the
-    // helper to simulate "what would the lock_reason be
-    // after the unlock?" If the answer is still
-    // schedule-driven, refuse. Routes through the same
-    // `lock_reason` helper as every other gate so a future
-    // change to the rule is automatically picked up here.
+    // Probe the post-unlock state — pass `false` to the helper to ask "what
+    // would `lock_reason` be after the unlock?" If the answer is still
+    // schedule-driven, refuse. Going through the same `lock_reason` helper as
+    // every other gate means a future change to the rule is picked up here for
+    // free.
     if !new_val && crate::schedule::lock_reason(false, state.tabs[idx].schedule.as_ref()) == Some("schedule") {
-        drop(state);
-        error_json(stream, 423, "schedule is closed");
-        return;
+        return Err(Failure::problem(423, "schedule is closed"));
     }
     state.tabs[idx].locked = new_val;
     state.pending_lock_changes.push((tab_id, new_val));
     drop(state);
-    let body = serde_json::to_string(&serde_json::json!({"locked": new_val})).unwrap_or_default();
-    respond_json(stream, 200, &body);
+    Ok(Doc::ok(Locked { locked: new_val }))
 }

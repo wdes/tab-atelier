@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! A request body is a struct that parses and validates itself.
+//! A request body is a struct that parses and validates itself — and the
+//! envelope that body arrives in.
 //!
 //! A handler never sees a raw body. It takes a type that could only have been
 //! built from a body that was valid — the parsing, the presence check and the
@@ -8,6 +9,11 @@
 //! controller has a value there is nothing left to be defensive about. The
 //! refusal happens once, here, and every handler below it assumes the happy
 //! path.
+//!
+//! [`Request`] is the rest of what a handler is given: the method, the path, the
+//! query and the caching headers, as a transport parsed them. It names no
+//! framework, so the same handler serves a Rocket route and a server that owns
+//! its listener.
 //!
 //! # Adding a request
 //!
@@ -20,8 +26,78 @@
 
 use bytes::Bytes;
 
+use crate::cache::Conditional;
 use crate::marshal::{Reply, json_of};
 use crate::resource::ProblemResource;
+
+/// What a handler is handed, once a transport has parsed the wire.
+///
+/// The body contract below is half of it; this is the other half. A server that
+/// keeps its own listener — the daemon does, for its WebSocket viewer and SSE
+/// relay — parses HTTP/1.1 into one of these and hands it to the same handlers a
+/// Rocket route would call, so a route is written once instead of twice. The
+/// type names no framework, which is what makes that possible.
+///
+/// Copy, because it borrows: a handler that needs to hold a piece of the request
+/// past the call borrows the piece, not the envelope.
+#[derive(Debug, Clone, Copy)]
+pub struct Request<'a> {
+    /// The method, as the wire spelled it — upper-case from a client, but a
+    /// handler compares rather than assumes (`HEAD` is normalised to `GET` by
+    /// the transport, which is where that convention belongs).
+    pub method: &'a str,
+    /// The path, with the query string and the fragment already removed.
+    pub path: &'a str,
+    /// The raw query string, without the leading `?`. Empty when there was none.
+    pub query: &'a str,
+    /// The body, empty for a method that carries none.
+    pub body: &'a Bytes,
+    /// What this request said about caching: its `Accept-Encoding` and
+    /// `If-None-Match`, already read.
+    pub conditional: Conditional<'a>,
+}
+
+impl<'a> Request<'a> {
+    /// A request with no query and no body, for a fixed-path GET.
+    #[must_use]
+    pub const fn get(path: &'a str) -> Self {
+        // A `static` rather than a temporary: `&Bytes::new()` would need the
+        // temporary promoted to `'static`, which the compiler refuses for a
+        // type with a destructor. `Bytes::new()` is const, so this is free.
+        static EMPTY: Bytes = Bytes::new();
+        Self {
+            method: "GET",
+            path,
+            query: "",
+            body: &EMPTY,
+            conditional: Conditional::none(),
+        }
+    }
+
+    /// The raw value of `name` in the query string, still percent-encoded.
+    ///
+    /// Raw on purpose: whether a value needs decoding depends on what it means,
+    /// and a path arrives already decoded by the time it is matched. The first
+    /// occurrence wins, as RFC 3986 leaves duplicates undefined and a caller that
+    /// cares should not be reading a second one.
+    #[must_use]
+    pub fn query_value(&self, name: &str) -> Option<&'a str> {
+        self.query
+            .split('&')
+            .find_map(|pair| pair.strip_prefix(name)?.strip_prefix('='))
+    }
+}
+
+/// The deserialiser half of [`Validated`] for a handler holding a [`Request`].
+///
+/// # Errors
+///
+/// [`Rejection`], exactly as [`Validated::accept`] documents — this is a
+/// convenience over it so a handler passes its envelope rather than the body
+/// field.
+pub fn body_of<T: Validated>(request: &Request<'_>) -> Result<T, Rejection> {
+    T::accept(request.body)
+}
 
 /// A request body that refuses to become a value when it is not valid.
 ///
@@ -210,7 +286,7 @@ pub mod loose_bool {
 mod tests {
     use bytes::Bytes;
 
-    use super::{Rejection, Reply, Validated, parse};
+    use super::{Rejection, Reply, Request, Validated, parse};
 
     /// A request whose only job is to refuse, so the trait's two failure modes
     /// can be told apart without a real DTO in the way.
@@ -272,5 +348,27 @@ mod tests {
         let r = Rejection::with_status(409, "already exists".to_owned());
         let reply: Reply = r.into();
         assert_eq!(reply.status, 409);
+    }
+
+    #[test]
+    fn a_query_value_is_found_by_its_exact_name() {
+        // `token` must not match `tokens`, which is why the name is matched
+        // with its `=` rather than as a prefix of the pair.
+        let request = Request {
+            query: "lines=40&token=abc&tokens=no",
+            ..Request::get("/tabs")
+        };
+        assert_eq!(request.query_value("token"), Some("abc"));
+        assert_eq!(request.query_value("lines"), Some("40"));
+        assert_eq!(request.query_value("nothing"), None);
+    }
+
+    #[test]
+    fn a_get_has_no_query_no_body_and_no_caching_opinion() {
+        let request = Request::get("/tabs");
+        assert_eq!(request.method, "GET");
+        assert!(request.body.is_empty());
+        assert_eq!(request.query_value("anything"), None);
+        assert_eq!(request.conditional.if_none_match, None);
     }
 }

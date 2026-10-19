@@ -61,9 +61,9 @@ pub use guard::{Actor, Admin, presented};
 pub use marshal::{Body, Reply, ReplyBody, json, json_of, text};
 pub use openapi::{Exempt, Mounted, assert_covers, mount};
 pub use refusal::{Refusal, recall, remember, tokens_match};
-pub use request::{Rejection, Validated, loose_bool, parse};
+pub use request::{Rejection, Request, Validated, body_of, loose_bool, parse};
 pub use resource::{OkResource, ProblemResource};
-pub use respond::{BodyReader, status_of};
+pub use respond::{BodyReader, Doc, Failure, status_of};
 pub use rocket_okapi::openapi_get_routes_spec as routes_spec;
 
 pub use rocket;

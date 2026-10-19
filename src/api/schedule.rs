@@ -3,12 +3,24 @@
 //! The per-tab off-hours auto-lock schedule resource, validated through
 //! `TabSchedule::new` and queued to the owner.
 
-use std::io::Write;
 use std::sync::{Arc, Mutex};
 
-use super::{TabSnapshot, error_json, respond_json};
+use serde::Serialize;
+use tab_atelier_api::schemars;
+use tab_atelier_api::schemars::JsonSchema;
+use tab_atelier_api::{Doc, Failure, Request};
 
-pub(super) fn run<W: Write>(stream: &mut W, state: &Arc<Mutex<TabSnapshot>>, p: &str, body_bytes: &[u8]) {
+use super::TabSnapshot;
+
+/// The schedule as stored, or a bare `{"rule": null}` when it was cleared.
+#[derive(Debug, Serialize, JsonSchema)]
+pub(super) struct Stored {
+    rule: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tz: Option<String>,
+}
+
+pub(super) fn run(request: &Request<'_>, state: &Arc<Mutex<TabSnapshot>>) -> Result<Doc<Stored>, Failure> {
     // Set or clear the off-hours auto-lock schedule. Master
     // token only — same gate as /lock and /bg-color (the
     // share-token route table refuses everything past
@@ -27,35 +39,33 @@ pub(super) fn run<W: Write>(stream: &mut W, state: &Arc<Mutex<TabSnapshot>>, p: 
         rule: Option<String>,
         tz: Option<String>,
     }
-    let inner = &p["/tabs/by-id/".len()..p.len() - "/schedule".len()];
-    let parsed: Option<Body> = if body_bytes.is_empty() {
+    let Some(inner) = request
+        .path
+        .strip_prefix("/tabs/by-id/")
+        .and_then(|rest| rest.strip_suffix("/schedule"))
+    else {
+        return Err(Failure::problem(404, "tab not found"));
+    };
+    let parsed: Option<Body> = if request.body.is_empty() {
         Some(Body { rule: None, tz: None })
     } else {
-        serde_json::from_slice::<Body>(body_bytes).ok()
+        serde_json::from_slice::<Body>(request.body).ok()
     };
     let Some(body) = parsed else {
-        error_json(stream, 400, "invalid JSON body");
-        return;
+        return Err(Failure::problem(400, "invalid JSON body"));
     };
     let schedule_opt: Option<crate::schedule::TabSchedule> = match (body.rule.as_deref(), body.tz.as_deref()) {
         (None | Some(""), _) => None,
-        (Some(rule), Some(tz)) => match crate::schedule::TabSchedule::new(rule, tz) {
-            Ok(s) => Some(s),
-            Err(e) => {
-                error_json(stream, 400, &format!("{e}"));
-                return;
-            }
-        },
+        (Some(rule), Some(tz)) => {
+            Some(crate::schedule::TabSchedule::new(rule, tz).map_err(|e| Failure::problem(400, format!("{e}")))?)
+        }
         (Some(_), None) => {
-            error_json(stream, 400, "tz is required when rule is set");
-            return;
+            return Err(Failure::problem(400, "tz is required when rule is set"));
         }
     };
     let mut state = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let Some(idx) = state.tabs.iter().position(|t| &*t.id == inner) else {
-        drop(state);
-        error_json(stream, 404, "tab not found");
-        return;
+        return Err(Failure::problem(404, "tab not found"));
     };
     let tab_id = state.tabs[idx].id.to_string();
     // Mirror immediately in the snapshot so the next /output
@@ -65,9 +75,11 @@ pub(super) fn run<W: Write>(stream: &mut W, state: &Arc<Mutex<TabSnapshot>>, p: 
     state.tabs[idx].schedule.clone_from(&schedule_opt);
     state.pending_schedule_changes.push((tab_id, schedule_opt.clone()));
     drop(state);
-    let body = schedule_opt.as_ref().map_or_else(
-        || serde_json::json!({"rule": serde_json::Value::Null}),
-        |s| serde_json::json!({"rule": s.rule, "tz": s.tz}),
-    );
-    respond_json(stream, 200, &body.to_string());
+    let stored = schedule_opt
+        .as_ref()
+        .map_or(Stored { rule: None, tz: None }, |s| Stored {
+            rule: Some(s.rule.clone()),
+            tz: Some(s.tz.clone()),
+        });
+    Ok(Doc::ok(stored))
 }
