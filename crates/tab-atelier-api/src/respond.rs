@@ -312,6 +312,22 @@ impl<T: Serialize, const CODE: u16> From<Result<Doc<T, CODE>, Failure>> for Repl
     }
 }
 
+/// A handler that may refuse and answers a `Reply` directly.
+///
+/// The handful of routes that carry headers or a body the resource types cannot
+/// describe — a viewer document with a CSP, a text stream with its live state in
+/// `X-…` headers — still want the `?` chain. Without this they would spell out
+/// `match` at every call site.
+// `use_self` would rewrite this to `impl From<Result<Self, Failure>> for Self`,
+// which does not compile: `Self` is not valid in an impl's self type. Allowing
+// the lint is the only option that keeps the `?` chain available here.
+#[allow(clippy::use_self)]
+impl From<Result<Reply, Failure>> for Reply {
+    fn from(outcome: Result<Reply, Failure>) -> Self {
+        outcome.map_or_else(Into::into, std::convert::identity)
+    }
+}
+
 /// A body that is still being produced, as something Rocket can read.
 ///
 /// Adapter rather than a buffer. The producer arrives as a sequence of frames,

@@ -3,31 +3,42 @@
 //! The `/tabs/usage` read-model: per-tab RSS, token usage, CPU%, connections
 //! and egress — an ETag-cached projection parallel to `/tabs`.
 
-use std::io::Write;
 use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
+use tab_atelier_api::schemars;
+use tab_atelier_api::schemars::JsonSchema;
+use tab_atelier_api::{Conditional, cached};
 
-use super::{TabSnapshot, respond_with_etag};
+use super::TabSnapshot;
 
-pub(super) fn run<W: Write>(
-    stream: &mut W,
-    state: &Arc<Mutex<TabSnapshot>>,
-    accept_gzip: bool,
-    if_none_match: Option<&str>,
-) {
-    #[derive(Serialize)]
-    struct UsageTab {
-        id: String,
-        name: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        resident_memory_bytes: Option<u64>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        tokens: Option<crate::TokenUsage>,
-        cpu_percent: f64,
-        connections: usize,
-        tx_bytes: u64,
-    }
+/// One tab's resource picture.
+///
+/// The two optional axes are skipped rather than sent as `null` because their
+/// absence is meaningful: a tab with no `/proc` sample has no resident memory to
+/// report, and one that has never called a model has no token counts. A caller
+/// rendering "—" for a missing sample and 0 for a real zero needs the two to be
+/// distinguishable on the wire.
+#[derive(Debug, Serialize, JsonSchema)]
+pub(super) struct UsageTab {
+    id: String,
+    name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resident_memory_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tokens: Option<crate::TokenUsage>,
+    cpu_percent: f64,
+    connections: usize,
+    tx_bytes: u64,
+}
+
+/// `GET /tabs/usage`, asked conditionally.
+///
+/// The body is unchanged from the hand-rolled `ETag` writer this replaces, down to
+/// the pretty-printing: a client that already parses this keeps working, and the
+/// tag is still the CRC of the *identity* body, so an in-flight revalidation
+/// across the deploy answers 304 rather than re-fetching.
+pub(super) fn run(state: &Arc<Mutex<TabSnapshot>>) -> Vec<UsageTab> {
     let state = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     // CPU% is sampled by the `energy` feature (`state.power`, parallel to
     // `state.tabs` by index); 0.0 when the binary was built without it.
@@ -51,15 +62,17 @@ pub(super) fn run<W: Write>(
             tx_bytes: t.tx_bytes,
         })
         .collect();
-    let body = serde_json::to_string_pretty(&usage).unwrap_or_default();
     drop(state);
-    respond_with_etag(
-        stream,
-        200,
-        "application/json",
-        body.as_bytes(),
-        accept_gzip,
-        if_none_match,
-        "",
-    );
+    usage
+}
+
+/// The conditional reply for this route: the pretty JSON body, tagged.
+///
+/// Separate from [`run`] because the tag is computed from the *serialized* bytes
+/// — deriving it before serialization would mean hashing something a caller
+/// never receives, and the shared `cached` helper needs the final body anyway.
+pub(super) fn reply(usage: &[UsageTab], conditional: Conditional<'_>) -> tab_atelier_api::Reply {
+    let body = serde_json::to_string_pretty(&usage).unwrap_or_default();
+    let etag = format!("{:08x}", crate::crc32(body.as_bytes()));
+    cached(200, "application/json", bytes::Bytes::from(body), &etag, conditional)
 }

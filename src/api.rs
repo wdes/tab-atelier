@@ -775,10 +775,11 @@ pub struct TabSnapshot {
     /// Cached serialized `/tabs` JSON body. Built lazily on the first GET
     /// after invalidation; cleared by `persist()` whenever the snapshot
     /// changes. Avoids rebuilding the whole response (`strip_ansi` per tab,
-    /// pretty-printed JSON) on every mobile-remote poll. `Arc<str>` so a
-    /// cache hit hands the body out with a refcount bump — the full-body
-    /// `String` copy used to happen while holding this snapshot's mutex.
-    pub cached_response: Option<std::sync::Arc<str>>,
+    /// pretty-printed JSON) on every mobile-remote poll. `Bytes` so a cache
+    /// hit hands the body out with a refcount bump — the full-body `String`
+    /// copy used to happen while holding this snapshot's mutex — and so the
+    /// reply carries it out without a second copy.
+    pub cached_response: Option<bytes::Bytes>,
     /// Lock-free "someone is talking to the daemon" signal. Bumped (via
     /// [`Self::touch`]) by every handled HTTP request and every WS `in`
     /// frame. The GUI's input-drain tick and the headless main loop read
@@ -1219,7 +1220,7 @@ const FILE_LIST_MAX_ENTRIES: usize = 2000;
 /// size/mtime. Each path component must pass [`sanitize_basename`] or the
 /// entry (and, for a directory, its whole subtree) is skipped — the same
 /// filter the flat listing used.
-fn collect_files_tree(dir: &std::path::Path, rel_prefix: &str, depth: usize, out: &mut Vec<serde_json::Value>) {
+fn collect_files_tree(dir: &std::path::Path, rel_prefix: &str, depth: usize, out: &mut Vec<outbox::FileEntry>) {
     if depth > FILE_LIST_MAX_DEPTH || out.len() >= FILE_LIST_MAX_ENTRIES {
         return;
     }
@@ -1248,12 +1249,12 @@ fn collect_files_tree(dir: &std::path::Path, rel_prefix: &str, depth: usize, out
                 .ok()
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map_or(0u64, |d| d.as_secs());
-            out.push(serde_json::json!({
-                "name": name,
-                "path": rel,
-                "size": meta.len(),
-                "mtime": mtime,
-            }));
+            out.push(outbox::FileEntry {
+                name,
+                path: rel,
+                size: meta.len(),
+                mtime,
+            });
         }
     }
 }
@@ -1290,100 +1291,16 @@ pub fn count_files_tree(dir: &std::path::Path) -> usize {
     n
 }
 
-/// Smallest body worth compressing. Shared with `respond_with_etag_precomputed`
-/// so it can tell which representation it is about to send without paying for
-/// the compression first.
-const GZIP_MIN_BODY: usize = 4096;
-
-fn maybe_gzip(bytes: &[u8], accept_gzip: bool) -> Option<Vec<u8>> {
-    const MIN_BODY: usize = GZIP_MIN_BODY;
-    if !accept_gzip || bytes.len() < MIN_BODY {
-        return None;
-    }
-    // `fast` (level 1), not `default` (level 6): these are polled live
-    // endpoints (/tabs, /output) re-compressed per response, and
-    // terminal text / JSON compresses nearly as well at level 1 for a
-    // fraction of the CPU. The WS path made the same call (`api_ws::gzip`).
-    let mut enc = flate2::write::GzEncoder::new(Vec::with_capacity(bytes.len() / 4), flate2::Compression::fast());
-    Write::write_all(&mut enc, bytes).ok()?;
-    enc.finish().ok()
-}
-
-/// Cap gzip on file downloads at this size: past it the encoder
-/// allocates a second near-body-sized buffer and burns CPU on payloads
-/// that are usually already-compressed artifacts (tarballs, images) —
-/// a 1 GiB outbox file would transiently hold ~2 GiB.
-const DOWNLOAD_GZIP_MAX: usize = 4 * 1024 * 1024;
-
-/// Generic body writer with `Accept-Encoding: gzip` and `ETag` support.
-/// `extra_headers` is appended verbatim (each line should end with `\r\n`);
-/// callers pass per-endpoint metadata there (e.g. X-Output-* on
-/// `/tabs/{idx}/output`). Cursor / cwd headers etc.
-/// `#RRGGBB` validator — refuses anything that would break the
-/// surrounding HTTP header line or CSS context if echoed back. Used
-/// both at the POST/preferences-write path (validation-on-input) and
-/// before emitting `X-Tab-Bg` on every `/output` and `/stream`
-/// response (validation-on-output, defense in depth: if a future bug
-/// ever bypasses the input validator, the header line still can't be
-/// corrupted).
-fn is_safe_hex_color(s: &str) -> bool {
-    s.len() == 7 && s.starts_with('#') && s[1..].chars().all(|c| c.is_ascii_hexdigit())
-}
-
-/// Emit `X-Tab-Schedule-Tz` + (when computable) `X-Tab-Schedule-Next`
-/// onto the response's extra-headers buffer. Called from /output and
-/// /stream so the viewer can render "locked until Mo 09:00
-/// Europe/Paris" without parsing the rule itself.
+/// Constant-time byte-slice equality.
 ///
-/// `X-Tab-Schedule-Next` is RFC 3339 in UTC. The viewer applies the tz
-/// header to format it back to the schedule's local time.
-///
-/// Re-validates the tz before echoing — input validation already
-/// rejected unknown zones at `TabSchedule::new`, but a defense-in-
-/// depth check keeps a hypothetical bypass from turning into a
-/// header-injection vector.
-fn write_schedule_headers(extra: &mut String, schedule: &crate::schedule::TabSchedule) {
-    // tz is restricted to the chrono-tz table (ASCII letters, digits,
-    // `/`, `_`, `-`). No CRLF or other unsafe bytes can appear.
-    let tz_safe = schedule
-        .tz
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '_' | '-' | '+'));
-    if tz_safe {
-        let _ = write!(extra, "X-Tab-Schedule-Tz: {}\r\n", schedule.tz);
-    }
-    if let Some(next_utc) = schedule.next_change_from_now() {
-        // RFC 3339 in UTC — strict ASCII, no CRLF.
-        let _ = write!(extra, "X-Tab-Schedule-Next: {}\r\n", next_utc.to_rfc3339());
-    }
-    // Echo the rule too — let the viewer show what the schedule says
-    // without an extra round-trip. Rule is OSM grammar (`Mo-Fr
-    // 09:00-18:00`, `; PH off`, etc.); the parser accepts non-ASCII
-    // in some comment forms, so percent-encode anything outside the
-    // safe printable set.
-    let mut encoded = String::with_capacity(schedule.rule.len());
-    for byte in schedule.rule.bytes() {
-        if matches!(byte, 0x20..=0x7e) && byte != b'%' && byte != b'\r' && byte != b'\n' {
-            encoded.push(byte as char);
-        } else {
-            let _ = write!(encoded, "%{byte:02X}");
-        }
-    }
-    if !encoded.is_empty() {
-        let _ = write!(extra, "X-Tab-Schedule-Rule: {encoded}\r\n");
-    }
-}
-
-/// Constant-time byte-slice equality. Returns false on length mismatch
-/// without leaking length differences via early exit; on equal lengths
-/// folds every byte difference into a single accumulator before
-/// reducing to a bool. Used for every token comparison so a remote
-/// attacker can't shave bits off a 128-bit token by timing how
-/// quickly different guesses get rejected.
-// `pub` here is restricted by the surrounding `pub(crate) mod api;`
-// in lib.rs, so this is effectively crate-visible only. Clippy's
-// `pub_with_shorthand` lint complained about `pub(crate)` inside a
-// non-public module, hence the relaxation.
+/// False on a length mismatch, folded byte-by-byte on equal lengths, so a
+/// remote attacker cannot shave bits off a 128-bit token by timing how quickly
+/// different guesses are rejected. Used for **every** token comparison in this
+/// module — the master token, the relay token, the remote token and both share
+/// tokens — which is why it lives here rather than beside any one of them.
+// `pub` is restricted by the surrounding `pub(crate) mod api;` in lib.rs, so
+// this is effectively crate-visible; clippy's `pub_with_shorthand` complained
+// about `pub(crate)` inside a non-public module, hence the shape.
 pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -1395,98 +1312,28 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-/// Anti-indexing header emitted on every response. Share-link URLs
-/// embed an unguessable token, but if one leaks (a screenshot, a
-/// chat-history index, a paste in a public ticket) the worst case
-/// today is a crawler discovering it and surfacing it in search
-/// results. `X-Robots-Tag` is the HTTP equivalent of the
-/// `<meta name="robots">` we already set in the viewer HTML — it
-/// covers the JSON / binary routes the meta tag can't reach.
+/// The `X-Robots-Tag` every response carries.
+///
+/// A deployed daemon sits behind share links and reverse proxies; a search
+/// engine that crawls one must not index a terminal, a file listing or an
+/// `/openapi.yaml`.
 const ROBOTS_TAG: &str = "X-Robots-Tag: noindex, nofollow, noarchive\r\n";
 
-fn respond_with_etag<W: Write>(
-    stream: &mut W,
-    status: u16,
-    content_type: &str,
-    body: &[u8],
-    accept_gzip: bool,
-    if_none_match: Option<&str>,
-    extra_headers: &str,
-) {
-    respond_with_etag_precomputed(
-        stream,
-        status,
-        content_type,
-        body,
-        accept_gzip,
-        if_none_match,
-        extra_headers,
-        None,
-    );
-}
+/// The largest download the viewer will compress.
+///
+/// Above this the transfer is left alone: a big binary is already in flight for
+/// seconds, and re-running it through the encoder under a share token simply
+/// burns CPU and memory the box may not have.
+const DOWNLOAD_GZIP_MAX: usize = 4 * 1024 * 1024;
 
-/// [`respond_with_etag`] for a caller that already knows the body's CRC
-/// (e.g. `/output`, whose full-payload CRC is cached on the snapshot) —
-/// skips the extra full-body hash pass per response.
-#[allow(clippy::too_many_arguments)]
-fn respond_with_etag_precomputed<W: Write>(
-    stream: &mut W,
-    status: u16,
-    content_type: &str,
-    body: &[u8],
-    accept_gzip: bool,
-    if_none_match: Option<&str>,
-    extra_headers: &str,
-    etag: Option<String>,
-) {
-    let base_etag = etag.unwrap_or_else(|| etag_for(body));
-    // One ETag per REPRESENTATION, not per resource. The gzipped and identity
-    // bodies are different bytes, so sharing a tag lets a shared cache hand a
-    // stored gzip response to a client that never asked for one — and a client
-    // revalidating an identity copy could be told 304 for a gzip it does not
-    // have. `will_gzip` mirrors `maybe_gzip`'s rule so this decision costs no
-    // compression on a conditional request that is about to 304.
-    let will_gzip = accept_gzip && body.len() >= GZIP_MIN_BODY;
-    let etag = if will_gzip {
-        format!("{base_etag}-gz")
-    } else {
-        base_etag
-    };
-    // Any cache in the path must key on the encoding for the same reason.
-    let vary = "Vary: Accept-Encoding\r\n";
-    if status == 200 && if_none_match.is_some_and(|v| v == etag) {
-        // Content is byte-identical to what the client already has.
-        let _ = write!(
-            stream,
-            "HTTP/1.1 304 Not Modified\r\nETag: \"{etag}\"\r\n{vary}{ROBOTS_TAG}{extra_headers}\r\n"
-        );
-        return;
-    }
-    let reason = match status {
-        201 => "Created",
-        400 => "Bad Request",
-        401 => "Unauthorized",
-        403 => "Forbidden",
-        404 => "Not Found",
-        500 => "Internal Server Error",
-        // 200 and anything we haven't enumerated still render "OK".
-        _ => "OK",
-    };
-    if let Some(gz) = maybe_gzip(body, accept_gzip) {
-        let _ = write!(
-            stream,
-            "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Encoding: gzip\r\nETag: \"{etag}\"\r\n{vary}{ROBOTS_TAG}{extra_headers}Content-Length: {}\r\n\r\n",
-            gz.len()
-        );
-        let _ = stream.write_all(&gz);
-    } else {
-        let _ = write!(
-            stream,
-            "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nETag: \"{etag}\"\r\n{vary}{ROBOTS_TAG}{extra_headers}Content-Length: {}\r\n\r\n",
-            body.len()
-        );
-        let _ = stream.write_all(body);
-    }
+/// Whether a value is a `#RRGGBB` colour.
+///
+/// Checked before anything is echoed into a response **header**, which is a
+/// different threat from the HTML/CSS check: `X-Tab-Bg` is a header line, so a
+/// CR or LF in the value would end it and start one of the caller's choosing.
+/// Six hex digits cannot contain either.
+fn is_safe_hex_color(s: &str) -> bool {
+    s.len() == 7 && s.starts_with('#') && s[1..].chars().all(|c| c.is_ascii_hexdigit())
 }
 
 /// The reason phrase for a status code.
@@ -1782,31 +1629,25 @@ fn handle_connection<S: Read + Write>(
     // take the already-parsed `usize`s. Owned, not borrowed from `raw_path`,
     // which `path` below replaces by value.
     let mut query_raw = String::new();
-    let (path, query_token, query_lines, query_since, query_crc, query_name, query_path) =
-        if let Some((p, q)) = raw_path.split_once('?') {
-            q.clone_into(&mut query_raw);
-            let qt = q
-                .split('&')
-                .find_map(|pair| pair.strip_prefix("token="))
-                .map(std::string::ToString::to_string);
-            let ql = q
-                .split('&')
-                .find_map(|pair| pair.strip_prefix("lines="))
-                .and_then(|s| s.parse::<usize>().ok());
-            let qs = q
-                .split('&')
-                .find_map(|pair| pair.strip_prefix("since="))
-                .and_then(|s| s.parse::<usize>().ok());
-            let qc = q
-                .split('&')
-                .find_map(|pair| pair.strip_prefix("crc="))
-                .and_then(|s| u32::from_str_radix(s, 16).ok());
-            let qn = q.split('&').find_map(|pair| pair.strip_prefix("name=")).map(url_decode);
-            let qp = q.split('&').find_map(|pair| pair.strip_prefix("path=")).map(url_decode);
-            (p.to_string(), qt, ql, qs, qc, qn, qp)
-        } else {
-            (raw_path, None, None, None, None, None, None)
-        };
+    let (path, query_token, query_lines) = if let Some((p, q)) = raw_path.split_once('?') {
+        q.clone_into(&mut query_raw);
+        let qt = q
+            .split('&')
+            .find_map(|pair| pair.strip_prefix("token="))
+            .map(std::string::ToString::to_string);
+        let ql = q
+            .split('&')
+            .find_map(|pair| pair.strip_prefix("lines="))
+            .and_then(|s| s.parse::<usize>().ok());
+        // `since`, `crc`, `name` and `path` are no longer pulled out here: the
+        // routes that read them are migrated, and they read the raw query
+        // through `tab_atelier_api::Request`. One parser, and the parameters a
+        // route understands are declared in the route rather than asserted to
+        // be one of seven the dispatcher happens to know about.
+        (p.to_string(), qt, ql)
+    } else {
+        (raw_path, None, None)
+    };
     // Strip a trailing slash so a path like `/tabs/.../view/` (added
     // by some reverse proxies / Cloudflare Tunnel normalisation)
     // still matches the `ends_with("/view")` route arms below.
@@ -1875,13 +1716,15 @@ fn handle_connection<S: Read + Write>(
     // the URL.
     // Public static assets (spec, catalog, viewer JS/CSS/font, icons) are
     // served before the auth gate — a favicon / spec fetch never needs a token.
-    if assets::try_serve(
-        stream,
+    if let Some(reply) = assets::serve(
         method.as_str(),
         path.as_str(),
-        accept_gzip,
-        if_none_match.as_deref(),
+        tab_atelier_api::Conditional {
+            accept_gzip,
+            if_none_match: if_none_match.as_deref(),
+        },
     ) {
+        write_reply(stream, reply);
         return;
     }
 
@@ -2038,8 +1881,17 @@ fn handle_connection<S: Read + Write>(
     match path.as_str() {
         // ---- fixed paths ----
         "/" | "/tabs" => match method.as_str() {
-            "GET" => tabs::list(stream, state, accept_gzip, if_none_match.as_deref()),
-            "POST" if path == "/tabs" => tabs::create(stream, state, &body_bytes),
+            "GET" => write_reply(
+                stream,
+                tabs::list(
+                    state,
+                    tab_atelier_api::Conditional {
+                        accept_gzip,
+                        if_none_match: if_none_match.as_deref(),
+                    },
+                ),
+            ),
+            "POST" if path == "/tabs" => write_reply(stream, tabs::create(&envelope, state).into()),
             _ => method_not_allowed(stream),
         },
         // Lean per-tab consumption projection for a dashboard poller — the
@@ -2047,7 +1899,19 @@ fn handle_connection<S: Read + Write>(
         // `raw_output` scrollback dumps, so it's cheap to poll ~1 s. Same
         // auth gate as `/tabs` (checked upstream of this match).
         "/tabs/usage" => match method.as_str() {
-            "GET" => usage::run(stream, state, accept_gzip, if_none_match.as_deref()),
+            "GET" => {
+                let usage = usage::run(state);
+                write_reply(
+                    stream,
+                    usage::reply(
+                        &usage,
+                        tab_atelier_api::Conditional {
+                            accept_gzip,
+                            if_none_match: if_none_match.as_deref(),
+                        },
+                    ),
+                );
+            }
             _ => method_not_allowed(stream),
         },
         "/tabs/rotate-tokens" => match method.as_str() {
@@ -2067,12 +1931,12 @@ fn handle_connection<S: Read + Write>(
             _ => method_not_allowed(stream),
         },
         "/relay-mode" => match method.as_str() {
-            "POST" => relay::mode(stream, state, &body_bytes),
+            "POST" => write_reply(stream, relay::mode(&envelope, state).into()),
             _ => method_not_allowed(stream),
         },
         "/relay-config" => match method.as_str() {
-            "GET" => relay::config_get(stream),
-            "POST" => relay::config_set(stream, state, &body_bytes),
+            "GET" => write_reply(stream, relay::config_get().into()),
+            "POST" => write_reply(stream, relay::config_set(&envelope, state).into()),
             _ => method_not_allowed(stream),
         },
         "/logs" => match method.as_str() {
@@ -2130,28 +1994,25 @@ fn handle_connection<S: Read + Write>(
         // fixed paths, not a 404: the path exists, the segment does not.
         p if p.starts_with("/tabs/") => match method.as_str() {
             #[cfg(feature = "catbus")]
-            "GET" if p.ends_with("/catbus") => catbus::session(stream, state, p),
+            "GET" if p.ends_with("/catbus") => write_reply(stream, catbus::session_request(&envelope, state).into()),
             #[cfg(feature = "catbus")]
-            "POST" if p.ends_with("/catbus/message") => catbus::message(stream, state, p, &body_bytes),
+            "POST" if p.ends_with("/catbus/message") => {
+                write_reply(stream, catbus::message(&envelope, state).into());
+            }
             #[cfg(feature = "catbus")]
-            "GET" if p.ends_with("/catbus/messages") => catbus::messages(stream, state, p, query_since),
+            "GET" if p.ends_with("/catbus/messages") => {
+                write_reply(stream, catbus::messages_request(&envelope, state).into());
+            }
             "GET" if p.ends_with("/view") => {
-                view::run(
-                    stream,
-                    state,
-                    p,
-                    accept_gzip,
-                    if_none_match.as_deref(),
-                    had_trailing_slash,
-                );
+                write_reply(stream, view::run(&envelope, state, had_trailing_slash).into());
             }
             "GET" if p.ends_with("/output") => {
-                output::run(stream, state, p, query_since, query_crc, query_lines, accept_gzip);
+                write_reply(stream, output::run(&envelope, state).into());
             }
             "GET" if p.ends_with("/env") => write_reply(stream, env::list_tab(&envelope, state).into()),
             "POST" if p.ends_with("/env") => write_reply(stream, env::set_tab(&envelope, state).into()),
             "DELETE" if !p[6..].contains('/') || (p[6..].starts_with("by-id/") && p[6..].matches('/').count() == 1) => {
-                tabs::close(stream, state, p);
+                write_reply(stream, tabs::close(&envelope, state).into());
             }
             "POST" if p.ends_with("/meta") => write_reply(stream, meta::set(&envelope, state)),
             // Mint (or return) this tab's RW share token, so a caller that is
@@ -2169,40 +2030,31 @@ fn handle_connection<S: Read + Write>(
             // `TAG_ACTIVATE` covers the same intent for the web viewer
             // and no CLI subcommand depends on it.)
             "POST" if p.starts_with("/tabs/by-id/") && p.ends_with("/status") => {
-                status::run(stream, state, p, &body_bytes);
+                write_reply(stream, status::run(&envelope, state).into());
             }
             "POST" if p.ends_with("/files") => {
-                files::upload(
+                write_reply(
                     stream,
-                    state,
-                    p,
-                    &body_bytes,
-                    provided_token.as_deref(),
-                    query_name.as_deref(),
+                    files::upload(&envelope, state, provided_token.as_deref()).into(),
                 );
             }
             "GET" if p.ends_with("/files") => {
-                files::download(
-                    stream,
-                    state,
-                    p,
-                    query_path.as_deref(),
-                    accept_gzip,
-                    if_none_match.as_deref(),
-                );
+                write_reply(stream, files::download(&envelope, state).into());
             }
             // A named download: `/tabs/<key>/outbox/<name>`. The name is in the
             // path so the browser's fallback filename is already correct when an
             // `<a download>` is ignored (it is, cross-origin).
             "GET" if p.contains("/outbox/") => {
-                files::download_by_path(stream, state, p, accept_gzip, if_none_match.as_deref());
+                write_reply(stream, files::download_by_path(&envelope, state).into());
             }
             // List `outbox/` or `inbox/` contents so the viewer can
             // render the download / sent-files panels. The panel header
             // shows `dir` (absolute path) so the user can paste it into
             // Claude / their agent ("read inbox/foo.txt"). RO + RW
             // share-tokens both allowed, master token always allowed.
-            "GET" if p.ends_with("/outbox") || p.ends_with("/inbox") => outbox::list(stream, state, p),
+            "GET" if p.ends_with("/outbox") || p.ends_with("/inbox") => {
+                write_reply(stream, outbox::list(&envelope, state).into());
+            }
             "POST" if p.starts_with("/tabs/by-id/") && p.ends_with("/lock") => {
                 write_reply(stream, lock::run(&envelope, state).into());
             }
@@ -2213,7 +2065,7 @@ fn handle_connection<S: Read + Write>(
                 write_reply(stream, net::allow(&envelope, state).into());
             }
             "POST" if p.starts_with("/tabs/by-id/") && p.ends_with("/ssh-agent") => {
-                ssh_agent::set(stream, state, p, &body_bytes);
+                write_reply(stream, ssh_agent::set(&envelope, state).into());
             }
             "POST" if p.starts_with("/tabs/by-id/") && p.ends_with("/schedule") => {
                 write_reply(stream, schedule::run(&envelope, state).into());
@@ -2227,7 +2079,7 @@ fn handle_connection<S: Read + Write>(
             "POST" if p.starts_with("/tabs/by-id/") && p.ends_with("/context") => {
                 write_reply(stream, tab_props::context(&envelope, state).into());
             }
-            "POST" if p.ends_with("/input") => input::run(stream, state, p, body_bytes.to_vec()),
+            "POST" if p.ends_with("/input") => write_reply(stream, input::run(&envelope, state).into()),
             _ => method_not_allowed(stream),
         },
         _ => error_json(stream, 404, "not found"),
@@ -3451,19 +3303,6 @@ mod tests {
     }
 
     #[test]
-    fn maybe_gzip_compresses_only_when_worthwhile() {
-        let big = "the same line of terminal text over and over\n".repeat(200);
-        assert!(maybe_gzip(big.as_bytes(), false).is_none(), "client can't gzip");
-        assert!(maybe_gzip(b"tiny", true).is_none(), "under the 4 KB floor");
-        let gz = maybe_gzip(big.as_bytes(), true).expect("big + accepted");
-        assert!(gz.len() < big.len() / 4, "repetitive text shrinks a lot");
-        let mut dec = flate2::read::GzDecoder::new(gz.as_slice());
-        let mut round = String::new();
-        std::io::Read::read_to_string(&mut dec, &mut round).unwrap();
-        assert_eq!(round, big, "round-trips byte-exact");
-    }
-
-    #[test]
     fn h1_request_forces_a_consistent_content_length() {
         let mut headers = hyper::HeaderMap::new();
         headers.insert(hyper::header::HOST, "localhost".parse().unwrap());
@@ -4072,17 +3911,31 @@ mod tests {
             rule: "Mo-Fr 09:00-18:00".into(),
             tz: "Europe/Paris".into(),
         };
-        let mut extra = String::new();
-        super::write_schedule_headers(&mut extra, &schedule);
+        let headers = super::output::schedule_headers(&schedule);
         // A viewer shows the reason and the next change, so both have to be
         // present…
-        assert!(extra.contains("X-Tab-Schedule"), "{extra}");
-        // …and every header line must be CRLF-terminated, or the rest of the
-        // response is swallowed into a malformed header block.
-        assert!(extra.ends_with("\r\n"), "{extra:?}");
-        for line in extra.split("\r\n").filter(|l| !l.is_empty()) {
-            assert!(line.contains(':'), "not a header: {line:?}");
-            assert!(!line.contains('\n'), "embedded newline: {line:?}");
+        assert!(headers.iter().any(|(n, _)| *n == "X-Tab-Schedule-Rule"), "{headers:?}");
+        assert!(headers.iter().any(|(n, _)| *n == "X-Tab-Schedule-Next"), "{headers:?}");
+        // …and no value may carry a line break, which would end the header and
+        // start one of the client's choosing.
+        for (name, value) in &headers {
+            assert!(!value.contains('\r'), "{name} carries a CR: {value:?}");
+            assert!(!value.contains('\n'), "{name} carries an LF: {value:?}");
+        }
+    }
+
+    #[test]
+    fn a_hostile_schedule_rule_cannot_inject_a_header() {
+        // `rule` is whatever an operator typed on the command line, and it
+        // reaches a header verbatim in most cases — so the encoding is the only
+        // thing standing between a typo and a response-splitting bug.
+        let schedule = crate::schedule::TabSchedule {
+            rule: "Mo-Fr 09:00-18:00\r\nX-Injected: yes".into(),
+            tz: "Europe/Paris".into(),
+        };
+        for (name, value) in super::output::schedule_headers(&schedule) {
+            assert!(!value.contains('\r'), "{name}: {value:?}");
+            assert!(!value.contains('\n'), "{name}: {value:?}");
         }
     }
 
@@ -5119,6 +4972,107 @@ mod tests {
         assert_eq!(status_code(&resp), 200);
         assert!(resp.contains("line-0"));
         crate::log_ring::clear();
+    }
+
+    #[test]
+    fn every_documented_path_actually_routes() {
+        // The enforcement this server did not have. Two failure modes it
+        // catches, both of which shipped before:
+        //
+        //   * a path in openapi.yaml that the dispatcher does not serve — the
+        //     document promises something that 404s;
+        //   * a route the dispatcher serves that the document omits — invisible
+        //     to anyone reading the contract.
+        //
+        // It probes the REAL routing rather than comparing against a second
+        // list of route strings: a hand-kept list is one more thing to forget,
+        // and the whole point is that the document and the router agree.
+        //
+        // The dispatcher's unknown-path arm answers exactly
+        // `{"error":"not found"}`; every route it does serve answers something
+        // else, even when refusing (401, 403, 423, …). So "not that body" is a
+        // reliable "the router knew this path".
+        let (port, _, _) = spawn_server();
+        let unknown = r#"{"error":"not found"}"#;
+        let mut unreachable = Vec::new();
+        for path in documented_paths() {
+            // A documented template reaches the router as a concrete path; any
+            // value works because the handler only resolves it after routing.
+            let concrete = path.replace("{idx}", "0").replace("{id}", "tab-a");
+            // GET is the method every documented path supports at least for a
+            // refusal; a POST-only path still routes and refuses.
+            let response = request(port, &format!("GET {concrete} HTTP/1.1\r\n\r\n"));
+            let body = body(&response);
+            if body.trim() == unknown {
+                unreachable.push(path);
+            }
+        }
+        assert!(
+            unreachable.is_empty(),
+            "documented in openapi.yaml but not routed: {unreachable:?}"
+        );
+    }
+
+    #[test]
+    fn the_migrated_routes_keep_their_documented_statuses() {
+        // A migration that quietly changed a status would still pass every
+        // other test here — the body shape and the code are separate promises.
+        let (port, _, token) = spawn_server();
+        let cases = [
+            // (request line, body, expected status, why)
+            ("GET /fleet HTTP/1.1", "", 200, "a read"),
+            ("GET /tabs/usage HTTP/1.1", "", 200, "a read"),
+            (
+                "GET /tabs/by-id/nope/meta HTTP/1.1",
+                "",
+                405,
+                "GET is not a method /meta serves",
+            ),
+            (
+                "POST /tabs/by-id/nope/meta HTTP/1.1",
+                r#"{"key":"role","value":"rev"}"#,
+                404,
+                "a valid body for a tab that does not exist",
+            ),
+            // A malformed body is refused BEFORE the tab is looked up: the
+            // request is answered on its own merits, and a caller that cannot
+            // form a request should not learn whether a tab exists.
+            (
+                "POST /tabs/by-id/nope/meta HTTP/1.1",
+                "",
+                400,
+                "no body at all — validated before any lookup",
+            ),
+            ("POST /tabs/by-id/tab-a/resize HTTP/1.1", "", 400, "no body"),
+            ("POST /claude-only HTTP/1.1", "", 400, "no body"),
+            ("POST /claims HTTP/1.1", "", 400, "no body"),
+        ];
+        for (line, body_text, want, why) in cases {
+            let response = request(
+                port,
+                &format!(
+                    "{line}\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\n\r\n{body_text}",
+                    body_text.len()
+                ),
+            );
+            assert_eq!(status_code(&response), want, "{line} — {why}");
+        }
+    }
+
+    /// Every path `assets/openapi.yaml` declares.
+    fn documented_paths() -> Vec<String> {
+        // A deliberate textual read, not a YAML parse: this test exists to
+        // catch a divergence between the document and the router, and a parser
+        // would accept a document the server cannot serve. Only the two-space
+        // `  /path:` lines under `paths:` are route declarations.
+        OPENAPI_YAML
+            .lines()
+            .filter_map(|line| {
+                let path = line.strip_prefix("  /")?;
+                let (path, _) = path.split_once(':')?;
+                Some(format!("/{path}"))
+            })
+            .collect()
     }
 
     #[test]
@@ -6535,11 +6489,11 @@ mod tests {
         for (req, label) in [
             (
                 format!("GET /tabs/0/output HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n"),
-                "output (respond_with_etag)",
+                "output (cached reply)",
             ),
             (
                 format!("GET /tabs HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n"),
-                "tabs (respond_json)",
+                "tabs (cached reply)",
             ),
             (
                 "GET /tabs/0/output HTTP/1.1\r\nAuthorization: Bearer wrong-token\r\n\r\n".to_string(),

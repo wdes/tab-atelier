@@ -3,34 +3,68 @@
 //! The `/outbox` + `/inbox` listing: the file tree the share viewer renders
 //! for its download / sent-files panels.
 
-use std::io::Write;
 use std::sync::{Arc, Mutex};
 
-use super::{TabSnapshot, collect_files_tree, error_json, parse_tab_key, resolve_tab_idx, respond_json};
+use serde::Serialize;
+use tab_atelier_api::schemars;
+use tab_atelier_api::schemars::JsonSchema;
+use tab_atelier_api::{Doc, Failure, Request};
 
-pub(super) fn list<W: Write>(stream: &mut W, state: &Arc<Mutex<TabSnapshot>>, p: &str) {
-    let dirname = if p.ends_with("/outbox") { "outbox" } else { "inbox" };
+use super::{TabSnapshot, collect_files_tree, parse_tab_key, resolve_tab_idx};
+
+/// One file in the tree.
+///
+/// A type rather than a `serde_json::Value`, which is what this was: the shape
+/// is fixed, so building it as an untyped map meant the sort below had to treat
+/// a missing `path` as `""` and the response could not be documented.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct FileEntry {
+    /// The basename, already sanitised.
+    pub name: String,
+    /// Relative to the listing's `dir`, so a download resolves it against
+    /// `<dir>/<path>` and cannot climb out.
+    pub path: String,
+    /// Bytes.
+    pub size: u64,
+    /// Unix seconds of the last modification.
+    pub mtime: u64,
+}
+
+/// The listing, or an empty one when the tab has no cwd or the directory is
+/// not inside it.
+#[derive(Debug, Serialize, JsonSchema)]
+pub(super) struct Tree {
+    files: Vec<FileEntry>,
+    dir: String,
+}
+
+pub(super) fn list(request: &Request<'_>, state: &Arc<Mutex<TabSnapshot>>) -> Result<Doc<Tree>, Failure> {
+    let dirname = if request.path.ends_with("/outbox") {
+        "outbox"
+    } else {
+        "inbox"
+    };
     let suffix = if dirname == "outbox" { "/outbox" } else { "/inbox" };
-    let Some((key_raw, is_uuid)) = parse_tab_key(p, suffix) else {
-        error_json(stream, 404, "invalid tab key");
-        return;
+    let Some((key_raw, is_uuid)) = parse_tab_key(request.path, suffix) else {
+        return Err(Failure::problem(404, "invalid tab key"));
+    };
+    let empty = || {
+        Doc::ok(Tree {
+            files: Vec::new(),
+            dir: String::new(),
+        })
     };
     let snap = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let Some(idx) = resolve_tab_idx(&snap, key_raw, is_uuid) else {
-        drop(snap);
-        error_json(stream, 404, "tab not found");
-        return;
+        return Err(Failure::problem(404, "tab not found"));
     };
     let Some(t) = snap.tabs.get(idx) else {
-        drop(snap);
-        error_json(stream, 404, "tab index out of range");
-        return;
+        return Err(Failure::problem(404, "tab index out of range"));
     };
     let cwd = t.cwd.clone();
     drop(snap);
     let Some(cwd) = cwd else {
-        respond_json(stream, 200, r#"{"files":[],"dir":""}"#);
-        return;
+        return Ok(empty());
     };
     let dir_path = std::path::Path::new(&*cwd).join(dirname);
     // The DIRECTORY itself must not be a way out. `read_dir` follows a symlink
@@ -46,22 +80,21 @@ pub(super) fn list<W: Write>(stream: &mut W, state: &Arc<Mutex<TabSnapshot>>, p:
         _ => false,
     };
     if !inside {
-        respond_json(stream, 200, r#"{"files":[],"dir":""}"#);
-        return;
+        return Ok(empty());
     }
     // Walk the whole subtree (not just the top level) so files the
     // agent tucked into subfolders show up — the viewer renders
     // them in tree mode. Each file carries a `path` relative to
     // `dir_path`; downloads resolve it against `<dir>/<path>`.
-    let mut files: Vec<serde_json::Value> = Vec::new();
+    let mut files = Vec::new();
     collect_files_tree(&dir_path, "", 0, &mut files);
     // Stable order (by relative path) so folders group together and
-    // the viewer's diff (new-file toast) is predictable across polls.
-    files.sort_by(|a, b| a["path"].as_str().unwrap_or("").cmp(b["path"].as_str().unwrap_or("")));
-    let body = serde_json::to_string(&serde_json::json!({
-        "files": files,
-        "dir": dir_path.to_string_lossy(),
+    // the viewer's diff (new-file toast) is predictable across polls. On the
+    // typed entries this is a plain string compare with no "missing field"
+    // case to worry about.
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(Doc::ok(Tree {
+        files,
+        dir: dir_path.to_string_lossy().into_owned(),
     }))
-    .unwrap_or_default();
-    respond_json(stream, 200, &body);
 }

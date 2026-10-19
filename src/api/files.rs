@@ -4,25 +4,34 @@
 //! symlink-guarded, per-token concurrency cap) and download from `inbox/` /
 //! `outbox/` (sandbox-resolved, no-sniff).
 
-use std::io::Write;
 use std::sync::{Arc, Mutex};
 
 use log::info;
+use serde::Serialize;
+use tab_atelier_api::schemars;
+use tab_atelier_api::schemars::JsonSchema;
+use tab_atelier_api::{Doc, Failure, Reply, Request, cached};
 
 use super::{
     DOWNLOAD_GZIP_MAX, TabSnapshot, UPLOAD_MAX_BYTES, UPLOAD_MAX_BYTES_MIB, UPLOAD_MAX_INFLIGHT_PER_TOKEN, UploadSlot,
-    error_json, parse_tab_key, resolve_sandbox_path, resolve_tab_idx, respond_json, respond_with_etag,
-    sanitize_basename, write_new_file_no_symlink,
+    parse_tab_key, resolve_sandbox_path, resolve_tab_idx, sanitize_basename, write_new_file_no_symlink,
 };
 
-pub(super) fn upload<W: Write>(
-    stream: &mut W,
+/// Where an upload landed.
+#[derive(Debug, Serialize, JsonSchema)]
+pub(super) struct Stored {
+    /// Absolute, for a caller on the same host.
+    path: String,
+    /// Relative to the tab's cwd, for anything addressable through this API.
+    relpath: String,
+    bytes: usize,
+}
+
+pub(super) fn upload(
+    request: &Request<'_>,
     state: &Arc<Mutex<TabSnapshot>>,
-    p: &str,
-    body_bytes: &[u8],
     provided_token: Option<&str>,
-    query_name: Option<&str>,
-) {
+) -> Result<Doc<Stored>, Failure> {
     // Upload file body into the tab's `cwd/inbox/<name>`.
     // `?name=<basename>` is required and is sanitised to a
     // path-component (no `..`, no separators) so a malicious
@@ -34,33 +43,21 @@ pub(super) fn upload<W: Write>(
     // one share recipient can't queue dozens of concurrent
     // 100 MiB POSTs and amplify memory pressure (audit #3).
     let upload_token = provided_token.unwrap_or("");
-    let _slot = match UploadSlot::try_acquire(upload_token) {
-        Ok(s) => s,
-        Err(n) => {
-            error_json(
-                stream,
-                429,
-                &format!(
-                    "too many concurrent uploads from this token ({n} already in flight; cap {UPLOAD_MAX_INFLIGHT_PER_TOKEN})"
-                ),
-            );
-            return;
-        }
-    };
-    let Some((key_raw, is_uuid)) = parse_tab_key(p, "/files") else {
-        error_json(stream, 404, "invalid tab key");
-        return;
+    let _slot = UploadSlot::try_acquire(upload_token).map_err(|n| {
+        Failure::problem(
+            429,
+            format!("too many concurrent uploads from this token ({n} already in flight; cap {UPLOAD_MAX_INFLIGHT_PER_TOKEN})"),
+        )
+    })?;
+    let Some((key_raw, is_uuid)) = parse_tab_key(request.path, "/files") else {
+        return Err(Failure::problem(404, "invalid tab key"));
     };
     let snap = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let Some(idx) = resolve_tab_idx(&snap, key_raw, is_uuid) else {
-        drop(snap);
-        error_json(stream, 404, "tab not found");
-        return;
+        return Err(Failure::problem(404, "tab not found"));
     };
     let Some(t) = snap.tabs.get(idx) else {
-        drop(snap);
-        error_json(stream, 404, "tab index out of range");
-        return;
+        return Err(Failure::problem(404, "tab index out of range"));
     };
     // Refuse uploads to a locked tab — same policy as POST
     // /input. Lock means "this tab is read-only right now";
@@ -69,32 +66,30 @@ pub(super) fn upload<W: Write>(
     // the session. `effective_locked()` covers BOTH the
     // manual flag and the off-hours schedule.
     if crate::schedule::LockState::effective_locked(t) {
-        drop(snap);
-        error_json(stream, 423, "tab is locked");
-        return;
+        return Err(Failure::problem(423, "tab is locked"));
     }
     let cwd = t.cwd.clone();
     drop(snap);
     let Some(cwd) = cwd else {
-        error_json(stream, 400, "tab has no known cwd");
-        return;
+        return Err(Failure::problem(400, "tab has no known cwd"));
     };
-    let Some(name) = query_name.and_then(sanitize_basename) else {
-        error_json(stream, 400, "missing or invalid ?name=<basename>");
-        return;
+    let Some(name) = request.query_value("name").and_then(sanitize_basename) else {
+        return Err(Failure::problem(400, "missing or invalid ?name=<basename>"));
     };
     // Hard cap. The Content-Length pre-check already 413'd
     // anything bigger (see UPLOAD_MAX_BYTES below), so this
     // is the post-read safety net for `Transfer-Encoding:
     // chunked` requests we can't size in advance.
+    let body_bytes = request.body;
     if body_bytes.len() > UPLOAD_MAX_BYTES {
-        error_json(stream, 413, &format!("upload exceeds {UPLOAD_MAX_BYTES_MIB} MiB limit"));
-        return;
+        return Err(Failure::problem(
+            413,
+            format!("upload exceeds {UPLOAD_MAX_BYTES_MIB} MiB limit"),
+        ));
     }
     let inbox = std::path::Path::new(&*cwd).join("inbox");
     if let Err(e) = std::fs::create_dir_all(&inbox) {
-        error_json(stream, 500, &format!("mkdir inbox: {e}"));
-        return;
+        return Err(Failure::problem(500, format!("mkdir inbox: {e}")));
     }
     // Sandbox guard (parity with the GET /files download path,
     // which funnels through resolve_sandbox_path). The upload
@@ -109,12 +104,10 @@ pub(super) fn upload<W: Write>(
         .ok()
         .zip(inbox.canonicalize().ok());
     let Some((cwd_canon, inbox_canon)) = resolved else {
-        error_json(stream, 404, "inbox path unreadable");
-        return;
+        return Err(Failure::problem(404, "inbox path unreadable"));
     };
     if !inbox_canon.starts_with(&cwd_canon) || inbox_canon.file_name() != Some(std::ffi::OsStr::new("inbox")) {
-        error_json(stream, 403, "inbox escapes the tab's cwd");
-        return;
+        return Err(Failure::problem(403, "inbox escapes the tab's cwd"));
     }
     // Atomic write: stage to <name>.tmp then rename. A reader
     // walking inbox/ never sees a half-written file. `create_new`
@@ -125,25 +118,24 @@ pub(super) fn upload<W: Write>(
     let dest = inbox_canon.join(&name);
     let staging = inbox_canon.join(format!(".{name}.tmp"));
     if let Err(e) = write_new_file_no_symlink(&staging, body_bytes) {
-        error_json(stream, 500, &format!("write inbox/.{name}.tmp: {e}"));
-        return;
+        return Err(Failure::problem(500, format!("write inbox/.{name}.tmp: {e}")));
     }
     // rename() replaces the destination entry itself (it does
     // not follow a symlink at `dest`), so the rename can't be
     // redirected either.
     if let Err(e) = std::fs::rename(&staging, &dest) {
         let _ = std::fs::remove_file(&staging);
-        error_json(stream, 500, &format!("rename into inbox/{name}: {e}"));
-        return;
+        return Err(Failure::problem(500, format!("rename into inbox/{name}: {e}")));
     }
     info!("API: stored {} bytes in {}", body_bytes.len(), dest.display());
-    let body = serde_json::to_string(&serde_json::json!({
-        "path": dest.to_string_lossy(),
-        "relpath": format!("inbox/{name}"),
-        "bytes": body_bytes.len(),
-    }))
-    .unwrap_or_default();
-    respond_json(stream, 201, &body);
+    Ok(Doc::at(
+        201,
+        Stored {
+            path: dest.to_string_lossy().into_owned(),
+            relpath: format!("inbox/{name}"),
+            bytes: body_bytes.len(),
+        },
+    ))
 }
 
 /// `GET /tabs/{key}/outbox/{name}` — the same download, addressed by path.
@@ -157,81 +149,66 @@ pub(super) fn upload<W: Write>(
 /// With the name in the path there is nothing left to guess: the fallback name
 /// IS the filename, `Content-Disposition` agrees with it, and a plain
 /// `<a href download>` needs no JavaScript to work.
-pub(super) fn download_by_path<W: Write>(
-    stream: &mut W,
-    state: &Arc<Mutex<TabSnapshot>>,
-    p: &str,
-    accept_gzip: bool,
-    if_none_match: Option<&str>,
-) {
+pub(super) fn download_by_path(request: &Request<'_>, state: &Arc<Mutex<TabSnapshot>>) -> Result<Reply, Failure> {
     // `/tabs/<key>/outbox/<rel>` → key, and `outbox/<rel>` as the sandbox path.
-    let Some((left, rest)) = p.split_once("/outbox/") else {
-        error_json(stream, 404, "not a file path");
-        return;
+    let Some((left, rest)) = request.path.split_once("/outbox/") else {
+        return Err(Failure::problem(404, "not a file path"));
     };
     let rel = super::url_decode(rest);
     if rel.is_empty() {
-        error_json(stream, 404, "no file named");
-        return;
+        return Err(Failure::problem(404, "no file named"));
     }
     // Reuse the query-form handler so the sandbox check, the ETag and the
     // Content-Disposition are the same code — a second copy of a path check
     // is a second chance to get it wrong.
-    download(
-        stream,
-        state,
-        &format!("{left}/files"),
-        Some(&format!("outbox/{rel}")),
-        accept_gzip,
-        if_none_match,
-    );
+    //
+    // The handler below is path-shaped (`…/files?path=…`), so the suffix is
+    // re-attached here rather than passing a second "what to serve" argument
+    // through it.
+    serve_path(state, &format!("{left}/files"), &format!("outbox/{rel}"), request)
 }
 
-pub(super) fn download<W: Write>(
-    stream: &mut W,
-    state: &Arc<Mutex<TabSnapshot>>,
-    p: &str,
-    query_path: Option<&str>,
-    accept_gzip: bool,
-    if_none_match: Option<&str>,
-) {
+pub(super) fn download(request: &Request<'_>, state: &Arc<Mutex<TabSnapshot>>) -> Result<Reply, Failure> {
     // Download a file from the tab's sandbox. `?path=…` must
     // resolve inside one of `FILE_SANDBOX_DIRS` (currently
     // `inbox/` + `outbox/`) of the tab's cwd — anything
     // else is rejected before any filesystem access. See
     // `resolve_sandbox_path` for the full check.
-    let Some((key_raw, is_uuid)) = parse_tab_key(p, "/files") else {
-        error_json(stream, 404, "invalid tab key");
-        return;
+    let Some(raw_path) = request.query_value("path") else {
+        return Err(Failure::problem(400, "missing ?path=<relative-path>"));
+    };
+    // Percent-decoded here, not by the caller: the dispatcher used to decode
+    // this query value before handing it over, and a handler that reads the raw
+    // query now owns that step. Without it an uploaded "Frédéric report.txt"
+    // is looked up as the literal `Fr%C3%A9d%C3%A9ric%20report.txt` and 404s —
+    // which is exactly what the RFC 5987 test caught.
+    let raw_path = super::url_decode(raw_path);
+    serve_path(state, request.path, &raw_path, request)
+}
+
+/// Resolve, guard and read one sandbox file, then answer it conditionally.
+fn serve_path(
+    state: &Arc<Mutex<TabSnapshot>>,
+    path: &str,
+    raw_path: &str,
+    request: &Request<'_>,
+) -> Result<Reply, Failure> {
+    let Some((key_raw, is_uuid)) = parse_tab_key(path, "/files") else {
+        return Err(Failure::problem(404, "invalid tab key"));
     };
     let snap = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let Some(idx) = resolve_tab_idx(&snap, key_raw, is_uuid) else {
-        drop(snap);
-        error_json(stream, 404, "tab not found");
-        return;
+        return Err(Failure::problem(404, "tab not found"));
     };
     let Some(t) = snap.tabs.get(idx) else {
-        drop(snap);
-        error_json(stream, 404, "tab index out of range");
-        return;
+        return Err(Failure::problem(404, "tab index out of range"));
     };
     let cwd = t.cwd.clone();
     drop(snap);
     let Some(cwd) = cwd else {
-        error_json(stream, 400, "tab has no known cwd");
-        return;
+        return Err(Failure::problem(400, "tab has no known cwd"));
     };
-    let Some(raw_path) = query_path else {
-        error_json(stream, 400, "missing ?path=<relative-path>");
-        return;
-    };
-    let canonical = match resolve_sandbox_path(&cwd, raw_path) {
-        Ok(p) => p,
-        Err((status, msg)) => {
-            error_json(stream, status, &msg);
-            return;
-        }
-    };
+    let canonical = resolve_sandbox_path(&cwd, raw_path).map_err(|(status, msg)| Failure::problem(status, msg))?;
     // Defense in depth against a component being swapped for a
     // symlink in the window between resolve_sandbox_path's
     // canonicalize and the read below: confirm the final entry
@@ -239,23 +216,23 @@ pub(super) fn download<W: Write>(
     // lstat that does NOT follow links. Narrows the TOCTOU and
     // avoids reading through a freshly-planted symlink.
     let Ok(meta) = std::fs::symlink_metadata(&canonical) else {
-        error_json(stream, 404, "file not found");
-        return;
+        return Err(Failure::problem(404, "file not found"));
     };
     if !meta.file_type().is_file() {
-        error_json(stream, 403, "not a regular file");
-        return;
+        return Err(Failure::problem(403, "not a regular file"));
     }
     // Generic message — do not echo the absolute server path /
     // OS error back to a remote share-link holder.
     let Ok(bytes) = std::fs::read(&canonical) else {
-        error_json(stream, 404, "file not found");
-        return;
+        return Err(Failure::problem(404, "file not found"));
     };
     let display_name = canonical.file_name().and_then(|s| s.to_str()).unwrap_or("download");
     info!("API: served {} bytes from {}", bytes.len(), canonical.display());
     // See DOWNLOAD_GZIP_MAX — no gzip for big binary downloads.
-    let accept_gzip = accept_gzip && bytes.len() <= DOWNLOAD_GZIP_MAX;
+    let client = tab_atelier_api::Conditional {
+        accept_gzip: request.conditional.accept_gzip && bytes.len() <= DOWNLOAD_GZIP_MAX,
+        if_none_match: request.conditional.if_none_match,
+    };
     // RFC 5987 `filename*=UTF-8''…` so accented / non-ASCII
     // names ("Frédéric.txt") survive transit; the ASCII
     // fallback `filename="…"` is also included for legacy
@@ -263,7 +240,7 @@ pub(super) fn download<W: Write>(
     let mut percent: String = String::with_capacity(display_name.len());
     for byte in display_name.bytes() {
         if matches!(byte, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~') {
-            percent.push(byte as char);
+            percent.push(char::from(byte));
         } else {
             use std::fmt::Write as _;
             let _ = write!(&mut percent, "%{byte:02X}");
@@ -273,16 +250,20 @@ pub(super) fn download<W: Write>(
         .chars()
         .filter(|c| c.is_ascii() && *c != '"' && *c != '\\')
         .collect();
-    let disposition = format!(
-        "Content-Disposition: attachment; filename=\"{ascii_fallback}\"; filename*=UTF-8''{percent}\r\nX-Content-Type-Options: nosniff\r\n"
-    );
-    respond_with_etag(
-        stream,
+    let etag = format!("{:08x}", crate::crc32(&bytes));
+    Ok(cached(
         200,
         "application/octet-stream",
-        &bytes,
-        accept_gzip,
-        if_none_match,
-        &disposition,
-    );
+        bytes::Bytes::from(bytes),
+        &etag,
+        client,
+    )
+    .with_header(
+        "content-disposition",
+        format!("attachment; filename=\"{ascii_fallback}\"; filename*=UTF-8''{percent}"),
+    )
+    // `nosniff` so a browser never second-guesses `application/octet-stream`
+    // from the file's leading bytes — an uploaded HTML file must download, not
+    // render as a page on this origin.
+    .with_header("x-content-type-options", "nosniff".to_owned()))
 }

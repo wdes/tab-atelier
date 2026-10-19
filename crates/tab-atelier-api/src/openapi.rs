@@ -82,8 +82,6 @@ pub struct Exempt {
 /// With a list of the routes that broke a rule, so the fix is named rather than
 /// guessed.
 pub fn assert_covers(rocket: &rocket::Rocket<rocket::Build>, spec: &okapi::openapi3::OpenApi, exempt: &[Exempt]) {
-    use std::collections::BTreeSet;
-
     // The mounted (method, path) pairs, normalised the way okapi normalises a
     // route into a document path: Rocket's `<x>`/`<x..>` become `{x}`.
     //
@@ -91,14 +89,43 @@ pub fn assert_covers(rocket: &rocket::Rocket<rocket::Build>, spec: &okapi::opena
     // which is the base and the route concatenated. Prefixing `route.uri.base()`
     // as well double-counts the mount point, and a root mount (`"/"`) shows it
     // as a leading `//` that matches no document path.
-    let mounted: BTreeSet<(String, String)> = rocket
-        .routes()
-        .map(|route| {
+    assert_covers_routes(
+        rocket.routes().map(|route| {
             (
                 route.method.to_string().to_ascii_uppercase(),
-                normalise(route.uri.path()),
+                route.uri.path().to_owned(),
             )
-        })
+        }),
+        spec,
+        exempt,
+    );
+}
+
+/// The same rule for a server that does not mount through Rocket.
+///
+/// The daemon keeps its own listener — it needs the WebSocket upgrade, the SSE
+/// relay and HTTP/3, none of which fit a Rocket route — so it cannot hand this
+/// function a `Rocket<Build>`. It can hand it the routes it serves. Taking the
+/// pairs rather than the framework is what lets one rule police every server in
+/// the workspace instead of only the two that moved.
+///
+/// Paths are given in either notation: `<x>`/`<x..>` from Rocket, or `{x}` from
+/// a server that already writes them that way. Both normalise to `{x}`, which is
+/// what `okapi` puts in the document.
+///
+/// # Panics
+///
+/// With a list of the routes that broke a rule, so the fix is named rather than
+/// guessed.
+pub fn assert_covers_routes(
+    mounted_routes: impl Iterator<Item = (String, String)>,
+    spec: &okapi::openapi3::OpenApi,
+    exempt: &[Exempt],
+) {
+    use std::collections::BTreeSet;
+
+    let mounted: BTreeSet<(String, String)> = mounted_routes
+        .map(|(method, path)| (method.to_ascii_uppercase(), normalise(&path)))
         .collect();
 
     // What the document says it offers. `PathItem` holds one optional operation

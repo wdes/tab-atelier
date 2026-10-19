@@ -3,14 +3,31 @@
 //! The per-tab agent-state hook (`set-status`): thinking/waiting/error/idle,
 //! plus session/kind/plan/daemon metadata, queued to the owner.
 
-use std::io::Write;
 use std::sync::{Arc, Mutex};
 
 use log::info;
+use serde::Serialize;
+use tab_atelier_api::schemars;
+use tab_atelier_api::schemars::JsonSchema;
+use tab_atelier_api::{Doc, Failure, Request};
 
-use super::{PendingStatusUpdate, TabSnapshot, error_json, respond_json};
+use super::{PendingStatusUpdate, TabSnapshot};
 
-pub(super) fn run<W: Write>(stream: &mut W, state: &Arc<Mutex<TabSnapshot>>, p: &str, body_bytes: &[u8]) {
+/// The acknowledgement: either `{"ok":true}` or, on a detach, `{"cleared":true}`.
+///
+/// Two keys in one type rather than two types, because it is one route with one
+/// meaning and the shape was already this on the wire — a script that reads
+/// `cleared` must keep working, and a caller that only checks for a 200 does not
+/// care which arrived. Exactly one of the two is ever serialized.
+#[derive(Debug, Serialize, JsonSchema)]
+pub(super) struct StatusAck {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ok: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cleared: Option<bool>,
+}
+
+pub(super) fn run(request: &Request<'_>, state: &Arc<Mutex<TabSnapshot>>) -> Result<Doc<StatusAck>, Failure> {
     // Per-tab agent state hook. Looked up by stable UUID
     // (`_TAB_ID` env var) rather than position, so a rename
     // doesn't break the mapping.
@@ -19,24 +36,18 @@ pub(super) fn run<W: Write>(stream: &mut W, state: &Arc<Mutex<TabSnapshot>>, p: 
     // `ends_with` guard also admits "/tabs/by-id/status", whose tail is
     // inside the prefix, so `p[12..p.len() - 7]` would slice backwards
     // and panic.
-    let Some(tab_id) = p
+    let Some(tab_id) = request
+        .path
         .strip_prefix("/tabs/by-id/")
         .and_then(|rest| rest.strip_suffix("/status"))
         .filter(|id| !id.is_empty())
     else {
-        error_json(stream, 404, "missing tab id");
-        return;
+        return Err(Failure::problem(404, "missing tab id"));
     };
-    let parsed: serde_json::Value = match serde_json::from_slice(body_bytes) {
-        Ok(v) => v,
-        Err(e) => {
-            error_json(stream, 400, &format!("invalid JSON body: {e}"));
-            return;
-        }
-    };
+    let parsed: serde_json::Value =
+        serde_json::from_slice(request.body).map_err(|e| Failure::problem(400, format!("invalid JSON body: {e}")))?;
     let Some(state_str) = parsed.get("state").and_then(|v| v.as_str()) else {
-        error_json(stream, 400, "missing `state` field");
-        return;
+        return Err(Failure::problem(400, "missing `state` field"));
     };
     let agent_state = match state_str {
         "thinking" => Some(crate::AgentState::Thinking),
@@ -48,10 +59,7 @@ pub(super) fn run<W: Write>(stream: &mut W, state: &Arc<Mutex<TabSnapshot>>, p: 
         // therefore leaves the attachment exactly as it was; only the
         // `__clear__` label detaches (see `WIPE_LABEL`).
         "idle" => None,
-        _ => {
-            error_json(stream, 400, "invalid state (idle/thinking/waiting/error)");
-            return;
-        }
+        _ => return Err(Failure::problem(400, "invalid state (idle/thinking/waiting/error)")),
     };
     let raw_label = parsed.get("label").and_then(|v| v.as_str());
     // `__clear__` is a verb, not text — see `crate::api::WIPE_LABEL`.
@@ -81,9 +89,7 @@ pub(super) fn run<W: Write>(stream: &mut W, state: &Arc<Mutex<TabSnapshot>>, p: 
     };
     let mut snap = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let Some(t) = snap.tabs.iter().find(|t| &*t.id == tab_id) else {
-        drop(snap);
-        error_json(stream, 404, "tab not found");
-        return;
+        return Err(Failure::problem(404, "tab not found"));
     };
     let id = t.id.clone();
     info!(
@@ -102,13 +108,15 @@ pub(super) fn run<W: Write>(stream: &mut W, state: &Arc<Mutex<TabSnapshot>>, p: 
         wipe_attachment,
     });
     drop(snap);
-    respond_json(
-        stream,
-        200,
-        if wipe_attachment {
-            r#"{"cleared":true}"#
-        } else {
-            r#"{"ok":true}"#
-        },
-    );
+    Ok(Doc::ok(if wipe_attachment {
+        StatusAck {
+            ok: None,
+            cleared: Some(true),
+        }
+    } else {
+        StatusAck {
+            ok: Some(true),
+            cleared: None,
+        }
+    }))
 }

@@ -59,7 +59,7 @@ pub use cache::{Conditional, cached, gzip, will_gzip};
 pub use catcher::catchers;
 pub use guard::{Actor, Admin, presented};
 pub use marshal::{Body, Reply, ReplyBody, json, json_of, text};
-pub use openapi::{Exempt, Mounted, assert_covers, mount};
+pub use openapi::{Exempt, Mounted, assert_covers, assert_covers_routes, mount};
 pub use refusal::{Refusal, recall, remember, tokens_match};
 pub use request::{Rejection, Request, Validated, body_of, loose_bool, parse};
 pub use resource::{OkResource, ProblemResource};

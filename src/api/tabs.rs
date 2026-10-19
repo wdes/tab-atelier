@@ -1,39 +1,26 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! The core tab collection: the `GET /` / `/tabs` list (ETag-cached), tab
-//! creation (`POST /tabs`) and close (`DELETE /tabs/<id>`).
+//! The core tab collection: the `GET /` / `/tabs` list (cached, conditional),
+//! tab creation (`POST /tabs`) and close (`DELETE /tabs/<id>`).
 
-use std::io::Write;
 use std::sync::{Arc, Mutex};
 
 use log::info;
+use tab_atelier_api::{Conditional, Doc, Failure, Reply, Request, cached};
 
 use super::{
-    ApiResponse, DnsEntryInfo, HostInfo, NewTabCreated, PendingNewTab, TabInfo, TabSnapshot, error_json, parse_tab_key,
-    resolve_tab_idx, respond_json, respond_with_etag, strip_ansi,
+    ApiResponse, DnsEntryInfo, HostInfo, NewTabCreated, PendingNewTab, TabInfo, TabSnapshot, etag_for, parse_tab_key,
+    resolve_tab_idx, strip_ansi,
 };
 
-pub(super) fn list<W: Write>(
-    stream: &mut W,
-    state: &Arc<Mutex<TabSnapshot>>,
-    accept_gzip: bool,
-    if_none_match: Option<&str>,
-) {
-    let mut state = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(body) = state.cached_response.clone() {
-        drop(state);
-        respond_with_etag(
-            stream,
-            200,
-            "application/json",
-            body.as_bytes(),
-            accept_gzip,
-            if_none_match,
-            "",
-        );
-        return;
-    }
-    let tabs: Vec<TabInfo> = state
+/// The projection every tab-list caller reads — built once, from the snapshot.
+///
+/// Extracted from the handler so the cached body and the JSON body in
+/// `cached_response` are demonstrably the same function, and so the feature
+/// gates (`energy`) live in one place rather than inside a closure that also
+/// builds the envelope.
+fn project(state: &TabSnapshot) -> Vec<TabInfo> {
+    state
         .tabs
         .iter()
         .enumerate()
@@ -101,57 +88,74 @@ pub(super) fn list<W: Write>(
             resident_memory_bytes: t.resident_memory_bytes,
             tokens: t.tokens,
         })
-        .collect();
-    #[cfg(feature = "energy")]
-    let host = HostInfo {
-        battery_percent: state.battery_percent,
-        // Sum each tab's watts to give a host-wide draw figure;
-        // tabs without a reading contribute zero, which is the
-        // honest answer for any not-yet-sampled process.
-        watts: {
-            let total: f64 = state.power.iter().filter_map(|p| p.watts).sum();
-            if total > 0.0 { Some(total) } else { None }
-        },
-    };
-    #[cfg(not(feature = "energy"))]
-    let host = HostInfo::default();
-    let resp = ApiResponse {
-        app: crate::tracking::USER_AGENT,
-        host,
-        tabs,
-    };
-    let body: std::sync::Arc<str> = serde_json::to_string_pretty(&resp).unwrap_or_default().into();
-    state.cached_response = Some(body.clone());
-    drop(state);
-    respond_with_etag(
-        stream,
-        200,
-        "application/json",
-        body.as_bytes(),
-        accept_gzip,
-        if_none_match,
-        "",
-    );
+        .collect()
 }
 
-pub(super) fn close<W: Write>(stream: &mut W, state: &Arc<Mutex<TabSnapshot>>, p: &str) {
+/// The host-wide half of the envelope, feature-gated in one place.
+fn host_of(state: &TabSnapshot) -> HostInfo {
+    #[cfg(feature = "energy")]
+    {
+        HostInfo {
+            battery_percent: state.battery_percent,
+            // Sum each tab's watts to give a host-wide draw figure;
+            // tabs without a reading contribute zero, which is the
+            // honest answer for any not-yet-sampled process.
+            watts: {
+                let total: f64 = state.power.iter().filter_map(|p| p.watts).sum();
+                if total > 0.0 { Some(total) } else { None }
+            },
+        }
+    }
+    #[cfg(not(feature = "energy"))]
+    {
+        let _ = state;
+        HostInfo::default()
+    }
+}
+
+pub(super) fn list(state: &Arc<Mutex<TabSnapshot>>, client: Conditional<'_>) -> Reply {
+    // The body is cached on the snapshot and cleared by `persist()` on any
+    // mutation, so the expensive part (`strip_ansi` per tab, pretty-printed
+    // JSON) happens once per generation instead of once per poll. The lock is
+    // released before the reply is built, so a slow client cannot hold up the
+    // owner loop.
+    let body: bytes::Bytes = {
+        let mut state = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.cached_response.clone().unwrap_or_else(|| {
+            let resp = ApiResponse {
+                app: crate::tracking::USER_AGENT,
+                host: host_of(&state),
+                tabs: project(&state),
+            };
+            let bytes = bytes::Bytes::from(serde_json::to_string_pretty(&resp).unwrap_or_default());
+            state.cached_response = Some(bytes.clone());
+            bytes
+        })
+    };
+    let etag = etag_for(&body);
+    cached(200, "application/json", body, &etag, client)
+}
+
+pub(super) fn close(request: &Request<'_>, state: &Arc<Mutex<TabSnapshot>>) -> Result<Doc<Closed>, Failure> {
     // Accepts `/tabs/<idx>` and `/tabs/by-id/<uuid>` — the UUID is
     // the stable handle (index drifts as tabs open/close).
-    let Some((key_raw, is_uuid)) = parse_tab_key(p, "") else {
-        error_json(stream, 404, "invalid tab key");
-        return;
+    let Some((key_raw, is_uuid)) = parse_tab_key(request.path, "") else {
+        return Err(Failure::problem(404, "invalid tab key"));
     };
     let mut state = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let Some(idx) = resolve_tab_idx(&state, key_raw, is_uuid) else {
-        drop(state);
-        error_json(stream, 404, "tab not found");
-        return;
+        return Err(Failure::problem(404, "tab not found"));
     };
     info!("API: closing tab {idx}");
     state.pending_closes.push(idx);
     drop(state);
-    let body = serde_json::to_string(&serde_json::json!({"closed": idx})).unwrap_or_default();
-    respond_json(stream, 200, &body);
+    Ok(Doc::ok(Closed { closed: idx }))
+}
+
+/// Which tab was queued for closing.
+#[derive(Debug, serde::Serialize, tab_atelier_api::schemars::JsonSchema)]
+pub(super) struct Closed {
+    closed: usize,
 }
 
 /// A parsed `POST /tabs` body.
@@ -207,14 +211,30 @@ fn parse_create_body(body_bytes: &[u8]) -> Result<CreateRequest, String> {
     Ok(CreateRequest { cwd, meta, sync })
 }
 
-pub(super) fn create<W: Write>(stream: &mut W, state: &Arc<Mutex<TabSnapshot>>, body_bytes: &[u8]) {
-    let CreateRequest { cwd, meta, sync } = match parse_create_body(body_bytes) {
-        Ok(parsed) => parsed,
-        Err(reason) => {
-            error_json(stream, 400, &reason);
-            return;
-        }
-    };
+/// What a creation answers: queued (with the cwd accepted), or synchronously
+/// created with the tab's id.
+///
+/// One type for both because it is one route and the shape is the response's,
+/// not the caller's: `queued` is present when the request was async, `id` when
+/// it was `sync`. Exactly one of the two is ever serialized.
+#[derive(Debug, serde::Serialize, tab_atelier_api::schemars::JsonSchema)]
+pub(super) struct Created {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    queued: Option<&'static str>,
+    /// The cwd this creation landed on, always present and `null` when the tab
+    /// inherited one. Not skipped: "which directory did I get" is the whole
+    /// question a creation reply answers, and an absent key would read as
+    /// "unchanged" rather than "none".
+    cwd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    meta: Option<std::collections::BTreeMap<String, String>>,
+}
+
+pub(super) fn create(request: &Request<'_>, state: &Arc<Mutex<TabSnapshot>>) -> Result<Doc<Created>, Failure> {
+    let CreateRequest { cwd, meta, sync } =
+        parse_create_body(request.body).map_err(|reason| Failure::problem(400, reason))?;
     // What was accepted, captured before the hint is moved into the queue below.
     let accepted_cwd = cwd.as_ref().map(|p| p.display().to_string());
     info!(
@@ -247,29 +267,29 @@ pub(super) fn create<W: Write>(stream: &mut W, state: &Arc<Mutex<TabSnapshot>>, 
     if !sync {
         // The legacy reply, unchanged: what was accepted, not merely that
         // something was.
-        let body = serde_json::to_string(&serde_json::json!({
-            "queued": "new",
-            "cwd": accepted_cwd,
-        }))
-        .unwrap_or_default();
-        respond_json(stream, 200, &body);
-        return;
+        return Ok(Doc::ok(Created {
+            queued: Some("new"),
+            cwd: accepted_cwd,
+            id: None,
+            meta: None,
+        }));
     }
 
     // Blocking wait, no timeout: it ends on the owner's reply, on an error, or
     // when the sender is dropped (the entry was taken and its drain never
     // answered). The tab is created either way.
     match reply_rx.recv() {
-        Ok(Ok(created)) => {
-            let body = serde_json::to_string(&serde_json::json!({
-                "id": created.id,
-                "cwd": created.cwd.map(|p| p.display().to_string()),
-                "meta": meta,
-            }))
-            .unwrap_or_default();
-            respond_json(stream, 200, &body);
-        }
-        Ok(Err(reason)) => error_json(stream, 500, &format!("tab creation failed: {reason}")),
-        Err(_) => error_json(stream, 500, "tab creation aborted (owner went away)"),
+        Ok(Ok(created)) => Ok(Doc::ok(Created {
+            queued: None,
+            // The tab's *own* cwd, resolved by the drain — not the one that was
+            // asked for. They differ whenever the request omitted it or asked
+            // for one that was refused, which is exactly when a caller needs to
+            // know what it actually got.
+            cwd: created.cwd.map(|p| p.display().to_string()),
+            id: Some(created.id),
+            meta: Some(meta),
+        })),
+        Ok(Err(reason)) => Err(Failure::problem(500, format!("tab creation failed: {reason}"))),
+        Err(_) => Err(Failure::problem(500, "tab creation aborted (owner went away)")),
     }
 }

@@ -239,6 +239,26 @@ mod tests {
     }
 
     #[test]
+    fn a_compressed_body_round_trips_byte_exact() {
+        // The daemon's own test for this lived beside its hand-rolled encoder;
+        // the encoder moved here, so the property moves with it. A body that
+        // decompresses to something *nearly* right would be worse than no
+        // compression at all, and only a round-trip catches that.
+        let text = "the same line of terminal text over and over\n".repeat(200);
+        let encoded = gzip(text.as_bytes()).expect("big enough to compress");
+        assert!(
+            encoded.len() < text.len() / 4,
+            "repetitive text shrinks a lot: {} -> {}",
+            text.len(),
+            encoded.len()
+        );
+        let mut decoder = flate2::read::GzDecoder::new(encoded.as_slice());
+        let mut round = String::new();
+        std::io::Read::read_to_string(&mut decoder, &mut round).expect("valid gzip");
+        assert_eq!(round, text);
+    }
+
+    #[test]
     fn the_prediction_and_the_encoder_agree() {
         // They are separate functions; if they disagreed a client could be told
         // 304 for a representation it was never sent.

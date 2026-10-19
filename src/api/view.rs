@@ -3,13 +3,11 @@
 //! The `/tabs/<id>/view` share-link viewer: the xterm.js document with the
 //! tab's name/background/key templated in, served with no-store + strict CSP.
 
-use std::io::Write;
 use std::sync::{Arc, Mutex};
 
-use super::{
-    BUILD_HASH, TabSnapshot, VIEWER_HTML, error_json, is_safe_hex_color, parse_tab_key, resolve_tab_idx,
-    respond_with_etag,
-};
+use tab_atelier_api::{Failure, Reply, Request, cached};
+
+use super::{BUILD_HASH, TabSnapshot, VIEWER_HTML, is_safe_hex_color, parse_tab_key, resolve_tab_idx};
 
 /// How many `../` a `/view` document needs to climb back to the API root.
 ///
@@ -53,25 +51,19 @@ fn js_string_body(name: &str) -> String {
         .replace('&', "\\u0026")
 }
 
-pub(super) fn run<W: Write>(
-    stream: &mut W,
+pub(super) fn run(
+    request: &Request<'_>,
     state: &Arc<Mutex<TabSnapshot>>,
-    p: &str,
-    accept_gzip: bool,
-    if_none_match: Option<&str>,
     // The request path ended in `/`, so the document sits one directory
     // deeper than the route match suggests.
     trailing_slash: bool,
-) {
-    let Some((key_raw, is_uuid)) = parse_tab_key(p, "/view") else {
-        error_json(stream, 404, "invalid tab key");
-        return;
+) -> Result<Reply, Failure> {
+    let Some((key_raw, is_uuid)) = parse_tab_key(request.path, "/view") else {
+        return Err(Failure::problem(404, "invalid tab key"));
     };
     let state_g = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let Some(idx) = resolve_tab_idx(&state_g, key_raw, is_uuid) else {
-        drop(state_g);
-        error_json(stream, 404, "tab not found");
-        return;
+        return Err(Failure::problem(404, "tab not found"));
     };
     let t = &state_g.tabs[idx];
     let tab_name = t.name.clone();
@@ -86,48 +78,30 @@ pub(super) fn run<W: Write>(
     } else {
         key_raw.to_string()
     };
-    // Relative hop from the viewer document back to the mount
-    // root so `<prefix>/assets/...` references resolve under any
-    // reverse-proxy prefix (the proxy strips the prefix before
-    // the request reaches us, so absolute `/assets/...` URLs
-    // bypass it and 404). The document lives at
-    // `<prefix>/tabs/{key}/view`; its directory is
-    // `<prefix>/tabs/{key}/`, so one `../` per path segment in
-    // `tabs/{key}` climbs back to `<prefix>/`:
+    // Relative hop from the viewer document back to the mount root so
+    // `<prefix>/assets/...` references resolve under any reverse-proxy prefix
+    // (the proxy strips the prefix before the request reaches us, so absolute
+    // `/assets/...` URLs bypass it and 404). The document lives at
+    // `<prefix>/tabs/{key}/view`; its directory is `<prefix>/tabs/{key}/`, so
+    // one `../` per path segment in `tabs/{key}` climbs back to `<prefix>/`:
     //   - `/tabs/0/view`            → `../../`
     //   - `/tabs/by-id/<uuid>/view` → `../../../`
     let asset_depth = asset_depth(&key_for_html, trailing_slash);
     let asset_prefix = "../".repeat(asset_depth);
-    // The tab name lands in two distinct contexts: inside
-    // <title> (HTML-escape) and inside a JS string literal
-    // (JSON-encode — handles quotes, backslashes, newlines,
-    // and any future weirdness in one go). Using two
+    // The tab name lands in two distinct contexts: inside <title> (HTML-escape)
+    // and inside a JS string literal (JSON-encode — handles quotes,
+    // backslashes, newlines, and any future weirdness in one go). Using two
     // substitution markers keeps each context safe.
     let html_name = tab_name
         .replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;");
-    // serde_json::to_string yields a quoted JS-safe string
-    // literal; strip the surrounding quotes so the template
-    // can wrap it in its own quotes.
-    //
-    // serde_json escapes quotes/backslashes/control chars but
-    // NOT `<`, `>`, or `&` — and the HTML parser ends the
-    // inline <script> element on the literal byte sequence
-    // `</script>` regardless of JS string context. Since the
-    // viewer's CSP allows 'unsafe-inline', an unescaped
-    // `</script><script>…` tab name would break out and run.
-    // Re-escape those three as JS `\uXXXX` so the value stays a
-    // valid string literal that can never terminate the script
-    // element. (`__TAB_NAME_HTML__` above is separately escaped
-    // for its <title> context.)
     let js_name = js_string_body(&tab_name);
-    // Validate that bg_color looks like #RRGGBB before
-    // inlining into HTML / CSS (defense against a malformed
-    // value in tabs.json or someone POSTing junk into the
-    // bg-color endpoint). Fall back to the default on
-    // anything sketchy.
+    // Validate that bg_color looks like #RRGGBB before inlining into HTML / CSS
+    // (defense against a malformed value in tabs.json or someone POSTing junk
+    // into the bg-color endpoint). Fall back to the default on anything
+    // sketchy.
     let safe_bg: &str = if is_safe_hex_color(&tab_bg) {
         &tab_bg
     } else {
@@ -140,31 +114,40 @@ pub(super) fn run<W: Write>(
         .replace("__TAB_NAME_JS__", &js_name)
         .replace("__TAB_BG__", safe_bg)
         .replace("__BUILD_HASH__", BUILD_HASH);
-    // Tell browsers (and any intervening CDN) not to cache
-    // the viewer HTML — we ship JS fixes in the deb and
-    // users would otherwise see a stale banner / poll loop
-    // until a hard reload.
-    respond_with_etag(
-        stream,
+    // Tell browsers (and any intervening CDN) not to cache the viewer HTML — we
+    // ship JS fixes in the deb and users would otherwise see a stale banner /
+    // poll loop until a hard reload.
+    //
+    // `cache` gives the conditional handling and the `Vary`; the four headers
+    // below are the part only this document wants, and they are stated here
+    // rather than threaded through the shared helper because nothing else in
+    // the API needs a CSP this tight.
+    let etag = format!("{:08x}", crate::crc32(html.as_bytes()));
+    let reply = cached(
         200,
         "text/html; charset=utf-8",
-        html.as_bytes(),
-        accept_gzip,
-        if_none_match,
-        // Cache headers + clickjacking guards. CSP locks the
-        // page to its own origin for everything (no inline
-        // scripts despite the template subs — they live in a
-        // pinned `<script>` set up to read `window.TAB`, no
-        // user-controlled JS). X-Frame-Options blocks iframe
-        // embedding of share links into phishing pages.
-        "Cache-Control: no-store, no-cache, must-revalidate\r\n\
-         Pragma: no-cache\r\n\
-         X-Frame-Options: DENY\r\n\
-         Content-Security-Policy: default-src 'none'; script-src 'self' 'unsafe-inline'; \
-         style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; \
-         connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'\r\n\
-         Referrer-Policy: no-referrer\r\n",
+        bytes::Bytes::from(html),
+        &etag,
+        request.conditional,
     );
+    Ok(reply
+        .with_header("cache-control", "no-store, no-cache, must-revalidate".to_owned())
+        .with_header("pragma", "no-cache".to_owned())
+        // Clickjacking guard: share links must not be iframe-able into a
+        // phishing page.
+        .with_header("x-frame-options", "DENY".to_owned())
+        // CSP locks the page to its own origin for everything. `'unsafe-inline'`
+        // is required because the template substitutes into inline script; the
+        // JS-string escaping above is what makes that safe (an unescaped
+        // `</script>` in a tab name would otherwise break out).
+        .with_header(
+            "content-security-policy",
+            "default-src 'none'; script-src 'self' 'unsafe-inline'; \
+             style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; \
+             connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+                .to_owned(),
+        )
+        .with_header("referrer-policy", "no-referrer".to_owned()))
 }
 
 #[cfg(test)]

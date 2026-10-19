@@ -2498,7 +2498,7 @@ pub fn load_tab_energy(state_base: &std::path::Path, tab_name: &str) -> Option<f
 }
 
 /// Cumulative token usage for one tab's catbus-agent session.
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq, tab_atelier_api::schemars::JsonSchema)]
 pub struct TokenUsage {
     pub input: u64,
     pub output: u64,
