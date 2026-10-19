@@ -38,6 +38,9 @@
 
 pub mod auth;
 pub mod body;
+// Conditional GETs: the tag-per-representation rule and the 304 path, which a
+// live-and-polled page needs and no transport renders for it.
+pub mod cache;
 pub mod catcher;
 pub mod guard;
 // The second edge: `Reply` → a hyper response, for a server that keeps its own
@@ -52,6 +55,7 @@ pub mod respond;
 
 pub use auth::{Authenticator, DenyAll, Presented};
 pub use body::{Json, MAX_BODY_BYTES};
+pub use cache::{Conditional, cached, gzip, will_gzip};
 pub use catcher::catchers;
 pub use guard::{Actor, Admin, presented};
 pub use marshal::{Body, Reply, ReplyBody, json, json_of, text};

@@ -20,13 +20,16 @@ publish = false
 # exactly one place.
 [dependencies]
 tab-atelier-web = { path = "../tab-atelier-web" }
-rocket = { version = "0.5.1", features = ["json"] }
-rocket_okapi = "0.9"
-schemars = "0.8"
+rocket.workspace = true
+rocket_okapi.workspace = true
+schemars.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
 bytes = "1"
+# Gzip at the edge: a polled page is compressed per response, so this is a
+# runtime cost, not a build one. Level 1 — see `cache::gzip`.
+flate2 = "1"
 http = "1"
 http-body = "1"
 http-body-util = "0.1"
@@ -39,7 +42,9 @@ hyper = { version = "1", default-features = false }
 tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "net", "signal", "time", "macros"] }
 
 [dev-dependencies]
-rocket = { version = "0.5.1", features = ["json"] }
+# `rocket` is not repeated here: a normal dependency is already available to
+# the test targets, and repeating the pin is exactly the drift this workspace
+# table exists to prevent.
 # One fixture needs a multi-frame body; `http_body_util::StreamBody` wants a
 # stream and std has none.
 futures-util = { version = "0.3", default-features = false, features = ["std"] }

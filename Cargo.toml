@@ -5,6 +5,22 @@ members = ["crates/catbus-agent", "crates/claude-api", "crates/tab-atelier-brief
 # `cargo build -p <server-crate>` when you want one.
 default-members = [".", "crates/catbus-agent", "crates/claude-api", "crates/tab-atelier-briefs"]
 
+# The HTTP stack the servers share. `rocket_okapi` pins `rocket = 0.5.1` and
+# `schemars = 0.8`, so the three are a lockstep: bumping one means bumping all,
+# and this is the one place that happens.
+#
+# The servers still name `rocket` and `rocket_okapi` in their own dependency
+# tables, as `{ workspace = true }` — they are NOT reachable through
+# `tab-atelier-api`'s re-exports. That is not a style choice: `rocket_codegen`
+# hardcodes `::rocket::` into every `#[get]`, `#[catch]` and `routes!` it
+# expands, and `#[openapi]` expands `::rocket_okapi::`; an absolute path only
+# resolves against the crate's own extern prelude, which a re-export cannot
+# populate. Pinning the versions here is what stops the three crates drifting.
+[workspace.dependencies]
+rocket = { version = "0.5.1", features = ["json"] }
+rocket_okapi = "0.9"
+schemars = "0.8"
+
 # Release codegen tuned for the hot VT-parse / grid-update loop. Cargo's
 # defaults (lto = false, codegen-units = 16) leave cross-crate inlining
 # on the table — the parser lives in alacritty_terminal/vte while the

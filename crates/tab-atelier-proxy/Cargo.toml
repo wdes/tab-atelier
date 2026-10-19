@@ -53,8 +53,8 @@ futures-util = { version = "0.3", default-features = false, features = ["std", "
 # `#[openapi]` the other. Every *type* still comes through `tab-atelier-api`,
 # which owns the lockstep; bumping the three together is its business, not this
 # crate's.
-rocket = { version = "0.5.1", features = ["json"] }
-rocket_okapi = "0.9"
+rocket = { workspace = true }
+rocket_okapi = { workspace = true }
 sha2 = { version = "0.10", default-features = false }
 # Subresource Integrity, which mandates base64 — hex cannot stand in for it.
 # Already in this crate's graph via ureq, so declaring it costs no compile unit.

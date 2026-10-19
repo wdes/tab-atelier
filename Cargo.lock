@@ -7283,6 +7283,7 @@ name = "tab-atelier-api"
 version = "0.5.0-dev"
 dependencies = [
  "bytes",
+ "flate2",
  "futures-util",
  "http 1.4.2",
  "http-body 1.0.1",
