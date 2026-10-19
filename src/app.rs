@@ -226,6 +226,11 @@ struct Tab {
     /// the PR/task it's on). Shown as a hover tooltip on the tab name.
     /// In-memory; set via the API + drained from the snapshot.
     context: Option<std::sync::Arc<str>>,
+    /// What this tab is assigned to do — `phase/role`, set via `set-assignment`.
+    ///
+    /// Typed and separate from `context`: context changes every few minutes, an assignment changes
+    /// when the work does, and only the assignment is safe to group a dashboard by.
+    assignment: Option<crate::assignment::Assignment>,
     /// One-shot resume command queued on tab restore — when the
     /// shell is up the next tick types `<command>\n` into the
     /// PTY, then clears this. Set in `insert_tab` from the
@@ -327,6 +332,7 @@ impl Tab {
             applied_tint: std::cell::Cell::new(None),
             resolved_badge: None,
             context: None,
+            assignment: None,
             last_pushed_locked: None,
             pending_agent_resume,
             snap_cache: None,
@@ -1451,6 +1457,7 @@ impl AppState {
             pending_ssh_agent_changes: Vec::new(),
             pending_bg_color_changes: Vec::new(),
             pending_context_changes: Vec::new(),
+            pending_assignment_changes: Vec::new(),
             pending_token_rotations: Vec::new(),
             pending_share_mints: Vec::new(),
             pending_schedule_changes: Vec::new(),
@@ -2264,6 +2271,7 @@ impl AppState {
                 bg_color,
                 badge,
                 context: tab.context.clone(),
+                assignment: tab.assignment.clone(),
                 shell_pid,
                 agent_state: tab.agent_state.clone(),
                 agent_session_id: tab.agent_session_id.clone(),
@@ -2511,6 +2519,8 @@ impl AppState {
             let bg_color_changes: Vec<(String, Option<String>)> = snapshot.pending_bg_color_changes.drain(..).collect();
             let badge_changes: Vec<(String, Option<String>)> = snapshot.pending_badge_changes.drain(..).collect();
             let context_changes: Vec<(String, Option<String>)> = snapshot.pending_context_changes.drain(..).collect();
+            let assignment_changes: Vec<(String, Option<crate::assignment::Assignment>)> =
+                snapshot.pending_assignment_changes.drain(..).collect();
             let token_rotations: Vec<String> = snapshot.pending_token_rotations.drain(..).collect();
             let share_mints: Vec<(String, String)> = snapshot.pending_share_mints.drain(..).collect();
             let schedule_changes: Vec<(String, Option<crate::schedule::TabSchedule>)> =
@@ -2657,6 +2667,13 @@ impl AppState {
             for (tab_id, context) in context_changes {
                 if let Some(tab) = self.tabs.iter_mut().find(|t| *t.id == tab_id) {
                     tab.context = context.map(std::sync::Arc::from);
+                }
+            }
+            // Assignment changes — `None` clears it. Typed all the way through, so nothing here has
+            // to parse or re-validate what the route already accepted.
+            for (tab_id, assignment) in assignment_changes {
+                if let Some(tab) = self.tabs.iter_mut().find(|t| *t.id == tab_id) {
+                    tab.assignment = assignment;
                 }
             }
             // Schedule changes — None clears, Some sets. Mirrors the

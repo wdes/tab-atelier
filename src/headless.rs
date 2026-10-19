@@ -159,6 +159,12 @@ struct HeadlessTab {
     /// Free-text context the in-tab agent set via `set-context`.
     /// In-memory only (not persisted); reflected on `/tabs`.
     context: Option<Arc<str>>,
+    /// What this tab is assigned to do — `phase/role`, set via `set-assignment`.
+    ///
+    /// Typed and separate from `context` on purpose: context is a note that changes every few
+    /// minutes, an assignment changes when the work does, and only the assignment is safe to group
+    /// a dashboard by. `None` ⇒ nothing assigned, which the dashboard renders as `unassigned`.
+    assignment: Option<crate::assignment::Assignment>,
     pending_agent_resume: Option<String>,
     colors_enabled: bool,
     /// Raw PTY byte ring captured BEFORE alacritty's parser sees the
@@ -756,6 +762,7 @@ fn spawn_pty_tab(
         tx_bytes: 0,
         tx_denied_bytes: 0,
         context: None,
+        assignment: None,
         pending_agent_resume,
         colors_enabled,
         viewers: viewers_handle,
@@ -1045,6 +1052,7 @@ pub fn run() -> std::io::Result<()> {
         pending_ssh_agent_changes: Vec::new(),
         pending_bg_color_changes: Vec::new(),
         pending_context_changes: Vec::new(),
+        pending_assignment_changes: Vec::new(),
         pending_token_rotations: Vec::new(),
         pending_share_mints: Vec::new(),
         pending_schedule_changes: Vec::new(),
@@ -1457,6 +1465,7 @@ fn refresh_snapshot(
             bg_color: crate::effective_tab_bg(tab.bg_color.as_deref(), folder.color.as_deref(), Some(global_bg)).into(),
             badge: crate::effective_tab_badge(tab.badge.as_deref(), folder.badge.as_deref()).map(Into::into),
             context: tab.context.clone(),
+            assignment: tab.assignment.clone(),
             shell_pid: tab.pid,
             agent_state: tab.agent_state.clone(),
             agent_session_id: tab.agent_session_id.clone(),
@@ -1968,6 +1977,8 @@ fn drain_pending(
     let bg_color_changes: Vec<(String, Option<String>)> = s.pending_bg_color_changes.drain(..).collect();
     let badge_changes: Vec<(String, Option<String>)> = s.pending_badge_changes.drain(..).collect();
     let context_changes: Vec<(String, Option<String>)> = s.pending_context_changes.drain(..).collect();
+    let assignment_changes: Vec<(String, Option<crate::assignment::Assignment>)> =
+        s.pending_assignment_changes.drain(..).collect();
     let token_rotations: Vec<String> = s.pending_token_rotations.drain(..).collect();
     let share_mints: Vec<(String, String)> = s.pending_share_mints.drain(..).collect();
     let schedule_changes: Vec<(String, Option<crate::schedule::TabSchedule>)> =
@@ -2125,6 +2136,14 @@ fn drain_pending(
     for (tab_id, context) in context_changes {
         if let Some(t) = tabs.iter_mut().find(|t| *t.id == tab_id) {
             t.context = context.map(Arc::from);
+        }
+    }
+
+    // Assignment changes (`set-assignment`): the typed `phase/role` the dashboard groups by.
+    // `None` clears it, which the dashboard reads as `unassigned` rather than as an empty band.
+    for (tab_id, assignment) in assignment_changes {
+        if let Some(t) = tabs.iter_mut().find(|t| *t.id == tab_id) {
+            t.assignment = assignment;
         }
     }
 

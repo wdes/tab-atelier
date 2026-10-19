@@ -26,7 +26,7 @@
 use std::time::Duration;
 
 use super::{bench, bench_lag, brain, claude_hook, delegate, flags, logging, remote};
-use super::{set_context, set_font, set_meta, set_status, share_link, team, tokens};
+use super::{set_assignment, set_context, set_font, set_meta, set_status, share_link, team, tokens};
 
 // ── the local API endpoint ──────────────────────────────────────────
 //
@@ -200,6 +200,31 @@ pub(crate) fn api_post_to(ep: &Endpoint, path: &str, body: String) -> Result<(),
         .map_err(|e| format!("POST {path}: {e}"))
 }
 
+/// POST a JSON body and keep the answer.
+///
+/// `api_post_to` throws the reply away, which is right for a command whose only question is "did it
+/// work". A command that wants to *show* what the server recorded — the assignment verb, which
+/// echoes the phase and role the daemon actually parsed — needs the body, and re-fetching it would
+/// be a second round trip that could observe a different state.
+pub(crate) fn api_post_json_to(ep: &Endpoint, path: &str, body: String) -> Result<serde_json::Value, String> {
+    let mut response = agent()
+        .post(format!("{}{path}", ep.url))
+        .header("Authorization", format!("Bearer {}", ep.token))
+        .header("Content-Type", "application/json")
+        .send(body)
+        .map_err(|e| format!("POST {path}: {e}"))?;
+    let text = response
+        .body_mut()
+        .read_to_string()
+        .map_err(|e| format!("POST {path}: unreadable answer: {e}"))?;
+    // An empty body is not a failure: a route that answers 204 has nothing to say, and a caller
+    // that only prints a confirmation should not turn that into an error.
+    if text.trim().is_empty() {
+        return Ok(serde_json::Value::Null);
+    }
+    serde_json::from_str(&text).map_err(|e| format!("POST {path}: unreadable answer: {e}"))
+}
+
 /// Dispatch a client subcommand by name against raw `&[String]` args.
 ///
 /// Returns `Some(exit_code)` when `name` is a recognized client subcommand
@@ -213,6 +238,7 @@ pub fn dispatch(name: &str, rest: &[String]) -> Option<i32> {
         "set-status" => set_status::run(rest),
         "set-font" => set_font::run(rest),
         "set-context" => set_context::run(rest),
+        "set-assignment" => set_assignment::run(rest),
         "set-meta" => set_meta::run(rest),
         "style" => super::style::run(rest),
         "token" => tokens::show(rest),

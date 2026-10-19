@@ -16,6 +16,11 @@ pub(crate) mod api;
 pub(crate) mod api_ws;
 #[cfg(feature = "gui")]
 pub mod app;
+/// What a tab is for: `phase/role`, with an optional override.
+///
+/// The field the dashboard's bands and `dispatch --to <role>` read. Typed, because three positional
+/// strings are easy to build in the wrong order and impossible to display back.
+pub mod assignment;
 #[cfg(feature = "gui")]
 pub(crate) mod box_drawing;
 pub mod briefs;

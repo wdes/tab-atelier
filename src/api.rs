@@ -269,6 +269,13 @@ struct TabInfo {
     /// PR/task it's on. Omitted when unset.
     #[serde(skip_serializing_if = "Option::is_none")]
     context: Option<String>,
+    /// What this tab is assigned to do (`set-assignment`): `{over?, phase, role}`.
+    ///
+    /// Typed rather than derived from `meta` so the dashboard's bands are a group-by on a real
+    /// field, and so `"review/pr"` cannot be confused with a label someone happened to call
+    /// `assignment`. Omitted when nothing is assigned — the dashboard reads that as `unassigned`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    assignment: Option<crate::assignment::Assignment>,
     /// Free-form durable labels the tab set for itself via `set-meta`. We
     /// assign no meaning to the keys — an orchestration layer carries its own
     /// vocabulary here (role, phase, whatever) without us growing a field per
@@ -459,6 +466,12 @@ pub struct SnapshotTab {
     /// on. Surfaced on `/tabs` and as a hover tooltip on the GUI tab
     /// name. `None` ⇒ no context set.
     pub context: Option<std::sync::Arc<str>>,
+    /// What this tab is assigned to do (`set-assignment`), typed.
+    ///
+    /// Separate from [`Self::context`] because the two answer different questions: context is the
+    /// note that changes every few minutes, an assignment is the band the tab belongs to and it
+    /// changes when the work does. Only this one is safe to group a dashboard by.
+    pub assignment: Option<crate::assignment::Assignment>,
     /// PID of the tab's shell. The /catbus endpoints walk its
     /// descendant processes to find a catbus-agent (or fallback
     /// `claude` TUI) and resolve the session's transcript file.
@@ -703,6 +716,13 @@ pub struct TabSnapshot {
     /// `None` clears the tab's context. Same drain shape as
     /// `pending_bg_color_changes`.
     pub pending_context_changes: Vec<(String, Option<String>)>,
+    /// (`tab_id`, assignment-or-None) queued by `POST /tabs/by-id/{id}/assignment`.
+    ///
+    /// A typed queue rather than a `meta` entry: `meta` is capped by `META_MAX_KEYS` and every key
+    /// passes `sanitize_meta`, so an assignment stored there would compete with an agent's own
+    /// labels for room and be flattened to a plain string — losing exactly the structure the
+    /// dashboard groups by. `None` clears it.
+    pub pending_assignment_changes: Vec<(String, Option<crate::assignment::Assignment>)>,
     /// Tab ids whose per-tab share tokens (`share_token_rw`/`_ro`) the
     /// owner loop should clear, queued by `POST /tabs/rotate-tokens`.
     /// Clearing revokes every outstanding share link for that tab (it
@@ -2079,6 +2099,9 @@ fn handle_connection<S: Read + Write>(
             "POST" if p.starts_with("/tabs/by-id/") && p.ends_with("/context") => {
                 write_reply(stream, tab_props::context(&envelope, state).into());
             }
+            "POST" if p.starts_with("/tabs/by-id/") && p.ends_with("/assignment") => {
+                write_reply(stream, tab_props::assignment(&envelope, state).into());
+            }
             "POST" if p.ends_with("/input") => write_reply(stream, input::run(&envelope, state).into()),
             _ => method_not_allowed(stream),
         },
@@ -3002,6 +3025,7 @@ pub fn test_snapshot_tab(id: &str, name: &str) -> SnapshotTab {
         schedule: None,
         bg_color: "".into(),
         context: None,
+        assignment: None,
         shell_pid: 0,
         agent_state: None,
         agent_session_id: None,
@@ -3087,6 +3111,7 @@ pub fn test_snapshot(tabs: Vec<SnapshotTab>) -> TabSnapshot {
         pending_ssh_agent_changes: vec![],
         pending_bg_color_changes: vec![],
         pending_context_changes: vec![],
+        pending_assignment_changes: vec![],
         pending_token_rotations: vec![],
         pending_share_mints: vec![],
         pending_schedule_changes: vec![],
@@ -3187,6 +3212,7 @@ mod tests {
             last_used_at: None,
             agent_session_id: None,
             context: None,
+            assignment: None,
             meta: std::collections::BTreeMap::new(),
             badge: None,
             output_crc: 0,
@@ -3448,6 +3474,22 @@ mod tests {
         buf
     }
 
+    /// POST a JSON body, with the length computed rather than counted.
+    ///
+    /// Every hand-written `Content-Length` in a test is one more chance to be a byte out, and a
+    /// request one byte short does not fail loudly — the server waits for a byte that never comes
+    /// and the connection closes with an empty response, which surfaces as an `unwrap` on `None`
+    /// far from the cause. That happened twice while writing these tests.
+    fn post_json(port: u16, token: &str, path: &str, body: &str) -> String {
+        request(
+            port,
+            &format!(
+                "POST {path} HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            ),
+        )
+    }
+
     fn status_code(response: &str) -> u16 {
         response
             .lines()
@@ -3663,6 +3705,93 @@ mod tests {
         for (m, p) in refused {
             assert!(!sidecar_route(m, p), "{m} {p} must stay master-only");
         }
+    }
+
+    #[test]
+    fn an_assignment_is_parsed_and_reflected_on_the_tab_list() {
+        // The whole point of the field: a caller sets `build/api` and the dashboard's next poll
+        // reads a band with a role in it, not a string it has to split itself.
+        let (port, state, master) = spawn_server();
+        let response = post_json(
+            port,
+            &master,
+            "/tabs/by-id/tab-a/assignment",
+            r#"{"assignment":"build/api"}"#,
+        );
+        assert_eq!(status_code(&response), 200);
+        let parsed: serde_json::Value = serde_json::from_str(body(&response)).expect("json");
+        assert_eq!(parsed["assignment"]["phase"], "build");
+        assert_eq!(parsed["assignment"]["role"], "api");
+        // Reflected on the snapshot at once, so the next `/tabs` poll already carries it…
+        let reflected = {
+            let snap = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            snap.tabs[0].assignment.clone()
+        };
+        assert_eq!(
+            reflected.as_ref().map(ToString::to_string).as_deref(),
+            Some("build/api")
+        );
+        // …and the `/tabs` projection renders it as the same object.
+        let listed = request(
+            port,
+            &format!("GET /tabs HTTP/1.1\r\nAuthorization: Bearer {master}\r\n\r\n"),
+        );
+        let listed: serde_json::Value = serde_json::from_str(body(&listed)).expect("json");
+        assert_eq!(listed["tabs"][0]["assignment"]["phase"], "build");
+    }
+
+    #[test]
+    fn clearing_an_assignment_omits_it_from_the_tabs_list() {
+        // `null` on the wire, and absent from the projection — a dashboard groups that as
+        // `unassigned`, and an empty string would be a band named "".
+        let (port, state, master) = spawn_server();
+        post_json(
+            port,
+            &master,
+            "/tabs/by-id/tab-a/assignment",
+            r#"{"assignment":"review/pr"}"#,
+        );
+        // An empty body clears, which is what `set-assignment --clear` sends.
+        let cleared = post_json(port, &master, "/tabs/by-id/tab-a/assignment", "");
+        assert_eq!(status_code(&cleared), 200);
+        assert!(
+            cleared.contains("\"assignment\":null"),
+            "the answer says it was cleared: {}",
+            body(&cleared)
+        );
+        let reflect = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).tabs[0]
+            .assignment
+            .clone();
+        assert!(reflect.is_none(), "the snapshot forgot it");
+    }
+
+    #[test]
+    fn a_phase_with_no_role_is_still_a_band() {
+        // `build/` is a phase nobody is named in. The dashboard has to show it as build, and the
+        // echo must not invent a role.
+        let (port, _state, master) = spawn_server();
+        let response = post_json(
+            port,
+            &master,
+            "/tabs/by-id/tab-a/assignment",
+            r#"{"assignment":"build/"}"#,
+        );
+        assert_eq!(status_code(&response), 200);
+        let parsed: serde_json::Value = serde_json::from_str(body(&response)).expect("json");
+        assert_eq!(parsed["assignment"]["phase"], "build");
+        assert_eq!(parsed["assignment"]["role"], "");
+    }
+
+    #[test]
+    fn an_assignment_on_an_unknown_tab_is_a_404_not_a_silent_no_op() {
+        let (port, _state, master) = spawn_server();
+        let response = post_json(
+            port,
+            &master,
+            "/tabs/by-id/no-such/assignment",
+            r#"{"assignment":"build/api"}"#,
+        );
+        assert_eq!(status_code(&response), 404);
     }
 
     #[test]

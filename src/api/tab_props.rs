@@ -37,6 +37,15 @@ pub(super) struct ContextApplied {
     context: Option<String>,
 }
 
+/// The assignment that was stored, already parsed into its parts.
+///
+/// Answered as the parsed object rather than the string that was sent, so a caller sending
+/// `"build/"` sees that the role is empty instead of having to parse its own echo back.
+#[derive(Debug, Serialize, JsonSchema)]
+pub(super) struct AssignmentApplied {
+    assignment: Option<crate::assignment::Assignment>,
+}
+
 /// The tab a `/tabs/by-id/<uuid>/<suffix>` path names.
 fn tab_of<'a>(path: &'a str, suffix: &str) -> Option<&'a str> {
     path.strip_prefix("/tabs/by-id/")?.strip_suffix(suffix)
@@ -158,4 +167,50 @@ pub(super) fn context(request: &Request<'_>, state: &Arc<Mutex<TabSnapshot>>) ->
     state.pending_context_changes.push((tab_id, context_opt.clone()));
     drop(state);
     Ok(Doc::ok(ContextApplied { context: context_opt }))
+}
+
+pub(super) fn assignment(
+    request: &Request<'_>,
+    state: &Arc<Mutex<TabSnapshot>>,
+) -> Result<Doc<AssignmentApplied>, Failure> {
+    // Set or clear this tab's assignment — what the tab is *for*, as `[override:]phase[/role]`.
+    // Body: {"assignment":"review/pr"} to set, {"assignment":null} or an empty body to clear.
+    //
+    // Separate from `/context`, which is a free-text note about the current PR: this is what the
+    // dashboard groups by and what `dispatch --to <role>` matches, so it is parsed and stored as a
+    // typed value rather than kept as a string.
+    let Some(inner) = tab_of(request.path, "/assignment") else {
+        return Err(Failure::problem(404, "tab not found"));
+    };
+    let raw: Option<String> = if request.body.is_empty() {
+        None
+    } else {
+        serde_json::from_slice::<serde_json::Value>(request.body)
+            .ok()
+            .and_then(|v| v.get("assignment").cloned())
+            .and_then(|a| {
+                if a.is_null() {
+                    None
+                } else {
+                    a.as_str().map(str::to_owned)
+                }
+            })
+    };
+    // A blank string clears, exactly as a null does: `set-assignment ""` is how a shell pipeline
+    // clears a field it computed as empty, and rejecting it would make that a special case.
+    let parsed = raw
+        .as_deref()
+        .map(crate::assignment::Assignment::parse)
+        .filter(|a| !a.is_empty());
+    let mut state = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(idx) = state.tabs.iter().position(|t| &*t.id == inner) else {
+        return Err(Failure::problem(404, "tab not found"));
+    };
+    let tab_id = state.tabs[idx].id.to_string();
+    // Reflected immediately so the next `/tabs` poll already carries it; the owner loop mirrors it
+    // onto the runtime tab on the next tick, the same path `/context` takes.
+    state.tabs[idx].assignment.clone_from(&parsed);
+    state.pending_assignment_changes.push((tab_id, parsed.clone()));
+    drop(state);
+    Ok(Doc::ok(AssignmentApplied { assignment: parsed }))
 }

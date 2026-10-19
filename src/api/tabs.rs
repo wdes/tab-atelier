@@ -55,6 +55,10 @@ fn project(state: &TabSnapshot) -> Vec<TabInfo> {
             schedule_rule: t.schedule.as_ref().map(|s| s.rule.clone()),
             schedule_tz: t.schedule.as_ref().map(|s| s.tz.clone()),
             context: t.context.as_deref().map(str::to_string),
+            // The dashboard groups by `phase`; a tab with no assignment reports `null` rather than
+            // an empty string, so "nobody assigned this" is distinguishable from "assigned to a
+            // phase whose name is empty" — the latter being a typo, not a state.
+            assignment: t.assignment.clone(),
             meta: t.meta.clone(),
             badge: t.badge.as_deref().map(str::to_string),
             // Mirror what /output would serve: raw_output when present (what

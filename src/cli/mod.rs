@@ -43,6 +43,7 @@ pub mod logs;
 /// the deliberate, local way to drop history nobody reads.
 pub mod prune;
 pub mod remote;
+pub mod set_assignment;
 pub mod set_context;
 pub mod set_font;
 pub mod set_meta;
