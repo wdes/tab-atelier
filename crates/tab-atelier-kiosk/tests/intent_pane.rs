@@ -105,3 +105,70 @@ fn the_intent_pane_is_wired_into_the_tab_shell() {
         assert!(js.contains(needle), "the pane never fetches {why} ({needle})");
     }
 }
+
+/// The dashboard's bands come from the daemon's **typed** `assignment`, and this test exists
+/// because they did not.
+///
+/// The board grouped by `tab.meta.phase`, a label nothing has ever written — the CLI sets
+/// `assignment` through `/tabs/by-id/<id>/assignment`, and the only `meta.phase` in the tree was in
+/// a test fixture. So every band was empty and every tab fell into "sans phase": a page that
+/// rendered correctly and told the reader nothing. Nothing failed, because nothing asserted.
+#[test]
+fn the_board_groups_by_the_typed_assignment() {
+    let script = r#"
+const src = require("fs").readFileSync(process.argv[1], "utf8");
+// The three pure helpers, evaluated without a DOM — they are self-contained by design precisely so
+// this is possible.
+for (const name of ["bandOf", "roleOf", "assignmentOf"]) {
+  const m = src.match(new RegExp("function " + name + "[\\s\\S]*?\\n}"));
+  if (!m) throw new Error(name + " not found — was it renamed?");
+  eval(m[0]);
+}
+const NO_PHASE = (src.match(/const NO_PHASE = "([^"]*)"/) || [])[1];
+if (!NO_PHASE) throw new Error("NO_PHASE not found");
+
+const cases = [
+  // The case that was broken: a tab set with `set-assignment build/api` must land in band "build".
+  [{ assignment: { phase: "build", role: "api" } }, "build", "api", "build/api"],
+  [{ assignment: { over: "hotfix", phase: "build", role: "api" } }, "build", "api", "hotfix:build/api"],
+  [{ assignment: { phase: "review", role: "" } }, "review", "", "review"],
+  // A tab nobody assigned goes to the bucket, not to a band named "".
+  [{}, NO_PHASE, "", ""],
+  [{ assignment: null }, NO_PHASE, "", ""],
+  [{ assignment: { phase: "  ", role: "api" } }, NO_PHASE, "api", ""],
+  // A tab from an older daemon (no typed field) must not throw.
+  [{ meta: { phase: "review" } }, NO_PHASE, "", ""],
+];
+for (const [tab, band, role, whole] of cases) {
+  const gotBand = bandOf(tab);
+  const gotRole = roleOf(tab);
+  const gotWhole = assignmentOf(tab);
+  if (gotBand !== band) throw new Error(`bandOf(${JSON.stringify(tab)}) = ${gotBand}, wanted ${band}`);
+  if (gotRole !== role) throw new Error(`roleOf(${JSON.stringify(tab)}) = ${gotRole}, wanted ${role}`);
+  if (gotWhole !== whole) throw new Error(`assignmentOf(${JSON.stringify(tab)}) = ${gotWhole}, wanted ${whole}`);
+}
+
+// And the board must actually use them.
+if (!/const phase = bandOf\(tab\)/.test(src)) {
+  throw new Error("dashboardHtml does not group by bandOf() — is it back on meta.phase?");
+}
+// Block comments too: a `/** … */` that still says `meta.phase` is documentation that
+// contradicts the code, which is how the original bug was able to sit there unnoticed.
+const code = src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "");
+if (/meta\.phase/.test(code)) {
+  throw new Error("meta.phase is still read outside a comment");
+}
+"#;
+    let asset = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/kiosk.js");
+    let out = std::process::Command::new("node")
+        .arg("-e")
+        .arg(script)
+        .arg(asset)
+        .output()
+        .expect("node must be available");
+    assert!(
+        out.status.success(),
+        "the board's banding failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

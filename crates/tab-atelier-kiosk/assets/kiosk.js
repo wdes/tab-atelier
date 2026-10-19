@@ -1655,7 +1655,35 @@ const VIEW_KEY = "kiosk-view";
 /// The canonical phases, in flow order — the columns, left to right. Anything
 /// else is an operator-invented label and sorts after these, alpha.
 export const PHASES = ["scope", "plan", "build", "review", "verify", "sweep", "done"];
-export const NO_PHASE = "sans phase";
+export const NO_PHASE = "non assigné";
+
+/**
+ * The band a tab belongs to: its typed assignment's phase, or the unassigned bucket.
+ *
+ * A phase of `""` counts as unassigned — `Assignment::parse` keeps an empty phase only for input
+ * that had nothing in it, and a band named "" would be a column with no heading.
+ */
+export function bandOf(tab) {
+  const assignment = tab && tab.assignment;
+  const phase = assignment && typeof assignment.phase === "string" ? assignment.phase.trim() : "";
+  return phase === "" ? NO_PHASE : phase;
+}
+
+/** The role within the band, or "" when nobody is named for one. */
+export function roleOf(tab) {
+  const assignment = tab && tab.assignment;
+  return assignment && typeof assignment.role === "string" ? assignment.role.trim() : "";
+}
+
+/** `phase/role` as one string, for a tooltip or a test. */
+export function assignmentOf(tab) {
+  const phase = bandOf(tab);
+  if (phase === NO_PHASE) return "";
+  const role = roleOf(tab);
+  const over = (tab.assignment && tab.assignment.over) || "";
+  const head = over ? `${over}:${phase}` : phase;
+  return role ? `${head}/${role}` : head;
+}
 
 /** The active view: `?view=` wins, then the saved choice, then Dashboard. */
 function currentView() {
@@ -1683,14 +1711,21 @@ function paintViewSwitch() {
 
 /** The Dashboard: every tab's card, in a lane per phase.
  *
- *  A tab with no `meta.phase` is not dropped — it lands in a final "sans phase"
- *  lane, so nothing silently disappears. */
+ *  The phase comes from the tab's typed `assignment` (`set-assignment`), not from a `meta` label.
+ *  A tab with no assignment is not dropped — it lands in a final "non assigné" lane, so nothing
+ *  silently disappears. */
 export function dashboardHtml(model) {
   const byPhase = new Map();
   for (const server of (model && model.servers) || []) {
     if (server.error) continue;
     for (const tab of server.tabs || []) {
-      const phase = (tab.meta && tab.meta.phase) || NO_PHASE;
+      // The daemon's typed `assignment`, not `meta.phase`.
+      //
+      // `meta.phase` was the original source, and nothing has ever written it: the CLI sets
+      // `assignment` through `/tabs/by-id/<id>/assignment`, and the only `meta.phase` in the tree is
+      // in a test payload. So every band was empty and every tab landed in "sans phase" — a
+      // dashboard that renders, with no information in it.
+      const phase = bandOf(tab);
       if (!byPhase.has(phase)) byPhase.set(phase, []);
       byPhase.get(phase).push({ serverId: server.id, tab });
     }
@@ -1790,13 +1825,17 @@ function tabCardHtml(serverId, tab) {
   const meta = tab.meta || {};
   const led = ledOf(tab);
   const fields = CARD_FIELDS.map(([key, label]) => {
-    const value = meta[key];
+    // `assignment` is a typed field on the tab now, not a meta label: the daemon parses
+    // `[override:]phase[/role]` and answers `{over?, phase, role}`. Reading it from `meta` showed
+    // "—" for every tab that used `set-assignment`, which is the command the field exists for.
+    // The other card fields are still meta conventions — those are free text by design.
+    const value = key === "assignment" ? assignmentOf(tab) : meta[key];
     const shown = value ? escapeHtml(String(value)) : `<span class="unset">—</span>`;
     return `<div class="card-field" data-key="${key}" title="modifier ${label}"><dt>${label}</dt><dd>${shown}</dd></div>`;
   }).join("");
   // Labels that are not card fields (project, phase, …) shown as raw tags.
   const extras = Object.keys(meta)
-    .filter((k) => !CARD_FIELDS.some(([f]) => f === k))
+    .filter((k) => !CARD_FIELDS.some(([f]) => f === k) && k !== "assignment")
     .map((k) => `<span class="card-tag">${escapeHtml(k)}=${escapeHtml(String(meta[k]))}</span>`)
     .join("");
   // A real link, not a fetch: the terminal viewer is served by the REMOTE and is
