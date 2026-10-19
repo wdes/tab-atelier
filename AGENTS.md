@@ -107,3 +107,30 @@ done
 RUSTFLAGS="-L /tmp/ta-links" cargo test            # gui default
 RUSTFLAGS="-L /tmp/ta-links" cargo test --no-default-features --features headless
 ```
+
+## Deferred, with the reason
+
+Things that look like gaps and are decisions. Re-opening one is fine; re-deriving
+it from scratch is not.
+
+- **Aligator** (the swamp-drain input router, `backup/feat/aligator-poc`). The
+  half a person can feel — the up-to-2 s typing latency — already shipped as
+  `aa1ea97d` (signal-driven input drain, adaptive daemon tick). What is left on
+  the branch is a CLI that only an agent calls, sized ~2,400 lines because it is
+  stacked with `set_card`/`task` work. If it is ever wanted, rewrite it at ~700
+  lines against the existing `/tabs/<idx>/input`, `/tabs/<id>/meta` and
+  `/blackboard` routes; do not port it.
+- **A Vue/tsc rebuild of the Kiosk UI.** The kiosk is vanilla JS with its own
+  tests; moving it onto the proxy's toolchain would add a build step, ~2,500
+  lines and a test-suite port, for a UI that looks the same. The deferred
+  *feature* there is only agent-vs-plain tab separation, and that is worth doing
+  when a concrete bug asks for it.
+- **The éval-à-3 loop** (`EvalVotes`, `EvalResult`, `Bilan`). Separable from the
+  catalogue, which now has its retire loop. Deferred until there is a use to
+  evaluate against — building an evaluation harness with no evaluated thing is
+  how a loop ends up scoring itself.
+- **One `chmod 0600` helper.** Eight copies exist across the daemon, kiosk,
+  proxy, catbus-agent, ssh-agent and the catalogue crate. Consolidating them is
+  a security-shaped change worth doing on its own, not folded into whichever
+  feature next needs a ninth.
+
