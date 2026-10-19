@@ -295,6 +295,15 @@ tab-atelier remote watch colossus
 
 # Re-capture the cert after a renewal (Ctrl-C-safe)
 tab-atelier remote re-pin colossus
+
+# What a tab is for — the dashboard's band and `dispatch --to`'s role
+tab-atelier set-assignment build/api
+
+# Put a decision in front of a person (idempotent by id, safe from a cron)
+tab-atelier decision open --id deploy-42 --title "Ship 0.5.0?"
+
+# The fleet's distilled profiles — retire is a tombstone, not a delete
+tab-atelier catalog list
 ```
 
 ### Sidecar attach — drive a single remote tab from your terminal
@@ -616,6 +625,65 @@ tab-atelier set-context --clear
 The text is capped at 2000 chars; a whitespace-only value clears it. Like `set-status`, it's safe to call unconditionally — it's a silent no-op (exit 0) when the `TAB_ATELIER_API_*` env isn't present, so a shell rc file or Claude Code hook calling it outside a tab does nothing.
 
 Both `.deb`s wire this automatically: the shipped `/etc/claude-code/managed-settings.json` routes Claude Code's `UserPromptSubmit` through `tab-atelier claude-hook user-prompt` (desktop) / `tab-atelier-headless claude-hook user-prompt` (headless), which stamps the prompt as the tab context, and `SessionEnd` clears it — so any `claude` running in a tab labels its tab with no per-user setup. To do it yourself instead, point a `UserPromptSubmit` hook in `~/.claude/settings.json` at `set-context`, or just ask Claude to run it when it picks up a task.
+
+### `tab-atelier set-assignment` — what a tab is *for*
+
+`set-context` is a note about what a tab is doing *right now*; it changes every few minutes. An
+**assignment** is what the tab is for — its band and its role — and it changes when the work does. It
+is the field the Kiosk's dashboard groups by, and the one `dispatch --to <role>` matches.
+
+```sh
+tab-atelier set-assignment build/api            # the band "build", role "api"
+tab-atelier set-assignment review/pr
+tab-atelier set-assignment hotfix:build/api --tab <id>   # narrowing the band, on someone else's tab
+tab-atelier set-assignment --clear
+```
+
+The grammar is `[override:]phase[/role]`. The phase is the dashboard band; the override narrows it
+(`hotfix` inside `build`); the role is free text, and may contain a slash (`review/infra/db`), because
+a reviewer of `infra/db` is a real thing. A tab with no assignment lands in **non assigné** rather
+than disappearing from the board — that is the whole reason it is a typed field and not a `meta`
+label: a label nobody sets leaves every band empty, which is a page that renders and says nothing.
+
+### `tab-atelier decision` — put a question in front of a person
+
+The Kiosk renders the decision journal, but the thing that *needs* a decision is usually a build hook,
+a dispatcher or an agent with no browser open. This is that path.
+
+```sh
+tab-atelier decision open --id deploy-42 --title "Ship 0.5.0?" --why "the tag is ready"
+echo '{"id":"deploy-42","state":"open","title":"Ship 0.5.0?"}' | tab-atelier decision open -
+tab-atelier decision list
+tab-atelier decision list --all --id deploy-42
+```
+
+Appending is **idempotent by id**, and the verb tells you which of four things happened:
+
+| Answer | Meaning |
+|---|---|
+| `appended` | new — it is on the board |
+| `already-present` | byte-identical re-post; nothing written |
+| `already-ruled` | the id was settled; **the verdict was left alone** |
+| `updated` | an open decision whose content changed, replaced rather than duplicated |
+
+That is what makes it safe to call from a cron or a hook that may fire twice: a repeat cannot put two
+cards in front of a person, and it can never silently overturn a ruling. `decision list` shows what is
+still waiting; `--all` adds the archived ones (ruled decisions are always listed — they carry the
+verdict, which is the record).
+
+### `tab-atelier catalog` — the fleet's distilled profiles
+
+```sh
+tab-atelier catalog list          # what is on offer
+tab-atelier catalog list --all    # including retired
+tab-atelier catalog retire swift-reviewer
+tab-atelier catalog restore swift-reviewer
+```
+
+`retire` is a **tombstone**, not a delete: the profile stops being offered, and the prompt it recorded
+survives, because a later agent may need to know what the fleet had been told. It reads and writes the
+catalogue file directly rather than going through the daemon — a skill is your notes about your own
+fleet, not fleet state, so there is nothing to coordinate.
 
 ### Auto-resume on restart
 
