@@ -63,6 +63,7 @@ import org.connectbot.data.PubkeyRepository
 import org.connectbot.data.entity.Host
 import org.connectbot.data.entity.Pubkey
 import org.connectbot.di.CoroutineDispatchers
+import org.connectbot.tabatelier.SessionTabKeys
 import org.connectbot.transport.TransportFactory
 import org.connectbot.util.PreferenceConstants
 import org.connectbot.util.ProviderLoader
@@ -123,7 +124,14 @@ class TerminalManager :
     // choice waits here between the tap that made it and the connect that uses
     // it, and the transport takes it — taken, not read, so a later session
     // cannot inherit the previous session's tab.
-    private val pendingTabKeys = ConcurrentHashMap<Long, String>()
+    /**
+     * Which tab each host's session is on — the pending choice and the sticky fact, kept
+     * apart.
+     *
+     * See [SessionTabKeys]: conflating the two is what made the app's own reconnect fail with
+     * "no tab was chosen" for a tab the user had plainly tapped.
+     */
+    private val tabKeys = SessionTabKeys()
 
     private val _disconnected = ArrayList<Host>()
     private val _disconnectedFlow = MutableStateFlow<List<Host>>(emptyList())
@@ -517,16 +525,19 @@ class TerminalManager :
         if (!tabKey.isNullOrBlank()) {
             val existing = getConnectedBridge(host)
             if (existing != null) {
+                // Before the switch, so a reconnect that races it remembers the tab that
+                // was asked for rather than the one being left.
+                tabKeys.remember(host.id, tabKey)
                 existing.switchTab(tabKey)
                 // A choice left over from a tap whose session never started is not
                 // this session's; this one has been told directly.
-                pendingTabKeys.remove(host.id)
+                tabKeys.forgetPending(host.id)
                 return existing
             }
         }
 
         if (!tabKey.isNullOrBlank()) {
-            pendingTabKeys[host.id] = tabKey
+            tabKeys.choose(host.id, tabKey)
         }
         return openConnection(host)
     }
@@ -538,7 +549,20 @@ class TerminalManager :
      * reading is deliberate: a choice belongs to one session, and a stale one
      * would send the next connection to a tab the user did not pick.
      */
-    fun takePendingTabKey(hostId: Long): String? = pendingTabKeys.remove(hostId)
+    fun takePendingTabKey(hostId: Long): String? = tabKeys.takePending(hostId)
+
+    /**
+     * The tab this host was last on, for a reconnect that has no pending choice.
+     *
+     * The app's own reconnect (`requestReconnect` → `startConnection`) builds a **new**
+     * transport, so the choice the old one consumed is gone by the time `connect()` runs.
+     * Without this, the reconnect has nothing to open and the session ends with "no tab was
+     * chosen" — for a tab the user had tapped, on a connection that was working a moment ago.
+     */
+    fun lastTabKey(hostId: Long): String? = tabKeys.resumeKey(hostId)
+
+    /** Records the tab a live session has moved to, so a later reopen lands there. */
+    fun rememberTabKey(hostId: Long, tabKey: String) = tabKeys.remember(hostId, tabKey)
 
     /**
      * Update the last-connected value for the given nickname by passing through

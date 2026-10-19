@@ -280,7 +280,10 @@ class TabAtelier : AbsTransport() {
         // typo in a fallback, and the way to fix it is the editor.
         val parsed = addresses.parsed()
         if (parsed.isEmpty()) {
-            bridge?.outputLine(service.getString(R.string.tabatelier_url_missing))
+            // On the strip, not in the terminal: see [TerminalBridge.connectionBanner]. An
+            // error is still something the app has to say, and saying it in the user's
+            // scrollback is how a session ends up with text in it that no program wrote.
+            bridge?.setConnectionBanner(service.getString(R.string.tabatelier_url_missing))
             bridge?.dispatchDisconnect(DisconnectReason.REMOTE_EOF)
             return
         }
@@ -296,13 +299,17 @@ class TabAtelier : AbsTransport() {
         this.base = parsed.values.first()
         this.token = client.token(host.id)
 
-        // The tab this session is on is read once and then held, because whoever
-        // puts it there is what a redial does not have: see [retryLoop] for why a
-        // reconnect that goes through `TerminalManager` cannot work for this
-        // protocol.
-        val tabKey = service.takePendingTabKey(host.id) ?: currentTabKey
+        // The tab this session is on is read once and then held, because whoever puts it
+        // there is what a redial does not have: see [retryLoop] for why a reconnect that goes
+        // through `TerminalManager` cannot work for this protocol.
+        //
+        // [TerminalManager.lastTabKey] is the fallback that makes the app's *own* reconnect
+        // work. That path (`requestReconnect` → `startConnection`) builds a new transport, so
+        // a key consumed by the previous one is gone and this would otherwise fail with "no
+        // tab was chosen" for a tab the user had tapped — which is exactly what was reported.
+        val tabKey = service.takePendingTabKey(host.id) ?: service.lastTabKey(host.id)
         if (tabKey.isNullOrBlank()) {
-            bridge?.outputLine(service.getString(R.string.tabatelier_tab_not_chosen))
+            bridge?.setConnectionBanner(service.getString(R.string.tabatelier_tab_not_chosen))
             bridge?.dispatchDisconnect(DisconnectReason.REMOTE_EOF)
             return
         }
@@ -315,6 +322,7 @@ class TabAtelier : AbsTransport() {
         closed = false
         failure = null
         currentTabKey = tabKey
+        manager?.rememberTabKey(host.id, tabKey)
 
         // Before the daemon has said anything there is no session to draw, and the
         // terminal is on its "connecting" line; this is the state that says the app
@@ -497,9 +505,9 @@ class TabAtelier : AbsTransport() {
     /**
      * Starts reporting what a dial is doing, into the terminal.
      *
-     * Only while connecting: once the session is up the terminal belongs to the remote
-     * program, and this must never write into it again — see [ConnectionProgress] for why
-     * the dots are dots, and [TerminalBridge.writeProgress] for why whole lines would not do.
+     * Into the console's status strip, never into the terminal: the terminal belongs to the
+     * remote program, and text this end invents has no business among its output. See
+     * [ConnectionProgress] and [TerminalBridge.connectionBanner].
      *
      * A null bridge means there is nowhere to write, which happens in tests and in a session
      * that was torn down between the caller deciding to dial and getting here. The progress
@@ -508,7 +516,7 @@ class TabAtelier : AbsTransport() {
      */
     private fun startProgress(base: TabAtelierBase): ConnectionProgress {
         val progress = ConnectionProgress(
-            write = { text -> bridge?.writeProgress(text) },
+            render = { line -> bridge?.setConnectionBanner(line) },
         )
         progress.start()
         // Named before any event arrives, so the first thing on screen is that a connection
@@ -585,7 +593,7 @@ class TabAtelier : AbsTransport() {
                 // the address the user gave cannot be reached, and the silence here is
                 // what made that take so long to notice. The same message connect()
                 // gives, because it is the same problem.
-                bridge?.outputLine(service.getString(R.string.tabatelier_url_missing))
+                bridge?.setConnectionBanner(service.getString(R.string.tabatelier_url_missing))
                 return false
             }
             client = rebuilt
@@ -615,6 +623,23 @@ class TabAtelier : AbsTransport() {
         leftoverOffset = 0
         // The old socket's failure, if it had one, is not this socket's.
         failure = null
+
+        // **The previous tab's screen is cleared now, not when the new socket paints.**
+        // Waiting for the first frame of the new connection meant that a switch which did
+        // not connect left the old tab's content on screen — the user tapped tab B, the
+        // terminal kept showing tab A, and nothing said the move had failed. Queueing the
+        // erase puts it *in the stream*, so the Relay applies it in order on its own thread:
+        // clearing the emulator from here instead would race that thread.
+        //
+        // The session's own screen-state flag is set with it, so the first frame that does
+        // arrive does not erase a second time for nothing.
+        screenStateUnknown = true
+        inbound.offer(screenErase())
+        // The strip shows the switch being attempted; openSocket replaces it with the first
+        // real phase a moment later.
+        manager?.let { service ->
+            bridge?.setConnectionBanner(service.getString(R.string.tabatelier_banner_switching))
+        }
 
         // The tab the user asked for becomes the session's tab *before* the socket for
         // it is opened, not after.
@@ -655,7 +680,9 @@ class TabAtelier : AbsTransport() {
                     // "restored the terminal feed".
                     setSocketState(ConnectionState.RECONNECTING)
                     manager?.let { service ->
-                        bridge?.emitSessionStatus(service.getString(R.string.tabatelier_connection_lost))
+                        bridge?.setConnectionBanner(
+                            service.getString(R.string.tabatelier_banner_switching_failed),
+                        )
                     }
                     retrying()
                 }
@@ -825,7 +852,7 @@ class TabAtelier : AbsTransport() {
                 // looking like something the server said.
                 Timber.w(cause, "Tab-atelier socket dropped; redialling")
                 manager?.let { service ->
-                    bridge?.emitSessionStatus(service.getString(R.string.tabatelier_connection_lost))
+                    bridge?.setConnectionBanner(service.getString(R.string.tabatelier_banner_reconnecting))
                 }
                 setSocketState(ConnectionState.RECONNECTING)
                 retrying()
@@ -948,6 +975,11 @@ class TabAtelier : AbsTransport() {
         // when it is resumed, the failure count that belonged to whatever happened before
         // would otherwise start it at a thirty-second wait.
         attempts = 0
+        // Kept on screen, unlike a failed connection's: the session is still here, the tab is
+        // still running, and the user is coming back to it.
+        manager?.let { service ->
+            bridge?.setConnectionBanner(service.getString(R.string.tabatelier_banner_offline))
+        }
         setSocketState(ConnectionState.DISCONNECTED)
     }
 
@@ -961,6 +993,9 @@ class TabAtelier : AbsTransport() {
         if (!suspended || closed) return
         val tabKey = currentTabKey ?: return
         suspended = false
+        manager?.let { service ->
+            bridge?.setConnectionBanner(service.getString(R.string.tabatelier_banner_reconnecting))
+        }
         setSocketState(ConnectionState.RECONNECTING)
         // Dialled at once rather than after a backoff: what parked it — no network, or
         // nobody looking — has just stopped being true.
@@ -1096,15 +1131,10 @@ class TabAtelier : AbsTransport() {
          * reads on. Clearing the emulator from elsewhere would race that thread.
          */
         fun presentedFrame(frame: ByteArray, screenStateUnknown: Boolean): ByteArray =
-            if (screenStateUnknown) SCREEN_ERASE + frame else frame
+            if (screenStateUnknown) screenErase() + frame else frame
 
-        /**
-         * Erase display, home the cursor, erase the scrollback.
-         *
-         * `CSI 2 J` alone would leave old lines above the cursor where the replay is
-         * shorter than the screen had been, so the home is not decoration.
-         */
-        private val SCREEN_ERASE = "\u001b[2J\u001b[H\u001b[3J".toByteArray(Charsets.US_ASCII)
+        /** Erase display, home the cursor, erase the scrollback — see [screenErase]. */
+        internal val SCREEN_ERASE: ByteArray get() = screenErase()
 
         /** The escalating waits, in seconds; the last one is the cap. */
         private val DELAYS_SECONDS = longArrayOf(2, 5, 10, 20, 30)
@@ -1278,6 +1308,9 @@ class TabAtelier : AbsTransport() {
     private fun onSocketReady() {
         established = true
         failure = null
+        // The strip goes quiet once there is a session: there is nothing to report, and a
+        // permanently visible "connected" bar is just something else to read past.
+        bridge?.setConnectionBanner(null)
         setSocketState(ConnectionState.CONNECTED)
     }
 
@@ -1541,6 +1574,20 @@ class TabAtelier : AbsTransport() {
          * or a suspend to land within a second of being asked for, which no user can
          * distinguish from immediately.
          */
+        /**
+         * Erase display, home the cursor, erase the scrollback.
+         *
+         * `CSI 2 J` alone would leave old lines above the cursor where the replay is
+         * shorter than the screen had been, so the home is not decoration. `CSI 3 J` takes
+         * the scrollback with it, so the user cannot scroll up out of the tab they are on
+         * and into the previous tab's output.
+         *
+         * Returns a fresh array each call rather than sharing one: it is handed to a queue
+         * and then to the relay, and a shared array is a mutable thing in two threads for no
+         * benefit.
+         */
+        internal fun screenErase(): ByteArray = "\u001b[2J\u001b[H\u001b[3J".toByteArray(Charsets.US_ASCII)
+
         private const val READ_POLL_MILLIS = 1_000L
 
         /**

@@ -72,4 +72,8 @@
 	<string name="tabatelier_urls_summary">Facultatif. Essayées dans l\'ordre quand l\'adresse ci-dessus ne répond pas — et essayées en premier quand votre téléphone est sur le même réseau local que l\'une d\'elles. Séparez-les par des virgules.</string>
 	<string name="tabatelier_urls_error">Chaque adresse doit commencer par http:// ou https://, par exemple http://192.168.1.10:8443</string>
 	<string name="tabatelier_phase_starting">Connexion à %1$s</string>
+	<string name="tabatelier_banner_reconnecting">Reconnexion…</string>
+	<string name="tabatelier_banner_offline">Hors ligne — en attente d\'un réseau</string>
+	<string name="tabatelier_banner_switching">Changement d\'onglet…</string>
+	<string name="tabatelier_banner_switching_failed">Changement impossible — nouvelle tentative…</string>
 </resources>

@@ -24,6 +24,8 @@ import android.content.Context
 import androidx.annotation.VisibleForTesting
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.tween
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.shrinkVertically
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInVertically
@@ -346,6 +348,53 @@ private val HEX_COLOR = Regex("^#[0-9a-fA-F]{6}$")
 private const val TERMINAL_OUTLINE_COVER_DP = 2
 
 /**
+ * The one-line strip above the terminal that says what the app is doing with the connection.
+ *
+ * Changed for Tab Atelier Remote (Apache-2.0 section 4(b)), and it replaces something that
+ * should never have been there: these messages used to be written into the terminal itself.
+ * The terminal is the remote program's surface — text the app invents lands among its output,
+ * where it reads as something the server said, and then has to be erased again, which means
+ * writing more bytes into a screen the user is reading. A connection's state is this end's
+ * business, so it gets this end's chrome.
+ *
+ * The shape is deliberately a bar that appears and disappears rather than a permanent
+ * indicator: when there is nothing to say there is no strip at all, so a healthy session looks
+ * exactly as it did before this existed and costs no vertical space. That is the whole
+ * difference from the "Connecting to …" line it replaces, which sat in the scrollback forever.
+ *
+ * [background] is the session's own colour when the daemon reports one, so the strip reads as
+ * part of the terminal rather than as a separate widget bolted above it; without one it falls
+ * back to the theme's surface.
+ */
+@Composable
+private fun ConnectionBannerStrip(banner: String?, background: Color?) {
+    AnimatedVisibility(
+        visible = banner != null,
+        enter = expandVertically() + fadeIn(),
+        exit = shrinkVertically() + fadeOut(),
+    ) {
+        // A fixed height and one line: the text is a phase name plus dots, and letting it wrap
+        // would make the terminal jump in size as a connection progressed.
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(background ?: MaterialTheme.colorScheme.surfaceVariant)
+                .padding(horizontal = 8.dp, vertical = 4.dp)
+                .testTag("connection_banner"),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = banner.orEmpty(),
+                style = MaterialTheme.typography.labelMedium,
+                color = if (background != null) Color.White.copy(alpha = 0.85f) else MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+    }
+}
+
+/**
  * Paints over the ring where [org.connectbot.terminal.Terminal] draws its own border.
  *
  * The terminal's node is left the size it was given and is not moved, so its layout — and
@@ -499,6 +548,11 @@ private fun ConsoleTerminalPage(
         // surface. A tab with no colour of its own therefore looks exactly as it did
         // before this app had colours at all.
         val remoteTabBackground by bridge.remoteBackgroundColor.collectAsState()
+
+        // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): what the app has to say
+        // about this session's connection, shown *above* the terminal rather than written
+        // into it. The terminal is the remote program's; this is this end's.
+        val connectionBanner by bridge.connectionBanner.collectAsState()
         val remoteTabColor = remember(remoteTabBackground) { remoteTabBackground?.let(::terminalColorOrNull) }
         val terminalBackground = remoteTabColor ?: Color.Black
 
@@ -512,10 +566,14 @@ private fun ConsoleTerminalPage(
             }
         }
 
-        Terminal(
-            terminalEmulator = bridge.terminalEmulator,
-            modifier = Modifier
-                .fillMaxSize()
+        Column(modifier = Modifier.fillMaxSize()) {
+            ConnectionBannerStrip(banner = connectionBanner, background = remoteTabColor)
+
+            Terminal(
+                terminalEmulator = bridge.terminalEmulator,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f)
                 .padding(
                     // Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): the
                     // whole bar, not one row of it.
@@ -593,10 +651,11 @@ private fun ConsoleTerminalPage(
                     bridge.keyHandler.sendPressedKey(key)
                     bridge.tryKeyVibrate()
                 }
-            } else {
-                null
-            },
-        )
+                } else {
+                    null
+                },
+            )
+        }
 
         SideEffect {
             bridge.onTextInputRequest = onTextInputRequest

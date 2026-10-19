@@ -18,29 +18,32 @@
 package org.connectbot.tabatelier
 
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertTrue
+import org.junit.Assert.assertNull
 import org.junit.Test
 
 /**
- * Covers [ConnectionProgress]: the phase lines and their per-second dots.
+ * Covers [ConnectionProgress]: the one-line description of a connection attempt that the
+ * console's status strip displays.
  *
- * The ticker is not started here — `tick()` is called directly — because the point of the
- * class is what it writes, and a test that waits real seconds to see a dot is a test that will
- * be flaky at exactly the moment it matters.
+ * The ticker is not started here — `tick()` is called directly — because what matters is the
+ * line, and a test that waits real seconds for a dot is a test that goes flaky exactly when it
+ * is needed.
  */
 class ConnectionProgressTest {
 
-    private val written = StringBuilder()
-    private val joined: String get() = written.toString()
+    /** Every value the strip was asked to show, in order. */
+    private val shown = mutableListOf<String?>()
 
-    private fun progress() = ConnectionProgress(write = { written.append(it) })
+    private fun progress() = ConnectionProgress(render = { shown += it })
+
+    private val current: String? get() = shown.lastOrNull()
 
     /**
-     * A phase is written as a line, and each tick adds exactly one dot.
+     * A phase is named, and each tick extends the same line by one full stop.
      *
-     * This is the whole visible behaviour, in one assertion: the phase names itself, and one
-     * dot per tick appears on that same line — the failure mode of a misplaced newline being
-     * every dot on a line of its own.
+     * The whole visible behaviour in one assertion — and the failure it guards is the one an
+     * append-only API would produce: a fresh call per tick that replaces instead of extends,
+     * so the strip would show exactly one dot at all times and never look like progress.
      */
     @Test
     fun aPhaseGainsOneDotPerTick() {
@@ -51,18 +54,17 @@ class ConnectionProgressTest {
         progress.tick()
         progress.tick()
 
-        assertEquals("DNS lookup for home.example...", joined)
+        assertEquals("DNS lookup for home.example...", current)
     }
 
     /**
-     * A second phase starts on a new line and does not inherit the first one's dots.
+     * A new phase replaces the previous one instead of joining it.
      *
-     * Both halves matter. Without the newline the phases run together into one
-     * unreadable line; without the reset, a phase inherits the previous phase's dots and
-     * appears to have been slow when it was not.
+     * A bar has one line. Joining would give "DNS lookup for …..TCP connection to …", which is
+     * exactly the unreadable accumulation the strip exists to avoid.
      */
     @Test
-    fun aNewPhaseStartsOnItsOwnLineWithNoDots() {
+    fun aNewPhaseReplacesThePreviousOne() {
         val progress = progress()
 
         progress.phase("DNS lookup for home.example")
@@ -71,81 +73,77 @@ class ConnectionProgressTest {
         progress.phase("TCP connection to 192.168.1.10:8443")
         progress.tick()
 
-        assertEquals(
-            "DNS lookup for home.example..\r\nTCP connection to 192.168.1.10:8443.",
-            joined,
-        )
+        assertEquals("TCP connection to 192.168.1.10:8443.", current)
     }
 
     /**
-     * Ticks after [ConnectionProgress.finish] write nothing.
+     * Ticks after [ConnectionProgress.finish] change nothing.
      *
-     * The ticker is stopped by the caller as well, but the two are not atomic with each
-     * other: a tick already in flight when `finish` lands must not put a dot on the line the
-     * next phase — or the remote program — is about to write.
+     * `finish` and the ticker are not atomic with each other: a tick already in flight must
+     * not extend a line that describes a phase which has ended.
      */
     @Test
-    fun ticksAfterFinishWriteNothing() {
+    fun ticksAfterFinishChangeNothing() {
         val progress = progress()
 
         progress.phase("TLS handshake with home.example")
         progress.finish()
+        val afterFinish = shown.size
         progress.tick()
         progress.tick()
 
-        assertEquals("TLS handshake with home.example\r\n", joined)
+        assertEquals("finished phase must not keep growing", afterFinish, shown.size)
     }
 
     /**
-     * A tick before any phase writes nothing.
+     * A tick before any phase shows nothing.
      *
-     * The ticker starts with the object, so its first tick can arrive before the first phase
-     * is named — and a bare dot on an otherwise empty terminal would be the first thing the
-     * user saw.
+     * The ticker starts with the object, so its first tick can arrive before a phase is named
+     * — and a bare dot appearing from nowhere is the first thing the user would see.
      */
     @Test
-    fun aTickBeforeAnyPhaseWritesNothing() {
+    fun aTickBeforeAnyPhaseShowsNothing() {
         val progress = progress()
 
         progress.tick()
 
-        assertEquals("", joined)
+        assertEquals(emptyList<String?>(), shown)
     }
 
     /**
-     * `finish` twice is harmless.
+     * Stopping clears the strip.
      *
-     * It is called on every exit path from the dial, including ones where the phase already
-     * ended, and a second newline would leave a blank line on the terminal.
+     * The line describes a connection that is no longer being attempted; leaving it on screen
+     * would be a permanent bar saying "TCP connection to …" over a session that connected
+     * minutes ago. This is the assertion that keeps the strip from becoming the old always-on
+     * "Connecting to" line by another name.
      */
     @Test
-    fun finishingTwiceWritesOneNewline() {
+    fun stoppingClearsTheStrip() {
         val progress = progress()
 
         progress.phase("DNS lookup for home.example")
-        progress.finish()
-        progress.finish()
+        progress.tick()
+        progress.stop()
 
-        assertEquals("DNS lookup for home.example\r\n", joined)
+        assertNull(current)
     }
 
     /**
-     * [ConnectionProgress.stop] is safe without [ConnectionProgress.start], and twice.
+     * Stopping twice does not re-clear, and is safe without a start.
      *
-     * The dial's `finally` block always stops, including when the progress was never started
-     * — a null reporter, or a test — and a `Timer` cancelled twice throws nothing but a
-     * missing one is a different matter. Cheap to get right, so it is asserted rather than
-     * assumed.
+     * The dial's `finally` always stops, including on paths where nothing was ever started,
+     * and a second `render(null)` is at best noise.
      */
     @Test
-    fun stopIsSafeWithoutStartAndTwice() {
+    fun stoppingTwiceIsHarmless() {
         val progress = progress()
 
-        progress.stop()
         progress.start()
         progress.stop()
+        val afterFirstStop = shown.size
         progress.stop()
 
-        assertTrue(true)
+        assertEquals(afterFirstStop, shown.size)
     }
 }

@@ -116,4 +116,11 @@
 	<string name="tabatelier_urls_summary">Optional. Tried in order when the address above does not answer — and tried first when your phone is on the same local network as one of them. Separate with commas.</string>
 	<string name="tabatelier_urls_error">Every address must start with http:// or https://, for example http://192.168.1.10:8443</string>
 	<string name="tabatelier_phase_starting">Connecting to %1$s</string>
+	<!-- The strip above the terminal. It carries everything the app has to say about
+	     the connection, so that none of it is ever written into the terminal itself —
+	     see TerminalBridge.connectionBanner. Kept short: it is one line. -->
+	<string name="tabatelier_banner_reconnecting">Reconnecting…</string>
+	<string name="tabatelier_banner_offline">Offline — waiting for a network</string>
+	<string name="tabatelier_banner_switching">Switching tab…</string>
+	<string name="tabatelier_banner_switching_failed">Could not switch — retrying…</string>
 </resources>

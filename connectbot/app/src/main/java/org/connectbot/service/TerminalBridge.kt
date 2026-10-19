@@ -363,23 +363,6 @@ class TerminalBridge {
         manager.notifyBridgeStateChanged()
     }
 
-    /**
-     * Tells the console something about this session's own connection.
-     *
-     * The same channel upstream uses for network status, and for the same reasons it
-     * was built: it is emitted from a background thread, and the console shows it
-     * *beside* the terminal rather than printing it into one — so it cannot be
-     * mistaken for the remote program's output, and the daemon's replay cannot wipe
-     * it the way it would wipe a line written into the screen.
-     *
-     * [outputLine] is the other candidate and the wrong one here: it is for the
-     * banner shown before a session exists, and calling it afterwards logs an error
-     * to say so. A connection that drops and redials is exactly the case that has a
-     * session already.
-     */
-    internal fun emitSessionStatus(message: String) {
-        scope.launch { _networkStatusMessages.emit(message) }
-    }
 
     // Terminal emulator from ConnectBot Terminal library
     val terminalEmulator: TerminalEmulator
@@ -862,22 +845,32 @@ class TerminalBridge {
     }
 
     /**
-     * Appends to the terminal exactly as given, without a newline.
+     * A one-line description of what this session's connection is doing, or null for nothing.
      *
-     * The counterpart to [outputLine] for text that is written *in pieces* rather than in
-     * whole lines — a connection phase and then one dot per second, so the dots land on the
-     * line that names the phase. [outputLine] splits on newlines and adds `\r\n` to each,
-     * which would put every dot on its own line.
+     * This is the terminal's *chrome*, not its content. Everything the app wants to say about
+     * a connection goes here — the phase being attempted and how long it has taken, then
+     * "reconnecting", then "offline" — and none of it is ever written into the terminal.
      *
-     * It touches the emulator directly, like [outputLine], so it is only correct before the
-     * session is established and before anything else is reading — which is exactly when a
-     * connection is being described.
+     * Changed for Tab Atelier Remote (Apache-2.0 section 4(b)): an earlier version printed
+     * these lines into the emulator, and that was wrong twice over. They landed among the
+     * remote program's output, where they read as something the server had said; and they had
+     * to be erased again afterwards, which meant writing *more* bytes into a screen the user
+     * was reading. A strip above the terminal keeps the two surfaces apart: the program owns
+     * the terminal and this end owns the strip.
      */
-    internal fun writeProgress(text: String) {
-        if (text.isEmpty()) return
-        synchronized(localOutput) {
-            terminalEmulator.writeInput(text.encodeToByteArray())
-        }
+    private val _connectionBanner = MutableStateFlow<String?>(null)
+    val connectionBanner: StateFlow<String?> = _connectionBanner.asStateFlow()
+
+    /**
+     * Sets that description, or clears it with null.
+     *
+     * Wakes the manager as well, because the console reads this out of a state it collected
+     * earlier and a StateFlow write alone would not recompose around it.
+     */
+    internal fun setConnectionBanner(text: String?) {
+        if (_connectionBanner.value == text) return
+        _connectionBanner.value = text
+        manager.notifyBridgeStateChanged()
     }
 
     /**
