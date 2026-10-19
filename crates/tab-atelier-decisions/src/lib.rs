@@ -90,6 +90,57 @@ pub enum DecisionError {
     Unavailable,
 }
 
+/// What an [`Journal::append`] did, because a producer that re-runs needs to
+/// know whether it changed anything.
+///
+/// A cron, a crashed hook or a retry after a timeout will post the same
+/// decision more than once. Two of these four outcomes are "nothing changed"
+/// and two are "the board moved", and a caller that cannot tell them apart
+/// either reports success for everything or re-renders on every no-op.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Appended {
+    /// A decision with this id was not in the journal; it is now.
+    New,
+    /// The identical decision was already there. Nothing was written.
+    Identical,
+    /// The id exists and has already been ruled. Nothing was written: the
+    /// producer's version is stale, and replacing a person's verdict with it
+    /// would silently overturn a decision.
+    Settled,
+    /// The id exists, is not yet ruled, and the content differs — the producer
+    /// updated its own open question. The line was replaced, not duplicated.
+    Reopened,
+}
+
+impl Appended {
+    /// Whether the journal changed.
+    #[must_use]
+    pub const fn wrote(self) -> bool {
+        matches!(self, Self::New | Self::Reopened)
+    }
+
+    /// A short word for a CLI to print.
+    #[must_use]
+    pub const fn describe(self) -> &'static str {
+        match self {
+            Self::New => "appended",
+            Self::Identical => "already-present",
+            Self::Settled => "already-ruled",
+            Self::Reopened => "updated",
+        }
+    }
+}
+
+/// Whether two decisions would serialize to the same line.
+///
+/// Compared through the serialized form rather than `PartialEq` on the struct:
+/// `PartialEq` would say two decisions differ when a field is `None` versus
+/// absent, which is the same line on disk. What matters here is "would this
+/// write a different line", so the line is what is compared.
+fn same(a: &Decision, b: &Decision) -> bool {
+    serde_json::to_string(a).ok() == serde_json::to_string(b).ok()
+}
+
 /// The journal on disk, and the tree the files it references live under.
 #[derive(Debug, Clone)]
 pub struct Journal {
@@ -184,6 +235,74 @@ impl Journal {
         Ok(updated)
     }
 
+    /// What happened to an append, so a caller can tell a fresh decision from a
+    /// repeat without diffing the file itself.
+    ///
+    /// The four cases are not decoration: a producer that re-runs (a cron, a
+    /// crashed hook, a retry after a timeout) will post the same decision more
+    /// than once, and the board must not grow a duplicate card each time — nor
+    /// may a re-post silently *reset* a decision somebody already ruled.
+    ///
+    /// # Errors
+    ///
+    /// [`DecisionError::Unavailable`] when the journal cannot be read or
+    /// appended to.
+    pub fn append(&self, decision: &Decision) -> Result<Appended, DecisionError> {
+        // At the top of the function, not inside the arm: an item after a
+        // statement is confusing to read, because it is in scope for the whole
+        // block whether or not the statement above it ran.
+        use std::io::Write as _;
+
+        // Match on id: it is the decision's identity, and a producer is
+        // expected to reuse it when re-posting the same thing.
+        let existing = self
+            .list(true)
+            .map_err(|_| DecisionError::Unavailable)?
+            .into_iter()
+            .find(|d| d.id == decision.id);
+        match existing {
+            // Byte-identical re-post: already there, nothing to do. Comparing
+            // the serialized form rather than the struct means a field added
+            // later automatically participates in "is this the same thing".
+            Some(old) if same(&old, decision) => Ok(Appended::Identical),
+            // Same id, already ruled. Appending would replace a verdict a
+            // person gave with whatever the producer believes now, so it is
+            // refused — the producer's news is stale by definition.
+            Some(old) if old.state == STATE_TRANCHED => Ok(Appended::Settled),
+            // Same id, different content, not yet ruled: the producer is
+            // updating its own open question. Replace the line, so the board
+            // shows the current wording rather than two versions of one thing.
+            Some(_) => {
+                // Through the same `update` the two mutations use, so there is one
+                // implementation of "rewrite one line in this journal" rather than
+                // two that can disagree about comments, blank lines or ordering.
+                self.update(&decision.id, |line| line.clone_from(decision))?;
+                Ok(Appended::Reopened)
+            }
+            None => {
+                // A trailing newline only when the file does not already end in
+                // one, so a journal written by hand (no final newline) does not
+                // gain a blank line before every appended entry.
+                let mut line = serde_json::to_string(decision).map_err(|_| DecisionError::Unavailable)?;
+                line.push('\n');
+                if let Ok(existing) = fs::read_to_string(&self.path)
+                    && !existing.is_empty()
+                    && !existing.ends_with('\n')
+                {
+                    line.insert(0, '\n');
+                }
+                let mut file = fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&self.path)
+                    .map_err(|_| DecisionError::Unavailable)?;
+                file.write_all(line.as_bytes())
+                    .map_err(|_| DecisionError::Unavailable)?;
+                Ok(Appended::New)
+            }
+        }
+    }
+
     /// Reads a file the journal references, confined to the outbox.
     ///
     /// # Errors
@@ -242,7 +361,7 @@ fn expand_with(raw: &str, home: Option<&Path>) -> PathBuf {
 /// The content type for a served file, by extension.
 #[cfg(test)]
 mod tests {
-    use super::{Decision, DecisionError, Journal, STATE_OPEN, STATE_READ, STATE_TRANCHED, expand_with};
+    use super::{Appended, Decision, DecisionError, Journal, STATE_OPEN, STATE_READ, STATE_TRANCHED, expand_with};
     use std::fs;
     use std::io::Write as _;
     use std::path::PathBuf;
@@ -362,5 +481,113 @@ mod tests {
             back.contains("\"whyGated\":\"because\""),
             "camelCase is what the page reads: {back}"
         );
+    }
+
+    /// A decision with just an id, for the append tests.
+    fn decision(id: &str, title: &str) -> Decision {
+        Decision {
+            id: id.to_owned(),
+            project: None,
+            state: STATE_OPEN.to_owned(),
+            title: Some(title.to_owned()),
+            verdict: None,
+            summary: None,
+            detail: None,
+            why_gated: None,
+            reco: None,
+            effort: None,
+            files: Vec::new(),
+        }
+    }
+
+    /// The idempotence rule that makes a re-runnable producer safe: posting the
+    /// same decision twice must not put two cards on the board.
+    #[test]
+    fn appending_the_same_decision_twice_puts_one_card_on_the_board() {
+        let (journal, _dir) = scratch("append-identical");
+        assert_eq!(
+            journal.append(&decision("d1", "Ship it?")).expect("append"),
+            Appended::New
+        );
+        assert_eq!(
+            journal.append(&decision("d1", "Ship it?")).expect("append again"),
+            Appended::Identical
+        );
+        let listed = journal.list(false).expect("list");
+        assert_eq!(listed.len(), 1, "one card, not two: {listed:?}");
+    }
+
+    /// The rule that protects a person's ruling: a producer that re-posts after
+    /// a decision was settled must not overwrite the verdict.
+    #[test]
+    fn a_re_post_cannot_overwrite_a_verdict() {
+        let (journal, _dir) = scratch("append-settled");
+        journal.append(&decision("d1", "Ship it?")).expect("append");
+        // A person rules on it — the same path `/decisions/<id>/tranch` takes.
+        journal
+            .update("d1", |d| {
+                d.state = STATE_TRANCHED.to_owned();
+                d.verdict = Some("yes, ship".to_owned());
+            })
+            .expect("tranch");
+
+        let changed = decision("d1", "Actually, hold off");
+        assert_eq!(journal.append(&changed).expect("re-post"), Appended::Settled);
+
+        let listed = journal.list(false).expect("list");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].state, STATE_TRANCHED, "the ruling stands");
+        assert_eq!(
+            listed[0].title.as_deref(),
+            Some("Ship it?"),
+            "the settled wording was not replaced by the producer's"
+        );
+        assert_eq!(listed[0].verdict.as_deref(), Some("yes, ship"));
+    }
+
+    /// A producer updating its own *open* question replaces the line rather than
+    /// adding a second one — otherwise the board shows two versions of one thing
+    /// and a reader cannot tell which is current.
+    #[test]
+    fn re_posting_an_open_decision_updates_it_in_place() {
+        let (journal, _dir) = scratch("append-reopened");
+        journal.append(&decision("d1", "Ship it?")).expect("append");
+        assert_eq!(
+            journal.append(&decision("d1", "Ship it on Friday?")).expect("update"),
+            Appended::Reopened
+        );
+        let listed = journal.list(false).expect("list");
+        assert_eq!(listed.len(), 1, "replaced, not appended: {listed:?}");
+        assert_eq!(listed[0].title.as_deref(), Some("Ship it on Friday?"));
+    }
+
+    /// Appending to a journal written by hand — no trailing newline — must not
+    /// produce a blank line, and must not glue the two records together.
+    #[test]
+    fn appending_to_a_file_without_a_final_newline_stays_one_record_per_line() {
+        let (journal, _dir) = scratch("append-no-newline");
+        write(
+            &journal.path,
+            r#"{"id":"hand","state":"open","title":"written by hand"}"#,
+        );
+        assert_eq!(
+            journal.append(&decision("d2", "From a producer")).expect("append"),
+            Appended::New
+        );
+        let listed = journal.list(false).expect("list");
+        assert_eq!(listed.len(), 2, "both records survived: {listed:?}");
+        let raw = fs::read_to_string(&journal.path).expect("read");
+        assert!(!raw.contains("\n\n"), "no blank line was introduced: {raw:?}");
+    }
+
+    /// The description a CLI prints comes from the outcome, not from the caller's
+    /// guess, so a producer reporting "appended" for a no-op cannot happen.
+    #[test]
+    fn only_the_writing_outcomes_claim_a_change() {
+        assert!(Appended::New.wrote());
+        assert!(Appended::Reopened.wrote());
+        assert!(!Appended::Identical.wrote());
+        assert!(!Appended::Settled.wrote());
+        assert_ne!(Appended::New.describe(), Appended::Identical.describe());
     }
 }
