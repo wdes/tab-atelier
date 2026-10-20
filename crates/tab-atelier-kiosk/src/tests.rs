@@ -88,24 +88,68 @@ fn test_config(state: &Path, token: Option<&str>) -> Config {
 /// test, and cheaper than threading a pre-bound listener into Rocket, which it
 /// does not accept. The loop then waits for Rocket to answer, so a test never
 /// races the server's own startup.
+/// A fresh port, retried until Rocket actually binds it.
+///
+/// The obvious form — probe a free port by binding `:0`, read the number, drop the
+/// listener, hand the number to Rocket — has a real race: the tests run
+/// concurrently, and between the release and Rocket's own bind another test (or
+/// another process) can take that port. `launch()` then fails, its error is
+/// swallowed by the spawn, and the test hangs for five seconds and panics with
+/// "the kiosk never came up" — a failure that names nothing and reproduces
+/// nowhere.
+///
+/// Rocket 0.5 has no `launch_on(pre_bound_listener)` (that arrives in 0.6), so the
+/// socket cannot be handed over directly. The honest fix is to retry the whole
+/// probe-and-launch until one sticks, and to *look at* the launch error instead of
+/// discarding it: a bind conflict is worth retrying, anything else is a real bug
+/// and should be reported as itself.
 async fn spawn_kiosk_with(mut cfg: Config) -> SocketAddr {
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("find a free port")
-        .local_addr()
-        .expect("a port")
-        .port();
-    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().expect("a bind address");
-    cfg.bind = addr;
-    tokio::spawn(async move {
-        let _ = build(cfg, scaled_timeouts()).launch().await;
-    });
-    for _ in 0..500 {
-        if tokio::net::TcpStream::connect(addr).await.is_ok() {
-            return addr;
+    /// How many times to re-probe. Each attempt is cheap; the failures are rare.
+    const ATTEMPTS: usize = 8;
+
+    let mut last: Option<String> = None;
+    for _ in 0..ATTEMPTS {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("find a free port")
+            .local_addr()
+            .expect("a port")
+            .port();
+        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().expect("a bind address");
+        cfg.bind = addr;
+
+        // The launch future reports *why* it failed, and the reason decides whether
+        // retrying is right. Keep it rather than dropping it on the floor.
+        let (tx, mut rx) = tokio::sync::oneshot::channel::<String>();
+        let to_launch = cfg.clone();
+        tokio::spawn(async move {
+            if let Err(e) = build(to_launch, scaled_timeouts()).launch().await {
+                let _ = tx.send(e.to_string());
+            }
+        });
+
+        // Wait for Rocket to answer, or for the launch to report a failure — whichever
+        // comes first. Without racing the two, a lost port costs the full wait budget
+        // before the retry even starts.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                return addr;
+            }
+            if let Ok(reason) = rx.try_recv() {
+                last = Some(reason);
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                last = Some(format!("nothing listening at {addr} after 5s"));
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    panic!("the kiosk never came up at {addr}");
+    panic!(
+        "the kiosk never came up after {ATTEMPTS} attempts; last: {}",
+        last.unwrap_or_else(|| "no reason reported".to_owned())
+    );
 }
 
 /// A kiosk with its own uniquely-named state directory, no token.

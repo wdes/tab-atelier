@@ -5184,13 +5184,14 @@ mod tests {
 
     #[test]
     fn every_documented_path_actually_routes() {
-        // The enforcement this server did not have. Two failure modes it
-        // catches, both of which shipped before:
+        // The enforcement this server did not have: a path in openapi.yaml that the
+        // dispatcher does not serve — the document promising something that 404s.
         //
-        //   * a path in openapi.yaml that the dispatcher does not serve — the
-        //     document promises something that 404s;
-        //   * a route the dispatcher serves that the document omits — invisible
-        //     to anyone reading the contract.
+        // The OTHER direction — a route the dispatcher serves that the document omits
+        // — is NOT checked here, and this comment used to claim it was. The spec
+        // covers 24 paths while the dispatcher serves some forty route entries, so
+        // that direction has a real gap; `the_spec_loses_no_ground` measures it as a
+        // ratchet rather than pretending it is closed.
         //
         // It probes the REAL routing rather than comparing against a second
         // list of route strings: a hand-kept list is one more thing to forget,
@@ -5218,6 +5219,80 @@ mod tests {
         assert!(
             unreachable.is_empty(),
             "documented in openapi.yaml but not routed: {unreachable:?}"
+        );
+    }
+
+    #[test]
+    fn the_spec_loses_no_ground() {
+        // The reverse of `every_documented_path_actually_routes`, as a ratchet.
+        //
+        // The spec documents 24 paths; the dispatcher serves many more. That gap is
+        // real and was invisible: the test above only proves the documented ones
+        // route, so a new route could be added without any document at all and
+        // nothing noticed. Fifteen route entries are in that state today.
+        //
+        // Growing openapi.yaml is not the fix — the plan is to *delete* it when the
+        // dispatcher becomes Rocket routes with a derived document. So the gap is
+        // pinned rather than closed: a new undocumented route fails this test, which
+        // forces the author to either document it or add it here with the reason.
+        // Both documenting and deleting the spec reduce the number.
+        //
+        // The routes are read out of this file's own source, not a second list —
+        // a hand-kept list is the thing that drifts.
+        // The baseline, frozen at the day this ratchet was written. If a route gained
+        // a doc entry, this number goes DOWN and the constant should follow — the
+        // assert below is `<=`, so a lower count passes and nudges you to tighten it.
+        //
+        // At the top, before any statement: an item after a statement is in scope from
+        // the start of the block anyway, which reads as a lie about where it applies.
+        const KNOWN_UNDOCUMENTED: usize = 16;
+        const SERVED: &str = include_str!("api.rs");
+        let documented: Vec<String> = documented_paths()
+            .into_iter()
+            // `{idx}` / `{id}` are placeholders; only the trailing segment is compared.
+            .map(|p| p.trim_end_matches('}').to_owned())
+            .collect();
+        let is_documented = |suffix: &str| {
+            // `/` is an alias for `/tabs` — one arm spells both, and `/tabs` is
+            // documented, so the bare form is covered. Counting it missing would make
+            // the baseline depend on which spelling an arm happens to list first.
+            if suffix == "/" {
+                return true;
+            }
+            documented.iter().any(|p| p == suffix || p.ends_with(suffix))
+        };
+
+        let mut undocumented: Vec<String> = Vec::new();
+        for line in SERVED.lines() {
+            let line = line.trim();
+            // A whole-path arm: `"/fleet" => match method.as_str() {`
+            if let Some(rest) = line.strip_prefix('"')
+                && let Some(path) = rest.split('"').next()
+                && path.starts_with('/')
+                && rest.contains("\" =>")
+                && !is_documented(path)
+            {
+                undocumented.push(path.to_owned());
+            }
+            // A suffix arm: `"GET" if p.ends_with("/meta") =>`
+            if let Some(idx) = line.find("ends_with(\"")
+                && let Some(rest) = line.get(idx + "ends_with(\"".len()..)
+                && let Some(suffix) = rest.split('"').next()
+                && suffix.starts_with('/')
+                && !is_documented(suffix)
+            {
+                undocumented.push(suffix.to_owned());
+            }
+        }
+        undocumented.sort();
+        undocumented.dedup();
+
+        assert!(
+            undocumented.len() <= KNOWN_UNDOCUMENTED,
+            "{} routes are served but absent from openapi.yaml, baseline {KNOWN_UNDOCUMENTED}.\n\
+             Document the new one, or lower the baseline if you removed a route.\n\
+             Currently undocumented: {undocumented:?}",
+            undocumented.len()
         );
     }
 
