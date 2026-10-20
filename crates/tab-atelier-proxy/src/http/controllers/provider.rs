@@ -53,6 +53,7 @@ pub(crate) fn save(request: &SaveProvider, state: &Arc<State>) -> Result<Doc<IdR
             preference: request.preference(),
             enabled: true,
             peak: None,
+            server_tools: None,
         }
     };
 

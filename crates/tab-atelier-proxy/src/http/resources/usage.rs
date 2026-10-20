@@ -60,12 +60,31 @@ impl From<&usage::Tokens> for TokenResource {
 /// costs, and binary floating point accumulates the error in the direction
 /// nobody looks. Shown as dollars only at the last moment, by the UI.
 #[derive(Serialize, tab_atelier_api::schemars::JsonSchema)]
+// Every field ends in `_micro`, which clippy flags as a redundant suffix. It is the
+// unit, and it is the wire name — the dashboard reads `in_micro` and the stored
+// history is written with it — so the suffix stays and the lint is silenced.
+#[allow(clippy::struct_field_names)]
 pub(crate) struct CostResource {
     /// Cache reads and misses, each at its own published rate, plus cache
     /// writes at the miss rate — a write is a first read that pays full price.
     pub in_micro: i128,
     /// Everything the model generated.
     pub out_micro: i128,
+    /// Server-side tool requests — a `web_search`, a `web_fetch` — billed per
+    /// request rather than by the token.
+    ///
+    /// Its own figure because it is its own line on the invoice: no token rate can
+    /// produce it, and a client that adds up `in_micro + out_micro` would otherwise
+    /// understate what the hour cost. Omitted when zero, so a hop with no tool
+    /// traffic is unchanged on the wire.
+    #[serde(skip_serializing_if = "is_zero_i128")]
+    #[schemars(default)]
+    pub tools_micro: i128,
+}
+
+/// `serde`/`schemars` helper: omit a figure that carries nothing.
+const fn is_zero_i128(v: &i128) -> bool {
+    *v == 0
 }
 
 impl CostResource {
@@ -83,6 +102,7 @@ impl CostResource {
         Self {
             in_micro: cost.in_micro,
             out_micro: cost.out_micro,
+            tools_micro: cost.tools_micro,
         }
     }
 }
@@ -146,6 +166,14 @@ pub(crate) struct BucketResource {
     /// absent case.
     pub cost_in_micro: Option<i128>,
     pub cost_out_micro: Option<i128>,
+    /// This hour's per-request tool charges, beside the token ones.
+    ///
+    /// Separate for the same reason the stored figure is: a chart that draws only
+    /// tokens and cache would leave it out of its total. Absent when it is zero, so
+    /// an hour with no tool traffic draws exactly as it did.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(default)]
+    pub cost_tools_micro: Option<i128>,
 }
 
 impl BucketResource {
@@ -167,6 +195,7 @@ impl BucketResource {
             cache_write: b.tokens.cache_write,
             cost_in_micro: cost.as_ref().map(|c| c.in_micro),
             cost_out_micro: cost.as_ref().map(|c| c.out_micro),
+            cost_tools_micro: cost.as_ref().map(|c| c.tools_micro).filter(|micro| *micro != 0),
         }
     }
 }
@@ -605,6 +634,7 @@ mod tests {
             cost: Some(usage::Cost {
                 in_micro: 42,
                 out_micro: 7,
+                tools_micro: 0,
             }),
         };
         let r = BucketResource::of(&bucket);

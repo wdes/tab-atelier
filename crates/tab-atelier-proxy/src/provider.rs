@@ -227,6 +227,116 @@ pub struct Price {
     pub output: u32,
 }
 
+/// What a provider charges for the server-side tools it runs on the model's behalf.
+///
+/// A third kind of charge, alongside the three token rates: these are billed per
+/// **request**, not per token, so no token rate can reproduce them. That is why
+/// the counter for them (`Tokens::web_search`, `web_fetch`) existed for a while
+/// with nothing pricing it.
+///
+/// **Absence is not zero.** A provider with no entry here and tool traffic in a
+/// round makes that round's total unknown, and the ledger records nothing rather
+/// than a figure that leaves the tools out — see `charge` in the relay.
+///
+/// [`DeepSeek`] is the case this was written for: $0.75 per 1000 requests for
+/// either tool, and free until 2026-11-01 00:00 Beijing time (`2026-10-31T16:00Z`)
+/// for calls made on the model's behalf — which is the form this proxy's traffic
+/// takes. A vendor whose price is known gets it from [`published_for`] so the
+/// feature is not inert on a configuration written before it existed; anything
+/// else must be configured.
+///
+/// [`published_for`]: ServerToolPrice::published_for
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, tab_atelier_api::schemars::JsonSchema)]
+pub struct ServerToolPrice {
+    /// Micro-USD per `web_search` request.
+    pub web_search_micro: u64,
+    /// Micro-USD per `web_fetch` request.
+    pub web_fetch_micro: u64,
+    /// Unix seconds before which the vendor charges nothing for either.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub free_until: Option<u64>,
+}
+
+impl ServerToolPrice {
+    /// The rate and free window a vendor publishes, when it is known here.
+    ///
+    /// Matched on the API host rather than on the operator-chosen `id`, because
+    /// the id is a label — the same `DeepSeek` account can be reached under any
+    /// name — while the host is what the invoice is about.
+    #[must_use]
+    pub fn published_for(base_url: &str) -> Option<Self> {
+        let host = base_url
+            .split_once("://")
+            .map_or(base_url, |(_, rest)| rest)
+            .split('/')
+            .next()?
+            .split(':')
+            .next()?;
+        match host {
+            "api.deepseek.com" => Some(Self {
+                // $0.75 per 1000 requests.
+                web_search_micro: 750,
+                web_fetch_micro: 750,
+                // 2026-11-01 00:00 +08:00.
+                free_until: Some(1_793_469_600),
+            }),
+            _ => None,
+        }
+    }
+
+    /// The tool charge for one round, given what is known about the provider.
+    ///
+    /// A free function rather than a method because the decision it encodes is not
+    /// about one provider: it is about the **three** states a provider's tool price
+    /// can be in, and the whole point is that two of them are not the same thing.
+    ///
+    /// - **No tool traffic** — `Some(0)`. Nothing was used, so nothing is owed, and
+    ///   this must be a figure rather than an unknown: treating it as unknown would
+    ///   throw away the token charge on every ordinary round.
+    /// - **`None` price, with traffic** — `None`. The vendor never said what a
+    ///   search costs, so the round's total is unknown. Recording the tokens alone
+    ///   would report a number that leaves the searches out, which is the
+    ///   understatement this whole module exists to prevent.
+    /// - **A price** — that price applied, or zero inside its free window.
+    ///
+    /// Pulled out of the relay's `charge` so this rule has a test: inline, it could
+    /// only be exercised through a running proxy and a fake upstream, which in
+    /// practice means it would not be.
+    #[must_use]
+    pub fn server_tool_charge_micro(
+        price: Option<Self>,
+        web_search: u64,
+        web_fetch: u64,
+        at_unix: u64,
+    ) -> Option<i128> {
+        if web_search == 0 && web_fetch == 0 {
+            return Some(0);
+        }
+        let price = price?;
+        price.charge_micro(web_search, web_fetch, at_unix)
+    }
+
+    /// What this provider's server tools cost for one round, in micro-USD.
+    ///
+    /// `None` when there is nothing to charge — no tool traffic — or when the
+    /// traffic exists but the vendor is inside a free window, in which case the
+    /// answer is a recorded zero and not an unknown. The two are deliberately
+    /// different: one is "costs nothing", the other is "we do not know", and only
+    /// the second may leave the ledger empty.
+    #[must_use]
+    pub fn charge_micro(self, web_search: u64, web_fetch: u64, at_unix: u64) -> Option<i128> {
+        if web_search == 0 && web_fetch == 0 {
+            return None;
+        }
+        if self.free_until.is_some_and(|until| at_unix < until) {
+            return Some(0);
+        }
+        let micro = u128::from(web_search) * u128::from(self.web_search_micro)
+            + u128::from(web_fetch) * u128::from(self.web_fetch_micro);
+        i128::try_from(micro).ok()
+    }
+}
+
 impl Price {
     /// The same rates at a peak multiplier, rounded down.
     ///
@@ -566,6 +676,13 @@ pub struct Provider {
     /// When this provider charges more for the same tokens.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peak: Option<Peak>,
+    /// What its server-side tools cost, when they are not free.
+    ///
+    /// Left out when the vendor's published rate is known, since
+    /// [`Provider::server_tool_price`] falls back to it; set it to override, or
+    /// for a vendor this build has no figure for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_tools: Option<ServerToolPrice>,
     /// An outbound attribution stamped on every request to this provider, when
     /// its API has a field for one.
     ///
@@ -655,6 +772,18 @@ const fn yes() -> bool {
 }
 
 impl Provider {
+    /// What this provider's server-side tools cost, or `None` when it is unknown.
+    ///
+    /// The configured figure wins, and the vendor's published one is the fallback
+    /// — see [`ServerToolPrice::published_for`]. Without that fallback this would
+    /// be inert on every deployment configured before server tools were priced,
+    /// which is the shape of bug worth designing out rather than documenting.
+    #[must_use]
+    pub fn server_tool_price(&self) -> Option<ServerToolPrice> {
+        self.server_tools
+            .or_else(|| ServerToolPrice::published_for(&self.base_url))
+    }
+
     /// The cheapest current model this provider has in a class, if any.
     ///
     /// Cheapest *right now*: a provider on peak pricing is a different deal
@@ -1084,6 +1213,11 @@ impl Preset {
                     // year.
                     holidays: holidays_2026(),
                 }),
+                // Left to the vendor's published figure rather than restated
+                // here: `Provider::server_tool_price` falls back to
+                // `ServerToolPrice::published_for`, which is where the $0.75 per
+                // 1000 requests and the 2026-11-01 free window live.
+                server_tools: None,
                 models: vec![
                     // 1M context, thinking and non-thinking, tool calls,
                     // vision. The only model here that is not being withdrawn.
@@ -1174,6 +1308,7 @@ impl Preset {
                 preference: 10,
                 enabled: true,
                 peak: None,
+                server_tools: None,
                 models: vec![
                     Model::new("gpt-5.6-sol", Class::Heavy, 400).priced(400_000, 4_000_000, 20_000_000),
                     Model::new("gpt-5.6-terra", Class::Balanced, 200).priced(200_000, 2_000_000, 12_000_000),
@@ -1402,6 +1537,7 @@ impl Default for Registry {
                 preference: 0,
                 enabled: true,
                 peak: None,
+                server_tools: None,
                 models: vec![
                     Model::new("claude-haiku-4-5-20251001", Class::Fast, 100),
                     Model::new("claude-sonnet-5", Class::Balanced, 300),
@@ -1853,6 +1989,160 @@ impl Registry {
 mod tests {
     use super::*;
 
+    // --- server-side tool prices -------------------------------------------
+    //
+    // A web_search is billed per request, so no token rate can reproduce these
+    // figures; that is the whole reason they are priced apart. Checked here rather
+    // than only end-to-end because the free window is a date comparison, and a
+    // test that needs a live vendor to exercise it will not be run.
+
+    /// $0.75 per 1000 requests is 750 micro-USD each, and 1000 of them is $0.75.
+    #[test]
+    fn a_thousand_searches_cost_seventy_five_cents() {
+        let price = ServerToolPrice::published_for("https://api.deepseek.com").expect("published");
+
+        assert_eq!(price.web_search_micro, 750);
+        assert_eq!(price.web_fetch_micro, 750);
+        // 1000 * 750 micro = 750_000 micro = $0.75.
+        assert_eq!(price.charge_micro(1000, 0, 1_900_000_000), Some(750_000));
+        assert_eq!(price.charge_micro(0, 1000, 1_900_000_000), Some(750_000));
+        assert_eq!(price.charge_micro(1, 1, 1_900_000_000), Some(1_500));
+    }
+
+    /// The free window is a boundary, and the boundary is Beijing midnight.
+    ///
+    /// One second before it costs nothing; at it, the rate applies. An off-by-one
+    /// here is a day of traffic billed at the wrong price and invisible either way.
+    #[test]
+    fn the_free_window_ends_at_beijing_midnight() {
+        let price = ServerToolPrice::published_for("https://api.deepseek.com").expect("published");
+        let cutoff = price.free_until.expect("a free window");
+
+        // 2026-10-31T16:00:00Z is 2026-11-01T00:00:00+08:00.
+        assert_eq!(cutoff, 1_793_469_600);
+        assert_eq!(price.charge_micro(1, 0, cutoff - 1), Some(0), "still free");
+        assert_eq!(price.charge_micro(1, 0, cutoff), Some(750), "billed from the cutoff");
+    }
+
+    /// The three states of a provider's tool price, which must not be conflated.
+    ///
+    /// No traffic is `Some(0)` — a figure, because nothing is owed and every round
+    /// has a token charge that depends on this not being unknown. Traffic with no
+    /// known price is `None` — unknown, so the round records nothing rather than a
+    /// total that leaves the searches out. Traffic with a price is that price.
+    #[test]
+    fn tool_charge_distinguishes_no_use_from_no_price() {
+        let known = ServerToolPrice::published_for("https://api.deepseek.com");
+
+        // Nothing used, price known or not: a definite zero either way.
+        assert_eq!(
+            ServerToolPrice::server_tool_charge_micro(known, 0, 0, 1_900_000_000),
+            Some(0)
+        );
+        assert_eq!(
+            ServerToolPrice::server_tool_charge_micro(None, 0, 0, 1_900_000_000),
+            Some(0)
+        );
+
+        // Used, price unknown: the answer is "unknown", not "free".
+        assert_eq!(
+            ServerToolPrice::server_tool_charge_micro(None, 1, 0, 1_900_000_000),
+            None
+        );
+        assert_eq!(
+            ServerToolPrice::server_tool_charge_micro(None, 0, 1, 1_900_000_000),
+            None
+        );
+
+        // Used, price known: priced.
+        assert_eq!(
+            ServerToolPrice::server_tool_charge_micro(known, 1, 0, 1_900_000_000),
+            Some(750)
+        );
+    }
+
+    /// A round that used no tools costs nothing extra.
+    ///
+    /// `None` and not `Some(0)` because it is not a zero charge, it is no charge —
+    /// and the caller distinguishes those (a zero would still be a figure to add).
+    #[test]
+    fn no_tool_traffic_has_no_tool_charge() {
+        let price = ServerToolPrice::published_for("https://api.deepseek.com").expect("published");
+
+        assert_eq!(price.charge_micro(0, 0, 1_900_000_000), None);
+    }
+
+    /// A vendor this build knows no figure for is not guessed at.
+    ///
+    /// Absence has to stay absence: inventing a rate here would put a number on
+    /// somebody's invoice that nothing supports.
+    #[test]
+    fn an_unknown_vendor_has_no_published_rate() {
+        assert_eq!(ServerToolPrice::published_for("https://api.anthropic.com"), None);
+        assert_eq!(ServerToolPrice::published_for("https://example.invalid:8443/v1"), None);
+    }
+
+    /// The host is what is matched, not the path or a port or the operator's label.
+    #[test]
+    fn the_vendor_is_matched_by_host_alone() {
+        for url in [
+            "https://api.deepseek.com/anthropic",
+            "http://api.deepseek.com:8080/v1",
+            "api.deepseek.com",
+        ] {
+            assert!(
+                ServerToolPrice::published_for(url).is_some(),
+                "{url} should be recognised as DeepSeek"
+            );
+        }
+    }
+
+    /// A configured rate wins over the published one, and fills in for a vendor
+    /// this build has never heard of.
+    #[test]
+    fn configuration_overrides_and_extends_the_published_rates() {
+        let mut provider: Provider = serde_json::from_value(serde_json::json!({
+            "id": "some-vendor",
+            "wire": "openai",
+            "base_url": "https://example.invalid",
+            "auth": {"kind": "claude_oauth"},
+            "models": [],
+        }))
+        .expect("a minimal provider");
+
+        // Known vendor, no override: the published rate.
+        provider.base_url = "https://api.deepseek.com".into();
+        assert_eq!(provider.server_tool_price().map(|p| p.web_search_micro), Some(750),);
+
+        // Configured: the configured figure, not the published one.
+        provider.server_tools = Some(ServerToolPrice {
+            web_search_micro: 5_000,
+            web_fetch_micro: 1_000,
+            free_until: None,
+        });
+        assert_eq!(provider.server_tool_price().map(|p| p.web_search_micro), Some(5_000),);
+
+        // Unknown vendor, configured: the configured figure.
+        provider.base_url = "https://example.invalid".into();
+        assert_eq!(provider.server_tool_price().map(|p| p.web_fetch_micro), Some(1_000),);
+    }
+
+    /// Unconfigured and unknown is `None`, which is what makes a round unknown
+    /// rather than free.
+    #[test]
+    fn an_unconfigured_unknown_vendor_has_no_tool_price() {
+        let provider: Provider = serde_json::from_value(serde_json::json!({
+            "id": "some-vendor",
+            "wire": "openai",
+            "base_url": "https://example.invalid",
+            "auth": {"kind": "claude_oauth"},
+            "models": [],
+        }))
+        .expect("a minimal provider");
+
+        assert_eq!(provider.server_tool_price(), None);
+    }
+
     fn two_provider_registry() -> Registry {
         let mut r = Registry::default();
         // The same models from a different quota pool — the case the whole
@@ -1860,6 +2150,7 @@ mod tests {
         r.providers.push(Provider {
             user_id: None,
             peak: None,
+            server_tools: None,
             id: "bedrock".to_owned(),
             wire: Wire::Anthropic,
             base_url: "https://bedrock.example".to_owned(),
@@ -2640,6 +2931,7 @@ mod tests {
             preference: 0,
             enabled: true,
             peak: None,
+            server_tools: None,
             user_id: Some("tchouk".to_owned()),
             models: vec![],
         };
@@ -2743,6 +3035,7 @@ mod tests {
             preference: 0,
             enabled: true,
             peak: None,
+            server_tools: None,
         };
         let why = p
             .unusable_reason()
@@ -2846,6 +3139,7 @@ mod tests {
                 path: "/tmp/whatever.key".to_owned(),
             },
             peak: None,
+            server_tools: None,
             preference: 99,
             enabled: false,
             ..original.clone()
@@ -2904,6 +3198,7 @@ mod tests {
                 preference: 10,
                 enabled: true,
                 peak: None,
+                server_tools: None,
             };
             assert!(
                 !p.uses_the_subscription(),
@@ -3153,6 +3448,7 @@ mod tests {
             preference: 10,
             enabled: true,
             peak: None,
+            server_tools: None,
         };
         p.adopt_published_rates();
         assert_eq!(

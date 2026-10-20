@@ -1287,15 +1287,34 @@ fn charge(state: &State, provider: Option<&str>, model: Option<&str>, tokens: &u
         return None;
     }
     let now = usage::now_secs();
-    // A cache write is a first read that pays full price, so it is charged at
-    // the miss rate beside the reads.
-    let price = {
+    // Two independent charges, and the round is only known when both are known.
+    //
+    // The token part is a rate table lookup; the tool part is a per-request price
+    // on the provider, and a provider whose server tools are unpriced makes the
+    // whole round unknown rather than reporting the tokens and quietly leaving the
+    // searches out. That is the same rule the token part already follows: a
+    // missing price is not a zero price.
+    let (price, tool_price) = {
         let registry = state.registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        registry.billing_price(provider, model)?.at(now)
+        (
+            registry.billing_price(provider, model)?.at(now),
+            provider
+                .and_then(|id| registry.get(id))
+                .and_then(provider::Provider::server_tool_price),
+        )
     };
     let cache_read = tokens.cache_read.saturating_add(tokens.cache_write);
     let (in_micro, out_micro) = price.split_micro(cache_read, tokens.input, tokens.output);
-    Some(usage::Cost { in_micro, out_micro })
+    // `None` from this means the round's total is unknown — the tools were used and
+    // nobody said what they cost — so no cost is recorded rather than a token-only
+    // figure. See `ServerToolPrice::server_tool_charge_micro` for the three states.
+    let tools_micro =
+        provider::ServerToolPrice::server_tool_charge_micro(tool_price, tokens.web_search, tokens.web_fetch, now)?;
+    Some(usage::Cost {
+        in_micro,
+        out_micro,
+        tools_micro,
+    })
 }
 
 pub(crate) fn upstream_url(base: &str, wire: provider::Wire, path: &str) -> String {

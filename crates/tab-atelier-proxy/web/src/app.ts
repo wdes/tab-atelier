@@ -412,6 +412,11 @@ const AdminApp = Vue.defineComponent({
           if (priced) {
             t.cost_in_micro = (t.cost_in_micro ?? 0) + (b.cost_in_micro ?? 0);
             t.cost_out_micro = (t.cost_out_micro ?? 0) + (b.cost_out_micro ?? 0);
+            // The third charge. Left out of this sum, every added account would
+            // quietly drop its search and fetch costs from the merged view.
+            if (b.cost_tools_micro != null) {
+              t.cost_tools_micro = (t.cost_tools_micro ?? 0) + b.cost_tools_micro;
+            }
           }
         });
       }
@@ -511,7 +516,15 @@ const AdminApp = Vue.defineComponent({
       // Any priced hour is enough to make the total meaningful; a view with
       // none reports the dash instead of a confident `$0.00`.
       const priced = this.series.some((b: UsageBucket) => b.cost_in_micro != null);
-      const paid = sum((b: UsageBucket) => (b.cost_in_micro ?? 0) + (b.cost_out_micro ?? 0));
+      // All three components, because this figure is compared against the invoice.
+      // Tokens are the bulk of it; the server-tool charges are billed per request and
+      // no token rate reproduces them, so leaving them out would understate the total
+      // by exactly the search and fetch traffic.
+      const paid = sum(
+        (b: UsageBucket) =>
+          (b.cost_in_micro ?? 0) + (b.cost_out_micro ?? 0) + (b.cost_tools_micro ?? 0),
+      );
+      const toolCharge = sum((b: UsageBucket) => b.cost_tools_micro ?? 0);
       return [
         { label: "API calls", value: this.fmt(calls), sub: errors ? `${errors} failed` : "none failed" },
         { label: "Tokens", value: this.fmt(input + output + cache), sub: "input + output + cache" },
@@ -520,7 +533,11 @@ const AdminApp = Vue.defineComponent({
         {
           label: "Cost",
           value: priced ? window.TaCharts.fmtMoney(paid) : "—",
-          sub: priced ? "at list rates · see the token chart note" : "no price known for this hop",
+          sub: !priced
+            ? "no price known for this hop"
+            : toolCharge
+              ? "at list rates · incl. search/fetch"
+              : "at list rates · see the token chart note",
         },
         {
           label: "Energy",

@@ -293,6 +293,7 @@ fn stub_provider(id: &str, port: u16, preference: i32, key_path: &std::path::Pat
         preference,
         enabled: true,
         peak: None,
+        server_tools: None,
         user_id: None,
         models: vec![Model {
             id: format!("{id}-balanced"),

@@ -354,6 +354,33 @@ because a rate read from *today's* table and applied to a *month-old* token
 count is a number nobody was ever billed — and for a vendor that moved a price
 in between, it is wrong by exactly the amount that moved.
 
+**A token rate cannot price a tool request.** A server-side `web_search` or
+`web_fetch` is billed per *request*, so it is charged from a separate figure —
+`server_tools` on the provider — and stored in `tools_micro` beside `in_micro` and
+`out_micro`. A provider that names no figure and has a published one this build
+knows gets the published one (DeepSeek: $0.75 per 1000 requests for either tool);
+anything else must be configured, and a round that used tools on a provider with
+no figure records **no money at all** rather than a total that quietly leaves the
+searches out. That is the same rule as below, applied to the second kind of charge.
+
+DeepSeek's figure carries a free window: calls the model makes on its own behalf
+— which is the form this proxy's traffic takes — cost nothing until
+2026-11-01 00:00 Beijing time (`2026-10-31T16:00Z`), and are billed from then on.
+A round inside the window records a *zero*, which is different from the absent
+figure above: the vendor has stated the price, and it is nought.
+
+For a vendor this build has no figure for, state it on the provider — in micro-USD
+per request, like every other price here:
+
+```json
+"server_tools": { "web_search_micro": 750, "web_fetch_micro": 750,
+                  "free_until": 1793469600 }
+```
+
+`free_until` is optional and is unix seconds; leave it out when the vendor charges
+from the start. Setting `server_tools` on DeepSeek overrides the published figure
+rather than adding to it.
+
 **A model with no `price` records no money.** Not zero: nothing. `$0.00` is a
 claim that the tokens were free, and absence is the truth — the hop counts its
 tokens and its hours draw a gap. The subscription hop does this because a flat

@@ -371,6 +371,7 @@ mod tests {
             preference: 0,
             enabled: true,
             peak: None,
+            server_tools: None,
         }
     }
 

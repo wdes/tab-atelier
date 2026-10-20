@@ -116,8 +116,15 @@ impl Tokens {
     }
 
     #[must_use]
+    /// Whether this round carried nothing billable at all.
+    ///
+    /// Tool requests count even though they are not tokens. A round whose server
+    /// ran one search and generated nothing else still cost money, and calling it
+    /// zero would drop that charge on the floor at both places this is consulted:
+    /// `charge` returns early on it, and `record` refuses to store a cost beside
+    /// it.
     pub const fn is_zero(&self) -> bool {
-        self.total() == 0
+        self.total() == 0 && self.web_search == 0 && self.web_fetch == 0
     }
 }
 
@@ -131,18 +138,51 @@ impl Tokens {
 ///
 /// Micro-USD, and the same in/out split the chart draws, so what the far end
 /// charged and what the graph shows are the same number written once.
+//
+// Every field ends in `_micro`, which clippy flags as a redundant suffix. It is
+// not redundant here: the suffix *is* the unit, and it is the part that stops a
+// caller from reading the number as dollars. It is also on the wire — the stored
+// usage file and the API both say `in_micro` — so renaming the fields for the
+// lint would either break history or need a rename mapping, which is a worse
+// trade than this line.
+#[allow(clippy::struct_field_names)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Cost {
     pub in_micro: i128,
     pub out_micro: i128,
+    /// Server-side tool requests the upstream ran on the model's behalf — a
+    /// `web_search` or a `web_fetch` — billed per request rather than by the
+    /// token.
+    ///
+    /// Apart from the in/out split because it is apart in the invoice: those two
+    /// are the token figures multiplied by a rate, this is a count multiplied by a
+    /// per-request price, and no token rate can produce it. Defaulted and skipped
+    /// when zero so every hour recorded before this existed still reads back, and
+    /// so a hop with no tool traffic is unchanged on the wire.
+    #[serde(default, skip_serializing_if = "is_zero_i128")]
+    pub tools_micro: i128,
+}
+
+/// `serde` helper: omit a field that carries nothing.
+const fn is_zero_i128(v: &i128) -> bool {
+    *v == 0
 }
 
 impl Cost {
+    /// Everything this batch cost, tools included.
+    #[must_use]
+    pub const fn total_micro(&self) -> i128 {
+        self.in_micro
+            .saturating_add(self.out_micro)
+            .saturating_add(self.tools_micro)
+    }
+
     /// Add another batch's charge, saturating rather than wrapping: a total that
     /// silently overflows is worse than one that stops at the ceiling.
     pub const fn add(&mut self, other: Self) {
         self.in_micro = self.in_micro.saturating_add(other.in_micro);
         self.out_micro = self.out_micro.saturating_add(other.out_micro);
+        self.tools_micro = self.tools_micro.saturating_add(other.tools_micro);
     }
 }
 
@@ -879,6 +919,90 @@ impl Sniffer {
 mod tests {
     use super::*;
 
+    // --- the per-request tool charge ---------------------------------------
+
+    /// A round whose only billable work was a search is not an empty round.
+    ///
+    /// Both callers of `is_zero` are gates that would drop the charge: `charge`
+    /// returns early on it, and `record` refuses to store a cost beside it. So a
+    /// search-only round has to answer false, or the one thing that round cost is
+    /// the one thing the ledger forgets.
+    #[test]
+    fn a_search_only_round_is_not_zero() {
+        let searched = Tokens {
+            web_search: 1,
+            ..Tokens::default()
+        };
+
+        assert!(!searched.is_zero());
+        assert_eq!(
+            searched.total(),
+            0,
+            "and it is still zero tokens, which is why it was dropped"
+        );
+    }
+
+    /// No tools, no tokens, still zero — the ordinary empty case is unaffected.
+    #[test]
+    fn a_round_with_nothing_is_still_zero() {
+        assert!(Tokens::default().is_zero());
+    }
+
+    /// The tool charge adds, and the total includes it.
+    ///
+    /// The total is what a reader compares against the invoice; leaving the tools
+    /// out of it is precisely the understatement this field was added to stop.
+    #[test]
+    fn the_tool_charge_is_part_of_the_total() {
+        let a = Cost {
+            in_micro: 10,
+            out_micro: 20,
+            tools_micro: 750,
+        };
+        let b = Cost {
+            in_micro: 1,
+            out_micro: 2,
+            tools_micro: 750,
+        };
+
+        assert_eq!(a.total_micro(), 780);
+        let mut sum = a;
+        sum.add(b);
+        assert_eq!(sum.tools_micro, 1_500);
+        // 11 in + 22 out + 1500 tools. Written out rather than folded, because the
+        // point of the test is that the tools are in this number at all.
+        assert_eq!(sum.total_micro(), 1_533);
+    }
+
+    /// An hour stored before this existed reads back with no tool charge.
+    ///
+    /// The field is `serde(default)` for exactly this: the usage file is history,
+    /// and history cannot be rewritten. A missing key must mean zero here — unlike a
+    /// missing *price*, which means unknown.
+    #[test]
+    fn an_old_stored_cost_reads_back_as_no_tool_charge() {
+        let old: Cost = serde_json::from_str(r#"{"in_micro":10,"out_micro":20}"#).expect("old shape");
+
+        assert_eq!(old.tools_micro, 0);
+        assert_eq!(old.total_micro(), 30);
+    }
+
+    /// And a cost with no tool charge is written back exactly as it always was, so
+    /// the file the dashboard reads does not change shape for token-only traffic.
+    #[test]
+    fn a_cost_with_no_tool_charge_serialises_unchanged() {
+        let cost = Cost {
+            in_micro: 10,
+            out_micro: 20,
+            tools_micro: 0,
+        };
+
+        assert_eq!(
+            serde_json::to_string(&cost).expect("json"),
+            r#"{"in_micro":10,"out_micro":20}"#
+        );
+    }
+
     /// The response `usage` block carries more than the four token counts, and
     /// every one of the rest used to be discarded on arrival. This pins them.
     #[test]
@@ -1235,6 +1359,7 @@ mod tests {
             Some(Cost {
                 in_micro: 100,
                 out_micro: 40,
+                tools_micro: 0,
             }),
         );
         // A refused call carries no tokens and so no charge; it must not create
@@ -1247,6 +1372,7 @@ mod tests {
             Some(Cost {
                 in_micro: 999,
                 out_micro: 999,
+                tools_micro: 0,
             }),
         );
 
@@ -1285,10 +1411,12 @@ mod tests {
         let mut total = Cost {
             in_micro: i128::MAX,
             out_micro: i128::MIN,
+            tools_micro: 0,
         };
         total.add(Cost {
             in_micro: 1_000,
             out_micro: -1_000,
+            tools_micro: 0,
         });
         assert_eq!(total.in_micro, i128::MAX, "clamped at the ceiling");
         assert_eq!(total.out_micro, i128::MIN, "clamped at the floor");
@@ -1381,6 +1509,7 @@ mod tests {
             Some(Cost {
                 in_micro: 1,
                 out_micro: 4,
+                tools_micro: 0,
             }),
         );
 
@@ -1389,7 +1518,8 @@ mod tests {
             series.last().and_then(|b| b.cost),
             Some(Cost {
                 in_micro: 1,
-                out_micro: 4
+                out_micro: 4,
+                tools_micro: 0,
             }),
             "the hour's charge must reach the series, or the money graph is blank"
         );
@@ -1398,7 +1528,8 @@ mod tests {
             s.cost_total("ada", hours(24)),
             Some(Cost {
                 in_micro: 1,
-                out_micro: 4
+                out_micro: 4,
+                tools_micro: 0,
             })
         );
         // And an idle hour stays unpriced rather than becoming free.

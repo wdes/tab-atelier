@@ -196,6 +196,14 @@ interface UsageBucket {
      */
     cost_in_micro?: number | null;
     cost_out_micro?: number | null;
+    /**
+     * Per-request server-tool charges — a `web_search`, a `web_fetch` — for this hour.
+     *
+     * A third component rather than folded into the token figures because no token
+     * rate can produce it. Omitted by the server when it is zero, so a hop with no
+     * tool traffic is unchanged here.
+     */
+    cost_tools_micro?: number | null;
 }
 
 /** What one span's tokens cost, in micro-USD. See `UsageBucket`'s split. */

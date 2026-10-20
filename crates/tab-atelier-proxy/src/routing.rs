@@ -352,6 +352,7 @@ mod tests {
         r.providers.push(Provider {
             user_id: None,
             peak: None,
+            server_tools: None,
             id: "bedrock".to_owned(),
             wire: Wire::Anthropic,
             base_url: "https://bedrock.example".to_owned(),
