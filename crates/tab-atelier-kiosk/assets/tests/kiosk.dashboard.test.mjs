@@ -1,7 +1,14 @@
 // Self-check for the Dashboard view's PURE grouping logic: dashboardHtml groups
-// every tab into a lane per `meta.phase`, in the canonical flow order, and a tab
-// with no phase is NOT dropped — it lands in a final "sans phase" lane. An
-// operator-invented phase sorts after the canonical ones, alphabetically.
+// every tab into a lane per its typed `assignment.phase`, in the canonical flow
+// order, and a tab with no assignment is NOT dropped — it lands in a final
+// "non assigné" lane. An operator-invented phase sorts after the canonical ones,
+// alphabetically.
+//
+// IMPORTANT — this file is why the board was broken and nobody noticed. It used to
+// assert on `meta.phase`, a label nothing in the tree writes, so it passed against a
+// board whose every lane was empty: it verified that the implementation matched
+// itself, not that the feature worked. The fixtures now use the shape the daemon
+// actually sends.
 // Run: node assets/kiosk.dashboard.test.mjs
 import assert from "node:assert/strict";
 import { dashboardHtml, PHASES, NO_PHASE } from "../kiosk.js";
@@ -13,9 +20,9 @@ const model = (tabs) => ({ servers: [{ id: "local", label: "local", tabs }] });
 {
   const html = dashboardHtml(
     model([
-      { id: "d", name: "d", meta: { phase: "done" } },
-      { id: "s", name: "s", meta: { phase: "scope" } },
-      { id: "b", name: "b", meta: { phase: "build" } },
+      { id: "d", name: "d", assignment: { phase: "done", role: "" } },
+      { id: "s", name: "s", assignment: { phase: "scope", role: "" } },
+      { id: "b", name: "b", assignment: { phase: "build", role: "api" } },
     ]),
   );
   // Every phase present renders as a lane, and they sit in PHASES order — not in
@@ -33,9 +40,9 @@ const model = (tabs) => ({ servers: [{ id: "local", label: "local", tabs }] });
 {
   const html = dashboardHtml(
     model([
-      { id: "known", name: "known", meta: { phase: "plan" } },
+      { id: "known", name: "known", assignment: { phase: "plan", role: "" } },
       { id: "orphan", name: "orphan" },
-      { id: "empty", name: "empty", meta: {} },
+      { id: "empty", name: "empty", meta: {}, assignment: { phase: "", role: "" } },
     ]),
   );
   const at = (p) => html.indexOf(`data-phase="${p}"`);
@@ -50,9 +57,9 @@ const model = (tabs) => ({ servers: [{ id: "local", label: "local", tabs }] });
 {
   const html = dashboardHtml(
     model([
-      { id: "z", name: "z", meta: { phase: "zwave" } },
-      { id: "a", name: "a", meta: { phase: "audit" } },
-      { id: "d", name: "d", meta: { phase: "done" } },
+      { id: "z", name: "z", assignment: { phase: "zwave", role: "" } },
+      { id: "a", name: "a", assignment: { phase: "audit", role: "" } },
+      { id: "d", name: "d", assignment: { phase: "done", role: "" } },
     ]),
   );
   const at = (p) => html.indexOf(`data-phase="${p}"`);
@@ -69,4 +76,4 @@ const model = (tabs) => ({ servers: [{ id: "local", label: "local", tabs }] });
   assert.match(withError, /Aucun onglet/, "an error-only fleet is still empty, not broken");
 }
 
-console.log("ok - kiosk dashboard (phase lanes, flow order, sans phase last)");
+console.log("ok - kiosk dashboard (assignment lanes, flow order, non assigné last)");
