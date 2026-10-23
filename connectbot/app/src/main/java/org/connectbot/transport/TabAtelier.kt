@@ -474,9 +474,14 @@ class TabAtelier : AbsTransport() {
         // The listener is OkHttp's own, so these are real events rather than a guess at
         // what the client is probably doing.
         val progress = startProgress(base)
+        // Handed over on success, stopped on every other path. The distinction is the point:
+        // the dial is only the first half of a connect, and the phases that matter most to a
+        // reader — the upgrade, the tab it attached to, the replay — happen after this
+        // function returns.
+        var handedOver = false
         try {
             val webSocket = client.clientFor(host.id, base, progress)
-                .newWebSocket(request, Listener(opened, attempt))
+                .newWebSocket(request, Listener(opened, attempt, progress))
             socket = webSocket
 
             if (!opened.await(CONNECT_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
@@ -491,14 +496,18 @@ class TabAtelier : AbsTransport() {
             if (!open) {
                 throw IOException("The tab-atelier session at $url closed before it opened")
             }
+            activeProgress = progress
+            handedOver = true
         } finally {
-            // Stopped on every path: a ticker left running would outlive the connection and
-            // keep writing dots into a terminal that has since started showing real output.
-            progress.finish()
-            progress.stop()
-            // And forgotten, so a later call on the cached client cannot find a stopped
-            // reporter and write somewhere that no longer shows anything.
-            client?.clearProgress(host.id, progress)
+            if (!handedOver) {
+                // Stopped on every failure path: a ticker left running would outlive the
+                // attempt and keep counting seconds for a dial that is over. It is also what
+                // lets the *next* address in the fallback walk start with a clean strip.
+                progress.stop()
+                // And forgotten, so a later call on the cached client cannot find a stopped
+                // reporter and write somewhere that no longer shows anything.
+                client?.clearProgress(host.id, progress)
+            }
         }
     }
 
@@ -517,12 +526,49 @@ class TabAtelier : AbsTransport() {
     private fun startProgress(base: TabAtelierBase): ConnectionProgress {
         val progress = ConnectionProgress(
             render = { line -> bridge?.setConnectionBanner(line) },
+            // Resolved here because this is where the `Context` is: the listener and the
+            // socket callback have none, and threading one through the cached OkHttp client
+            // would mean a per-dial map beside `progressByHost`. Keeping the words in
+            // `ConnectionProgress` also means the French locale comes for free.
+            format = { id, args -> manager?.getString(id, *args.toTypedArray()).orEmpty() },
+            // Units are part of the sentence: English "2.4 MB", French "2,4 Mo".
+            formatBytes = { bytes ->
+                manager?.let { android.text.format.Formatter.formatShortFileSize(it, bytes) }
+                    ?: ConnectionProgress.formatBytes(bytes)
+            },
         )
         progress.start()
         // Named before any event arrives, so the first thing on screen is that a connection
         // is being attempted at all rather than silence followed by dots.
-        progress.phase(manager?.getString(R.string.tabatelier_phase_starting, base.host) ?: base.host)
+        progress.phase(R.string.tabatelier_phase_starting, base.host)
         return progress
+    }
+
+    /**
+     * The progress reporting the socket that is now up, from the upgrade until the tab paints.
+     *
+     * Null when nothing is being reported — a session that has not connected, or one whose
+     * phases have already ended.
+     */
+    @Volatile
+    private var activeProgress: ConnectionProgress? = null
+
+    /**
+     * Ends the attach reporting, if any.
+     *
+     * Called wherever the socket stops being ours: the session closing, being suspended for
+     * the network or for idleness, a tab switch replacing it, or a drop before the redial.
+     * Stopping before those paths set their own banner is what keeps the strip from being
+     * cleared *after* it says "Reconnecting…" — the dial thread used to do exactly that,
+     * because `onFailure` counts the latch down before `handleDrop` runs.
+     */
+    private fun stopProgress() {
+        val host = host ?: return
+        val progress = activeProgress ?: return
+        // Stopped first, while it is still the active one, so its own "clear" render lands.
+        progress.stop()
+        activeProgress = null
+        client?.clearProgress(host.id, progress)
     }
 
     /** The address this session last established a socket on, if any. */
@@ -607,6 +653,9 @@ class TabAtelier : AbsTransport() {
         // A redial in flight is watching a socket this switch is about to replace,
         // and the state it would land on is not the state the new tab starts in.
         cancelRetry()
+        // Likewise the attach reporting: the tab being left may still be replaying its
+        // scrollback, and its byte count has no meaning for the tab being opened.
+        stopProgress()
 
         // Switching tabs is the app doing something deliberate and likely to work,
         // so the backoff earned by a server that was down is forgiven here rather
@@ -633,7 +682,10 @@ class TabAtelier : AbsTransport() {
         //
         // The session's own screen-state flag is set with it, so the first frame that does
         // arrive does not erase a second time for nothing.
-        screenStateUnknown = true
+        // The queued erase does the clearing, so the first frame of the switch has no reason
+        // to erase again: setting this flag here would have it do exactly that, since `read`
+        // prefixes the erase to whatever it dequeues while the flag is set.
+        screenStateUnknown = false
         inbound.offer(screenErase())
         // The strip shows the switch being attempted; openSocket replaces it with the first
         // real phase a moment later.
@@ -703,7 +755,38 @@ class TabAtelier : AbsTransport() {
     private inner class Listener(
         private val opened: CountDownLatch,
         private val attempt: Any,
+        /** The reporter for this socket's attach phases, if one is recording them. */
+        private val progress: ConnectionProgress?,
     ) : WebSocketListener() {
+
+        /** Whether the daemon's meta frame — tab name and grid — has been seen. */
+        @Volatile
+        private var metaSeen = false
+
+        /** Whether any of the tab's own bytes have arrived. */
+        @Volatile
+        private var outputSeen = false
+
+        /** Whether the success line has been shown, so it is shown once. */
+        @Volatile
+        private var connectedDeclared = false
+
+        /**
+         * Declares the connect finished.
+         *
+         * Called when the tab's first content arrives, and — for a tab with nothing to
+         * replay and a silent program — shortly after the daemon's meta frame instead. Both
+         * are "the daemon is talking to us", which is what the line is claiming.
+         */
+        private fun declareConnected() {
+            if (connectedDeclared) return
+            connectedDeclared = true
+            progress?.connectThenClear(
+                ConnectionProgress.HOLD_MILLIS,
+                R.string.tabatelier_phase_connected,
+                ConnectionProgress.REPLAY_MIN_VISIBLE_MILLIS,
+            )
+        }
 
         /**
          * Whether this listener's socket is still the one speaking for the
@@ -731,13 +814,40 @@ class TabAtelier : AbsTransport() {
             // what moves it there when an open session is switched to it.
             webSocket.send(byteArrayOf(TAG_FOCUS).toByteString())
             onSocketReady()
+            // The upgrade is done and the session is live, but the tab has not painted yet:
+            // the daemon is about to send its meta frame and then the scrollback. Those are
+            // the phases that were missing, and they are reported from here rather than from
+            // OkHttp because only the socket can see them.
+            progress?.steadyPhase(R.string.tabatelier_phase_ws_open)
+            progress?.deadlineAfter(
+                ATTACH_TIMEOUT_MILLIS,
+                R.string.tabatelier_phase_no_response,
+            )
             opened.countDown()
         }
 
         override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
             if (!isCurrent()) return
             when (val frame = decodeFrame(bytes.toByteArray())) {
-                is Frame.Output -> if (frame.bytes.size > 0) inbound.offer(frame.bytes.toByteArray())
+                is Frame.Output -> {
+                    if (frame.bytes.size > 0) {
+                        if (!outputSeen) {
+                            outputSeen = true
+                            // The replay is starting. Named before the first byte is counted
+                            // so the strip says what the growing number is *of*.
+                            progress?.steadyPhase(R.string.tabatelier_phase_replaying)
+                        }
+                        // The count is kept by ConnectionProgress, which formats it through
+                        // the locale-aware formatter it was built with, and re-renders only
+                        // when the text changes — a large scrollback is thousands of frames.
+                        progress?.addReplayBytes(frame.bytes.size.toLong())
+                    }
+                    inbound.offer(frame.bytes.toByteArray())
+                    // The tab's own bytes are here, which is the honest moment to call the
+                    // connect finished: not the upgrade, which happens seconds earlier on a
+                    // big replay.
+                    declareConnected()
+                }
                 is Frame.Meta -> {
                     // The name the console's title shows, and the grid its
                     // terminal has to mirror.
@@ -747,6 +857,33 @@ class TabAtelier : AbsTransport() {
                     // viewer has no background of its own must not keep the colour
                     // of the tab the session was on before it.
                     bridge?.setRemoteBackgroundColor(frame.bgColor)
+
+                    if (!metaSeen) {
+                        metaSeen = true
+                        // The daemon answering is itself proof the attach worked, so the
+                        // "no response" deadline is over — it was waiting for exactly this.
+                        progress?.finish()
+                        val name = frame.name
+                        val grid = frame.grid
+                        when {
+                            name != null && grid != null -> progress?.steadyPhase(
+                                R.string.tabatelier_phase_attached, name, grid.cols, grid.rows,
+                            )
+                            grid != null -> progress?.steadyPhase(
+                                R.string.tabatelier_phase_attached_unnamed, grid.cols, grid.rows,
+                            )
+                            // No meta to describe: the replay phase will name itself when
+                            // the first bytes arrive.
+                            else -> Unit
+                        }
+                        // An idle tab has no scrollback and a silent program prints nothing,
+                        // so waiting for output would leave "Attached to …" on screen for
+                        // ever. The daemon has answered; that is enough to call it connected.
+                        scope.launch {
+                            delay(NO_OUTPUT_GRACE_MILLIS)
+                            if (isCurrent() && !outputSeen) declareConnected()
+                        }
+                    }
                 }
                 Frame.Ignored -> Unit
             }
@@ -773,8 +910,12 @@ class TabAtelier : AbsTransport() {
                 return
             }
             Timber.d("tab-atelier session closed: %d %s", code, reason)
-            opened.countDown()
+            // Before the latch, not after. `handleDrop` stops the dial's progress reporter and
+            // then writes "Reconnecting…"; counting the latch down first would let the dial
+            // thread wake and reach its cleanup *between* those two, clearing the message the
+            // user is meant to read.
             handleDrop(IOException("the tab-atelier connection closed ($code $reason)"))
+            opened.countDown()
         }
 
         /**
@@ -794,8 +935,9 @@ class TabAtelier : AbsTransport() {
                 return
             }
             Timber.w(t, "tab-atelier session failed")
-            opened.countDown()
+            // See the ordering note in onClosed.
             handleDrop(IOException(t.message ?: "tab-atelier connection failed", t))
+            opened.countDown()
         }
     }
 
@@ -850,7 +992,12 @@ class TabAtelier : AbsTransport() {
                 // screen would be overwritten by that replay moments later, and
                 // until then it would sit among the remote program's own output
                 // looking like something the server said.
-                Timber.w(cause, "Tab-atelier socket dropped; redialling")
+                // Before the strip is told to say "Reconnecting…", and that order is the fix for a
+        // race: `onFailure`/`onClosed` count the dial's latch down before calling this, so the
+        // dial thread could reach its cleanup and clear the strip *after* it had been set.
+        // Stopping here makes the reconnect message the last word.
+        stopProgress()
+        Timber.w(cause, "Tab-atelier socket dropped; redialling")
                 manager?.let { service ->
                     bridge?.setConnectionBanner(service.getString(R.string.tabatelier_banner_reconnecting))
                 }
@@ -966,6 +1113,7 @@ class TabAtelier : AbsTransport() {
     internal fun suspendSession() {
         if (!established) return
         cancelRetry()
+        stopProgress()
         open = false
         closeSocketQuietly()
         // A redial started before the suspend could still be in flight; its socket is
@@ -1246,6 +1394,7 @@ class TabAtelier : AbsTransport() {
      */
     override fun close() {
         cancelRetry()
+        stopProgress()
         open = false
         established = false
         closed = true
@@ -1308,9 +1457,11 @@ class TabAtelier : AbsTransport() {
     private fun onSocketReady() {
         established = true
         failure = null
-        // The strip goes quiet once there is a session: there is nothing to report, and a
-        // permanently visible "connected" bar is just something else to read past.
-        bridge?.setConnectionBanner(null)
+        // The strip is *not* cleared here any more. Clearing at the upgrade was what made the
+        // phases stop exactly where they became interesting: the daemon still has to say which
+        // tab it attached to and then replay its scrollback, which on a long-running tab is
+        // megabytes. The strip is cleared when that content arrives — see
+        // `Listener.declareConnected`.
         setSocketState(ConnectionState.CONNECTED)
     }
 
@@ -1574,6 +1725,28 @@ class TabAtelier : AbsTransport() {
          * or a suspend to land within a second of being asked for, which no user can
          * distinguish from immediately.
          */
+        private const val READ_POLL_MILLIS = 1_000L
+
+        /**
+         * How long the daemon gets to say anything after accepting the socket.
+         *
+         * It sends its meta frame immediately on attach, so ten seconds means a genuine
+         * stall. Kept below `CONNECT_TIMEOUT_SECONDS` (15 s) so the two timeouts cannot race:
+         * this one describes a session that opened and then went quiet, which is a different
+         * failure from one that never opened.
+         */
+        private const val ATTACH_TIMEOUT_MILLIS = 10_000L
+
+        /**
+         * How long to wait for output after the daemon's meta frame before calling it
+         * connected anyway.
+         *
+         * A tab with an empty scrollback and an idle program legitimately sends nothing more,
+         * and waiting for output would leave "Attached to …" on the strip for ever — or,
+         * worse, trip the attach deadline and call a healthy tab unresponsive.
+         */
+        private const val NO_OUTPUT_GRACE_MILLIS = 1_500L
+
         /**
          * Erase display, home the cursor, erase the scrollback.
          *
@@ -1587,8 +1760,6 @@ class TabAtelier : AbsTransport() {
          * benefit.
          */
         internal fun screenErase(): ByteArray = "\u001b[2J\u001b[H\u001b[3J".toByteArray(Charsets.US_ASCII)
-
-        private const val READ_POLL_MILLIS = 1_000L
 
         /**
          * How long a read waits while the session is suspended.

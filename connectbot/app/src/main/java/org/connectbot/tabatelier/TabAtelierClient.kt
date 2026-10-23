@@ -339,7 +339,7 @@ class TabAtelierClient @Inject constructor(
             buildClient(hostId, base).newBuilder()
                 // Reads the map on every call rather than capturing a reporter, so the
                 // cached client serves whichever dial is happening. See [progressByHost].
-                .eventListenerFactory { ConnectionEventListener(progressFor(hostId), base) }
+                .eventListenerFactory { ConnectionEventListener(progressFor(hostId)) }
                 .build()
         }
     }

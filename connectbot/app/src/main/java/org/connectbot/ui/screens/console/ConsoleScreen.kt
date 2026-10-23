@@ -368,6 +368,15 @@ private const val TERMINAL_OUTLINE_COVER_DP = 2
  */
 @Composable
 private fun ConnectionBannerStrip(banner: String?, background: Color?) {
+    // The last text actually shown, kept so the exit animation has something to fade.
+    //
+    // Without it the strip's `Text` reads the *current* banner, which is already null when the
+    // exit starts — so the bar would collapse around an empty string and the final
+    // "Connected" would vanish instantly instead of fading, which is the one moment this
+    // strip most needs to be read.
+    var lastShown by remember { mutableStateOf("") }
+    if (banner != null) lastShown = banner
+
     AnimatedVisibility(
         visible = banner != null,
         enter = expandVertically() + fadeIn(),
@@ -384,7 +393,7 @@ private fun ConnectionBannerStrip(banner: String?, background: Color?) {
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Text(
-                text = banner.orEmpty(),
+                text = lastShown,
                 style = MaterialTheme.typography.labelMedium,
                 color = if (background != null) Color.White.copy(alpha = 0.85f) else MaterialTheme.colorScheme.onSurfaceVariant,
                 maxLines = 1,

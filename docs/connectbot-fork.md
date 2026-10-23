@@ -676,6 +676,59 @@ functions on `TabAtelier.Reconnect`, and both are unit-tested and mutation-check
 deliberate: they are the substance of the behaviour, and a rule that can only be exercised
 by reproducing a real network drop is a rule that will not be exercised.
 
+### The connection strip narrates the whole connect, not just the dial
+
+The strip above the terminal shows each phase of a connect as it happens, gaining a dot per
+second while the phase is *work in progress*:
+
+```
+Connecting to home.example
+DNS lookup for home.example = 192.168.1.10
+TCP connection to 192.168.1.10:8443 ..
+TLS handshake with home.example (TLS_1_3)
+Opening WebSocket…
+WebSocket open
+Attached to fix-ci (193×54)
+Replaying scrollback… 2.4 MB
+Connected
+```
+
+Three things about it are easy to get wrong, and all three were wrong at least once:
+
+- **The strip used to stop at the upgrade.** `onSocketReady` cleared it, so a connect that had
+  only just begun to be interesting — the daemon still has to name the tab and replay its
+  scrollback — went blank, over a blank terminal.
+- **`connectionAcquired` is not the upgrade.** It is OkHttp's *pool* event and fires before
+  the request is written, so the old "WebSocket connection open" line announced something that
+  had not happened. The upgrade is HTTP **101**, and the old `responseHeadersEnd` reported
+  anything outside `200..299` as an error — so a *successful* upgrade would have been drawn as
+  `Server answered 101 Switching Protocols`. `upgradeOutcome()` is now a pure function with a
+  test; the socket's own `onOpen` is the authority for "WebSocket open".
+- **The three parts of the line are separate on purpose.** `base` + `detail` + dots lets the
+  replay volume update inside a running phase without resetting its dots, and the detail only
+  re-renders when its text changes: a multi-megabyte replay is thousands of frames, and a
+  render per frame is a recomposition per frame.
+
+`Connected` is declared when the daemon's first content frame arrives — not at the upgrade —
+and it waits `REPLAY_MIN_VISIBLE_MILLIS` first. The dwell exists because `connect()` returns at
+the upgrade while the Relay only starts afterwards, so the daemon can have queued the entire
+replay in between; without it the byte counter would flash by faster than it can be read. After
+that line the progress is finished and accepts nothing more: a frame still arriving during the
+closing hold must not render `Connected 2.4 MB`.
+
+Two smaller rules worth keeping:
+
+- **States do not tick.** `WebSocket open . . .` reads as though it were still waiting.
+  `steadyPhase` is for phases that describe a state; `phase` is for work in progress.
+- **An idle tab is not an unresponsive one.** A tab with no scrollback and a silent program
+  sends meta and then nothing, so the attach deadline is disarmed by the meta frame and
+  `Connected` follows a short grace. Otherwise a healthy tab would be called unresponsive.
+- **Byte units follow the locale.** `2.4 MB` in English, `2,4 Mo` in French: `formatBytes` is
+  injected, and production passes Android's formatter.
+
+The strip is chrome, never terminal content — see the note below on why nothing is written into
+the emulator.
+
 ### Fallback addresses, and why the LAN one goes first
 
 A host row carries a primary address (`tabatelier_url`) and any number of fallbacks

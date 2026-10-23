@@ -18,12 +18,12 @@
 package org.connectbot.tabatelier
 
 import okhttp3.Call
-import okhttp3.Connection
 import okhttp3.EventListener
 import okhttp3.Handshake
 import okhttp3.Protocol
 import okhttp3.Request
 import okhttp3.Response
+import org.connectbot.R
 import timber.log.Timber
 import java.io.IOException
 import java.net.InetAddress
@@ -31,8 +31,7 @@ import java.net.InetSocketAddress
 import java.net.Proxy
 
 /**
- * Turns OkHttp's own idea of what a call is doing into the phases [ConnectionProgress]
- * writes.
+ * Turns OkHttp's own idea of what a call is doing into the phases [ConnectionProgress] writes.
  *
  * The point of using OkHttp's events rather than instrumenting the call by hand is honesty:
  * these are the events the client actually experienced, so "TCP connection to …" appearing
@@ -40,53 +39,55 @@ import java.net.Proxy
  * also the only way to know the resolved address, which is the one piece of information that
  * tells a DNS problem apart from a routing one.
  *
+ * **This listener stops at the upgrade.** The WebSocket's own lifecycle — open, the daemon's
+ * meta frame, the scrollback replay — is the socket's business, not OkHttp's, and is reported
+ * from `TabAtelier.Listener`. In particular [connectionAcquired] is *not* used: it is a
+ * connection-*pool* event that fires before the request is even written, so it never meant
+ * what its old message ("WebSocket connection open") claimed.
+ *
  * Every callback is a no-op without a [progress], because the client this is attached to is
  * cached and shared: one built during a dial keeps its factory afterwards, and a later call
  * on it — a tab switch, a retry — attaches its own.
  */
 internal class ConnectionEventListener(
     private val progress: ConnectionProgress?,
-    private val base: TabAtelierBase,
 ) : EventListener() {
-
-    /** Whether the phases on screen have got as far as TLS, so a failure can say so. */
-    @Volatile
-    private var reachedTls = false
 
     /**
      * DNS is the phase that most often needs explaining.
      *
      * A name that resolves slowly, or to an address on the wrong network, produces "nothing
-     * happens" for several seconds and no error at all — so the resolved addresses are named
-     * as they arrive, which is what makes the difference between a slow resolver and a slow
-     * server visible.
+     * happens" for several seconds and no error at all.
      */
     override fun dnsStart(call: Call, domainName: String) {
-        progress?.phase("DNS lookup for $domainName")
+        progress?.phase(R.string.tabatelier_phase_dns, domainName)
     }
 
+    /**
+     * The resolved addresses, which is what makes a slow resolver distinguishable from a slow
+     * server: the phase either names an address and moves on, or does not.
+     */
     override fun dnsEnd(call: Call, domainName: String, inetAddressList: List<InetAddress>) {
         val addresses = inetAddressList.joinToString(", ") { it.hostAddress.orEmpty() }
         if (addresses.isEmpty()) {
-            // OkHttp reports an empty list when the lookup produced nothing usable, which
-            // is a different failure from the lookup throwing — worth saying separately,
-            // because one is a broken resolver and the other is a name with no records.
-            progress?.phase("No address for $domainName")
+            // OkHttp reports an empty list when the lookup produced nothing usable, which is a
+            // different failure from the lookup throwing: one is a broken resolver, the other
+            // a name with no records.
+            progress?.phase(R.string.tabatelier_phase_dns_empty, domainName)
         } else {
-            progress?.phase("DNS lookup for $domainName = $addresses")
+            progress?.phase(R.string.tabatelier_phase_dns_resolved, domainName, addresses)
         }
     }
 
     /**
      * TCP, including which address is being tried.
      *
-     * The address matters: a host with several addresses tries them in turn, and a connection
-     * that spends four seconds on each of three addresses is a different problem from one
-     * that spends twelve on a single address.
+     * A host with several addresses tries them in turn, and a connection that spends four
+     * seconds on each of three addresses is a different problem from one that spends twelve on
+     * a single address.
      */
     override fun connectStart(call: Call, inetSocketAddress: InetSocketAddress, proxy: Proxy) {
-        val address = inetSocketAddress.address?.hostAddress ?: inetSocketAddress.hostString
-        progress?.phase("TCP connection to $address:${inetSocketAddress.port}")
+        progress?.phase(R.string.tabatelier_phase_tcp, inetSocketAddress.describe())
     }
 
     override fun connectEnd(
@@ -95,8 +96,7 @@ internal class ConnectionEventListener(
         proxy: Proxy,
         protocol: Protocol?,
     ) {
-        val address = inetSocketAddress.address?.hostAddress ?: inetSocketAddress.hostString
-        progress?.phase("Connected to $address:${inetSocketAddress.port}")
+        progress?.phase(R.string.tabatelier_phase_tcp_ok, inetSocketAddress.describe())
     }
 
     override fun connectFailed(
@@ -106,45 +106,101 @@ internal class ConnectionEventListener(
         protocol: Protocol?,
         ioe: IOException,
     ) {
-        val address = inetSocketAddress.address?.hostAddress ?: inetSocketAddress.hostString
-        // Named as the failure it is, and with the address that refused — so a user
-        // diagnosing a wrong LAN address sees which one, rather than a generic error.
-        progress?.phase("Could not connect to $address:${inetSocketAddress.port}: ${ioe.summary()}")
+        // Named with the address that refused, so a user diagnosing a wrong LAN address sees
+        // which one rather than a generic error.
+        progress?.phase(
+            R.string.tabatelier_phase_tcp_failed,
+            inetSocketAddress.describe(),
+            ioe.summary(),
+        )
     }
 
     override fun secureConnectStart(call: Call) {
-        reachedTls = true
-        progress?.phase("TLS handshake with ${base.host}")
+        progress?.phase(R.string.tabatelier_phase_tls, call.resolvedHost())
     }
 
     override fun secureConnectEnd(call: Call, handshake: Handshake?) {
         val protocol = handshake?.tlsVersion?.javaName ?: "TLS"
-        progress?.phase("TLS handshake with ${base.host} ($protocol)")
+        progress?.phase(R.string.tabatelier_phase_tls_ok, call.resolvedHost(), protocol)
     }
 
     /**
-     * The WebSocket upgrade — the last step, and the one that fails when the daemon is up but
-     * refuses the token or the tab.
+     * The upgrade request is being written: the step that was missing.
+     *
+     * Reported from [requestHeadersStart] rather than from a socket callback because this is
+     * the last thing OkHttp knows before the connection stops being HTTP and becomes a
+     * WebSocket. Everything after it — whether the daemon accepted, which tab, how much
+     * scrollback — is reported by the socket.
+     */
+    override fun requestHeadersEnd(call: Call, request: Request) {
+        progress?.phase(R.string.tabatelier_phase_ws_opening)
+    }
+
+    /**
+     * The daemon's answer to the upgrade.
+     *
+     * A WebSocket upgrade answers **101**, which is outside `200..299` — so the previous
+     * version, which only spoke up outside that range, would have printed a successful upgrade
+     * as "Server answered 101 Switching Protocols". Anything else is the daemon (or a proxy in
+     * front of it) refusing, and is worth saying plainly: it is not a network problem.
      */
     override fun responseHeadersEnd(call: Call, response: Response) {
-        if (response.code !in 200..299) {
-            // A daemon that answers 401 or 404 is not a network problem at all, and saying
-            // so here is the whole reason this hook exists: without it the terminal would
-            // show a completed TLS handshake and then nothing.
-            progress?.phase("Server answered ${response.code} ${response.message}")
+        when (upgradeOutcome(response.code)) {
+            // Deliberately silent. The socket's own `onOpen` is the authority for "WebSocket
+            // open", and it fires a moment later: announcing it here as well would show the
+            // line twice, and the first time would be *before* the socket could be written to.
+            UpgradeOutcome.SUCCESS -> Unit
+            UpgradeOutcome.REFUSED ->
+                progress?.phase(
+                    R.string.tabatelier_phase_ws_refused,
+                    "${response.code} ${response.message}".trim(),
+                )
+            // A 2xx to an upgrade request is the server answering instead of upgrading —
+            // something in front of the daemon, most likely. Nothing to announce: the socket
+            // will fail next and say so.
+            UpgradeOutcome.IGNORED -> Unit
         }
     }
 
-    override fun connectionAcquired(call: Call, connection: Connection) {
-        progress?.phase("WebSocket connection open")
-    }
-
     override fun callFailed(call: Call, ioe: IOException) {
-        // The summary only: OkHttp's exception messages already name the address, and the
-        // stack trace belongs in the log, not on the terminal the user is watching.
+        // The summary only: OkHttp's messages already name the address, and a stack trace
+        // belongs in the log, not on the strip the user is watching.
         Timber.w(ioe, "tab-atelier call failed")
     }
 
-    /** OkHttp's message without the class name it is conventionally prefixed with. */
+    /** What an upgrade response status means for the strip. */
+    internal enum class UpgradeOutcome {
+        /** The WebSocket is open. */
+        SUCCESS,
+
+        /** The daemon answered, and not with an upgrade. */
+        REFUSED,
+
+        /** Still HTTP: 2xx means the request was answered, not upgraded. */
+        IGNORED,
+    }
+
+    /** The remote's host, for messages that name who we are talking to. */
+    private fun Call.resolvedHost(): String = request().url.host
+
+    private fun InetSocketAddress.describe(): String =
+        "${address?.hostAddress ?: hostString}:$port"
+
+    /** OkHttp's message without a class-name prefix. */
     private fun IOException.summary(): String = message?.takeIf { it.isNotBlank() } ?: "failed"
+
+    companion object {
+        /**
+         * A status that answers "did the WebSocket open?".
+         *
+         * Extracted and pure so it has a test: the 101 case is the one that used to be wrong,
+         * and it cannot be exercised through a real upgrade without a live daemon.
+         */
+        internal fun upgradeOutcome(status: Int): UpgradeOutcome = when {
+            // The RFC 6455 answer to `Upgrade: websocket`.
+            status == 101 -> UpgradeOutcome.SUCCESS
+            status in 200..299 -> UpgradeOutcome.IGNORED
+            else -> UpgradeOutcome.REFUSED
+        }
+    }
 }

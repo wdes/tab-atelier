@@ -76,4 +76,20 @@
 	<string name="tabatelier_banner_offline">Hors ligne — en attente d\'un réseau</string>
 	<string name="tabatelier_banner_switching">Changement d\'onglet…</string>
 	<string name="tabatelier_banner_switching_failed">Changement impossible — nouvelle tentative…</string>
+	<string name="tabatelier_phase_dns">Résolution DNS de %1$s</string>
+	<string name="tabatelier_phase_dns_resolved">Résolution DNS de %1$s = %2$s</string>
+	<string name="tabatelier_phase_dns_empty">Aucune adresse pour %1$s</string>
+	<string name="tabatelier_phase_tcp">Connexion TCP à %1$s</string>
+	<string name="tabatelier_phase_tcp_ok">TCP connecté à %1$s</string>
+	<string name="tabatelier_phase_tcp_failed">Connexion impossible à %1$s : %2$s</string>
+	<string name="tabatelier_phase_tls">Poignée de main TLS avec %1$s</string>
+	<string name="tabatelier_phase_tls_ok">Poignée de main TLS avec %1$s (%2$s)</string>
+	<string name="tabatelier_phase_ws_opening">Ouverture du WebSocket…</string>
+	<string name="tabatelier_phase_ws_open">WebSocket ouvert</string>
+	<string name="tabatelier_phase_ws_refused">Le serveur a répondu %1$s</string>
+	<string name="tabatelier_phase_attached">Attaché à %1$s (%2$d×%3$d)</string>
+	<string name="tabatelier_phase_attached_unnamed">Attaché (%1$d×%2$d)</string>
+	<string name="tabatelier_phase_replaying">Relecture de l’historique…</string>
+	<string name="tabatelier_phase_connected">Connecté</string>
+	<string name="tabatelier_phase_no_response">Aucune réponse de l’onglet</string>
 </resources>

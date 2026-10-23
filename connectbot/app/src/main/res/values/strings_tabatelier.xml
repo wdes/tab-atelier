@@ -123,4 +123,22 @@
 	<string name="tabatelier_banner_offline">Offline — waiting for a network</string>
 	<string name="tabatelier_banner_switching">Switching tab…</string>
 	<string name="tabatelier_banner_switching_failed">Could not switch — retrying…</string>
+	<!-- The connect phases, written to the status strip above the terminal. Each is
+	     named as it starts and gains a dot per second; see ConnectionProgress. -->
+	<string name="tabatelier_phase_dns">DNS lookup for %1$s</string>
+	<string name="tabatelier_phase_dns_resolved">DNS lookup for %1$s = %2$s</string>
+	<string name="tabatelier_phase_dns_empty">No address for %1$s</string>
+	<string name="tabatelier_phase_tcp">TCP connection to %1$s</string>
+	<string name="tabatelier_phase_tcp_ok">TCP connected to %1$s</string>
+	<string name="tabatelier_phase_tcp_failed">Could not connect to %1$s: %2$s</string>
+	<string name="tabatelier_phase_tls">TLS handshake with %1$s</string>
+	<string name="tabatelier_phase_tls_ok">TLS handshake with %1$s (%2$s)</string>
+	<string name="tabatelier_phase_ws_opening">Opening WebSocket…</string>
+	<string name="tabatelier_phase_ws_open">WebSocket open</string>
+	<string name="tabatelier_phase_ws_refused">Server answered %1$s</string>
+	<string name="tabatelier_phase_attached">Attached to %1$s (%2$d×%3$d)</string>
+	<string name="tabatelier_phase_attached_unnamed">Attached (%1$d×%2$d)</string>
+	<string name="tabatelier_phase_replaying">Replaying scrollback…</string>
+	<string name="tabatelier_phase_connected">Connected</string>
+	<string name="tabatelier_phase_no_response">No response from the tab</string>
 </resources>
