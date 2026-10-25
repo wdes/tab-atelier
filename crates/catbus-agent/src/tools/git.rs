@@ -488,6 +488,10 @@ async fn git_allow_failure(cwd: &Path, args: &[&str]) -> Result<Outcome, String>
         // A hook can hang, and the future is dropped on the timeout arm — `Child` does not
         // kill on drop, so without this the hook would outlive the turn.
         .kill_on_drop(true);
+    // Git is not the reason this exists — hooks are. A `pre-commit` that runs
+    // Composer, PHPStan or any other tool asking "is an agent driving this?" gets
+    // the right answer, rather than whichever variable the tab inherited.
+    crate::agent_env::mark(&mut command);
     let output = match tokio::time::timeout(TIMEOUT, command.output()).await {
         Ok(Ok(output)) => output,
         Ok(Err(e)) => {

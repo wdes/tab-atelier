@@ -93,6 +93,10 @@ pub fn spawn(command: &str, cwd: &Path) -> Result<tokio::process::Child, String>
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
+    // The command is agent-driven, and some of them ask: Composer refuses to
+    // prompt when `AI_AGENT` is set, which is the right answer here for a second
+    // reason — stdin is null, so there is nobody to answer a prompt.
+    crate::agent_env::mark(&mut cmd);
     // Before the spawn, so the shell leads a group nobody else is in and a later group signal
     // reaches every process the command forks. Without it there is no group to signal, and
     // stopping the command stops only its shell.
@@ -158,6 +162,22 @@ mod tests {
         // damage as replacement characters instead.
         assert!(out.contains('\u{2014}'), "the tail should hold the output itself");
         assert!(out.is_char_boundary(out.len()));
+    }
+
+    /// A command run by this tool is told an agent is driving it.
+    ///
+    /// Asserted through the tool rather than through `agent_env::mark`, because the
+    /// thing worth guaranteeing is that this spawn site calls it: a helper with its
+    /// own passing test would say nothing about that.
+    #[tokio::test]
+    async fn the_command_is_told_an_agent_is_driving_it() {
+        let out = run(
+            &serde_json::json!({ "command": "printf %s \"$AI_AGENT\"" }),
+            Path::new("/tmp"),
+        )
+        .await
+        .expect("the command runs");
+        assert_eq!(out, crate::agent_env::AGENT_NAME);
     }
 
     /// A command whose output fits is returned whole, with no marker.

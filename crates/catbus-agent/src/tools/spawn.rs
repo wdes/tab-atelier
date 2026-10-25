@@ -124,6 +124,10 @@ pub async fn run(input: &serde_json::Value, cwd: &Path) -> Result<String, String
         // `Child` does not kill on drop, so without this every failure path
         // below would leak a running agent. `bash.rs` had the same hole.
         .kill_on_drop(true);
+    // A sub-agent is catbus too, not whatever launched the parent: the child
+    // would otherwise inherit `AI_AGENT=claude-code…` from the tab and report
+    // itself as Claude Code in every tool it calls.
+    crate::agent_env::mark(&mut command);
 
     let mut child = command
         .spawn()

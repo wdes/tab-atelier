@@ -429,6 +429,10 @@ async fn command(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
+    // Local only: `Command::env` sets what ssh inherits before it connects, and
+    // nothing here sends an environment to the remote side unless asked to. It
+    // matters when the remote command is a tool that asks the question.
+    crate::agent_env::mark(&mut command);
 
     let output = match tokio::time::timeout(timeout, command.output()).await {
         Ok(Ok(output)) => output,

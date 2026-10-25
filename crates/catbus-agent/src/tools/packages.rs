@@ -308,6 +308,10 @@ async fn run(program: PathBuf, args: Vec<String>, cwd: &Path, timeout: Duration,
         // The timeout arm drops the future, and `Child` does not kill on drop — without this
         // a stuck install keeps running with nothing left to reap it.
         .kill_on_drop(true);
+    // `composer` and `bun` are the two programs in the tree that actually read this:
+    // Composer 2.8 refuses to prompt when it sees an agent, which is what should
+    // happen here anyway, since stdin is null.
+    crate::agent_env::mark(&mut command);
 
     let started = std::time::Instant::now();
     let output = match tokio::time::timeout(timeout, command.output()).await {

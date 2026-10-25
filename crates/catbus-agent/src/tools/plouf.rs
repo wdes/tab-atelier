@@ -95,6 +95,7 @@ pub async fn run(input: &serde_json::Value, cwd: &Path) -> Result<String, String
         // Answers are read, not asked for: with no stdin the tool cannot block waiting for input it
         // will never get.
         .stdin(std::process::Stdio::null());
+    crate::agent_env::mark(&mut command);
     let output = tokio::time::timeout(TIMEOUT, command.output())
         .await
         .map_err(|_| {

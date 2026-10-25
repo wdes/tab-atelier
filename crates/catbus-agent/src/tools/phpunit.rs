@@ -73,6 +73,10 @@ pub async fn run(input: &serde_json::Value, cwd: &Path, configured: Option<&[Str
         // kill on drop — so without this a hung suite keeps running with nothing left to
         // reap it. `bash.rs` had the same hole.
         .kill_on_drop(true);
+    // PHPUnit itself does not care, but a `bootstrap.php` or a listener that shells
+    // out to Composer does — and a test run started by an agent is exactly the case
+    // those tools want to treat differently from a human's.
+    crate::agent_env::mark(&mut command);
 
     let started = std::time::Instant::now();
     let output = match tokio::time::timeout(timeout, command.output()).await {

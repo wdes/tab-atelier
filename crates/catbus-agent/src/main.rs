@@ -25,6 +25,7 @@ use std::sync::Arc;
 use clap::Parser;
 
 mod agent;
+mod agent_env;
 mod ansi;
 mod applink;
 mod cache;

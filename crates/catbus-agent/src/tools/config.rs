@@ -835,6 +835,11 @@ impl ToolSet {
             // A tool that outlives its agent is a leak: the child would keep
             // running after a cancelled turn.
             .kill_on_drop(true);
+        // The project's own wrappers, so the variable reaches whatever they call.
+        // This is the site that matters most: a `.catbus/bin` script invoking
+        // Composer, PHPStan or a hook passes this on, and a session's whole tool
+        // surface is those scripts.
+        crate::agent_env::mark(&mut command);
         let mut child = command
             .spawn()
             .map_err(|e| format!("tool {:?} could not start {program:?}: {e}", tool.name))?;

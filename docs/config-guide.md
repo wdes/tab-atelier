@@ -147,6 +147,35 @@ schema = { type = "object", properties = { good = { type = "string" }, bad = { t
 The same body in JSON is documented below; the fields are identical, and either format is
 read by the same parser once it has been deserialised.
 
+### What a tool's command is told about being run by an agent
+
+Every command these tools start carries `AI_AGENT=catbus` in its environment, on top of
+whatever it inherits. `AI_AGENT` is the cross-agent convention for exactly this question —
+the variable Composer reads in `Util\Platform::isCodingAgent()` ([#13073][composer-ai-agent]),
+and the one named in [laravel/agent-detector][laravel-detector] and in
+[vercel/detect-agent][vercel-detect]'s `agents.json`. Its value is the agent's name, emitted
+verbatim: Claude Code sends `claude-code_2-1-302_agent`, this sends `catbus`.
+
+It is set by the tools rather than once on the agent process because `std::env::set_var` is
+`unsafe` under edition 2024 and this crate denies `unsafe`; stamping each command at its
+spawn site is the same guarantee without it. The practical consequence of it being
+*replaced* rather than inherited: a tab opened from inside another agent passes that
+agent's variable on, and the child would otherwise report itself as Claude Code while
+running here.
+
+What reads it, and why it matters:
+- **Composer** stops prompting when it sees an agent, which is the right answer regardless —
+  a tool's stdin is null, so nobody could answer.
+- **Git hooks** (`pre-commit`, and anything they call) run under it, so a project's own
+  hooks take their non-interactive path.
+
+The `!` shell is deliberately *not* marked: that is the operator's own shell, not
+something an agent is driving.
+
+[composer-ai-agent]: https://github.com/composer/composer/pull/13073
+[laravel-detector]: https://github.com/laravel/agent-detector
+[vercel-detect]: https://github.com/vercel/detect-agent
+
 ### Per-directory tools
 
 A working directory can carry its own tools at `<cwd>/.catbus/tools.toml`, beside the identity
