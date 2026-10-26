@@ -37,6 +37,8 @@ pub mod sweep;
 #[cfg(target_os = "linux")]
 pub(crate) mod cgroup;
 pub mod cli;
+#[cfg(feature = "gui")]
+pub(crate) mod desktop_notify;
 /// The shared alacritty `EventListener` both editions attach to their `Term`.
 pub(crate) mod event_proxy;
 pub(crate) use event_proxy::EventProxy;
@@ -2163,6 +2165,33 @@ pub enum AgentState {
     Error,
 }
 
+/// Why an alert is worth raising for a tab's agent (desktop notification, WS `alert` frame).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentAlert {
+    /// The turn ended (`stop` hook): the agent is back at its prompt.
+    Finished,
+    /// The agent is asking for something — a permission, an answer
+    /// (`notification` hook, which carries its message as the label).
+    Asking,
+}
+
+/// Decide whether a status update raises an [`AgentAlert`].
+///
+/// Only a turn that was actually running (`Thinking`) can end in an alert, so
+/// the idle "still waiting for your input" reminder Claude sends after a `stop`
+/// does not notify a second time.
+#[must_use]
+pub const fn agent_alert(prev: Option<AgentState>, next: Option<AgentState>, has_label: bool) -> Option<AgentAlert> {
+    match (prev, next) {
+        (Some(AgentState::Thinking), Some(AgentState::Waiting)) => Some(if has_label {
+            AgentAlert::Asking
+        } else {
+            AgentAlert::Finished
+        }),
+        _ => None,
+    }
+}
+
 /// In-memory snapshot stored on each `TabState`.
 ///
 /// Carries the state plus an optional short label ("tool: Bash")
@@ -2860,6 +2889,10 @@ pub struct Preferences {
     /// cheap and opt-in. Toggled from a tab's right-click menu.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub show_tab_gauge: bool,
+    /// Raise a desktop notification when a tab's agent finishes its turn or
+    /// asks for something. Off by default; toggled from the preferences.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub desktop_notifications: bool,
     /// Force "Claude-only" mode: every new tab launches `claude` in `auto`
     /// mode instead of a shell. Toggled from the right-click menu (the
     /// "New bash tab" item cancels it). Off by default.
@@ -6471,6 +6504,22 @@ mod state_writer_tests {
             compute_tab_led(Some(AgentState::Thinking), true, false, true, false, false, false),
             Some(TabLed::Working)
         );
+    }
+
+    #[test]
+    fn only_a_running_turn_ending_raises_an_agent_alert() {
+        use crate::{AgentAlert, AgentState, agent_alert};
+        let thinking = Some(AgentState::Thinking);
+        let waiting = Some(AgentState::Waiting);
+        assert_eq!(agent_alert(thinking, waiting, false), Some(AgentAlert::Finished));
+        assert_eq!(agent_alert(thinking, waiting, true), Some(AgentAlert::Asking));
+        // Claude's "still waiting for your input" reminder lands on a turn that
+        // already ended: one alert per turn, not two.
+        assert_eq!(agent_alert(waiting, waiting, true), None);
+        assert_eq!(agent_alert(None, waiting, false), None);
+        assert_eq!(agent_alert(thinking, thinking, true), None);
+        assert_eq!(agent_alert(thinking, None, false), None);
+        assert_eq!(agent_alert(thinking, Some(AgentState::Error), false), None);
     }
 
     #[test]

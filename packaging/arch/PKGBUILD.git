@@ -51,7 +51,8 @@ package_tab-atelier-git() {
   pkgdesc='Guake-style drop-down terminal emulator for Linux/X11 (desktop GUI, git)'
   depends=('gcc-libs' 'freetype2' 'fontconfig' 'libxcb' 'libxkbcommon'
            'libxkbcommon-x11' 'ttf-dejavu')
-  optdepends=('noto-fonts-emoji: colour emoji in the UI (menus, status markers)')
+  optdepends=('noto-fonts-emoji: colour emoji in the UI (menus, status markers)'
+              'libnotify: desktop notifications when an agent finishes or asks for something')
   provides=('tab-atelier')
   conflicts=('tab-atelier' 'tab-atelier-headless')
   backup=('etc/tab-atelier/preferences.json'

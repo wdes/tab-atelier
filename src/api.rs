@@ -609,6 +609,70 @@ pub struct PendingStatusUpdate {
     pub wipe_attachment: bool,
 }
 
+/// How many agent alerts are kept for WS viewers that have not read them yet.
+const AGENT_ALERT_BACKLOG: usize = 64;
+
+/// An agent alert raised by `POST /tabs/by-id/{id}/status`, pushed to the
+/// tab's WS viewers as an `alert` frame.
+#[derive(Clone, Debug)]
+pub struct AgentAlertEvent {
+    pub seq: u64,
+    pub tab_id: Arc<str>,
+    pub alert: crate::AgentAlert,
+    pub label: Option<String>,
+}
+
+/// Agent alerts judged where the status hook lands, so every edition and
+/// every viewer gets the same ones.
+#[derive(Debug, Default)]
+pub struct AgentAlerts {
+    /// The state each tab's hook last reported. Kept here rather than read
+    /// from the tab, which lags until the main loop drains the update.
+    last_state: std::collections::HashMap<Arc<str>, crate::AgentState>,
+    events: std::collections::VecDeque<AgentAlertEvent>,
+    seq: u64,
+}
+
+impl AgentAlerts {
+    /// Record a status update; returns whether it raised an alert.
+    pub fn record(&mut self, tab_id: &Arc<str>, next: Option<crate::AgentState>, label: Option<&str>) -> bool {
+        let prev = match next {
+            Some(state) => self.last_state.insert(tab_id.clone(), state),
+            None => self.last_state.remove(tab_id),
+        };
+        let Some(alert) = crate::agent_alert(prev, next, label.is_some()) else {
+            return false;
+        };
+        self.seq += 1;
+        if self.events.len() == AGENT_ALERT_BACKLOG {
+            self.events.pop_front();
+        }
+        self.events.push_back(AgentAlertEvent {
+            seq: self.seq,
+            tab_id: tab_id.clone(),
+            alert,
+            label: label.map(str::to_owned),
+        });
+        true
+    }
+
+    /// Sequence number of the newest alert, 0 before the first one.
+    #[must_use]
+    pub const fn seq(&self) -> u64 {
+        self.seq
+    }
+
+    /// Every tab's alerts newer than `seq`, oldest first.
+    pub fn after(&self, seq: u64) -> impl Iterator<Item = &AgentAlertEvent> {
+        self.events.iter().filter(move |e| e.seq > seq)
+    }
+
+    /// The tab's alerts newer than `seq`, oldest first.
+    pub fn since<'a>(&'a self, tab_id: &'a str, seq: u64) -> impl Iterator<Item = &'a AgentAlertEvent> + 'a {
+        self.after(seq).filter(move |e| &*e.tab_id == tab_id)
+    }
+}
+
 /// A queued relay-config change (the CLI `relay via <ep>` / `relay egress`).
 /// `endpoint: Some("box")` sets `relay_endpoint_id` (resolved against
 /// `remote_endpoints`); `Some("")` clears it. `egress: Some(bool)` sets the
@@ -837,6 +901,7 @@ pub struct TabSnapshot {
     /// that drop `cached_response`). WS meta ticks compare it lock-free
     /// and skip rebuilding a meta frame nothing could have changed.
     pub generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    pub agent_alerts: AgentAlerts,
 }
 
 impl TabSnapshot {
@@ -3165,6 +3230,7 @@ pub fn test_snapshot(tabs: Vec<SnapshotTab>) -> TabSnapshot {
         activity: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         activity_waker: std::sync::Arc::new((std::sync::Mutex::new(()), std::sync::Condvar::new())),
         generation: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        agent_alerts: AgentAlerts::default(),
         master_token: String::new(),
     }
 }
@@ -7327,6 +7393,40 @@ mod tests {
         let daemon = s.pending_status_updates.last().unwrap().daemon;
         drop(s);
         assert_eq!(daemon, None, "absent flag leaves the tab's setting untouched");
+    }
+
+    #[test]
+    fn a_turn_ending_on_the_status_route_raises_an_alert_and_wakes_ws_meta() {
+        let (port, state, token) = spawn_server();
+        let post = |body: &str| {
+            let resp = request(
+                port,
+                &format!(
+                    "POST /tabs/by-id/tab-a/status HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len(),
+                ),
+            );
+            assert_eq!(status_code(&resp), 200);
+        };
+        post(r#"{"state":"thinking"}"#);
+        let generation = state
+            .lock()
+            .unwrap()
+            .generation
+            .load(std::sync::atomic::Ordering::Relaxed);
+        // Both land before any main loop drains them: the alert must not wait for it.
+        post(r#"{"state":"waiting"}"#);
+        let (alerts, now) = {
+            let s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let alerts: Vec<_> = s
+                .agent_alerts
+                .since("tab-a", 0)
+                .map(|e| (e.alert, e.label.clone()))
+                .collect();
+            (alerts, s.generation.load(std::sync::atomic::Ordering::Relaxed))
+        };
+        assert_eq!(alerts, vec![(crate::AgentAlert::Finished, None)]);
+        assert!(now > generation);
     }
 
     #[test]

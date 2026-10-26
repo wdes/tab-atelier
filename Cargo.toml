@@ -371,7 +371,9 @@ depends = "$auto, libgcc-s1, libfreetype6, fonts-dejavu-core"
 # a normal `apt install` pulls it while a `--no-install-recommends` /
 # minimal setup can skip the 10 MB. gpui/cosmic-text rasterises Noto's
 # COLR/CBDT colour glyphs, so this is the font that makes them appear.
-recommends = "fonts-noto-color-emoji"
+# libnotify-bin provides `notify-send`, which the opt-in desktop
+# notifications shell out to; without it they are silently skipped.
+recommends = "fonts-noto-color-emoji, libnotify-bin"
 # Desktop and headless ship the same `catbus-agent` helper binary in
 # `/usr/bin/`, so they can't both be installed at once.
 # `Conflicts:` makes apt refuse the second install with a clean
