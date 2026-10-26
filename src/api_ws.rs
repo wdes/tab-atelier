@@ -36,6 +36,7 @@
 //! | 0x08 | rename   | C→S | JSON `{"name":"…"}`                    |
 //! | 0x09 | close    | C→S | empty — close this tab                 |
 //! | 0x0C | preview  | S→C | UTF-8 ANSI text — quick approximate paint |
+//! | 0x0D | alert    | S→C | JSON `{"seq":N,"kind":"finished"\|"asking","label":…}` |
 //!
 //! Ping/pong stay on tungstenite's built-in control frames; no
 //! application-layer keepalive.
@@ -123,6 +124,10 @@ const TAG_OUT_DEFLATE: u8 = 0x0A;
 /// client's `since=` reconnect offset — see the module docs' "Fast
 /// first paint" section and [`build_preview`].
 const TAG_PREVIEW: u8 = 0x0C;
+/// S→C: the tab's agent finished its turn or is asking for something
+/// ([`crate::api::AgentAlerts`]). Sent once per alert raised while the
+/// viewer is connected; alerts from before the connect are not replayed.
+const TAG_ALERT: u8 = 0x0D;
 
 /// Don't bother gzipping `out` frames below this — gzip's ~18-byte
 /// header + deflate framing would erase the win on tiny payloads, and
@@ -787,9 +792,9 @@ async fn run_pump(
     // TTL), a schedule transition crossing "now", and the initial gen
     // load racing a concurrent bump (read BEFORE the first build, so a
     // lost race re-builds once rather than skipping a change).
-    let generation = {
+    let (generation, mut last_alert_seq) = {
         let Ok(s) = state.lock() else { return };
-        s.generation.clone()
+        (s.generation.clone(), s.agent_alerts.seq())
     };
     let mut last_gen = generation.load(std::sync::atomic::Ordering::Relaxed);
     let mut dir_counts = DirCountCache::new();
@@ -975,10 +980,48 @@ async fn run_pump(
                             last_meta = Some(meta);
                         }
                     }
+                    // After the meta, so a viewer already shows the new state when the alert lands.
+                    for bytes in new_alert_frames(&state, &uuid, &mut last_alert_seq) {
+                        if sink.send(Message::Binary(bytes.into())).await.is_err() {
+                            return;
+                        }
+                    }
                 }
             }
         }
     }
+}
+
+/// Payload of a [`TAG_ALERT`] frame.
+#[derive(serde::Serialize)]
+struct AlertFrame<'a> {
+    seq: u64,
+    kind: &'static str,
+    label: Option<&'a str>,
+}
+
+/// Encode the tab's alerts raised since `last_seq`, and advance it.
+fn new_alert_frames(state: &Arc<Mutex<TabSnapshot>>, uuid: &str, last_seq: &mut u64) -> Vec<Vec<u8>> {
+    let Ok(snap) = state.lock() else {
+        return Vec::new();
+    };
+    let frames = snap
+        .agent_alerts
+        .since(uuid, *last_seq)
+        .map(|e| {
+            let frame = AlertFrame {
+                seq: e.seq,
+                kind: match e.alert {
+                    crate::AgentAlert::Finished => "finished",
+                    crate::AgentAlert::Asking => "asking",
+                },
+                label: e.label.as_deref(),
+            };
+            encode_frame(TAG_ALERT, serde_json::to_vec(&frame).unwrap_or_default())
+        })
+        .collect();
+    *last_seq = snap.agent_alerts.seq();
+    frames
 }
 
 fn encode_frame(tag: u8, mut payload: Vec<u8>) -> Vec<u8> {
@@ -1658,6 +1701,33 @@ mod tests {
         let mut snap = crate::api::test_snapshot(vec![tab]);
         snap.master_token = "master-tok".to_string();
         Arc::new(Mutex::new(snap))
+    }
+
+    #[test]
+    fn alert_frames_carry_only_this_tabs_new_alerts() {
+        use crate::AgentState::{Thinking, Waiting};
+        let state = snapshot_with(crate::api::test_snapshot_tab("uuid-1", "shell"));
+        let (one, two): (Arc<str>, Arc<str>) = ("uuid-1".into(), "uuid-2".into());
+        let record = |id: &Arc<str>, next, label| state.lock().unwrap().agent_alerts.record(id, Some(next), label);
+        record(&one, Thinking, None);
+        assert!(record(&one, Waiting, None), "a turn ending before the connect");
+        let mut seq = state.lock().unwrap().agent_alerts.seq();
+        record(&two, Thinking, None);
+        assert!(record(&two, Waiting, None), "another tab's turn");
+        record(&one, Thinking, None);
+        assert!(record(&one, Waiting, Some("Bash permission")));
+        assert!(
+            !record(&one, Waiting, Some("still waiting")),
+            "a reminder on an ended turn is not a second alert"
+        );
+        let frames = new_alert_frames(&state, "uuid-1", &mut seq);
+        assert_eq!(frames.len(), 1, "neither the pre-connect alert nor uuid-2's");
+        assert_eq!(frames[0][0], TAG_ALERT);
+        let json: serde_json::Value = serde_json::from_slice(&frames[0][1..]).unwrap();
+        assert_eq!(json["kind"], "asking");
+        assert_eq!(json["label"], "Bash permission");
+        assert_eq!(seq, 3);
+        assert!(new_alert_frames(&state, "uuid-1", &mut seq).is_empty(), "sent once");
     }
 
     #[test]

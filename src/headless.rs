@@ -1072,6 +1072,7 @@ pub fn run() -> std::io::Result<()> {
         activity: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         activity_waker: std::sync::Arc::new((std::sync::Mutex::new(()), std::sync::Condvar::new())),
         generation: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        agent_alerts: api::AgentAlerts::default(),
     }));
     info!("API server starting on {api_addr} (TLS {api_tls_addr})");
     api::start_api_server(api_state.clone(), api_token.clone(), read_only, api_addr);
