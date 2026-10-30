@@ -722,7 +722,7 @@ mod tests {
             }));
         }
         json!({
-            "model": "claude-opus-5",
+            "model": "claude-opus-5-5",
             "max_tokens": 4096,
             "metadata": {"user_id": "abc"},
             "context_management": {"edits": [{"keep": "all", "type": "clear_thinking_20251015"}]},
@@ -1161,7 +1161,7 @@ mod tests {
             msgs.push(json!({"role": "user", "content": text}));
             msgs.push(json!({"role": "system", "content": text}));
         }
-        let mut b = json!({"model": "claude-opus-5", "max_tokens": 4096, "messages": msgs});
+        let mut b = json!({"model": "claude-opus-5-5", "max_tokens": 4096, "messages": msgs});
 
         let stats = apply(&mut b, Compact::All);
         assert_eq!(stats.notices_dropped, 4);

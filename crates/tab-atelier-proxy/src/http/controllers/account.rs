@@ -10,11 +10,11 @@
 use std::sync::Arc;
 
 use crate::http::requests::compact::SetCompact;
-use crate::http::requests::user::{AddUser, PinModel, PinProvider, SetDisabled, SetTools, SetWeight};
+use crate::http::requests::user::{AddUser, PinModel, PinProvider, SetDisabled, SetRoute, SetTools, SetWeight};
 use crate::http::resources;
 use crate::server::State;
 use crate::transport::{Doc, Failure};
-use crate::users::Store;
+use crate::users::{self, Store};
 
 /// Every account, for the operator's table.
 pub(crate) fn list(state: &Arc<State>) -> Doc<resources::AccountsResource> {
@@ -114,6 +114,82 @@ pub(crate) fn set_model(
     };
     let mut store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     match store.set_model(who, canonical.as_deref()) {
+        Ok(a) => Ok(Doc::ok(resources::AccountEnvelope::from(&a))),
+        Err(e) => Err(failure(404, &e.to_string())),
+    }
+}
+
+/// Add, replace, or remove one of an account's per-person model routes.
+///
+/// A route says "when THIS account asks for X, serve Y". It is the one thing
+/// that overrules the account's provider pin, which is otherwise absolute:
+/// without that exception, "force this person onto one provider, except send
+/// their Opus traffic elsewhere" cannot be expressed at all. See
+/// `users::Account::routes`.
+///
+/// Both ends are canonicalised against the catalogue before storage, for the
+/// same reason the model pin is: routing resolves them by EXACT id, so a value
+/// stored in whatever case it arrived would 503 every request it matched. `from`
+/// is canonicalised only when the catalogue knows it — a route may legitimately
+/// rename a model this proxy does not serve, which is how an operator catches
+/// traffic for a retired id.
+pub(crate) fn set_route(
+    state: &Arc<State>,
+    who: &str,
+    req: &SetRoute,
+) -> Result<Doc<resources::AccountEnvelope>, Failure> {
+    let from = req.from.trim();
+    let to_model = req.to_model.trim();
+
+    // Empty destination removes the route, mirroring an empty model pin.
+    if to_model.is_empty() {
+        let mut store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        return match store.remove_route(who, from) {
+            Ok(a) => Ok(Doc::ok(resources::AccountEnvelope::from(&a))),
+            Err(e) => Err(failure(404, &e.to_string())),
+        };
+    }
+
+    let resolved = {
+        let reg = state.registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(to) = reg.canonical_model(to_model).map(str::to_owned) else {
+            return Err(failure(400, &reg.refuses_model(to_model)));
+        };
+        // A named provider has to exist AND serve the destination, or the route
+        // is a 503 waiting to happen the next time this person sends anything.
+        let to_provider = match req.to_provider.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+            None => None,
+            Some(id) => match reg.get(id) {
+                None => return Err(failure(400, &format!("no provider {id}"))),
+                Some(p) if p.serves(&to).is_none() => {
+                    return Err(failure(400, &format!("{id} does not serve {to}")));
+                }
+                Some(_) => Some(id.to_owned()),
+            },
+        };
+        // The source keeps the operator's spelling when the catalogue has never
+        // heard of it; see the note above.
+        let from = reg.canonical_model(from).map_or_else(|| from.to_owned(), str::to_owned);
+        // The guard has done its work. Released here rather than at the end of the
+        // block so the registry lock is not held across the store write below —
+        // two locks in one function, and taking the second while holding the first
+        // is how a lock-order bug gets written.
+        drop(reg);
+        users::ModelRoute {
+            from,
+            to_model: to,
+            to_provider,
+            note: req
+                .note
+                .as_deref()
+                .map(str::trim)
+                .filter(|n| !n.is_empty())
+                .map(str::to_owned),
+        }
+    };
+
+    let mut store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    match store.set_route(who, resolved) {
         Ok(a) => Ok(Doc::ok(resources::AccountEnvelope::from(&a))),
         Err(e) => Err(failure(404, &e.to_string())),
     }
@@ -401,7 +477,7 @@ mod tests {
             &state,
             "model-case@example.com",
             &PinModel {
-                model: "CLAUDE-SONNET-5".to_owned(),
+                model: "CLAUDE-SONNET-5-5".to_owned(),
             },
         );
         assert_eq!(answered(&reply), 200);
@@ -411,7 +487,218 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .find("model-case@example.com")
             .and_then(|a| a.model.clone());
-        assert_eq!(stored.as_deref(), Some("claude-sonnet-5"));
+        assert_eq!(stored.as_deref(), Some("claude-sonnet-5-5"));
+    }
+
+    #[test]
+    fn pinning_to_a_retired_model_is_refused_rather_than_quietly_redirected() {
+        // A pin is exact by contract — "a pin nothing serves returns None and the
+        // caller reports 503" — so a name the catalogue has moved past must be
+        // refused at write time, not resolved to its successor. Silently pinning
+        // to a different model than the operator typed is the failure this
+        // guards: `claude-sonnet-5` became `claude-sonnet-5-5`, and a pin that
+        // looked accepted but named the old id would 503 on every request.
+        //
+        // Note the asymmetry with *routing*: a client asking for the retired name
+        // is still served (routing reads a family substring), because a client is
+        // expressing a preference. A pin is an instruction, and an unsatisfiable
+        // instruction should fail where it can still be read by a human.
+        let state = state_for("model-retired", "model-retired@example.com");
+        let reply = set_model(
+            &state,
+            "model-retired@example.com",
+            &PinModel {
+                model: "claude-sonnet-5".to_owned(),
+            },
+        );
+        assert_eq!(answered(&reply), 400);
+    }
+
+    // ── per-person model routes ─────────────────────────────────────────────
+
+    /// A state whose registry has a second provider, so routes have somewhere
+    /// to point.
+    ///
+    /// `state_for` starts from `Registry::default()`, which is Anthropic alone
+    /// — deliberately, it is what the proxy was before configuration existed.
+    /// Every route test below is about pointing traffic at a *different*
+    /// provider, so they need one that exists.
+    fn state_with_deepseek(name: &str, email: &str) -> Arc<State> {
+        let state = state_for(name, email);
+        {
+            let mut reg = state.registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut deepseek = crate::provider::Preset::Deepseek.provider(std::path::Path::new("/tmp/providers.json"));
+            deepseek.auth = crate::provider::Auth::ApiKeyEnv { var: "K".to_owned() };
+            reg.providers.push(deepseek);
+        }
+        state
+    }
+
+    fn route(from: &str, to: &str, provider: Option<&str>) -> SetRoute {
+        SetRoute {
+            from: from.to_owned(),
+            to_model: to.to_owned(),
+            to_provider: provider.map(str::to_owned),
+            note: None,
+        }
+    }
+
+    /// The routes an account ends up carrying, read back from the store.
+    fn routes_of(state: &Arc<State>, email: &str) -> Vec<users::ModelRoute> {
+        let store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        store.find(email).expect("the account").routes.clone()
+    }
+
+    /// A route is stored against the account, resolved to catalogue ids.
+    ///
+    /// Resolved on the way in for the same reason the model pin is: routing
+    /// matches a route's `from` exactly, so a value stored in whatever case it
+    /// arrived would be a rule that never fires — the worst kind, because it
+    /// looks configured.
+    #[test]
+    fn a_route_is_stored_resolved() {
+        let state = state_with_deepseek("route-store", "route-store@example.com");
+
+        let reply = set_route(
+            &state,
+            "route-store@example.com",
+            &route("CLAUDE-OPUS-5-5", "DEEPSEEK-FLASH", Some("deepseek")),
+        );
+        assert_eq!(answered(&reply), 200);
+
+        let routes = routes_of(&state, "route-store@example.com");
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].from, "claude-opus-5-5");
+        assert_eq!(routes[0].to_model, "deepseek-flash");
+        assert_eq!(routes[0].to_provider.as_deref(), Some("deepseek"));
+    }
+
+    /// Setting the same `from` twice edits the route instead of stacking one.
+    ///
+    /// `route_for` takes the first match, so a second route for the same source
+    /// would be dead weight that no one could see the effect of — and the
+    /// operator, seeing two entries, would reasonably conclude the second wins.
+    #[test]
+    fn setting_the_same_source_twice_replaces_it() {
+        let state = state_with_deepseek("route-replace", "route-replace@example.com");
+        let who = "route-replace@example.com";
+
+        set_route(&state, who, &route("claude-opus-5-5", "deepseek-flash", None)).expect("the first route is valid");
+        // A destination this registry actually serves — `gpt-5.6-luna` is not in
+        // it, and would be refused, leaving the first route in place and making
+        // this test pass for the wrong reason.
+        set_route(&state, who, &route("claude-opus-5-5", "claude-sonnet-5-5", None))
+            .expect("the second route is valid");
+
+        let routes = routes_of(&state, who);
+        assert_eq!(routes.len(), 1, "one route per source");
+        assert_eq!(routes[0].to_model, "claude-sonnet-5-5");
+    }
+
+    /// An empty destination removes the route, so one verb covers undo.
+    #[test]
+    fn an_empty_destination_removes_the_route() {
+        let state = state_with_deepseek("route-remove", "route-remove@example.com");
+        let who = "route-remove@example.com";
+
+        set_route(&state, who, &route("claude-opus-5-5", "deepseek-flash", None)).expect("the route is valid");
+        let reply = set_route(&state, who, &route("claude-opus-5-5", "", None));
+
+        assert_eq!(answered(&reply), 200);
+        assert!(routes_of(&state, who).is_empty());
+    }
+
+    /// A destination no provider serves is refused where a human can read it.
+    ///
+    /// This is the difference between a 400 now and a 503 on every request the
+    /// moment that person sends traffic — and per-person routes do NOT fall
+    /// back, so an unchecked destination is an outage waiting for its first
+    /// request.
+    #[test]
+    fn a_destination_nothing_serves_is_refused() {
+        let state = state_with_deepseek("route-bad-model", "route-bad-model@example.com");
+
+        let reply = set_route(
+            &state,
+            "route-bad-model@example.com",
+            &route("claude-opus-5-5", "no-such-model", None),
+        );
+
+        assert_eq!(answered(&reply), 400);
+        assert!(routes_of(&state, "route-bad-model@example.com").is_empty());
+    }
+
+    /// A named provider that does not serve the destination is refused.
+    ///
+    /// The pair is checked as a pair: either half alone is servable, so a route
+    /// naming both would pass a per-field check and fail on every request.
+    #[test]
+    fn a_provider_that_does_not_serve_the_destination_is_refused() {
+        let state = state_with_deepseek("route-bad-pair", "route-bad-pair@example.com");
+
+        let reply = set_route(
+            &state,
+            "route-bad-pair@example.com",
+            &route("claude-opus-5-5", "deepseek-flash", Some("anthropic")),
+        );
+
+        assert_eq!(answered(&reply), 400);
+        assert!(routes_of(&state, "route-bad-pair@example.com").is_empty());
+    }
+
+    /// A route to the same model is refused as the no-op it is.
+    ///
+    /// Accepting it would fill the file with rules that change nothing, and an
+    /// operator reading them later would believe something was in effect.
+    /// A route to the same model is refused as the no-op it is.
+    ///
+    /// Asserted against `validate`, which is where the rule lives: `accept` is the
+    /// transport boundary and a direct controller call does not go through it, so
+    /// a test of the controller would exercise the storage path and pass while the
+    /// rule sat unused. Test each rule where it is enforced — this one at the
+    /// boundary, the resolution rules in the controller below.
+    #[test]
+    fn a_route_to_the_same_model_is_refused() {
+        use crate::http::requests::Validated as _;
+
+        let same = route("claude-opus-5-5", "claude-opus-5-5", None);
+        assert!(same.validate().is_err());
+
+        // Case-insensitively too: the ids are canonicalised, so a route that
+        // differs only in case is still a no-op.
+        let cased = route("CLAUDE-OPUS-5-5", "claude-opus-5-5", None);
+        assert!(cased.validate().is_err());
+
+        // And a route that names nothing is refused, because `from` is its key.
+        assert!(route("", "deepseek-flash", None).validate().is_err());
+
+        // A real route passes.
+        assert!(route("claude-opus-5-5", "deepseek-flash", None).validate().is_ok());
+    }
+
+    /// A route survives being written and read back, which is what makes it
+    /// outlive the process.
+    #[test]
+    fn routes_round_trip_through_the_store() {
+        let state = state_with_deepseek("route-reload", "route-reload@example.com");
+        let who = "route-reload@example.com";
+        set_route(
+            &state,
+            who,
+            &route("claude-opus-5-5", "deepseek-flash", Some("deepseek")),
+        )
+        .expect("the route is valid");
+
+        let path = {
+            let store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            store.path().to_path_buf()
+        };
+        let reloaded = Store::load(path).expect("the store reloads");
+
+        let routes = &reloaded.find(who).expect("the account").routes;
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].from, "claude-opus-5-5");
+        assert_eq!(routes[0].to_provider.as_deref(), Some("deepseek"));
     }
 
     // ── compaction ──────────────────────────────────────────────────────────

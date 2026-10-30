@@ -526,9 +526,9 @@ mod tests {
         // different phrasing. The catalogue therefore survived the prune.
         let mut body = json!({
             "system": concat!(
-                " - The most recent Claude models are the Claude 5 family and Haiku 4.5. ",
-                "Model IDs — Fable 5.1: 'claude-fable-5-1', Opus 5: 'claude-opus-5', ",
-                "Sonnet 5: 'claude-sonnet-5', Haiku 4.5: 'claude-haiku-4-5-20251001'. ",
+                " - The most recent Claude models are the Claude 5.5 family. ",
+                "Model IDs — Fable 5.1: 'claude-fable-5-1', Opus 5.5: 'claude-opus-5-5', ",
+                "Sonnet 5.5: 'claude-sonnet-5-5', Haiku 5.5: 'claude-haiku-5-5'. ",
                 "When building AI applications, default to the latest and most capable Claude models.\n",
                 " - Kept.",
             ),
@@ -668,7 +668,7 @@ mod tests {
         // Anthropic's own request keeps it: this is their text, addressed to
         // their model, and the rewrite is not in the business of editing it.
         let mut body = json!({ "system": paragraph });
-        apply(&mut body, Vendor::Anthropic, "claude-opus-5");
+        apply(&mut body, Vendor::Anthropic, "claude-opus-5-5");
         assert_eq!(body["system"].as_str().unwrap(), paragraph);
     }
 

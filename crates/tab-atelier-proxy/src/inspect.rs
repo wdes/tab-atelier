@@ -545,7 +545,7 @@ mod tests {
     #[test]
     fn the_client_identity_unpacks_from_its_own_nested_json() {
         let body: serde_json::Value = serde_json::from_str(
-            r#"{"model":"claude-opus-5","metadata":{"user_id":"{\"device_id\":\"323056b1018ba40f8d9327977429a92eab0a05a7a6a1a8d8f026bef3b779d625\",\"account_uuid\":\"\",\"session_id\":\"a3412ddb-82d5-4ce5-868a-1c8475b5cb38\"}"}}"#,
+            r#"{"model":"claude-opus-5-5","metadata":{"user_id":"{\"device_id\":\"323056b1018ba40f8d9327977429a92eab0a05a7a6a1a8d8f026bef3b779d625\",\"account_uuid\":\"\",\"session_id\":\"a3412ddb-82d5-4ce5-868a-1c8475b5cb38\"}"}}"#,
         )
         .expect("parses");
 
@@ -569,7 +569,7 @@ mod tests {
     #[test]
     fn a_body_without_a_usable_user_id_has_no_client() {
         for body in [
-            json!({"model": "claude-opus-5"}),
+            json!({"model": "claude-opus-5-5"}),
             json!({"metadata": {}}),
             json!({"metadata": {"user_id": ""}}),
             json!({"metadata": {"user_id": "not json at all"}}),
@@ -627,14 +627,14 @@ mod tests {
         // The two that pass through: the proxy's Claude token and the caller's
         // user key. A capture that recorded either would turn a debugging aid
         // into a second place a live credential lives.
-        let body = r#"{"model":"claude-opus-5","system":"my key is sk-ant-oat01-AAAABBBBCCCC and the proxy one is tap_deadbeefcafe0123"}"#;
+        let body = r#"{"model":"claude-opus-5-5","system":"my key is sk-ant-oat01-AAAABBBBCCCC and the proxy one is tap_deadbeefcafe0123"}"#;
         let out = scrub(body);
         assert!(!out.contains("sk-ant-oat01-AAAABBBBCCCC"), "{out}");
         assert!(!out.contains("tap_deadbeefcafe0123"), "{out}");
         assert_eq!(out.matches("<redacted-credential>").count(), 2, "{out}");
         // Everything around them survives — a scrub that ate the request would
         // defeat the purpose.
-        assert!(out.contains(r#""model":"claude-opus-5""#), "{out}");
+        assert!(out.contains(r#""model":"claude-opus-5-5""#), "{out}");
         assert!(out.contains("my key is"), "{out}");
     }
 
@@ -659,7 +659,7 @@ mod tests {
             kind: crate::classifier::Kind::Work,
             headers: &headers,
             origin: None,
-            body: br#"{"model":"claude-haiku-4-5-20251001"}"#,
+            body: br#"{"model":"claude-haiku-5-5"}"#,
         });
         let names: Vec<_> = c.request_headers.iter().map(|(k, _)| k.to_ascii_lowercase()).collect();
         assert!(!names.contains(&"authorization".to_owned()), "{names:?}");
@@ -671,7 +671,7 @@ mod tests {
         assert!(!serialised.contains("tap_callerkey"), "{serialised}");
         assert!(!serialised.contains("cf-secret"), "{serialised}");
         // The model upstream was asked for is pulled out for the list view.
-        assert_eq!(c.model.as_deref(), Some("claude-haiku-4-5-20251001"));
+        assert_eq!(c.model.as_deref(), Some("claude-haiku-5-5"));
     }
 
     #[test]
@@ -750,7 +750,7 @@ mod tests {
         // real request to exercise the guard at all. That is the point of
         // raising it: nothing ordinary meets it.
         let big = format!(
-            r#"{{"model":"claude-opus-5","messages":[{}]}}"#,
+            r#"{{"model":"claude-opus-5-5","messages":[{}]}}"#,
             "x".repeat(MAX_BODY + 1024)
         );
         let c = capture(&Outgoing {
@@ -768,7 +768,7 @@ mod tests {
         assert!(c.request_truncated, "truncation must be declared, not silent");
         assert!(c.request_body.len() < big.len());
         assert!(
-            c.request_body.contains(r#""model":"claude-opus-5""#),
+            c.request_body.contains(r#""model":"claude-opus-5-5""#),
             "the head survives"
         );
         assert!(

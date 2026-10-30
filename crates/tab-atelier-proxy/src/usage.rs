@@ -1208,10 +1208,10 @@ mod tests {
     #[test]
     fn a_plain_json_reply_reports_its_usage() {
         let mut s = Sniffer::new(Some("application/json"));
-        s.feed(br#"{"model":"claude-opus-5","usage":{"input_tokens":12,"#);
+        s.feed(br#"{"model":"claude-opus-5-5","usage":{"input_tokens":12,"#);
         s.feed(br#""output_tokens":34,"cache_read_input_tokens":5}}"#);
         let (model, t) = s.finish();
-        assert_eq!(model.as_deref(), Some("claude-opus-5"));
+        assert_eq!(model.as_deref(), Some("claude-opus-5-5"));
         assert_eq!(t.input, 12);
         assert_eq!(t.output, 34);
         assert_eq!(t.cache_read, 5);
@@ -1254,7 +1254,7 @@ mod tests {
     fn a_streamed_reply_takes_the_last_running_total_not_their_sum() {
         let mut s = Sniffer::new(Some("text/event-stream"));
         s.feed(b"event: message_start\n");
-        s.feed(br#"data: {"type":"message_start","message":{"model":"claude-opus-5","usage":{"input_tokens":100,"cache_read_input_tokens":7}}}"#);
+        s.feed(br#"data: {"type":"message_start","message":{"model":"claude-opus-5-5","usage":{"input_tokens":100,"cache_read_input_tokens":7}}}"#);
         s.feed(b"\n\n");
         for running in [10u64, 25, 40] {
             s.feed(
@@ -1264,7 +1264,7 @@ mod tests {
         }
         s.feed(b"data: [DONE]\n\n");
         let (model, t) = s.finish();
-        assert_eq!(model.as_deref(), Some("claude-opus-5"));
+        assert_eq!(model.as_deref(), Some("claude-opus-5-5"));
         assert_eq!(t.input, 100);
         assert_eq!(t.cache_read, 7);
         assert_eq!(t.output, 40, "the last running total, not 10+25+40");
@@ -1297,7 +1297,7 @@ mod tests {
         let mut s = Store::load(tmp("bucket"));
         s.record(
             "ada",
-            Some("claude-opus-5"),
+            Some("claude-opus-5-5"),
             Tokens {
                 input: 10,
                 output: 5,
@@ -1308,7 +1308,7 @@ mod tests {
         );
         s.record(
             "ada",
-            Some("claude-opus-5"),
+            Some("claude-opus-5-5"),
             Tokens {
                 input: 3,
                 output: 1,
@@ -1333,7 +1333,7 @@ mod tests {
 
         let ada = s.for_account("ada").expect("ada");
         assert_eq!(ada.buckets.len(), 1, "two calls in the same hour share a bucket");
-        assert_eq!(ada.by_model.get("claude-opus-5").map(Tokens::total), Some(19));
+        assert_eq!(ada.by_model.get("claude-opus-5-5").map(Tokens::total), Some(19));
     }
 
     /// A charge is kept as it was charged, and adds up across hours.
@@ -1353,7 +1353,7 @@ mod tests {
 
         s.record(
             "ada",
-            Some("claude-opus-5"),
+            Some("claude-opus-5-5"),
             spend,
             true,
             Some(Cost {
@@ -1366,7 +1366,7 @@ mod tests {
         // a priced hour out of nothing.
         s.record(
             "ada",
-            Some("claude-opus-5"),
+            Some("claude-opus-5-5"),
             Tokens::default(),
             false,
             Some(Cost {
@@ -1439,14 +1439,14 @@ mod tests {
             output: 100,
             ..Tokens::default()
         };
-        s.record("ada", Some("claude-opus-5"), opus, true, None);
+        s.record("ada", Some("claude-opus-5-5"), opus, true, None);
         s.record("ada", Some("claude-haiku-4-5"), haiku, true, None);
         s.record("ada", Some("claude-haiku-4-5"), haiku, true, None);
 
         let bucket = &s.for_account("ada").expect("ada").buckets[0];
         assert_eq!(bucket.calls, 3);
         assert_eq!(bucket.by_model.len(), 2, "both models must appear in the hour");
-        assert_eq!(bucket.by_model["claude-opus-5"].total(), 1_500);
+        assert_eq!(bucket.by_model["claude-opus-5-5"].total(), 1_500);
         assert_eq!(
             bucket.by_model["claude-haiku-4-5"].total(),
             600,
@@ -1571,7 +1571,7 @@ mod tests {
         let mut s = Store::load(&root);
         s.record(
             "ada",
-            Some("claude-opus-5"),
+            Some("claude-opus-5-5"),
             Tokens {
                 input: 5,
                 ..Tokens::default()
@@ -1600,7 +1600,7 @@ mod tests {
         // One account's traffic must not rewrite another's file — that is the
         // point of splitting them.
         let ada = std::fs::read_to_string(root.join("ada").join(format!("{today}_usage.json"))).expect("read");
-        assert!(ada.contains("claude-opus-5"));
+        assert!(ada.contains("claude-opus-5-5"));
         assert!(
             !ada.contains("claude-haiku-4-5"),
             "grace's models must not be in ada's file"
@@ -1608,7 +1608,7 @@ mod tests {
 
         // A day file is self-describing when read on its own.
         let doc: AccountUsage = serde_json::from_str(&ada).expect("parse day");
-        assert_eq!(doc.by_model["claude-opus-5"].total(), 5);
+        assert_eq!(doc.by_model["claude-opus-5-5"].total(), 5);
 
         let back = Store::load(&root);
         assert_eq!(back.totals("ada", all()).2.input, 5);

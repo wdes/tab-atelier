@@ -86,6 +86,13 @@ pub(crate) struct AccountResource {
     /// chooses the hop that serves it. This is also what makes a model
     /// selectable per person, since routing resolves the id to a provider.
     pub model: Option<String>,
+    /// This person's model routes: "when they ask for X, serve Y".
+    ///
+    /// The one thing that overrules [`Self::provider`], so a row showing a
+    /// provider pin is not the whole story without these.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(default)]
+    pub routes: Vec<users::ModelRoute>,
     /// This person's compaction level. Per ACCOUNT, not per provider — the two
     /// axes meet in the account, and the level is what the relay reads.
     pub compact: &'static str,
@@ -116,6 +123,7 @@ impl From<&users::Account> for AccountResource {
             weight: a.weight,
             provider: a.provider.clone(),
             model: a.model.clone(),
+            routes: a.routes.clone(),
             compact: a.compact.as_str(),
             tools: a.tools.clone(),
             keys: a.keys.iter().map(KeyResource::from).collect(),
@@ -498,6 +506,7 @@ mod tests {
         let a = users::Account {
             provider: None,
             model: None,
+            routes: Vec::new(),
             compact: crate::compact::Compact::None,
             tools: crate::tools::Policy::default(),
             id: "id-1".to_owned(),

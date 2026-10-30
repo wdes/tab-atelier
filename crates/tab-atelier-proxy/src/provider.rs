@@ -425,7 +425,7 @@ impl Rate {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Model {
     /// The id to send upstream. Provider-specific — the same model is
-    /// `claude-opus-5` at Anthropic and something longer on Bedrock.
+    /// `claude-opus-5-5` at Anthropic and something longer on Bedrock.
     pub id: String,
     pub class: Class,
     /// Relative price, only ever compared with other entries. An absolute
@@ -744,12 +744,12 @@ impl Provider {
 ///
 /// Two jobs, and they are the same mechanism:
 ///
-/// * **Across providers.** Claude Code asks for `claude-opus-5`; `DeepSeek` has
+/// * **Across providers.** Claude Code asks for `claude-opus-5-5`; `DeepSeek` has
 ///   never heard of it. `DeepSeek`'s own endpoint papers over this by mapping
 ///   `claude-opus*` to `deepseek-v4-pro` server-side — which is a decision
 ///   about *their* margin and *their* roadmap, made where the operator cannot
 ///   see or change it. Ours is visible, editable, and in one place.
-/// * **Within one provider.** `claude-opus-5 → claude-sonnet-5` is a
+/// * **Within one provider.** `claude-opus-5-5 → claude-sonnet-5-5` is a
 ///   deliberate downgrade: the same provider, a cheaper class, chosen by the
 ///   operator rather than forced by capacity.
 ///
@@ -1539,9 +1539,29 @@ impl Default for Registry {
                 peak: None,
                 server_tools: None,
                 models: vec![
-                    Model::new("claude-haiku-4-5-20251001", Class::Fast, 100),
-                    Model::new("claude-sonnet-5", Class::Balanced, 300),
-                    Model::new("claude-opus-5", Class::Heavy, 1500),
+                    // Anthropic's current line-up, newest generation. `relative_cost`
+                    // is input $/MTok × 100, the same scale every other preset here
+                    // uses (DeepSeek Flash at $0.15 is 15, Luna at $0.20 is 20), so
+                    // these orderings stay comparable across providers.
+                    //
+                    // Published rates per MTok, for the record — deliberately NOT in
+                    // `priced()`, because that needs a cache-read figure and the
+                    // published table quotes only input and output. A missing price
+                    // is not a zero price; see `Price`.
+                    //
+                    //   Haiku 5.5    from $0.10 in / $0.50 out
+                    //   Sonnet 5.5        $2    in / $10    out
+                    //   Opus 5.5          $4    in / $20    out
+                    //   Fable 5.1         $10   in / $50    out
+                    //
+                    // All four: 1M context, 128K max output, adaptive thinking.
+                    Model::new("claude-haiku-5-5", Class::Fast, 10),
+                    Model::new("claude-sonnet-5-5", Class::Balanced, 200),
+                    Model::new("claude-opus-5-5", Class::Heavy, 400),
+                    // Heavy alongside Opus, and dearer: the class is a capability
+                    // tier, not a unique slot, and `relative_cost` is what orders
+                    // two models inside one.
+                    Model::new("claude-fable-5-1", Class::Heavy, 1000),
                 ],
             }],
             mappings: Vec::new(),
@@ -1699,6 +1719,13 @@ impl Registry {
         }
         let lower = model.to_ascii_lowercase();
         for (needle, class) in [
+            // Longest-lived names first is not the ordering that matters here —
+            // these are disjoint words, so the order is arbitrary. What matters
+            // is that EVERY family name appears: a name absent from this table
+            // falls through to `None`, which `choose` then reads as Balanced. For
+            // Fable that would quietly route the most capable model as a
+            // mid-tier one, which is the opposite of the request.
+            ("fable", Class::Heavy),
             ("opus", Class::Heavy),
             ("sonnet", Class::Balanced),
             ("haiku", Class::Fast),
@@ -2184,9 +2211,9 @@ mod tests {
     #[test]
     fn a_requested_model_maps_to_the_kind_of_work_it_is() {
         let r = two_provider_registry();
-        assert_eq!(r.class_of("claude-opus-5"), Some(Class::Heavy));
-        assert_eq!(r.class_of("claude-sonnet-5"), Some(Class::Balanced));
-        assert_eq!(r.class_of("claude-haiku-4-5-20251001"), Some(Class::Fast));
+        assert_eq!(r.class_of("claude-opus-5-5"), Some(Class::Heavy));
+        assert_eq!(r.class_of("claude-sonnet-5-5"), Some(Class::Balanced));
+        assert_eq!(r.class_of("claude-haiku-5-5"), Some(Class::Fast));
         // A provider-specific id is known exactly.
         assert_eq!(r.class_of("anthropic.claude-opus-5-v1:0"), Some(Class::Heavy));
         // A dated or aliased name we have never seen still classifies by
@@ -2215,7 +2242,7 @@ mod tests {
         // Nobody serves balanced except anthropic.
         let balanced = r.candidates_with(Class::Balanced, with_key, true, 0);
         assert_eq!(balanced.len(), 1);
-        assert_eq!(balanced[0].1.id, "claude-sonnet-5");
+        assert_eq!(balanced[0].1.id, "claude-sonnet-5-5");
     }
 
     /// A provider whose key is missing must not be offered. Routing to it
@@ -2980,10 +3007,10 @@ mod tests {
     #[test]
     fn a_mapping_rewrites_the_name_and_terminates_whatever_the_table_says() {
         let mut r = Registry::default();
-        r.set_mapping("claude-opus-5", "claude-sonnet-5", Some("cost control".to_owned()));
-        let (name, from) = r.resolve("claude-opus-5");
-        assert_eq!(name, "claude-sonnet-5");
-        assert_eq!(from.as_deref(), Some("claude-opus-5"));
+        r.set_mapping("claude-opus-5-5", "claude-sonnet-5-5", Some("cost control".to_owned()));
+        let (name, from) = r.resolve("claude-opus-5-5");
+        assert_eq!(name, "claude-sonnet-5-5");
+        assert_eq!(from.as_deref(), Some("claude-opus-5-5"));
 
         // A mapping is stronger than the family heuristic: class_of would
         // still say Heavy from the word "opus", but the resolved name is what
@@ -2991,10 +3018,7 @@ mod tests {
         assert_eq!(r.class_of(&name), Some(Class::Balanced));
 
         // Nothing mapped is unchanged, and reports no change.
-        assert_eq!(
-            r.resolve("claude-haiku-4-5-20251001"),
-            ("claude-haiku-4-5-20251001".to_owned(), None)
-        );
+        assert_eq!(r.resolve("claude-haiku-5-5"), ("claude-haiku-5-5".to_owned(), None));
 
         // A chain resolves to its end…
         r.set_mapping("a", "b", None);
@@ -3362,7 +3386,7 @@ mod tests {
             // models and a price there could never be selected for billing.
             "deepseek-v4-pro",
             // The subscription hop has no per-token cost at all.
-            "claude-opus-5",
+            "claude-opus-5-5",
             // And nothing that was never heard of.
             "no-such-model",
         ] {

@@ -720,7 +720,7 @@ fn the_auto_mode_classifier_is_not_retargeted_by_a_mapping() {
             // operator who wrote this meant the CONVERSATION; they did not say
             // "let the balanced model adjudicate whether `rm -rf` is safe".
             mappings: vec![tab_atelier_proxy::provider::Mapping {
-                from: "claude-opus-5".to_owned(),
+                from: "claude-opus-5-5".to_owned(),
                 to: "primary-balanced".to_owned(),
                 note: None,
             }],
@@ -742,7 +742,7 @@ fn the_auto_mode_classifier_is_not_retargeted_by_a_mapping() {
     // that decide routing and compaction. The transcript is a STRING inside the
     // single user turn — not `tool_result` blocks — which is the whole reason
     // the current elision pass would find nothing to do here.
-    let classifier = r#"{"model":"claude-opus-5","max_tokens":64,"stop_sequences":["</severity>"],"thinking":{"type":"disabled"},"system":[{"type":"text","text":"You are a security monitor for autonomous AI coding agents."}],"messages":[{"role":"user","content":"<transcript>Bash: rm -rf /tmp/scratch</transcript>\n<cc_automode_permissions>Bash</cc_automode_permissions>"}]}"#;
+    let classifier = r#"{"model":"claude-opus-5-5","max_tokens":64,"stop_sequences":["</severity>"],"thinking":{"type":"disabled"},"system":[{"type":"text","text":"You are a security monitor for autonomous AI coding agents."}],"messages":[{"role":"user","content":"<transcript>Bash: rm -rf /tmp/scratch</transcript>\n<cc_automode_permissions>Bash</cc_automode_permissions>"}]}"#;
     let resp = request(
         port,
         &format!(
@@ -804,7 +804,7 @@ fn a_saturated_subscription_does_not_gate_a_provider_that_bills_separately() {
     let rt = serve(&state);
     let port = rt.port;
 
-    let payload = r#"{"model":"claude-sonnet-5","max_tokens":1,"messages":[{"role":"user","content":"x"}]}"#;
+    let payload = r#"{"model":"claude-sonnet-5-5","max_tokens":1,"messages":[{"role":"user","content":"x"}]}"#;
     let resp = request(
         port,
         &format!(
@@ -868,7 +868,7 @@ fn a_providers_429_does_not_pause_the_subscription() {
     let key = first_key(&state);
     let rt = serve(&state);
 
-    let payload = r#"{"model":"claude-sonnet-5","max_tokens":1,"messages":[{"role":"user","content":"x"}]}"#;
+    let payload = r#"{"model":"claude-sonnet-5-5","max_tokens":1,"messages":[{"role":"user","content":"x"}]}"#;
     let resp = request(
         rt.port,
         &format!(

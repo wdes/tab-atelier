@@ -51,7 +51,7 @@ use crate::http::requests::inspect::ArmInspect;
 use crate::http::requests::key::{AddKey, SetKeyDisabled};
 use crate::http::requests::mapping::AddMapping;
 use crate::http::requests::provider::{RotateProviderKey, SaveProvider};
-use crate::http::requests::user::{AddUser, PinModel, PinProvider, SetDisabled, SetTools, SetWeight};
+use crate::http::requests::user::{AddUser, PinModel, PinProvider, SetDisabled, SetRoute, SetTools, SetWeight};
 use crate::server::State as AppState;
 use crate::transport::{Doc, Reply};
 use rocket::http::Method;
@@ -254,6 +254,21 @@ pub(crate) fn set_user_model(
     body: Json<PinModel>,
 ) -> Result<crate::transport::Doc<crate::http::resources::AccountEnvelope>, crate::transport::Failure> {
     account::set_model(state, account, &body.0)
+}
+
+/// Add, replace or remove one of this account's per-person model routes.
+///
+/// A route overrules the account's provider pin for the model it names; an
+/// empty `to_model` removes it. See `account::set_route`.
+#[openapi]
+#[post("/api/users/<account>/route", data = "<body>")]
+pub(crate) fn set_user_route(
+    state: &State<Arc<AppState>>,
+    _admin: Admin,
+    account: &str,
+    body: Json<SetRoute>,
+) -> Result<crate::transport::Doc<crate::http::resources::AccountEnvelope>, crate::transport::Failure> {
+    account::set_route(state, account, &body.0)
 }
 
 /// How much history this account keeps before a conversation is compacted.
@@ -574,6 +589,7 @@ pub fn all_and_spec() -> (Vec<Route>, tab_atelier_api::rocket_okapi::okapi::open
         set_user_weight,
         set_user_provider,
         set_user_model,
+        set_user_route,
         set_user_compact,
         set_user_tools,
         add_key,

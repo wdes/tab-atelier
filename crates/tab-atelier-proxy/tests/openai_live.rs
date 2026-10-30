@@ -113,7 +113,7 @@ fn a_live_streamed_turn_translates_and_bills() {
     // because it is what makes `to_chat` ask OpenAI to report usage — the
     // final chunk is the only place a stream tells you what it cost.
     let anthropic = json!({
-        "model": "claude-haiku-4-5-20251001",
+        "model": "claude-haiku-5-5",
         "max_tokens": 64,
         "stream": true,
         "system": "You are terse. Obey the instruction literally.",
@@ -292,7 +292,7 @@ fn a_live_streamed_tool_call_reassembles_the_arguments() {
     };
 
     let anthropic = json!({
-        "model": "claude-haiku-4-5-20251001",
+        "model": "claude-haiku-5-5",
         "max_tokens": 256,
         "stream": true,
         "messages": [{"role": "user", "content": "What is the weather in Paris and in Lyon?"}],
@@ -425,7 +425,7 @@ fn the_tool_policy_survives_translation_to_openai() {
     };
 
     let mut body = json!({
-        "model": "claude-haiku-4-5-20251001",
+        "model": "claude-haiku-5-5",
         "max_tokens": 64,
         "messages": [{"role": "user", "content": "hi"}],
         "tools": [

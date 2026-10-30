@@ -156,7 +156,7 @@ mod tests {
     /// reads. Reproduced from a captured body rather than imagined.
     fn classifier() -> serde_json::Value {
         json!({
-            "model": "claude-haiku-4-5-20251001",
+            "model": "claude-haiku-5-5",
             "max_tokens": 64,
             "stop_sequences": ["</severity>"],
             "thinking": {"type": "disabled"},
@@ -172,7 +172,7 @@ mod tests {
     /// Ordinary traffic: a conversation with tools, no verdict to parse.
     fn work() -> serde_json::Value {
         json!({
-            "model": "claude-opus-5",
+            "model": "claude-opus-5-5",
             "max_tokens": 32000,
             "system": [{"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."}],
             "messages": [{"role": "user", "content": "why is auto mode failing?"}],

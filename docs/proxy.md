@@ -496,13 +496,61 @@ them all at once.
 
 ### Model mapping
 
-One global table, applied before routing. "When someone asks for the name on
-the left, use the one on the right."
+Applied before routing. "When someone asks for the name on the left, use the one
+on the right."
 
 ```
-claude-opus-5  →  deepseek-flash      across providers
-claude-opus-5  →  claude-sonnet-5     within one — a deliberate downgrade
+claude-opus-5-5  →  deepseek-flash       across providers
+claude-opus-5-5  →  claude-sonnet-5-5    within one — a deliberate downgrade
 ```
+
+There are **two** kinds, and they behave deliberately differently.
+
+**Global** — one table in `providers.json`, for everybody:
+
+```json
+"mappings": [ { "from": "claude-opus-5-5", "to": "deepseek-flash" } ]
+```
+
+A global mapping is a *rewrite*: it names a model rather than a lock, so when
+the destination is served by one provider the request goes there, and when that
+provider is unreachable **normal routing applies instead**. That is what stops a
+cost-control measure from becoming an outage the first time the far end
+rate-limits.
+
+**Per person** — an account's own routes, for one account:
+
+```sh
+sudo -u tab-atelier-proxy tab-atelier-proxy route ada@example.org claude-opus-5-5 gpt-5.6-luna
+# from another provider, and only from that one:
+sudo -u tab-atelier-proxy tab-atelier-proxy route ada@example.org claude-opus-5-5 \
+     gpt-5.6-luna --provider aider
+# remove it
+sudo -u tab-atelier-proxy tab-atelier-proxy route ada@example.org claude-opus-5-5 ""
+```
+
+A per-person route is a **pin**, and is the one thing that overrules that
+person's provider pin — which is otherwise absolute. That exception is the whole
+point: without it, "keep Ada on Anthropic, except send her Opus traffic to
+DeepSeek" cannot be said at all. The provider pin then governs everything her
+routes do not name.
+
+Precedence, most specific first:
+
+```
+account route  →  account model pin  →  account provider pin  →  preference order
+```
+
+Because it is a pin and not a rewrite, **an unusable per-person route is a 503,
+not a fallback.** If its destination is blocked or down, the request fails rather
+than quietly using a provider the operator routed that person away from. Both
+ends are checked when the route is set — an unknown destination model, an unknown
+provider, or a provider that does not serve the destination are all refused
+there, so most mistakes never become a 503.
+
+Routes are matched by exact `from`, first match wins, and are **not transitive**:
+a route's destination is a destination, not another name to resolve, so routes
+cannot chain or cycle.
 
 A mapping names a **model**, not a lock. When the destination is a model only
 one provider serves, the request goes there whatever the preference order says;

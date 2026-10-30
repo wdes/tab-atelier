@@ -73,6 +73,78 @@ pub fn set_model(who: &str, model: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Add, replace or remove one of an account's per-person model routes.
+///
+/// A route says "when this person asks for `from`, serve `to`". It is the one
+/// thing that overrules their provider pin, which is otherwise absolute: it is
+/// the only way to express "keep this person on one provider, except send this
+/// model elsewhere".
+///
+/// An empty `to` removes the route.
+///
+/// # Errors
+/// No such account, an unknown destination model or provider, a provider that
+/// does not serve the destination, or the file could not be written.
+pub fn set_route(who: &str, from: &str, to: &str, provider: Option<&str>) -> Result<(), String> {
+    let mut s = store()?;
+    let from = from.trim();
+    let to = to.trim();
+    if from.is_empty() {
+        return Err("name the model this account asks for".to_owned());
+    }
+
+    if to.is_empty() {
+        let a = s.remove_route(who, from).map_err(|e| e.to_string())?;
+        println!("{} <{}> — no route for {from}", a.display_name(), a.email);
+        return Ok(());
+    }
+    if from.eq_ignore_ascii_case(to) {
+        return Err("a route to the same model changes nothing".to_owned());
+    }
+
+    // Both ends resolved against the catalogue here, where the registry is in
+    // hand, for the same reason the model pin is: routing matches by EXACT id,
+    // so a route stored in the case it arrived would be a 503 nobody could
+    // explain. `from` keeps the operator's spelling when the catalogue has
+    // never heard of it — catching traffic for a retired id is a real use.
+    let path = config_dir()?.join("providers.json");
+    let reg = tab_atelier_proxy::provider::Registry::load(&path);
+    let to_model = reg
+        .canonical_model(to)
+        .ok_or_else(|| format!("{} in {}", reg.refuses_model(to), path.display()))?
+        .to_owned();
+    let to_provider = match provider.map(str::trim).filter(|p| !p.is_empty()) {
+        None => None,
+        Some(id) => {
+            let p = reg
+                .get(id)
+                .ok_or_else(|| format!("no provider {id} in {}", path.display()))?;
+            if p.serves(&to_model).is_none() {
+                return Err(format!("{id} does not serve {to_model}"));
+            }
+            Some(id.to_owned())
+        }
+    };
+    let from = reg.canonical_model(from).map_or_else(|| from.to_owned(), str::to_owned);
+
+    let route = tab_atelier_proxy::users::ModelRoute {
+        from: from.clone(),
+        to_model: to_model.clone(),
+        to_provider: to_provider.clone(),
+        note: None,
+    };
+    let a = s.set_route(who, route).map_err(|e| e.to_string())?;
+    match to_provider {
+        None => println!("{} <{}> — {from} is served as {to_model}", a.display_name(), a.email),
+        Some(p) => println!(
+            "{} <{}> — {from} is served as {to_model} on {p}",
+            a.display_name(),
+            a.email
+        ),
+    }
+    Ok(())
+}
+
 /// How often to ask Anthropic how much of the plan has been used.
 ///
 /// Five minutes: the five-hour window moves slowly enough that finer polling
@@ -209,7 +281,15 @@ fn report_routing(registry: &tab_atelier_proxy::provider::Registry) -> bool {
     let healthy = |_: &str| tab_atelier_proxy::routing::Health::default();
     let mut failed = false;
     println!("\nrouting (healthy providers)");
-    for model in ["claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5-20251001"] {
+    // One per class, named as the catalogue names them: `doctor` is how an
+    // operator checks the table is reachable, so a probe for a model the
+    // registry no longer lists would report a fault that is only in this list.
+    for model in [
+        "claude-fable-5-1",
+        "claude-opus-5-5",
+        "claude-sonnet-5-5",
+        "claude-haiku-5-5",
+    ] {
         // No account, so no pin: this is what an unpinned person gets.
         let chosen = tab_atelier_proxy::routing::choose(
             registry,

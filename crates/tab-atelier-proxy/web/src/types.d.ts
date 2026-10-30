@@ -78,6 +78,25 @@ interface ApiKey {
     sessions: ApiSession[];
 }
 
+/**
+ * One per-person model route.
+ *
+ * Distinct from the registry's global `mappings`, which apply to everybody and
+ * DEGRADE when their target is unusable. A route is a pin: if its destination
+ * is blocked the request fails rather than quietly using a provider this person
+ * was routed away from.
+ */
+interface ModelRoute {
+    /** The model id this account asks for. Matched exactly. */
+    from: string;
+    /** The model id served instead. */
+    to_model: string;
+    /** The provider to serve it from, or absent for whichever one does. */
+    to_provider?: string | null;
+    /** Why this exists, for whoever reads it later. */
+    note?: string | null;
+}
+
 interface ApiUser {
     id: string;
     first_name: string;
@@ -98,6 +117,14 @@ interface ApiUser {
      * the provider too.
      */
     model: string | null;
+    /**
+     * This person's model routes: "when they ask for `from`, serve `to_model`".
+     *
+     * The one thing that overrules `provider`, which is otherwise absolute —
+     * so a row showing a provider pin is not the whole story without these.
+     * Absent when empty.
+     */
+    routes?: ModelRoute[];
     /**
      * This account's compaction level. Per ACCOUNT, not per provider: routing
      * picks the provider per request, so a level filed under one would quietly

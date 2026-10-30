@@ -388,6 +388,74 @@ pub struct Account {
     /// [`crate::tools`]. That is why this is a plain id and not an enum.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Per-person model routes: "when this account asks for X, serve Y".
+    ///
+    /// PER PERSON like `compact` and `tools`, and the reason this exists rather
+    /// than reusing the registry's global `mappings` is that a global mapping
+    /// cannot say "for Alice". One person moved onto a cheaper model, or off a
+    /// vendor they must not reach, is a per-account fact.
+    ///
+    /// ## This is the one thing that overrules [`Self::provider`]
+    ///
+    /// The provider pin is otherwise absolute — that is its whole job. A route
+    /// here is the deliberate exception: it names a destination explicitly, so
+    /// it is honoured even when it points outside the pinned provider. The pin
+    /// then governs everything the routes do not name. Without that, "force
+    /// this person onto one provider, except send their Opus traffic to
+    /// `DeepSeek`" would be unsayable.
+    ///
+    /// ## And it is harder than a global mapping
+    ///
+    /// A global mapping degrades: if its target is blocked, routing falls back
+    /// to the class ladder, because a mapping is a rewrite and the work still
+    /// has to get done. A route here does NOT. It is a pin, and an unusable pin
+    /// is a 503 — the operator said *this* model for *this* person, and quietly
+    /// using a provider they routed someone away from is the failure the route
+    /// existed to prevent. The two kinds of indirection look alike and behave
+    /// deliberately differently; see `routing::choose`.
+    ///
+    /// Matched by exact `from`, first match wins. Unlike the registry's
+    /// mappings, routes are NOT followed transitively: a route's `to` is a
+    /// destination, not another name to resolve, so a person's routes cannot
+    /// form a chain or a cycle.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub routes: Vec<ModelRoute>,
+}
+
+/// One per-person model route: asked-for name in, destination out.
+///
+/// Both halves are optional in the way that matters: `to_provider` may be left
+/// out to mean "wherever serves `to_model`", which is what a route that only
+/// changes the model needs. `to_model` is required — a route that renames
+/// nothing is not a route.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, tab_atelier_api::schemars::JsonSchema)]
+pub struct ModelRoute {
+    /// The model id this account asks for, matched exactly.
+    pub from: String,
+    /// The model id to serve instead.
+    pub to_model: String,
+    /// The provider to serve it from, or `None` for whichever one does.
+    ///
+    /// Naming it is how an operator distinguishes two providers that serve the
+    /// same id — a model available both on its vendor and through a reseller.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_provider: Option<String>,
+    /// Why, for the operator who reads this file in six months.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+impl Account {
+    /// The route this account has for `requested`, if any.
+    ///
+    /// Exact match on `from`, first wins. Case-insensitive, because the write
+    /// path canonicalises against the catalogue but a hand-edited `users.json`
+    /// is a thing that happens and a route that silently does not apply is
+    /// worse than one that applies to a differently-cased name.
+    #[must_use]
+    pub fn route_for(&self, requested: &str) -> Option<&ModelRoute> {
+        self.routes.iter().find(|r| r.from.eq_ignore_ascii_case(requested))
+    }
 }
 
 /// Normal, on the scale the UI presents.
@@ -707,6 +775,7 @@ impl Store {
             weight: default_weight(),
             provider: None,
             model: None,
+            routes: Vec::new(),
             compact: crate::compact::Compact::None,
             tools: crate::tools::Policy::default(),
         };
@@ -865,6 +934,69 @@ impl Store {
             .find(|a| a.id == id)
             .ok_or_else(|| Error::NotFound(who.to_owned()))?;
         account.model = model.map(str::to_owned).filter(|m| !m.is_empty());
+        let out = account.clone();
+        self.reindex();
+        self.save()?;
+        Ok(out)
+    }
+
+    /// Add or replace one of this account's model routes.
+    ///
+    /// Replaces by `from`, case-insensitively, so setting the same source twice
+    /// edits the route rather than stacking a second one that the first would
+    /// always shadow — `route_for` takes the first match.
+    ///
+    /// Validation of the destination belongs to the caller, as with
+    /// [`Self::set_provider`]: this module knows about people, not about where
+    /// requests can go. The route that validates it has the registry in hand.
+    ///
+    /// # Errors
+    /// No such account, or the file could not be written.
+    pub fn set_route(&mut self, who: &str, route: ModelRoute) -> Result<Account, Error> {
+        let id = self
+            .find(who)
+            .ok_or_else(|| Error::NotFound(who.to_owned()))?
+            .id
+            .clone();
+        let account = self
+            .accounts
+            .iter_mut()
+            .find(|a| a.id == id)
+            .ok_or_else(|| Error::NotFound(who.to_owned()))?;
+        if let Some(existing) = account
+            .routes
+            .iter_mut()
+            .find(|r| r.from.eq_ignore_ascii_case(&route.from))
+        {
+            *existing = route;
+        } else {
+            account.routes.push(route);
+        }
+        let out = account.clone();
+        self.reindex();
+        self.save()?;
+        Ok(out)
+    }
+
+    /// Remove the route for `from`, if there is one.
+    ///
+    /// Returns the account either way: removing a route that was not there
+    /// leaves the operator where they wanted to be, so it is not an error.
+    ///
+    /// # Errors
+    /// No such account, or the file could not be written.
+    pub fn remove_route(&mut self, who: &str, from: &str) -> Result<Account, Error> {
+        let id = self
+            .find(who)
+            .ok_or_else(|| Error::NotFound(who.to_owned()))?
+            .id
+            .clone();
+        let account = self
+            .accounts
+            .iter_mut()
+            .find(|a| a.id == id)
+            .ok_or_else(|| Error::NotFound(who.to_owned()))?;
+        account.routes.retain(|r| !r.from.eq_ignore_ascii_case(from));
         let out = account.clone();
         self.reindex();
         self.save()?;

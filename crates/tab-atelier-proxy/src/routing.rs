@@ -237,6 +237,18 @@ pub fn choose<G: Fn(&str) -> Option<String> + Copy>(
 /// "whichever fast model is cheapest right now", so a pin nothing serves
 /// returns `None` and the caller reports 503 rather than substituting.
 ///
+/// **A model pin outranks a provider pin.** `provider` is tried first and then
+/// dropped: choosing a model chooses the hop that serves it. The two pins
+/// disagreeing is not a misconfiguration to punish — it is an operator saying
+/// "this person on this provider, except for this model", which is the only way
+/// to say that at all.
+///
+/// This used to pass `provider` straight through as a filter, so a model pin
+/// naming anything the pinned provider did not serve left no candidates and
+/// every request 503'd. Two doc comments asserted the opposite — here and at
+/// `Registry::providers_serving` — which is how it went unnoticed: the contract
+/// was written down and never implemented.
+///
 /// `changed_from` is left for the caller to fill: only it knows the name the
 /// client actually asked for.
 #[must_use]
@@ -249,14 +261,20 @@ pub fn choose_exact<G: Fn(&str) -> Option<String> + Copy>(
     host: Host<G>,
     now: u64,
 ) -> Option<Route> {
-    pick_exact(registry, model_id, health, host, now, provider).map(|(p, m)| Route {
-        provider_id: p.id.clone(),
-        model_id: m.id.clone(),
-        class: m.class,
-        kind,
-        changed_from: None,
-        reason: Some("pinned"),
-    })
+    // The pinned provider first, so an account whose provider does serve the
+    // pinned model stays where it was put — the pin still contains everything
+    // it can contain.
+    pick_exact(registry, model_id, health, host, now, provider)
+        // Then anywhere, because the model is the more specific instruction.
+        .or_else(|| pick_exact(registry, model_id, health, host, now, None))
+        .map(|(p, m)| Route {
+            provider_id: p.id.clone(),
+            model_id: m.id.clone(),
+            class: m.class,
+            kind,
+            changed_from: None,
+            reason: Some("pinned"),
+        })
 }
 
 /// A provider that serves this exact model id, healthy first.
@@ -384,9 +402,9 @@ mod tests {
     #[test]
     fn a_healthy_subscription_serves_what_was_asked_for() {
         let r = two_providers();
-        let route = choose(&r, "claude-opus-5", None, classifier::Kind::Work, &healthy, host(), 0).expect("a route");
+        let route = choose(&r, "claude-opus-5-5", None, classifier::Kind::Work, &healthy, host(), 0).expect("a route");
         assert_eq!(route.provider_id, "anthropic");
-        assert_eq!(route.model_id, "claude-opus-5");
+        assert_eq!(route.model_id, "claude-opus-5-5");
         assert_eq!(route.changed_from, None, "nothing to report when nothing changed");
         assert_eq!(route.reason, None);
     }
@@ -401,7 +419,7 @@ mod tests {
         assert_eq!(
             choose(
                 &r,
-                "claude-opus-5",
+                "claude-opus-5-5",
                 None,
                 classifier::Kind::Work,
                 &healthy,
@@ -421,7 +439,7 @@ mod tests {
         let r = two_providers();
         let route = choose(
             &r,
-            "claude-opus-5",
+            "claude-opus-5-5",
             None,
             classifier::Kind::Work,
             &healthy,
@@ -450,11 +468,20 @@ mod tests {
                 Health::default()
             }
         };
-        let route = choose(&r, "claude-opus-5", None, classifier::Kind::Work, &squeezed, host(), 0).expect("a route");
+        let route = choose(
+            &r,
+            "claude-opus-5-5",
+            None,
+            classifier::Kind::Work,
+            &squeezed,
+            host(),
+            0,
+        )
+        .expect("a route");
         assert_eq!(route.provider_id, "bedrock", "the work should move, not shrink");
         assert_eq!(route.class, Class::Heavy, "and stay at the same class");
         assert_eq!(route.reason, Some("rerouted"));
-        assert_eq!(route.changed_from.as_deref(), Some("claude-opus-5"));
+        assert_eq!(route.changed_from.as_deref(), Some("claude-opus-5-5"));
     }
 
     /// Only when there is nowhere left does the answer get cheaper.
@@ -467,7 +494,7 @@ mod tests {
             backoff_secs: 30,
         };
         assert_eq!(
-            choose(&r, "claude-opus-5", None, classifier::Kind::Work, &blocked, host(), 0),
+            choose(&r, "claude-opus-5-5", None, classifier::Kind::Work, &blocked, host(), 0),
             None,
             "a blocked provider serves nothing, at any class"
         );
@@ -488,7 +515,7 @@ mod tests {
         };
         let route = choose(
             &r,
-            "claude-opus-5",
+            "claude-opus-5-5",
             None,
             classifier::Kind::Work,
             &bedrock_blocked,
@@ -515,13 +542,22 @@ mod tests {
             utilization: Some(0.93),
             backoff_secs: 0,
         };
-        let route = choose(&r, "claude-opus-5", None, classifier::Kind::Work, &strained, host(), 0).expect("a route");
+        let route = choose(
+            &r,
+            "claude-opus-5-5",
+            None,
+            classifier::Kind::Work,
+            &strained,
+            host(),
+            0,
+        )
+        .expect("a route");
         assert_eq!(
             route.class,
             Class::Heavy,
             "the last tenth of a paid plan is still usable"
         );
-        assert_eq!(route.model_id, "claude-opus-5");
+        assert_eq!(route.model_id, "claude-opus-5-5");
         assert_eq!(route.reason, None);
     }
 
@@ -532,7 +568,7 @@ mod tests {
         let r = two_providers();
         let route = choose(
             &r,
-            "claude-haiku-4-5-20251001",
+            "claude-haiku-5-5",
             None,
             classifier::Kind::Work,
             &healthy,
@@ -541,7 +577,7 @@ mod tests {
         )
         .expect("a route");
         assert_eq!(route.class, Class::Fast);
-        assert_ne!(route.model_id, "claude-opus-5");
+        assert_ne!(route.model_id, "claude-opus-5-5");
     }
 
     #[test]
@@ -583,27 +619,27 @@ mod tests {
     #[test]
     fn a_mapping_to_another_providers_model_routes_there() {
         let mut r = with_deepseek();
-        r.set_mapping("claude-opus-5", "deepseek-flash", None);
+        r.set_mapping("claude-opus-5-5", "deepseek-flash", None);
 
-        let route = choose(&r, "claude-opus-5", None, classifier::Kind::Work, &healthy, host(), 0).expect("a route");
+        let route = choose(&r, "claude-opus-5-5", None, classifier::Kind::Work, &healthy, host(), 0).expect("a route");
         // Not Anthropic, even though it has preference 0 and serves a model of
         // the same class. `deepseek-flash` exists in exactly one place, so the
         // mapping named a destination, not just a rename.
         assert_eq!(route.provider_id, "deepseek");
         assert_eq!(route.model_id, "deepseek-flash");
         assert_eq!(route.reason, Some("mapped"));
-        assert_eq!(route.changed_from.as_deref(), Some("claude-opus-5"));
+        assert_eq!(route.changed_from.as_deref(), Some("claude-opus-5-5"));
     }
 
     /// Mapping claude to claude: a deliberate downgrade, same provider.
     #[test]
     fn a_mapping_within_one_provider_is_honoured_even_though_it_costs_less() {
         let mut r = Registry::default();
-        r.set_mapping("claude-opus-5", "claude-sonnet-5", Some("cost control".to_owned()));
+        r.set_mapping("claude-opus-5-5", "claude-sonnet-5-5", Some("cost control".to_owned()));
 
-        let route = choose(&r, "claude-opus-5", None, classifier::Kind::Work, &healthy, host(), 0).expect("a route");
+        let route = choose(&r, "claude-opus-5-5", None, classifier::Kind::Work, &healthy, host(), 0).expect("a route");
         assert_eq!(route.provider_id, "anthropic");
-        assert_eq!(route.model_id, "claude-sonnet-5");
+        assert_eq!(route.model_id, "claude-sonnet-5-5");
         assert_eq!(route.class, Class::Balanced);
         assert_eq!(route.reason, Some("mapped"));
     }
@@ -614,7 +650,7 @@ mod tests {
     #[test]
     fn a_mapping_does_not_become_a_pin_that_survives_an_outage() {
         let mut r = with_deepseek();
-        r.set_mapping("claude-opus-5", "deepseek-flash", None);
+        r.set_mapping("claude-opus-5-5", "deepseek-flash", None);
 
         // DeepSeek is refusing traffic outright.
         let no_deepseek = |id: &str| Health {
@@ -623,7 +659,7 @@ mod tests {
         };
         let route = choose(
             &r,
-            "claude-opus-5",
+            "claude-opus-5-5",
             None,
             classifier::Kind::Work,
             &no_deepseek,
@@ -649,7 +685,7 @@ mod tests {
         // off.
         if let Some(rt) = choose(
             &r,
-            "claude-opus-5",
+            "claude-opus-5-5",
             Some("deepseek"),
             classifier::Kind::Work,
             &healthy,
@@ -662,7 +698,7 @@ mod tests {
         // Pinned to Anthropic: DeepSeek is never chosen, whatever it costs.
         let route = choose(
             &r,
-            "claude-opus-5",
+            "claude-opus-5-5",
             Some("anthropic"),
             classifier::Kind::Work,
             &healthy,
@@ -673,6 +709,164 @@ mod tests {
         assert_eq!(route.provider_id, "anthropic");
     }
 
+    /// A client asking for a retired model name still gets served.
+    ///
+    /// The catalogue moves when a vendor ships a generation — `claude-opus-5`
+    /// became `claude-opus-5-5` — but clients in the wild keep asking for what
+    /// they were configured with, sometimes for months. `class_of` falls back to
+    /// a family substring for exactly this, so an old name is read as a class
+    /// hint and answered with the current model of that class.
+    ///
+    /// Asserted because the rename relies on it: without this fallback, every
+    /// client pinned to a previous generation would break the day the catalogue
+    /// was updated, and the failure would look like a routing outage.
+    #[test]
+    fn a_retired_model_name_is_still_routed_by_its_family() {
+        let r = with_deepseek();
+
+        let route = choose(&r, "claude-opus-5", None, classifier::Kind::Work, &healthy, host(), 0)
+            .expect("a retired name still names a family");
+
+        assert_eq!(route.class, crate::provider::Class::Heavy, "opus is still Heavy");
+        assert_eq!(
+            route.model_id, "claude-opus-5-5",
+            "answered with the current Heavy model"
+        );
+    }
+
+    /// Fable is Heavy, which it has to be read as from its name alone.
+    ///
+    /// `class_of` matches a family substring when the id is not in the
+    /// catalogue, and `fable` was missing from that table — so a request for
+    /// any Fable id the registry did not list fell through to `None`, which
+    /// `choose` reads as Balanced. The most capable model would have been
+    /// routed as a mid-tier one.
+    #[test]
+    fn fable_is_read_as_the_heavy_class_it_is() {
+        let r = with_deepseek();
+
+        assert_eq!(
+            r.class_of("claude-fable-5-1-20260601"),
+            Some(crate::provider::Class::Heavy),
+            "an unlisted Fable id is still Heavy",
+        );
+    }
+
+    // --- choose_exact: the model pin ---------------------------------------
+    //
+    // This function had NO tests before the bug below was found, which is how
+    // the bug shipped: the behaviour it got wrong was documented in two places
+    // and checked in none.
+
+    /// A model pin reaches its model even when the account is pinned elsewhere.
+    ///
+    /// **This is the regression test for the bug.** `choose_exact` passed the
+    /// provider pin into the candidate filter, so the provider was narrowed
+    /// before the model was resolved: pin someone to Anthropic and to
+    /// `deepseek-flash` and nothing served the model, so every request 503'd.
+    /// Two doc comments promised the opposite — "a model pin outranks a
+    /// provider pin" — which is why nobody looked.
+    ///
+    /// The exception is deliberate and is the whole point: it is the only way
+    /// to say "this person on this provider, except for this model".
+    #[test]
+    fn a_model_pin_outranks_the_provider_pin_it_disagrees_with() {
+        let r = with_deepseek();
+
+        let route = choose_exact(
+            &r,
+            "deepseek-flash",
+            Some("anthropic"),
+            classifier::Kind::Work,
+            &healthy,
+            host(),
+            0,
+        )
+        .expect("the model pin names a model, and something serves it");
+
+        assert_eq!(route.provider_id, "deepseek", "the model chose the hop that serves it");
+        assert_eq!(route.model_id, "deepseek-flash");
+        assert_eq!(route.reason, Some("pinned"));
+    }
+
+    /// The provider pin still wins when it CAN serve the pinned model.
+    ///
+    /// Dropping the pin entirely would be the opposite error: an account pinned
+    /// to a reseller that serves the model must stay on the reseller, not be
+    /// re-decided by preference order. The pin is tried first and only then
+    /// dropped.
+    #[test]
+    fn a_provider_that_serves_the_pinned_model_keeps_it() {
+        let mut r = with_deepseek();
+        // A second provider serving the very same id, cheaper and preferred,
+        // so preference order would move the request if the pin were ignored.
+        let mut rival = crate::provider::Preset::Deepseek.provider(std::path::Path::new("/tmp"));
+        rival.id = "reseller".to_owned();
+        rival.auth = crate::provider::Auth::ApiKeyEnv { var: "K".to_owned() };
+        rival.preference = -10;
+        r.providers.push(rival);
+
+        let route = choose_exact(
+            &r,
+            "deepseek-flash",
+            Some("deepseek"),
+            classifier::Kind::Work,
+            &healthy,
+            host(),
+            0,
+        )
+        .expect("a route");
+
+        assert_eq!(
+            route.provider_id, "deepseek",
+            "the pin is honoured when it can be; only an unservable pin is dropped"
+        );
+    }
+
+    /// A model pin nothing serves is a visible failure, not a substitution.
+    ///
+    /// The point of an exact pin is that it is exact. Falling back to the class
+    /// ladder here would quietly give the operator a model they did not choose,
+    /// which is the behaviour `choose` exists for and `choose_exact` exists to
+    /// avoid.
+    #[test]
+    fn a_model_pin_nothing_serves_yields_no_route() {
+        let r = with_deepseek();
+
+        assert!(
+            choose_exact(
+                &r,
+                "no-such-model",
+                Some("anthropic"),
+                classifier::Kind::Work,
+                &healthy,
+                host(),
+                0,
+            )
+            .is_none(),
+            "a 503 the operator can see, not a quiet substitution"
+        );
+    }
+
+    /// A pinned model on a blocked provider does not degrade.
+    ///
+    /// `choose` would step down a class; `choose_exact` must not. An operator
+    /// who pinned a model wants that model or an error — and the error is what
+    /// tells them the provider is in trouble.
+    #[test]
+    fn a_pinned_model_on_a_blocked_provider_does_not_degrade() {
+        let r = with_deepseek();
+        let blocked = |id: &str| Health {
+            utilization: None,
+            backoff_secs: if id == "deepseek" { 60 } else { 0 },
+        };
+
+        assert!(
+            choose_exact(&r, "deepseek-flash", None, classifier::Kind::Work, &blocked, host(), 0,).is_none(),
+            "the pin is a pin: no ladder, no other provider's model"
+        );
+    }
+
     /// A pin to something that is not configured must fail visibly.
     #[test]
     fn a_pin_to_nothing_yields_no_route_rather_than_a_quiet_substitution() {
@@ -680,7 +874,7 @@ mod tests {
         assert_eq!(
             choose(
                 &r,
-                "claude-sonnet-5",
+                "claude-sonnet-5-5",
                 Some("typo-not-a-provider"),
                 classifier::Kind::Work,
                 &healthy,
@@ -711,7 +905,7 @@ mod tests {
         // Off-peak: DeepSeek's flash (15) beats the subscription (20).
         let off = choose(
             &r,
-            "claude-sonnet-5",
+            "claude-sonnet-5-5",
             Some("deepseek"),
             classifier::Kind::Work,
             &healthy,
@@ -725,7 +919,7 @@ mod tests {
         // the price, the pin moves the traffic.
         let peak = choose(
             &r,
-            "claude-sonnet-5",
+            "claude-sonnet-5-5",
             Some("deepseek"),
             classifier::Kind::Work,
             &healthy,
@@ -737,7 +931,7 @@ mod tests {
         // With no pin, the ordering is what changes.
         let unpinned_peak = choose(
             &r,
-            "claude-sonnet-5",
+            "claude-sonnet-5-5",
             None,
             classifier::Kind::Work,
             &healthy,
@@ -760,7 +954,7 @@ mod tests {
         assert_eq!(
             choose(
                 &empty,
-                "claude-opus-5",
+                "claude-opus-5-5",
                 None,
                 classifier::Kind::Work,
                 &healthy,

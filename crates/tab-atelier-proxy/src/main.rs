@@ -31,7 +31,7 @@ enum Command {
     /// Time the round trip to the Anthropic API, stage by stage.
     Ping {
         /// Model to ask for the one-token completion.
-        #[arg(long, default_value = "claude-haiku-4-5-20251001")]
+        #[arg(long, default_value = "claude-haiku-5-5")]
         model: String,
         /// Repeat this many times and report the spread.
         #[arg(long, default_value_t = 1)]
@@ -92,6 +92,27 @@ enum Command {
         #[arg(default_value = "")]
         model: String,
     },
+    /// Route one of this person's models somewhere else.
+    ///
+    /// "When they ask for `from`, serve `to`" — optionally from a named
+    /// `provider`. This is the ONLY thing that overrules an account's provider
+    /// pin, which is otherwise absolute: it is how you keep somebody on one
+    /// provider but send one model of theirs elsewhere.
+    ///
+    /// An empty `to` removes the route. See `docs/proxy.md`, "Pinning someone
+    /// to a model".
+    Route {
+        /// Account email or id.
+        who: String,
+        /// The model id this account asks for.
+        from: String,
+        /// The model id to serve instead. Empty removes the route.
+        #[arg(default_value = "")]
+        to: String,
+        /// Serve it from this provider, or anywhere that has it.
+        #[arg(long)]
+        provider: Option<String>,
+    },
     /// Install a Claude login copied from a machine that can run `claude`.
     ///
     /// The proxy talks to Anthropic with the host's own Claude OAuth
@@ -132,6 +153,12 @@ fn run() -> Result<(), String> {
         Command::Enable { who } => cli::set_disabled(&who, false),
         Command::SetProvider { who, provider } => cli::set_provider(&who, &provider),
         Command::SetModel { who, model } => cli::set_model(&who, &model),
+        Command::Route {
+            who,
+            from,
+            to,
+            provider,
+        } => cli::set_route(&who, &from, &to, provider.as_deref()),
         Command::Remove { who } => cli::remove_account(&who),
         Command::ImportCredentials { from } => cli::import_credentials(from.as_deref()),
     }

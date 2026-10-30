@@ -66,6 +66,55 @@ impl Validated for PinModel {
     }
 }
 
+/// Adding or replacing one of an account's per-person model routes.
+///
+/// `to_model` empty means "delete the route for `from`", mirroring how an empty
+/// `model` clears the pin: one endpoint, and the operator does not have to know
+/// a second verb to undo what they just did.
+#[derive(Debug, Default, serde::Deserialize, tab_atelier_api::schemars::JsonSchema)]
+pub struct SetRoute {
+    /// The model id this account asks for.
+    #[serde(default)]
+    pub from: String,
+    /// The model id to serve instead, or empty to remove the route.
+    #[serde(default)]
+    pub to_model: String,
+    /// The provider to serve it from, or absent for whichever one does.
+    #[serde(default)]
+    pub to_provider: Option<String>,
+    /// Why, for whoever reads the file later.
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+impl Validated for SetRoute {
+    fn validate(&self) -> Result<(), String> {
+        // `from` is the key: without it there is nothing to file the route
+        // under, and an empty one would match an empty request model.
+        if self.from.trim().is_empty() {
+            return Err("from: name the model this account asks for".to_owned());
+        }
+        // A route to the same name is a no-op that looks like a configured
+        // one, which is worse than a refusal — the operator would believe
+        // something was in effect.
+        if !self.to_model.trim().is_empty() && self.from.trim().eq_ignore_ascii_case(self.to_model.trim()) {
+            return Err("to_model: a route to the same model changes nothing".to_owned());
+        }
+        Ok(())
+    }
+
+    fn accept(body: &bytes::Bytes) -> Result<Self, Rejection> {
+        // Validated here, in `accept`, and not only in `validate` — the trait
+        // method is a hook nobody calls unless the impl does. `SetTools` is the
+        // precedent. This is the same class of gap as a rule written down and
+        // never enforced, which is exactly the bug that brought this file into
+        // being.
+        let parsed: Self = super::parse(body)?;
+        parsed.validate().map_err(|why| Rejection::field("route", &why))?;
+        Ok(parsed)
+    }
+}
+
 /// Switching an account off, or back on.
 #[derive(Debug, Default, serde::Deserialize, tab_atelier_api::schemars::JsonSchema)]
 pub struct SetDisabled {

@@ -116,7 +116,7 @@ fn mock_upstream() -> u16 {
                     break;
                 }
             }
-            let body = r#"{"model":"claude-sonnet-5","usage":{"input_tokens":11,"output_tokens":7}}"#;
+            let body = r#"{"model":"claude-sonnet-5-5","usage":{"input_tokens":11,"output_tokens":7}}"#;
             let _ = write!(
                 sock,
                 "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
@@ -316,7 +316,7 @@ fn a_key_minted_by_the_cli_works_against_the_running_server() {
     let _serving = Serving(child);
 
     // 4. Spend the key on a real proxied request.
-    let payload = r#"{"model":"claude-sonnet-5","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}"#;
+    let payload = r#"{"model":"claude-sonnet-5-5","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}"#;
     let resp = http(
         port,
         &format!(
@@ -379,7 +379,7 @@ fn a_key_minted_by_the_cli_works_against_the_running_server() {
     let file = found.unwrap_or_else(|| panic!("no usage file appeared under {}", usage_root.display()));
     let recorded = std::fs::read_to_string(&file).expect("read usage");
     assert!(
-        recorded.contains("claude-sonnet-5"),
+        recorded.contains("claude-sonnet-5-5"),
         "the hour must record which model was billed: {recorded}"
     );
     assert!(recorded.contains("\"calls\":1"), "{recorded}");
@@ -497,7 +497,7 @@ fn a_provider_that_lost_its_rate_still_records_a_cost() {
             r#""base_url":"http://127.0.0.1:{upstream}","auth":{{"kind":"api_key_file","path":"{key}"}},"#,
             r#""models":[{{"id":"deepseek-flash","class":"balanced","relative_cost":15}}],"#,
             r#""preference":0,"enabled":true}}],"#,
-            r#""mappings":[{{"from":"claude-sonnet-5","to":"deepseek-flash"}}]}}"#,
+            r#""mappings":[{{"from":"claude-sonnet-5-5","to":"deepseek-flash"}}]}}"#,
         ),
         upstream = upstream,
         key = key_file.display(),
@@ -518,7 +518,7 @@ fn a_provider_that_lost_its_rate_still_records_a_cost() {
     let _serving = Serving(child);
 
     let payload = concat!(
-        r#"{"model":"claude-sonnet-5","max_tokens":16,"#,
+        r#"{"model":"claude-sonnet-5-5","max_tokens":16,"#,
         r#""messages":[{"role":"user","content":"hi"}]}"#,
     );
     let resp = http(
@@ -590,7 +590,7 @@ fn an_hour_answered_under_a_legacy_model_name_is_still_priced() {
             r#""base_url":"http://127.0.0.1:{upstream}","auth":{{"kind":"api_key_file","path":"{key}"}},"#,
             r#""models":[{{"id":"deepseek-flash","class":"balanced","relative_cost":15}}],"#,
             r#""preference":0,"enabled":true}}],"#,
-            r#""mappings":[{{"from":"claude-sonnet-5","to":"deepseek-flash"}}]}}"#,
+            r#""mappings":[{{"from":"claude-sonnet-5-5","to":"deepseek-flash"}}]}}"#,
         ),
         upstream = upstream,
         key = key_file.display(),
@@ -611,7 +611,7 @@ fn an_hour_answered_under_a_legacy_model_name_is_still_priced() {
     let _serving = Serving(child);
 
     let payload = concat!(
-        r#"{"model":"claude-sonnet-5","max_tokens":16,"#,
+        r#"{"model":"claude-sonnet-5-5","max_tokens":16,"#,
         r#""messages":[{"role":"user","content":"hi"}]}"#,
     );
     let resp = http(
@@ -715,7 +715,7 @@ fn a_non_anthropic_request_carries_no_claude_attribution() {
             r#""base_url":"http://127.0.0.1:{upstream}","auth":{{"kind":"api_key_file","path":"{key}"}},"#,
             r#""models":[{{"id":"deepseek-flash","class":"balanced","relative_cost":1}}],"#,
             r#""preference":0,"enabled":true}}],"#,
-            r#""mappings":[{{"from":"claude-sonnet-5","to":"deepseek-flash"}}]}}"#,
+            r#""mappings":[{{"from":"claude-sonnet-5-5","to":"deepseek-flash"}}]}}"#,
         ),
         upstream = upstream,
         key = key_file.display(),
@@ -739,7 +739,7 @@ fn a_non_anthropic_request_carries_no_claude_attribution() {
     // the `Bash` tool's description. `\n` here is a literal backslash-n, which
     // is what a JSON string on the wire carries.
     let payload = concat!(
-        r#"{"model":"claude-sonnet-5","max_tokens":16,"#,
+        r#"{"model":"claude-sonnet-5-5","max_tokens":16,"#,
         r#""system":"Do not use the Agent tool, workflows, or deep-research unless the user, a CLAUDE.md file, or a skill asks for it.\nKept line.","#,
         r#""messages":[{"role":"user","content":"hi"}],"#,
         r#""tools":[{"name":"Bash","description":"Run a command. End git commit messages with:\nCo-Authored-By: Claude 4.8 (noreply@anthropic.com)\n- End PR bodies with:\n"#,
@@ -826,7 +826,7 @@ fn a_subscription_with_no_credential_file_is_refused_and_not_drawn() {
     // 2. The request is refused rather than routed into an egress that cannot
     //    authenticate, and the refusal names the file that would fix it instead
     //    of leaving a bare "no provider".
-    let payload = r#"{"model":"claude-sonnet-5","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}"#;
+    let payload = r#"{"model":"claude-sonnet-5-5","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}"#;
     let resp = http(
         port,
         &format!(
@@ -894,16 +894,16 @@ fn a_model_pin_is_set_refused_and_cleared() {
     assert_eq!(on_disk(s), None, "a refused pin must not reach the file");
 
     // A model the catalogue publishes reaches the file the server reads.
-    cli(s, &["set-model", "ada@example.org", "claude-sonnet-5"]);
-    assert_eq!(on_disk(s).as_deref(), Some("claude-sonnet-5"));
+    cli(s, &["set-model", "ada@example.org", "claude-sonnet-5-5"]);
+    assert_eq!(on_disk(s).as_deref(), Some("claude-sonnet-5-5"));
 
     // The same model in another case is stored as the catalogue spells it, not
     // as it was typed: routing resolves the pin by exact id, so keeping the
     // operator's capitalisation would write a value only a 503 could come of.
-    cli(s, &["set-model", "ada@example.org", "claude-SONNET-5"]);
+    cli(s, &["set-model", "ada@example.org", "claude-SONNET-5-5"]);
     assert_eq!(
         on_disk(s).as_deref(),
-        Some("claude-sonnet-5"),
+        Some("claude-sonnet-5-5"),
         "the pin is stored canonically, not as typed"
     );
 

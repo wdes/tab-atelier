@@ -254,6 +254,36 @@ pub(crate) fn pick_route(
     // await makes this future non-Send — which the compiler reports as a
     // spawn failure a long way from here. Taken only for the decision.
     let registry = state.registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    // A per-person route for this exact name outranks BOTH pins. It is the one
+    // deliberate exception to the provider pin being absolute, because it is
+    // the only way to say "this person on this provider, except this model" —
+    // see `users::Account::routes`.
+    //
+    // Checked before the model pin too: a route names the model asked for, so
+    // it is the more specific of the two instructions.
+    if let Some(route) = account.route_for(requested) {
+        return routing::choose_exact(
+            &registry,
+            &route.to_model,
+            // The route's own provider when it names one; otherwise anywhere
+            // that serves the model — NOT the account's pin, which this route
+            // is explicitly allowed to leave.
+            route.to_provider.as_deref(),
+            kind,
+            health,
+            host,
+            now,
+        )
+        .map(|mut chosen| {
+            // Distinguished from a plain pin in the response headers: an
+            // operator debugging "why is Alice on DeepSeek" needs to know it
+            // was her route rather than a reroute or a degrade.
+            chosen.reason = Some("routed");
+            chosen
+        });
+    }
+
     pin.map_or_else(
         || {
             routing::choose(
