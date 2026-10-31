@@ -68,6 +68,12 @@ pub enum Kind {
     Work,
     /// Claude Code's auto-mode permission classifier. Not work: a second,
     /// per-action call whose output is a parsed verdict rather than a reply.
+    ///
+    /// `auto` is accepted as a spelling of this in configuration, because that
+    /// is what the feature is called in Claude Code's own UI and in the
+    /// conversation that asked for routing it. A rule an operator writes with
+    /// the name they know is a rule that gets used.
+    #[serde(alias = "auto", alias = "auto_mode")]
     Classifier,
 }
 

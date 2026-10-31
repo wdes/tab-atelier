@@ -323,7 +323,7 @@ fn parse_client(body: &serde_json::Value) -> Option<Client> {
 /// ships a new date when the tool changes; hardcoding today's would leave the
 /// badge silently absent the day `web_search_20260209` arrives, which is the
 /// exact failure a label is supposed to make visible.
-fn server_tool(body: &serde_json::Value) -> Option<String> {
+pub(crate) fn server_tool(body: &serde_json::Value) -> Option<String> {
     body.get("tools")?
         .as_array()?
         .iter()

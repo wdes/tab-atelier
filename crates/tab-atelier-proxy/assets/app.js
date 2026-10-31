@@ -156,6 +156,21 @@ function emptyUsage(id) {
  * app chrome, not a chart, and charts.js is wrapped in an IIFE so its names
  * never reach this scope to collide with.
  */
+/** A blank row, so the editor opens with somewhere to type. */
+function blankRoute() {
+    return { from: "", kind: "", from_provider: "", tool: "", to_model: "", to_provider: "" };
+}
+/** A stored route as a draft row. */
+function draftFrom(r) {
+    return {
+        from: r.from ?? "",
+        kind: r.kind ?? "",
+        from_provider: r.from_provider ?? "",
+        tool: r.tool ?? "",
+        to_model: r.to_model,
+        to_provider: r.to_provider ?? "",
+    };
+}
 const BusyButton = Vue.defineComponent({
     name: "BusyButton",
     props: {
@@ -237,6 +252,11 @@ const AdminApp = Vue.defineComponent({
             providers: null,
             newMapping: { from: "", to: "", note: "" },
             tools: null,
+            // The route editor. Opened from the row, saved per row rather than whole:
+            // each route is validated on its own — an unknown destination or provider
+            // is refused for that rule — so there is no combination state to protect,
+            // unlike the tools editor.
+            routes: null,
             // "Weight" is the scheduler's word for this and means nothing to anyone
             // reading a table of people. The stored value is still a weight — the
             // API and the QoS maths are unchanged — but the UI names what it does.
@@ -785,6 +805,79 @@ const AdminApp = Vue.defineComponent({
             }
             catch (e) {
                 this.error = e instanceof Error ? e.message : String(e);
+            }
+            finally {
+                this.busy = false;
+            }
+        },
+        // ── model routes ─────────────────────────────────────────────────────
+        //
+        // Routes are "when this account's traffic matches these conditions, serve
+        // that instead". Opened from a row, saved one rule at a time: each rule is
+        // validated on its own by the server, so unlike the tools editor there is no
+        // combination to protect and no reason to hold a whole set hostage to one bad
+        // row.
+        openRoutes(u) {
+            this.routes = {
+                id: u.id,
+                rows: [...(u.routes ?? []).map(draftFrom), blankRoute()],
+            };
+        },
+        addRouteRow() {
+            if (this.routes)
+                this.routes.rows.push(blankRoute());
+        },
+        removeRouteRow(i) {
+            if (this.routes)
+                this.routes.rows.splice(i, 1);
+        },
+        /**
+         * Save one row.
+         *
+         * Empty destination removes the rule those conditions identify — the same
+         * convention the model pin uses for clearing, so the operator does not have
+         * to learn a second verb to undo what they just did.
+         */
+        async saveRoute(i) {
+            if (!this.routes)
+                return;
+            const row = this.routes.rows[i];
+            // `noUncheckedIndexedAccess`: an index into an array is not proof of an
+            // element. Saving a row that has been removed under the click is nothing
+            // to do, not a crash.
+            if (!row)
+                return;
+            // Captured now, because the editor may be closed before the request
+            // returns and `this.routes` would then be null.
+            const accountId = this.routes.id;
+            const payload = {
+                from: row.from.trim(),
+                kind: row.kind.trim(),
+                from_provider: row.from_provider.trim(),
+                tool: row.tool.trim(),
+                to_model: row.to_model.trim(),
+                to_provider: row.to_provider.trim() || null,
+            };
+            this.busy = true;
+            try {
+                const updated = await api.users.setRoute(accountId, payload);
+                // Re-read the stored rules rather than trusting the draft: the server
+                // canonicalises both ends, so what came back is what a request will
+                // actually match against. Skipped if the editor was closed while the
+                // request was in flight — the save still happened, the form is just gone.
+                const editor = this.routes;
+                if (editor && editor.id === accountId) {
+                    editor.rows = [...(updated.routes ?? []).map(draftFrom), blankRoute()];
+                }
+                this.error = "";
+                await this.refresh();
+            }
+            catch (e) {
+                this.error = e instanceof Error ? e.message : String(e);
+                // The draft is kept on failure: a refused rule is usually one field away
+                // from a good one, and clearing the form would make the operator retype
+                // it to find out which.
+                await this.refresh();
             }
             finally {
                 this.busy = false;

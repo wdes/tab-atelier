@@ -86,9 +86,41 @@ interface ApiKey {
  * is blocked the request fails rather than quietly using a provider this person
  * was routed away from.
  */
-interface ModelRoute {
-    /** The model id this account asks for. Matched exactly. */
+/**
+ * One row of the route editor, as text.
+ *
+ * Every field is a string because every field is an input: the operator types,
+ * clears and retypes, and a half-typed provider name must not be coerced to
+ * something else mid-edit. Empty means "this condition is not set", which is the
+ * convention the server uses too.
+ *
+ * Declared here rather than beside the component because `AppState` refers to
+ * it, and this file's shapes are global while `app.ts` is a module.
+ */
+interface DraftRoute {
     from: string;
+    kind: string;
+    from_provider: string;
+    tool: string;
+    to_model: string;
+    to_provider: string;
+}
+
+interface ModelRoute {
+    /** The model id this account asks for. Absent matches any model. */
+    from?: string | null;
+    /**
+     * Which traffic the rule is about: `work` or `classifier` (auto mode).
+     *
+     * Absent means work only, so a rule that does not name it never moves the
+     * auto-mode judgement — that call carries Anthropic's security-monitor
+     * prompt to whoever serves it.
+     */
+    kind?: "work" | "classifier" | null;
+    /** Only traffic that would otherwise have gone to this provider. */
+    from_provider?: string | null;
+    /** Only traffic declaring this server-side tool (`web_search`, `web_fetch`). */
+    tool?: string | null;
     /** The model id served instead. */
     to_model: string;
     /** The provider to serve it from, or absent for whichever one does. */
@@ -691,6 +723,13 @@ interface AppState {
     form: { first_name: string; last_name: string; email: string };
     freshKey: FreshKey | null;
     copied: boolean;
+    /**
+     * The route editor, when open.
+     *
+     * Per row rather than a whole set: each rule is validated on its own by the
+     * server, so one bad destination must not hold the others hostage.
+     */
+    routes: { id: string; rows: DraftRoute[] } | null;
     error: string;
     busy: boolean;
     /**

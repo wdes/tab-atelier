@@ -518,16 +518,73 @@ provider is unreachable **normal routing applies instead**. That is what stops a
 cost-control measure from becoming an outage the first time the far end
 rate-limits.
 
-**Per person** — an account's own routes, for one account:
+**Per person** — an account's own routes, for one account. A route is a set of
+**conditions** plus a destination. Every condition present must match; one left
+out matches anything, and at least one is required (a rule with none would catch
+every request in the system).
+
+| condition | matches |
+|---|---|
+| a model id | requests for that model |
+| `--kind` | `work`, or `classifier` (alias `auto`) |
+| `--from-provider` | traffic that would otherwise have gone to that provider |
+| `--tool` | traffic declaring that server-side tool (`web_search`, `web_fetch`) |
+
+All of it is reachable from the dashboard: **Routes** on an account row opens an
+editor with these conditions as columns, one rule per row, saved individually —
+each rule is validated on its own, so one bad destination does not hold the rest
+hostage.
 
 ```sh
+# one model, wherever it would go
 sudo -u tab-atelier-proxy tab-atelier-proxy route ada@example.org claude-opus-5-5 gpt-5.6-luna
-# from another provider, and only from that one:
+
+# ...from a named provider, and only that one
 sudo -u tab-atelier-proxy tab-atelier-proxy route ada@example.org claude-opus-5-5 \
      gpt-5.6-luna --provider aider
-# remove it
-sudo -u tab-atelier-proxy tab-atelier-proxy route ada@example.org claude-opus-5-5 ""
+
+# every auto-mode judgement, to one provider and model
+sudo -u tab-atelier-proxy tab-atelier-proxy route ada@example.org "" claude-haiku-5-5 \
+     --provider aider --kind auto
+
+# only the judgements that were heading for Anthropic
+sudo -u tab-atelier-proxy tab-atelier-proxy route ada@example.org "" claude-haiku-5-5 \
+     --provider aider --kind auto --from-provider anthropic
+
+# search traffic somewhere else, without moving the conversation that asked for it
+sudo -u tab-atelier-proxy tab-atelier-proxy route ada@example.org "" deepseek-flash \
+     --tool web_search --provider deepseek
+
+# anything at all bound for Anthropic
+sudo -u tab-atelier-proxy tab-atelier-proxy route ada@example.org "" claude-haiku-5-5 \
+     --provider aider --from-provider anthropic
+
+# remove one — same conditions, empty destination
+sudo -u tab-atelier-proxy tab-atelier-proxy route ada@example.org "" "" --kind auto
 ```
+
+`--tool` matches the tool's *family*, not its versioned type, so a rule written
+today keeps applying when Anthropic moves `web_search_20250305` to a new date —
+the same normalisation the usage badge relies on. That matters here for the same
+reason: a rule pinned to a date silently stops firing, and a routing rule that
+stops firing is an outage nobody can see.
+
+`--from-provider` is why routes are applied **after** the ordinary routing
+decision: it selects traffic by where it *would have gone*, which is not known
+until routing has answered. A route then rewrites that answer, at most once, so
+routes cannot chain or cycle.
+
+**The auto-mode judge is never moved by a rule that does not name it.** A route
+without `--kind` applies to work traffic only. The classifier call carries
+Anthropic's security-monitor prompt, relayed verbatim to whoever serves it, which
+is the same reason global mappings refuse to retarget it — a route may, but only
+by saying `--kind auto` out loud.
+
+Routes are stored in the order they were written and the first match wins, so
+order is how one rule is made to take precedence over another. Two routes are
+"the same rule" — and so replace rather than stack — when their conditions
+match, not when their model does: "all classifier traffic" and "Anthropic's
+classifier traffic" are different rules and coexist.
 
 A per-person route is a **pin**, and is the one thing that overrules that
 person's provider pin — which is otherwise absolute. That exception is the whole

@@ -239,6 +239,7 @@ pub(crate) fn pick_route(
     requested: &str,
     kind: classifier::Kind,
     health: &dyn Fn(&str) -> routing::Health,
+    server_tool: Option<&str>,
 ) -> Option<routing::Route> {
     let pin = account.model.as_deref();
     // The host state the decision reads, gathered once: the environment, and
@@ -255,36 +256,14 @@ pub(crate) fn pick_route(
     // spawn failure a long way from here. Taken only for the decision.
     let registry = state.registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
-    // A per-person route for this exact name outranks BOTH pins. It is the one
-    // deliberate exception to the provider pin being absolute, because it is
-    // the only way to say "this person on this provider, except this model" —
-    // see `users::Account::routes`.
+    // Phase one: the ordinary decision — mapping, pin, class ladder, preference.
     //
-    // Checked before the model pin too: a route names the model asked for, so
-    // it is the more specific of the two instructions.
-    if let Some(route) = account.route_for(requested) {
-        return routing::choose_exact(
-            &registry,
-            &route.to_model,
-            // The route's own provider when it names one; otherwise anywhere
-            // that serves the model — NOT the account's pin, which this route
-            // is explicitly allowed to leave.
-            route.to_provider.as_deref(),
-            kind,
-            health,
-            host,
-            now,
-        )
-        .map(|mut chosen| {
-            // Distinguished from a plain pin in the response headers: an
-            // operator debugging "why is Alice on DeepSeek" needs to know it
-            // was her route rather than a reroute or a degrade.
-            chosen.reason = Some("routed");
-            chosen
-        });
-    }
-
-    pin.map_or_else(
+    // Routes are applied to this answer rather than instead of it, because two of
+    // their conditions describe traffic by *where it would have gone*: a route
+    // restricted to `from_provider = anthropic` means "whatever routing sends to
+    // Anthropic, except this", and there is nothing to compare until routing has
+    // decided.
+    let base = pin.map_or_else(
         || {
             routing::choose(
                 &registry,
@@ -297,7 +276,47 @@ pub(crate) fn pick_route(
             )
         },
         |pin| routing::choose_exact(&registry, pin, account.provider.as_deref(), kind, health, host, now),
-    )
+    );
+
+    // Phase two: at most one rewrite. Matched against what phase one chose, so a
+    // route can select by model, by kind (the auto-mode judgement), and by the
+    // provider the request was heading for.
+    //
+    // Runs even when phase one chose nothing, so a route can rescue traffic that
+    // would otherwise 503 — "these requests go here" is a complete routing
+    // instruction and needs no help from the pin.
+    //
+    // `kind` is passed through and `users::ModelRoute::matches` refuses to move
+    // the classifier unless the route named it: see that method for why the
+    // auto-mode judge is the one kind a route must ask for by name.
+    if let Some(route) = account.route_matching(
+        requested,
+        kind,
+        base.as_ref().map(|r| r.provider_id.as_str()),
+        server_tool,
+    ) {
+        return routing::choose_exact(
+            &registry,
+            &route.to_model,
+            // The route's own provider when it names one; otherwise anywhere that
+            // serves the model — NOT the account's pin, which a route is
+            // explicitly allowed to leave.
+            route.to_provider.as_deref(),
+            kind,
+            health,
+            host,
+            now,
+        )
+        .map(|mut chosen| {
+            // Distinguished from a plain pin in the response headers: an operator
+            // debugging "why is Alice on DeepSeek" needs to know it was her route
+            // rather than a reroute or a degrade.
+            chosen.reason = Some("routed");
+            chosen
+        });
+    }
+
+    base
 }
 
 /// Why no provider could take a request, in the words of the ones configured to.
@@ -395,7 +414,12 @@ pub(crate) async fn shape_and_admit(
     // fast model is cheapest would quietly serve a different vendor than the
     // one they chose.
     let pin = account.model.as_deref();
-    let Some(mut route) = pick_route(state, account, &requested, kind, &health) else {
+    // What server-side tool the caller declared, if any — routing asks because a
+    // rule may select on it: search traffic can go somewhere other than the
+    // conversation that requested it. Already parsed above, so this costs a walk
+    // of a value that is in hand.
+    let server_tool = parsed.as_ref().and_then(inspect::server_tool);
+    let Some(mut route) = pick_route(state, account, &requested, kind, &health, server_tool.as_deref()) else {
         // Nothing configured can serve this at any class. A guess would be
         // worse than saying so.
         return Err(text(503, &no_route_message(state)));

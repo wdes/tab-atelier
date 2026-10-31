@@ -85,30 +85,77 @@ pub fn set_model(who: &str, model: &str) -> Result<(), String> {
 /// # Errors
 /// No such account, an unknown destination model or provider, a provider that
 /// does not serve the destination, or the file could not be written.
-pub fn set_route(who: &str, from: &str, to: &str, provider: Option<&str>) -> Result<(), String> {
+pub fn set_route(
+    who: &str,
+    from: &str,
+    to: &str,
+    provider: Option<&str>,
+    kind: Option<&str>,
+    from_provider: Option<&str>,
+) -> Result<(), String> {
     let mut s = store()?;
     let from = from.trim();
     let to = to.trim();
-    if from.is_empty() {
-        return Err("name the model this account asks for".to_owned());
+
+    // The kind names which traffic the rule is about. `auto` is accepted because
+    // that is what the feature is called where the operator met it — in Claude
+    // Code's own UI.
+    let kind = match kind.map(|k| k.trim().to_ascii_lowercase()).as_deref() {
+        None | Some("") => None,
+        Some("work") => Some(tab_atelier_proxy::classifier::Kind::Work),
+        Some("classifier" | "auto" | "auto_mode") => Some(tab_atelier_proxy::classifier::Kind::Classifier),
+        Some(other) => {
+            return Err(format!("kind {other} is not work or classifier (alias: auto)"));
+        }
+    };
+    let from_provider = from_provider.map(str::trim).filter(|p| !p.is_empty());
+
+    // At least one condition, or the rule matches everything.
+    if !to.is_empty() && from.is_empty() && kind.is_none() && from_provider.is_none() {
+        return Err(
+            "give at least one of a model, --kind or --from-provider, or the rule matches everything".to_owned(),
+        );
+    }
+
+    let path = config_dir()?.join("providers.json");
+    let reg = tab_atelier_proxy::provider::Registry::load(&path);
+
+    // A source provider has to exist, or the rule matches nothing — the same trap
+    // as a route that never fires.
+    if let Some(id) = from_provider {
+        reg.get(id)
+            .ok_or_else(|| format!("no provider {id} in {}", path.display()))?;
     }
 
     if to.is_empty() {
-        let a = s.remove_route(who, from).map_err(|e| e.to_string())?;
-        println!("{} <{}> — no route for {from}", a.display_name(), a.email);
+        let removal = tab_atelier_proxy::users::ModelRoute {
+            from: (!from.is_empty()).then(|| from.to_owned()),
+            kind,
+            from_provider: from_provider.map(str::to_owned),
+            // The CLI predates the tool condition and the dashboard is the
+            // supported way to set it; a CLI flag for it is not worth the
+            // surface. See `POST /api/users/<account>/route`.
+            tool: None,
+            to_model: String::new(),
+            to_provider: None,
+            note: None,
+        };
+        let a = s.remove_route(who, &removal).map_err(|e| e.to_string())?;
+        println!("{} <{}> — no such route", a.display_name(), a.email);
         return Ok(());
     }
-    if from.eq_ignore_ascii_case(to) {
+    if let Some(src) = from_provider {
+        let _ = src;
+    }
+    if from.eq_ignore_ascii_case(to) && from_provider.is_none() && kind.is_none() {
         return Err("a route to the same model changes nothing".to_owned());
     }
 
     // Both ends resolved against the catalogue here, where the registry is in
     // hand, for the same reason the model pin is: routing matches by EXACT id,
     // so a route stored in the case it arrived would be a 503 nobody could
-    // explain. `from` keeps the operator's spelling when the catalogue has
-    // never heard of it — catching traffic for a retired id is a real use.
-    let path = config_dir()?.join("providers.json");
-    let reg = tab_atelier_proxy::provider::Registry::load(&path);
+    // explain. `from` keeps the operator's spelling when the catalogue has never
+    // heard of it — catching traffic for a retired id is a real use.
     let to_model = reg
         .canonical_model(to)
         .ok_or_else(|| format!("{} in {}", reg.refuses_model(to), path.display()))?
@@ -125,24 +172,53 @@ pub fn set_route(who: &str, from: &str, to: &str, provider: Option<&str>) -> Res
             Some(id.to_owned())
         }
     };
-    let from = reg.canonical_model(from).map_or_else(|| from.to_owned(), str::to_owned);
+    let from = (!from.is_empty()).then(|| reg.canonical_model(from).map_or_else(|| from.to_owned(), str::to_owned));
 
     let route = tab_atelier_proxy::users::ModelRoute {
-        from: from.clone(),
+        from,
+        kind,
+        from_provider: from_provider.map(str::to_owned),
+        tool: None,
         to_model: to_model.clone(),
         to_provider: to_provider.clone(),
         note: None,
     };
-    let a = s.set_route(who, route).map_err(|e| e.to_string())?;
+    let a = s.set_route(who, route.clone()).map_err(|e| e.to_string())?;
+
+    // Say what the rule actually covers, because "a route" is too vague to check:
+    // the operator needs to see that they did not accidentally catch everything.
+    let scope = describe_scope(&route);
     match to_provider {
-        None => println!("{} <{}> — {from} is served as {to_model}", a.display_name(), a.email),
+        None => println!("{} <{}> — {scope} is served as {to_model}", a.display_name(), a.email),
         Some(p) => println!(
-            "{} <{}> — {from} is served as {to_model} on {p}",
+            "{} <{}> — {scope} is served as {to_model} on {p}",
             a.display_name(),
             a.email
         ),
     }
     Ok(())
+}
+
+/// A route's conditions, in words, for the confirmation line.
+fn describe_scope(route: &tab_atelier_proxy::users::ModelRoute) -> String {
+    let mut parts = Vec::new();
+    if let Some(from) = route.from.as_deref() {
+        parts.push(format!("requests for {from}"));
+    }
+    // `None` and `Work` are the same scope: an unnamed kind means work only.
+    match route.kind {
+        Some(tab_atelier_proxy::classifier::Kind::Classifier) => {
+            parts.push("auto-mode judgements".to_owned());
+        }
+        _ => parts.push("work traffic".to_owned()),
+    }
+    if let Some(tool) = route.tool.as_deref() {
+        parts.push(format!("using {tool}"));
+    }
+    if let Some(provider) = route.from_provider.as_deref() {
+        parts.push(format!("bound for {provider}"));
+    }
+    parts.join(", ")
 }
 
 /// How often to ask Anthropic how much of the plan has been used.

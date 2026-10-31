@@ -84,6 +84,15 @@ class ApiClient {
             setModel: (id, model) => this.request("POST", `/api/users/${seg(id)}/model`, { model }),
             setCompact: (id, compact) => this.request("POST", `/api/users/${seg(id)}/compact`, { compact }),
             setTools: (id, policy) => this.request("POST", `/api/users/${seg(id)}/tools`, policy),
+            /**
+             * Add, replace or remove one of this person's model routes.
+             *
+             * An empty `to_model` removes the route identified by the conditions.
+             * The server canonicalises both ends and refuses an unknown destination,
+             * so a route that reaches the store is one that can actually be served.
+             */
+            setRoute: (id, route) => this.request("POST", `/api/users/${seg(id)}/route`, route)
+                .then((r) => r.user),
         };
         this.keys = {
             add: (id, name) => this.request("POST", `/api/users/${seg(id)}/keys`, { name }),

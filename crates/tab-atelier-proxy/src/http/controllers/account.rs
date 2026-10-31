@@ -141,10 +141,45 @@ pub(crate) fn set_route(
     let from = req.from.trim();
     let to_model = req.to_model.trim();
 
-    // Empty destination removes the route, mirroring an empty model pin.
+    // The kind decides which traffic this rule is about. `auto` is accepted
+    // because that is what the feature is called where the operator met it.
+    let kind = match req.kind.trim().to_ascii_lowercase().as_str() {
+        "" => None,
+        "work" => Some(crate::classifier::Kind::Work),
+        "classifier" | "auto" | "auto_mode" => Some(crate::classifier::Kind::Classifier),
+        other => {
+            return Err(failure(
+                400,
+                &format!("kind: {other} is not work or classifier (alias: auto)"),
+            ));
+        }
+    };
+
+    // The tool the rule selects on, if any. Normalised to the family for the
+    // same reason `inspect::server_tool` is: a rule pinned to
+    // `web_search_20250305` would stop applying the day the version moves.
+    let tool = match req.tool.trim().to_ascii_lowercase().as_str() {
+        "" => None,
+        "web_search" | "web_search_20250305" | "web_search_20260209" => Some("web_search".to_owned()),
+        "web_fetch" => Some("web_fetch".to_owned()),
+        other => {
+            return Err(failure(400, &format!("tool: {other} is not web_search or web_fetch")));
+        }
+    };
+
+    // Empty destination removes the route that these conditions identify.
     if to_model.is_empty() {
+        let removal = users::ModelRoute {
+            from: (!from.is_empty()).then(|| from.to_owned()),
+            kind,
+            from_provider: Some(req.from_provider.trim().to_owned()).filter(|p| !p.is_empty()),
+            tool,
+            to_model: String::new(),
+            to_provider: None,
+            note: None,
+        };
         let mut store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        return match store.remove_route(who, from) {
+        return match store.remove_route(who, &removal) {
             Ok(a) => Ok(Doc::ok(resources::AccountEnvelope::from(&a))),
             Err(e) => Err(failure(404, &e.to_string())),
         };
@@ -155,6 +190,13 @@ pub(crate) fn set_route(
         let Some(to) = reg.canonical_model(to_model).map(str::to_owned) else {
             return Err(failure(400, &reg.refuses_model(to_model)));
         };
+        // A source provider has to exist: a rule restricted to a provider that is
+        // not configured matches nothing, which is the same trap as a route that
+        // never fires.
+        let from_provider = Some(req.from_provider.trim().to_owned()).filter(|p| !p.is_empty());
+        if let Some(id) = from_provider.as_deref().filter(|id| reg.get(id).is_none()) {
+            return Err(failure(400, &format!("no provider {id}")));
+        }
         // A named provider has to exist AND serve the destination, or the route
         // is a 503 waiting to happen the next time this person sends anything.
         let to_provider = match req.to_provider.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
@@ -167,16 +209,21 @@ pub(crate) fn set_route(
                 Some(_) => Some(id.to_owned()),
             },
         };
-        // The source keeps the operator's spelling when the catalogue has never
-        // heard of it; see the note above.
-        let from = reg.canonical_model(from).map_or_else(|| from.to_owned(), str::to_owned);
+        // Resolved while the guard is still held, then released. Both ends use the
+        // registry, so this has to be before the drop rather than inline in the
+        // struct below.
+        let from_model =
+            (!from.is_empty()).then(|| reg.canonical_model(from).map_or_else(|| from.to_owned(), str::to_owned));
         // The guard has done its work. Released here rather than at the end of the
         // block so the registry lock is not held across the store write below —
         // two locks in one function, and taking the second while holding the first
         // is how a lock-order bug gets written.
         drop(reg);
         users::ModelRoute {
-            from,
+            from: from_model,
+            kind,
+            from_provider,
+            tool,
             to_model: to,
             to_provider,
             note: req
@@ -537,9 +584,37 @@ mod tests {
     fn route(from: &str, to: &str, provider: Option<&str>) -> SetRoute {
         SetRoute {
             from: from.to_owned(),
+            kind: String::new(),
+            from_provider: String::new(),
+            tool: String::new(),
             to_model: to.to_owned(),
             to_provider: provider.map(str::to_owned),
             note: None,
+        }
+    }
+
+    /// A route with conditions of the caller's choosing, for the finer-grained
+    /// cases — `kind` and `from_provider` are the whole point of them.
+    fn cond_route(from: &str, kind: &str, from_provider: &str, to: &str, provider: Option<&str>) -> SetRoute {
+        SetRoute {
+            from: from.to_owned(),
+            kind: kind.to_owned(),
+            from_provider: from_provider.to_owned(),
+            tool: String::new(),
+            to_model: to.to_owned(),
+            to_provider: provider.map(str::to_owned),
+            note: None,
+        }
+    }
+
+    /// A route selecting on a server-side tool, which is how search traffic is
+    /// sent somewhere other than the conversation that asked for it.
+    fn tool_route(from: &str, tool: &str, to: &str) -> SetRoute {
+        SetRoute {
+            from: from.to_owned(),
+            tool: tool.to_owned(),
+            to_model: to.to_owned(),
+            ..cond_route("", "", "", to, None)
         }
     }
 
@@ -568,14 +643,14 @@ mod tests {
 
         let routes = routes_of(&state, "route-store@example.com");
         assert_eq!(routes.len(), 1);
-        assert_eq!(routes[0].from, "claude-opus-5-5");
+        assert_eq!(routes[0].from.as_deref(), Some("claude-opus-5-5"));
         assert_eq!(routes[0].to_model, "deepseek-flash");
         assert_eq!(routes[0].to_provider.as_deref(), Some("deepseek"));
     }
 
     /// Setting the same `from` twice edits the route instead of stacking one.
     ///
-    /// `route_for` takes the first match, so a second route for the same source
+    /// the conditions are the identity, so a second route for the same source
     /// would be dead weight that no one could see the effect of — and the
     /// operator, seeing two entries, would reasonably conclude the second wins.
     #[test]
@@ -671,6 +746,8 @@ mod tests {
 
         // And a route that names nothing is refused, because `from` is its key.
         assert!(route("", "deepseek-flash", None).validate().is_err());
+        // But a `from` is not the only way to satisfy that rule.
+        assert!(cond_route("", "auto", "", "deepseek-flash", None).validate().is_ok());
 
         // A real route passes.
         assert!(route("claude-opus-5-5", "deepseek-flash", None).validate().is_ok());
@@ -697,8 +774,214 @@ mod tests {
 
         let routes = &reloaded.find(who).expect("the account").routes;
         assert_eq!(routes.len(), 1);
-        assert_eq!(routes[0].from, "claude-opus-5-5");
+        assert_eq!(routes[0].from.as_deref(), Some("claude-opus-5-5"));
         assert_eq!(routes[0].to_provider.as_deref(), Some("deepseek"));
+    }
+
+    // ── route conditions through the endpoint ───────────────────────────────
+
+    /// `auto` is accepted where the operator meets the feature by that name.
+    ///
+    /// Claude Code's UI calls it auto mode; the internal kind is `classifier`.
+    /// Accepting both spellings is not politeness — a rule written with a name
+    /// the tool rejects is a rule that does not get written.
+    #[test]
+    fn the_kind_accepts_auto_as_a_spelling_of_classifier() {
+        let state = state_with_deepseek("route-alias", "route-alias@example.com");
+        let who = "route-alias@example.com";
+
+        for spelling in ["auto", "classifier", "auto_mode", "AUTO"] {
+            let reply = set_route(
+                &state,
+                who,
+                &cond_route("", spelling, "", "deepseek-flash", Some("deepseek")),
+            );
+            assert_eq!(answered(&reply), 200, "{spelling} should be accepted");
+        }
+
+        // All four spellings are the same rule, so they replace one another
+        // rather than stacking four identical entries.
+        let routes = routes_of(&state, who);
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].kind, Some(crate::classifier::Kind::Classifier));
+    }
+
+    /// An unknown kind is refused rather than silently treated as work.
+    ///
+    /// Guessing here would be the worst outcome: a typo that quietly produced a
+    /// work-only rule would leave the auto-mode judge moving when the operator
+    /// meant to contain it, or the reverse.
+    #[test]
+    fn an_unknown_kind_is_refused() {
+        let state = state_with_deepseek("route-kind-bad", "route-kind-bad@example.com");
+
+        let reply = set_route(
+            &state,
+            "route-kind-bad@example.com",
+            &cond_route("", "classifer", "", "deepseek-flash", None),
+        );
+
+        assert_eq!(answered(&reply), 400);
+    }
+
+    /// A rule with no conditions at all is refused.
+    ///
+    /// It would match every request in the system — including the auto-mode
+    /// judge — which is a provider pin plus a model pin wearing a rule's clothes,
+    /// and a typo away from the exact leak the kind rule prevents.
+    #[test]
+    fn a_rule_with_no_conditions_is_refused() {
+        // At the boundary, where the rule is enforced. `accept` is what a real
+        // request goes through; a controller call does not, so asserting here
+        // would pass while the check sat unused — the mistake this file has made
+        // once already.
+        use crate::http::requests::Validated as _;
+
+        assert!(cond_route("", "", "", "deepseek-flash", None).validate().is_err());
+
+        // Any one condition is enough to make it a rule.
+        assert!(cond_route("", "auto", "", "deepseek-flash", None).validate().is_ok());
+        assert!(
+            cond_route("claude-opus-5-5", "", "", "deepseek-flash", None)
+                .validate()
+                .is_ok()
+        );
+        assert!(
+            cond_route("", "", "anthropic", "deepseek-flash", None)
+                .validate()
+                .is_ok()
+        );
+
+        // Removing a route has no conditions to require: the empty destination
+        // plus whatever identifies it is the whole instruction.
+        assert!(cond_route("", "", "", "", None).validate().is_ok());
+    }
+
+    /// A `from_provider` that is not configured is refused.
+    ///
+    /// A rule restricted to a provider that does not exist matches nothing —
+    /// configured, visible, and dead. That is the same trap as a route that
+    /// never fires, and it is checkable here.
+    #[test]
+    fn an_unknown_source_provider_is_refused() {
+        let state = state_with_deepseek("route-src-bad", "route-src-bad@example.com");
+
+        let reply = set_route(
+            &state,
+            "route-src-bad@example.com",
+            &cond_route("", "auto", "nowhere", "deepseek-flash", None),
+        );
+
+        assert_eq!(answered(&reply), 400);
+    }
+
+    /// Two rules differing only in their conditions coexist.
+    ///
+    /// The end-to-end version of the `key` test: "all auto-mode traffic" and
+    /// "Anthropic's auto-mode traffic" are different rules, and writing the
+    /// second must not replace the first.
+    #[test]
+    fn rules_that_differ_only_in_conditions_coexist() {
+        let state = state_with_deepseek("route-coexist", "route-coexist@example.com");
+        let who = "route-coexist@example.com";
+
+        set_route(
+            &state,
+            who,
+            &cond_route("", "auto", "", "deepseek-flash", Some("deepseek")),
+        )
+        .expect("the general rule is valid");
+        set_route(
+            &state,
+            who,
+            &cond_route("", "auto", "anthropic", "deepseek-flash", Some("deepseek")),
+        )
+        .expect("the narrower rule is valid");
+
+        let routes = routes_of(&state, who);
+        assert_eq!(routes.len(), 2, "two rules, not one replacing the other");
+        assert_eq!(routes[0].from_provider, None, "the general rule survives");
+        assert_eq!(routes[1].from_provider.as_deref(), Some("anthropic"));
+    }
+
+    /// A model-only route still stores the kind as unset, which is what keeps it
+    /// off the classifier.
+    #[test]
+    fn a_model_only_route_leaves_the_kind_unset() {
+        let state = state_with_deepseek("route-modelonly", "route-modelonly@example.com");
+        let who = "route-modelonly@example.com";
+
+        set_route(&state, who, &route("claude-opus-5-5", "deepseek-flash", None)).expect("the route is valid");
+
+        let routes = routes_of(&state, who);
+        assert_eq!(routes[0].kind, None, "unset means work only");
+        assert_eq!(routes[0].from.as_deref(), Some("claude-opus-5-5"));
+    }
+
+    // ── the tool condition ──────────────────────────────────────────────────
+
+    /// A route can select on the server-side tool a request declares.
+    ///
+    /// This is what lets search traffic be routed on its own: to a provider that
+    /// runs it more cheaply, or to one that supports it at all, without moving
+    /// the conversation that asked for it.
+    #[test]
+    fn a_route_can_select_on_a_server_tool() {
+        let state = state_with_deepseek("route-tool", "route-tool@example.com");
+        let who = "route-tool@example.com";
+
+        let reply = set_route(&state, who, &tool_route("", "web_search", "deepseek-flash"));
+
+        assert_eq!(answered(&reply), 200);
+        let routes = routes_of(&state, who);
+        assert_eq!(routes[0].tool.as_deref(), Some("web_search"));
+        // A tool-only rule has no model condition: it catches search from any
+        // model, which is the point of routing search separately.
+        assert_eq!(routes[0].from, None);
+        assert_eq!(routes[0].kind, None, "and it stays off the classifier");
+    }
+
+    /// A versioned tool type is normalised to its family.
+    ///
+    /// The type Anthropic sends carries a date (`web_search_20250305`). A rule
+    /// stored with the date would stop applying when the version moves, so the
+    /// family is what is kept — the same normalisation the usage badge relies on.
+    #[test]
+    fn a_versioned_tool_type_is_stored_as_its_family() {
+        let state = state_with_deepseek("route-tool-ver", "route-tool-ver@example.com");
+        let who = "route-tool-ver@example.com";
+
+        set_route(&state, who, &tool_route("", "web_search_20260209", "deepseek-flash"))
+            .expect("a versioned type is accepted");
+
+        assert_eq!(routes_of(&state, who)[0].tool.as_deref(), Some("web_search"));
+    }
+
+    /// An unknown tool is refused rather than stored as a rule that never fires.
+    #[test]
+    fn an_unknown_tool_is_refused() {
+        let state = state_with_deepseek("route-tool-bad", "route-tool-bad@example.com");
+
+        let reply = set_route(
+            &state,
+            "route-tool-bad@example.com",
+            &tool_route("", "web_crawl", "deepseek-flash"),
+        );
+
+        assert_eq!(answered(&reply), 400);
+    }
+
+    /// A tool rule and a model rule for the same model coexist: they select
+    /// different traffic.
+    #[test]
+    fn a_tool_rule_does_not_replace_an_unrelated_rule() {
+        let state = state_with_deepseek("route-tool-co", "route-tool-co@example.com");
+        let who = "route-tool-co@example.com";
+
+        set_route(&state, who, &route("claude-opus-5-5", "deepseek-flash", None)).expect("the model rule is valid");
+        set_route(&state, who, &tool_route("", "web_search", "deepseek-flash")).expect("the tool rule is valid");
+
+        assert_eq!(routes_of(&state, who).len(), 2);
     }
 
     // ── compaction ──────────────────────────────────────────────────────────

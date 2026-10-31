@@ -79,6 +79,24 @@ interface UsersApi {
   setModel(id: string, model: string): Promise<ApiUser>;
   setCompact(id: string, compact: string): Promise<ApiUser>;
   setTools(id: string, policy: ToolsPolicy): Promise<ApiUser>;
+  /**
+   * Add, replace or remove one of this person's model routes.
+   *
+   * An empty `to_model` removes the rule the conditions identify. Both ends are
+   * canonicalised server-side and an unknown destination is refused, so a rule
+   * that reaches the store is one that can actually be served.
+   */
+  setRoute(
+    id: string,
+    route: {
+      from: string;
+      kind: string;
+      from_provider: string;
+      tool: string;
+      to_model: string;
+      to_provider: string | null;
+    },
+  ): Promise<ApiUser>;
 }
 
 /** The endpoints that act on an account's keys. */
@@ -168,6 +186,16 @@ class ApiClient {
       setCompact: (id, compact) =>
         this.request("POST", `/api/users/${seg(id)}/compact`, { compact }),
       setTools: (id, policy) => this.request("POST", `/api/users/${seg(id)}/tools`, policy),
+      /**
+       * Add, replace or remove one of this person's model routes.
+       *
+       * An empty `to_model` removes the route identified by the conditions.
+       * The server canonicalises both ends and refuses an unknown destination,
+       * so a route that reaches the store is one that can actually be served.
+       */
+      setRoute: (id, route) =>
+        this.request<{ user: ApiUser }>("POST", `/api/users/${seg(id)}/route`, route)
+          .then((r) => r.user),
     };
 
     this.keys = {

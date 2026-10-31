@@ -422,16 +422,62 @@ pub struct Account {
     pub routes: Vec<ModelRoute>,
 }
 
-/// One per-person model route: asked-for name in, destination out.
+/// One per-person model route: match conditions in, destination out.
 ///
-/// Both halves are optional in the way that matters: `to_provider` may be left
-/// out to mean "wherever serves `to_model`", which is what a route that only
-/// changes the model needs. `to_model` is required — a route that renames
-/// nothing is not a route.
+/// A route is a set of **conditions** and a destination. Every condition that is
+/// present must match; a condition left out matches anything. So:
+///
+/// ```text
+/// from = claude-opus-5-5                     that one model, wherever it would go
+/// kind = classifier                          every auto-mode judgement
+/// kind = classifier, from_provider = anthropic   only Anthropic's judgements
+/// from_provider = anthropic                   anything bound for Anthropic
+/// ```
+///
+/// At least one condition is required — a route with none matches every request
+/// and is a configuration mistake dressed as a rule.
+///
+/// ## Applied as a rewrite, after the ordinary decision
+///
+/// The conditions `kind` and `from_provider` describe traffic by where it *would
+/// have gone*, so routing resolves normally first and the route is applied to
+/// that answer. Still at most one rewrite — a route's destination is a
+/// destination, not another name to resolve — so routes cannot chain or cycle.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, tab_atelier_api::schemars::JsonSchema)]
 pub struct ModelRoute {
-    /// The model id this account asks for, matched exactly.
-    pub from: String,
+    /// The model id asked for, matched exactly, or `None` for any model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    /// The kind of traffic — work, or the auto-mode judgement.
+    ///
+    /// **The classifier is only retargeted when a route says so.** A route that
+    /// does not name a kind applies to work alone, because moving the auto-mode
+    /// judge is a different decision with a consequence the work case does not
+    /// have: the judge carries Anthropic's security-monitor prompt, relayed
+    /// verbatim to whoever serves it. `classifier::Kind::retargets_by_mapping`
+    /// refuses that for global mappings; a route may do it, but only by naming
+    /// `classifier` explicitly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<crate::classifier::Kind>,
+    /// The provider the request would otherwise have gone to.
+    ///
+    /// The only condition that depends on the ordinary decision, which is why
+    /// routes are applied after it. This is how "Anthropic's traffic is fine,
+    /// except send Anthropic's judgements elsewhere" is said.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_provider: Option<String>,
+    /// A server-side tool the request declares — `web_search` or `web_fetch`.
+    ///
+    /// Reads the tool's *family*, not its versioned type, so a rule written for
+    /// `web_search` survives the next `web_search_2026xxxx` revision. That is the
+    /// same normalisation `inspect::server_tool` does for the usage badge, and for
+    /// the same reason: hardcoding a date is how a rule silently stops applying.
+    ///
+    /// This is what lets search traffic be routed on its own — to a provider that
+    /// runs it more cheaply, or to one that supports it at all — without moving
+    /// the conversation that asked for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
     /// The model id to serve instead.
     pub to_model: String,
     /// The provider to serve it from, or `None` for whichever one does.
@@ -445,16 +491,104 @@ pub struct ModelRoute {
     pub note: Option<String>,
 }
 
-impl Account {
-    /// The route this account has for `requested`, if any.
+impl ModelRoute {
+    /// Whether this route applies to a request.
     ///
-    /// Exact match on `from`, first wins. Case-insensitive, because the write
-    /// path canonicalises against the catalogue but a hand-edited `users.json`
-    /// is a thing that happens and a route that silently does not apply is
-    /// worse than one that applies to a differently-cased name.
+    /// `base_provider` is the provider the ordinary decision chose, or `None`
+    /// when it chose nothing — in which case a `from_provider` condition cannot
+    /// be satisfied, because there is no "would have gone" to compare.
+    ///
+    /// The kind rule is the subtle one and is stated here rather than at the
+    /// call site so it cannot be forgotten there: **an unnamed kind means work
+    /// only.** The auto-mode judge is never moved by a route that did not ask
+    /// for it.
     #[must_use]
-    pub fn route_for(&self, requested: &str) -> Option<&ModelRoute> {
-        self.routes.iter().find(|r| r.from.eq_ignore_ascii_case(requested))
+    pub fn matches(
+        &self,
+        requested: &str,
+        kind: crate::classifier::Kind,
+        base_provider: Option<&str>,
+        server_tool: Option<&str>,
+    ) -> bool {
+        // Every condition is "absent, or satisfied" — written as one chain so
+        // the AND is visible instead of being spread over early returns.
+        //
+        // A tool condition is satisfied only by a request declaring that tool: a
+        // route that names no tool does not care what the request declares, which
+        // is what keeps an ordinary rule an ordinary rule.
+        let tool_ok = self
+            .tool
+            .as_deref()
+            .is_none_or(|wanted| server_tool.is_some_and(|t| t.eq_ignore_ascii_case(wanted)));
+
+        // Unnamed kind means work only. See the field docs.
+        let kind_ok = self
+            .kind
+            .map_or_else(|| kind == crate::classifier::Kind::Work, |wanted| wanted == kind);
+
+        let from_ok = self
+            .from
+            .as_deref()
+            .is_none_or(|from| from.eq_ignore_ascii_case(requested));
+
+        let provider_ok = self
+            .from_provider
+            .as_deref()
+            .is_none_or(|provider| base_provider.is_some_and(|b| b.eq_ignore_ascii_case(provider)));
+
+        tool_ok && kind_ok && from_ok && provider_ok
+    }
+
+    /// Whether any condition is set, which is what makes it a rule.
+    #[must_use]
+    pub const fn has_condition(&self) -> bool {
+        self.from.is_some() || self.kind.is_some() || self.from_provider.is_some() || self.tool.is_some()
+    }
+
+    /// A stable identity for "the same rule", for replacing on write.
+    ///
+    /// The conditions together, not `from` alone: two routes that differ only in
+    /// kind or source provider are different rules, and one must not overwrite
+    /// the other. Rendered as a string so it can be used as a map key.
+    #[must_use]
+    pub fn key(&self) -> String {
+        format!(
+            "{}|{}|{}|{}",
+            self.from.as_deref().map(str::to_ascii_lowercase).unwrap_or_default(),
+            match self.kind {
+                Some(crate::classifier::Kind::Work) => "work",
+                Some(crate::classifier::Kind::Classifier) => "classifier",
+                None => "",
+            },
+            self.from_provider
+                .as_deref()
+                .map(str::to_ascii_lowercase)
+                .unwrap_or_default(),
+            self.tool.as_deref().map(str::to_ascii_lowercase).unwrap_or_default(),
+        )
+    }
+}
+
+impl Account {
+    /// The first route that applies to a request, if any.
+    ///
+    /// First match wins, in the order the operator wrote them, so ordering is the
+    /// way to make one route take precedence over another. Conditions are
+    /// compared case-insensitively: the write path canonicalises against the
+    /// catalogue, but a hand-edited `users.json` is a thing that happens and a
+    /// route that silently does not apply is worse than one that applies to a
+    /// differently-cased name.
+    #[must_use]
+    pub fn route_matching(
+        &self,
+        requested: &str,
+        kind: crate::classifier::Kind,
+        base_provider: Option<&str>,
+        server_tool: Option<&str>,
+    ) -> Option<&ModelRoute> {
+        self.routes
+            .iter()
+            .find(|r| r.matches(requested, kind, base_provider, server_tool))
     }
 }
 
@@ -944,7 +1078,7 @@ impl Store {
     ///
     /// Replaces by `from`, case-insensitively, so setting the same source twice
     /// edits the route rather than stacking a second one that the first would
-    /// always shadow — `route_for` takes the first match.
+    /// always shadow — `route_matching` takes the first match.
     ///
     /// Validation of the destination belongs to the caller, as with
     /// [`Self::set_provider`]: this module knows about people, not about where
@@ -963,11 +1097,13 @@ impl Store {
             .iter_mut()
             .find(|a| a.id == id)
             .ok_or_else(|| Error::NotFound(who.to_owned()))?;
-        if let Some(existing) = account
-            .routes
-            .iter_mut()
-            .find(|r| r.from.eq_ignore_ascii_case(&route.from))
-        {
+        // Replaced on the CONDITIONS, not on `from` alone. Two routes differing
+        // only in kind or source provider are different rules — replacing one
+        // with the other would make "all classifier traffic" silently overwrite
+        // "Anthropic's classifier traffic", and the operator would be left with
+        // a rule that does more than they asked.
+        let key = route.key();
+        if let Some(existing) = account.routes.iter_mut().find(|r| r.key() == key) {
             *existing = route;
         } else {
             account.routes.push(route);
@@ -978,14 +1114,14 @@ impl Store {
         Ok(out)
     }
 
-    /// Remove the route for `from`, if there is one.
+    /// Remove a route by its conditions.
     ///
     /// Returns the account either way: removing a route that was not there
     /// leaves the operator where they wanted to be, so it is not an error.
     ///
     /// # Errors
     /// No such account, or the file could not be written.
-    pub fn remove_route(&mut self, who: &str, from: &str) -> Result<Account, Error> {
+    pub fn remove_route(&mut self, who: &str, route: &ModelRoute) -> Result<Account, Error> {
         let id = self
             .find(who)
             .ok_or_else(|| Error::NotFound(who.to_owned()))?
@@ -996,7 +1132,8 @@ impl Store {
             .iter_mut()
             .find(|a| a.id == id)
             .ok_or_else(|| Error::NotFound(who.to_owned()))?;
-        account.routes.retain(|r| !r.from.eq_ignore_ascii_case(from));
+        let key = route.key();
+        account.routes.retain(|r| r.key() != key);
         let out = account.clone();
         self.reindex();
         self.save()?;
@@ -1199,6 +1336,174 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- route conditions ---------------------------------------------------
+    //
+    // `matches` is the rule that decides whose traffic a route moves, and the
+    // interesting cases are the ones an operator would write and then be
+    // surprised by. Asserted directly rather than through routing: the point is
+    // the matching, not the destination.
+
+    fn route(from: Option<&str>, kind: Option<crate::classifier::Kind>, from_provider: Option<&str>) -> ModelRoute {
+        ModelRoute {
+            from: from.map(str::to_owned),
+            kind,
+            from_provider: from_provider.map(str::to_owned),
+            tool: None,
+            to_model: "claude-haiku-5-5".to_owned(),
+            to_provider: None,
+            note: None,
+        }
+    }
+
+    /// **An unnamed kind means work only.**
+    ///
+    /// This is the safety rule the whole two-phase design exists to make
+    /// expressible and safe: a route that does not mention the auto-mode judge
+    /// must not move it, because that call carries Anthropic's security-monitor
+    /// prompt to whoever serves it. A cost-saving rule written as "everything to
+    /// the cheap provider" would otherwise quietly ship the judge.
+    #[test]
+    fn a_route_without_a_kind_never_moves_the_classifier() {
+        let r = route(None, None, None);
+
+        assert!(r.matches(
+            "claude-opus-5-5",
+            crate::classifier::Kind::Work,
+            Some("anthropic"),
+            None
+        ));
+        assert!(!r.matches(
+            "claude-opus-5-5",
+            crate::classifier::Kind::Classifier,
+            Some("anthropic"),
+            None
+        ));
+    }
+
+    /// Naming the classifier moves the classifier and nothing else.
+    ///
+    /// The other half of the same rule: an operator who asks for the judge's
+    /// traffic to be rerouted means the judge, not their ordinary work.
+    #[test]
+    fn a_route_for_the_classifier_does_not_move_work() {
+        let r = route(None, Some(crate::classifier::Kind::Classifier), None);
+
+        assert!(r.matches(
+            "claude-opus-5-5",
+            crate::classifier::Kind::Classifier,
+            Some("anthropic"),
+            None
+        ));
+        assert!(!r.matches(
+            "claude-opus-5-5",
+            crate::classifier::Kind::Work,
+            Some("anthropic"),
+            None
+        ));
+    }
+
+    /// `from_provider` selects by where the request would have gone.
+    ///
+    /// The condition that made routing two-phase: there is nothing to compare
+    /// until the ordinary decision has named a provider.
+    #[test]
+    fn a_source_provider_narrows_the_route_to_that_provider() {
+        let r = route(None, Some(crate::classifier::Kind::Classifier), Some("anthropic"));
+
+        assert!(r.matches("x", crate::classifier::Kind::Classifier, Some("anthropic"), None));
+        assert!(!r.matches("x", crate::classifier::Kind::Classifier, Some("deepseek"), None));
+        // Nothing chosen means no "would have gone" to compare, so a route
+        // restricted to a source provider cannot match.
+        assert!(!r.matches("x", crate::classifier::Kind::Classifier, None, None));
+    }
+
+    /// Conditions are `AND`ed, and an absent one matches anything.
+    ///
+    /// The composition rule, asserted once in full rather than inferred from the
+    /// individual cases above.
+    #[test]
+    fn conditions_are_combined_with_and() {
+        let r = route(
+            Some("claude-opus-5-5"),
+            Some(crate::classifier::Kind::Classifier),
+            Some("anthropic"),
+        );
+
+        assert!(r.matches(
+            "claude-opus-5-5",
+            crate::classifier::Kind::Classifier,
+            Some("anthropic"),
+            None
+        ));
+        assert!(!r.matches(
+            "claude-sonnet-5-5",
+            crate::classifier::Kind::Classifier,
+            Some("anthropic"),
+            None
+        ));
+        assert!(!r.matches(
+            "claude-opus-5-5",
+            crate::classifier::Kind::Work,
+            Some("anthropic"),
+            None
+        ));
+        assert!(!r.matches(
+            "claude-opus-5-5",
+            crate::classifier::Kind::Classifier,
+            Some("deepseek"),
+            None
+        ));
+    }
+
+    /// Comparisons ignore case, because a hand-edited `users.json` happens.
+    #[test]
+    fn conditions_match_case_insensitively() {
+        let r = route(Some("CLAUDE-OPUS-5-5"), None, Some("ANTHROPIC"));
+
+        assert!(r.matches(
+            "claude-opus-5-5",
+            crate::classifier::Kind::Work,
+            Some("anthropic"),
+            None
+        ));
+    }
+
+    /// A route with no conditions is not a rule, and is detected as such so the
+    /// write paths can refuse it.
+    ///
+    /// Without this, an empty rule matches every request in the system,
+    /// including the classifier — a typo away from the exact failure the kind
+    /// rule exists to prevent.
+    #[test]
+    fn a_route_with_no_conditions_is_not_a_rule() {
+        assert!(!route(None, None, None).has_condition());
+        assert!(route(Some("m"), None, None).has_condition());
+        assert!(route(None, Some(crate::classifier::Kind::Work), None).has_condition());
+        assert!(route(None, None, Some("p")).has_condition());
+    }
+
+    /// Two routes differ when their conditions differ, even on the same model.
+    ///
+    /// `key` is what decides replacement. Keying on `from` alone would make
+    /// "all classifier traffic" overwrite "Anthropic's classifier traffic", and
+    /// the operator would be left with a rule doing more than they asked.
+    #[test]
+    fn the_key_separates_routes_that_differ_only_in_conditions() {
+        let model_only = route(Some("m"), None, None);
+        let classifier_only = route(None, Some(crate::classifier::Kind::Classifier), None);
+        let from_anthropic = route(None, None, Some("anthropic"));
+
+        let keys = [model_only.key(), classifier_only.key(), from_anthropic.key()];
+        let unique: std::collections::HashSet<_> = keys.iter().collect();
+        assert_eq!(unique.len(), 3, "three different rules, three different keys");
+
+        // And the same conditions produce the same key, whatever their case.
+        assert_eq!(
+            route(Some("M"), None, Some("Anthropic")).key(),
+            route(Some("m"), None, Some("anthropic")).key(),
+        );
+    }
 
     /// Minimal scratch dir — the crate carries no dev-dependencies and a
     /// unique path plus cleanup on drop is all a test needs from one.

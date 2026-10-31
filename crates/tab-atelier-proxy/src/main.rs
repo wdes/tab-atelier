@@ -112,6 +112,19 @@ enum Command {
         /// Serve it from this provider, or anywhere that has it.
         #[arg(long)]
         provider: Option<String>,
+        /// Which traffic this rule is about: `work` or `classifier` (alias `auto`).
+        ///
+        /// Left out means work only. The auto-mode judgement is never moved by a
+        /// rule that did not name it, because that call carries Anthropic's
+        /// security-monitor prompt to whoever serves it.
+        #[arg(long)]
+        kind: Option<String>,
+        /// Only traffic that was heading for this provider.
+        ///
+        /// The one condition that depends on the ordinary routing decision, which
+        /// is why rules are applied after it.
+        #[arg(long = "from-provider")]
+        from_provider: Option<String>,
     },
     /// Install a Claude login copied from a machine that can run `claude`.
     ///
@@ -158,7 +171,16 @@ fn run() -> Result<(), String> {
             from,
             to,
             provider,
-        } => cli::set_route(&who, &from, &to, provider.as_deref()),
+            kind,
+            from_provider,
+        } => cli::set_route(
+            &who,
+            &from,
+            &to,
+            provider.as_deref(),
+            kind.as_deref(),
+            from_provider.as_deref(),
+        ),
         Command::Remove { who } => cli::remove_account(&who),
         Command::ImportCredentials { from } => cli::import_credentials(from.as_deref()),
     }

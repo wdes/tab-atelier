@@ -73,9 +73,28 @@ impl Validated for PinModel {
 /// a second verb to undo what they just did.
 #[derive(Debug, Default, serde::Deserialize, tab_atelier_api::schemars::JsonSchema)]
 pub struct SetRoute {
-    /// The model id this account asks for.
+    /// The model id this account asks for, or empty for any model.
+    ///
+    /// One of the three conditions. A route with none of them would match every
+    /// request, which is a configuration mistake rather than a rule.
     #[serde(default)]
     pub from: String,
+    /// Which traffic: `work`, or `classifier` (also accepted: `auto`).
+    ///
+    /// Empty means work only — the auto-mode judgement is never moved by a route
+    /// that did not name it.
+    #[serde(default)]
+    pub kind: String,
+    /// Only reroute traffic that was heading for this provider.
+    #[serde(default)]
+    pub from_provider: String,
+    /// Only reroute traffic that declares this server-side tool.
+    ///
+    /// `web_search` or `web_fetch`. A versioned type is accepted and normalised
+    /// to the family, so a rule written today keeps applying when the version
+    /// moves.
+    #[serde(default)]
+    pub tool: String,
     /// The model id to serve instead, or empty to remove the route.
     #[serde(default)]
     pub to_model: String,
@@ -89,10 +108,16 @@ pub struct SetRoute {
 
 impl Validated for SetRoute {
     fn validate(&self) -> Result<(), String> {
-        // `from` is the key: without it there is nothing to file the route
-        // under, and an empty one would match an empty request model.
-        if self.from.trim().is_empty() {
-            return Err("from: name the model this account asks for".to_owned());
+        // At least one condition, or the rule matches everything — which a
+        // provider pin plus a model pin already expresses, and which as a route
+        // would silently swallow every request including the auto-mode judge.
+        let removing = self.to_model.trim().is_empty();
+        if !removing
+            && self.from.trim().is_empty()
+            && self.kind.trim().is_empty()
+            && self.from_provider.trim().is_empty()
+        {
+            return Err("route: give at least one of from, kind or from_provider, or it matches everything".to_owned());
         }
         // A route to the same name is a no-op that looks like a configured
         // one, which is worse than a refusal — the operator would believe
