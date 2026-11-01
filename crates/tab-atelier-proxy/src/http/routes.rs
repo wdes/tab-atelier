@@ -51,7 +51,9 @@ use crate::http::requests::inspect::ArmInspect;
 use crate::http::requests::key::{AddKey, SetKeyDisabled};
 use crate::http::requests::mapping::AddMapping;
 use crate::http::requests::provider::{RotateProviderKey, SaveProvider};
-use crate::http::requests::user::{AddUser, PinModel, PinProvider, SetDisabled, SetRoute, SetTools, SetWeight};
+use crate::http::requests::user::{
+    AddUser, PinModel, PinProvider, SetDisabled, SetKind, SetRoute, SetTools, SetWeight,
+};
 use crate::server::State as AppState;
 use crate::transport::{Doc, Reply};
 use rocket::http::Method;
@@ -254,6 +256,21 @@ pub(crate) fn set_user_model(
     body: Json<PinModel>,
 ) -> Result<crate::transport::Doc<crate::http::resources::AccountEnvelope>, crate::transport::Failure> {
     account::set_model(state, account, &body.0)
+}
+
+/// Declare what kind of traffic this account produces.
+///
+/// The only way to reach `plan`, which no request field identifies; an empty
+/// `kind` clears it. See `account::set_kind`.
+#[openapi]
+#[post("/api/users/<account>/kind", data = "<body>")]
+pub(crate) fn set_user_kind(
+    state: &State<Arc<AppState>>,
+    _admin: Admin,
+    account: &str,
+    body: Json<SetKind>,
+) -> Result<crate::transport::Doc<crate::http::resources::AccountEnvelope>, crate::transport::Failure> {
+    account::set_kind(state, account, &body.0)
 }
 
 /// Add, replace or remove one of this account's per-person model routes.
@@ -590,6 +607,7 @@ pub fn all_and_spec() -> (Vec<Route>, tab_atelier_api::rocket_okapi::okapi::open
         set_user_provider,
         set_user_model,
         set_user_route,
+        set_user_kind,
         set_user_compact,
         set_user_tools,
         add_key,

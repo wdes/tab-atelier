@@ -79,6 +79,8 @@ interface UsersApi {
   setModel(id: string, model: string): Promise<ApiUser>;
   setCompact(id: string, compact: string): Promise<ApiUser>;
   setTools(id: string, policy: ToolsPolicy): Promise<ApiUser>;
+  /** Declares the account's kind, or clears it with "". See `setKind`. */
+  setKind(id: string, kind: string): Promise<ApiUser>;
   /**
    * Add, replace or remove one of this person's model routes.
    *
@@ -186,6 +188,16 @@ class ApiClient {
       setCompact: (id, compact) =>
         this.request("POST", `/api/users/${seg(id)}/compact`, { compact }),
       setTools: (id, policy) => this.request("POST", `/api/users/${seg(id)}/tools`, policy),
+      /**
+       * Declare what kind of traffic this account produces, or clear it with "".
+       *
+       * The only way to reach `plan`: no request field identifies plan mode, so
+       * an operator saying which account does their planning is the honest
+       * arrangement rather than a body-level guess.
+       */
+      setKind: (id, kind) =>
+        this.request<{ user: ApiUser }>("POST", `/api/users/${seg(id)}/kind`, { kind })
+          .then((r) => r.user),
       /**
        * Add, replace or remove one of this person's model routes.
        *

@@ -85,6 +85,15 @@ class ApiClient {
             setCompact: (id, compact) => this.request("POST", `/api/users/${seg(id)}/compact`, { compact }),
             setTools: (id, policy) => this.request("POST", `/api/users/${seg(id)}/tools`, policy),
             /**
+             * Declare what kind of traffic this account produces, or clear it with "".
+             *
+             * The only way to reach `plan`: no request field identifies plan mode, so
+             * an operator saying which account does their planning is the honest
+             * arrangement rather than a body-level guess.
+             */
+            setKind: (id, kind) => this.request("POST", `/api/users/${seg(id)}/kind`, { kind })
+                .then((r) => r.user),
+            /**
              * Add, replace or remove one of this person's model routes.
              *
              * An empty `to_model` removes the route identified by the conditions.

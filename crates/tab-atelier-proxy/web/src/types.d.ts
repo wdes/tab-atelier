@@ -433,6 +433,11 @@ interface Capture {
     /** The model actually requested upstream, not necessarily the one asked for. */
     model?: string;
     /**
+     * Every request from this account treated as this kind, whatever its body
+     * looks like. The only way to reach `plan`, which no request field identifies.
+     */
+    kind_override?: "work" | "classifier" | "plan" | null;
+    /**
      * Which client session sent this, unpacked from the body's `metadata`.
      *
      * Client-supplied and unauthenticated: it groups and explains, and must

@@ -86,6 +86,11 @@ pub(crate) struct AccountResource {
     /// chooses the hop that serves it. This is also what makes a model
     /// selectable per person, since routing resolves the id to a provider.
     pub model: Option<String>,
+    /// Every request from this account treated as this kind, whatever it looks
+    /// like — the only way to reach `plan`, which no request field identifies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(default)]
+    pub kind_override: Option<crate::classifier::Kind>,
     /// This person's model routes: "when they ask for X, serve Y".
     ///
     /// The one thing that overrules [`Self::provider`], so a row showing a
@@ -123,6 +128,7 @@ impl From<&users::Account> for AccountResource {
             weight: a.weight,
             provider: a.provider.clone(),
             model: a.model.clone(),
+            kind_override: a.kind_override,
             routes: a.routes.clone(),
             compact: a.compact.as_str(),
             tools: a.tools.clone(),
@@ -506,6 +512,7 @@ mod tests {
         let a = users::Account {
             provider: None,
             model: None,
+            kind_override: None,
             routes: Vec::new(),
             compact: crate::compact::Compact::None,
             tools: crate::tools::Policy::default(),

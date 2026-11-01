@@ -526,7 +526,7 @@ every request in the system).
 | condition | matches |
 |---|---|
 | a model id | requests for that model |
-| `--kind` | `work`, or `classifier` (alias `auto`) |
+| `--kind` | `work`, `classifier` (alias `auto`), or `plan` |
 | `--from-provider` | traffic that would otherwise have gone to that provider |
 | `--tool` | traffic declaring that server-side tool (`web_search`, `web_fetch`) |
 
@@ -562,6 +562,33 @@ sudo -u tab-atelier-proxy tab-atelier-proxy route ada@example.org "" claude-haik
 # remove one — same conditions, empty destination
 sudo -u tab-atelier-proxy tab-atelier-proxy route ada@example.org "" "" --kind auto
 ```
+
+### Plan mode is declared, not detected
+
+`--kind plan` selects plan-mode traffic, but **nothing in a request identifies
+plan mode**, so the kind comes from the account rather than from the body:
+
+```
+Routes → Traffic kind → plan mode          (dashboard, per account)
+POST /api/users/<account>/kind  {"kind":"plan"}
+```
+
+Why it cannot be detected: the authoritative marker is `permissionMode`, which is
+client-side state that never reaches a request. The obvious body-level proxy — a
+plan tool in `tools[]` — does not work either: `EnterPlanMode` and `ExitPlanMode`
+are two of the 17 harness tools Claude Code declares in **every** request, because
+tool definitions sit in the stable prompt prefix for cache reasons and the harness
+enforces plan mode rather than removing tools.
+
+An earlier version keyed on `ExitPlanMode` and was removed before it shipped into
+use: it matched every Claude Code request, so every request would have been
+classified as plan and any rule written for plan traffic would have caught
+everything — sending real, writing work to whatever cheap model plan mode pointed
+at. If a reliable wire signal appears later, that is where it goes, with a test
+asserting the false-positive direction first.
+
+Because the declaration is per account, it cannot leak between accounts, and
+clearing it (`"kind": ""`) returns that account to ordinary body classification.
 
 `--tool` matches the tool's *family*, not its versioned type, so a rule written
 today keeps applying when Anthropic moves `web_search_20250305` to a new date —

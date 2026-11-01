@@ -84,10 +84,16 @@ pub enum Kind {
     /// without changing what the agent produces — and plan mode is often the
     /// largest share of a session's thinking.
     ///
-    /// Detected from the declared tools (see [`is_plan`]), which is a heuristic
-    /// and is documented as one there. A missed plan call is routed as ordinary
-    /// work, which is exactly today's behaviour; a false positive would send real
-    /// work to the cheap model, so the detector is deliberately narrow.
+    /// **Never detected — declared per account.** No field in a request body
+    /// identifies plan mode: the authoritative marker is `permissionMode`, which
+    /// is client-side state that never reaches a request, and the plan tools are
+    /// declared in every request regardless of mode (see [`kind_of`]).
+    ///
+    /// So this kind arises only from `Account::kind_override`, which is an
+    /// operator saying so. That is the honest arrangement rather than a stopgap:
+    /// a detector that guessed would fail in the direction that costs both money
+    /// and correctness — ordinary, writing traffic sent to whatever cheap model
+    /// plan mode was pointed at.
     Plan,
 }
 
@@ -166,54 +172,31 @@ pub fn is_classifier(body: &serde_json::Value) -> bool {
     verdict_terminated || mentions_monitor_prompt(body)
 }
 
-/// Name of the tool Claude Code declares while plan mode is active.
-///
-/// `ExitPlanMode` is how the agent leaves the phase, so it is declared when — and
-/// only when — there is a plan mode to leave. `EnterPlanMode` is *not* used as a
-/// signal: it is the tool for asking to enter, and is available outside plan mode
-/// by construction.
-const PLAN_TOOL: &str = "ExitPlanMode";
-
-/// Whether this request is Claude Code in plan mode.
-///
-/// ## This is a heuristic, and deliberately a narrow one
-///
-/// The authoritative marker is `permissionMode`, which is client-side state and
-/// never appears in a request body. What the wire carries is the tool list, and
-/// `ExitPlanMode` appears in it exactly while the phase is active.
-///
-/// The two failure directions are not symmetric, which is what decides the
-/// narrowness: a **missed** plan call is routed as ordinary work — precisely
-/// today's behaviour, nothing regresses — while a **false positive** would send
-/// real, writing traffic to whatever cheap model plan mode was pointed at. So
-/// this matches a declared tool by exact name and nothing else: no system-prompt
-/// substring, no guessing from message content. If a real capture later shows a
-/// stronger and stable marker, it belongs here, behind the same test.
-#[must_use]
-pub fn is_plan(body: &serde_json::Value) -> bool {
-    body.get("tools")
-        .and_then(serde_json::Value::as_array)
-        .is_some_and(|tools| {
-            tools.iter().any(|tool| {
-                tool.get("name")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|name| name == PLAN_TOOL)
-            })
-        })
-}
-
 /// Which kind of traffic this request is.
 ///
-/// Ordered so the positive identifications win: the classifier is recognised by
-/// an unmistakable string that no other caller emits, and is checked first
-/// because a classifier body is minimal and would not otherwise be mistaken for
-/// plan mode — but the ordering makes that explicit rather than incidental.
+/// ## Plan mode is deliberately NOT detected here
+///
+/// It was, via `ExitPlanMode` in the declared tools, and **that detector was
+/// wrong**: `docs/proxy-tools.md` measures a real Claude Code request and lists
+/// `EnterPlanMode` and `ExitPlanMode` among the 17 harness tools that are
+/// declared in *every* request — 4,011 B of description for `EnterPlanMode`
+/// alone. Tool definitions live in the stable prompt prefix for cache reasons, so
+/// they cannot vary by permission mode; the harness enforces plan mode, it does
+/// not remove tools from the list.
+///
+/// So the tool was present in every body, every request classified as plan mode,
+/// and any rule written for plan traffic would have caught everything. That is
+/// the dangerous direction: a false positive sends real, writing traffic to
+/// whatever cheap model plan mode was pointed at.
+///
+/// There is no verified wire signal for plan mode. `permissionMode`, which is
+/// authoritative, is client-side state that never reaches a request. Until a real
+/// capture shows something better, plan mode is *declared per account* instead —
+/// see `Account::kind_override` — which is honest about who decided.
 #[must_use]
 pub fn kind_of(body: &serde_json::Value) -> Kind {
     if is_classifier(body) {
         Kind::Classifier
-    } else if is_plan(body) {
-        Kind::Plan
     } else {
         Kind::Work
     }
@@ -238,50 +221,44 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    // --- plan mode ---------------------------------------------------------
-    //
-    // The authoritative marker is `permissionMode`, which never reaches the wire.
-    // What the wire carries is the tool list, so these tests pin down exactly
-    // which tool is the signal and — more importantly — which one is not.
-
     fn with_tools(names: &[&str]) -> serde_json::Value {
         json!({ "tools": names.iter().map(|n| json!({ "name": n })).collect::<Vec<_>>() })
     }
 
-    /// Plan mode is recognised by the tool that leaves it.
-    #[test]
-    fn plan_mode_is_detected_from_the_declared_tool() {
-        assert!(is_plan(&with_tools(&["Bash", "Read", "ExitPlanMode"])));
-    }
+    // --- plan mode is NOT detectable from the body ---------------------------
+    //
+    // These assert the invariant that disproved the first implementation, so it
+    // cannot be reintroduced by someone reading only the kind's name.
 
-    /// `EnterPlanMode` is NOT the signal.
+    /// The plan tools are declared in EVERY request, so they are not a signal.
     ///
-    /// It is the tool for *asking* to enter the phase, so it is declared outside
-    /// plan mode by construction — treating it as the marker would classify every
-    /// ordinary request as plan mode, and a false positive sends real work to
-    /// whatever cheap model plan mode was pointed at. That is the asymmetric
-    /// failure this detector is narrow to avoid.
+    /// `docs/proxy-tools.md` measures a real Claude Code body: `EnterPlanMode`
+    /// (4,011 B of description) and `ExitPlanMode` are two of the 17 harness tools
+    /// present regardless of permission mode — tool definitions sit in the stable
+    /// prompt prefix, so they cannot vary by mode without breaking the cache, and
+    /// the harness enforces plan mode rather than removing tools.
+    ///
+    /// An earlier `is_plan` keyed on `ExitPlanMode`. It matched every Claude Code
+    /// request, so every request was classified as plan mode and any rule written
+    /// for plan traffic would have caught all of it.
     #[test]
-    fn enter_plan_mode_is_not_the_signal() {
-        assert!(!is_plan(&with_tools(&["Bash", "EnterPlanMode"])));
+    fn the_plan_tools_are_not_a_plan_mode_signal() {
+        let ordinary = with_tools(&["Bash", "Read", "Edit", "EnterPlanMode", "ExitPlanMode"]);
+
+        assert_eq!(
+            kind_of(&ordinary),
+            Kind::Work,
+            "a normal request declaring both plan tools is still ordinary work",
+        );
     }
 
-    /// A body with no tools at all is not plan mode, and does not crash.
+    /// signals is judged by the one that actually identifies it.
     #[test]
-    fn a_body_without_tools_is_not_plan_mode() {
-        assert!(!is_plan(&json!({})));
-        assert!(!is_plan(&json!({ "tools": [] })));
-        assert!(!is_plan(&json!({ "tools": "not an array" })));
-    }
-
-    /// The classifier is identified first, so a body that somehow carried both
-    /// signals is judged by the safer of the two.
-    #[test]
-    fn the_classifier_takes_precedence_over_plan_mode() {
+    fn the_classifier_is_identified_even_beside_the_plan_tools() {
         let both = json!({
             "stop_sequences": ["</severity>"],
             "system": [{ "type": "text", "text": "You are a security monitor." }],
-            "tools": [{ "name": "ExitPlanMode" }],
+            "tools": [{ "name": "EnterPlanMode" }, { "name": "ExitPlanMode" }],
         });
 
         assert_eq!(kind_of(&both), Kind::Classifier);

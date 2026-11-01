@@ -66,6 +66,31 @@ impl Validated for PinModel {
     }
 }
 
+/// Declaring what kind of traffic an account produces.
+///
+/// `kind` empty clears the override. The values are the same spellings routes
+/// accept — `work`, `classifier`/`auto`, `plan`/`plan_mode` — so one vocabulary
+/// covers both.
+#[derive(Debug, Default, serde::Deserialize, tab_atelier_api::schemars::JsonSchema)]
+pub struct SetKind {
+    #[serde(default)]
+    pub kind: String,
+}
+
+impl Validated for SetKind {
+    fn validate(&self) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn accept(body: &bytes::Bytes) -> Result<Self, Rejection> {
+        // Parsed and validated at the boundary, like every other request here:
+        // `validate` is a hook nothing calls unless `accept` does.
+        let parsed: Self = super::parse(body)?;
+        parsed.validate().map_err(|why| Rejection::field("kind", &why))?;
+        Ok(parsed)
+    }
+}
+
 /// Adding or replacing one of an account's per-person model routes.
 ///
 /// `to_model` empty means "delete the route for `from`", mirroring how an empty
