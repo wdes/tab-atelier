@@ -6,7 +6,7 @@
 # going, and falling back to the newest successful run otherwise.
 #
 #     RUN_ID=$(scripts/ci-artifact-run.sh arch-pkg.yml)
-#     RUN_ID=$(scripts/ci-artifact-run.sh windows-msi.yml 0)   # never wait
+#     RUN_ID=$(scripts/ci-artifact-run.sh arch-pkg.yml 0)      # never wait
 #
 # Needs GH_TOKEN and GITHUB_REPOSITORY in the environment. Prints the id on
 # stdout (empty if there is nothing usable) and its reasoning on stderr.
@@ -25,7 +25,8 @@
 # long one, ~15 min). That is the price of publishing the commit you just
 # pushed rather than the one before it.
 #
-# NOT EVERY WORKFLOW RUNS ON EVERY PUSH — windows-msi is tag-only. When no run
+# NOT EVERY WORKFLOW RUNS ON EVERY PUSH — a tag-only workflow has no run for a
+# commit on main. When no run
 # exists for this commit there is nothing to wait for, so we fall straight back
 # to the newest successful run and the MSI keeps being republished as-is.
 set -euo pipefail

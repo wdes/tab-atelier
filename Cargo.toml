@@ -99,10 +99,8 @@ required-features = ["headless"]
 [features]
 default = ["gui", "energy", "catbus", "pets"]
 # Desktop GUI build: gpui + x11rb (hotkeys + screenshot) + qrcode.
-# Does NOT pull `catbus` — the GUI uses catbus on Linux, but a Windows
-# desktop build must drop it (catbus_agent uses AF_UNIX + /proc).
-# `catbus` is in the `default` feature instead, so Linux builds keep it
-# while `--no-default-features --features gui` on Windows omits it.
+# Does NOT pull `catbus` — that is in `default` instead, so the GUI alone stays
+# usable without the per-tab Claude session detection.
 gui = ["dep:gpui", "dep:x11rb", "dep:qrcode"]
 # Desktop-only "screen mate" — eSheep-compatible pets (the Mini Owl, rainbow
 # sheep, Blue Ham Ham) whose sprite sheets + animation XML are shipped in the
@@ -117,8 +115,8 @@ energy = ["dep:wattaouille"]
 # catbus-agent integration: per-tab Claude session detection (walks
 # /proc), token-usage sidecars, and the `/tabs/N/catbus*` API endpoints
 # that talk to the agent over a UNIX socket. Hard Linux dependency
-# (/proc + AF_UNIX), so it's a separate feature that the Windows build
-# leaves off. Implied by `gui`; included in the Linux headless .deb.
+# (/proc + AF_UNIX), so it is a separate feature. Implied by `gui`;
+# included in the headless .deb.
 catbus = []
 # EXPERIMENTAL HTTP/3 + WebTransport transport (quinn-based, via
 # wtransport). Default-OFF so the normal build + .deb pull none of the
@@ -180,8 +178,7 @@ alacritty_terminal = "0.26"
 polling = "3"
 env_logger = "0.11"
 # gpui's windowing backend is platform-specific, so it's declared in the
-# per-target tables below (x11 feature on Linux; the auto-selected
-# Windows backend with no feature on Windows) rather than here.
+# per-target table below (the x11 feature on Linux) rather than here.
 log = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -292,34 +289,12 @@ chrono-tz = { version = "0.10", default-features = false, features = ["std"] }
 gpui = { version = "0.2", default-features = false, features = ["x11", "test-support"] }
 tempfile = "3"
 
-# Windows has no /dev/urandom; getrandom wraps BCryptGenRandom so
-# platform::random_bytes() has a real CSPRNG. Already present
-# transitively (rand, uuid) — gated to Windows so the Linux dep graph
-# is untouched.
+# Declared directly rather than relied on transitively (rand, uuid pull it in),
+# so `platform::random_bytes()` has a stated source of randomness rather than an
+# incidental one.
 # gpui with the X11 backend — Linux desktop build only.
 [target.'cfg(target_os = "linux")'.dependencies]
 gpui = { version = "0.2", default-features = false, features = ["x11"], optional = true }
-
-[target.'cfg(windows)'.dependencies]
-# getrandom 0.4 renamed `getrandom()` → `fill()` and dropped the
-# alloc feature gate. Tracked under src/platform/windows.rs which
-# uses the new API. Held at the current minor (0.4.x picks up
-# patches automatically).
-getrandom = "0.4"
-# SCM integration so the installed MSI can run the daemon as a Windows
-# service (no console window). The crate's FFI dispatcher macro needs
-# `unsafe`, confined to src/win_service.rs via an explicit allow.
-#
-# Held at 0.6 — the 0.7 / 0.8 jumps both renamed types in
-# `windows_service::service::*` and the dispatcher macro signature.
-# Bumping needs a manual sweep of src/win_service.rs against the
-# 0.7 changelog (ServiceControlAccept → ServiceAccept rename
-# among others). Tracking issue: next windows-service review.
-windows-service = "0.6"
-# gpui with no backend feature → gpui auto-selects its Windows (DirectX)
-# backend. Whether the published 0.2 crate actually supports Windows is
-# what the windows-desktop probe build verifies.
-gpui = { version = "0.2", default-features = false, optional = true }
 
 [package.metadata.deb]
 section = "x11"
@@ -455,8 +430,7 @@ conf-files = [
 # `--no-default-features --features headless,energy,catbus` under the
 # hood so the binary depends only on libc / libgcc and never pulls in
 # libfreetype / libxkbcommon / libxcb / libqrcode. `catbus` stays on
-# for the Linux .deb; a future Windows headless build is the only
-# configuration that drops it.
+# for the .deb.
 [package.metadata.deb.variants.headless]
 name = "tab-atelier-headless"
 features = ["headless", "energy", "catbus"]

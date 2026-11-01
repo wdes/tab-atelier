@@ -310,9 +310,9 @@ writes go somewhere else:
   `cargo deb` that today is one binary. Likely a separate optional package
   (e.g. `tab-atelier-firecracker`) carrying the images, gated behind a
   preference.
-- **No Windows.** Firecracker is Linux/KVM only — fine, the GUI already
-  `#[cfg(windows)]`-stubs the PID path, and this is a Linux-target project,
-  but the feature must compile away cleanly off-Linux.
+- **Linux only.** Firecracker is Linux/KVM only, which costs nothing here: the
+  project targets Linux, and the PID-based features (catbus detection, the
+  energy probe, `/proc` cwd) are Linux-native already.
 - **First-boot latency:** sub-second once images are warm, but image build /
   download is a one-time multi-second-to-minutes cost we must surface.
 - **Per-tab memory:** guest RAM (configurable, e.g. 128–512 MiB) + ~5 MiB

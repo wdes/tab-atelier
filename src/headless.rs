@@ -509,17 +509,6 @@ fn spawn_pty_tab(
     } else {
         "/bin/sh".to_string()
     };
-    // On Windows there is no equivalent of the passwd shell — alacritty's
-    // ConPTY backend just calls CreateProcess on whatever we hand it. Use
-    // %COMSPEC% (the canonical env-pointer at cmd.exe) when set, fall
-    // back to the well-known path. Without this override the Linux-style
-    // `/bin/sh` reaches alacritty and CreateProcess returns ERROR_FILE_NOT_FOUND
-    // (os error 2) — the bug the CI Windows self-test caught.
-    #[cfg(windows)]
-    let shell_program: String = std::env::var("COMSPEC")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| r"C:\Windows\System32\cmd.exe".to_string());
     // Whether the launch shell supports `exec -a` (for the agent proctitle
     // below) — captured before `shell_program` is moved into the tuple.
     let shell_titleable = crate::shell_supports_exec_a(&shell_program);
@@ -652,12 +641,6 @@ fn spawn_pty_tab(
     };
     #[cfg(unix)]
     let pid = pty.child().id();
-    // ConPTY's Pty doesn't expose the child the way the Unix one does.
-    // Every PID consumer (catbus, energy, /proc cwd) is disabled on
-    // Windows, so a sentinel keeps the build going until a real ConPTY
-    // child-PID lookup is wired up.
-    #[cfg(windows)]
-    let pid = 0u32;
     // Put every tab in its OWN cgroup immediately: nft egress enforcement
     // (when opted in) keys on it AND it makes the tab's whole process tree
     // reliably killable/reapable (cgroup.kill) so a `claude --resume` can't

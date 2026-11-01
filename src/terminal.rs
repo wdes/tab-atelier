@@ -932,12 +932,8 @@ impl TerminalView {
                 return;
             }
         };
-        // ConPTY's Pty doesn't expose the child like the Unix one; pid feeds
-        // /proc cwd + catbus detection (Linux-only), so a 0 sentinel is fine.
-        #[cfg(unix)]
+        // Feeds /proc cwd + catbus detection.
         let pid = pty.child().id();
-        #[cfg(windows)]
-        let pid = 0u32;
         let pty = crate::pty_ring::PtyTap::new(pty, self.pty_ring.clone());
         let el = match EventLoop::new(self.term.clone(), self.event_proxy.clone(), pty, false, false) {
             Ok(el) => el,
@@ -1201,12 +1197,8 @@ impl TerminalView {
             }
         };
         // ConPTY's Pty doesn't expose the child the way the Unix one does.
-        // The PID feeds /proc cwd + catbus detection — both Linux-only, so
-        // a 0 sentinel is fine on Windows.
-        #[cfg(unix)]
+        // The PID feeds /proc cwd + catbus detection.
         let pid = pty.child().id();
-        #[cfg(windows)]
-        let pid = 0u32;
 
         self.term.lock().grid_mut().scroll_display(Scroll::Bottom);
 

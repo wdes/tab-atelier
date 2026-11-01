@@ -48,7 +48,7 @@ The packages are built by `.github/workflows/arch-pkg.yml` in an `archlinux`
 container (makepkg can't run on the Ubuntu .deb runner), and
 `.github/workflows/apt-publish.yml` pulls the latest build into `site/arch/`,
 regenerates the repo db with `repo-add`, and serves it from GitHub Pages — the
-same single-publisher flow used for the Windows MSI and Android APK. It's a
+same single-publisher flow used for the Android APK. It's a
 rolling channel (newest build wins, 10 kept); the AUR `PKGBUILD` below is the
 versioned path.
 

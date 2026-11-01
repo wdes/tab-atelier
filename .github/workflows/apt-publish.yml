@@ -25,16 +25,13 @@ on:
     push:
         branches: [main]
         tags: ['v*']
-    # Manual trigger so the windows-msi.yml workflow can chain into a
-    # republish after it finishes (push-driven apt-publish often races
-    # the parallel windows-msi build and picks the previous MSI run).
+    # Manual trigger, so the repo can be republished without a commit.
     workflow_dispatch:
 
 permissions:
     contents: write
-    actions: read # download the latest windows-msi artifact for /windows/
 
-# gh-pages has two writers: this workflow (deb, Arch, Windows) and the
+# gh-pages has two writers: this workflow (deb, Arch) and the
 # android-apk workflow on the android-app branch, which owns /android/ now that
 # the app lives there. Both rebuild the branch from a fresh clone of it, so if
 # they overlapped, whichever pushed second would do so from a tree that does not
@@ -69,8 +66,8 @@ jobs:
               id: ver
               run: |
                   # The version itself comes from scripts/deb-version.sh, so
-                  # the published nightly, the smoke-test deb and the Windows
-                  # installers cannot tell three different stories.
+                  # the published nightly and the smoke-test deb cannot tell
+                  # two different stories.
                   if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
                       CHANNEL=stable
                   else
@@ -212,130 +209,6 @@ jobs:
                       ls -1t pool/$CHANNEL/main/t/tab-atelier/${pkg}-dbgsym_*.ddeb 2>/dev/null \
                           | tail -n +4 | xargs -r rm -f
                   done
-
-            # Windows MSIs are built on a windows runner by
-            # windows-msi.yml and can't be produced here. Pull the .msi
-            # from the most recent successful run into site/windows/ and
-            # regenerate that folder's index. The gh-pages clone above
-            # already preserved any previously-published MSIs, so if no
-            # fresh artifact is found the existing set just carries over.
-            #
-            # `gh run download` would be the obvious tool but it assumes
-            # actions/upload-artifact@v7 wraps single files in a zip;
-            # v7 actually ships them BARE (we verified: the artifact
-            # bytes start with the MSI OLE2 magic `d0cf 11e0`, not the
-            # zip magic `50 4b 03 04`), which makes `gh run download`
-            # error out with "zip: not a valid zip file" and leave
-            # site/windows/ empty. Use the artifacts API directly:
-            # the `/zip` endpoint returns whatever was uploaded — for
-            # single-file v7 artifacts, that's the file itself, named
-            # after the artifact.
-            - name: Find latest Windows MSI run
-              id: msi_run
-              env:
-                  GH_TOKEN: ${{ github.token }}
-              run: |
-                  # `0`: windows-msi is tag-only, so on a push to main there is
-                  # no run for this commit and nothing to wait for — it falls
-                  # straight back to the last successful (tag) build.
-                  RUN_ID=$(scripts/ci-artifact-run.sh windows-msi.yml 0)
-                  echo "run_id=${RUN_ID}" >> "$GITHUB_OUTPUT"
-                  if [ -z "$RUN_ID" ]; then
-                      echo "→ no usable windows-msi run; keeping existing MSIs"
-                  fi
-            - name: Stage MSI artifacts + regenerate index
-              env:
-                  GH_TOKEN: ${{ github.token }}
-                  RUN_ID: ${{ steps.msi_run.outputs.run_id }}
-              run: |
-                  cd site
-                  mkdir -p windows
-                  if [ -n "$RUN_ID" ]; then
-                      # Walk every artifact on that run, fetch the raw
-                      # bytes via the API (NOT via gh run download —
-                      # see comment on the previous step). Each
-                      # artifact's `name` is already the destination
-                      # filename, including the .msi extension.
-                      # The artifact zip endpoint returns a 302 to a
-                      # presigned S3 URL. `gh api` doesn't follow
-                      # redirects (exits 1 instead) — use curl -fL
-                      # with the same token. `set -o pipefail` further
-                      # up would otherwise nuke the whole step on a
-                      # single failed fetch; loop with explicit
-                      # || true so one transient hiccup doesn't lose
-                      # the rest of the artifacts. Each MSI is
-                      # validated post-download against the MSI OLE2
-                      # magic to catch silent half-writes.
-                      gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/artifacts" \
-                          --jq '.artifacts[] | "\(.id)\t\(.name)"' \
-                      | while IFS=$'\t' read -r ID NAME; do
-                          case "$NAME" in
-                              *.msi)
-                                  TMP="windows/$NAME.partial"
-                                  echo "→ fetching artifact $ID → windows/$NAME"
-                                  # Capture curl's stderr so a silent
-                                  # failure leaves a breadcrumb in the
-                                  # job log; the previous "✗ curl
-                                  # failed" line gave no detail. -w
-                                  # echoes status + size so an HTTP
-                                  # 401/404 is obvious.
-                                  # No `Accept: application/octet-stream` —
-                                  # the artifact API replies 415 to that. The
-                                  # endpoint returns a 302 to a presigned S3
-                                  # URL regardless of Accept; curl -L follows
-                                  # it and S3 sends the raw bytes.
-                                  if curl -fSL --write-out 'http=%{http_code} bytes=%{size_download}\n' \
-                                      -H "Authorization: Bearer $GH_TOKEN" \
-                                      -H "X-GitHub-Api-Version: 2022-11-28" \
-                                      -o "$TMP" \
-                                      "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/artifacts/$ID/zip" \
-                                  ; then
-                                      # MSIs start with the OLE2 CFB
-                                      # magic D0 CF 11 E0. Anything
-                                      # else (404 HTML, an actual
-                                      # zip, …) gets rejected so the
-                                      # site never serves a broken
-                                      # download.
-                                      if head -c 4 "$TMP" | od -An -tx1 | tr -d ' \n' | grep -q '^d0cf11e0$'; then
-                                          mv "$TMP" "windows/$NAME"
-                                      else
-                                          echo "  ✗ wrong magic on $NAME — discarding"
-                                          rm -f "$TMP"
-                                      fi
-                                  else
-                                      echo "  ✗ curl failed for artifact $ID — skipping"
-                                      rm -f "$TMP"
-                                  fi
-                                  ;;
-                              *) echo "→ skipping non-MSI artifact: $NAME" ;;
-                          esac
-                      done
-                  fi
-                  # Cap at the 10 most recent MSIs.
-                  ls -1t windows/*.msi 2>/dev/null | tail -n +11 | xargs -r rm -f
-                  # Regenerate the folder index (newest first).
-                  {
-                      echo '<!DOCTYPE html><meta charset=utf-8><title>tab-atelier Windows builds</title>'
-                      echo '<style>body{font-family:system-ui;max-width:48em;margin:3em auto;padding:0 1em}'
-                      echo 'code{background:#f4f4f4;padding:.1em .3em;border-radius:3px}'
-                      echo 'pre{background:#f4f4f4;padding:.6em .8em;border-radius:4px;overflow-x:auto}'
-                      echo '.note{background:#fff8d6;border-left:3px solid #d9a900;padding:.6em .9em;margin:1em 0;font-size:.95em}</style>'
-                      echo '<h1>tab-atelier Windows builds</h1>'
-                      echo '<p>Headless daemon MSI installers (<code>tab-atelier-headless</code>), newest first. Each filename carries the commit short SHA.</p>'
-                      echo '<ul>'
-                      for f in $(ls -1t windows/*.msi 2>/dev/null); do
-                          bn=$(basename "$f")
-                          sz=$(du -h "$f" | cut -f1)
-                          echo "<li><a href=\"$bn\">$bn</a> &mdash; $sz</li>"
-                      done
-                      echo '</ul>'
-                      echo '<h2>Installing</h2>'
-                      echo '<p>From an elevated <code>cmd.exe</code> or PowerShell (run as Administrator), in the folder where you downloaded the MSI:</p>'
-                      echo '<pre>msiexec /i tab-atelier-headless-XXXXXXXX-0.4.0-x86_64.msi /qb</pre>'
-                      echo '<p><code>/qb</code> shows a basic progress bar without TaskDialog; <code>/qn</code> is fully silent. Both bypass the legacy Windows installer chrome.</p>'
-                      echo '<div class="note"><strong>If double-click install fails with “entrypoint TaskDialogIndirect can not be found in dynamic link library”:</strong> your shell is loading the legacy comctl32 v5 instead of v6. Use the <code>/qb</code> or <code>/qn</code> command-line install above &mdash; it does not invoke TaskDialog at all.</div>'
-                      echo '<p><a href="../">&larr; back to the apt repo</a></p>'
-                  } > windows/index.html
 
             # Arch packages: built in an archlinux container by arch-pkg.yml
             # (makepkg can't run here). Same "pull latest successful run" pattern
@@ -535,8 +408,6 @@ jobs:
                   <div class="note">
                   <strong><code>gpg --dearmor</code> handles older apt:</strong> the published key is ASCII-armored. <code>apt 2.4+</code> accepts both armored and binary keyrings in <code>/usr/share/keyrings/</code>; <code>apt &lt; 2.4</code> (Debian 11 buster &amp; older, Ubuntu 20.04 focal) requires binary. The <code>gpg --dearmor</code> step converts to binary in place, so the same one-liner works on every supported release.
                   </div>
-                  <h2>Windows</h2>
-                  <p>Headless MSI installers for Windows are at <a href="/windows/">/windows/</a>.</p>
                   <h2>Arch Linux</h2>
                   <p>A pacman repository (packages <code>tab-atelier</code> / <code>tab-atelier-headless</code>) is at <a href="/arch/">/arch/</a>.</p>
                   <h2>Android</h2>

@@ -96,10 +96,9 @@ else
     channel=nightly
 fi
 
-# Windows asks for a bare numeric x.y.z: an MSI ProductVersion has no room for
-# a pre-release marker, and the installers used to hardcode one that went stale.
-# Answered before anything reaches for `date` or `git`, because this runs under
-# git-bash on the Windows runners.
+# The bare numeric version: `x.y.z`, with any pre-release marker stripped.
+# Answered before anything reaches for `date` or `git`, so it is cheap and
+# deterministic.
 if [ "$want_base" = 1 ]; then
     echo "${base%%\~*}"
     exit 0
