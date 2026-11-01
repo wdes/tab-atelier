@@ -392,11 +392,13 @@ pub(crate) async fn shape_and_admit(
         .as_ref()
         .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(str::to_owned))
         .unwrap_or_default();
-    let kind = if parsed.as_ref().is_some_and(classifier::is_classifier) {
-        classifier::Kind::Classifier
-    } else {
-        classifier::Kind::Work
-    };
+    // Which kind of traffic this is: the auto-mode judge, a plan-mode
+    // investigation, or ordinary work. Decided here because routing rules can
+    // select on it and because the classifier must never be compacted.
+    //
+    // `kind_of` rather than `is_classifier` so adding a kind is one place, not
+    // every call site — plan mode went in without touching this line again.
+    let kind = parsed.as_ref().map_or(classifier::Kind::Work, classifier::kind_of);
     let health = provider_health(state);
     // A per-person model pin is resolved in place of the name the caller used,
     // but the body is left carrying the caller's name on purpose: `shape_body`

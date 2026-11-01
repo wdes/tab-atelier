@@ -147,10 +147,11 @@ pub(crate) fn set_route(
         "" => None,
         "work" => Some(crate::classifier::Kind::Work),
         "classifier" | "auto" | "auto_mode" => Some(crate::classifier::Kind::Classifier),
+        "plan" | "plan_mode" => Some(crate::classifier::Kind::Plan),
         other => {
             return Err(failure(
                 400,
-                &format!("kind: {other} is not work or classifier (alias: auto)"),
+                &format!("kind: {other} is not work, classifier (alias: auto) or plan"),
             ));
         }
     };
@@ -916,6 +917,29 @@ mod tests {
         let routes = routes_of(&state, who);
         assert_eq!(routes[0].kind, None, "unset means work only");
         assert_eq!(routes[0].from.as_deref(), Some("claude-opus-5-5"));
+    }
+
+    /// `plan` is accepted as a kind, and stored as such.
+    ///
+    /// Plan mode is the cheapest traffic to redirect — an investigation writes
+    /// nothing — so it is the one an operator most wants a rule for.
+    #[test]
+    fn a_route_can_select_plan_mode() {
+        let state = state_with_deepseek("route-plan", "route-plan@example.com");
+        let who = "route-plan@example.com";
+
+        for spelling in ["plan", "plan_mode"] {
+            let reply = set_route(
+                &state,
+                who,
+                &cond_route("", spelling, "", "deepseek-flash", Some("deepseek")),
+            );
+            assert_eq!(answered(&reply), 200, "{spelling} should be accepted");
+        }
+
+        let routes = routes_of(&state, who);
+        assert_eq!(routes.len(), 1, "both spellings are the same rule");
+        assert_eq!(routes[0].kind, Some(crate::classifier::Kind::Plan));
     }
 
     // ── the tool condition ──────────────────────────────────────────────────

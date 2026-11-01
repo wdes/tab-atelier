@@ -116,7 +116,7 @@ interface ModelRoute {
      * auto-mode judgement — that call carries Anthropic's security-monitor
      * prompt to whoever serves it.
      */
-    kind?: "work" | "classifier" | null;
+    kind?: "work" | "classifier" | "plan" | null;
     /** Only traffic that would otherwise have gone to this provider. */
     from_provider?: string | null;
     /** Only traffic declaring this server-side tool (`web_search`, `web_fetch`). */

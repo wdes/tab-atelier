@@ -558,6 +558,7 @@ impl ModelRoute {
             match self.kind {
                 Some(crate::classifier::Kind::Work) => "work",
                 Some(crate::classifier::Kind::Classifier) => "classifier",
+                Some(crate::classifier::Kind::Plan) => "plan",
                 None => "",
             },
             self.from_provider

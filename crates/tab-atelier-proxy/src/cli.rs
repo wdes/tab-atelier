@@ -104,8 +104,9 @@ pub fn set_route(
         None | Some("") => None,
         Some("work") => Some(tab_atelier_proxy::classifier::Kind::Work),
         Some("classifier" | "auto" | "auto_mode") => Some(tab_atelier_proxy::classifier::Kind::Classifier),
+        Some("plan" | "plan_mode") => Some(tab_atelier_proxy::classifier::Kind::Plan),
         Some(other) => {
-            return Err(format!("kind {other} is not work or classifier (alias: auto)"));
+            return Err(format!("kind {other} is not work, classifier (alias: auto) or plan"));
         }
     };
     let from_provider = from_provider.map(str::trim).filter(|p| !p.is_empty());
@@ -209,6 +210,9 @@ fn describe_scope(route: &tab_atelier_proxy::users::ModelRoute) -> String {
     match route.kind {
         Some(tab_atelier_proxy::classifier::Kind::Classifier) => {
             parts.push("auto-mode judgements".to_owned());
+        }
+        Some(tab_atelier_proxy::classifier::Kind::Plan) => {
+            parts.push("plan-mode traffic".to_owned());
         }
         _ => parts.push("work traffic".to_owned()),
     }
