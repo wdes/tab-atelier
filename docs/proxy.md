@@ -222,7 +222,7 @@ path is for Claude Code. So the proxy forwards the client's own identity rather
 than substituting its own: the `claude-cli/…` User-Agent, `x-app`, the session
 id, the SDK's `x-stainless-*` telemetry headers and the client's
 `anthropic-beta` flags all travel unchanged. It used to rebuild each request
-from scratch, which replaced that fingerprint with `tab-atelier-proxy/0.5.0`
+from scratch, which replaced that fingerprint with `tab-atelier-proxy/0.6.0`
 and dropped the session id — so every call looked like an unknown client, and a
 support question about one session could not be traced through.
 

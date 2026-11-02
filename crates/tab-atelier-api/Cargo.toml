@@ -1,6 +1,6 @@
 [package]
 name = "tab-atelier-api"
-version = "0.5.0-dev"
+version = "0.6.0-dev"
 edition = "2024"
 license = "MPL-2.0"
 description = "The HTTP API a tab-atelier server writes to: a Rocket scaffold, and the Request/Response/Resource rules, with a derived OpenAPI"

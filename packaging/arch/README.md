@@ -65,7 +65,7 @@ to build uncommitted work).
 
 ## Cut a release (versioned AUR package)
 
-1. Tag and push `v<version>` (e.g. `v0.5.0`) so the GitHub archive tarball
+1. Tag and push `v<version>` (e.g. `v0.6.0`) so the GitHub archive tarball
    exists.
 2. Bump `pkgver` in `PKGBUILD` to match, reset `pkgrel=1`.
 3. Fill the tarball digest:

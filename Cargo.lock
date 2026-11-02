@@ -1202,7 +1202,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "claude-api"
-version = "0.5.0-dev"
+version = "0.6.0-dev"
 dependencies = [
  "serde",
  "serde_json",
@@ -7226,7 +7226,7 @@ dependencies = [
 
 [[package]]
 name = "tab-atelier"
-version = "0.5.0-dev"
+version = "0.6.0-dev"
 dependencies = [
  "alacritty_terminal",
  "bytes",
@@ -7281,7 +7281,7 @@ dependencies = [
 
 [[package]]
 name = "tab-atelier-api"
-version = "0.5.0-dev"
+version = "0.6.0-dev"
 dependencies = [
  "bytes",
  "flate2",
@@ -7302,11 +7302,11 @@ dependencies = [
 
 [[package]]
 name = "tab-atelier-briefs"
-version = "0.5.0-dev"
+version = "0.6.0-dev"
 
 [[package]]
 name = "tab-atelier-catalog"
-version = "0.5.0-dev"
+version = "0.6.0-dev"
 dependencies = [
  "schemars 0.8.22",
  "serde",
@@ -7315,7 +7315,7 @@ dependencies = [
 
 [[package]]
 name = "tab-atelier-decisions"
-version = "0.5.0-dev"
+version = "0.6.0-dev"
 dependencies = [
  "schemars 0.8.22",
  "serde",
@@ -7344,11 +7344,11 @@ dependencies = [
 
 [[package]]
 name = "tab-atelier-pace"
-version = "0.5.0-dev"
+version = "0.6.0-dev"
 
 [[package]]
 name = "tab-atelier-proxy"
-version = "0.5.0-dev"
+version = "0.6.0-dev"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -7374,7 +7374,7 @@ dependencies = [
 
 [[package]]
 name = "tab-atelier-web"
-version = "0.5.0-dev"
+version = "0.6.0-dev"
 dependencies = [
  "bytes",
  "http 1.4.2",

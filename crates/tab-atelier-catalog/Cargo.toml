@@ -1,6 +1,6 @@
 [package]
 name = "tab-atelier-catalog"
-version = "0.5.0-dev"
+version = "0.6.0-dev"
 edition = "2024"
 license = "MPL-2.0"
 description = "The skills catalogue: reusable agent profiles, with an optimistic-concurrency edit and a tombstone"

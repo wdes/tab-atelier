@@ -3,7 +3,7 @@
 #
 # Print the Debian version for the package being built here, right now.
 #
-#     scripts/deb-version.sh                 # 0.5.0~nightly20260907070700.04cb329-1
+#     scripts/deb-version.sh                 # 0.6.0~nightly20260907070700.04cb329-1
 #     scripts/deb-version.sh --revision 0ci  # …-0ci, for a throwaway build
 #     scripts/deb-version.sh --explain       # the components, one per line
 #
@@ -22,14 +22,14 @@
 # care which word it is: what matters is the `~`.
 #
 # `~` sorts BEFORE an empty string in dpkg's comparison, and before nothing
-# else does. That single character is what makes a nightly for 0.5.0 sort below
-# the eventual 0.5.0 release, so a machine tracking `nightly` steps up onto
+# else does. That single character is what makes a nightly for 0.6.0 sort below
+# the eventual 0.6.0 release, so a machine tracking `nightly` steps up onto
 # stable when it lands rather than being pinned above it forever.
 #
-#     0.5.0-1                            the release
-#     0.5.0~pre2-1                       a release candidate for it
-#     0.5.0~nightly20260907070700.abc-1  a nightly heading towards it
-#     0.3.0-1                            the previous release
+#     0.6.0-1                            the release
+#     0.6.0~pre2-1                       a release candidate for it
+#     0.6.0~nightly20260907070700.abc-1  a nightly heading towards it
+#     0.5.0-1                            the previous release
 #
 # WHY THE DATE IS 14 DIGITS AND NOT THE WIKI'S 8. The wiki writes the date as
 # YYYYMMDD because it assumes one nightly per day. We publish on every push to
@@ -76,9 +76,9 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 raw="$(grep -m1 '^version = ' "$root/Cargo.toml" | cut -d'"' -f2)"
 [ -n "$raw" ] || { echo "$0: no version in $root/Cargo.toml" >&2; exit 1; }
 
-# `0.5.0-dev` means "0.5.0 is what we are heading for" — that is the upcoming
+# `0.6.0-dev` means "0.6.0 is what we are heading for" — that is the upcoming
 # version the convention asks for, so the marker comes off. Any OTHER cargo
-# pre-release (`0.5.0-rc1`) keeps its identity but switches to Debian's
+# pre-release (`0.6.0-rc1`) keeps its identity but switches to Debian's
 # separator, since `-` would read as a revision and sort the wrong way.
 base="${raw%-dev}"
 case "$base" in
