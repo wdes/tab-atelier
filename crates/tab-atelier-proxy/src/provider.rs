@@ -58,12 +58,6 @@ pub fn host_of(url: &str) -> String {
         .to_ascii_lowercase()
 }
 
-/// How many mapping hops to follow before giving up.
-///
-/// A chain longer than this is not a routing strategy, it is a mistake — and
-/// the loop has to terminate whatever the table says.
-const MAX_MAPPING_HOPS: usize = 8;
-
 /// What a model is for, rather than what it is called.
 ///
 /// Routing happens within a class: a request that arrived asking for Opus is a
@@ -738,33 +732,6 @@ impl Provider {
     pub fn price_at(&self, model: &Model, unix_secs: u64) -> Option<Price> {
         Some(price_with_peak(model.price?, self.peak.as_ref(), unix_secs))
     }
-}
-
-/// "When someone asks for X, use Y."
-///
-/// Two jobs, and they are the same mechanism:
-///
-/// * **Across providers.** Claude Code asks for `claude-opus-5-5`; `DeepSeek` has
-///   never heard of it. `DeepSeek`'s own endpoint papers over this by mapping
-///   `claude-opus*` to `deepseek-v4-pro` server-side — which is a decision
-///   about *their* margin and *their* roadmap, made where the operator cannot
-///   see or change it. Ours is visible, editable, and in one place.
-/// * **Within one provider.** `claude-opus-5-5 → claude-sonnet-5-5` is a
-///   deliberate downgrade: the same provider, a cheaper class, chosen by the
-///   operator rather than forced by capacity.
-///
-/// A mapping rewrites the NAME. Everything downstream — health, preference,
-/// the degrade ladder — still applies, so a mapping cannot quietly become a
-/// hard pin that survives an outage.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, tab_atelier_api::schemars::JsonSchema)]
-pub struct Mapping {
-    /// The name a client asks for. Matched exactly, then case-insensitively.
-    pub from: String,
-    /// The name to use instead.
-    pub to: String,
-    /// For the operator.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub note: Option<String>,
 }
 
 const fn yes() -> bool {
@@ -1518,9 +1485,6 @@ pub fn parse_models(spec: &str) -> Result<Vec<Model>, String> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Registry {
     pub providers: Vec<Provider>,
-    /// Client model name → the name to use instead. See [`Mapping`].
-    #[serde(default)]
-    pub mappings: Vec<Mapping>,
 }
 
 impl Default for Registry {
@@ -1564,7 +1528,6 @@ impl Default for Registry {
                     Model::new("claude-fable-5-1", Class::Heavy, 1000),
                 ],
             }],
-            mappings: Vec::new(),
         }
     }
 }
@@ -1927,42 +1890,6 @@ impl Registry {
         })
     }
 
-    /// Rewrite a requested model name through the mapping table.
-    ///
-    /// Follows chains, so `a → b → c` resolves to `c`, and stops on a cycle
-    /// rather than looping: a table an operator can edit freely is a table
-    /// that will eventually contain `opus → sonnet → opus`, and a router that
-    /// hangs on it takes the whole proxy down.
-    ///
-    /// Returns the name to use and, when it differs, the name that was asked
-    /// for — so the response header can say what happened.
-    #[must_use]
-    pub fn resolve(&self, requested: &str) -> (String, Option<String>) {
-        let mut current = requested.to_owned();
-        let mut hops = 0;
-        while hops < MAX_MAPPING_HOPS {
-            let Some(next) = self.mapping_from(&current) else {
-                break;
-            };
-            if next == current {
-                break;
-            }
-            next.clone_into(&mut current);
-            hops += 1;
-        }
-        let changed = current != requested;
-        (current, changed.then(|| requested.to_owned()))
-    }
-
-    /// The target of a mapping, matched exactly then case-insensitively.
-    fn mapping_from(&self, name: &str) -> Option<&str> {
-        self.mappings
-            .iter()
-            .find(|m| m.from == name)
-            .or_else(|| self.mappings.iter().find(|m| m.from.eq_ignore_ascii_case(name)))
-            .map(|m| m.to.as_str())
-    }
-
     /// Add or replace a provider by id, keeping its position in the list.
     ///
     /// Position is kept so the UI does not reshuffle under an operator every
@@ -1980,29 +1907,6 @@ impl Registry {
         let before = self.providers.len();
         self.providers.retain(|p| p.id != id);
         self.providers.len() != before
-    }
-
-    /// Set or replace a mapping.
-    pub fn set_mapping(&mut self, from: &str, to: &str, note: Option<String>) {
-        let existing = self.mappings.iter_mut().find(|m| m.from == from);
-        match existing {
-            Some(m) => {
-                to.clone_into(&mut m.to);
-                m.note = note;
-            }
-            None => self.mappings.push(Mapping {
-                from: from.to_owned(),
-                to: to.to_owned(),
-                note,
-            }),
-        }
-    }
-
-    /// Remove a mapping. Returns whether it was there.
-    pub fn remove_mapping(&mut self, from: &str) -> bool {
-        let before = self.mappings.len();
-        self.mappings.retain(|m| m.from != from);
-        self.mappings.len() != before
     }
 
     /// A count per provider id, for diagnostics.
@@ -2630,7 +2534,6 @@ mod tests {
     fn an_unrecognised_model_name_is_billed_at_the_providers_rate() {
         let registry = Registry {
             providers: vec![Preset::Deepseek.provider(Path::new("/tmp"))],
-            ..Registry::default()
         };
 
         let known = registry
@@ -2650,7 +2553,6 @@ mod tests {
         // which model, never whether there is one.
         let mut unpaid = Registry {
             providers: vec![Preset::Deepseek.provider(Path::new("/tmp"))],
-            ..Registry::default()
         };
         for model in &mut unpaid.providers[0].models {
             model.price = None;
@@ -3003,43 +2905,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// "When someone asks for X, use Y" — across providers and within one.
-    #[test]
-    fn a_mapping_rewrites_the_name_and_terminates_whatever_the_table_says() {
-        let mut r = Registry::default();
-        r.set_mapping("claude-opus-5-5", "claude-sonnet-5-5", Some("cost control".to_owned()));
-        let (name, from) = r.resolve("claude-opus-5-5");
-        assert_eq!(name, "claude-sonnet-5-5");
-        assert_eq!(from.as_deref(), Some("claude-opus-5-5"));
-
-        // A mapping is stronger than the family heuristic: class_of would
-        // still say Heavy from the word "opus", but the resolved name is what
-        // routing now classifies.
-        assert_eq!(r.class_of(&name), Some(Class::Balanced));
-
-        // Nothing mapped is unchanged, and reports no change.
-        assert_eq!(r.resolve("claude-haiku-5-5"), ("claude-haiku-5-5".to_owned(), None));
-
-        // A chain resolves to its end…
-        r.set_mapping("a", "b", None);
-        r.set_mapping("b", "c", None);
-        assert_eq!(r.resolve("a").0, "c");
-
-        // …and a cycle stops instead of hanging. An operator-editable table
-        // WILL eventually contain opus → sonnet → opus, and a router that
-        // loops on it takes the whole proxy down with it.
-        r.set_mapping("x", "y", None);
-        r.set_mapping("y", "x", None);
-        let (name, _) = r.resolve("x");
-        assert!(name == "x" || name == "y", "must terminate, got {name}");
-
-        // Replacing and removing.
-        r.set_mapping("a", "z", None);
-        assert_eq!(r.resolve("a").0, "z");
-        assert!(r.remove_mapping("a"));
-        assert!(!r.remove_mapping("a"), "second removal is a no-op");
-    }
-
     /// A provider whose credential is not a file must refuse a key write
     /// rather than accept one into a file nothing reads.
     /// The one combination that leaks a credential, refused wherever a
@@ -3069,7 +2934,6 @@ mod tests {
         assert!(!p.credential_ready_with(|_| Some("k".to_owned()), true));
         let r = Registry {
             providers: vec![p.clone()],
-            mappings: vec![],
         };
         assert!(
             r.candidates_with(Class::Balanced, |_| Some("k".to_owned()), true, 0)

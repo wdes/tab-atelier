@@ -81,10 +81,8 @@ interface ApiKey {
 /**
  * One per-person model route.
  *
- * Distinct from the registry's global `mappings`, which apply to everybody and
- * DEGRADE when their target is unusable. A route is a pin: if its destination
- * is blocked the request fails rather than quietly using a provider this person
- * was routed away from.
+ * A mapping is a pin: if its destination is blocked the request fails rather than
+ * quietly using a provider the rule excluded.
  */
 /**
  * One row of the route editor, as text.
@@ -640,16 +638,9 @@ interface PresetView {
     configured: boolean;
 }
 
-interface MappingView {
-    from: string;
-    to: string;
-    note?: string;
-}
-
 interface ProvidersResponse {
     providers: ProviderView[];
     presets: PresetView[];
-    mappings: MappingView[];
     compact_levels: CompactLevel[];
 }
 
@@ -764,7 +755,6 @@ interface AppState {
     inspect: InspectState | null;
     inspectOpen: Capture | null;
     providers: ProvidersResponse | null;
-    newMapping: { from: string; to: string; note: string };
     /**
      * The tool policy being edited, or null when no account has its editor
      * open — one at a time, because two half-written policies on screen is how

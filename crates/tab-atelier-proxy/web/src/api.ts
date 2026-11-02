@@ -116,12 +116,6 @@ interface ProvidersApi {
   remove(id: string): Promise<IdResponse>;
 }
 
-/** The endpoints that act on model-name mappings. */
-interface MappingsApi {
-  add(mapping: { from: string; to: string; note: string }): Promise<OkResponse>;
-  remove(from: string): Promise<OkResponse>;
-}
-
 /** The read-only reports. */
 interface UsageApi {
   report(window: string): Promise<UsageResponse>;
@@ -164,7 +158,6 @@ class ApiClient {
   readonly users: UsersApi;
   readonly keys: KeysApi;
   readonly providers: ProvidersApi;
-  readonly mappings: MappingsApi;
   readonly usage: UsageApi;
   readonly pressure: PressureApi;
   readonly inspect: InspectApi;
@@ -225,10 +218,6 @@ class ApiClient {
       remove: (id) => this.request("DELETE", `/api/providers/${seg(id)}`),
     };
 
-    this.mappings = {
-      add: (mapping) => this.request("POST", "/api/mappings", mapping),
-      remove: (from) => this.request("DELETE", `/api/mappings/${seg(from)}`),
-    };
 
     this.usage = {
       report: (window) =>

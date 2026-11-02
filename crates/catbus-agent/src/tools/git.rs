@@ -1097,6 +1097,13 @@ u UU N... 100644 100644 100644 100644 aaa bbb ccc conflicted.rs
         let repo = dir.path();
         for args in [
             vec!["init", "-q", "-b", "main"],
+            // Hermetic: a `core.hooksPath` in the machine's global config would
+            // otherwise apply to this repository too, and a commit-msg hook that
+            // polices commit subjects would refuse these fixtures' one-word
+            // messages — failing the test for a reason that has nothing to do
+            // with what it asserts. Pointing the repo's own hook path at nothing
+            // keeps the test about `history`, not about whoever configured git.
+            vec!["config", "core.hooksPath", "/dev/null"],
             vec!["config", "user.email", "t@example.org"],
             vec!["config", "user.name", "T"],
         ] {
@@ -1156,6 +1163,13 @@ u UU N... 100644 100644 100644 100644 aaa bbb ccc conflicted.rs
         let repo = dir.path();
         for args in [
             vec!["init", "-q", "-b", "main"],
+            // Hermetic: a `core.hooksPath` in the machine's global config would
+            // otherwise apply to this repository too, and a commit-msg hook that
+            // polices commit subjects would refuse these fixtures' one-word
+            // messages — failing the test for a reason that has nothing to do
+            // with what it asserts. Pointing the repo's own hook path at nothing
+            // keeps the test about `history`, not about whoever configured git.
+            vec!["config", "core.hooksPath", "/dev/null"],
             vec!["config", "user.email", "t@example.org"],
             vec!["config", "user.name", "T"],
         ] {
@@ -1212,6 +1226,13 @@ u UU N... 100644 100644 100644 100644 aaa bbb ccc conflicted.rs
         let repo = dir.path();
         for args in [
             vec!["init", "-q", "-b", "main"],
+            // Hermetic: a `core.hooksPath` in the machine's global config would
+            // otherwise apply to this repository too, and a commit-msg hook that
+            // polices commit subjects would refuse these fixtures' one-word
+            // messages — failing the test for a reason that has nothing to do
+            // with what it asserts. Pointing the repo's own hook path at nothing
+            // keeps the test about `history`, not about whoever configured git.
+            vec!["config", "core.hooksPath", "/dev/null"],
             vec!["config", "user.email", "t@example.org"],
             vec!["config", "user.name", "T"],
         ] {
@@ -1245,6 +1266,13 @@ u UU N... 100644 100644 100644 100644 aaa bbb ccc conflicted.rs
         let repo = dir.path();
         for args in [
             vec!["init", "-q", "-b", "main"],
+            // Hermetic: a `core.hooksPath` in the machine's global config would
+            // otherwise apply to this repository too, and a commit-msg hook that
+            // polices commit subjects would refuse these fixtures' one-word
+            // messages — failing the test for a reason that has nothing to do
+            // with what it asserts. Pointing the repo's own hook path at nothing
+            // keeps the test about `history`, not about whoever configured git.
+            vec!["config", "core.hooksPath", "/dev/null"],
             vec!["config", "user.email", "t@example.org"],
             vec!["config", "user.name", "T"],
         ] {

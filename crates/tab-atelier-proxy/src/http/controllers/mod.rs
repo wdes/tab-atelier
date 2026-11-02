@@ -11,7 +11,6 @@ pub mod account;
 pub mod hello;
 pub mod inspect;
 pub mod key;
-pub mod mapping;
 pub mod me;
 pub mod models;
 pub mod provider;

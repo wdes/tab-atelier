@@ -327,7 +327,6 @@ fn a_429_moves_the_next_request_to_another_provider() {
     let stub_key = dir.join("stub.key");
     std::fs::write(&stub_key, "sk-stub-provider").expect("write stub key");
     let registry = Registry {
-        mappings: vec![],
         providers: vec![
             stub_provider("primary", refuser, 0, &stub_key),
             stub_provider("backup", backup, 1, &stub_key),
@@ -497,7 +496,6 @@ fn compaction_reaches_upstream_and_only_where_it_is_configured() {
         inspect: Mutex::new(tab_atelier_proxy::inspect::Store::load(std::env::temp_dir())),
         wake: tokio::sync::Notify::new(),
         registry: Mutex::new(Registry {
-            mappings: vec![],
             providers: vec![provider],
         }),
         registry_path: dir.join("providers.json"),
@@ -621,7 +619,6 @@ fn the_attribution_replaces_the_clients_identity_upstream() {
         inspect: Mutex::new(tab_atelier_proxy::inspect::Store::load(std::env::temp_dir())),
         wake: tokio::sync::Notify::new(),
         registry: Mutex::new(Registry {
-            mappings: vec![],
             providers: vec![provider],
         }),
         registry_path: dir.join("providers.json"),
@@ -707,6 +704,26 @@ fn the_auto_mode_classifier_is_not_retargeted_by_a_mapping() {
     store
         .set_compact(&a.id, tab_atelier_proxy::compact::Compact::All)
         .expect("set");
+    // Every heavy request this account makes is rewritten to the balanced name.
+    // An operator who wrote that meant the CONVERSATION; they did not say "let
+    // the balanced model adjudicate whether `rm -rf` is safe". The rule names no
+    // kind, so it covers work only and the classifier is untouched — which is
+    // the protection this test exists for, now expressed as a per-account route
+    // rather than the registry-wide table that used to hold it.
+    store
+        .set_route(
+            &a.email,
+            tab_atelier_proxy::users::ModelRoute {
+                from: Some("claude-opus-5-5".to_owned()),
+                kind: None,
+                from_provider: None,
+                tool: None,
+                to_model: "primary-balanced".to_owned(),
+                to_provider: None,
+                note: None,
+            },
+        )
+        .expect("route");
     let (_k, key) = store.add_key(&a.email, "laptop").expect("key");
     let state = Arc::new(State {
         store: Mutex::new(store),
@@ -716,14 +733,6 @@ fn the_auto_mode_classifier_is_not_retargeted_by_a_mapping() {
         inspect: Mutex::new(tab_atelier_proxy::inspect::Store::load(std::env::temp_dir())),
         wake: tokio::sync::Notify::new(),
         registry: Mutex::new(Registry {
-            // Every heavy request is rewritten to the balanced name. An
-            // operator who wrote this meant the CONVERSATION; they did not say
-            // "let the balanced model adjudicate whether `rm -rf` is safe".
-            mappings: vec![tab_atelier_proxy::provider::Mapping {
-                from: "claude-opus-5-5".to_owned(),
-                to: "primary-balanced".to_owned(),
-                note: None,
-            }],
             providers: vec![provider],
         }),
         registry_path: dir.join("providers.json"),
@@ -947,10 +956,7 @@ fn state_with(providers: Vec<Provider>, dir: &std::path::Path, sched: qos::Sched
         account: Mutex::new(account::Monitor::load(dir)),
         inspect: Mutex::new(tab_atelier_proxy::inspect::Store::load(std::env::temp_dir())),
         wake: tokio::sync::Notify::new(),
-        registry: Mutex::new(Registry {
-            mappings: vec![],
-            providers,
-        }),
+        registry: Mutex::new(Registry { providers }),
         registry_path: dir.join("providers.json"),
         provider_backoff: Mutex::new(std::collections::BTreeMap::new()),
         admin_token: "tap_admin".to_owned(),
@@ -1046,7 +1052,6 @@ fn a_local_tool_is_resolved_by_the_proxy_and_never_asked_upstream() {
         inspect: Mutex::new(tab_atelier_proxy::inspect::Store::load(std::env::temp_dir())),
         wake: tokio::sync::Notify::new(),
         registry: Mutex::new(Registry {
-            mappings: vec![],
             providers: vec![provider],
         }),
         registry_path: dir.join("providers.json"),
@@ -1137,7 +1142,6 @@ fn an_openai_upstream_receives_a_user_agent() {
     let mut provider = stub_provider("oai", upstream, 0, &stub_key);
     provider.wire = Wire::Openai;
     let registry = Registry {
-        mappings: vec![],
         providers: vec![provider],
     };
 

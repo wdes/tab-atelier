@@ -66,7 +66,6 @@ class ApiClient {
     users;
     keys;
     providers;
-    mappings;
     usage;
     pressure;
     inspect;
@@ -113,10 +112,6 @@ class ApiClient {
             save: (body) => this.request("POST", "/api/providers", body),
             rotateKey: (id, key) => this.request("POST", `/api/providers/${seg(id)}/key`, { key }),
             remove: (id) => this.request("DELETE", `/api/providers/${seg(id)}`),
-        };
-        this.mappings = {
-            add: (mapping) => this.request("POST", "/api/mappings", mapping),
-            remove: (from) => this.request("DELETE", `/api/mappings/${seg(from)}`),
         };
         this.usage = {
             report: (window) => this.request("GET", `/api/usage?window=${encodeURIComponent(window)}`),

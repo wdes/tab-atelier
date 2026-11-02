@@ -28,14 +28,12 @@
 pub mod compact;
 pub mod inspect;
 pub mod key;
-pub mod mapping;
 pub mod provider;
 pub mod user;
 
 pub use compact::SetCompact;
 pub use inspect::ArmInspect;
 pub use key::{AddKey, SetKeyDisabled};
-pub use mapping::AddMapping;
 pub use provider::{RotateProviderKey, SaveProvider};
 pub use user::{AddUser, PinModel, PinProvider, SetDisabled, SetWeight};
 

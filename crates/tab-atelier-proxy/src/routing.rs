@@ -147,39 +147,12 @@ pub fn choose<G: Fn(&str) -> Option<String> + Copy>(
     host: Host<G>,
     now: u64,
 ) -> Option<Route> {
-    // A mapping rewrites the NAME and nothing else. Health, preference and the
-    // degrade ladder all still apply to whatever it resolves to, so an
-    // operator who writes `opus → deepseek-flash` gets DeepSeek when DeepSeek
-    // is usable and the normal ladder when it is not — rather than a hard pin
-    // that turns into an outage the first time the far end rate-limits.
-    //
-    // Held to work, though: the classifier judges whether work may run, and
-    // "save money on the conversation" is not a statement about who adjudicates
-    // `rm -rf`. So the classifier is routed on the name it asked for. The pin
-    // and the ladder below still apply, so it goes somewhere fast and cheap.
-    let (target, mapped_from) = if kind.retargets_by_mapping() {
-        registry.resolve(requested)
-    } else {
-        (requested.to_owned(), None)
-    };
-
-    // An explicit mapping to a model that exactly ONE provider serves is a
-    // decision about destination, not just a rename: `deepseek-flash` exists
-    // only at DeepSeek, so preference order must not send it to Anthropic.
-    // Tried before the class ladder, because it is the most specific answer
-    // available.
-    if mapped_from.is_some()
-        && let Some((p, m)) = pick_exact(registry, &target, health, host, now, pinned)
-    {
-        return Some(Route {
-            provider_id: p.id.clone(),
-            model_id: m.id.clone(),
-            class: m.class,
-            kind,
-            changed_from: mapped_from,
-            reason: Some("mapped"),
-        });
-    }
+    // No mapping layer: names are what the caller asked for. A per-person model
+    // mapping is applied by the caller AFTER this returns, because it can select
+    // on the answer — see `relay::pick_route`. Keeping it out of here is what
+    // makes the two scopes one mechanism instead of two.
+    let target = requested.to_owned();
+    let mapped_from: Option<String> = None;
 
     // An unrecognised name is treated as the middle of the road. Refusing it
     // would break a client asking for a model we simply have not listed, and
@@ -614,66 +587,26 @@ mod tests {
         r
     }
 
-    /// The case the whole mapping feature exists for: a client asks for a
-    /// Claude model name, and the answer is a model only another provider has.
+    /// `choose` does not rewrite names: a per-person mapping is applied after it.
+    ///
+    /// The plain `Registry.mappings` table that used to live here was removed —
+    /// mapping is per account now (`Account.routes`), and it is applied by
+    /// `relay::pick_route` on the ANSWER this returns, because a rule may select
+    /// on the provider the request was heading for. So this function must leave
+    /// the name alone, and this test is what stops a second rewrite layer growing
+    /// back in a place where it would run before the pin.
     #[test]
-    fn a_mapping_to_another_providers_model_routes_there() {
-        let mut r = with_deepseek();
-        r.set_mapping("claude-opus-5-5", "deepseek-flash", None);
+    fn choose_does_not_rewrite_the_requested_name() {
+        let r = with_deepseek();
 
         let route = choose(&r, "claude-opus-5-5", None, classifier::Kind::Work, &healthy, host(), 0).expect("a route");
-        // Not Anthropic, even though it has preference 0 and serves a model of
-        // the same class. `deepseek-flash` exists in exactly one place, so the
-        // mapping named a destination, not just a rename.
-        assert_eq!(route.provider_id, "deepseek");
-        assert_eq!(route.model_id, "deepseek-flash");
-        assert_eq!(route.reason, Some("mapped"));
-        assert_eq!(route.changed_from.as_deref(), Some("claude-opus-5-5"));
-    }
 
-    /// Mapping claude to claude: a deliberate downgrade, same provider.
-    #[test]
-    fn a_mapping_within_one_provider_is_honoured_even_though_it_costs_less() {
-        let mut r = Registry::default();
-        r.set_mapping("claude-opus-5-5", "claude-sonnet-5-5", Some("cost control".to_owned()));
-
-        let route = choose(&r, "claude-opus-5-5", None, classifier::Kind::Work, &healthy, host(), 0).expect("a route");
-        assert_eq!(route.provider_id, "anthropic");
-        assert_eq!(route.model_id, "claude-sonnet-5-5");
-        assert_eq!(route.class, Class::Balanced);
-        assert_eq!(route.reason, Some("mapped"));
-    }
-
-    /// A mapping is a decision, not a hard pin: when the mapped destination is
-    /// unreachable, routing still has somewhere to go. A pin would turn the
-    /// first rate-limit at the far end into an outage.
-    #[test]
-    fn a_mapping_does_not_become_a_pin_that_survives_an_outage() {
-        let mut r = with_deepseek();
-        r.set_mapping("claude-opus-5-5", "deepseek-flash", None);
-
-        // DeepSeek is refusing traffic outright.
-        let no_deepseek = |id: &str| Health {
-            utilization: None,
-            backoff_secs: if id == "deepseek" { 60 } else { 0 },
-        };
-        let route = choose(
-            &r,
-            "claude-opus-5-5",
-            None,
-            classifier::Kind::Work,
-            &no_deepseek,
-            host(),
-            0,
-        )
-        .expect("a route");
-        assert_eq!(
-            route.provider_id, "anthropic",
-            "the work still gets done; the mapping was a preference for DeepSeek, and it is unusable"
+        assert_ne!(
+            route.model_id, "deepseek-flash",
+            "no mapping layer here: the name is the caller's",
         );
+        assert_eq!(route.changed_from, None, "and nothing was changed on the way through");
     }
-
-    /// Pinning is a statement about where someone's work is allowed to go.
     #[test]
     fn a_pinned_account_only_ever_reaches_its_provider() {
         let r = with_deepseek();
@@ -947,10 +880,7 @@ mod tests {
 
     #[test]
     fn nothing_configured_means_no_route_rather_than_a_guess() {
-        let empty = Registry {
-            providers: vec![],
-            mappings: vec![],
-        };
+        let empty = Registry { providers: vec![] };
         assert_eq!(
             choose(
                 &empty,

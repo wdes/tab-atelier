@@ -542,61 +542,6 @@
                 </span>
               </div>
 
-              <!-- Mappings: one global table, applied before routing. -->
-              <hr class="my-4" />
-              <h3 class="h6">Model mapping</h3>
-              <p class="small text-body-secondary">
-                When someone asks for the name on the left, use the one on the right — for
-                everyone. It reaches across providers
-                (<code>claude-opus-5-5 → deepseek-flash</code>) and within one
-                (<code>claude-opus-5-5 → claude-sonnet-5-5</code>, a deliberate downgrade).
-                A mapping names a model, not a lock: if the destination is unreachable,
-                normal routing still applies.
-                <br>
-                For <em>one person</em> rather than everyone, use <strong>Routes</strong> on an
-                account row. A route is a pin, not a rewrite: it may select on the kind of
-                traffic or the provider a request was heading for, it overrules that person's
-                provider pin, and it does <em>not</em> fall back — an unusable route is an
-                error, so traffic is never quietly served somewhere the route excluded.
-              </p>
-              <table v-if="providers.mappings.length" class="table table-sm align-middle">
-                <tbody>
-                  <tr v-for="m in providers.mappings" :key="m.from">
-                    <td class="small font-monospace">{{ m.from }}</td>
-                    <td class="text-body-secondary">→</td>
-                    <td class="small font-monospace">{{ m.to }}</td>
-                    <td class="small text-body-secondary">{{ m.note || '' }}</td>
-                    <td class="text-end">
-                      <button class="btn btn-sm btn-outline-danger" @click="removeMapping(m)">Remove</button>
-                    </td>
-                  </tr>
-                </tbody>
-              </table>
-              <form class="row g-2 align-items-end" @submit.prevent="addMapping">
-                <div class="col-sm-4">
-                  <label class="form-label small mb-1" for="ta-mapping-from">Asked for</label>
-                  <select id="ta-mapping-from" v-model="newMapping.from" class="form-select form-select-sm font-monospace"
-                          required :disabled="!mappingModelChoices.length">
-                    <option value="" disabled>{{ mappingModelChoices.length ? 'Select a model' : 'No models available' }}</option>
-                    <option v-for="model in mappingModelChoices" :key="`from-${model}`" :value="model">{{ model }}</option>
-                  </select>
-                </div>
-                <div class="col-sm-4">
-                  <label class="form-label small mb-1" for="ta-mapping-to">Use instead</label>
-                  <select id="ta-mapping-to" v-model="newMapping.to" class="form-select form-select-sm font-monospace"
-                          required :disabled="!mappingModelChoices.length">
-                    <option value="" disabled>{{ mappingModelChoices.length ? 'Select a model' : 'No models available' }}</option>
-                    <option v-for="model in mappingModelChoices" :key="`to-${model}`" :value="model">{{ model }}</option>
-                  </select>
-                </div>
-                <div class="col-sm-2">
-                  <label class="form-label small mb-1">Note</label>
-                  <input v-model="newMapping.note" class="form-control form-control-sm" autocomplete="off" />
-                </div>
-                <div class="col-sm-2">
-                  <button class="btn btn-sm btn-primary w-100">Map</button>
-                </div>
-              </form>
             </div>
             <div v-else class="small text-body-secondary mt-3">
               Loading…
@@ -1065,12 +1010,12 @@
                       Tools<span v-if="toolsBadge(u) !== 'default'"
                                  class="badge text-bg-secondary ms-1">{{ toolsBadge(u) }}</span>
                     </button>
-                    <!-- Model routes: "when this account's traffic matches these
-                         conditions, serve that instead". The badge counts them,
-                         because a rule that is configured and invisible is a rule
-                         nobody can check. -->
+                    <!-- Model mapping, per account: "when this account's traffic
+                         matches these conditions, serve that instead". The badge
+                         counts the rules, because one that is configured and
+                         invisible is one nobody can check. -->
                     <button class="btn btn-sm btn-outline-secondary" @click="openRoutes(u)" :disabled="busy">
-                      Routes<span v-if="(u.routes || []).length"
+                      Model mapping<span v-if="(u.routes || []).length"
                                   class="badge text-bg-secondary ms-1">{{ (u.routes || []).length }}</span>
                     </button>
                     <button
@@ -1137,7 +1082,7 @@
         <div v-if="routes" class="ta-modal-backdrop" @click.self="routes = null">
           <div class="ta-modal" style="max-width: 60rem">
             <div class="d-flex justify-content-between align-items-center mb-2">
-              <h2 class="h5 mb-0">Model routes</h2>
+              <h2 class="h5 mb-0">Model mapping</h2>
               <button class="btn-close" @click="routes = null" aria-label="Close"></button>
             </div>
             <p class="small text-body-secondary">
@@ -1220,7 +1165,7 @@
 
             <div class="d-flex justify-content-between align-items-center mt-2">
               <button class="btn btn-sm btn-outline-secondary" @click="addRouteRow()" :disabled="busy">
-                Add a row
+                Add a mapping
               </button>
               <button class="btn btn-sm btn-outline-secondary" @click="routes = null">Done</button>
             </div>

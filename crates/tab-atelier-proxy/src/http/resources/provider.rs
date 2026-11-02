@@ -12,7 +12,7 @@ use serde::Serialize;
 use tab_atelier_api::schemars;
 
 use crate::compact::Compact;
-use crate::provider::{self, Mapping, Peak, Provider};
+use crate::provider::{self, Peak, Provider};
 use crate::server::State;
 use crate::usage;
 
@@ -124,8 +124,6 @@ pub(crate) struct CompactLevelResource {
 pub(crate) struct CatalogResource {
     pub providers: Vec<ProviderResource>,
     pub presets: Vec<PresetResource>,
-    /// The model-name rewrites, as configured.
-    pub mappings: Vec<Mapping>,
     pub compact_levels: Vec<CompactLevelResource>,
 }
 
@@ -143,7 +141,6 @@ pub(crate) fn providers_json(state: &State) -> CatalogResource {
             .into_iter()
             .map(|p| preset_resource(&reg, p))
             .collect(),
-        mappings: reg.mappings.clone(),
         compact_levels: Compact::ALL
             .into_iter()
             .map(|c| CompactLevelResource {

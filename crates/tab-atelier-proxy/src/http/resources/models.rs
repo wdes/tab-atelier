@@ -204,7 +204,6 @@ mod tests {
     fn deepseek() -> Registry {
         Registry {
             providers: vec![Preset::Deepseek.provider(Path::new("/tmp/tab-atelier-test"))],
-            mappings: Vec::new(),
         }
     }
 

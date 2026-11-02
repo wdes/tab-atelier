@@ -259,7 +259,6 @@ const AdminApp = Vue.defineComponent({
       inspect: null,
       inspectOpen: null,
       providers: null,
-      newMapping: { from: "", to: "", note: "" },
       tools: null,
       // The route editor. Opened from the row, saved per row rather than whole:
       // each route is validated on its own — an unknown destination or provider
@@ -1069,17 +1068,6 @@ const AdminApp = Vue.defineComponent({
         // the tick back where it was.
         await this.loadProviders();
       }
-    },
-    async addMapping() {
-      const m = this.newMapping;
-      if (!m.from || !m.to) return;
-      await api.mappings.add(m);
-      this.newMapping = { from: "", to: "", note: "" };
-      await this.loadProviders();
-    },
-    async removeMapping(m: MappingView) {
-      await api.mappings.remove(m.from);
-      await this.loadProviders();
     },
     async setUserProvider(u: ApiUser, provider: string) {
       await api.users.setProvider(u.id, provider);

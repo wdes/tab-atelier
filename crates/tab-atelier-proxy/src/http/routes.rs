@@ -43,13 +43,12 @@ use tab_atelier_api::rocket_okapi::openapi;
 use tab_atelier_api::rocket_okapi::openapi_get_routes_spec;
 
 use crate::http::body::Json;
-use crate::http::controllers::{account, hello, inspect, key, mapping, me, models, provider, relay, usage, web};
+use crate::http::controllers::{account, hello, inspect, key, me, models, provider, relay, usage, web};
 use crate::http::guards::{Admin, Arrival, ClientKey};
 use crate::http::raw::Raw;
 use crate::http::requests::compact::SetCompact;
 use crate::http::requests::inspect::ArmInspect;
 use crate::http::requests::key::{AddKey, SetKeyDisabled};
-use crate::http::requests::mapping::AddMapping;
 use crate::http::requests::provider::{RotateProviderKey, SaveProvider};
 use crate::http::requests::user::{
     AddUser, PinModel, PinProvider, SetDisabled, SetKind, SetRoute, SetTools, SetWeight,
@@ -397,29 +396,7 @@ pub(crate) fn remove_provider(
     provider::remove(id, state)
 }
 
-// ── the operator API: mappings, usage, pressure ─────────────────────────────
-
-/// Rename a model on the way through.
-#[openapi]
-#[post("/api/mappings", data = "<body>")]
-pub(crate) fn add_mapping(
-    state: &State<Arc<AppState>>,
-    _admin: Admin,
-    body: Json<AddMapping>,
-) -> Result<crate::transport::Doc<crate::http::resources::OkResource>, crate::transport::Failure> {
-    mapping::add(state, &body.0)
-}
-
-/// Stop renaming it.
-#[openapi]
-#[delete("/api/mappings/<from>")]
-pub(crate) fn remove_mapping(
-    state: &State<Arc<AppState>>,
-    _admin: Admin,
-    from: &str,
-) -> Result<crate::transport::Doc<crate::http::resources::OkResource>, crate::transport::Failure> {
-    mapping::remove(state, from)
-}
+// ── the operator API: usage, pressure ───────────────────────────────────────
 
 /// What everyone has spent, over a window.
 #[openapi]
@@ -617,8 +594,6 @@ pub fn all_and_spec() -> (Vec<Route>, tab_atelier_api::rocket_okapi::okapi::open
         save_provider,
         rotate_provider_key,
         remove_provider,
-        add_mapping,
-        remove_mapping,
         usage_report,
         pressure,
         read_inspect,

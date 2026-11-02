@@ -400,9 +400,6 @@ fn report_routing(registry: &tab_atelier_proxy::provider::Registry) -> bool {
         };
         println!("  {:<26} -> {}/{}{why}", model, route.provider_id, route.model_id);
     }
-    if registry.mappings.is_empty() {
-        println!("  no mappings configured");
-    }
     failed
 }
 
@@ -793,7 +790,6 @@ mod tests {
         use tab_atelier_proxy::provider::{Preset, Registry};
         let reg = Registry {
             providers: vec![Preset::Openai.provider(Path::new("/tmp"))],
-            mappings: Vec::new(),
         };
         assert_eq!(reg.canonical_model("GPT-5.6-LUNA"), Some("gpt-5.6-luna"));
         assert_eq!(reg.canonical_model("claude-sonet-5"), None, "a typo is not a model");
@@ -803,7 +799,6 @@ mod tests {
         // store an id routing then refuses, which is the 503 again.
         let ds = Registry {
             providers: vec![Preset::Deepseek.provider(Path::new("/tmp"))],
-            mappings: Vec::new(),
         };
         assert_eq!(
             ds.canonical_model("deepseek-v4-pro"),

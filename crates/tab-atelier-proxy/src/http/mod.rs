@@ -59,13 +59,3 @@ pub(crate) fn registry_dir(state: &State) -> PathBuf {
 pub(crate) fn problem(status: u16, message: impl Into<String>) -> Reply {
     crate::transport::json_of(status, &resources::status::ProblemResource::of(message))
 }
-
-/// An acknowledgement, as every "and it happened" route writes one.
-///
-/// Typed rather than a bare [`Reply`]: the body is the named
-/// [`resources::status::OkResource`], so the route that answers it documents
-/// that shape instead of an untyped one. A handler that may also refuse wraps
-/// this in `Ok`.
-pub(crate) const fn acknowledged() -> crate::transport::Doc<resources::status::OkResource> {
-    crate::transport::Doc::ok(resources::status::OkResource::yes())
-}
