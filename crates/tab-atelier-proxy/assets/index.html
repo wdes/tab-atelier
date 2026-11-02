@@ -546,11 +546,18 @@
               <hr class="my-4" />
               <h3 class="h6">Model mapping</h3>
               <p class="small text-body-secondary">
-                When someone asks for the name on the left, use the one on the right.
-                It reaches across providers (<code>claude-opus-5 → deepseek-flash</code>) and
-                within one (<code>claude-opus-5 → claude-sonnet-5</code>, a deliberate downgrade).
-                A mapping names a model, not a lock: if the destination is unreachable, normal
-                routing still applies.
+                When someone asks for the name on the left, use the one on the right — for
+                everyone. It reaches across providers
+                (<code>claude-opus-5-5 → deepseek-flash</code>) and within one
+                (<code>claude-opus-5-5 → claude-sonnet-5-5</code>, a deliberate downgrade).
+                A mapping names a model, not a lock: if the destination is unreachable,
+                normal routing still applies.
+                <br>
+                For <em>one person</em> rather than everyone, use <strong>Routes</strong> on an
+                account row. A route is a pin, not a rewrite: it may select on the kind of
+                traffic or the provider a request was heading for, it overrules that person's
+                provider pin, and it does <em>not</em> fall back — an unusable route is an
+                error, so traffic is never quietly served somewhere the route excluded.
               </p>
               <table v-if="providers.mappings.length" class="table table-sm align-middle">
                 <tbody>
@@ -1139,6 +1146,13 @@
               the account is pinned to another provider. Leave a condition empty
               to match anything; at least one is required. A row whose destination
               is empty is removed.
+              <br>
+              A rule left on <em>work</em> does not touch auto-mode or plan-mode
+              traffic: those are moved only by a rule that names them. And unlike a
+              global mapping, a route is a <strong>pin</strong> — if its destination
+              cannot be reached the request fails rather than falling back to normal
+              routing, so traffic is never quietly served by a provider the rule
+              excluded.
             </p>
 
             <div class="table-responsive">
