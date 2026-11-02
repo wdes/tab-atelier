@@ -832,6 +832,99 @@ const AdminApp = Vue.defineComponent({
     // validated on its own by the server, so unlike the tools editor there is no
     // combination to protect and no reason to hold a whole set hostage to one bad
     // row.
+    /**
+     * Models to offer for one account's model pin.
+     *
+     * Filtered by the provider it is pinned to, because a provider pin is a
+     * containment boundary: offering another provider's models builds a
+     * combination whose meaning the operator did not intend. An exception to the
+     * boundary is a Model mapping rule, which is a deliberate, visible thing.
+     *
+     * With no pin the full catalogue is right — the account may be routed
+     * anywhere.
+     *
+     * A model that the pin does NOT serve is still included when it is the one
+     * currently stored: hiding it would blank the select and lose the only
+     * evidence that this account carries a combination the boundary does not
+     * allow. It is marked so the operator can see why it is there.
+     */
+    modelsForProvider(providerId: string, current?: string): Array<{ value: string; label: string }> {
+      const all = this.providers ? this.providers.providers : [];
+      if (!providerId) return this.modelChoices;
+      const p = all.find((x) => x.id === providerId);
+      if (!p) return this.modelChoices;
+
+      const seen = new Set<string>();
+      const out: Array<{ value: string; label: string }> = [];
+      for (const m of p.models) {
+        if (m.deprecated || seen.has(m.id)) continue;
+        seen.add(m.id);
+        out.push({ value: m.id, label: m.id });
+      }
+      if (current && !seen.has(current) && current !== "") {
+        out.unshift({ value: current, label: `${current} — not served by ${p.id}` });
+      }
+      return out.sort((a, b) => a.label.localeCompare(b.label));
+    },
+    /**
+     * The "when they ask for" select's value for one rule.
+     *
+     * A rule's `from` is either empty (any model), a catalogue id, or an id the
+     * catalogue has dropped. Only the last needs the escape hatch, so this
+     * reports `__other` for it and the markup shows a text input beside the
+     * select. Keeping it derived rather than a stored flag means the editor
+     * cannot disagree with the rule it is editing.
+     */
+    routeFromValue(r: DraftRoute): string {
+      if (!r.from) return "";
+      return this.mappingModelChoices.includes(r.from) ? r.from : "__other";
+    },
+    /** Choosing from the select, including the escape hatch. */
+    setRouteFrom(r: DraftRoute, value: string) {
+      if (value === "__other") {
+        // Clear it so the text input starts empty; leaving the old id would
+        // make "other" look like it had already been answered.
+        r.from = "";
+      } else {
+        r.from = value;
+      }
+    },
+
+    /**
+     * Destinations offered for one rule, narrowed by its "from" provider.
+     *
+     * The same rule as the model pin: naming a provider is a boundary, so a
+     * destination it does not serve is not offered. When "anywhere" is chosen
+     * the whole catalogue is right, since the destination decides the hop.
+     *
+     * The rule's current destination is kept even when it falls outside the
+     * narrowed list — a rule stored before this restriction, or one whose
+     * provider no longer serves that model, must stay visible rather than
+     * silently blanking.
+     */
+    routeToModelChoices(r: DraftRoute): Array<{ value: string; label: string }> {
+      const all = this.mappingModelChoices.map((id: string) => ({ value: id, label: id }));
+      if (!r.to_provider) {
+        if (r.to_model && !all.some((m) => m.value === r.to_model)) {
+          all.unshift({ value: r.to_model, label: r.to_model });
+        }
+        return all;
+      }
+      const p = (this.providers ? this.providers.providers : []).find((x) => x.id === r.to_provider);
+      if (!p) return all;
+      const seen = new Set<string>();
+      const out: Array<{ value: string; label: string }> = [];
+      for (const m of p.models) {
+        if (m.deprecated || seen.has(m.id)) continue;
+        seen.add(m.id);
+        out.push({ value: m.id, label: m.id });
+      }
+      if (r.to_model && !seen.has(r.to_model)) {
+        out.unshift({ value: r.to_model, label: `${r.to_model} — not served by ${p.id}` });
+      }
+      return out;
+    },
+
     openRoutes(u: ApiUser) {
       this.routes = {
         id: u.id,

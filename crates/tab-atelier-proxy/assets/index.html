@@ -806,14 +806,20 @@
           <table class="table table-hover align-middle mb-0">
             <thead>
               <tr class="small text-body-secondary">
-                <th>Name</th>
-                <th>Email</th>
-                <th>Status</th>
-                <th class="text-center">Priority</th>
+                <!-- One column, because a person is one thing: the name, the
+                     address and how they are doing read as a single item in a
+                     list, and splitting them across four columns pushed the
+                     controls that matter off the right edge. -->
+                <th>Person</th>
                 <th>Keys · last used</th>
                 <th class="text-end">Tokens (7 d) · calls · avg/call</th>
-                <th>Routed to</th>
-                <th>Model</th>
+                <!-- One column: the provider and the model are one decision.
+                     The model list narrows to the chosen provider, because a
+                     provider pin is a boundary — offering another provider's
+                     models builds a combination nobody intended. An exception
+                     to that boundary is a Model mapping rule, not a contradiction
+                     between two neighbouring selects. -->
+                <th>Routing</th>
                 <th>Compaction</th>
                 <th>Traffic kind</th>
                 <th class="text-end">Key</th>
@@ -821,27 +827,31 @@
             </thead>
             <tbody>
               <tr v-for="u in users" :key="u.id" :class="{ 'opacity-50': u.disabled }">
-                <td>{{ u.first_name }} {{ u.last_name }}</td>
-                <td class="font-monospace small">{{ u.email }}</td>
-                <td>
-                  <span v-if="u.disabled" class="badge text-bg-secondary">disabled</span>
-                  <span v-else-if="!u.has_key" class="badge text-bg-warning">no key</span>
-                  <span v-else class="badge text-bg-success">active</span>
-                </td>
-                <td class="text-center">
-                  <select autocomplete="off"
-                    class="form-select form-select-sm mx-auto"
-                    style="width: 7.5rem"
-                    :value="u.weight"
-                    @change="setWeight(u, $event.target.value)"
-                    :disabled="busy"
-                  >
-                    <option v-for="t in tiersFor(u)" :key="t.weight" :value="t.weight">{{ t.label }}</option>
-                  </select>
-                  <!-- The number means nothing on its own; the share it works
-                       out to is the thing being decided. -->
-                  <div class="text-body-secondary" style="font-size:.75rem">
-                    {{ shareOf(u) }}
+                <td style="min-width: 17rem">
+                  <div class="d-flex align-items-center gap-2 flex-wrap">
+                    <span class="fw-semibold">{{ u.first_name }} {{ u.last_name }}</span>
+                    <span v-if="u.disabled" class="badge text-bg-secondary">disabled</span>
+                    <span v-else-if="!u.has_key" class="badge text-bg-warning">no key</span>
+                    <span v-else class="badge text-bg-success">active</span>
+                  </div>
+                  <div class="d-flex align-items-center gap-2 flex-wrap mt-1">
+                    <span class="font-monospace text-body-secondary" style="font-size:.8rem">{{ u.email }}</span>
+                    <!-- The priority control belongs with the person: it says how
+                         much of the shared pool they get, which is a fact about
+                         them rather than a column of its own. -->
+                    <select autocomplete="off"
+                      class="form-select form-select-sm"
+                      style="width: auto; max-width: 8rem"
+                      :value="u.weight"
+                      @change="setWeight(u, $event.target.value)"
+                      :disabled="busy"
+                      :aria-label="'Priority for ' + u.email"
+                    >
+                      <option v-for="t in tiersFor(u)" :key="t.weight" :value="t.weight">{{ t.label }}</option>
+                    </select>
+                    <!-- The number means nothing on its own; the share it works
+                         out to is the thing being decided. -->
+                    <span class="text-body-secondary" style="font-size:.75rem">{{ shareOf(u) }}</span>
                   </div>
                 </td>
                 <td class="small text-body-secondary" style="min-width: 18rem">
@@ -918,49 +928,48 @@
                     {{ avgPerCall(u.id) }}
                   </div>
                 </td>
-                <td class="small">
-                  <!-- Where this person's work is allowed to go. Blank means
-                       normal routing — the proxy picks. A value here is
-                       enforced, not preferred: an account pinned to a provider
-                       that is out of capacity gets a 503 rather than a quiet
-                       fall back to whatever the operator was keeping it off. -->
-                  <select class="form-select form-select-sm" autocomplete="off"
-                          :value="u.provider || ''"
-                          @change="setUserProvider(u, $event.target.value)">
-                    <option value="">any provider</option>
-                    <option v-for="p in (providers ? providers.providers : [])" :key="p.id" :value="p.id">
-                      {{ p.id }}
-                    </option>
-                  </select>
-                </td>
-                <td class="small">
-                  <!-- The model pin, which is what actually decides the hop:
-                       a model id resolves to the provider serving it, so this
-                       outranks the provider select to its left. Blank means the
-                       caller's own model is honoured.
+                <td class="small" style="min-width: 16rem">
+                  <div class="d-flex flex-column gap-1">
+                    <!-- Where this person's work is allowed to go. Blank means
+                         normal routing — the proxy picks. A value here is
+                         enforced, not preferred: an account pinned to a provider
+                         that is out of capacity gets a 503 rather than a quiet
+                         fall back to whatever the operator was keeping it off. -->
+                    <select class="form-select form-select-sm" autocomplete="off"
+                            :value="u.provider || ''"
+                            :aria-label="'Provider for ' + u.email"
+                            @change="setUserProvider(u, $event.target.value)">
+                      <option value="">any provider</option>
+                      <option v-for="p in (providers ? providers.providers : [])" :key="p.id" :value="p.id">
+                        {{ p.id }}
+                      </option>
+                    </select>
+                    <!-- The model pin, which is what actually decides the hop: a
+                         model id resolves to the provider serving it, so this
+                         outranks the provider select above.
 
-                       On the OpenAI wire a model cannot take tools and
-                       reasoning at once — a request with function tools must
-                       force reasoning off — so the list carries two entries per
-                       such model. The value is `model#flavour`. The flavour is
-                       not stored separately — it IS the tool mode, since on
-                       this wire whether tools may ride along is exactly
-                       whether reasoning is on. So each choice has to move the
-                       mode: "reasoning" sets `none`, and "tools" has to clear
-                       that `none` back to `all`, or the select would snap back
-                       to the label it was already showing. Both directions are
-                       in setUserModel.
-                       See modelChoices and setUserModel. -->
-                  <select class="form-select form-select-sm" autocomplete="off"
-                          style="min-width: 15rem"
-                          :value="userModelValue(u)"
-                          :disabled="busy"
-                          @change="setUserModel(u, $event.target.value)">
-                    <option value="">caller's model</option>
-                    <option v-for="m in modelChoices" :key="m.value" :value="m.value">
-                      {{ m.label }}
-                    </option>
-                  </select>
+                         Narrowed to that provider's catalogue. With no provider
+                         pinned the full list is right, because the account may go
+                         anywhere. A model the pin does not serve is still listed
+                         when it is the one stored, marked — blanking the select
+                         would hide the only sign that this account carries a
+                         combination the boundary no longer allows.
+
+                         On the OpenAI wire a model cannot take tools and
+                         reasoning at once, so the value is `model#flavour`; see
+                         userModelValue and setUserModel. -->
+                    <select class="form-select form-select-sm" autocomplete="off"
+                            :value="userModelValue(u)"
+                            :disabled="busy"
+                            :aria-label="'Model for ' + u.email"
+                            @change="setUserModel(u, $event.target.value)">
+                      <option value="">caller's model</option>
+                      <option v-for="m in modelsForProvider(u.provider || '', u.model || '')"
+                              :key="m.value" :value="m.value">
+                        {{ m.label }}
+                      </option>
+                    </select>
+                  </div>
                 </td>
                 <td>
                   <!-- Per PERSON, not per provider. The operator reasoning
@@ -1086,93 +1095,105 @@
              validated on its own, so one bad destination must not hold the others
              hostage, and a row that commits on blur would commit half-typed
              rules as you tab through. -->
+        <!-- Model mapping, per account.
+             Each rule is a card that reads as a sentence — label, control,
+             label, control — rather than a table row whose meaning lives in a
+             header far above. Every field that names a provider or a model is a
+             select, because a free-text provider is a rule that silently never
+             fires. -->
         <div v-if="routes" class="ta-modal-backdrop" @click.self="routes = null">
-          <div class="ta-modal" style="max-width: 60rem">
+          <div class="ta-modal" style="max-width: 46rem">
             <div class="d-flex justify-content-between align-items-center mb-2">
               <h2 class="h5 mb-0">Model mapping</h2>
               <button class="btn-close" @click="routes = null" aria-label="Close"></button>
             </div>
-            <p class="small text-body-secondary">
-              When this account's traffic matches <em>all</em> the conditions on a
-              row, it is served by that row's destination instead — including when
-              the account is pinned to another provider. Leave a condition empty
-              to match anything; at least one is required. A row whose destination
-              is empty is removed.
-              <br>
-              A rule left on <em>work</em> does not touch auto-mode or plan-mode
-              traffic: those are moved only by a rule that names them. And unlike a
-              global mapping, a route is a <strong>pin</strong> — if its destination
-              cannot be reached the request fails rather than falling back to normal
-              routing, so traffic is never quietly served by a provider the rule
-              excluded.
+
+            <p class="small text-body-secondary mb-3">
+              When this person's traffic matches a rule, it is served by that
+              rule's destination instead — even when they are pinned to another
+              provider. A rule left on <em>work</em> leaves auto-mode and
+              plan-mode traffic alone. Clearing a destination removes the rule.
             </p>
 
-            <div class="table-responsive">
-              <table class="table table-sm align-middle">
-                <thead>
-                  <tr>
-                    <th>Model asked for</th>
-                    <th>Kind</th>
-                    <th>From provider</th>
-                    <th>Tool</th>
-                    <th>→ Model</th>
-                    <th>→ Provider</th>
-                    <th></th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <tr v-for="(r, i) in routes.rows" :key="i">
-                    <td>
-                      <input class="form-control form-control-sm" v-model="r.from"
-                             placeholder="any" :disabled="busy">
-                    </td>
-                    <td>
-                      <!-- `auto` is what Claude Code calls it; `work` is ordinary
-                           traffic. Empty means work only, which is what keeps a
-                           cost rule from moving the auto-mode judge by accident. -->
-                      <select class="form-select form-select-sm" v-model="r.kind" :disabled="busy">
-                        <option value="">work (default)</option>
-                        <option value="classifier">auto mode</option>
-                        <option value="plan">plan mode</option>
-                      </select>
-                    </td>
-                    <td>
-                      <input class="form-control form-control-sm" v-model="r.from_provider"
-                             placeholder="any" :disabled="busy">
-                    </td>
-                    <td>
-                      <select class="form-select form-select-sm" v-model="r.tool" :disabled="busy">
-                        <option value="">any</option>
-                        <option value="web_search">web_search</option>
-                        <option value="web_fetch">web_fetch</option>
-                      </select>
-                    </td>
-                    <td>
-                      <input class="form-control form-control-sm" v-model="r.to_model"
-                             :placeholder="'remove this rule'" :disabled="busy">
-                    </td>
-                    <td>
-                      <input class="form-control form-control-sm" v-model="r.to_provider"
-                             placeholder="any" :disabled="busy">
-                    </td>
-                    <td class="text-end">
-                      <div class="d-inline-flex gap-1">
-                        <button class="btn btn-sm btn-primary" @click="saveRoute(i)" :disabled="busy">
-                          Save
-                        </button>
-                        <button class="btn btn-sm btn-outline-secondary"
-                                @click="removeRouteRow(i)" :disabled="busy"
-                                aria-label="Discard this row">&times;</button>
-                      </div>
-                    </td>
-                  </tr>
-                </tbody>
-              </table>
+            <div v-for="(r, i) in routes.rows" :key="i" class="border rounded p-3 mb-3">
+              <div class="d-flex justify-content-between align-items-center mb-2">
+                <span class="text-body-secondary small">Rule {{ i + 1 }}</span>
+                <button class="btn btn-sm btn-outline-secondary"
+                        @click="removeRouteRow(i)" :disabled="busy"
+                        aria-label="Discard this rule">Remove</button>
+              </div>
+
+              <div class="row g-2 align-items-center">
+                <div class="col-sm-4 text-sm-end"><label class="form-label mb-0 small">When they ask for</label></div>
+                <div class="col-sm-8">
+                  <select class="form-select form-select-sm" autocomplete="off"
+                          :value="routeFromValue(r)"
+                          @change="setRouteFrom(r, $event.target.value)" :disabled="busy">
+                    <option value="">any model</option>
+                    <option v-for="m in mappingModelChoices" :key="m" :value="m">{{ m }}</option>
+                    <!-- A rule may name a model the catalogue has dropped — that
+                         is how traffic for a retired id gets caught — so a bare
+                         dropdown would remove a real capability. -->
+                    <option value="__other">other (type it)…</option>
+                  </select>
+                  <input v-if="routeFromValue(r) === '__other'"
+                         class="form-control form-control-sm mt-1" v-model="r.from"
+                         placeholder="model id" :disabled="busy">
+                </div>
+
+                <div class="col-sm-4 text-sm-end"><label class="form-label mb-0 small">and the traffic is</label></div>
+                <div class="col-sm-8">
+                  <select class="form-select form-select-sm" v-model="r.kind" :disabled="busy">
+                    <option value="">work (default)</option>
+                    <option value="classifier">auto mode</option>
+                    <option value="plan">plan mode</option>
+                  </select>
+                </div>
+
+                <div class="col-sm-4 text-sm-end"><label class="form-label mb-0 small">and it is heading for</label></div>
+                <div class="col-sm-8">
+                  <select class="form-select form-select-sm" v-model="r.from_provider" :disabled="busy">
+                    <option value="">any provider</option>
+                    <option v-for="p in (providers ? providers.providers : [])" :key="p.id" :value="p.id">{{ p.id }}</option>
+                  </select>
+                </div>
+
+                <div class="col-sm-4 text-sm-end"><label class="form-label mb-0 small">and it uses</label></div>
+                <div class="col-sm-8">
+                  <select class="form-select form-select-sm" v-model="r.tool" :disabled="busy">
+                    <option value="">no server tool</option>
+                    <option value="web_search">web_search</option>
+                    <option value="web_fetch">web_fetch</option>
+                  </select>
+                </div>
+
+                <div class="col-sm-4 text-sm-end"><label class="form-label mb-0 small">serve instead</label></div>
+                <div class="col-sm-8">
+                  <select class="form-select form-select-sm" v-model="r.to_model" :disabled="busy">
+                    <option value="">— remove this rule —</option>
+                    <option v-for="m in routeToModelChoices(r)" :key="m.value" :value="m.value">{{ m.label }}</option>
+                  </select>
+                </div>
+
+                <div class="col-sm-4 text-sm-end"><label class="form-label mb-0 small">from</label></div>
+                <div class="col-sm-8">
+                  <select class="form-select form-select-sm" v-model="r.to_provider" :disabled="busy">
+                    <option value="">anywhere that serves it</option>
+                    <option v-for="p in (providers ? providers.providers : [])" :key="p.id" :value="p.id">{{ p.id }}</option>
+                  </select>
+                </div>
+              </div>
+
+              <div class="d-flex justify-content-end mt-2">
+                <button class="btn btn-sm btn-primary" @click="saveRoute(i)" :disabled="busy">
+                  Save this rule
+                </button>
+              </div>
             </div>
 
-            <div class="d-flex justify-content-between align-items-center mt-2">
+            <div class="d-flex justify-content-between align-items-center">
               <button class="btn btn-sm btn-outline-secondary" @click="addRouteRow()" :disabled="busy">
-                Add a mapping
+                + Add a rule
               </button>
               <button class="btn btn-sm btn-outline-secondary" @click="routes = null">Done</button>
             </div>
