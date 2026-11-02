@@ -16,7 +16,7 @@ use http_body_util::{BodyExt, StreamBody};
 use crate::http::guards::Arrival;
 use crate::http::middleware::arrival::{header_of, is_trusted_hop};
 use crate::server::{State, now_ms};
-use crate::transport::{Reply, text};
+use crate::transport::{Reply, json, text};
 use crate::users::Account;
 use crate::{classifier, egress, inspect, openai, provider, qos, routing, usage};
 
@@ -351,6 +351,84 @@ fn no_route_message(state: &Arc<State>) -> String {
     )
 }
 
+/// Make the completion reservation fit the context window, or refuse in a way
+/// the client understands.
+///
+/// **The output reservation counts against the same window as the
+/// conversation**, and that is the whole reason this exists. A session at
+/// 921,123 input tokens asking for the model's full 128,000 output reserved
+/// 1,049,123 against a 1,048,576 window — 547 over — and the provider refused
+/// the entire request rather than serving it with a smaller completion. Nothing
+/// here was subtracting the reservation, so every long session reached that line.
+///
+/// Three outcomes, from [`crate::budget::fit`]:
+///
+/// * **fits** — pass through untouched, because clamping a request that fits
+///   would quietly truncate a healthy answer;
+/// * **clamped** — rewrite `max_tokens` down to what the conversation leaves, so
+///   the caller still gets an answer. The `OpenAI` wire renames the field later,
+///   which is why it is rewritten under its Anthropic name here;
+/// * **too long** — no completion budget makes the request legal, so this
+///   answers with the 400 the client already keys its compaction on rather than
+///   forwarding a request that can only fail. Claude Code compacts on a message
+///   beginning "prompt is too long"; inventing different wording would leave it
+///   retrying a request that can never succeed.
+///
+/// # Errors
+/// The refusal above, in the client's own error shape.
+fn fit_completion(
+    state: &Arc<State>,
+    account: &Account,
+    route: &routing::Route,
+    requested: &str,
+    parsed: Option<&serde_json::Value>,
+    body: Bytes,
+) -> Result<Bytes, Reply> {
+    let Some(requested_max) = parsed
+        .and_then(|v| v.get("max_tokens"))
+        .and_then(serde_json::Value::as_u64)
+    else {
+        // No reservation asked for: nothing to decide, and nothing to refuse.
+        return Ok(body);
+    };
+    let window = {
+        let registry = state.registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        registry.context_window(&route.provider_id, &route.model_id)
+    };
+
+    match crate::budget::fit(window, crate::budget::estimate_input(&body), requested_max) {
+        crate::budget::Budget::Unchanged { .. } => Ok(body),
+        crate::budget::Budget::TooLong { input, usable } => {
+            log::warn!(
+                "proxy: {who} {requested} needs compaction — {input} input tokens against a {window} window ({usable} usable)",
+                who = account.display_name(),
+            );
+            Err(json(
+                400,
+                &format!(
+                    r#"{{"type":"error","error":{{"type":"invalid_request_error","message":"prompt is too long: {requested_max} tokens > {usable} maximum"}}}}"#,
+                ),
+            ))
+        }
+        crate::budget::Budget::Clamped { completion, .. } => {
+            log::info!(
+                "proxy: {who} {requested} completion clamped {requested_max} → {completion} to fit the context",
+                who = account.display_name(),
+            );
+            // Re-serialised from the parsed form, so any field ordering change is
+            // the parser's, not a string splice's. The caller already holds a
+            // parsed copy, so this costs one encode.
+            let mut rewritten = parsed.cloned().unwrap_or(serde_json::Value::Null);
+            if let Some(obj) = rewritten.as_object_mut() {
+                obj.insert("max_tokens".to_owned(), serde_json::json!(completion));
+            }
+            Ok(Bytes::from(
+                serde_json::to_vec(&rewritten).unwrap_or_else(|_| body.to_vec()),
+            ))
+        }
+    }
+}
+
 pub(crate) async fn shape_and_admit(
     state: &Arc<State>,
     account: &Account,
@@ -455,6 +533,11 @@ pub(crate) async fn shape_and_admit(
             route.model_id
         );
     }
+    // The completion budget, decided here because this is where both halves are
+    // known: the model that will serve the request, and the body that will be
+    // sent to it. Extracted because the decision is self-contained and this
+    // function is long enough already.
+    let body = fit_completion(state, account, &route, &requested, parsed.as_ref(), body)?;
     // What the far end is. It decides whether the client's claim to be Claude
     // Code is true — and so whether anything about it should be rewritten — and
     // whether admission applies at all, since only a destination that spends the

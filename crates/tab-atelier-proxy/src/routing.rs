@@ -358,6 +358,7 @@ mod tests {
                     price: None,
                     deprecated: false,
                     note: None,
+                    context_window: crate::provider::DEFAULT_CONTEXT_WINDOW,
                 },
                 Model {
                     id: "bedrock.haiku".to_owned(),
@@ -366,6 +367,7 @@ mod tests {
                     price: None,
                     deprecated: false,
                     note: None,
+                    context_window: crate::provider::DEFAULT_CONTEXT_WINDOW,
                 },
             ],
         });

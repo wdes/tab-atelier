@@ -448,7 +448,26 @@ pub struct Model {
     /// Why, for the operator. Shown beside the model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// How many tokens this model accepts in one request, input and output
+    /// together.
+    ///
+    /// Read by [`crate::budget`], which has to know the ceiling before it can
+    /// decide how much of it the completion may reserve — the output budget
+    /// counts against the same total as the conversation. Defaults to the
+    /// current generation's window; set it when a model differs, because an
+    /// overstated window means nothing is clamped and the provider refuses the
+    /// request instead.
+    #[serde(default = "default_context_window")]
+    pub context_window: u64,
 }
+
+/// A million tokens, the window every model in today's catalogue has.
+const fn default_context_window() -> u64 {
+    DEFAULT_CONTEXT_WINDOW
+}
+
+/// The same figure, for `Model::new` and for callers that need the default.
+pub const DEFAULT_CONTEXT_WINDOW: u64 = 1_048_576;
 
 const fn one() -> u32 {
     1
@@ -465,7 +484,20 @@ impl Model {
             price: None,
             deprecated: false,
             note: None,
+            context_window: DEFAULT_CONTEXT_WINDOW,
         }
+    }
+
+    /// The same model, with the context window its vendor publishes.
+    ///
+    /// Needed because the completion budget is computed from it: a window
+    /// overstated by a factor would leave the proxy clamping nothing and letting
+    /// the provider refuse the request, which is the failure
+    /// [`crate::budget`] exists to prevent.
+    #[must_use]
+    pub const fn with_context(mut self, window: u64) -> Self {
+        self.context_window = window;
+        self
     }
 
     /// The same model, with what it costs where those rates are known.
@@ -1823,6 +1855,21 @@ impl Registry {
 
     /// Providers that serve a model by that exact id, best first.
     ///
+    /// How many tokens one request to this model may hold, input and output
+    /// together.
+    ///
+    /// A model the catalogue does not list — a client naming something from
+    /// another vendor, or a retired id — answers with the default rather than
+    /// zero: refusing every such request with a budget error would be worse than
+    /// letting the provider decide, and the provider's own error is the honest
+    /// one when nobody here knows the ceiling.
+    #[must_use]
+    pub fn context_window(&self, provider_id: &str, model_id: &str) -> u64 {
+        self.get(provider_id)
+            .and_then(|p| p.serves(model_id))
+            .map_or(DEFAULT_CONTEXT_WINDOW, |m| m.context_window)
+    }
+
     /// This is what makes a mapping a decision rather than a hint: a mapping
     /// to `deepseek-flash` names a model only one provider has, so the request
     /// must go there regardless of preference order.
@@ -2170,6 +2217,7 @@ mod tests {
                     price: None,
                     deprecated: false,
                     note: None,
+                    context_window: DEFAULT_CONTEXT_WINDOW,
                 },
                 Model {
                     id: "anthropic.claude-haiku-4-5-v1:0".to_owned(),
@@ -2178,6 +2226,7 @@ mod tests {
                     price: None,
                     deprecated: false,
                     note: None,
+                    context_window: DEFAULT_CONTEXT_WINDOW,
                 },
             ],
         });

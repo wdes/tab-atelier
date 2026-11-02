@@ -302,6 +302,7 @@ fn stub_provider(id: &str, port: u16, preference: i32, key_path: &std::path::Pat
             price: None,
             deprecated: false,
             note: None,
+            context_window: tab_atelier_proxy::provider::DEFAULT_CONTEXT_WINDOW,
         }],
     }
 }
@@ -477,6 +478,7 @@ fn compaction_reaches_upstream_and_only_where_it_is_configured() {
         price: None,
         deprecated: false,
         note: None,
+        context_window: tab_atelier_proxy::provider::DEFAULT_CONTEXT_WINDOW,
     }];
 
     let mut store = Store::load(dir.join("users.json")).expect("store");
@@ -606,6 +608,7 @@ fn the_attribution_replaces_the_clients_identity_upstream() {
         price: None,
         deprecated: false,
         note: None,
+        context_window: tab_atelier_proxy::provider::DEFAULT_CONTEXT_WINDOW,
     }];
 
     let mut store = Store::load(dir.join("users.json")).expect("store");
@@ -686,6 +689,7 @@ fn the_auto_mode_classifier_is_not_retargeted_by_a_mapping() {
             price: None,
             deprecated: false,
             note: None,
+            context_window: tab_atelier_proxy::provider::DEFAULT_CONTEXT_WINDOW,
         },
         Model {
             id: "primary-balanced".to_owned(),
@@ -694,6 +698,7 @@ fn the_auto_mode_classifier_is_not_retargeted_by_a_mapping() {
             price: None,
             deprecated: false,
             note: None,
+            context_window: tab_atelier_proxy::provider::DEFAULT_CONTEXT_WINDOW,
         },
     ];
 
