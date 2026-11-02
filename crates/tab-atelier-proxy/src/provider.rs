@@ -1400,6 +1400,41 @@ pub fn provider_key_path(config_dir: &Path, id: &str) -> PathBuf {
     config_dir.join(format!("provider-{id}.key"))
 }
 
+/// Whether an operator-supplied provider id is usable as a name.
+///
+/// The id is not only a label: it is the filename of the provider's key
+/// (`provider-{id}.key`), the value accounts pin to, and the string a model
+/// mapping names. So it has to survive all three, and the check is a deny-list
+/// of what would break them rather than an allow-list of characters, because a
+/// name is the operator's to choose.
+///
+/// Refused: empty; anything with a path separator or `..`, which would place the
+/// key file outside the config directory; a leading `.` or `-`, which make a
+/// hidden file or look like a flag; and anything over 64 bytes, which is longer
+/// than a name needs and approaches filesystem limits once the prefix and
+/// suffix are added.
+///
+/// # Errors
+/// The reason, phrased for the operator who typed it.
+pub fn validate_provider_id(id: &str) -> Result<(), String> {
+    if id.is_empty() {
+        return Err("a provider needs a name".to_owned());
+    }
+    if id.len() > 64 {
+        return Err("keep the name under 64 characters".to_owned());
+    }
+    if id.contains('/') || id.contains('\\') || id.contains("..") {
+        return Err("a name cannot contain a path separator or `..`".to_owned());
+    }
+    if id.starts_with('.') || id.starts_with('-') {
+        return Err("a name cannot start with `.` or `-`".to_owned());
+    }
+    if id.chars().any(char::is_control) {
+        return Err("a name cannot contain control characters".to_owned());
+    }
+    Ok(())
+}
+
 /// Write a provider's key, `0600` from creation.
 ///
 /// Created 0600 rather than chmod'ed afterwards, for the same reason the
@@ -1919,6 +1954,43 @@ impl Registry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- provider ids ------------------------------------------------------
+    //
+    // The id is not only a label: it is the key's filename (`provider-{id}.key`),
+    // the value accounts pin to, and the string a mapping names. A name that
+    // breaks any of those is refused at write time rather than becoming a file
+    // outside the config directory or a pin nothing matches.
+
+    /// A name an operator would reasonably type is accepted.
+    #[test]
+    fn ordinary_names_are_accepted() {
+        for id in ["deepseek", "deepseek-team", "work.key", "a", "My_Provider"] {
+            assert!(validate_provider_id(id).is_ok(), "{id} should be accepted");
+        }
+    }
+
+    /// Anything that would escape the config directory is refused.
+    ///
+    /// The id is interpolated into `provider-{id}.key`, so a separator or `..`
+    /// writes the key somewhere else — the one case here with a security
+    /// consequence rather than merely an ugly name.
+    #[test]
+    fn path_traversal_is_refused() {
+        for id in ["../escape", "a/b", "a\\b", "..", "x/../../etc/passwd"] {
+            assert!(validate_provider_id(id).is_err(), "{id} should be refused");
+        }
+    }
+
+    /// Hidden files, flag-looking names, empties and overlong ones are refused.
+    #[test]
+    fn unusable_names_are_refused() {
+        for id in ["", ".hidden", "-flag", &"x".repeat(65)] {
+            assert!(validate_provider_id(id).is_err(), "{id:?} should be refused");
+        }
+        // A control character would reach the file name and the log.
+        assert!(validate_provider_id("a\tb").is_err());
+    }
 
     // --- server-side tool prices -------------------------------------------
     //

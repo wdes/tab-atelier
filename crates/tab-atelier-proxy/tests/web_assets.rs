@@ -344,3 +344,143 @@ fn tempdir(tag: &str) -> PathBuf {
     std::fs::create_dir_all(&d).expect("mkdir");
     d
 }
+
+/// Every asset the page references must reach an installed reader.
+///
+/// `Cargo.toml` claimed this test existed and it did not — which is how
+/// `api.js` shipped missing once, and then how `bootstrap.min.css` shipped
+/// missing again. The page loaded, every class in the markup was inert, and the
+/// dashboard came up unstyled: no panel backgrounds, no visible close glyph, no
+/// table borders. Nothing failed; it just looked broken.
+///
+/// Two ways a reference can be satisfied, and this checks that each reference
+/// has one of them:
+///
+///   * the file is in the deb's `assets` array, so it lands in the web root; or
+///   * `distro_asset` maps it to a path owned by a package we `Depends` on.
+///
+/// Anything else is a reference the installed server cannot answer, which is the
+/// bug this exists to catch.
+#[test]
+fn every_asset_the_page_references_is_shipped_or_comes_from_a_dependency() {
+    let dir = crate_dir();
+    let html = std::fs::read_to_string(dir.join("assets/index.html")).expect("index.html");
+    let cargo = std::fs::read_to_string(dir.join("Cargo.toml")).expect("Cargo.toml");
+
+    // References the page makes to its own origin: `<script src>` and
+    // `<link href>`, minus anything absolute. Querystrings are dropped because
+    // the served HTML version-stamps them (`app.js?v=…`) and the file on disk
+    // has no such suffix.
+    let referenced = local_references(&html);
+    assert!(
+        !referenced.is_empty(),
+        "found no local <script>/<link> references — has the markup shape changed?",
+    );
+
+    // What the deb installs into the web root, as `assets/<rel>`.
+    let shipped: BTreeSet<String> = cargo
+        .lines()
+        .filter_map(|l| {
+            // Bind the result: `strip_prefix` returns the remainder, it does not
+            // mutate, so ignoring it leaves the full line and splits on the quote
+            // right after `[`. That yielded a set containing just "[", which made
+            // this test report every reference as unshipped — a false positive
+            // that looked exactly like the bug it hunts.
+            let rest = l.trim().strip_prefix("[\"assets/")?;
+            let (path, _) = rest.split_once('"')?;
+            Some(path.to_owned())
+        })
+        .collect();
+
+    // What the controller hands to the distro instead of serving itself.
+    let distro: BTreeSet<String> = tab_atelier_proxy::http::controllers::web::distro_references();
+
+    for rel in &referenced {
+        if shipped.contains(rel) || distro.contains(rel) {
+            continue;
+        }
+        panic!(
+            "index.html references {rel:?}, and the installed package can satisfy it \
+             neither from its own assets (Cargo.toml `assets = [...]`) nor from a \
+             dependency (`distro_asset`). The page will load and act unstyled or \
+             dead.\n  shipped: {shipped:?}\n  from a dependency: {distro:?}",
+        );
+    }
+}
+
+/// Every path `distro_asset` redirects, so the check above can accept them.
+///
+/// Kept in the library rather than duplicated here: a mapping removed from the
+/// controller must also stop counting as satisfied, or this test would bless a
+/// reference nothing serves.
+#[test]
+fn the_distro_asset_paths_belong_to_a_declared_dependency() {
+    let dir = crate_dir();
+    let cargo = std::fs::read_to_string(dir.join("Cargo.toml")).expect("Cargo.toml");
+    let depends = deb_depends(&cargo);
+
+    for (rel, path) in tab_atelier_proxy::http::controllers::web::distro_asset_paths() {
+        // `libjs-bootstrap5` owns `/usr/share/javascript/bootstrap5`. A path
+        // outside a declared dependency is a file that may simply be absent on
+        // the host — which is precisely how the modal came up transparent.
+        let owned =
+            path.starts_with("/usr/share/javascript/bootstrap5/") && depends.iter().any(|d| d == "libjs-bootstrap5");
+        assert!(
+            owned,
+            "distro_asset maps {rel:?} to {path:?}, which no declared dependency provides \
+             (Depends: {depends:?}). Either add the owning package to `depends` in \
+             [package.metadata.deb], or stop pointing at it.",
+        );
+    }
+}
+
+/// The deb `Depends:` list from `Cargo.toml`, split on commas.
+fn deb_depends(cargo: &str) -> Vec<String> {
+    let line = cargo
+        .lines()
+        .find(|l| l.trim_start().starts_with("depends ="))
+        .expect("a [package.metadata.deb] depends line");
+    line.split_once('=')
+        .expect("key = value")
+        .1
+        .trim()
+        .trim_matches('"')
+        .split(',')
+        .map(|d| d.trim().to_owned())
+        .filter(|d| !d.is_empty())
+        .collect()
+}
+
+/// Same-origin `<script src>` and `<link href>` values, normalised.
+fn local_references(html: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for (open, attr) in [("<script", "src="), ("<link", "href=")] {
+        let mut rest = html;
+        while let Some(i) = rest.find(open) {
+            rest = &rest[i..];
+            let tag_end = rest.find('>').unwrap_or(rest.len());
+            let tag = &rest[..tag_end];
+            if let Some(j) = tag.find(attr) {
+                let after = &tag[j + attr.len()..];
+                let quote = after.chars().next().unwrap_or('"');
+                if quote == '"' || quote == '\'' {
+                    let value = &after[1..];
+                    if let Some(k) = value.find(quote) {
+                        let url = &value[..k];
+                        if !url.starts_with("http") && !url.starts_with("//") && !url.is_empty() {
+                            // Drop a version stamp; the file on disk has none.
+                            let path = url.split('?').next().unwrap_or(url);
+                            out.insert(path.to_owned());
+                        }
+                    }
+                }
+            }
+            rest = &rest[tag_end.min(rest.len())..];
+            if rest.len() <= 1 {
+                break;
+            }
+            rest = &rest[1..];
+        }
+    }
+    out
+}

@@ -750,11 +750,32 @@ const AdminApp = Vue.defineComponent({
       }
     },
     async addPreset(p: PresetView) {
+      // Ask for a name first. The generated one (`deepseek-2`) is fine for a
+      // throwaway second key but useless once there are three entries that differ
+      // by which account or key they carry — which is exactly when someone reaches
+      // for a name. Cancelling the prompt aborts, so this doubles as the way to
+      // change your mind; leaving it empty accepts the generated name.
+      const name = prompt(
+        `Name for this ${p.label} entry (blank for "${p.id}", "${p.id}-2", …):`,
+        "",
+      );
+      if (name === null) return;
+
       // `dup` makes this an ADDED entry, not an edit of one already there:
       // clicking DeepSeek twice has to leave two rows with two key files, not
       // one row holding whichever key was pasted last.
-      await api.providers.save({ preset: p.id, dup: true });
-      await this.loadProviders();
+      this.providersBusy = true;
+      try {
+        await api.providers.save({ preset: p.id, dup: true, id: name.trim() });
+        await this.loadProviders();
+      } catch (e) {
+        // A refused name (a path separator, a collision) is the operator's to
+        // correct, and the server says why — surface it rather than swallowing it
+        // in a busy flag.
+        this.error = e instanceof Error ? e.message : String(e);
+      } finally {
+        this.providersBusy = false;
+      }
     },
     async setKey(p: ProviderView) {
       const key = prompt(`API key for ${p.id}:`, "");
@@ -867,27 +888,19 @@ const AdminApp = Vue.defineComponent({
       return out.sort((a, b) => a.label.localeCompare(b.label));
     },
     /**
-     * The "when they ask for" select's value for one rule.
+     * Sources offered for one rule's "when they ask for".
      *
-     * A rule's `from` is either empty (any model), a catalogue id, or an id the
-     * catalogue has dropped. Only the last needs the escape hatch, so this
-     * reports `__other` for it and the markup shows a text input beside the
-     * select. Keeping it derived rather than a stored flag means the editor
-     * cannot disagree with the rule it is editing.
+     * The catalogue, plus the rule's own `from` when it is not in it. A rule may
+     * name an id the catalogue has dropped — that is how traffic for a retired
+     * model gets caught — and dropping it from the list would silently reset the
+     * field to "any model" the next time the rule was opened and saved. It is
+     * shown marked rather than omitted, so the operator can see what it is and
+     * replace it deliberately.
      */
-    routeFromValue(r: DraftRoute): string {
-      if (!r.from) return "";
-      return this.mappingModelChoices.includes(r.from) ? r.from : "__other";
-    },
-    /** Choosing from the select, including the escape hatch. */
-    setRouteFrom(r: DraftRoute, value: string) {
-      if (value === "__other") {
-        // Clear it so the text input starts empty; leaving the old id would
-        // make "other" look like it had already been answered.
-        r.from = "";
-      } else {
-        r.from = value;
-      }
+    routeFromChoices(r: DraftRoute): string[] {
+      const all = [...this.mappingModelChoices];
+      if (r.from && !all.includes(r.from)) all.unshift(r.from);
+      return all;
     },
 
     /**

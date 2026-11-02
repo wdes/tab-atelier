@@ -93,6 +93,32 @@ pub(crate) fn distro_asset(rel: &str) -> Option<&'static str> {
     }
 }
 
+/// Every relative path this server answers from a dependency rather than itself.
+///
+/// Public so a packaging test can prove that each one is owned by a package the
+/// `.deb` declares — a mapping to a file nobody installs is a reference the page
+/// makes and the host cannot answer, which is how the dashboard came up with no
+/// stylesheet at all.
+#[must_use]
+pub fn distro_asset_paths() -> Vec<(&'static str, &'static str)> {
+    // Kept as a list beside `distro_asset` rather than derived from it: the match
+    // is the source of truth, and a test that walked a second copy would bless a
+    // mapping the request handler does not make.
+    ["vendor/bootstrap.min.css", "vendor/bootstrap.min.css.map"]
+        .into_iter()
+        .filter_map(|rel| distro_asset(rel).map(|p| (rel, p)))
+        .collect()
+}
+
+/// The same set as [`distro_asset_paths`], keyed by the path the page requests.
+#[must_use]
+pub fn distro_references() -> std::collections::BTreeSet<String> {
+    distro_asset_paths()
+        .into_iter()
+        .map(|(rel, _)| rel.to_owned())
+        .collect()
+}
+
 const VERSIONED: &[&str] = &[
     "vendor/bootstrap.min.css",
     "vendor/vue.global.prod.js",

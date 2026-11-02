@@ -144,7 +144,41 @@
         display: flex; align-items: flex-start; justify-content: center;
         padding: 4vh 1rem; overflow-y: auto;
       }
-      .ta-modal { width: 100%; max-width: 46rem; }
+      /* The panel itself needs its own surface: the backdrop alone dims the page
+         and nothing more, so a modal built without Bootstrap's `.card` class
+         renders its form straight over the dimmed page — which reads as a
+         transparent dialog rather than a panel. Declared here rather than left to
+         `card` so every modal is opaque by construction, whichever classes it is
+         given; the variables keep it following the theme. */
+      .ta-modal {
+        width: 100%; max-width: 46rem;
+        background: var(--bs-body-bg);
+        color: var(--bs-body-color);
+        border: 1px solid var(--bs-border-color);
+        border-radius: var(--bs-border-radius-lg);
+        padding: 1.25rem;
+        box-shadow: 0 .5rem 2rem rgb(0 0 0 / .3);
+      }
+      /* A modal that also carries `.card` would otherwise get the card's padding
+         as well as this one, insetting the body twice. */
+      .ta-modal.card { padding: 0; }
+      /* The close control, defined here rather than taken from Bootstrap's
+         `.btn-close`. That class draws its glyph from a background image, so
+         wherever the stylesheet is unavailable — a host without libjs-bootstrap5,
+         which the proxy serves the CSS from — the button renders as an empty
+         invisible box. A literal "×" is legible with no stylesheet at all. */
+      .ta-close {
+        flex: none;
+        width: 2rem; height: 2rem;
+        display: inline-flex; align-items: center; justify-content: center;
+        font-size: 1.5rem; line-height: 1;
+        border: 1px solid var(--bs-border-color);
+        border-radius: var(--bs-border-radius);
+        background: transparent;
+        color: var(--bs-body-color);
+        cursor: pointer;
+      }
+      .ta-close:hover { background: var(--bs-secondary-bg, rgb(0 0 0 / .06)); }
 
       /* JSON body colouring. The selectors are the token classes the viewer
          hands back, so if the palette changes these must change with it.
@@ -708,7 +742,8 @@
                 <button class="btn btn-sm btn-outline-secondary ms-2" @click="copy(inspectOpen.request_body)">
                   {{ copied ? 'Copied' : 'Copy JSON' }}
                 </button>
-                <button class="btn-close ms-2" aria-label="Close" @click="inspectOpen = null"></button>
+                <button class="ta-close ms-2" aria-label="Close" title="Close"
+                          @click="inspectOpen = null">&times;</button>
               </div>
               <!-- Only reachable for a request larger than the 4 MB cap, which
                    no ordinary call comes near. Said plainly, because a clipped
@@ -1105,7 +1140,8 @@
           <div class="ta-modal" style="max-width: 46rem">
             <div class="d-flex justify-content-between align-items-center mb-2">
               <h2 class="h5 mb-0">Model mapping</h2>
-              <button class="btn-close" @click="routes = null" aria-label="Close"></button>
+              <button class="ta-close" @click="routes = null" aria-label="Close"
+                      title="Close">&times;</button>
             </div>
 
             <p class="small text-body-secondary mb-3">
@@ -1127,18 +1163,10 @@
                 <div class="col-sm-4 text-sm-end"><label class="form-label mb-0 small">When they ask for</label></div>
                 <div class="col-sm-8">
                   <select class="form-select form-select-sm" autocomplete="off"
-                          :value="routeFromValue(r)"
-                          @change="setRouteFrom(r, $event.target.value)" :disabled="busy">
+                          v-model="r.from" :disabled="busy">
                     <option value="">any model</option>
-                    <option v-for="m in mappingModelChoices" :key="m" :value="m">{{ m }}</option>
-                    <!-- A rule may name a model the catalogue has dropped — that
-                         is how traffic for a retired id gets caught — so a bare
-                         dropdown would remove a real capability. -->
-                    <option value="__other">other (type it)…</option>
+                    <option v-for="m in routeFromChoices(r)" :key="m" :value="m">{{ m }}</option>
                   </select>
-                  <input v-if="routeFromValue(r) === '__other'"
-                         class="form-control form-control-sm mt-1" v-model="r.from"
-                         placeholder="model id" :disabled="busy">
                 </div>
 
                 <div class="col-sm-4 text-sm-end"><label class="form-label mb-0 small">and the traffic is</label></div>

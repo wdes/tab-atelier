@@ -32,7 +32,26 @@ pub(crate) fn save(request: &SaveProvider, state: &Arc<State>) -> Result<Doc<IdR
     // free name; that name is also what gives it its own key file.
     let mut new = if let Some(preset) = request.preset() {
         if request.duplicate() {
-            preset.provider_for(&dir, reg.providers.iter().map(|x| x.id.as_str()))
+            // An operator naming the entry beats the generated one. The default
+            // (`deepseek`, `deepseek-2`, …) is fine for a throwaway second key
+            // but useless the moment there are three and they differ by which
+            // account or key they carry — which is exactly when someone reaches
+            // for a name.
+            let wanted = request.id.trim();
+            if wanted.is_empty() {
+                preset.provider_for(&dir, reg.providers.iter().map(|x| x.id.as_str()))
+            } else {
+                if let Err(why) = provider::validate_provider_id(wanted) {
+                    return Err(Failure::problem(400, format!("id: {why}")));
+                }
+                if reg.providers.iter().any(|x| x.id == wanted) {
+                    return Err(Failure::problem(
+                        409,
+                        format!("a provider called {wanted} already exists"),
+                    ));
+                }
+                preset.provider_named(&dir, wanted)
+            }
         } else {
             preset.provider(&dir)
         }
@@ -589,6 +608,11 @@ mod tests {
         let mut second = custom("ignored");
         second.preset = Preset::Deepseek.id().to_owned();
         second.dup = Some(true);
+        // No name typed, so the generated one is what should be used. The `id`
+        // from `custom` is filler for the hand-written case; leaving it set here
+        // would ask for a provider *called* "ignored", which is the other path
+        // and is covered by the test below.
+        second.id = String::new();
         second.key = "a-second-key".to_owned();
         assert_eq!(answered(save(&second, &state)), 200);
 
@@ -600,6 +624,69 @@ mod tests {
             2,
             "two deepseek rows, distinguishable: {all:?}"
         );
+    }
+
+    /// A name the operator typed is used instead of the generated one.
+    ///
+    /// `deepseek-2` says nothing about which account or key the entry carries —
+    /// which is exactly when someone reaches for a name. The generated name stays
+    /// the default for a name left blank.
+    #[test]
+    fn a_copy_takes_the_name_the_operator_gave() {
+        let state = state_for("dup-named");
+
+        let mut named = custom("ignored");
+        named.preset = Preset::Deepseek.id().to_owned();
+        named.dup = Some(true);
+        named.id = "deepseek-team".to_owned();
+        assert_eq!(answered(save(&named, &state)), 200);
+
+        let all = ids(&state);
+        assert!(
+            all.iter().any(|id| id == "deepseek-team"),
+            "the typed name is used: {all:?}",
+        );
+        assert!(
+            !all.iter().any(|id| id.starts_with("deepseek-2")),
+            "and the generated one is not: {all:?}",
+        );
+    }
+
+    /// Two entries cannot share a name: the id is also the key's filename, so a
+    /// collision would put two credentials in one file and lose whichever was
+    /// written first.
+    #[test]
+    fn a_name_already_taken_is_refused() {
+        let state = state_for("dup-collision");
+
+        let mut first = custom("ignored");
+        first.preset = Preset::Deepseek.id().to_owned();
+        first.dup = Some(true);
+        first.id = "taken".to_owned();
+        assert_eq!(answered(save(&first, &state)), 200);
+
+        let mut second = custom("ignored");
+        second.preset = Preset::Deepseek.id().to_owned();
+        second.dup = Some(true);
+        second.id = "taken".to_owned();
+        assert_eq!(answered(save(&second, &state)), 409, "refused, not overwritten");
+    }
+
+    /// A name that would escape the config directory is refused at the boundary.
+    ///
+    /// The id is interpolated into `provider-{id}.key`, so this is the one case
+    /// here with a security consequence rather than merely an ugly name.
+    #[test]
+    fn a_name_that_is_a_path_is_refused() {
+        let state = state_for("dup-path");
+
+        for bad in ["../escape", "a/b", ".hidden"] {
+            let mut p = custom("ignored");
+            p.preset = Preset::Deepseek.id().to_owned();
+            p.dup = Some(true);
+            p.id = bad.to_owned();
+            assert_eq!(answered(save(&p, &state)), 400, "{bad:?} should be refused");
+        }
     }
 
     // ── rotating a key ──────────────────────────────────────────────────────
