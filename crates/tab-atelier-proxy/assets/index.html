@@ -797,6 +797,12 @@
         </div>
 
         <div class="card shadow-sm">
+          <!-- Wrapped so the later columns stay reachable. A row carries eleven
+               cells — including the traffic-kind override and the model-mapping
+               button — and without this the table overflows the card, so the
+               rightmost ones sit past the window edge and read as "the control
+               does not exist". -->
+          <div class="table-responsive">
           <table class="table table-hover align-middle mb-0">
             <thead>
               <tr class="small text-body-secondary">
@@ -1038,6 +1044,7 @@
               </tr>
             </tbody>
           </table>
+          </div>
         </div>
 
         <div class="card shadow-sm mt-4">
