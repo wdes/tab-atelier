@@ -164,7 +164,15 @@ function emptyUsage(id: string): AccountUsage {
  */
 /** A blank row, so the editor opens with somewhere to type. */
 function blankRoute(): DraftRoute {
-  return { from: "", kind: "", from_provider: "", tool: "", to_model: "", to_provider: "" };
+  return {
+    from: "",
+    kind: "",
+    from_provider: "",
+    tool: "",
+    to_model: "",
+    to_provider: "",
+    saved: null,
+  };
 }
 
 /** A stored route as a draft row. */
@@ -176,6 +184,7 @@ function draftFrom(r: ModelRoute): DraftRoute {
     tool: r.tool ?? "",
     to_model: r.to_model,
     to_provider: r.to_provider ?? "",
+    saved: r,
   };
 }
 
@@ -783,6 +792,32 @@ const AdminApp = Vue.defineComponent({
       await api.providers.rotateKey(p.id, key);
       await this.loadProviders();
     },
+    /**
+     * Rename a provider.
+     *
+     * A server operation, not a field edit: the id names the key file and is the
+     * string accounts pin to and rules reference, so it has to move all of them
+     * together. Renaming to the same name is allowed and does nothing, which is
+     * what makes the prompt safe to confirm without reading it twice.
+     */
+    async renameProvider(p: ProviderView) {
+      const to = prompt(`New name for ${p.id}:`, p.id);
+      if (to === null) return;
+      const trimmed = to.trim();
+      if (trimmed === "" || trimmed === p.id) return;
+      this.providersBusy = true;
+      try {
+        await api.providers.rename(p.id, trimmed);
+        this.error = "";
+        await this.loadProviders();
+      } catch (e) {
+        // A refused name (taken, or not usable as a filename) is the operator's
+        // to correct and the server says why.
+        this.error = e instanceof Error ? e.message : String(e);
+      } finally {
+        this.providersBusy = false;
+      }
+    },
     async toggleProvider(p: ProviderView) {
       await api.providers.save({
         id: p.id,
@@ -947,8 +982,66 @@ const AdminApp = Vue.defineComponent({
     addRouteRow() {
       if (this.routes) this.routes.rows.push(blankRoute());
     },
-    removeRouteRow(i: number) {
-      if (this.routes) this.routes.rows.splice(i, 1);
+    /**
+     * Remove one rule — from the server, not just from the list.
+     *
+     * This used to splice the row out of `rows` and stop there, so the rule
+     * stayed in the store: the modal said it was gone, the next load brought it
+     * back, and the operator's only evidence was that the thing they deleted
+     * kept returning. Removing a row is a write.
+     *
+     * Two cases, and the difference matters:
+     *
+     * * A row the operator has just added (`saved === null`) exists only in this
+     *   form, so discarding it needs no request — and must not make one, since a
+     *   half-filled rule has no conditions the server could match.
+     * * A stored row is identified by the conditions it was READ with, not by
+     *   whatever the form holds now. The operator may have edited it before
+     *   deciding to remove it, and those edits identify a rule that does not
+     *   exist; deleting with them would silently do nothing while looking like it
+     *   worked.
+     */
+    async removeRoute(i: number) {
+      if (!this.routes) return;
+      const row = this.routes.rows[i];
+      if (!row) return;
+
+      // Never stored, so nothing to undo on the server.
+      if (!row.saved) {
+        this.routes.rows.splice(i, 1);
+        if (this.routes.rows.length === 0) this.routes.rows.push(blankRoute());
+        return;
+      }
+
+      const accountId = this.routes.id;
+      const saved = row.saved;
+      this.busy = true;
+      try {
+        // An empty destination is the deletion verb: the same convention the
+        // model pin uses for clearing. Sent with the stored conditions so it
+        // names exactly the rule the operator is looking at.
+        const updated = await api.users.setRoute(accountId, {
+          from: saved.from ?? "",
+          kind: saved.kind ?? "",
+          from_provider: saved.from_provider ?? "",
+          tool: saved.tool ?? "",
+          to_model: "",
+          to_provider: null,
+        });
+        const editor = this.routes;
+        if (editor && editor.id === accountId) {
+          editor.rows = [...(updated.routes ?? []).map(draftFrom), blankRoute()];
+        }
+        this.error = "";
+        await this.refresh();
+      } catch (e) {
+        this.error = e instanceof Error ? e.message : String(e);
+        // The row is left in place: a failed delete means the rule is still
+        // there, and hiding that would be the same lie the local splice told.
+        await this.refresh();
+      } finally {
+        this.busy = false;
+      }
     },
     /**
      * Save one row.

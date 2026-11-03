@@ -75,12 +75,73 @@ pub const fn fit(window: u64, input: u64, requested: u64) -> Budget {
 
 /// Estimated input tokens for a request body.
 ///
-/// Four bytes per token, the same approximation `qos::estimate_cost` uses: it is
-/// what is knowable before the provider has seen the request. `CONTEXT_MARGIN`
-/// exists to absorb how wrong it can be.
+/// Four bytes per token, the same approximation `qos::estimate_cost` uses — but
+/// **only for text**. Base64 payloads are excluded and charged a flat per-image
+/// cost, because four-bytes-per-token is meaningless for them: a 1.5 MB
+/// screenshot is ~2 MB of base64, which this rule would score at half a million
+/// tokens for something the provider counts in the low thousands. Three
+/// screenshots in a session then read as "past the window", and a proxy that
+/// believes that refuses a request that would have succeeded.
+///
+/// `raw_len` is the serialised body length, which already includes the base64.
+/// The `data` strings are subtracted from it and [`IMAGE_TOKENS`] is added back
+/// per image, so the text around them is still measured honestly.
 #[must_use]
-pub const fn estimate_input(body: &[u8]) -> u64 {
-    (body.len() as u64) / 4
+pub fn estimate_input(body: &serde_json::Value, raw_len: usize) -> u64 {
+    let mut media_bytes = 0u64;
+    let mut media_blocks = 0u64;
+    collect_media(body, &mut media_bytes, &mut media_blocks);
+
+    let text_bytes = (raw_len as u64).saturating_sub(media_bytes);
+    // The `+ 4` on each image is the four-bytes-per-token conversion applied to
+    // the nominal cost, so one arithmetic runs through the whole figure.
+    (text_bytes + media_blocks * IMAGE_TOKENS * 4) / 4
+}
+
+/// What one image is assumed to cost, in tokens.
+///
+/// Anthropic's documented figure for a full-size image is roughly 1,600 tokens
+/// (about 1,600 px on the long edge); smaller ones cost less. This is an upper
+/// bound on purpose — the number only ever *lowers* the completion reservation,
+/// and over-counting a little costs a slightly smaller completion, while
+/// under-counting means the provider refuses the request.
+pub const IMAGE_TOKENS: u64 = 1_600;
+
+/// Sum the bytes of base64 media and count the blocks carrying it.
+///
+/// Walks the whole body rather than only `messages`, because a tool result can
+/// carry an image nested inside it and the top-level shape differs between the
+/// two wires.
+fn collect_media(value: &serde_json::Value, bytes: &mut u64, blocks: &mut u64) {
+    match value {
+        serde_json::Value::Object(map) => {
+            let is_media = matches!(
+                map.get("type").and_then(serde_json::Value::as_str),
+                Some("image" | "document")
+            );
+            if is_media {
+                // The payload sits at `source.data` on the Anthropic wire and at
+                // `source.data` on the OpenAI one too, once converted.
+                if let Some(data) = map
+                    .get("source")
+                    .and_then(|s| s.get("data"))
+                    .and_then(serde_json::Value::as_str)
+                {
+                    *bytes = bytes.saturating_add(data.len() as u64);
+                    *blocks = blocks.saturating_add(1);
+                }
+            }
+            for v in map.values() {
+                collect_media(v, bytes, blocks);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for v in items {
+                collect_media(v, bytes, blocks);
+            }
+        }
+        _ => {}
+    }
 }
 
 #[cfg(test)]
@@ -191,10 +252,66 @@ mod tests {
         assert!(matches!(budget, Budget::TooLong { .. }), "got {budget:?}");
     }
 
-    /// The estimate is the documented four-bytes-per-token rule.
+    /// The estimate is the documented four-bytes-per-token rule, for text.
     #[test]
-    fn the_input_estimate_is_bytes_over_four() {
-        assert_eq!(estimate_input(&[0u8; 4_000]), 1_000);
-        assert_eq!(estimate_input(&[]), 0);
+    fn the_input_estimate_is_bytes_over_four_for_text() {
+        let body = serde_json::json!({ "messages": [] });
+        let raw = serde_json::to_vec(&body).expect("serialises").len();
+
+        assert_eq!(estimate_input(&body, raw), (raw as u64) / 4);
+        assert_eq!(estimate_input(&serde_json::Value::Null, 0), 0);
+    }
+
+    /// **The regression test for the hang.**
+    ///
+    /// A screenshot is base64 in the body: a 1.5 MB PNG is about 2 MB of
+    /// characters, which four-bytes-per-token scores at ~500,000 tokens for
+    /// something the provider counts as ~1,600. Three of them read as "past a
+    /// million-token window", and the proxy this estimate drives refused the
+    /// request — so the client compacted, resent the same images, was refused
+    /// again, and the session looped forever instead of failing once.
+    #[test]
+    fn an_image_is_charged_a_nominal_cost_not_its_base64_size() {
+        // ~2 MB of base64, the size of a real screenshot block.
+        let payload = "A".repeat(2_000_000);
+        let body = serde_json::json!({
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "image",
+                    "source": { "type": "base64", "media_type": "image/png", "data": payload },
+                }],
+            }],
+        });
+        let raw = serde_json::to_vec(&body).expect("serialises").len();
+
+        let estimate = estimate_input(&body, raw);
+
+        assert!(
+            estimate < IMAGE_TOKENS * 2,
+            "one image is a nominal cost, not half a million tokens: {estimate}",
+        );
+        assert!(estimate >= IMAGE_TOKENS, "but it is not free either: {estimate}");
+    }
+
+    /// Text beside an image is still measured, so the exclusion is not a blanket
+    /// discount that would let a genuinely long prompt through unmeasured.
+    #[test]
+    fn text_beside_an_image_is_still_counted() {
+        let payload = "A".repeat(100_000);
+        let long_text = "word ".repeat(20_000); // ~100 KB of text
+        let body = serde_json::json!({
+            "messages": [{
+                "content": [
+                    { "type": "text", "text": long_text },
+                    { "type": "image", "source": { "data": payload } },
+                ],
+            }],
+        });
+        let raw = serde_json::to_vec(&body).expect("serialises").len();
+
+        let estimate = estimate_input(&body, raw);
+
+        assert!(estimate > 20_000, "100 KB of text is measured normally: {estimate}");
     }
 }

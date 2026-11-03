@@ -34,7 +34,7 @@ pub mod user;
 pub use compact::SetCompact;
 pub use inspect::ArmInspect;
 pub use key::{AddKey, SetKeyDisabled};
-pub use provider::{RotateProviderKey, SaveProvider};
+pub use provider::{RenameProvider, RotateProviderKey, SaveProvider};
 pub use user::{AddUser, PinModel, PinProvider, SetDisabled, SetWeight};
 
 pub use tab_atelier_api::request::{Rejection, Validated, loose_bool, parse};

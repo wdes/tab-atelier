@@ -181,3 +181,25 @@ mod tests {
         assert!(RotateProviderKey::accept(&Bytes::from_static(br#"{"key":"sk"}"#)).is_ok());
     }
 }
+
+/// A provider's new name.
+///
+/// One field, and it is the whole operation: the id selects the entry, names its
+/// key file and is what accounts pin to, so renaming is the only attribute that
+/// cannot be edited in place.
+#[derive(Debug, serde::Deserialize, tab_atelier_api::schemars::JsonSchema)]
+pub struct RenameProvider {
+    pub id: String,
+}
+
+impl Validated for RenameProvider {
+    fn validate(&self) -> Result<(), String> {
+        crate::provider::validate_provider_id(self.id.trim())
+    }
+
+    fn accept(body: &bytes::Bytes) -> Result<Self, Rejection> {
+        let parsed: Self = super::parse(body)?;
+        parsed.validate().map_err(|why| Rejection::field("id", &why))?;
+        Ok(parsed)
+    }
+}

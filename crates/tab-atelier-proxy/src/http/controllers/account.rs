@@ -718,6 +718,28 @@ mod tests {
         assert!(routes_of(&state, who).is_empty());
     }
 
+    /// Removing a rule that is not there is refused, not quietly accepted.
+    ///
+    /// It used to return a cheerful account with the same rules it started with,
+    /// and that is what made the reported bug invisible from the server side: the
+    /// dashboard sent the conditions of a rule that had been edited (or the wrong
+    /// ones entirely), the store removed nothing, the response looked like a
+    /// success, and the rule was still there on the next load. A 404 naming the
+    /// conditions turns that into a diagnosable answer.
+    #[test]
+    fn removing_a_rule_that_does_not_exist_is_refused() {
+        let state = state_with_deepseek("route-gone", "route-gone@example.com");
+        let who = "route-gone@example.com";
+
+        let reply = set_route(&state, who, &route("claude-opus-5-5", "", None));
+
+        assert_eq!(
+            answered(&reply),
+            404,
+            "a delete that matches nothing must not look like a success",
+        );
+    }
+
     /// A destination no provider serves is refused where a human can read it.
     ///
     /// This is the difference between a 400 now and a 503 on every request the

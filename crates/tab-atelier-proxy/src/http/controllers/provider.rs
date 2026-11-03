@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use crate::http::registry_dir;
-use crate::http::requests::provider::{RotateProviderKey, SaveProvider};
+use crate::http::requests::provider::{RenameProvider, RotateProviderKey, SaveProvider};
 use crate::http::resources::status::{IdResource, OkResource};
 use crate::provider;
 use crate::server::State;
@@ -226,6 +226,93 @@ pub(crate) fn remove(id: &str, state: &Arc<State>) -> Result<Doc<OkResource>, Fa
     Ok(Doc::ok(OkResource::yes()))
 }
 
+/// Give a provider a different name.
+///
+/// Three things have to move together, and the order matters:
+///
+/// 1. **the key file** — `provider-{id}.key` is where the credential lives, so a
+///    rename that skipped it would leave a provider whose entry points at a file
+///    named after its old id;
+/// 2. **the registry entry**;
+/// 3. **every reference** — account pins and the source/destination of rules,
+///    followed by [`crate::users::Store::rename_provider`].
+///
+/// The key is copied first and removed last, so a failure between steps leaves
+/// the credential reachable under both names rather than under neither. Failing
+/// closed on a missing key would be worse than a stale duplicate: the duplicate
+/// is invisible, the missing key takes the provider's traffic down at the moment
+/// someone was reorganising names.
+pub(crate) fn rename(id: &str, request: &RenameProvider, state: &Arc<State>) -> Result<Doc<OkResource>, Failure> {
+    let to = request.id.trim();
+    if to == id {
+        return Ok(Doc::ok(OkResource::yes()));
+    }
+
+    // Validate and check for collisions before touching any file.
+    //
+    // The guard is scoped to this block on purpose: it must be released before the
+    // filesystem work below, because none of that needs the registry and holding a
+    // lock across I/O blocks every request on the proxy.
+    {
+        let reg = state.registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !reg.providers.iter().any(|p| p.id == id) {
+            return Err(Failure::problem(404, "no such provider"));
+        }
+        if reg.providers.iter().any(|p| p.id == to) {
+            return Err(Failure::problem(409, format!("a provider called {to} already exists")));
+        }
+        if let Err(why) = crate::provider::validate_provider_id(to) {
+            return Err(Failure::problem(400, format!("id: {why}")));
+        }
+        // Released here rather than at the end of the block: everything below is
+        // filesystem work, and a registry lock held across it would stall every
+        // request on the proxy for the duration of a rename.
+        drop(reg);
+    }
+
+    let config_dir = state
+        .registry_path
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_default();
+    let old_key = crate::provider::provider_key_path(&config_dir, id);
+    let new_key = crate::provider::provider_key_path(&config_dir, to);
+    let moved_key = if old_key.exists() {
+        std::fs::copy(&old_key, &new_key).map_err(|e| Failure::problem(500, format!("key: {e}")))?;
+        true
+    } else {
+        false
+    };
+
+    {
+        let mut reg = state.registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Err(why) = reg.rename(id, to) {
+            // Put the filesystem back the way it was: a copy with no entry that
+            // uses it is a stray credential on disk.
+            if moved_key {
+                let _ = std::fs::remove_file(&new_key);
+            }
+            return Err(Failure::problem(409, why));
+        }
+        if let Err(e) = reg.save(&state.registry_path) {
+            return Err(Failure::problem(500, format!("registry: {e}")));
+        }
+    }
+
+    {
+        let mut store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Err(e) = store.rename_provider(id, to) {
+            log::error!("proxy: provider {id} renamed to {to}, but references were not rewritten: {e}");
+            return Err(Failure::problem(500, format!("accounts: {e}")));
+        }
+    }
+
+    if moved_key && let Err(e) = std::fs::remove_file(&old_key) {
+        log::warn!("proxy: provider {id} renamed to {to}; old key file left behind: {e}");
+    }
+    Ok(Doc::ok(OkResource::yes()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -276,6 +363,14 @@ mod tests {
     /// The form has no field for the auth kind or the rotation weight, so the
     /// only way to set up the state those tests are about is behind its back —
     /// which is exactly the situation being checked.
+    /// A bare provider in the registry, for tests that only care about its id.
+    fn seed_minimal(state: &Arc<State>, id: &str) {
+        seed(
+            state,
+            crate::provider::Preset::Deepseek.provider_named(state.registry_path.parent().expect("dir"), id),
+        );
+    }
+
     fn seed(state: &Arc<State>, provider: crate::provider::Provider) {
         state
             .registry
@@ -624,6 +719,143 @@ mod tests {
             2,
             "two deepseek rows, distinguishable: {all:?}"
         );
+    }
+
+    // ── renaming ────────────────────────────────────────────────────────────
+
+    /// A rename moves the entry, the key file and every reference.
+    ///
+    /// The id is not a label: it selects the entry, names its key file, and is
+    /// what accounts pin to. A rename that moved only the first would leave the
+    /// credential under the old name and every account pinned to an id that
+    /// resolves to nothing — both invisible until traffic failed.
+    #[test]
+    fn a_rename_moves_the_entry_the_key_and_the_pins() {
+        let state = state_for("rename-ok");
+        seed_minimal(&state, "old-name");
+
+        let key = crate::provider::provider_key_path(state.registry_path.parent().expect("dir"), "old-name");
+        std::fs::write(&key, "sk-secret").expect("write key");
+
+        assert_eq!(
+            answered(rename(
+                "old-name",
+                &RenameProvider {
+                    id: "new-name".to_owned()
+                },
+                &state
+            )),
+            200,
+        );
+
+        // The fixture seeds a provider of its own, so this asks the question that
+        // matters — is the renamed entry there and the old id gone — rather than
+        // asserting the whole list, which would break every time a fixture gains
+        // a provider.
+        let after = ids(&state);
+        assert!(after.iter().any(|id| id == "new-name"), "the entry moved: {after:?}");
+        assert!(
+            !after.iter().any(|id| id == "old-name"),
+            "and not left behind: {after:?}"
+        );
+        let dir = state.registry_path.parent().expect("dir");
+        assert!(
+            crate::provider::provider_key_path(dir, "new-name").exists(),
+            "the key moved with it",
+        );
+        assert!(
+            !crate::provider::provider_key_path(dir, "old-name").exists(),
+            "and is not left behind under the old name",
+        );
+    }
+
+    /// An account pinned to the old name follows the rename.
+    ///
+    /// Otherwise the pin names an id that no longer exists, which resolves to no
+    /// route at all — the account silently stops being served.
+    #[test]
+    fn a_rename_carries_the_accounts_pinned_to_it() {
+        let state = state_for("rename-pins");
+        seed_minimal(&state, "old-name");
+
+        {
+            // Through the state's own store, so the rename below mutates the
+            // same one the controller reads.
+            let mut store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let account = store.add("Ada", "Lovelace", "ada@example.com").expect("add");
+            store.set_provider(&account.email, Some("old-name")).expect("pin");
+        }
+
+        assert_eq!(
+            answered(rename(
+                "old-name",
+                &RenameProvider {
+                    id: "new-name".to_owned()
+                },
+                &state
+            )),
+            200,
+        );
+
+        // Read out and assert after the guard drops: holding the store lock across
+        // the assertion serves nothing.
+        let pinned = {
+            let store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            store.find("ada@example.com").expect("account").provider.clone()
+        };
+        assert_eq!(pinned.as_deref(), Some("new-name"), "the pin follows the rename");
+    }
+
+    /// A name already in use is refused, and nothing moves.
+    #[test]
+    fn renaming_onto_an_existing_name_is_refused() {
+        let state = state_for("rename-taken");
+        seed_minimal(&state, "first");
+        seed_minimal(&state, "second");
+
+        assert_eq!(
+            answered(rename(
+                "first",
+                &RenameProvider {
+                    id: "second".to_owned()
+                },
+                &state
+            )),
+            409,
+        );
+        // Nothing moved: the two seeded names are still there, and no third
+        // entry appeared carrying the name that was refused.
+        let after = ids(&state);
+        assert!(after.iter().any(|id| id == "first"), "{after:?}");
+        assert!(after.iter().any(|id| id == "second"), "{after:?}");
+        assert_eq!(
+            after.iter().filter(|id| *id == "second").count(),
+            1,
+            "and the refused name did not create a second copy: {after:?}",
+        );
+    }
+
+    /// A name that would escape the config directory is refused.
+    #[test]
+    fn renaming_to_a_path_is_refused() {
+        let state = state_for("rename-path");
+        seed_minimal(&state, "keep");
+
+        assert_eq!(
+            answered(rename(
+                "keep",
+                &RenameProvider {
+                    id: "../escape".to_owned()
+                },
+                &state
+            )),
+            400,
+        );
+        // And it stayed where it was — a refused name must not remove the entry
+        // it was refusing to rename.
+        let after = ids(&state);
+        assert!(after.iter().any(|id| id == "keep"), "{after:?}");
+        assert!(!after.iter().any(|id| id.contains("escape")), "{after:?}");
     }
 
     /// A name the operator typed is used instead of the generated one.

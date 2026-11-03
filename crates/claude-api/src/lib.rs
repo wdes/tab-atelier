@@ -497,6 +497,18 @@ mod transport {
     pub fn agent() -> ureq::Agent {
         ureq::Agent::config_builder()
             .timeout_connect(Some(Duration::from_secs(10)))
+            // A connect timeout alone is not enough: a proxy or an overloaded
+            // upstream can accept the TCP connection and then say nothing at all.
+            // Without a deadline on the response the request waits forever, and a
+            // caller cannot tell a stalled provider from a slow one — which is
+            // exactly the shape of "the call hangs" reports.
+            //
+            // This bounds the HEADERS only, deliberately. A streaming completion
+            // legitimately runs for minutes, so a global timeout would cut healthy
+            // answers off; waiting two minutes for headers is enough for any real
+            // provider and short enough that a silent one fails while the client is
+            // still watching.
+            .timeout_recv_response(Some(Duration::from_mins(2)))
             .http_status_as_error(false)
             .build()
             .new_agent()

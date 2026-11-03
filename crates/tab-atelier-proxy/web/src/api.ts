@@ -113,6 +113,13 @@ interface ProvidersApi {
   list(): Promise<ProvidersResponse>;
   save(body: SaveProviderBody): Promise<IdResponse>;
   rotateKey(id: string, key: string): Promise<IdResponse>;
+  /**
+   * Give a provider a different name.
+   *
+   * The id is what accounts pin to and rules name, so this is a server operation
+   * rather than an edit: it moves the key file and rewrites every reference.
+   */
+  rename(id: string, to: string): Promise<IdResponse>;
   remove(id: string): Promise<IdResponse>;
 }
 
@@ -215,6 +222,7 @@ class ApiClient {
       list: () => this.request<ProvidersResponse>("GET", "/api/providers"),
       save: (body) => this.request("POST", "/api/providers", body),
       rotateKey: (id, key) => this.request("POST", `/api/providers/${seg(id)}/key`, { key }),
+      rename: (id, to) => this.request("POST", `/api/providers/${seg(id)}/rename`, { id: to }),
       remove: (id) => this.request("DELETE", `/api/providers/${seg(id)}`),
     };
 

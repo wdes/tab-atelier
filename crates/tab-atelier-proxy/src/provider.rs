@@ -1991,6 +1991,39 @@ impl Registry {
         self.providers.len() != before
     }
 
+    /// Rename a provider, in place.
+    ///
+    /// The id is not a label: it selects the entry, names its key file, and is
+    /// the string accounts pin to and rules name. So renaming has to be an
+    /// operation on the registry rather than an edit of a field — anything that
+    /// kept a second copy of the old id would be pointing at nothing.
+    ///
+    /// # Errors
+    /// No such provider, a name the operator cannot use, or a name already
+    /// taken. The last is why this is not a plain field assignment: two entries
+    /// sharing an id would share a key file.
+    pub fn rename(&mut self, from: &str, to: &str) -> Result<(), String> {
+        if from == to {
+            return Ok(());
+        }
+        validate_provider_id(to)?;
+        if !self.providers.iter().any(|p| p.id == from) {
+            return Err(format!("no provider called {from}"));
+        }
+        if self.providers.iter().any(|p| p.id == to) {
+            return Err(format!("a provider called {to} already exists"));
+        }
+        let slot = self
+            .providers
+            .iter_mut()
+            .find(|p| p.id == from)
+            .ok_or_else(|| format!("no provider called {from}"))?;
+        // The id is what every lookup goes through, so nothing else in the entry
+        // needs touching.
+        to.clone_into(&mut slot.id);
+        Ok(())
+    }
+
     /// A count per provider id, for diagnostics.
     #[must_use]
     pub fn summary(&self) -> BTreeMap<String, usize> {

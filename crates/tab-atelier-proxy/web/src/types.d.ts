@@ -102,6 +102,18 @@ interface DraftRoute {
     tool: string;
     to_model: string;
     to_provider: string;
+    /**
+     * The rule this draft was read from, or null for a row the operator has just
+     * added.
+     *
+     * Deleting has to send the *stored* conditions rather than whatever is in
+     * the form now, because the server identifies a rule by its conditions: a
+     * row the operator has edited identifies a rule that may not exist. Keeping
+     * the original here is what makes Remove remove the right thing — and what
+     * tells an unsaved row apart from a saved one, so discarding a half-typed
+     * rule does not become a request.
+     */
+    saved: ModelRoute | null;
 }
 
 interface ModelRoute {

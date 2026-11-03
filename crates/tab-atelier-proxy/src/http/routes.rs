@@ -49,7 +49,7 @@ use crate::http::raw::Raw;
 use crate::http::requests::compact::SetCompact;
 use crate::http::requests::inspect::ArmInspect;
 use crate::http::requests::key::{AddKey, SetKeyDisabled};
-use crate::http::requests::provider::{RotateProviderKey, SaveProvider};
+use crate::http::requests::provider::{RenameProvider, RotateProviderKey, SaveProvider};
 use crate::http::requests::user::{
     AddUser, PinModel, PinProvider, SetDisabled, SetKind, SetRoute, SetTools, SetWeight,
 };
@@ -385,6 +385,21 @@ pub(crate) fn rotate_provider_key(
     provider::rotate_key(id, &body.0, state)
 }
 
+/// Rename a provider.
+///
+/// Carries the key file and rewrites every reference — account pins and rule
+/// sources and destinations — because the id is what all of them are keyed by.
+#[openapi]
+#[post("/api/providers/<id>/rename", data = "<body>")]
+pub(crate) fn rename_provider(
+    state: &State<Arc<AppState>>,
+    _admin: Admin,
+    id: &str,
+    body: Json<RenameProvider>,
+) -> Result<crate::transport::Doc<crate::http::resources::OkResource>, crate::transport::Failure> {
+    provider::rename(id, &body.0, state)
+}
+
 /// Remove a provider.
 #[openapi]
 #[delete("/api/providers/<id>")]
@@ -593,6 +608,7 @@ pub fn all_and_spec() -> (Vec<Route>, tab_atelier_api::rocket_okapi::okapi::open
         list_providers,
         save_provider,
         rotate_provider_key,
+        rename_provider,
         remove_provider,
         usage_report,
         pressure,

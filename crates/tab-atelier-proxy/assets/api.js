@@ -111,6 +111,7 @@ class ApiClient {
             list: () => this.request("GET", "/api/providers"),
             save: (body) => this.request("POST", "/api/providers", body),
             rotateKey: (id, key) => this.request("POST", `/api/providers/${seg(id)}/key`, { key }),
+            rename: (id, to) => this.request("POST", `/api/providers/${seg(id)}/rename`, { id: to }),
             remove: (id) => this.request("DELETE", `/api/providers/${seg(id)}`),
         };
         this.usage = {

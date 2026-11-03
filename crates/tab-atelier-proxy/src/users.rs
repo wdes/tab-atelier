@@ -698,6 +698,13 @@ pub enum Error {
     DuplicateKeyName(String),
     InvalidEmail(String),
     MissingName,
+    /// A removal named a rule that is not stored.
+    ///
+    /// Distinct from succeeding with nothing removed, because those are not the
+    /// same event to the caller: a delete that silently matches nothing is how a
+    /// rule appears to be deleted and then comes back on the next load. Naming
+    /// the conditions that matched nothing is what makes that diagnosable.
+    NoSuchRoute(String),
     Io(String),
 }
 
@@ -709,6 +716,7 @@ impl std::fmt::Display for Error {
             Self::DuplicateKeyName(n) => write!(f, "this account already has a key named {n}"),
             Self::InvalidEmail(e) => write!(f, "not an email address: {e}"),
             Self::MissingName => write!(f, "first and last name are both required"),
+            Self::NoSuchRoute(what) => write!(f, "no rule matches {what}"),
             Self::Io(e) => write!(f, "{e}"),
         }
     }
@@ -1118,6 +1126,43 @@ impl Store {
         Ok(out)
     }
 
+    /// Follow a provider rename through everything that names it.
+    ///
+    /// A provider id appears in three places here — the pin an account carries,
+    /// and the source and destination of every rule — and a stale copy is not a
+    /// cosmetic problem: a pin naming an id that no longer exists resolves to no
+    /// route at all, so the account stops being served and the reason is a
+    /// string one character different from the right one.
+    ///
+    /// The registry does not call this; the controller does, once the rename has
+    /// been accepted, so the two stores cannot disagree about whether it happened.
+    ///
+    /// # Errors
+    /// The file could not be written.
+    pub fn rename_provider(&mut self, from: &str, to: &str) -> Result<(), Error> {
+        let mut touched = false;
+        for account in &mut self.accounts {
+            if account.provider.as_deref() == Some(from) {
+                account.provider = Some(to.to_owned());
+                touched = true;
+            }
+            for route in &mut account.routes {
+                if route.from_provider.as_deref() == Some(from) {
+                    route.from_provider = Some(to.to_owned());
+                    touched = true;
+                }
+                if route.to_provider.as_deref() == Some(from) {
+                    route.to_provider = Some(to.to_owned());
+                    touched = true;
+                }
+            }
+        }
+        if touched {
+            self.save()?;
+        }
+        Ok(())
+    }
+
     /// Add or replace one of this account's model routes.
     ///
     /// Replaces by `from`, case-insensitively, so setting the same source twice
@@ -1177,7 +1222,17 @@ impl Store {
             .find(|a| a.id == id)
             .ok_or_else(|| Error::NotFound(who.to_owned()))?;
         let key = route.key();
+        let before = account.routes.len();
         account.routes.retain(|r| r.key() != key);
+        // A removal that matches nothing used to succeed. That is what made the
+        // reported bug invisible from the server side: the UI sent the wrong
+        // conditions, the store removed nothing, the response was a cheerful
+        // account, and the rule was still there on the next load. Refusing is
+        // the honest answer — and the message names the conditions, so the next
+        // mismatch is diagnosable rather than mysterious.
+        if account.routes.len() == before {
+            return Err(Error::NoSuchRoute(key));
+        }
         let out = account.clone();
         self.reindex();
         self.save()?;

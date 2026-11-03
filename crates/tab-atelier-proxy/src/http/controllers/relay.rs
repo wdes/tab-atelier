@@ -16,7 +16,7 @@ use http_body_util::{BodyExt, StreamBody};
 use crate::http::guards::Arrival;
 use crate::http::middleware::arrival::{header_of, is_trusted_hop};
 use crate::server::{State, now_ms};
-use crate::transport::{Reply, json, text};
+use crate::transport::{Reply, text};
 use crate::users::Account;
 use crate::{classifier, egress, inspect, openai, provider, qos, routing, usage};
 
@@ -374,8 +374,10 @@ fn no_route_message(state: &Arc<State>) -> String {
 ///   beginning "prompt is too long"; inventing different wording would leave it
 ///   retrying a request that can never succeed.
 ///
-/// # Errors
-/// The refusal above, in the client's own error shape.
+/// Plain `Bytes`, not a `Result`: this can no longer refuse. That is the point of
+/// the change it was written for — a wrong clamp costs a slightly smaller
+/// completion, a wrong refusal costs the session because the client answers it by
+/// resending the same payload.
 fn fit_completion(
     state: &Arc<State>,
     account: &Account,
@@ -383,32 +385,43 @@ fn fit_completion(
     requested: &str,
     parsed: Option<&serde_json::Value>,
     body: Bytes,
-) -> Result<Bytes, Reply> {
+) -> Bytes {
     let Some(requested_max) = parsed
         .and_then(|v| v.get("max_tokens"))
         .and_then(serde_json::Value::as_u64)
     else {
         // No reservation asked for: nothing to decide, and nothing to refuse.
-        return Ok(body);
+        return body;
     };
     let window = {
         let registry = state.registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         registry.context_window(&route.provider_id, &route.model_id)
     };
 
-    match crate::budget::fit(window, crate::budget::estimate_input(&body), requested_max) {
-        crate::budget::Budget::Unchanged { .. } => Ok(body),
+    match crate::budget::fit(
+        window,
+        crate::budget::estimate_input(parsed.unwrap_or(&serde_json::Value::Null), body.len()),
+        requested_max,
+    ) {
+        crate::budget::Budget::Unchanged { .. } => body,
         crate::budget::Budget::TooLong { input, usable } => {
+            // **Forwarded, not refused.** The estimate said this cannot fit, but
+            // the estimate is a byte heuristic and the provider is the only
+            // authority on tokens: a conversation carrying screenshots once
+            // scored at half a million phantom tokens and produced a refusal for
+            // a request that would have been served. Refusing on a guess is the
+            // dangerous direction — the client answers a "prompt is too long" by
+            // compacting, compaction resends the same images, the estimate says
+            // too long again, and the session loops instead of failing once.
+            //
+            // So the provider gets the request and its own error, if any, reaches
+            // the client unchanged. The warning is here so the near miss is
+            // visible in the log.
             log::warn!(
-                "proxy: {who} {requested} needs compaction — {input} input tokens against a {window} window ({usable} usable)",
+                "proxy: {who} {requested} estimated at {input} tokens against a {window} window ({usable} usable) — forwarding anyway, the estimate is not authoritative",
                 who = account.display_name(),
             );
-            Err(json(
-                400,
-                &format!(
-                    r#"{{"type":"error","error":{{"type":"invalid_request_error","message":"prompt is too long: {requested_max} tokens > {usable} maximum"}}}}"#,
-                ),
-            ))
+            body
         }
         crate::budget::Budget::Clamped { completion, .. } => {
             log::info!(
@@ -422,9 +435,7 @@ fn fit_completion(
             if let Some(obj) = rewritten.as_object_mut() {
                 obj.insert("max_tokens".to_owned(), serde_json::json!(completion));
             }
-            Ok(Bytes::from(
-                serde_json::to_vec(&rewritten).unwrap_or_else(|_| body.to_vec()),
-            ))
+            Bytes::from(serde_json::to_vec(&rewritten).unwrap_or_else(|_| body.to_vec()))
         }
     }
 }
@@ -537,7 +548,7 @@ pub(crate) async fn shape_and_admit(
     // known: the model that will serve the request, and the body that will be
     // sent to it. Extracted because the decision is self-contained and this
     // function is long enough already.
-    let body = fit_completion(state, account, &route, &requested, parsed.as_ref(), body)?;
+    let body = fit_completion(state, account, &route, &requested, parsed.as_ref(), body);
     // What the far end is. It decides whether the client's claim to be Claude
     // Code is true — and so whether anything about it should be rewritten — and
     // whether admission applies at all, since only a destination that spends the

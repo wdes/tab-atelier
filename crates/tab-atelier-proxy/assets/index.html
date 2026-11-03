@@ -556,6 +556,13 @@
                                   ? 'Read from the service environment — set the variable there and restart.'
                                   : 'Set or rotate this provider\'s API key.'"
                               @click="setKey(p)">Key</button>
+                      <!-- Renaming is a server operation, not a field edit: the
+                           id names the key file and is what accounts pin to and
+                           rules reference, so all of them move together. -->
+                      <button class="btn btn-sm btn-outline-secondary"
+                              :disabled="busy"
+                              title="Give this provider a different name. Account pins and rules that name it are updated."
+                              @click="renameProvider(p)">Rename</button>
                       <button class="btn btn-sm btn-outline-danger" @click="removeProvider(p)">Remove</button>
                     </td>
                   </tr>
@@ -1154,9 +1161,11 @@
             <div v-for="(r, i) in routes.rows" :key="i" class="border rounded p-3 mb-3">
               <div class="d-flex justify-content-between align-items-center mb-2">
                 <span class="text-body-secondary small">Rule {{ i + 1 }}</span>
+                <!-- Deletes the rule from the server, not just from this list.
+                     A row that was never saved is simply dropped. -->
                 <button class="btn btn-sm btn-outline-secondary"
-                        @click="removeRouteRow(i)" :disabled="busy"
-                        aria-label="Discard this rule">Remove</button>
+                        @click="removeRoute(i)" :disabled="busy"
+                        :aria-label="'Remove rule ' + (i + 1)">Remove</button>
               </div>
 
               <div class="row g-2 align-items-center">
