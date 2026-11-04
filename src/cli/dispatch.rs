@@ -1466,6 +1466,14 @@ mod tests {
     /// fixture — only that the table routes them somewhere.
     #[test]
     fn every_subcommand_routes_through_the_table() {
+        // The board path is a process-wide global, and this test moves it. Every
+        // other test that does the same takes this lock; without it this one can
+        // swap the path in the middle of `prune`'s rewrite, and prune then reads
+        // back a different file than it wrote — which shows up as a count
+        // assertion failing a few modules away from the cause.
+        let _guard = crate::cli::team::BOARD_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = tempfile::tempdir().expect("tempdir");
         crate::cli::team::set_blackboard_path(Some(dir.path().join("blackboard.jsonl")));
         crate::claims::set_registry_path(Some(dir.path().join("claims.json")));
