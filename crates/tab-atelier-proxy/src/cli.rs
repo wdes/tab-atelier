@@ -104,9 +104,19 @@ pub fn set_route(
         None | Some("") => None,
         Some("work") => Some(tab_atelier_proxy::classifier::Kind::Work),
         Some("classifier" | "auto" | "auto_mode") => Some(tab_atelier_proxy::classifier::Kind::Classifier),
-        Some("plan" | "plan_mode") => Some(tab_atelier_proxy::classifier::Kind::Plan),
+        // Refused rather than accepted-and-never-matching. Nothing produces this
+        // kind: plan mode has no wire signal, and the per-account declaration that
+        // used to fake one has been removed. A rule written here would be created
+        // successfully and then never fire, which is worse than a refusal.
+        Some("plan" | "plan_mode") => {
+            return Err(
+                "kind plan is not selectable: plan mode cannot be identified from a request, so a rule \
+                 on it would never match"
+                    .to_owned(),
+            );
+        }
         Some(other) => {
-            return Err(format!("kind {other} is not work, classifier (alias: auto) or plan"));
+            return Err(format!("kind {other} is not work or classifier (alias: auto)"));
         }
     };
     let from_provider = from_provider.map(str::trim).filter(|p| !p.is_empty());

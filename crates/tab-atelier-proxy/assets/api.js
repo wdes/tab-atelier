@@ -90,8 +90,6 @@ class ApiClient {
              * an operator saying which account does their planning is the honest
              * arrangement rather than a body-level guess.
              */
-            setKind: (id, kind) => this.request("POST", `/api/users/${seg(id)}/kind`, { kind })
-                .then((r) => r.user),
             /**
              * Add, replace or remove one of this person's model routes.
              *

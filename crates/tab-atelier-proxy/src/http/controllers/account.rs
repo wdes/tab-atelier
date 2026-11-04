@@ -10,7 +10,6 @@
 use std::sync::Arc;
 
 use crate::http::requests::compact::SetCompact;
-use crate::http::requests::user::SetKind;
 use crate::http::requests::user::{AddUser, PinModel, PinProvider, SetDisabled, SetRoute, SetTools, SetWeight};
 use crate::http::resources;
 use crate::server::State;
@@ -120,39 +119,6 @@ pub(crate) fn set_model(
     }
 }
 
-/// Declare what kind of traffic this account produces, or clear it.
-///
-/// The only way to reach `plan`. No field in a request body identifies plan mode:
-/// the plan tools are declared in every Claude Code request regardless of
-/// permission mode, so a detector keyed on them classified all traffic as plan and
-/// would have routed real, writing work to whatever cheap model it pointed at.
-/// An operator saying which account does their planning is honest about where the
-/// decision came from.
-pub(crate) fn set_kind(
-    state: &Arc<State>,
-    who: &str,
-    req: &SetKind,
-) -> Result<Doc<resources::AccountEnvelope>, Failure> {
-    let kind = match req.kind.trim().to_ascii_lowercase().as_str() {
-        // Empty clears: the account goes back to being classified from its body.
-        "" => None,
-        "work" => Some(crate::classifier::Kind::Work),
-        "classifier" | "auto" | "auto_mode" => Some(crate::classifier::Kind::Classifier),
-        "plan" | "plan_mode" => Some(crate::classifier::Kind::Plan),
-        other => {
-            return Err(failure(
-                400,
-                &format!("kind: {other} is not work, classifier (alias: auto) or plan"),
-            ));
-        }
-    };
-    let mut store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    match store.set_kind_override(who, kind) {
-        Ok(a) => Ok(Doc::ok(resources::AccountEnvelope::from(&a))),
-        Err(e) => Err(failure(404, &e.to_string())),
-    }
-}
-
 /// Add, replace, or remove one of an account's per-person model routes.
 ///
 /// A route says "when THIS account asks for X, serve Y". It is the one thing
@@ -181,11 +147,21 @@ pub(crate) fn set_route(
         "" => None,
         "work" => Some(crate::classifier::Kind::Work),
         "classifier" | "auto" | "auto_mode" => Some(crate::classifier::Kind::Classifier),
-        "plan" | "plan_mode" => Some(crate::classifier::Kind::Plan),
+        // Refused rather than accepted-and-never-matching. Nothing produces this
+        // kind: plan mode has no wire signal, and the per-account declaration that
+        // used to fake one is gone. A rule created here would succeed and then never
+        // fire, which is worse than a 400 that says so.
+        "plan" | "plan_mode" => {
+            return Err(failure(
+                400,
+                "kind: plan is not selectable — plan mode cannot be identified from a request, \
+                 so a rule on it would never match",
+            ));
+        }
         other => {
             return Err(failure(
                 400,
-                &format!("kind: {other} is not work, classifier (alias: auto) or plan"),
+                &format!("kind: {other} is not work or classifier (alias: auto)"),
             ));
         }
     };
@@ -973,115 +949,6 @@ mod tests {
         let routes = routes_of(&state, who);
         assert_eq!(routes[0].kind, None, "unset means work only");
         assert_eq!(routes[0].from.as_deref(), Some("claude-opus-5-5"));
-    }
-
-    // ── the account's declared kind ─────────────────────────────────────────
-
-    /// Plan mode is reachable only by declaration, and it persists.
-    ///
-    /// This is the correction to a detector that was wrong: the plan tools are
-    /// declared in EVERY Claude Code request, so `is_plan` matched all traffic and
-    /// would have routed real work to whatever cheap model plan pointed at. Saying
-    /// it per account is the only honest source, so the round trip through the
-    /// store is the whole feature.
-    #[test]
-    fn plan_mode_is_reachable_by_declaration() {
-        let state = state_for("kind-plan", "kind-plan@example.com");
-        let who = "kind-plan@example.com";
-
-        for spelling in ["plan", "plan_mode", "PLAN"] {
-            let reply = set_kind(
-                &state,
-                who,
-                &SetKind {
-                    kind: spelling.to_owned(),
-                },
-            );
-            assert_eq!(answered(&reply), 200, "{spelling} should be accepted");
-        }
-
-        // Read the value out and let the guard drop before asserting: holding a
-        // lock across an assertion serves nothing and clippy rightly objects.
-        let stored = {
-            let store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            store.find(who).expect("the account").kind_override
-        };
-        assert_eq!(stored, Some(crate::classifier::Kind::Plan));
-    }
-
-    /// An empty kind clears it, returning the account to body classification.
-    ///
-    /// The undo, and it has to be a no-op rather than an error: an operator who
-    /// clears an override that was not set is where they wanted to be.
-    #[test]
-    fn clearing_the_kind_override_is_not_an_error() {
-        let state = state_for("kind-clear", "kind-clear@example.com");
-        let who = "kind-clear@example.com";
-
-        set_kind(
-            &state,
-            who,
-            &SetKind {
-                kind: "plan".to_owned(),
-            },
-        )
-        .expect("set");
-        let reply = set_kind(&state, who, &SetKind { kind: String::new() });
-
-        assert_eq!(answered(&reply), 200);
-        let stored = {
-            let store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            store.find(who).expect("the account").kind_override
-        };
-        assert_eq!(stored, None);
-    }
-
-    /// An unknown kind is refused rather than silently treated as work.
-    ///
-    /// Guessing would be the dangerous direction here: a typo meant to declare
-    /// plan mode would leave the account classified as ordinary writing traffic,
-    /// which is the opposite of what the operator asked for — and invisible.
-    #[test]
-    fn an_unknown_kind_override_is_refused() {
-        let state = state_for("kind-bad", "kind-bad@example.com");
-
-        let reply = set_kind(
-            &state,
-            "kind-bad@example.com",
-            &SetKind {
-                kind: "planing".to_owned(),
-            },
-        );
-
-        assert_eq!(answered(&reply), 400);
-        let stored = {
-            let store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            store.find("kind-bad@example.com").expect("the account").kind_override
-        };
-        assert_eq!(stored, None);
-    }
-
-    /// `plan` is accepted as a kind, and stored as such.
-    ///
-    /// Plan mode is the cheapest traffic to redirect — an investigation writes
-    /// nothing — so it is the one an operator most wants a rule for.
-    #[test]
-    fn a_route_can_select_plan_mode() {
-        let state = state_with_deepseek("route-plan", "route-plan@example.com");
-        let who = "route-plan@example.com";
-
-        for spelling in ["plan", "plan_mode"] {
-            let reply = set_route(
-                &state,
-                who,
-                &cond_route("", spelling, "", "deepseek-flash", Some("deepseek")),
-            );
-            assert_eq!(answered(&reply), 200, "{spelling} should be accepted");
-        }
-
-        let routes = routes_of(&state, who);
-        assert_eq!(routes.len(), 1, "both spellings are the same rule");
-        assert_eq!(routes[0].kind, Some(crate::classifier::Kind::Plan));
     }
 
     // ── the tool condition ──────────────────────────────────────────────────

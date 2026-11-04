@@ -125,6 +125,11 @@ interface ModelRoute {
      * Absent means work only, so a rule that does not name it never moves the
      * auto-mode judgement — that call carries Anthropic's security-monitor
      * prompt to whoever serves it.
+     *
+     * `plan` is listed because a rule saved by an earlier build may carry it, and
+     * the dashboard must render such a rule rather than break. It cannot be
+     * *chosen*: nothing produces that kind, so the editor offers only work and
+     * auto mode, and both the API and the CLI refuse it.
      */
     kind?: "work" | "classifier" | "plan" | null;
     /** Only traffic that would otherwise have gone to this provider. */
@@ -442,11 +447,6 @@ interface Capture {
     provider: string;
     /** The model actually requested upstream, not necessarily the one asked for. */
     model?: string;
-    /**
-     * Every request from this account treated as this kind, whatever its body
-     * looks like. The only way to reach `plan`, which no request field identifies.
-     */
-    kind_override?: "work" | "classifier" | "plan" | null;
     /**
      * Which client session sent this, unpacked from the body's `metadata`.
      *

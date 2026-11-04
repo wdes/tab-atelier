@@ -916,27 +916,6 @@ const AdminApp = Vue.defineComponent({
         this.busy = false;
       }
     },
-    /**
-     * Declare what kind of traffic this account produces.
-     *
-     * The only way to reach `plan`: no field in a request body identifies plan
-     * mode — the plan tools are declared in every Claude Code request regardless
-     * of mode, so a body-level detector classified everything as plan. Saying it
-     * per account is honest about who decided.
-     */
-    async setKind(u: ApiUser, value: string) {
-      this.busy = true;
-      try {
-        await api.users.setKind(u.id, value);
-        this.error = "";
-        await this.refresh();
-      } catch (e) {
-        this.error = e instanceof Error ? e.message : String(e);
-        await this.refresh();
-      } finally {
-        this.busy = false;
-      }
-    },
 
     // ── model routes ─────────────────────────────────────────────────────
     //

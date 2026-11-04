@@ -75,25 +75,26 @@ pub enum Kind {
     /// the name they know is a rule that gets used.
     #[serde(alias = "auto", alias = "auto_mode")]
     Classifier,
-    /// Claude Code's plan mode: the read-only investigation phase, before the
-    /// agent is allowed to act.
+    /// **Nothing produces this, and nothing may select it.**
     ///
-    /// Not work in the sense the other rules care about, and not the classifier
-    /// either. It is separated out because it is the cheapest possible traffic to
-    /// redirect: nothing in it writes, so an operator can send it to a small model
-    /// without changing what the agent produces — and plan mode is often the
-    /// largest share of a session's thinking.
+    /// Claude Code's plan mode is the read-only investigation phase, and it is
+    /// the cheapest traffic in a session to redirect — nothing in it writes, so
+    /// moving it changes a suggestion rather than an action. It is not routable
+    /// today because it cannot be identified: the authoritative marker is
+    /// `permissionMode`, client-side state that never reaches a request, and both
+    /// plan tools are declared in *every* request regardless of mode (see
+    /// [`kind_of`] and `docs/proxy-tools.md`).
     ///
-    /// **Never detected — declared per account.** No field in a request body
-    /// identifies plan mode: the authoritative marker is `permissionMode`, which
-    /// is client-side state that never reaches a request, and the plan tools are
-    /// declared in every request regardless of mode (see [`kind_of`]).
+    /// Two wrong attempts are recorded here so neither is retried. A body detector
+    /// keyed on `ExitPlanMode` matched every request, which would have sent real
+    /// work to the cheap model. A per-account declaration in its place made one
+    /// person's *entire* traffic — edits, tool calls, everything — count as plan
+    /// mode, which is the same mistake at a different level.
     ///
-    /// So this kind arises only from `Account::kind_override`, which is an
-    /// operator saying so. That is the honest arrangement rather than a stopgap:
-    /// a detector that guessed would fail in the direction that costs both money
-    /// and correctness — ordinary, writing traffic sent to whatever cheap model
-    /// plan mode was pointed at.
+    /// The variant survives for one reason: a stored rule may already say
+    /// `"kind": "plan"`, and `users::Store::load` refuses an unknown enum value,
+    /// so removing it would stop the whole account file from loading on upgrade.
+    /// Both entry points that could *create* such a rule now refuse it.
     Plan,
 }
 

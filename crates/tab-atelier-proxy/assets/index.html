@@ -863,7 +863,6 @@
                      between two neighbouring selects. -->
                 <th>Routing</th>
                 <th>Compaction</th>
-                <th>Traffic kind</th>
                 <th class="text-end">Key</th>
               </tr>
             </thead>
@@ -1038,25 +1037,6 @@
                             :key="c.value" :value="c.value">{{ c.label }}</option>
                   </select>
                 </td>
-                <td>
-                  <!-- What kind of traffic this account produces. It exists
-                       because plan mode cannot be detected: the plan tools are
-                       declared in every Claude Code request regardless of
-                       permission mode, so a body-level detector classified
-                       everything as plan. Saying it here is honest about who
-                       decided. Empty = classify from the body, as before. -->
-                  <select autocomplete="off"
-                    class="form-select form-select-sm"
-                    style="min-width: 10rem"
-                    :value="u.kind_override || ''"
-                    @change="setKind(u, $event.target.value)"
-                    :disabled="busy">
-                    <option value="">classify normally</option>
-                    <option value="work">work</option>
-                    <option value="classifier">auto mode</option>
-                    <option value="plan">plan mode</option>
-                  </select>
-                </td>
                 <td class="text-end">
                   <!-- gap-2 rather than bare adjacency: three destructive-ish
                        actions touching each other is how the wrong one gets
@@ -1183,7 +1163,6 @@
                   <select class="form-select form-select-sm" v-model="r.kind" :disabled="busy">
                     <option value="">work (default)</option>
                     <option value="classifier">auto mode</option>
-                    <option value="plan">plan mode</option>
                   </select>
                 </div>
 

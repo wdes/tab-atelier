@@ -526,7 +526,7 @@ every request in the system).
 | condition | matches |
 |---|---|
 | a model id | requests for that model |
-| `--kind` | `work`, `classifier` (alias `auto`), or `plan` |
+| `--kind` | `work`, or `classifier` (alias `auto`) |
 | `--from-provider` | traffic that would otherwise have gone to that provider |
 | `--tool` | traffic declaring that server-side tool (`web_search`, `web_fetch`) |
 
@@ -563,32 +563,37 @@ sudo -u tab-atelier-proxy tab-atelier-proxy route ada@example.org "" claude-haik
 sudo -u tab-atelier-proxy tab-atelier-proxy route ada@example.org "" "" --kind auto
 ```
 
-### Plan mode is declared, not detected
+### Plan mode is not routable
 
-`--kind plan` selects plan-mode traffic, but **nothing in a request identifies
-plan mode**, so the kind comes from the account rather than from the body:
+There is no `--kind plan`, and the reason is worth recording because two wrong
+attempts were made before it was accepted.
 
-```
-Routes → Traffic kind → plan mode          (dashboard, per account)
-POST /api/users/<account>/kind  {"kind":"plan"}
-```
+Plan mode is the read-only investigation phase — the cheapest traffic in a session
+to redirect, since nothing in it writes. But **nothing in a request identifies it**.
+The authoritative marker is `permissionMode`, which is client-side state that never
+reaches a request. The obvious body-level proxy — a plan tool in `tools[]` — does
+not work either: `EnterPlanMode` and `ExitPlanMode` are two of the 17 harness tools
+Claude Code declares in **every** request, because tool definitions sit in the
+stable prompt prefix for cache reasons and the harness enforces plan mode rather
+than removing tools.
 
-Why it cannot be detected: the authoritative marker is `permissionMode`, which is
-client-side state that never reaches a request. The obvious body-level proxy — a
-plan tool in `tools[]` — does not work either: `EnterPlanMode` and `ExitPlanMode`
-are two of the 17 harness tools Claude Code declares in **every** request, because
-tool definitions sit in the stable prompt prefix for cache reasons and the harness
-enforces plan mode rather than removing tools.
+The first attempt keyed on `ExitPlanMode` and was removed before it shipped: it
+matched every Claude Code request, so every request would have been classified as
+plan and any rule written for plan traffic would have caught everything.
 
-An earlier version keyed on `ExitPlanMode` and was removed before it shipped into
-use: it matched every Claude Code request, so every request would have been
-classified as plan and any rule written for plan traffic would have caught
-everything — sending real, writing work to whatever cheap model plan mode pointed
-at. If a reliable wire signal appears later, that is where it goes, with a test
+The second attempt declared the kind per account, to give the feature a path. That
+was wrong at the level it lived at — one person's *entire* traffic, edits and tool
+calls included, counted as plan mode, and routing it to a cheap model would have
+moved their real work. It is gone, along with the `Traffic kind` column it needed.
+
+`kind_of` therefore answers `classifier` or `work` and nothing else. Both entry
+points that could create a `plan` rule — `--kind` on the CLI and the kind select in
+the rules editor — refuse it rather than accepting one that could never match. The
+enum member itself stays, because a config saved by an earlier build may contain
+`"kind": "plan"` and an unknown value fails the whole account file on load.
+
+If a reliable wire signal appears, that is where the kind goes, with a test
 asserting the false-positive direction first.
-
-Because the declaration is per account, it cannot leak between accounts, and
-clearing it (`"kind": ""`) returns that account to ordinary body classification.
 
 `--tool` matches the tool's *family*, not its versioned type, so a rule written
 today keeps applying when Anthropic moves `web_search_20250305` to a new date —

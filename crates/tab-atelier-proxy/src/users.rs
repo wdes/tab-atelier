@@ -388,23 +388,6 @@ pub struct Account {
     /// [`crate::tools`]. That is why this is a plain id and not an enum.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    /// Treat every request from this account as this kind, whatever it looks
-    /// like.
-    ///
-    /// The one way to reach [`crate::classifier::Kind::Plan`], and the reason it
-    /// exists: **plan mode cannot be detected from a request.** Its authoritative
-    /// marker, `permissionMode`, is client-side state that never reaches a
-    /// request; the plan tools are declared in every request regardless of mode,
-    /// so a detector keyed on them matched all traffic. An operator who knows
-    /// which of their accounts does their planning can say so, which is honest
-    /// about where the decision came from.
-    ///
-    /// It overrides the *kind* and therefore everything the kind gates — routing
-    /// rules that select on it, compaction, and the mapping retarget — but it is
-    /// still a per-person setting, so it cannot leak between accounts. Unset
-    /// leaves classification exactly as it was.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub kind_override: Option<crate::classifier::Kind>,
     /// Per-person model routes: "when this account asks for X, serve Y".
     ///
     /// PER PERSON like `compact` and `tools`, and the reason this exists rather
@@ -935,7 +918,6 @@ impl Store {
             weight: default_weight(),
             provider: None,
             model: None,
-            kind_override: None,
             routes: Vec::new(),
             compact: crate::compact::Compact::None,
             tools: crate::tools::Policy::default(),
@@ -1095,31 +1077,6 @@ impl Store {
             .find(|a| a.id == id)
             .ok_or_else(|| Error::NotFound(who.to_owned()))?;
         account.model = model.map(str::to_owned).filter(|m| !m.is_empty());
-        let out = account.clone();
-        self.reindex();
-        self.save()?;
-        Ok(out)
-    }
-
-    /// Declare what kind of traffic this account produces, or clear it.
-    ///
-    /// The only way to reach `Kind::Plan`, because no request field identifies
-    /// plan mode — see [`Account::kind_override`].
-    ///
-    /// # Errors
-    /// No such account, or the file could not be written.
-    pub fn set_kind_override(&mut self, who: &str, kind: Option<crate::classifier::Kind>) -> Result<Account, Error> {
-        let id = self
-            .find(who)
-            .ok_or_else(|| Error::NotFound(who.to_owned()))?
-            .id
-            .clone();
-        let account = self
-            .accounts
-            .iter_mut()
-            .find(|a| a.id == id)
-            .ok_or_else(|| Error::NotFound(who.to_owned()))?;
-        account.kind_override = kind;
         let out = account.clone();
         self.reindex();
         self.save()?;
