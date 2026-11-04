@@ -102,7 +102,15 @@ impl Validated for RotateProviderKey {
     }
 
     fn accept(body: &bytes::Bytes) -> Result<Self, Rejection> {
-        super::parse(body)
+        // `validate` is a hook nothing calls unless `accept` does — the same dead
+        // contract that let a route accept a body it documented as refused. Here
+        // the consequence was worse than a bad response: an empty key passed
+        // through, overwrote the key file with a blank line, and turned a working
+        // provider into one reporting "missing", with the old credential already
+        // destroyed.
+        let parsed: Self = super::parse(body)?;
+        parsed.validate().map_err(|why| Rejection::field("key", &why))?;
+        Ok(parsed)
     }
 }
 

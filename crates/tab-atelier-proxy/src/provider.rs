@@ -1526,9 +1526,36 @@ pub fn validate_provider_id(id: &str) -> Result<(), String> {
 pub fn write_provider_key(path: &Path, key: &str) -> Result<(), String> {
     use std::io::Write as _;
 
+    // Last line of defence. Every caller is supposed to refuse an empty key, and
+    // one of them did not — its `validate` was never called. Writing a blank line
+    // here does not "set a key", it destroys a working one and reports "missing"
+    // afterwards, so the writer refuses rather than trusting its callers.
+    if key.trim().is_empty() {
+        return Err("refusing to write an empty key over a credential".to_owned());
+    }
+
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
     }
+
+    // Keep the key being replaced, once.
+    //
+    // A wrong key is not a rare accident: it is one paste away, it is invisible
+    // until traffic fails, and without this the old credential is gone the instant
+    // the rename lands — recoverable only by issuing a new key at the vendor.
+    // Exactly one previous key is kept, not a history: enough to undo a mistake,
+    // and a bounded amount of credential material on disk. `0600`, in the same
+    // directory as the file it backs up, so it inherits whatever protects that.
+    if path.exists() {
+        let previous = path.with_extension("key.previous");
+        std::fs::copy(path, &previous).map_err(|e| format!("back up {}: {e}", path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let _ = std::fs::set_permissions(&previous, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+
     let tmp = path.with_extension("key.tmp");
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create(true).truncate(true);
@@ -2088,6 +2115,73 @@ impl Registry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- replacing a key ---------------------------------------------------
+
+    /// The key being replaced is kept, so a wrong paste is undoable.
+    ///
+    /// Without this the old credential is gone the instant the rename lands, and
+    /// the only way back is issuing a new key at the vendor. One previous key is
+    /// kept — enough to undo a mistake, not an ever-growing store of credentials.
+    #[test]
+    fn replacing_a_key_keeps_the_previous_one() {
+        let dir = std::env::temp_dir().join(format!("ta-key-backup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("provider-demo.key");
+
+        write_provider_key(&path, "sk-old-key-that-worked").expect("first write");
+        write_provider_key(&path, "sk-new-key").expect("second write");
+
+        let current = std::fs::read_to_string(&path).expect("current");
+        let previous = std::fs::read_to_string(path.with_extension("key.previous")).expect("previous");
+        assert_eq!(current.trim(), "sk-new-key");
+        assert_eq!(
+            previous.trim(),
+            "sk-old-key-that-worked",
+            "the replaced key is still readable",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An empty key is refused, and the credential survives.
+    ///
+    /// This is the bug that cost a working key: `RotateProviderKey::validate`
+    /// rejected an empty key, but its `accept` never called it, so a blank paste
+    /// wrote a blank line over the credential and the provider then reported
+    /// "missing" — with the old key already destroyed.
+    #[test]
+    fn an_empty_key_is_refused_and_nothing_is_written() {
+        let dir = std::env::temp_dir().join(format!("ta-key-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("provider-demo.key");
+        write_provider_key(&path, "sk-still-here").expect("write");
+
+        assert!(write_provider_key(&path, "").is_err());
+        assert!(write_provider_key(&path, "   \n").is_err());
+
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("current").trim(),
+            "sk-still-here",
+            "the working key is untouched",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A first write leaves no `.previous`, since there is nothing to keep.
+    #[test]
+    fn a_first_write_creates_no_backup() {
+        let dir = std::env::temp_dir().join(format!("ta-key-first-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("provider-demo.key");
+
+        write_provider_key(&path, "sk-first").expect("write");
+
+        assert!(!path.with_extension("key.previous").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     // --- masking -----------------------------------------------------------
 
