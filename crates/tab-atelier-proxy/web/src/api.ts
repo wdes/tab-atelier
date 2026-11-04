@@ -112,6 +112,13 @@ interface KeysApi {
 interface ProvidersApi {
   list(): Promise<ProvidersResponse>;
   save(body: SaveProviderBody): Promise<IdResponse>;
+  /**
+   * The installed credential, masked: `sk-0cb68*****31ff`.
+   *
+   * Enough to tell which key this is without a usable credential ever reaching
+   * the page.
+   */
+  key(id: string): Promise<ProviderKeyView>;
   rotateKey(id: string, key: string): Promise<IdResponse>;
   /**
    * Give a provider a different name.
@@ -221,6 +228,7 @@ class ApiClient {
     this.providers = {
       list: () => this.request<ProvidersResponse>("GET", "/api/providers"),
       save: (body) => this.request("POST", "/api/providers", body),
+      key: (id) => this.request("GET", `/api/providers/${seg(id)}/key`),
       rotateKey: (id, key) => this.request("POST", `/api/providers/${seg(id)}/key`, { key }),
       rename: (id, to) => this.request("POST", `/api/providers/${seg(id)}/rename`, { id: to }),
       remove: (id) => this.request("DELETE", `/api/providers/${seg(id)}`),

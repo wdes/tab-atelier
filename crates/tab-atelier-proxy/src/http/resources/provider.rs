@@ -88,6 +88,44 @@ impl ProviderResource {
     }
 }
 
+/// What the key dialog needs: is one installed, which kind, and enough of it to
+/// recognise.
+///
+/// A separate resource rather than a field on [`ProviderResource`], because the
+/// catalogue is read on every dashboard refresh and a credential-derived value
+/// has no business riding along with it. It is admin-only either way; this keeps
+/// the number of places a credential can reach at one.
+#[derive(Serialize, schemars::JsonSchema)]
+pub(crate) struct ProviderKeyResource {
+    /// `file`, `env` or `login` — which of the three this provider authenticates
+    /// with. The dialog says so, because "missing" means something different for
+    /// each.
+    pub auth: &'static str,
+    /// Whether the credential resolves right now.
+    pub ready: bool,
+    /// `sk-0cb68*****31ff`, or `None` when nothing is installed.
+    ///
+    /// Enough to identify which key this is without putting a usable credential
+    /// on screen, in a screenshot or in a browser's history.
+    pub masked: Option<String>,
+    /// Whether the API accepts a replacement key for this provider.
+    pub can_set: bool,
+    /// Why it does not, when it does not.
+    pub refusal: Option<String>,
+}
+
+impl ProviderKeyResource {
+    pub(crate) fn of(p: &Provider) -> Self {
+        Self {
+            auth: auth_name(&p.auth),
+            ready: p.credential_ready(),
+            masked: p.auth.masked(),
+            can_set: p.auth.accepts_a_key(),
+            refusal: p.auth.no_key_reason(&p.id),
+        }
+    }
+}
+
 fn model_resource(p: &Provider, m: &provider::Model, now: u64) -> ModelResource {
     ModelResource {
         id: m.id.clone(),

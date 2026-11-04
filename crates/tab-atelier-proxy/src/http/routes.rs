@@ -385,6 +385,20 @@ pub(crate) fn rotate_provider_key(
     provider::rotate_key(id, &body.0, state)
 }
 
+/// The credential behind one provider, masked.
+///
+/// `sk-0cb68*****31ff` and nothing more: enough to tell which key is installed,
+/// not enough to use one.
+#[openapi]
+#[get("/api/providers/<id>/key")]
+pub(crate) fn provider_key(
+    state: &State<Arc<AppState>>,
+    _admin: Admin,
+    id: &str,
+) -> Result<crate::transport::Doc<crate::http::resources::ProviderKeyResource>, crate::transport::Failure> {
+    provider::key(id, state)
+}
+
 /// Rename a provider.
 ///
 /// Carries the key file and rewrites every reference — account pins and rule
@@ -607,6 +621,7 @@ pub fn all_and_spec() -> (Vec<Route>, tab_atelier_api::rocket_okapi::okapi::open
         remove_key,
         list_providers,
         save_provider,
+        provider_key,
         rotate_provider_key,
         rename_provider,
         remove_provider,

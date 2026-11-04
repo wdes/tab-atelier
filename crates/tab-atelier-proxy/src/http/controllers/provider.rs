@@ -148,6 +148,33 @@ pub(crate) fn save(request: &SaveProvider, state: &Arc<State>) -> Result<Doc<IdR
     Ok(Doc::ok(IdResource::of(id)))
 }
 
+/// What the key dialog shows: is a credential installed, which kind, and a masked
+/// form of it.
+///
+/// The masked value is the whole point. An operator rotating keys needs to know
+/// *which* key is installed — the one ending `31ff` they pasted last week, or the
+/// one ending `0a1c` belonging to an account they are closing — and the frontends
+/// this imitates show exactly that. Returning the key itself would put a usable
+/// credential in a browser's memory and history for no benefit: the fingerprint
+/// answers the question and cannot be spent.
+pub(crate) fn key(id: &str, state: &Arc<State>) -> Result<Doc<crate::http::resources::ProviderKeyResource>, Failure> {
+    // Built inside the lock and released before replying: the resource copies
+    // what it needs out of the entry, and holding a registry lock while a
+    // credential is read from disk would stall every request on the proxy for
+    // the duration of a file read.
+    let resource = {
+        let reg = state.registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let p = reg.get(id).ok_or_else(|| Failure::problem(404, "no such provider"))?;
+        let built = crate::http::resources::ProviderKeyResource::of(p);
+        // Explicit, not incidental: building the resource reads the credential
+        // from disk, and a registry lock held across that would stall every
+        // request on the proxy for the duration of a file read.
+        drop(reg);
+        built
+    };
+    Ok(Doc::ok(resource))
+}
+
 /// Replace one provider's key, and nothing else.
 pub(crate) fn rotate_key(
     id: &str,
@@ -275,9 +302,23 @@ pub(crate) fn rename(id: &str, request: &RenameProvider, state: &Arc<State>) -> 
         .parent()
         .map(std::path::Path::to_path_buf)
         .unwrap_or_default();
-    let old_key = crate::provider::provider_key_path(&config_dir, id);
+    // The key's location comes from the ENTRY, not from the id. A provider
+    // imported or edited by hand may point anywhere, and moving the canonical
+    // path while the entry names a different one would leave the credential
+    // behind — which is exactly how a working provider starts reporting
+    // "missing" after a rename.
+    let old_key = {
+        let reg = state.registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        reg.get(id).map_or_else(
+            || crate::provider::provider_key_path(&config_dir, id),
+            |p| match &p.auth {
+                crate::provider::Auth::ApiKeyFile { path } => std::path::PathBuf::from(path),
+                _ => crate::provider::provider_key_path(&config_dir, id),
+            },
+        )
+    };
     let new_key = crate::provider::provider_key_path(&config_dir, to);
-    let moved_key = if old_key.exists() {
+    let moved_key = if old_key.exists() && old_key != new_key {
         std::fs::copy(&old_key, &new_key).map_err(|e| Failure::problem(500, format!("key: {e}")))?;
         true
     } else {
@@ -286,7 +327,7 @@ pub(crate) fn rename(id: &str, request: &RenameProvider, state: &Arc<State>) -> 
 
     {
         let mut reg = state.registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Err(why) = reg.rename(id, to) {
+        if let Err(why) = reg.rename(id, to, &new_key) {
             // Put the filesystem back the way it was: a copy with no entry that
             // uses it is a stray credential on disk.
             if moved_key {
@@ -767,6 +808,31 @@ mod tests {
             !crate::provider::provider_key_path(dir, "old-name").exists(),
             "and is not left behind under the old name",
         );
+
+        // **The regression.** A file-backed credential stores its PATH in the
+        // entry, so renaming the id alone left `auth` pointing at
+        // `provider-{old}.key` — and once that file was cleaned up the provider
+        // reported "missing" while the models it served were untouched. Nothing
+        // caught it because the key was on disk and the id was right.
+        //
+        // Read out of the lock before asserting: the guard has nothing to do with
+        // the assertion, and holding it across one is what clippy objects to.
+        let (ready, fingerprinted, auth) = {
+            let store = state.registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let after = store.get("new-name").expect("renamed provider");
+            let out = (
+                after.credential_ready(),
+                after.auth.masked().is_some(),
+                after.auth.clone(),
+            );
+            drop(store);
+            out
+        };
+        assert!(
+            ready,
+            "the credential still resolves after the rename, got auth {auth:?}",
+        );
+        assert!(fingerprinted, "and the key dialog can still fingerprint it");
     }
 
     /// An account pinned to the old name follows the rename.

@@ -237,6 +237,22 @@ const AdminApp = Vue.defineComponent({
       // Per-panel, for the same reason as the chart flags: a fetch that greys
       // out unrelated controls reads as the page being broken.
       providersBusy: false,
+      /**
+       * The key dialog, when open.
+       *
+       * Holds the masked credential the server reported plus the replacement
+       * being typed, so the dialog can show "which key is installed" and "set a
+       * new one" in the same place — which is how the provider frontends this
+       * imitates do it, and it is the only way to tell a rotation worked.
+       */
+      keyFor: null as null | {
+        provider: ProviderView;
+        info: ProviderKeyView | null;
+        input: string;
+        busy: boolean;
+        /** Set once a replacement has been accepted, to confirm it took. */
+        saved: boolean;
+      },
       inspectBusy: false,
       origin: window.location.origin,
       // Per-account usage, keyed by id, as returned by /api/usage.
@@ -786,11 +802,52 @@ const AdminApp = Vue.defineComponent({
         this.providersBusy = false;
       }
     },
-    async setKey(p: ProviderView) {
-      const key = prompt(`API key for ${p.id}:`, "");
-      if (!key) return;
-      await api.providers.rotateKey(p.id, key);
-      await this.loadProviders();
+    /**
+     * Open the key dialog for one provider.
+     *
+     * Fetches the masked credential first, so the dialog can say which key is
+     * installed — `sk-0cb68*****31ff` — rather than asking the operator to
+     * replace a key they cannot identify. If the fetch fails the dialog still
+     * opens with the reason, because being unable to *see* the key is not a
+     * reason to be unable to set one.
+     */
+    async openKey(p: ProviderView) {
+      this.keyFor = { provider: p, info: null, input: "", busy: true, saved: false };
+      try {
+        const info = await api.providers.key(p.id);
+        if (this.keyFor && this.keyFor.provider.id === p.id) this.keyFor.info = info;
+      } catch (e) {
+        this.error = e instanceof Error ? e.message : String(e);
+      } finally {
+        if (this.keyFor) this.keyFor.busy = false;
+      }
+    },
+    /** Replace the key shown in the dialog, then re-read it to confirm. */
+    async saveKey() {
+      const dialog = this.keyFor;
+      if (!dialog) return;
+      const value = dialog.input.trim();
+      if (value === "") return;
+
+      dialog.busy = true;
+      try {
+        await api.providers.rotateKey(dialog.provider.id, value);
+        // Re-read rather than assume: the masked value the dialog shows next is
+        // the server's, so a key that did not take is visible as the old
+        // fingerprint instead of a success message over nothing.
+        const info = await api.providers.key(dialog.provider.id);
+        if (this.keyFor) {
+          this.keyFor.info = info;
+          this.keyFor.input = "";
+          this.keyFor.saved = true;
+        }
+        this.error = "";
+        await this.loadProviders();
+      } catch (e) {
+        this.error = e instanceof Error ? e.message : String(e);
+      } finally {
+        if (this.keyFor) this.keyFor.busy = false;
+      }
     },
     /**
      * Rename a provider.

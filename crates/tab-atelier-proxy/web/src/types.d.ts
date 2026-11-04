@@ -602,6 +602,25 @@ interface PeakConfig {
     holidays?: PeakHoliday[];
 }
 
+/**
+ * What the key dialog is told about one provider's credential.
+ *
+ * `masked` is a fingerprint, never the key: `sk-0cb68*****31ff`. Enough to tell
+ * which key is installed, useless if it leaks.
+ */
+interface ProviderKeyView {
+    /** `api_key_file`, `api_key_env` or `claude_oauth`. */
+    auth: string;
+    /** Whether the credential resolves right now. */
+    ready: boolean;
+    /** `sk-0cb68*****31ff`, or null when nothing is installed. */
+    masked: string | null;
+    /** Whether the API accepts a replacement key for this provider. */
+    can_set: boolean;
+    /** Why it does not, when it does not. */
+    refusal: string | null;
+}
+
 interface ProviderView {
     id: string;
     base_url: string;
@@ -738,6 +757,20 @@ interface AppState {
      * server, so one bad destination must not hold the others hostage.
      */
     routes: { id: string; rows: DraftRoute[] } | null;
+    /**
+     * The provider key dialog, when open.
+     *
+     * Carries the masked credential the server reported alongside the
+     * replacement being typed, so "which key is installed" and "set a new one"
+     * are one dialog — which is the only way to confirm a rotation took.
+     */
+    keyFor: {
+        provider: ProviderView;
+        info: ProviderKeyView | null;
+        input: string;
+        busy: boolean;
+        saved: boolean;
+    } | null;
     error: string;
     busy: boolean;
     /**

@@ -555,7 +555,7 @@
                                 : p.auth === 'api_key_env'
                                   ? 'Read from the service environment — set the variable there and restart.'
                                   : 'Set or rotate this provider\'s API key.'"
-                              @click="setKey(p)">Key</button>
+                              @click="openKey(p)">Key…</button>
                       <!-- Renaming is a server operation, not a field edit: the
                            id names the key file and is what accounts pin to and
                            rules reference, so all of them move together. -->
@@ -1234,6 +1234,79 @@
               </button>
               <button class="btn btn-sm btn-outline-secondary" @click="routes = null">Done</button>
             </div>
+          </div>
+        </div>
+
+        <!-- The provider's credential.
+             Shows a FINGERPRINT, never the key: enough to tell which secret is
+             installed — the one ending 31ff pasted last week, or the one ending
+             0a1c from an account being closed — and useless if it leaks. That is
+             what the provider frontends look like, and it is the only way to
+             confirm a rotation actually took. -->
+        <div v-if="keyFor" class="ta-modal-backdrop" @click.self="keyFor = null">
+          <div class="ta-modal" style="max-width: 34rem">
+            <div class="d-flex justify-content-between align-items-center mb-3">
+              <h2 class="h5 mb-0">
+                <span class="font-monospace">{{ keyFor.provider.id }}</span> key
+              </h2>
+              <button class="ta-close" @click="keyFor = null" aria-label="Close"
+                      title="Close">&times;</button>
+            </div>
+
+            <dl class="row small mb-3">
+              <dt class="col-5 text-body-secondary">Authentication</dt>
+              <dd class="col-7">
+                <span v-if="keyFor.info">{{ keyFor.info.auth }}</span>
+                <span v-else class="text-body-secondary">…</span>
+              </dd>
+
+              <dt class="col-5 text-body-secondary">Key</dt>
+              <dd class="col-7">
+                <code v-if="keyFor.info && keyFor.info.masked">{{ keyFor.info.masked }}</code>
+                <span v-else-if="keyFor.info" class="text-danger">missing</span>
+                <span v-else class="text-body-secondary">…</span>
+              </dd>
+
+              <dt class="col-5 text-body-secondary">Status</dt>
+              <dd class="col-7">
+                <span v-if="!keyFor.info" class="text-body-secondary">…</span>
+                <span v-else-if="keyFor.info.ready" class="badge text-bg-success">ready</span>
+                <span v-else class="badge text-bg-warning">not usable</span>
+              </dd>
+            </dl>
+
+            <template v-if="keyFor.info && !keyFor.info.can_set">
+              <p class="small text-body-secondary mb-0">
+                {{ keyFor.info.refusal || "This provider's key is not set from here." }}
+              </p>
+            </template>
+
+            <template v-else>
+              <label class="form-label small mb-1" for="ta-key-input">
+                Replace with a new key
+              </label>
+              <input id="ta-key-input" type="password" autocomplete="off"
+                     class="form-control form-control-sm font-monospace"
+                     :placeholder="keyFor.info && keyFor.info.masked ? keyFor.info.masked : 'sk-…'"
+                     v-model="keyFor.input"
+                     @keyup.enter="saveKey()">
+              <p class="form-text" style="font-size:.75rem">
+                Pasted keys are never shown again — only the fingerprint above,
+                so you can tell that the replacement took.
+              </p>
+              <div class="d-flex justify-content-end gap-2 mt-2">
+                <button class="btn btn-sm btn-outline-secondary"
+                        @click="keyFor = null">Done</button>
+                <button class="btn btn-sm btn-primary"
+                        @click="saveKey()"
+                        :disabled="keyFor.busy || keyFor.input.trim() === ''">
+                  Save key
+                </button>
+              </div>
+              <p v-if="keyFor.saved" class="small text-success mb-0 mt-2">
+                Key replaced — the fingerprint above is the new one.
+              </p>
+            </template>
           </div>
         </div>
 

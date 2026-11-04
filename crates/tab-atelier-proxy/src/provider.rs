@@ -133,6 +133,32 @@ pub enum Auth {
 }
 
 impl Auth {
+    /// The credential, masked for display: `sk-0cb68*****31ff`.
+    ///
+    /// The operators of the frontends this imitates show exactly this, and for a
+    /// good reason: it is enough to tell *which* key is installed — the one ending
+    /// `31ff` that you pasted last week, or the one ending `0a1c` from the
+    /// account you are closing — without putting the credential on screen, in a
+    /// screenshot, or in a browser's history.
+    ///
+    /// Returns `None` when there is nothing to show, so the caller can say "not
+    /// set" rather than render an empty mask. It never returns the key itself:
+    /// see [`mask_secret`].
+    #[must_use]
+    pub fn masked_with(&self, get: impl Fn(&str) -> Option<String>) -> Option<String> {
+        self.secret_with(get).ok().map(|k| mask_secret(&k))
+    }
+
+    /// The same, read from the environment the way the proxy itself reads it.
+    ///
+    /// The shorthand for callers that have no injected lookup — the key dialog —
+    /// so a provider configured from `$DEEPSEEK_KEY` shows its fingerprint
+    /// instead of an empty box that reads as "not set".
+    #[must_use]
+    pub fn masked(&self) -> Option<String> {
+        self.masked_with(|v| std::env::var(v).ok())
+    }
+
     /// Whether a key can be set for this provider from the UI or the API.
     ///
     /// Only a file-backed credential can. The other two have a credential
@@ -187,6 +213,28 @@ impl Auth {
             }
         }
     }
+}
+
+/// A credential reduced to what identifies it without revealing it.
+///
+/// Eight characters at the front and four at the end, which is enough to
+/// recognise a key and not enough to use one: provider prefixes are not secret
+/// (`sk-`, `sk-ant-`, `tap_`) and the tail is a fingerprint. Anything shorter than
+/// sixteen characters is masked entirely — a short secret has too little entropy
+/// for a partial reveal to be safe, and the arithmetic is unforgiving: showing
+/// four characters of twelve leaves two-thirds of a short key in the open.
+///
+/// Char-indexed rather than byte-indexed because a key pasted with a stray
+/// accented character would otherwise slice mid-codepoint and panic.
+#[must_use]
+pub fn mask_secret(key: &str) -> String {
+    let chars: Vec<char> = key.trim().chars().collect();
+    if chars.len() < 16 {
+        return "*****".to_owned();
+    }
+    let head: String = chars[..8].iter().collect();
+    let tail: String = chars[chars.len() - 4..].iter().collect();
+    format!("{head}*****{tail}")
 }
 
 /// What a model costs, in micro-USD per 1M tokens.
@@ -2002,7 +2050,7 @@ impl Registry {
     /// No such provider, a name the operator cannot use, or a name already
     /// taken. The last is why this is not a plain field assignment: two entries
     /// sharing an id would share a key file.
-    pub fn rename(&mut self, from: &str, to: &str) -> Result<(), String> {
+    pub fn rename(&mut self, from: &str, to: &str, new_key_path: &Path) -> Result<(), String> {
         if from == to {
             return Ok(());
         }
@@ -2018,9 +2066,15 @@ impl Registry {
             .iter_mut()
             .find(|p| p.id == from)
             .ok_or_else(|| format!("no provider called {from}"))?;
-        // The id is what every lookup goes through, so nothing else in the entry
-        // needs touching.
         to.clone_into(&mut slot.id);
+        // **Not only the id.** A file-backed credential stores its PATH in this
+        // entry, so renaming without rewriting it leaves `auth` pointing at
+        // `provider-{old}.key` — and once the old file is cleaned up, a provider
+        // that was working reports "missing". That is the bug this line fixes:
+        // the id and the path it points at have to move together.
+        if let Auth::ApiKeyFile { path } = &mut slot.auth {
+            path.clone_from(&new_key_path.display().to_string());
+        }
         Ok(())
     }
 
@@ -2034,6 +2088,46 @@ impl Registry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- masking -----------------------------------------------------------
+
+    /// A real key is reduced to a fingerprint: recognisable, not usable.
+    ///
+    /// The whole point is the middle: eight characters in front, four at the
+    /// end, and the 40-odd in between gone. Enough to tell which key is
+    /// installed; not enough to spend.
+    #[test]
+    fn a_key_is_masked_to_a_fingerprint() {
+        let key = "sk-0cb68a93c40d0d1a2b3c4d5e6f708192a3b4c5d6e7f831ff";
+        let masked = mask_secret(key);
+
+        assert_eq!(masked, "sk-0cb68*****31ff");
+        assert!(!masked.contains("a93c40d0"), "the middle is gone: {masked}");
+    }
+
+    /// A short secret is masked entirely.
+    ///
+    /// Showing four of twelve characters reveals a third of a key with almost no
+    /// entropy to begin with — the fingerprint is only safe when most of the
+    /// secret is hidden by length alone.
+    #[test]
+    fn a_short_secret_is_hidden_completely() {
+        assert_eq!(mask_secret("sk-short"), "*****");
+        assert_eq!(mask_secret("0123456789abcde"), "*****");
+        // Exactly sixteen is the first length that reveals anything.
+        assert_eq!(mask_secret("0123456789abcdef"), "01234567*****cdef");
+    }
+
+    /// A key with multi-byte characters does not panic the slice.
+    ///
+    /// Byte-indexing a `String` here would cut through a codepoint, and the panic
+    /// would happen in the key dialog — the one screen that must stay usable
+    /// while something is already wrong.
+    #[test]
+    fn a_multibyte_secret_is_masked_without_panicking() {
+        let masked = mask_secret("sk-é0cb68a93c40d0d1a2b3c4d5e6f708192a3b4c5d6é1ff");
+        assert!(masked.contains("*****"), "{masked}");
+    }
 
     // --- provider ids ------------------------------------------------------
     //
