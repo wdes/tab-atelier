@@ -91,5 +91,6 @@ to build uncommitted work).
 | `libxkbcommon0` / `-x11-0`     | `libxkbcommon` / `libxkbcommon-x11`|
 | `fonts-dejavu-core`            | `ttf-dejavu`                       |
 | `fonts-noto-color-emoji` (Rec) | `noto-fonts-emoji` (optdepends)    |
+| `libnotify-bin` (Rec)          | `libnotify` (optdepends)           |
 | `nftables`, `bubblewrap`       | `nftables`, `bubblewrap`           |
 | `adduser`, `init-system-helpers` | handled by sysusers/tmpfiles + systemd |

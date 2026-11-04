@@ -73,6 +73,11 @@ pub struct Strings {
     pub tokens: &'static str,
     pub show_gauge: &'static str,
     pub hide_gauge: &'static str,
+    pub desktop_notifications: &'static str,
+    pub notifications_on: &'static str,
+    pub notifications_off: &'static str,
+    pub agent_finished: &'static str,
+    pub agent_asking: &'static str,
 
     // Rename dialog
     pub rename_tab: &'static str,
@@ -194,6 +199,11 @@ pub static EN: Strings = Strings {
     tokens: "Tokens",
     show_gauge: "Show RAM gauge",
     hide_gauge: "Hide RAM gauge",
+    desktop_notifications: "Desktop notifications",
+    notifications_on: "When an agent finishes or asks for something",
+    notifications_off: "Off",
+    agent_finished: "finished",
+    agent_asking: "needs you",
 
     rename_tab: "Rename tab:",
 
@@ -304,6 +314,11 @@ pub static FR: Strings = Strings {
     tokens: "Tokens",
     show_gauge: "Afficher la jauge de RAM",
     hide_gauge: "Masquer la jauge de RAM",
+    desktop_notifications: "Notifications de bureau",
+    notifications_on: "Quand un agent a fini ou demande quelque chose",
+    notifications_off: "Désactivées",
+    agent_finished: "a fini",
+    agent_asking: "a besoin de toi",
 
     rename_tab: "Renommer l'onglet :",
 
