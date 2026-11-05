@@ -1,0 +1,24 @@
+# Names that ARE safe to publish, because they are already public.
+#
+# Kept in the repository rather than in the reviewer prompt: this is data about
+# public names, not a secret, and every clone should hold the same list. The
+# reviewer is told these are cleared and nothing else is.
+#
+# Only list a name here once it is genuinely published — in a released package, a
+# public repository, a vendor's own website. A company name is not automatically
+# safe: a client, an employer, a vendor under NDA and an unannounced project are
+# all findings.
+#
+# One per line, matched case-insensitively. `#` starts a comment.
+
+Debian
+Anthropic
+DeepSeek
+OpenAI
+Claude
+Rust
+catbus
+tab-atelier
+GitHub
+Bootstrap
+Vue

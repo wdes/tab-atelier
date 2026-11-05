@@ -1,0 +1,27 @@
+# Names that must never appear in a commit message or a diff.
+#
+# Copy to ~/.config/tab-atelier/commit-deny.txt (scripts/install-hooks.sh does
+# this for you) and fill in your own. One name per line, matched
+# case-insensitively, minimum three characters. `#` starts a comment.
+#
+# This file is deliberately OUTSIDE the repository: a committed list of
+# colleagues' and customers' names is the very leak it exists to prevent. Keep it
+# chmod 600.
+#
+# What to list:
+#   - colleagues, customers and account holders by name
+#   - hostnames and short host prefixes of your own machines
+#   - internal domain names that never appear in public DNS
+#   - client, employer and vendor names that are not already public
+#
+# What NOT to list:
+#   - your own published identity — it is in the manifests and package metadata,
+#     and listing it would refuse every commit you make
+#   - public vendors and products (Debian, Anthropic, DeepSeek, OpenAI, Claude,
+#     Rust); see scripts/commit-allow.example.txt for the committed equivalent
+
+# Examples, clearly invented:
+# alice
+# bob
+# prod-eu-01
+# acme-internal

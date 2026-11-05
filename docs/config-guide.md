@@ -54,6 +54,16 @@ launch configured and can never widen it, so a prompt file cannot grant itself a
 withheld. A name that is not available is an error rather than a silent drop, because a
 permission list with a typo in it should say so.
 
+`AllowedTools:` with nothing after it asks for **no tools at all**, which is the right
+declaration for an agent whose answer comes entirely from its prompt — a reviewer, a
+rewriter, a classifier. It cannot read, write or run anything. A list that names only
+unavailable tools is still an error; the difference is between "none, deliberately" and
+"none, because I misspelled something".
+
+Keys other than `AllowedTools`, `AllowedHosts` and `AllowedJumpHosts` are refused rather
+than ignored. The header carries security directives, so a typo like `AllowedTool:` would
+otherwise leave the agent with the full tool set and say nothing at all.
+
 A file whose body is blank but whose front matter names tools still limits them; that is how
 you say "no identity, but only these tools".
 

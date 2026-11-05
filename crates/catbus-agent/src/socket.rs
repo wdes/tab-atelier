@@ -429,6 +429,57 @@ pub fn is_live(path: &Path) -> bool {
     std::os::unix::net::UnixStream::connect(path).is_ok()
 }
 
+/// Answer one prompt with no client attached, and return the turn.
+///
+/// The socket exists so another process can talk to a running agent. When the
+/// caller *is* the one-shot caller — `--prompt-file`, a hook, a script — there is
+/// nothing to talk back with, and standing up a socket for a single question
+/// means the caller has to speak a wire format to ask it. This runs the same turn
+/// without one.
+///
+/// A question raised mid-turn cannot be answered: there is no inbound channel.
+/// It is logged and left to the ask's own timeout, which is the behaviour the
+/// socket path has when its client hangs up. An agent meant for this mode should
+/// declare no tools, so nothing it can do asks anything.
+///
+/// # Errors
+/// The turn failed, which is reported to the caller rather than swallowed.
+pub async fn answer_once(
+    agent: &Arc<Agent>,
+    text: String,
+    limit: std::time::Duration,
+) -> Result<crate::agent::Turn, SocketError> {
+    /// Often enough to notice a question quickly, rarely enough to be free.
+    const POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+    let mut run = std::pin::pin!(agent.run_user_prompt(text));
+    let mut warned = false;
+    let deadline = tokio::time::Instant::now() + limit;
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(SocketError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("the prompt did not finish within {limit:?}"),
+            )));
+        }
+        tokio::select! {
+            result = &mut run => {
+                return result.map_err(|e| SocketError::Io(std::io::Error::other(e.to_string())));
+            }
+            () = tokio::time::sleep(POLL) => {
+                if agent.asker().pending().is_some() && !warned {
+                    warned = true;
+                    log::warn!(
+                        "the agent asked a question, but this run has no client to answer it; \
+                         it will time out. Give an agent-driven identity no tools if it must \
+                         never ask."
+                    );
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

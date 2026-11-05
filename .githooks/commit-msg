@@ -24,6 +24,21 @@ msg_file=$1
 [ -n "$msg_file" ] || exit 0
 [ -f "$msg_file" ] || exit 0
 
+# Rewrite the message through a sub-agent and gate it, BEFORE the trailer is
+# appended: the gate refuses non-ASCII, emails, absolute paths, this machine's
+# hostname and the names in the operator's deny file, and the trailer itself is
+# an email address.
+#
+# Skipped when the commit is empty — git aborts those, and there is nothing to
+# rewrite. `scripts/commit-message.sh` explains the rest; TA_COMMIT_MSG=off
+# bypasses it for a scripted history edit.
+if grep -qvE '^[[:space:]]*(#|$)' "$msg_file"; then
+	root=$(git rev-parse --show-toplevel 2>/dev/null) || root=''
+	if [ -n "$root" ] && [ -x "$root/scripts/commit-message.sh" ]; then
+		"$root/scripts/commit-message.sh" "$msg_file" || exit 1
+	fi
+fi
+
 name=${TA_COAUTHOR_NAME:-$(git config --get coauthor.name)}
 email=${TA_COAUTHOR_EMAIL:-$(git config --get coauthor.email)}
 

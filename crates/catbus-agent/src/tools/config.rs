@@ -166,6 +166,21 @@ pub struct ToolSet {
 pub const PROJECT_TOOL_FILE: &str = "tools.toml";
 
 impl ToolSet {
+    /// A set that offers nothing.
+    ///
+    /// For an agent whose answer comes entirely from its prompt: a reviewer, a
+    /// rewriter, a classifier. It cannot read, write or run anything, which is the
+    /// point — such an agent is handed text and asked for text.
+    #[must_use]
+    pub fn none() -> Self {
+        Self {
+            specs: Vec::new(),
+            custom: BTreeMap::new(),
+            policy: crate::tools::ssh::Policy::default(),
+            phpunit_functions: None,
+        }
+    }
+
     /// Every built-in tool, with nothing disabled.
     #[must_use]
     pub fn builtin() -> Self {
@@ -564,6 +579,16 @@ impl ToolSet {
     /// would otherwise narrow to something the operator did not write, and say
     /// nothing about it.
     pub fn narrowed_to(&self, allowed: &[String]) -> Result<Self, String> {
+        // An explicitly empty `AllowedTools:` is a request for no tools at all,
+        // not a mistake. It is the right declaration for an agent whose whole job
+        // is to answer from the prompt it was given — a reviewer, a rewriter, any
+        // one-shot judgement — and forcing such an identity to carry a tool it
+        // does not need in order to satisfy a guard is how an agent ends up with
+        // capabilities nobody intended.
+        if allowed.is_empty() {
+            return Ok(Self::none());
+        }
+
         let available = self.names();
         let mut unknown: Vec<&str> = allowed
             .iter()
@@ -1107,19 +1132,43 @@ mod tests {
         assert!(err.contains("offers Read"), "and what was available: {err}");
     }
 
-    /// Narrowing to nothing is a configuration conflict, not a runnable state: an
-    /// agent with no tools can do nothing, so it is better to refuse at start-up.
+    /// An empty allow list asks for no tools, and is honoured.
+    ///
+    /// This used to be refused, on the reasoning that "an agent with no tools can
+    /// do nothing". That is false for the case it kept blocking: an agent whose
+    /// answer comes entirely from its prompt — a reviewer, a rewriter, a
+    /// classifier — needs no tools at all, and the refusal meant such an identity
+    /// could not declare itself. The restriction then had to live in a command-line
+    /// flag, where the identity file cannot describe it and a caller can forget it.
     #[test]
-    fn narrowing_to_nothing_is_refused() {
+    fn an_empty_allow_list_means_no_tools() {
         let set = ToolSet::from_config(ToolConfig {
             allow: Some(vec!["Read".into()]),
             ..ToolConfig::default()
         })
         .expect("valid");
-        // `allow` was already narrowed, so naming a tool that is not in it is the
-        // unknown-name path; an empty list is the empty path.
-        let err = set.narrowed_to(&[]).unwrap_err();
-        assert!(err.contains("no tools at all"), "{err}");
+
+        let none = set.narrowed_to(&[]).expect("an explicit empty list is a choice");
+        assert!(none.names().is_empty(), "and it offers nothing: {:?}", none.names());
+    }
+
+    /// A NON-empty list that matches nothing is still a conflict.
+    ///
+    /// That is a typo in a tool name, which is the case the old guard was actually
+    /// good for: the author meant to grant something and silently got nothing.
+    #[test]
+    fn naming_only_unknown_tools_is_refused() {
+        let set = ToolSet::from_config(ToolConfig {
+            allow: Some(vec!["Read".into()]),
+            ..ToolConfig::default()
+        })
+        .expect("valid");
+
+        let err = set.narrowed_to(&["NotATool".into()]).unwrap_err();
+        // Reported as an unknown NAME rather than as an empty result: that is the
+        // actionable message, and it is where a typo is actually caught.
+        assert!(err.contains("unknown tool"), "{err}");
+        assert!(err.contains("NotATool"), "{err}");
     }
 
     /// A sub-agent is capped, not held to the ceiling: the tools it does offer are granted, and the

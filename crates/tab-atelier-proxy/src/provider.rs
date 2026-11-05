@@ -2278,12 +2278,17 @@ mod tests {
     /// the same glyph, so a path built from one does not find the other. The
     /// deny-list this replaces could never catch it — the character is not
     /// suspicious, it is just unsafe in a filename.
+    ///
+    /// Written as escapes so this source file stays pure ASCII: a repository-wide
+    /// check refuses non-ASCII in added lines, because that is the shape of a name
+    /// copied out of a bug report, and an exception for "but this one is a test"
+    /// is exactly the hole the check would then have.
     #[test]
     fn a_name_that_is_not_ascii_is_refused() {
         // Precomposed and decomposed spellings of the same name, both refused.
-        assert!(validate_provider_id("Café").is_err());
+        assert!(validate_provider_id("Caf\u{e9}").is_err());
         assert!(validate_provider_id("Cafe\u{0301}").is_err());
-        assert!(validate_provider_id("日本語").is_err());
+        assert!(validate_provider_id("\u{65e5}\u{672c}\u{8a9e}").is_err());
     }
 
     /// Anything that would escape the config directory is refused.

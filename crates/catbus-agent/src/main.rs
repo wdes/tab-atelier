@@ -115,6 +115,35 @@ struct Args {
     #[arg(long)]
     once: bool,
 
+    /// Read one prompt from a file (`-` for stdin), answer it, print the answer to
+    /// stdout and exit.
+    ///
+    /// This is the mode for a caller that has a question and no way to speak the
+    /// socket protocol: a git hook, a shell script, a build step. Without it such a
+    /// caller has to stand up the socket and encode requests itself — which in
+    /// practice means reaching for a scripting language to build the JSON, and a
+    /// hook that needs a language runtime to ask a question is a hook people turn
+    /// off.
+    ///
+    /// A question raised mid-turn cannot be answered here: there is no inbound
+    /// channel, so it is logged and left to time out. Pair this with an identity
+    /// that declares no tools, and nothing can ask.
+    #[arg(long, value_name = "PATH")]
+    prompt_file: Option<String>,
+
+    /// Give up on a one-shot prompt after this many seconds (default 180).
+    ///
+    /// Belongs to the agent rather than to the caller's shell: a wrapper with
+    /// `timeout(1)` kills the process without telling the caller whether the work
+    /// was slow or the agent was stuck, and it does not exist on every machine the
+    /// hooks run on. Abandoning the turn here reports a timeout as a timeout.
+    ///
+    /// Only the `--prompt-file` mode has a deadline. A tab that serves a socket is
+    /// long-lived by design, and a deadline on it would terminate an agent whose
+    /// user simply stepped away.
+    #[arg(long, value_name = "SECONDS", default_value_t = 180)]
+    timeout: u64,
+
     /// Start in this permission mode: `open` (everything allowed, the default),
     /// `auto` (a judge checks each write/edit/bash first), or `plan` (write,
     /// edit, bash and spawn propose instead of acting).
@@ -355,11 +384,27 @@ fn resolve_tools(args: &Args, cwd: &Path) -> Result<(tools::ToolSet, identity::I
     } else {
         tool_set.narrowed_to(allowed)?
     };
-    log::info!(
-        "the identity file limits the tool set to {} (from {})",
-        narrowed.names().join(", "),
-        tool_set.names().join(", ")
-    );
+    // Worded for the zero case rather than left to a format string: "limits the
+    // tool set to " followed by nothing reads like a bug rather than a deliberate
+    // agent that cannot act. The base set is only worth naming when there was one —
+    // `--tools-config` may already have emptied it, and "(the set would have
+    // been )" is noise.
+    if narrowed.names().is_empty() {
+        if tool_set.names().is_empty() {
+            log::info!("the agent allows no tools");
+        } else {
+            log::info!(
+                "the identity file allows no tools (the set would have been {})",
+                tool_set.names().join(", ")
+            );
+        }
+    } else {
+        log::info!(
+            "the identity file limits the tool set to {} (from {})",
+            narrowed.names().join(", "),
+            tool_set.names().join(", ")
+        );
+    }
     Ok((narrowed, identity))
 }
 
@@ -569,6 +614,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // line is the only thing that says which one won.
     log::info!("permission mode: {}", agent.gate().as_str());
 
+    // Before the socket is set up: this mode has no client to talk to, so
+    // standing one up first would create a socket nobody connects to and exit.
+    if let Some(prompt_path) = args.prompt_file.as_deref() {
+        return run_one_prompt(&agent, prompt_path, args.timeout).await;
+    }
+
     let socket_task = tokio::spawn({
         let agent = Arc::clone(&agent);
         let path = socket_path.clone();
@@ -631,6 +682,43 @@ fn gate_command(input: &str) -> Option<tools::Gate> {
         // operator reaches for. Everything else is the shared vocabulary.
         "noplan" | "noauto" => Some(tools::Gate::Open),
         other => tools::parse_gate(other),
+    }
+}
+
+/// One prompt from a file or stdin, answered and printed, then done.
+///
+/// Split out of `run` so the process-level setup and the one-shot path read as the
+/// two separate things they are, and because `run` had grown past the length a
+/// reader can hold in their head.
+async fn run_one_prompt(
+    agent: &Arc<crate::agent::Agent>,
+    path: &str,
+    timeout_s: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let text = read_prompt(path)?;
+    let turn = crate::socket::answer_once(agent, text, std::time::Duration::from_secs(timeout_s))
+        .await
+        .map_err(|e| format!("the prompt failed: {e}"))?;
+
+    // The answer alone on stdout, so a caller can capture it directly. Reasoning
+    // and logs go to stderr through the logger.
+    print!("{}", turn.answer);
+    std::io::Write::flush(&mut std::io::stdout())?;
+    Ok(())
+}
+
+/// The whole prompt, from a file or from stdin when the path is `-`.
+///
+/// Read to the end rather than line at a time: a prompt is a document, and a
+/// caller piping a diff into it has no reason to worry about a trailing newline
+/// or a limit.
+fn read_prompt(path: &str) -> Result<String, Box<dyn std::error::Error>> {
+    if path == "-" {
+        let mut text = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)?;
+        Ok(text)
+    } else {
+        Ok(std::fs::read_to_string(path)?)
     }
 }
 

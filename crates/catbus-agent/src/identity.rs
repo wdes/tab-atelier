@@ -307,36 +307,58 @@ pub fn parse_prompt(raw: &str) -> Result<Parsed, String> {
     // are separate questions: a hop is a machine the connection passes through, not another place to
     // connect, so permitting destinations does not permit a route. See `tools::ssh`.
     let mut allowed_jump_hosts: Option<Vec<String>> = None;
-    let mut closed = false;
+    // Where the header ends, decided BEFORE its lines are judged.
+    //
+    // An unterminated header is the more fundamental fault: with no closing rule
+    // there is no way to tell header from body, so reporting "line 3 has no colon"
+    // would point at a symptom of it. The order also matters for the reader —
+    // "never closed with ---" is actionable, "not `Key: value`" on a line that was
+    // never meant to be a key is not.
+    let header_end = lines.clone().position(|l| l.trim_end_matches('\r') == "---");
+    let Some(header_end) = header_end else {
+        return Err("front matter opened with --- but never closed with ---".to_string());
+    };
     let mut body_start = 0;
     for (index, line) in lines.by_ref().enumerate() {
         // `+2` because the header line and this one are consumed here.
         let consumed = index + 2;
-        if line.trim_end_matches('\r') == "---" {
-            closed = true;
+        if index == header_end {
             body_start = consumed;
             break;
         }
-        let Some((key, value)) = line.split_once(':') else {
-            // A header line with no colon is ignored rather than rejected: the
-            // format is ours to extend, and refusing would make a stray line in a
-            // prompt file fatal.
+        // Blank lines and `#` comments are allowed anywhere in the header.
+        if line.trim().is_empty() || line.trim_start().starts_with('#') {
             continue;
+        }
+        let Some((key, value)) = line.split_once(':') else {
+            return Err(format!(
+                "front matter line {consumed} is not `Key: value` — the header takes \
+                 only the keys listed above, and a line without a colon is not one \
+                 of them: {line:?}",
+            ));
         };
-        if key.trim().eq_ignore_ascii_case("AllowedTools") {
+        let key = key.trim();
+        if key.eq_ignore_ascii_case("AllowedTools") {
             allowed_tools = Some(split_list(value));
-        }
-        if key.trim().eq_ignore_ascii_case("AllowedHosts") {
+        } else if key.eq_ignore_ascii_case("AllowedHosts") {
             allowed_hosts = Some(split_list(value));
-        }
-        if key.trim().eq_ignore_ascii_case("AllowedJumpHosts") {
+        } else if key.eq_ignore_ascii_case("AllowedJumpHosts") {
             allowed_jump_hosts = Some(split_list(value));
+        } else {
+            // **Unknown keys are refused, not ignored.**
+            //
+            // The header carries security directives, so the failure direction
+            // matters: a typo like `AllowedTool:` or `AllowHosts:` would otherwise
+            // leave the agent with the full tool set and say nothing, which is the
+            // opposite of what the author wrote. Ignoring them also invites keys
+            // that look meaningful and are not — `Name:`, `Author:` — which read as
+            // configuration to every later reader while doing nothing at all.
+            return Err(format!(
+                "front matter line {consumed} has unknown key `{key}` — \
+                 this file understands AllowedTools, AllowedHosts and AllowedJumpHosts",
+            ));
         }
     }
-    if !closed {
-        return Err("front matter opened with --- but never closed with ---".to_string());
-    }
-
     // Rebuilt from the line list rather than sliced, so the body's own use of a
     // `---` line cannot be mistaken for a delimiter.
     let body = raw
@@ -537,18 +559,37 @@ mod tests {
     /// prompt file must not stop working because a later version wrote a key this
     /// one does not know.
     #[test]
-    fn an_unknown_header_key_is_ignored() {
+    fn an_unknown_header_key_is_refused() {
+        // Refused, not ignored. The header carries security directives, so a typo
+        // must not leave the agent with the full tool set and say nothing — and a
+        // key that looks meaningful but does nothing (`Name:`, `Author:`) reads as
+        // configuration to everyone who comes after.
+        let err = parse_prompt("---\nAuthor: someone\nAllowedTools: Read\n---\nhi\n").unwrap_err();
+        assert!(err.contains("unknown key `Author`"), "{err}");
+        assert!(err.contains("AllowedTools"), "it names what is understood: {err}");
+
+        // The typo this exists for: a near-miss on a real key.
+        let err = parse_prompt("---\nAllowedTool: Read\n---\nhi\n").unwrap_err();
+        assert!(err.contains("unknown key `AllowedTool`"), "{err}");
+
+        // A line with no colon at all is a broken header, not a comment.
+        let err = parse_prompt("---\nnot a header line\n---\nhi\n").unwrap_err();
+        assert!(err.contains("not `Key: value`"), "{err}");
+    }
+
+    /// Blank lines and `#` comments in the header are fine.
+    ///
+    /// Refusing unknown KEYS must not turn a readable header into an error: a
+    /// commented identity file is how someone explains why a tool is withheld.
+    #[test]
+    fn comments_and_blank_lines_in_the_header_are_allowed() {
         let Parsed {
             body: text,
             allowed_tools: tools,
             ..
-        } = parse_prompt("---\nAuthor: williamdes\nAllowedTools: Read\n---\nhi\n").unwrap();
+        } = parse_prompt("---\n# ssh is withheld on purpose\n\nAllowedTools: Read\n---\nhi\n").unwrap();
         assert_eq!(text, "hi");
         assert_eq!(tools.as_deref(), Some(&["Read".to_string()][..]));
-
-        // A stray line with no colon at all, too.
-        let Parsed { body: text, .. } = parse_prompt("---\nnot a header line\n---\nhi\n").unwrap();
-        assert_eq!(text, "hi");
     }
 
     /// Unterminated front matter is an error, not a prompt that begins with
