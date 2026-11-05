@@ -406,6 +406,7 @@ assets = [
     ["docs/fleet-playbook.md", "/usr/share/doc/tab-atelier/", "644"],
     ["docs/agent-guide.md", "/usr/share/doc/tab-atelier/", "644"],
     ["docs/config-guide.md", "/usr/share/doc/tab-atelier/", "644"],
+    ["docs/catbus-headless.md", "/usr/share/doc/tab-atelier/", "644"],
     ["crates/catbus-agent/examples/tools.json", "/usr/share/doc/tab-atelier/", "644"],
     # eSheep pets (the `pets` feature): a baked sprite sheet (<id>.png, alpha-keyed
     # + palette-quantized) beside its animation XML (<id>.xml), loaded at runtime
@@ -473,6 +474,7 @@ assets = [
     ["docs/fleet-playbook.md", "/usr/share/doc/tab-atelier-headless/", "644"],
     ["docs/agent-guide.md", "/usr/share/doc/tab-atelier-headless/", "644"],
     ["docs/config-guide.md", "/usr/share/doc/tab-atelier-headless/", "644"],
+    ["docs/catbus-headless.md", "/usr/share/doc/tab-atelier-headless/", "644"],
     ["crates/catbus-agent/examples/tools.json", "/usr/share/doc/tab-atelier-headless/", "644"],
 ]
 # Service-account lifecycle (adduser/deluser) and unit enable/start
