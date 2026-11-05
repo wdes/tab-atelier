@@ -975,6 +975,48 @@ const AdminApp = Vue.defineComponent({
       return out.sort((a, b) => a.label.localeCompare(b.label));
     },
     /**
+     * The options for one ACCOUNT's model pin, which is really a model-and-flavour
+     * pin.
+     *
+     * `userModelValue` reports the pin as `model#tools` or `model#reasoning` on
+     * the OpenAI wire, because that rail cannot serve tools and reasoning in one
+     * request — so the account's tool mode IS the flavour, and the value has to
+     * carry it. The options here therefore have to carry it too.
+     *
+     * They did not. `modelsForProvider` offers bare model ids, so on an OpenAI
+     * account the select's value matched no option: clicking a model painted it for
+     * one frame and then the browser showed the field empty, because a value with no
+     * matching option renders as blank. The pin had in fact been stored correctly,
+     * which is why the row looked right after a reload and wrong the moment it was
+     * touched.
+     *
+     * Both flavours are offered per model rather than only the current one: whether
+     * to carry tools is a choice the operator makes here, and hiding the other
+     * flavour would leave "reasoning only" reachable solely by first switching the
+     * tool policy somewhere else.
+     */
+    modelPinChoices(u: ApiUser): Array<{ value: string; label: string }> {
+      const base = this.modelsForProvider(u.provider || "", u.model || "");
+      const openai = this.wireOf(u) === "openai";
+      const out: Array<{ value: string; label: string }> = [];
+      for (const choice of base) {
+        if (!openai || choice.value.includes("#")) {
+          out.push(choice);
+          continue;
+        }
+        out.push({ value: `${choice.value}#tools`, label: `${choice.label} — with tools` });
+        out.push({ value: `${choice.value}#reasoning`, label: `${choice.label} — reasoning only` });
+      }
+      // The stored value must be selectable whatever the catalogue says: a pin set
+      // under an older build, or one whose provider no longer serves the model, is
+      // still the pin in force and blanking the field would misreport it.
+      const current = this.userModelValue(u);
+      if (current !== "" && !out.some((c) => c.value === current)) {
+        out.unshift({ value: current, label: `${current} — current` });
+      }
+      return out;
+    },
+    /**
      * Sources offered for one rule's "when they ask for".
      *
      * The catalogue, plus the rule's own `from` when it is not in it. A rule may

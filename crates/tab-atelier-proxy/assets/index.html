@@ -1037,7 +1037,7 @@
                             :aria-label="'Model for ' + u.email"
                             @change="setUserModel(u, $event.target.value)">
                       <option value="">caller's model</option>
-                      <option v-for="m in modelsForProvider(u.provider || '', u.model || '')"
+                      <option v-for="m in modelPinChoices(u)"
                               :key="m.value" :value="m.value">
                         {{ m.label }}
                       </option>
