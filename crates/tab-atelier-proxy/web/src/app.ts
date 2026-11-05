@@ -411,6 +411,13 @@ const AdminApp = Vue.defineComponent({
 
       const bytesOf = (value: unknown): { bytes: number; media: number; images: number } => {
         const json = JSON.stringify(value) ?? "";
+        // Byte length, not `json.length`. A JS string length counts UTF-16 code
+        // units while the proxy counts UTF-8 bytes, and the two disagree on
+        // every accented character, em dash, arrow or ellipsis: one unit here,
+        // two or three bytes there. Measured on a text-heavy prompt the gap is
+        // about 8%, which is the size of the shortfall this view used to report
+        // as a failed reconciliation. The estimate is only as good as its units.
+        const byteLength = (text: string): number => new TextEncoder().encode(text).length;
         let media = 0;
         let images = 0;
         // Walk for image payloads, which are base64 rather than text and are
@@ -425,20 +432,31 @@ const AdminApp = Vue.defineComponent({
           const source = o.source as Record<string, unknown> | undefined;
           if (o.type === "image" && source && typeof source.data === "string") {
             images += 1;
-            media += source.data.length;
+            media += byteLength(source.data);
           }
           for (const key of Object.keys(o)) walk(o[key]);
         };
         walk(value);
-        return { bytes: json.length, media, images };
+        return { bytes: byteLength(json), media, images };
       };
 
       const blockOf = (value: unknown, where: string): ConversationBlock => {
         const measured = bytesOf(value);
         const o = (value && typeof value === "object" ? value : {}) as Record<string, unknown>;
-        const kind = typeof o.type === "string" ? o.type : Array.isArray(value) ? "array" : typeof value;
+        // A tool *definition* carries no `type`, so labelling it by its own
+        // missing field said "object" for every one of them — the least useful
+        // name in the whole view, on the blocks that are usually the largest.
+        // Its name is what a reader is looking for.
+        const named =
+          typeof o.name === "string" && o.input_schema !== undefined
+            ? `tool: ${o.name}`
+            : typeof o.type === "string"
+              ? o.type
+              : Array.isArray(value)
+                ? "array"
+                : typeof value;
         return {
-          kind,
+          kind: named,
           text: this.blockText(value),
           where,
           bytes: measured.bytes,
@@ -598,6 +616,13 @@ const AdminApp = Vue.defineComponent({
           rebuiltTokens,
           deltaTokens,
           deltaPct,
+          // A clamped body is not the split's fault. Past MAX_BODY the server
+          // keeps only the head and the tail, so the blocks are drawn from a
+          // request that is missing its middle: the sum is bound to come out
+          // below the billed total, and reporting that as a failed
+          // reconciliation sent the reader looking for a bug in the split. The
+          // shortfall is the dropped middle, nothing else.
+          truncated: capture.request_truncated === true,
           // Five percent is the threshold for "agrees": below it the split is
           // usable for comparing blocks, and pretending to more precision than
           // that would be the only thing the number could be used for.
@@ -1041,7 +1066,17 @@ const AdminApp = Vue.defineComponent({
      */
     blockText(value: unknown): string {
       const o = (value && typeof value === "object" && !Array.isArray(value) ? value : {}) as Record<string, unknown>;
-      if (typeof o.text === "string") return o.text;
+      if (typeof o.text === "string") {
+        // An empty text block is not a bug and not a rendering failure: clients
+        // emit one carrying nothing but a `cache_control`, to put a breakpoint
+        // in a place that has no content of its own. Showing an empty box there
+        // left the reader unable to tell that from a block whose text the view
+        // had lost, which is why it is spelled out.
+        if (o.text !== "") return o.text;
+        return o.cache_control !== undefined
+          ? "(empty text block: it carries only a cache_control breakpoint)"
+          : "(empty text block)";
+      }
       // A tool *definition*: its description is what a reader is scanning for,
       // and its schema is what actually gets sent. Both, labelled, because a
       // bare description leaves the reader guessing why the block is large.

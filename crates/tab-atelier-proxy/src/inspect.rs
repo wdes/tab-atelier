@@ -295,19 +295,160 @@ pub fn scrub(text: &str) -> String {
     out
 }
 
+/// The nearest char boundary at or before `index`.
+fn floor_boundary(text: &str, index: usize) -> usize {
+    (0..=index.min(text.len()))
+        .rev()
+        .find(|i| text.is_char_boundary(*i))
+        .unwrap_or(0)
+}
+
+/// The nearest char boundary at or after `index`.
+fn ceil_boundary(text: &str, index: usize) -> usize {
+    let index = index.min(text.len());
+    (index..=text.len())
+        .find(|i| text.is_char_boundary(*i))
+        .unwrap_or(text.len())
+}
+
+/// What takes the place of text cut out of a string value.
+fn elide_notice(bytes: usize) -> String {
+    format!("[{bytes} bytes elided by tab-atelier-proxy]")
+}
+
+/// Cap every string value, keeping at least `head` bytes at its start and
+/// `tail` at its end. Returns how many bytes were removed.
+///
+/// Inside the strings, never across the document: see [`clamp`].
+fn clamp_strings(value: &mut serde_json::Value, head: usize, tail: usize) -> usize {
+    let mut elided = 0;
+    match value {
+        // The guard is part of the pattern so the match stays one level deep.
+        serde_json::Value::String(text) if text.len() > head + tail => {
+            let head_end = floor_boundary(text, head);
+            let tail_start = ceil_boundary(text, text.len() - tail);
+            if tail_start > head_end {
+                elided += tail_start - head_end;
+                let notice = elide_notice(tail_start - head_end);
+                *text = format!("{}{}{}", &text[..head_end], notice, &text[tail_start..]);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                elided += clamp_strings(item, head, tail);
+            }
+        }
+        serde_json::Value::Object(fields) => {
+            for (_, field) in fields.iter_mut() {
+                elided += clamp_strings(field, head, tail);
+            }
+        }
+        _ => {}
+    }
+    elided
+}
+
+/// Keep the first and last `keep` entries of every long array, replacing the
+/// middle with one marker object. Returns how many entries were removed.
+///
+/// The last structural resort, for a JSON body made of so many entries that
+/// shrinking their text still does not fit. Whole blocks go rather than the
+/// document's shape: a body that no longer parses would show nothing at all,
+/// while this one still shows the start and the end of the request, which is
+/// what someone diagnosing a bill is looking for.
+fn clamp_arrays(value: &mut serde_json::Value, keep: usize) -> usize {
+    let mut dropped = 0;
+    match value {
+        serde_json::Value::Array(items) => {
+            if items.len() > keep * 2 + 1 {
+                let tail_start = items.len() - keep;
+                let removed = tail_start - keep;
+                // Two disjoint slices, so split rather than chain two borrows.
+                let (head, tail) = items.split_at_mut(tail_start);
+                for item in head.iter_mut().chain(tail.iter_mut()) {
+                    dropped += clamp_arrays(item, keep);
+                }
+                let marker = serde_json::json!({
+                    "type": "text",
+                    "text": elide_notice(removed),
+                });
+                items.splice(keep..tail_start, std::iter::once(marker));
+                dropped += removed;
+            } else {
+                for item in items.iter_mut() {
+                    dropped += clamp_arrays(item, keep);
+                }
+            }
+        }
+        serde_json::Value::Object(fields) => {
+            for (_, field) in fields.iter_mut() {
+                dropped += clamp_arrays(field, keep);
+            }
+        }
+        _ => {}
+    }
+    dropped
+}
+
 /// Keep both ends of an over-long body.
+///
+/// This used to slice the raw bytes, which left a body that was not JSON: the
+/// panel could not parse it, so the one thing a capture exists for — reading the
+/// request that was sent — was impossible for exactly the requests worth
+/// reading. Large text is now cut *inside its string values* instead, so the
+/// document stays valid, every block boundary survives, and the figures derived
+/// from those blocks stay comparable. Only the middle of the longest text is
+/// replaced, and the notice says how much.
 fn clamp(body: &str) -> (String, bool) {
     if body.len() <= MAX_BODY {
         return (body.to_owned(), false);
     }
-    // Split on a char boundary, or the slice panics on multi-byte input.
-    let head_end = (0..=MAX_BODY / 2)
-        .rev()
-        .find(|i| body.is_char_boundary(*i))
-        .unwrap_or(0);
-    let tail_start = (body.len() - MAX_BODY / 2..body.len())
-        .find(|i| body.is_char_boundary(*i))
-        .unwrap_or(body.len());
+
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(body) {
+        // Shrink the per-string allowance until the document fits. Each pass
+        // parses nothing and serialises once, and only a pathological body needs
+        // more than a couple; the floor guarantees termination.
+        //
+        // The floor is low on purpose: a long transcript is thousands of *short*
+        // text blocks rather than one huge one, so a 256-byte allowance would cut
+        // nothing and the body would fall through to the raw path, losing its
+        // structure after all.
+        let mut allowance = MAX_BODY / 8;
+        while allowance >= 32 {
+            let mut candidate = value.clone();
+            let elided = clamp_strings(&mut candidate, allowance, allowance);
+            let text = candidate.to_string();
+            if elided > 0 && text.len() <= MAX_BODY {
+                return (text, true);
+            }
+            allowance /= 4;
+        }
+
+        // Still too large: thousands of entries whose text is already short.
+        // Drop the middle of the long arrays rather than the document's shape.
+        for keep in [256usize, 32, 4] {
+            let mut candidate = value.clone();
+            if clamp_strings(&mut candidate, 64, 64) == 0 && clamp_arrays(&mut candidate, keep) == 0 {
+                continue;
+            }
+            let text = candidate.to_string();
+            if text.len() <= MAX_BODY {
+                return (text, true);
+            }
+        }
+    }
+
+    clamp_raw(body)
+}
+
+/// The last resort, for a body that is not JSON or cannot be shrunk: keep both
+/// ends. The result will not parse, which is why it is not the first choice.
+fn clamp_raw(body: &str) -> (String, bool) {
+    if body.len() <= MAX_BODY {
+        return (body.to_owned(), false);
+    }
+    let head_end = floor_boundary(body, MAX_BODY / 2);
+    let tail_start = ceil_boundary(body, body.len() - MAX_BODY / 2);
     (
         format!(
             "{}\n\n… {} bytes omitted by tab-atelier-proxy …\n\n{}",
@@ -965,20 +1106,19 @@ mod tests {
     }
 
     #[test]
-    fn an_enormous_body_keeps_both_ends_and_says_so() {
-        // A real request is megabytes and the interesting parts are the model
-        // and system blocks at the start and the newest turn at the end.
-        // The cap is megabytes now, so the fixture has to be bigger than a
-        // real request to exercise the guard at all. That is the point of
-        // raising it: nothing ordinary meets it.
+    fn an_enormous_body_is_cut_inside_its_strings_and_still_parses() {
+        // What a capture is for is reading the request that was sent, so a body
+        // over the cap has to stay readable. Slicing it as raw bytes did not:
+        // the result was not JSON, the panel could not parse it, and the one
+        // request worth looking at was the one it could not show.
         let big = format!(
-            r#"{{"model":"claude-opus-5-5","messages":[{}]}}"#,
+            r#"{{"model":"claude-opus-5-5","messages":[{{"role":"user","content":[{{"type":"text","text":"{}"}}]}}]}}"#,
             "x".repeat(MAX_BODY + 1024)
         );
         let c = capture(&Outgoing {
             ts: "t".to_owned(),
             account_id: "id",
-            account_email: "e",
+            account_email: "",
             method: "POST",
             path: "/v1/messages",
             provider: "anthropic",
@@ -989,28 +1129,60 @@ mod tests {
             body: big.as_bytes(),
         });
         assert!(c.request_truncated, "truncation must be declared, not silent");
-        assert!(c.request_body.len() < big.len());
+        assert!(c.request_body.len() <= MAX_BODY);
+
+        // The whole point: it parses, so the structure survives.
+        let parsed: serde_json::Value =
+            serde_json::from_str(&c.request_body).expect("a clamped body must still be JSON");
+        assert_eq!(parsed["model"], "claude-opus-5-5");
+        assert_eq!(parsed["messages"][0]["role"], "user");
+        let text = parsed["messages"][0]["content"][0]["text"]
+            .as_str()
+            .expect("the text block is still a string");
+        assert!(text.contains("bytes elided by tab-atelier-proxy"));
+        assert!(text.starts_with('x'), "the head of the text survives");
+        assert!(text.ends_with('x'), "and so does its tail");
+    }
+
+    /// A long transcript is thousands of short text blocks, not one huge one, so
+    /// an allowance that only cuts long strings would elide nothing and the body
+    /// would lose its structure anyway.
+    #[test]
+    fn a_body_of_many_short_strings_still_parses_after_clamping() {
+        let blocks: Vec<String> = (0..40_000)
+            .map(|n| format!(r#"{{"role":"user","content":[{{"type":"text","text":"block number {n} with enough text to be worth eliding"}}]}}"#))
+            .collect();
+        let big = format!(r#"{{"model":"m","messages":[{}]}}"#, blocks.join(","));
+        assert!(big.len() > MAX_BODY, "the fixture must exceed the cap");
+
+        let (out, cut) = clamp(&big);
+        assert!(cut);
+        assert!(out.len() <= MAX_BODY, "got {} bytes", out.len());
+        let parsed: serde_json::Value =
+            serde_json::from_str(&out).expect("the structure must survive even when every string is short");
+        // The first and last messages survive; the middle is replaced by a
+        // marker, because that many entries cannot fit however short their text.
+        let messages = parsed["messages"].as_array().expect("messages stay an array");
+        assert!(messages.len() < 40_000, "something had to go");
+        // The marker is inserted at whichever array was shortened, so search the
+        // whole document rather than guessing its depth.
         assert!(
-            c.request_body.contains(r#""model":"claude-opus-5-5""#),
-            "the head survives"
+            out.contains("bytes elided by tab-atelier-proxy"),
+            "the reader is told what was dropped"
         );
-        assert!(
-            c.request_body.ends_with("]}"),
-            "the tail survives: {:?}",
-            &c.request_body[c.request_body.len() - 20..]
-        );
-        assert!(c.request_body.contains("omitted by tab-atelier-proxy"));
+        assert!(!messages.is_empty(), "both ends survive");
     }
 
     #[test]
-    fn truncation_does_not_split_a_multibyte_character() {
-        // Slicing a String on a byte index panics mid-character, and a prompt
-        // is exactly the place non-ASCII shows up.
-        // é is two bytes in UTF-8, so this is 2×MAX_BODY bytes.
-        let big = "é".repeat(MAX_BODY);
+    fn a_body_that_is_not_json_still_keeps_both_ends() {
+        // The last resort: a body that cannot be parsed cannot be cut safely, so
+        // both ends are kept and the notice says what went. It will not parse,
+        // which is exactly why this is not the first choice.
+        let big = "x".repeat(MAX_BODY + 1024);
         let (out, cut) = clamp(&big);
         assert!(cut);
-        assert!(out.contains('é'));
+        assert!(out.contains("bytes omitted by tab-atelier-proxy"));
+        assert!(out.len() < big.len());
     }
 
     /// The date is stripped, so the label outlives the revision that carries

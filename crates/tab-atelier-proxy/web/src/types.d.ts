@@ -923,6 +923,16 @@ interface ConversationCheck {
     ok: boolean;
     /** Whether the rebuild fell short, which changes how the miss is worded. */
     short: boolean;
+    /**
+     * True when the captured body was clamped, so the blocks are incomplete.
+     *
+     * Past the body cap the server keeps only the head and the tail, so the
+     * blocks are drawn from a request missing its middle and their sum is bound
+     * to come out below the billed total. The shortfall is the dropped middle,
+     * not a defect in the split, and the view says that rather than reporting a
+     * total that does not reconcile.
+     */
+    truncated: boolean;
     /** The recorded amount, when the round could be priced. */
     billedMicro: number | null;
     /** The sum of the per-block estimates, when the round could be priced. */

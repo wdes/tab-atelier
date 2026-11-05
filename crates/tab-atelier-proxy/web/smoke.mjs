@@ -209,6 +209,11 @@ const TaApi = {
           system: [{ type: "text", text: "You are a careful assistant.", cache_control: { type: "ephemeral" } }],
           messages: [
             { role: "user", content: [{ type: "text", text: "Read the config please." }] },
+            // 500 two-byte characters: 1040 UTF-8 bytes against 540 UTF-16
+            // units, which is the ratio the view must use (see below).
+            // U+00E9 written as an escape: two UTF-8 bytes, one UTF-16 unit, and
+            // no non-ASCII literal in a source file that has to stay ASCII.
+            { role: "user", content: [{ type: "text", text: "NONASCII-MARKER" + "\u00e9".repeat(500) }] },
             { role: "assistant", content: [{ type: "text", text: "Sure." }, { type: "tool_use", name: "read", input: { path: "a.toml" } }] },
             // Long on purpose. The view used to clip a block to 120 characters
             // with an ellipsis, which hid the very bytes the token count beside
@@ -218,6 +223,10 @@ const TaApi = {
           ],
         }),
         response_body: "{}",
+        // Present, and false, so the truncation branch of the check is exercised
+        // on the detail fixture: without the field the branch could never fire
+        // here and the assertion below would pass for the wrong reason.
+        request_truncated: false,
         response_truncated: false,
         tokens: { input: 120, cache_read: 900, cache_write: 40, output: 30 },
         // Self-consistent with `rate` and `tokens`, not arbitrary: at
@@ -398,6 +407,34 @@ check(/totals agree/.test(convo) || /rebuilt is \d+%/.test(convo), "the two are 
 // The separator is the other reason the view exists, so its absence would be a
 // silent regression: the fixture puts one on the system block.
 check(/cache separator/.test(convo), "the cache separator is marked");
+// A tool definition has no `type` field, so labelling blocks by their own type
+// called every one of them "object" - the least useful name on the blocks that
+// are usually the largest. The fixture carries one tool; it must be named.
+check(/tool: read/.test(convo), "a tool definition is named after the tool, not called object");
+// Bytes, not UTF-16 units. The block is 1040 UTF-8 bytes against 540 units; a
+// view counting units under-reports it by half and, on a real prompt, mis-sizes
+// and mis-prices the whole request - the very shortfall this view used to
+// report as a failed reconciliation.
+const nonAsciiBlock = [...dom.document.querySelectorAll(".ta-conv-block-body")].find((el) =>
+  el.textContent.includes("NONASCII-MARKER"),
+);
+check(nonAsciiBlock !== undefined, "the non-ASCII block rendered");
+if (nonAsciiBlock !== undefined) {
+  check(
+    // 1040 bytes renders as "1.0 KB"; counting units would render "540 B".
+    /1\.0 KB/.test(nonAsciiBlock.querySelector(".ta-conv-nums").textContent),
+    "a block's size is counted in UTF-8 bytes, not UTF-16 units",
+  );
+}
+// Checked on the labels themselves, not on the text: the fixture's tool schema
+// is `{type: "object"}`, so the word legitimately appears in the rendered JSON.
+const blockLabels = [...dom.document.querySelectorAll(".ta-conv-kind")].map((el) => el.textContent.trim());
+check(blockLabels.length > 0, "the view labels its blocks");
+check(blockLabels.includes("object") === false, "no block is labelled object");
+// The fixture body is complete, so the truncation branch must stay out of it:
+// firing there would tell the reader a comparison was impossible when it was
+// not.
+check(/not comparable/.test(convo) === false, "a complete body is compared, not excused for being clamped");
 check(/no cache_control breakpoint at all/.test(convo) === false, "a body with a breakpoint is not reported as having none");
 // Nothing is clipped. The block below the summary used to be a 120-character
 // preview with an ellipsis; the tail of a long tool result is the proof it is

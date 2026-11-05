@@ -347,6 +347,8 @@
       }
       .ta-check-ok { border-color: #198754; }
       .ta-check-bad { border-color: #dc3545; }
+      /* Neither agreement nor failure: the comparison cannot be made. */
+      .ta-check-warn { border-color: #ffc107; }
       .ta-check-row {
         display: flex;
         gap: .5rem;
@@ -1018,7 +1020,8 @@
                      compared against what the provider actually counted. A miss
                      is reported as a size, in both directions. -->
                 <div v-if="conversation.check !== null" class="ta-check mb-2"
-                     :class="conversation.check.ok ? 'ta-check-ok' : 'ta-check-bad'">
+                     :class="conversation.check.truncated ? 'ta-check-warn'
+                             : conversation.check.ok ? 'ta-check-ok' : 'ta-check-bad'">
                   <div class="ta-check-row">
                     <span class="ta-check-label">billed</span>
                     <span class="font-monospace">
@@ -1044,7 +1047,17 @@
                     </span>
                   </div>
                   <div class="ta-check-row ta-check-verdict">
-                    <span v-if="conversation.check.ok">&#10003; totals agree</span>
+                    <!-- Past the cap the record keeps the structure and cuts
+                         text inside the strings, so the blocks render but their
+                         text is incomplete and cannot add up to the bill. -->
+                    <span v-if="conversation.check.truncated">
+                      &#8776; not comparable: this request was over the capture
+                      cap, so some of its text was elided when it was recorded.
+                      The blocks below are missing that text &mdash; the
+                      {{ Math.abs(conversation.check.deltaPct) }}% shortfall is
+                      the elision, not the split.
+                    </span>
+                    <span v-else-if="conversation.check.ok">&#10003; totals agree</span>
                     <span v-else>
                       &#10007; rebuilt is {{ Math.abs(conversation.check.deltaPct) }}%
                       {{ conversation.check.short ? 'BELOW' : 'ABOVE' }} billed
