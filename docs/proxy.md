@@ -285,6 +285,21 @@ not a structure the endpoint obeyed: that wire has no such field, and the proxy
 strips it on the way out while the provider prefix-caches implicitly. The view
 says so when the capture was taken on that wire.
 
+Nothing on the way is clipped. A block's own text is shown whole, inside its
+accordion, and so is a value in *Structure*: the figure beside a token count has
+to be the bytes that were counted, or the count reads as an estimate of what is
+on screen. Clipping also hid the one value worth reading, which is usually the
+long one.
+
+The list and the bodies are fetched separately. `GET /api/inspect` answers rows —
+the timestamp, the account, the model, the token counts — and
+`GET /api/inspect/{id}` answers one capture in full. The bodies used to ride
+along with the list, so opening the panel downloaded up to a hundred megabytes of
+prompts to draw a table of 25 rows, none of which reads a body. A row therefore
+shows the body's size rather than holding it, and the row the operator clicks is
+named by a capture id the server assigns, because a position in the ring shifts
+the moment the next call is recorded.
+
 It is off, and it turns itself off. A capture is a prompt, and a prompt is
 whatever someone was working on, so:
 

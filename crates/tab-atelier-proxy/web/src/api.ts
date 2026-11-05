@@ -139,6 +139,8 @@ interface PressureApi {
 /** The recording endpoints. */
 interface InspectApi {
   get(): Promise<InspectState>;
+  /** One capture in full, fetched when a row is opened. */
+  capture(id: number): Promise<Capture>;
   arm(minutes: number): Promise<InspectState>;
   disarm(): Promise<OkResponse>;
 }
@@ -237,6 +239,10 @@ class ApiClient {
     this.pressure = { get: () => this.request<Pressure>("GET", "/api/pressure") };
     this.inspect = {
       get: () => this.request<InspectState>("GET", "/api/inspect"),
+      // One capture in full. Separate from `get` because a body is up to 4 MiB
+      // and the list needs rows: fetching the bodies with the list meant the
+      // panel downloaded and parsed every prompt it held just to draw a table.
+      capture: (id) => this.request<Capture>("GET", `/api/inspect/${seg(String(id))}`),
       arm: (minutes) => this.request<InspectState>("POST", "/api/inspect", { minutes }),
       disarm: () => this.request("DELETE", "/api/inspect"),
     };

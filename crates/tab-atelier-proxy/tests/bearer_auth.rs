@@ -316,6 +316,10 @@ fn the_api_refuses_an_anonymous_request() {
         "/api/pressure",
         "/api/usage",
         "/api/inspect",
+        // The per-capture read holds the same prompts as the list, so it is
+        // listed here on its own rather than assumed to inherit the guard from
+        // the path it hangs off.
+        "/api/inspect/1",
     ] {
         let response = get(port, path);
         assert_eq!(status(&response), 401, "{path} must need the token");

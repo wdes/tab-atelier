@@ -119,6 +119,10 @@ class ApiClient {
         this.pressure = { get: () => this.request("GET", "/api/pressure") };
         this.inspect = {
             get: () => this.request("GET", "/api/inspect"),
+            // One capture in full. Separate from `get` because a body is up to 4 MiB
+            // and the list needs rows: fetching the bodies with the list meant the
+            // panel downloaded and parsed every prompt it held just to draw a table.
+            capture: (id) => this.request("GET", `/api/inspect/${seg(String(id))}`),
             arm: (minutes) => this.request("POST", "/api/inspect", { minutes }),
             disarm: () => this.request("DELETE", "/api/inspect"),
         };

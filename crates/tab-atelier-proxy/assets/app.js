@@ -267,7 +267,16 @@ const AdminApp = Vue.defineComponent({
             // Inspection: null until the panel is opened, so nothing is fetched —
             // and nothing hints that captures exist — unless someone asks.
             inspect: null,
+            /**
+             * The capture whose body is on screen — fetched one at a time.
+             *
+             * Separate from the list on purpose: a body is up to 4 MiB and the list
+             * holds rows, so this is filled by `openCapture` rather than being a
+             * capture the list handed over.
+             */
             inspectOpen: null,
+            /** The id being fetched, so the row that was clicked can say so. */
+            inspectOpening: null,
             providers: null,
             tools: null,
             // The route editor. Opened from the row, saved per row rather than whole:
@@ -295,19 +304,47 @@ const AdminApp = Vue.defineComponent({
     },
     computed: {
         /**
-         * The open capture's body as tree rows, parsed once.
+         * The open capture's body, parsed once for every view that needs it.
+         *
+         * Cached on the body string, so it re-parses when the selection changes and
+         * not when anything else on the page does. The parse is shared rather than
+         * done per view because all three views want it: Structure and Conversation
+         * each walk the same document, and a capture big enough for the parse to
+         * matter is exactly the one this caching exists for.
+         */
+        parsedBody() {
+            const text = this.inspectOpen ? this.inspectOpen.request_body : "";
+            if (!text)
+                return null;
+            try {
+                return { text, value: JSON.parse(text) };
+            }
+            catch {
+                return null;
+            }
+        },
+        /**
+         * The open capture's body as tree rows, or null when it does not parse.
          *
          * A computed rather than a call in the template: the template asks for it
          * three times per render — for the toggle's disabled state, for the row count
-         * and for the list — and `jsonRows` parses the whole body on each call. A
-         * multi-megabyte capture would re-parse it several times per keystroke.
-         *
-         * Cached on the body string, so it re-parses exactly when the selection
-         * changes and not when anything else on the page does.
+         * and for the list — and building the rows walks the whole document.
          */
         inspectRows() {
+            return this.parsedBody ? this.jsonRows(this.parsedBody.value) : null;
+        },
+        /**
+         * The raw view's coloured runs, built once per capture.
+         *
+         * Emphatically a computed and not a call in the template. A method call in
+         * a template re-runs on EVERY re-render of the component — a keystroke in
+         * the add-user form, the 30-second pressure poll, anything — and this one
+         * pretty-prints and tokenises a multi-hundred-kilobyte string. That is what
+         * made the page lag while a capture was open.
+         */
+        rawTokens() {
             const body = this.inspectOpen ? this.inspectOpen.request_body : "";
-            return body ? this.jsonRows(body) : null;
+            return body ? this.jsonTokens(body) : [];
         },
         /**
          * The captured conversation, with an attributed size and cost per block.
@@ -342,13 +379,12 @@ const AdminApp = Vue.defineComponent({
             const capture = this.inspectOpen;
             if (!capture || !capture.request_body)
                 return null;
-            let body;
-            try {
-                body = JSON.parse(capture.request_body);
-            }
-            catch {
+            // The parse every view shares. Done here rather than in each view: a
+            // capture large enough for this to cost anything is the one being read.
+            const parsed = this.parsedBody;
+            if (!parsed)
                 return null;
-            }
+            const body = parsed.value;
             if (!body || typeof body !== "object" || Array.isArray(body))
                 return null;
             const root = body;
@@ -389,7 +425,7 @@ const AdminApp = Vue.defineComponent({
                 const kind = typeof o.type === "string" ? o.type : Array.isArray(value) ? "array" : typeof value;
                 return {
                     kind,
-                    preview: this.blockPreview(o),
+                    text: this.blockText(value),
                     where,
                     bytes: measured.bytes,
                     // The server's own estimator, block by block: text by length, media by
@@ -987,40 +1023,51 @@ const AdminApp = Vue.defineComponent({
             return Object.values(o).some((inner) => (inner && typeof inner === "object" ? this.hasBreakpoint(inner) : false));
         },
         /**
-         * One line of a block's own content, for its accordion summary.
+         * A block's own content, complete.
          *
-         * A summary has to be recognisable at a glance, so each kind shows the thing
-         * a reader would look for: the text of a text block, the name of a tool
-         * call, the tool's name on its result. Nothing here is exhaustive — the
-         * expanded body is the full block.
+         * Not a preview and deliberately not clipped. This view exists to answer
+         * "which part of this conversation is the expensive part", and a tool result
+         * cut to 120 characters hides precisely the bytes that were billed. The
+         * earlier version clipped, and a truncated figure next to a token count
+         * invites the reader to believe the count was of what they can see.
+         *
+         * So: the text where there is text, a citation the reader can act on where
+         * there is not, and the whole block as JSON otherwise. Rendering it in full
+         * costs nothing until someone opens the block — see the conversation view's
+         * template, where the body sits inside the accordion.
          */
-        blockPreview(o) {
-            const clip = (text) => {
-                const clean = text.replace(/\s+/g, " ").trim();
-                return clean.length > 120 ? `${clean.slice(0, 117)}…` : clean;
-            };
+        blockText(value) {
+            const o = (value && typeof value === "object" && !Array.isArray(value) ? value : {});
             if (typeof o.text === "string")
-                return clip(o.text);
-            // A tool *definition* — name plus its description, which is what a reader
-            // is scanning for. Falls through to JSON for a definition that carries
-            // neither, because an empty line would hide a tool that exists.
+                return o.text;
+            // A tool *definition*: its description is what a reader is scanning for,
+            // and its schema is what actually gets sent. Both, labelled, because a
+            // bare description leaves the reader guessing why the block is large.
             if (typeof o.name === "string" && o.input_schema !== undefined) {
-                const description = typeof o.description === "string" ? ` — ${o.description}` : "";
-                return clip(`${o.name}${description}`);
+                const description = typeof o.description === "string" ? o.description : "";
+                const schema = JSON.stringify(o.input_schema, null, 2) ?? "";
+                return description ? `${description}\n\ninput_schema\n${schema}` : schema;
             }
-            if (typeof o.name === "string" && o.type === "tool_use") {
-                return clip(o.name);
-            }
+            // A tool result whose content is a string, or an array of text blocks.
+            // Mixed content — an image beside text — falls through to the JSON below,
+            // which is the only rendering that loses nothing.
             if (o.type === "tool_result") {
                 const content = o.content;
-                const text = typeof content === "string" ? content : Array.isArray(content) ? content.map((c) => (c && typeof c === "object" && typeof c.text === "string" ? c.text : "")).join(" ") : "";
-                return clip(text);
+                if (typeof content === "string")
+                    return content;
+                if (Array.isArray(content) && content.every((c) => c && typeof c === "object" && typeof c.text === "string")) {
+                    return content.map((c) => c.text).join("\n");
+                }
             }
-            if (o.type === "image")
-                return "image";
             if (typeof o.content === "string")
-                return clip(o.content);
-            return clip(JSON.stringify(o) ?? "");
+                return o.content;
+            if (o.type === "image") {
+                const source = o.source;
+                const kind = source && typeof source.media_type === "string" ? source.media_type : "image";
+                const size = source && typeof source.data === "string" ? source.data.length : 0;
+                return `${kind}, ${size.toLocaleString("en-US")} base64 characters`;
+            }
+            return JSON.stringify(value, null, 2) ?? String(value);
         },
         /**
          * A micro-USD amount, at a precision that does not round it to nothing.
@@ -1880,6 +1927,47 @@ const AdminApp = Vue.defineComponent({
                 this.inspectBusy = false;
             }
         },
+        /**
+         * Fetch one capture's body and show it, or close it if it is already open.
+         *
+         * Clicking the open row closes it, because the toggle and the row action are
+         * the same thing to the person clicking. The body is fetched here rather
+         * than shipped with the list — see `CaptureSummary` — so this is the call
+         * that made the panel feel slow, and it is now one request for one request
+         * instead of one request for all of them.
+         */
+        async openCapture(id) {
+            if (this.inspectOpen && this.inspectOpen.id === id) {
+                this.inspectOpen = null;
+                return;
+            }
+            this.inspectOpening = id;
+            this.error = "";
+            try {
+                const capture = await api.inspect.capture(id);
+                // Not assigned through a stale closure: the operator may have clicked a
+                // different row while this was in flight, and the later click wins.
+                if (this.inspectOpening === id) {
+                    this.inspectOpen = capture;
+                    // Structure is the default because it is the wider question, and a
+                    // body that does not parse has no structure to show.
+                    this.bodyView = "structure";
+                }
+            }
+            catch (e) {
+                // The ring turns over, so this is an ordinary answer rather than a
+                // fault: the row named a capture that a newer one has displaced. Said
+                // in the page rather than swallowed, because a button that does nothing
+                // reads as broken.
+                this.error = e instanceof Error ? e.message : String(e);
+                this.inspectOpen = null;
+                await this.loadInspect();
+            }
+            finally {
+                if (this.inspectOpening === id)
+                    this.inspectOpening = null;
+            }
+        },
         async armInspect() {
             const raw = prompt(`Capture the JSON sent to Anthropic for how many minutes? (max ${this.inspect?.max_arm_minutes ?? 60})\n\n` +
                 "Captures contain PROMPTS — whatever people are working on. Credentials are stripped, " +
@@ -1920,10 +2008,15 @@ const AdminApp = Vue.defineComponent({
          */
         jsonTokens(body) {
             const pretty = this.prettyJson(body);
-            // A run per token is a `<span>` per token, and a body near the capture
-            // cap has millions. Past this size plain text is the only rendering that
-            // will not lock up the tab, and JSON this large is not read by eye.
-            if (pretty.length > 262144)
+            // A run per token is a `<span>` per token, so this is a budget on DOM
+            // nodes rather than on what is shown: past it the body is one run of
+            // plain text, which is complete and uncoloured rather than clipped.
+            //
+            // The number is lower than it was because the cost is not only the first
+            // paint: every later re-render of the page diffs those spans, so a body
+            // near the cap kept making the whole dashboard sluggish long after it had
+            // drawn.
+            if (pretty.length > 65536)
                 return [{ cls: "", text: pretty }];
             const re = /"(?:\\.|[^"\\])*"|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|\b(?:true|false|null)\b/g;
             const out = [];
@@ -1955,42 +2048,41 @@ const AdminApp = Vue.defineComponent({
          * outline, and a flat list keeps the whole body in one scroll container so the
          * browser does not have to lay out thousands of nested boxes.
          *
-         * Two limits, both for the same reason — a capture can be megabytes and JSON
-         * that large is not read by eye:
-         *   - `depth` stops at 8, and anything below says so rather than vanishing;
-         *   - strings are cut to 160 characters, with the full value in the row's
-         *     `title` so hovering shows the rest.
+         * # Nothing is clipped
+         *
+         * A string is shown in full, however long. Values used to be cut to 160
+         * characters with the rest in a `title`, which is useless in practice: the
+         * one value worth reading is usually the long one, and a tooltip is not
+         * selectable, not searchable and not copyable. The clip also lied about the
+         * row next to it — a byte count that included text the reader could not see.
+         *
+         * The cost of that is a row holding perhaps a megabyte of text. It is one
+         * text node, which every browser lays out; the alternative was a page that
+         * quietly did not show the answer.
          *
          * Returns `null` when the body is not JSON: the caller then shows the raw
          * text alone, because a parse failure is worth seeing rather than hiding
          * behind an empty tree.
          */
-        jsonRows(body) {
-            let parsed;
-            try {
-                parsed = JSON.parse(body);
-            }
-            catch {
+        jsonRows(parsed) {
+            if (parsed === undefined)
                 return null;
-            }
             const out = [];
             const walk = (value, key, depth) => {
                 const pad = depth;
                 if (depth > 8) {
-                    out.push({ pad, key, kind: "more", text: "… deeper than this view shows" });
+                    out.push({ pad, key, kind: "more", text: "nested deeper than this view shows" });
                     return;
                 }
                 if (value === null) {
                     out.push({ pad, key, kind: "null", text: "null" });
                 }
                 else if (typeof value === "string") {
-                    const oneLine = value.length > 160 ? `${value.slice(0, 160)}…` : value;
-                    // A newline inside a string would break the row into several lines and
-                    // destroy the alignment the tree depends on. Shown as the literal `\n`
-                    // rather than a symbol, because that is how the value reads in the raw
-                    // view next door — and because it keeps this file pure ASCII, which the
-                    // commit gate enforces on every added line.
-                    out.push({ pad, key, kind: "str", text: oneLine.replace(/\n/g, "\\n"), title: value });
+                    // Newlines are literal in the text but the row is one line of a
+                    // block layout, so they are made visible rather than reflowed: a
+                    // multi-line tool result would otherwise break the outline's
+                    // alignment and read as several rows.
+                    out.push({ pad, key, kind: "str", text: value });
                 }
                 else if (typeof value === "number" || typeof value === "boolean") {
                     out.push({ pad, key, kind: "num", text: String(value) });

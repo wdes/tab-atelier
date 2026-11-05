@@ -41,10 +41,12 @@ use tab_atelier_api::schemars;
 
 use crate::users::Client;
 
-/// How many captures to keep. Small on purpose: this is for looking at the
-/// last few calls, not for building an archive. With full bodies now stored
-/// rather than clipped fragments, this is the number that bounds the file.
-const KEEP: usize = 25;
+/// How many captures to keep.
+///
+/// Small on purpose: this is for looking at the last few calls, not for building
+/// an archive. With full bodies now stored rather than clipped fragments, this is
+/// the number that bounds the file.
+pub const KEEP: usize = 25;
 
 /// Longest body recorded, in bytes.
 ///
@@ -55,7 +57,7 @@ const KEEP: usize = 25;
 /// a working context is a few hundred KB, so the cap is now well clear of
 /// real traffic and exists only so that one pathological request cannot fill
 /// the disk.
-const MAX_BODY: usize = 4 * 1024 * 1024;
+pub const MAX_BODY: usize = 4 * 1024 * 1024;
 
 /// How much of a reply is kept on the capture.
 ///
@@ -90,6 +92,20 @@ const KEEP_HEADERS: &[&str] = &[
 /// One recorded call.
 #[derive(Debug, Clone, Serialize, Deserialize, tab_atelier_api::schemars::JsonSchema)]
 pub struct Capture {
+    /// Which capture this is, within the ring the process is holding.
+    ///
+    /// Assigned by [`Store`], never by the caller, and it exists because the
+    /// panel now lists captures with their bodies withheld and asks for one at
+    /// a time. A position in the ring would not do: one call arriving between
+    /// the list and the click shifts every position after it, so the row the
+    /// operator clicked would open a different request.
+    ///
+    /// Meaningless across restarts, which is why [`Store::load`] renumbers
+    /// rather than trusting what the file says — a record written by a build
+    /// that had this field and one written by a build that did not would
+    /// otherwise need two schemes for one job.
+    #[serde(default)]
+    pub id: u64,
     /// RFC3339.
     pub ts: String,
     pub account_id: String,
@@ -425,6 +441,9 @@ pub fn capture(o: &Outgoing<'_>) -> Capture {
     let server_tool = parsed.as_ref().and_then(server_tool);
     let (request_body, request_truncated) = clamp(&scrubbed);
     Capture {
+        // The store's to give: one capture has no identity until it is in the
+        // ring, and a caller that made one up could collide with a live one.
+        id: 0,
         ts: ts.clone(),
         account_id: (*account_id).to_owned(),
         account_email: (*account_email).to_owned(),
@@ -472,6 +491,10 @@ pub struct Store {
     path: PathBuf,
     /// Unix seconds until which capturing is on. Zero is off.
     armed_until: u64,
+    /// The id the next capture gets. Only has to be unique among the captures
+    /// held right now, which is why [`Self::load`] restarts the count rather
+    /// than continuing from whatever the file says.
+    next_id: u64,
     recent: Vec<Capture>,
 }
 
@@ -482,7 +505,7 @@ impl Store {
     #[must_use]
     pub fn load(dir: impl Into<PathBuf>) -> Self {
         let path = dir.into().join("inspect.jsonl");
-        let recent = std::fs::read_to_string(&path).map_or_else(
+        let mut recent = std::fs::read_to_string(&path).map_or_else(
             |_| Vec::new(),
             |raw| {
                 raw.lines()
@@ -495,9 +518,18 @@ impl Store {
                     .collect()
             },
         );
+        // Renumbered rather than trusted: a file written before this field
+        // existed carries `id: 0` on every line, and several captures sharing
+        // one id would make the panel's "open the one I clicked" a guess.
+        let mut next_id = 1;
+        for c in &mut recent {
+            c.id = next_id;
+            next_id += 1;
+        }
         Self {
             path,
             armed_until: 0,
+            next_id,
             recent,
         }
     }
@@ -529,6 +561,16 @@ impl Store {
         &self.recent
     }
 
+    /// The capture with this id, while the ring still holds it.
+    ///
+    /// `None` is an ordinary answer, not an error: the ring turns over, so a
+    /// row a browser listed a minute ago can name a capture that a newer one
+    /// has already displaced.
+    #[must_use]
+    pub fn find(&self, id: u64) -> Option<&Capture> {
+        self.recent.iter().find(|c| c.id == id)
+    }
+
     /// Forget everything captured so far, on disk as well as in memory.
     ///
     /// # Errors
@@ -543,7 +585,9 @@ impl Store {
     }
 
     /// Record one call, trimming to [`KEEP`].
-    pub fn push(&mut self, c: Capture) {
+    pub fn push(&mut self, mut c: Capture) {
+        c.id = self.next_id;
+        self.next_id += 1;
         self.recent.push(c);
         let overflow = self.recent.len().saturating_sub(KEEP);
         if overflow > 0 {

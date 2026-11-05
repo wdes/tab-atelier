@@ -18,6 +18,17 @@
     <title>tab-atelier-proxy — accounts</title>
     <link rel="stylesheet" href="vendor/bootstrap.min.css" />
     <style>
+      /* Nothing is shown until Vue has mounted.
+         Raw markup is not inert: `v-if` is an attribute, so until the app
+         mounts every modal on the page — the tools editor, the route editor,
+         the key dialog — is in the document and painted, and each one is a
+         full-screen backdrop. The page loaded behind a stack of empty dialogs
+         for as long as the first fetch took.
+
+         The attribute goes on `#app`, not on `body`: Vue removes it from the
+         element it mounts into, and nothing else, so an attribute on `body`
+         would only ever be cleared by the fallback below. */
+      [v-cloak] { display: none !important; }
       /* Chart roles as custom properties, so light and dark are chosen from
          the same ramps in ONE place and the SVG is written against roles
          rather than hex. Both palettes were run through the validator; dark is
@@ -246,8 +257,10 @@
         color: var(--bs-secondary-color);
         flex: none;
       }
-      /* The only column allowed to give way when the row is narrow — it is
-         context, whereas the numbers are the content. */
+      /* Where a block sits in the request, on an inline row. It gives way
+         first when the row is narrow, because the numbers are the content and
+         this is the citation. The block's OWN text is never clipped — it is
+         shown in full inside the accordion. */
       .ta-conv-preview {
         overflow: hidden;
         text-overflow: ellipsis;
@@ -255,6 +268,22 @@
         min-width: 0;
         flex: 1 1 auto;
         color: var(--bs-secondary-color);
+      }
+      /* The full block, inside its accordion. Wrapped rather than clipped, and
+         scrolled rather than cut: a long tool result is the thing this view is
+         usually opened to read. */
+      .ta-conv-full {
+        font-family: var(--bs-font-monospace);
+        font-size: .75rem;
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+        max-height: 24rem;
+        overflow: auto;
+        background: var(--bs-tertiary-bg, rgb(0 0 0 / .03));
+        border: 1px solid var(--bs-border-color);
+        border-radius: var(--bs-border-radius);
+        padding: .4rem .5rem;
+        margin: .25rem 0 0;
       }
       .ta-conv-where {
         font-family: var(--bs-font-monospace);
@@ -271,6 +300,10 @@
         white-space: nowrap;
         overflow: hidden;
       }
+      /* One block inside an expanded message: its citation row, then its full
+         text. Separated rather than interleaved so the numbers of every block
+         still line up down the panel. */
+      .ta-conv-block-body + .ta-conv-block-body { margin-top: .5rem; }
 
       .ta-badge-bp, .ta-badge-sep, .ta-badge-hot {
         font-size: .65rem;
@@ -343,7 +376,7 @@
   <body class="bg-body-tertiary">
     <!-- Full width: the account table has seven columns and the charts read
          better wide. A 60rem cap left two thirds of a laptop screen empty. -->
-    <div id="app" class="container-fluid px-4 py-4">
+    <div id="app" class="container-fluid px-4 py-4" v-cloak>
       <!-- Sign in ------------------------------------------------------->
       <div v-if="!authed" class="card shadow-sm mx-auto" style="max-width: 30rem">
         <div class="card-body">
@@ -794,7 +827,7 @@
                   </tr>
                 </thead>
                 <tbody>
-                  <tr v-for="(c, i) in inspect.captures.slice().reverse()" :key="'cap'+i">
+                  <tr v-for="c in inspect.captures.slice().reverse()" :key="c.id">
                     <td class="small text-nowrap">{{ whenLocal(c.ts) }}</td>
                     <td class="small">{{ c.account_email }}</td>
                     <td class="small">
@@ -820,7 +853,13 @@
                       {{ c.status || '—' }}
                     </td>
                     <td class="text-end">
-                      <button class="btn btn-sm btn-outline-secondary" @click="inspectOpen = c">JSON</button>
+                      <!-- Fetches the body on demand: the list carries rows,
+                           not payloads. See `CaptureSummary`. -->
+                      <button class="btn btn-sm btn-outline-secondary"
+                              :disabled="inspectOpening !== null"
+                              @click="openCapture(c.id)">
+                        {{ inspectOpening === c.id ? 'Opening' : (inspectOpen && inspectOpen.id === c.id ? 'Close' : 'Open') }}
+                      </button>
                     </td>
                   </tr>
                 </tbody>
@@ -1044,7 +1083,6 @@
                   <details v-for="(b, i) in g.blocks" :key="g.key + i" class="ta-conv-block">
                     <summary>
                       <span class="ta-conv-kind">{{ b.kind }}</span>
-                      <span class="ta-conv-preview">{{ b.preview }}</span>
                       <span class="ta-conv-nums">
                         {{ bytesLabel(b.bytes) }} &middot; {{ tok(b.tokens) }} tok
                         <template v-if="!conversation.noCost"> &middot; {{ microUsd(b.micro) }}</template>
@@ -1053,6 +1091,10 @@
                       <span v-else-if="b.breakpoint" class="ta-badge-bp">cache_control</span>
                     </summary>
                     <div class="ta-conv-where">{{ b.where }}</div>
+                    <!-- The block as sent, in full. No clipping anywhere on
+                         this path: a tool result shown short next to a token
+                         count reads as if the count were of the short form. -->
+                    <pre class="ta-conv-full">{{ b.text }}</pre>
                   </details>
 
                   <!-- messages: each one an accordion over its own blocks. -->
@@ -1066,7 +1108,6 @@
                         <span class="ta-conv-idx">{{ m.index }}</span>
                         <span class="ta-conv-role">{{ m.role }}</span>
                         <span class="ta-conv-kind">{{ m.kinds }}</span>
-                        <span class="ta-conv-preview"></span>
                         <span class="ta-conv-nums">
                           {{ bytesLabel(m.bytes) }} &middot; {{ tok(m.tokens) }} tok
                           <template v-if="!conversation.noCost"> &middot; {{ microUsd(m.micro) }}</template>
@@ -1076,16 +1117,18 @@
                         <span v-else-if="m.after" class="ta-badge-hot">full rate</span>
                       </summary>
                       <div class="ta-conv-blocks">
-                        <div v-for="(b, i) in m.blocks" :key="i" class="ta-conv-row">
-                          <span class="ta-conv-where">{{ b.where }}</span>
-                          <span class="ta-conv-kind">{{ b.kind }}</span>
-                          <span class="ta-conv-preview">{{ b.preview }}</span>
-                          <span class="ta-conv-nums">
-                            {{ bytesLabel(b.bytes) }} &middot; {{ tok(b.tokens) }} tok
-                            <template v-if="!conversation.noCost"> &middot; {{ microUsd(b.micro) }}</template>
-                          </span>
-                          <span v-if="b.separator" class="ta-badge-sep">separator</span>
-                          <span v-else-if="b.breakpoint" class="ta-badge-bp">cache_control</span>
+                        <div v-for="(b, i) in m.blocks" :key="i" class="ta-conv-block-body">
+                          <div class="ta-conv-row">
+                            <span class="ta-conv-where">{{ b.where }}</span>
+                            <span class="ta-conv-kind">{{ b.kind }}</span>
+                            <span class="ta-conv-nums">
+                              {{ bytesLabel(b.bytes) }} &middot; {{ tok(b.tokens) }} tok
+                              <template v-if="!conversation.noCost"> &middot; {{ microUsd(b.micro) }}</template>
+                            </span>
+                            <span v-if="b.separator" class="ta-badge-sep">separator</span>
+                            <span v-else-if="b.breakpoint" class="ta-badge-bp">cache_control</span>
+                          </div>
+                          <pre class="ta-conv-full">{{ b.text }}</pre>
                         </div>
                       </div>
                     </details>
@@ -1102,14 +1145,14 @@
                 </div>
               </div>
               <!-- Fields, indented, one per row: the view for "what model did it
-                   ask for" without hunting through braces. Values keep their
-                   untruncated form in `title`, so hovering shows what the row
-                   shortened. -->
+                   ask for" without hunting through braces. Values are shown
+                   whole, however long: the one worth reading is usually the
+                   long one, and a tooltip is neither searchable nor copyable. -->
               <div v-if="bodyView === 'structure' && inspectRows !== null"
                    class="small bg-body-tertiary p-2 rounded mb-0 font-monospace"
                    style="max-height: 30rem; overflow:auto">
                 <div v-for="(row, i) in inspectRows" :key="i"
-                     class="ta-jrow" :title="row.title">
+                     class="ta-jrow">
                   <span :style="{ paddingLeft: (row.pad * 1.1) + 'rem' }"></span>
                   <span v-if="row.key" class="ta-j-key">{{ row.key }}</span>
                   <span v-if="row.key && row.kind !== 'open'" class="text-body-secondary">: </span>
@@ -1124,7 +1167,9 @@
                    prompt-injection payload would be on display; interpolation
                    escapes it, `v-html` would execute a `<img onerror=…>`
                    sitting in a system prompt. -->
-              <pre v-else class="small bg-body-tertiary p-2 rounded mb-0" style="max-height: 30rem; overflow:auto"><span v-for="t in jsonTokens(inspectOpen.request_body)" :class="t.cls">{{ t.text }}</span></pre>
+              <pre v-else-if="bodyView === 'raw' || inspectRows === null"
+                   class="small bg-body-tertiary p-2 rounded mb-0"
+                   style="max-height: 30rem; overflow:auto"><span v-for="(t, i) in rawTokens" :key="i" :class="t.cls">{{ t.text }}</span></pre>
 
               <!-- The other half of the call. Captured apart from the request
                    because they fail to different places: a 400 says the request
@@ -1726,5 +1771,18 @@
     <script src="api.js"></script>
     <script src="charts.js"></script>
     <script src="app.js"></script>
+    <!-- The undoing of `v-cloak`, for the case where it never happens.
+         Hiding the page until Vue mounts is right, but a bundle that fails to
+         load would then leave a blank screen with nothing to diagnose it — and
+         raw markup, however unrendered, at least says what went wrong. The
+         delay is long enough that a slow first paint cannot reach it. -->
+    <script>
+      addEventListener("load", function () {
+        setTimeout(function () {
+          var app = document.getElementById("app");
+          if (app) app.removeAttribute("v-cloak");
+        }, 5000);
+      });
+    </script>
   </body>
 </html>

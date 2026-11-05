@@ -459,6 +459,21 @@ pub(crate) fn read_inspect(
     inspect::status(state)
 }
 
+/// One caught request, in full.
+///
+/// Ranked above the UI catch-all by being more specific, the same way every
+/// other `/api/*` path is — a capture body is the largest thing this API hands
+/// out, so it is fetched one at a time rather than riding along in the list.
+#[openapi]
+#[get("/api/inspect/<id>")]
+pub(crate) fn read_capture(
+    state: &State<Arc<AppState>>,
+    _admin: Admin,
+    id: u64,
+) -> Result<crate::transport::Doc<crate::inspect::Capture>, crate::transport::Failure> {
+    inspect::capture(state, id)
+}
+
 /// Start recording the next exchange, verbatim.
 #[openapi]
 #[post("/api/inspect", data = "<body>")]
@@ -610,6 +625,7 @@ pub fn all_and_spec() -> (Vec<Route>, tab_atelier_api::rocket_okapi::okapi::open
         usage_report,
         pressure,
         read_inspect,
+        read_capture,
         arm_inspect,
         disarm_inspect,
     ];

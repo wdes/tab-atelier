@@ -466,6 +466,13 @@ interface CaptureRate {
 }
 
 interface Capture {
+    /**
+     * Which capture this is, assigned by the server's ring.
+     *
+     * Meaningless across restarts — the store renumbers on load — so it is only
+     * ever used to fetch the body a row names and to tell two rows apart.
+     */
+    id: number;
     ts: string;
     account_id: string;
     account_email: string;
@@ -736,7 +743,52 @@ interface InspectState {
     armed_until: number;
     seconds_left: number;
     max_arm_minutes: number;
-    captures: Capture[];
+    /**
+     * Rows, not captures: the body is fetched per capture by `openCapture`.
+     *
+     * The list used to carry every request body it held. With 25 captures of
+     * up to 4 MiB each, opening this panel meant fetching and parsing around a
+     * hundred megabytes of prompts to draw a table that reads none of it.
+     */
+    captures: CaptureSummary[];
+}
+
+/**
+ * What the capture list and the capture detail have in common.
+ *
+ * The row helpers — a token summary, the compaction note, the server-tool
+ * label — read only these fields, and the list passes a `CaptureSummary` where
+ * the detail passes a `Capture`. Naming the overlap keeps the signatures honest
+ * instead of typing the list's rows as full captures they are not.
+ */
+type CaptureLike = Capture | CaptureSummary;
+
+/**
+ * One row of the capture list, with nothing of the payload.
+ *
+ * Mirrors `http::resources::inspect::CaptureSummary`. `body_bytes` is the one
+ * figure that is not on the row but derived from the body, so a row can say how
+ * large a request was without the panel holding it.
+ */
+interface CaptureSummary {
+    id: number;
+    ts: string;
+    account_id: string;
+    account_email: string;
+    method: string;
+    path: string;
+    provider: string;
+    model?: string;
+    client?: CaptureClient;
+    server_tool?: string;
+    kind: string;
+    status?: number;
+    tokens?: CaptureTokens;
+    cost?: CaptureCost;
+    compaction?: CaptureCompaction;
+    request_truncated: boolean;
+    /** The request body's length in bytes: what the detail read will return. */
+    body_bytes: number;
 }
 
 /**
@@ -760,10 +812,8 @@ interface JsonRow {
     key: string;
     /** How to draw the value: colour, and whether it opens a container. */
     kind: "open" | "str" | "num" | "null" | "more";
-    /** The value as shown — already truncated, already free of newlines. */
+    /** The value, in full. Nothing here is clipped; see `jsonRows`. */
     text: string;
-    /** The untruncated value, for a tooltip. Absent when nothing was cut. */
-    title?: string;
 }
 
 /**
@@ -778,8 +828,16 @@ interface JsonRow {
 interface ConversationBlock {
     /** `text`, `tool_use`, `tool_result`, `image`, … — the block's own `type`. */
     kind: string;
-    /** One line of the block's own content, clipped for the summary line. */
-    preview: string;
+    /**
+     * The block's own content, complete.
+     *
+     * Complete, not a summary: this view exists to diagnose a bill, and a
+     * clipped preview hides exactly the part that is expensive. It is rendered
+     * inside the block's accordion rather than on the summary line, and the
+     * whole request is fetched lazily for the same reason — text is worth
+     * showing in full only where someone has asked to see it.
+     */
+    text: string;
     /** Where it sits, as a human would cite it — `messages[7].content[1]`. */
     where: string;
     bytes: number;
@@ -1008,7 +1066,15 @@ interface AppState {
     pressureTimer: ReturnType<typeof setInterval> | null;
     tiers: Tier[];
     inspect: InspectState | null;
+    /**
+     * The capture whose body is on screen, fetched one at a time.
+     *
+     * The list carries rows, not payloads, so this is filled by `openCapture`
+     * rather than being a capture the list handed over.
+     */
     inspectOpen: Capture | null;
+    /** The id whose body is being fetched, so its row can say so. */
+    inspectOpening: number | null;
     providers: ProvidersResponse | null;
     /**
      * The tool policy being edited, or null when no account has its editor

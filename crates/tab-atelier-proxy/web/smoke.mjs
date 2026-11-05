@@ -109,6 +109,11 @@ const account = {
   ],
 };
 
+// A tool result longer than the 120 characters the view used to clip to, with
+// a distinctive tail. Both halves matter: the head is what a preview liked to
+// show, and the tail is what it dropped.
+const TOOL_RESULT = `key = 1\n`.repeat(40) + `# END-OF-TOOL-RESULT`;
+
 const users = [account.user];
 const TaApi = {
   api: {
@@ -151,6 +156,10 @@ const TaApi = {
     // not add up to the billed total, and a recorded price. The mismatch is
     // deliberate — the reconciliation is the feature, and a fixture where the
     // numbers happen to agree would never render its failing path.
+    //
+    // Split in two like the API is: the list carries rows, and the body is
+    // fetched per capture. A fixture that put the body in the list would pass
+    // while the real panel fetched a hundred megabytes to draw a table.
     inspect: {
       get: async () => ({
         armed: true,
@@ -159,6 +168,7 @@ const TaApi = {
         max_arm_minutes: 60,
         captures: [
           {
+            id: 7,
             ts: "2026-09-15T12:04:11Z",
             account_id: "acc-1",
             // No address here on purpose: this view never reads one, and a
@@ -170,33 +180,53 @@ const TaApi = {
             path: "/v1/messages",
             provider: "deepseek",
             model: "deepseek-flash",
-            origin: "cli",
-            wire: "anthropic",
+            kind: "work",
             status: 200,
-            request_headers: [["content-type", "application/json"]],
-            response_headers: [["content-type", "application/json"]],
-            request_body: JSON.stringify({
-              model: "deepseek-flash",
-              tools: [{ name: "read", description: "Read a file", input_schema: { type: "object" } }],
-              system: [{ type: "text", text: "You are a careful assistant.", cache_control: { type: "ephemeral" } }],
-              messages: [
-                { role: "user", content: [{ type: "text", text: "Read the config please." }] },
-                { role: "assistant", content: [{ type: "text", text: "Sure." }, { type: "tool_use", name: "read", input: { path: "a.toml" } }] },
-                { role: "user", content: [{ type: "tool_result", content: "key = 1" }] },
-              ],
-            }),
-            response_body: "{}",
-            response_truncated: false,
             tokens: { input: 120, cache_read: 900, cache_write: 40, output: 30 },
-            // Self-consistent with `rate` and `tokens`, not arbitrary: at
-            // 20,000 micro/1M for a cache read and 200,000 for a miss,
-            // 940 cached + 120 new is 43 micro, and 30 output at 1,200,000 is
-            // 36. A fixture whose money disagreed with its own rate would make
-            // the view look broken when it was the fixture that was wrong.
             cost: { in_micro: 43, out_micro: 36, tools_micro: 0 },
-            rate: { cache_hit: 20000, input: 200000, output: 1200000 },
+            request_truncated: false,
+            body_bytes: 4096,
           },
         ],
+      }),
+      capture: async () => ({
+        id: 7,
+        ts: "2026-09-15T12:04:11Z",
+        account_id: "acc-1",
+        account_email: "",
+        method: "POST",
+        path: "/v1/messages",
+        provider: "deepseek",
+        model: "deepseek-flash",
+        origin: "cli",
+        wire: "anthropic",
+        status: 200,
+        request_headers: [["content-type", "application/json"]],
+        response_headers: [["content-type", "application/json"]],
+        request_body: JSON.stringify({
+          model: "deepseek-flash",
+          tools: [{ name: "read", description: "Read a file", input_schema: { type: "object" } }],
+          system: [{ type: "text", text: "You are a careful assistant.", cache_control: { type: "ephemeral" } }],
+          messages: [
+            { role: "user", content: [{ type: "text", text: "Read the config please." }] },
+            { role: "assistant", content: [{ type: "text", text: "Sure." }, { type: "tool_use", name: "read", input: { path: "a.toml" } }] },
+            // Long on purpose. The view used to clip a block to 120 characters
+            // with an ellipsis, which hid the very bytes the token count beside
+            // it had counted; the tail here is the assertion that it no longer
+            // does.
+            { role: "user", content: [{ type: "tool_result", content: TOOL_RESULT }] },
+          ],
+        }),
+        response_body: "{}",
+        response_truncated: false,
+        tokens: { input: 120, cache_read: 900, cache_write: 40, output: 30 },
+        // Self-consistent with `rate` and `tokens`, not arbitrary: at
+        // 20,000 micro/1M for a cache read and 200,000 for a miss,
+        // 940 cached + 120 new is 43 micro, and 30 output at 1,200,000 is
+        // 36. A fixture whose money disagreed with its own rate would make
+        // the view look broken when it was the fixture that was wrong.
+        cost: { in_micro: 43, out_micro: 36, tools_micro: 0 },
+        rate: { cache_hit: 20000, input: 200000, output: 1200000 },
       }),
       arm: async () => {},
       disarm: async () => {},
@@ -237,6 +267,19 @@ for (const name of ["window", "document", "sessionStorage", "localStorage", "loc
 globalThis.console = console;
 dom.document.write(read("index.html"));
 dom.sessionStorage.setItem("ta-proxy-admin", "smoke-token");
+
+// The page as it looks *before* any script runs, which is what a slow first
+// fetch leaves on screen. Modals here are `v-if`-guarded only once Vue has read
+// the attribute, so before mount every one of them is painted — a stack of
+// full-screen backdrops over a page that has not loaded. `v-cloak` is what
+// hides them, and it has to sit on the element Vue mounts into: Vue clears the
+// attribute from that element alone, so one on `body` is never removed.
+const mountApp = dom.document.querySelector("#app");
+const preMount = {
+  cloaked: mountApp !== null && mountApp.hasAttribute("v-cloak"),
+  bodyCloaked: dom.document.body.hasAttribute("v-cloak"),
+  backdrops: dom.document.querySelectorAll(".ta-modal-backdrop").length,
+};
 
 // Indirect eval, not `new Function`: these are classic scripts, and the vendor
 // bundle declares Vue with a top-level `var`, which only lands on the global
@@ -280,6 +323,12 @@ const app = dom.document.querySelector("#app");
 const text = app ? app.textContent.replace(/\s+/g, " ") : "";
 
 check(app !== null, "#app exists");
+check(preMount.backdrops > 0, "the modals are in the markup before mount, so hiding them is worth doing");
+check(preMount.cloaked, "the mount point carries v-cloak, so the modals are hidden until Vue reads them");
+check(
+  preMount.bodyCloaked === false,
+  "v-cloak is on #app and not on body, because Vue only clears it from the element it mounts into",
+);
 check(text.length > 200, `the page rendered content (got ${text.length} chars of text)`);
 // The fallback is a *diagnostic*, not a pass: a page showing it is a broken
 // page, so the smoke must fail on it rather than be satisfied that something
@@ -317,10 +366,26 @@ const clickText = (label) => {
 // button of the same name, which is why this is specific.
 check(clickText("Open"), "the inspect panel can be opened");
 await settle();
-check(clickText("JSON"), "a capture can be opened from the inspect panel");
+// The row's own button, which fetches that capture's body. It also reads
+// "Open", and the one above has by now become "Refresh", so this finds the row.
+check(clickText("Open"), "a capture can be opened from the inspect panel");
 await settle();
+const rows = [...dom.document.querySelectorAll(".ta-jrow")];
+check(rows.length > 0, "the structure view renders once a capture is open");
 check(clickText("Conversation"), "the conversation view is offered once a capture is open");
 await settle();
+
+// The view is Conversation, and only Conversation. The raw body's `<pre>` was
+// the `v-else` of the structure view's `v-if`, so adding a third view left the
+// JSON dump rendering underneath it — this is that regression, pinned.
+check(
+  dom.document.querySelectorAll(".ta-jrow").length === 0,
+  "the structure view is gone while the conversation view is up",
+);
+check(
+  dom.document.querySelectorAll(".ta-j-key").length === 0,
+  "the raw JSON body is not rendered beside the conversation view",
+);
 
 const convo = [...dom.document.querySelectorAll(".ta-conv")].map((el) => el.textContent.replace(/\s+/g, " ")).join(" ");
 check(convo.length > 0, "the conversation view rendered");
@@ -334,6 +399,11 @@ check(/totals agree/.test(convo) || /rebuilt is \d+%/.test(convo), "the two are 
 // silent regression: the fixture puts one on the system block.
 check(/cache separator/.test(convo), "the cache separator is marked");
 check(/no cache_control breakpoint at all/.test(convo) === false, "a body with a breakpoint is not reported as having none");
+// Nothing is clipped. The block below the summary used to be a 120-character
+// preview with an ellipsis; the tail of a long tool result is the proof it is
+// now shown whole.
+check(convo.includes("END-OF-TOOL-RESULT"), "a long block is shown in full, not clipped");
+check(convo.includes("\u2026") === false, "and nothing on the way is elided with an ellipsis");
 
 if (failures.length > 0) {
   console.error("smoke: the dashboard did not render correctly");

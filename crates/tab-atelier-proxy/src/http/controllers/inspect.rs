@@ -10,7 +10,9 @@
 use std::sync::Arc;
 
 use crate::http::requests::inspect::ArmInspect;
+use crate::http::resources::inspect::CaptureSummary;
 use crate::http::resources::{InspectStateResource, InspectStatusResource, OkResource};
+use crate::inspect::Capture;
 use crate::server::State;
 use crate::transport::{Doc, Failure};
 
@@ -27,13 +29,37 @@ fn snapshot(state: &Arc<State>) -> InspectStatusResource {
         armed_until: ins.armed_until(),
         seconds_left: ins.armed_until().saturating_sub(now),
         max_arm_minutes: crate::inspect::MAX_ARM_MINUTES,
-        captures: ins.recent().to_vec(),
+        captures: ins.recent().iter().map(CaptureSummary::of).collect(),
     }
 }
 
 /// What the recorder is doing, and everything it has caught.
 pub(crate) fn status(state: &Arc<State>) -> Doc<InspectStatusResource> {
     Doc::ok(snapshot(state))
+}
+
+/// One capture in full: the request body, the headers and the reply excerpt.
+///
+/// A separate read from the list because the body is the expensive part — up to
+/// [`crate::inspect::MAX_BODY`] per capture — and the list only needs rows.
+///
+/// A `Failure` rather than an empty answer when the id is gone: the ring turns
+/// over, so a row listed a minute ago can name a capture that has since been
+/// displaced, and the panel has to say that rather than open a blank body.
+pub(crate) fn capture(state: &Arc<State>, id: u64) -> Result<Doc<Capture>, Failure> {
+    let found = {
+        let ins = state.inspect.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        ins.find(id).cloned()
+    };
+    found.map(Doc::ok).ok_or_else(|| {
+        Failure::problem(
+            404,
+            format!(
+                "no capture with id {id}: the ring holds the last {} only",
+                crate::inspect::KEEP
+            ),
+        )
+    })
 }
 
 /// Start recording, for the requested number of minutes.
