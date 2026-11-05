@@ -1484,15 +1484,26 @@ pub fn provider_key_path(config_dir: &Path, id: &str) -> PathBuf {
 ///
 /// The id is not only a label: it is the filename of the provider's key
 /// (`provider-{id}.key`), the value accounts pin to, and the string a model
-/// mapping names. So it has to survive all three, and the check is a deny-list
-/// of what would break them rather than an allow-list of characters, because a
-/// name is the operator's to choose.
+/// mapping names. So it has to survive all three.
 ///
-/// Refused: empty; anything with a path separator or `..`, which would place the
-/// key file outside the config directory; a leading `.` or `-`, which make a
-/// hidden file or look like a flag; and anything over 64 bytes, which is longer
-/// than a name needs and approaches filesystem limits once the prefix and
-/// suffix are added.
+/// **An allow-list, not a deny-list.** The deny-list this replaces refused `/`,
+/// `\`, `..`, a leading `.` and control characters, and it was still wrong: a
+/// provider named with an accented letter had its key written to
+/// `provider-<that name>.key`, and the provider then reported "missing" with the
+/// file sitting right there. A letter carrying a diacritic has two Unicode
+/// spellings — one codepoint, or the base letter plus a combining accent — which
+/// are different byte sequences naming the same glyph, so a path built from one
+/// does not find a file written under the other. No deny-list catches that: the
+/// character is not suspicious, it is simply not safe in a filename.
+///
+/// Permitted: ASCII letters, digits, space, `-` and `_`. Refused: everything
+/// else, including `.`, which avoids hidden files, extension confusion and a
+/// stray component that survives a `..` check in some other form. Space is kept
+/// because operators name providers after people and the existing configs use it.
+///
+/// A stored config that already holds an id outside this set still loads — this
+/// runs where a name is *written*, not where it is read, so tightening the rule
+/// cannot lock anyone out of their own setup.
 ///
 /// # Errors
 /// The reason, phrased for the operator who typed it.
@@ -1503,14 +1514,26 @@ pub fn validate_provider_id(id: &str) -> Result<(), String> {
     if id.len() > 64 {
         return Err("keep the name under 64 characters".to_owned());
     }
-    if id.contains('/') || id.contains('\\') || id.contains("..") {
-        return Err("a name cannot contain a path separator or `..`".to_owned());
+    if let Some(bad) = id
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || *c == ' ' || *c == '-' || *c == '_'))
+    {
+        return Err(format!(
+            "a name can only use letters, digits, spaces, `-` and `_` — `{bad}` is not allowed. \
+             It becomes a filename, so anything outside ASCII risks a name that cannot be found again",
+        ));
     }
-    if id.starts_with('.') || id.starts_with('-') {
-        return Err("a name cannot start with `.` or `-`".to_owned());
+    if !id.chars().any(|c| c.is_ascii_alphanumeric()) {
+        return Err("a name needs at least one letter or digit".to_owned());
     }
-    if id.chars().any(char::is_control) {
-        return Err("a name cannot contain control characters".to_owned());
+    if id.starts_with(' ') || id.ends_with(' ') {
+        return Err("a name cannot start or end with a space".to_owned());
+    }
+    // Not a filename problem — `provider--flag.key` is a fine filename. It is a
+    // CLI one: `--provider -flag` reads as a flag rather than a value, so a name
+    // that starts with `-` can be written here but not passed back in.
+    if id.starts_with('-') {
+        return Err("a name cannot start with `-`, which reads as an option on the command line".to_owned());
     }
     Ok(())
 }
@@ -2233,9 +2256,34 @@ mod tests {
     /// A name an operator would reasonably type is accepted.
     #[test]
     fn ordinary_names_are_accepted() {
-        for id in ["deepseek", "deepseek-team", "work.key", "a", "My_Provider"] {
+        for id in [
+            "deepseek",
+            "deepseek-team",
+            "a",
+            "My_Provider",
+            // Names with spaces are in use — providers named after the person or
+            // account they belong to — so they must stay legal.
+            "DeepSeek Alice",
+            "OpenAI Bob",
+        ] {
             assert!(validate_provider_id(id).is_ok(), "{id} should be accepted");
         }
+    }
+
+    /// **The regression.** A non-ASCII name is refused, because it becomes a file.
+    ///
+    /// An accented name wrote `provider-<name>.key` and the provider then reported
+    /// "missing" with the file sitting there: the accented letter as one codepoint
+    /// and as base letter plus combining accent are different byte sequences naming
+    /// the same glyph, so a path built from one does not find the other. The
+    /// deny-list this replaces could never catch it — the character is not
+    /// suspicious, it is just unsafe in a filename.
+    #[test]
+    fn a_name_that_is_not_ascii_is_refused() {
+        // Precomposed and decomposed spellings of the same name, both refused.
+        assert!(validate_provider_id("Café").is_err());
+        assert!(validate_provider_id("Cafe\u{0301}").is_err());
+        assert!(validate_provider_id("日本語").is_err());
     }
 
     /// Anything that would escape the config directory is refused.
@@ -2250,6 +2298,18 @@ mod tests {
         }
     }
 
+    /// A dot is refused outright, not merely at the start.
+    ///
+    /// The key file is `provider-{id}.key` and the backup is made with
+    /// `with_extension`, so a dot in the id puts a second extension in play —
+    /// `provider-a.key.key` — and the backup then lands on a name nobody expects.
+    #[test]
+    fn a_dot_anywhere_is_refused() {
+        for id in ["work.key", "a.b", "provider.x"] {
+            assert!(validate_provider_id(id).is_err(), "{id:?} should be refused");
+        }
+    }
+
     /// Hidden files, flag-looking names, empties and overlong ones are refused.
     #[test]
     fn unusable_names_are_refused() {
@@ -2258,6 +2318,12 @@ mod tests {
         }
         // A control character would reach the file name and the log.
         assert!(validate_provider_id("a\tb").is_err());
+        // A name of nothing but punctuation is not a name.
+        assert!(validate_provider_id("---").is_err());
+        assert!(validate_provider_id("   ").is_err());
+        // Nor one padded with spaces, which is invisible in a table.
+        assert!(validate_provider_id(" name").is_err());
+        assert!(validate_provider_id("name ").is_err());
     }
 
     // --- server-side tool prices -------------------------------------------
