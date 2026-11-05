@@ -172,6 +172,15 @@ material, a deny list — belong *before* the call, so the obvious leaks never l
 the machine. Use the agent for what a matcher cannot see: whether a name is
 attached to a real person.
 
+The email check needs one carve-out or it refuses every fixture: `example.com`,
+`example.net` and `example.org` are reserved for documentation by
+[RFC 6761](https://www.rfc-editor.org/info/rfc6761/) and the
+[IANA special-use registry](https://www.iana.org/domains/reserved), so an address
+there names nobody. Match the domain whole and case-insensitively, subdomains
+included — `shop.example.com` is reserved — but never as a suffix:
+`notexample.com` and `example.com.attacker.net` are real domains that merely read
+like reserved ones.
+
 **Match on a substring, not the whole line.** The same answer arrives as
 `VERDICT: clean` one run and `**VERDICT: clean**` the next — models decorate. The
 `case` above matches anywhere in the answer for that reason; `[ "$answer" =

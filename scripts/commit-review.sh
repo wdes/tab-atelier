@@ -15,7 +15,9 @@
 #   1. A DETERMINISTIC scan of added lines. Emails, absolute paths, this machine's
 #      hostname, key material, non-ASCII, the operator's deny list. It runs first
 #      and it refuses BEFORE any diff leaves the machine, because sending a diff to
-#      a model to ask "does this contain a secret" is itself a disclosure.
+#      a model to ask "does this contain a secret" is itself a disclosure. An
+#      address under example.com, example.net or example.org is not an email for
+#      this purpose: RFC 6761 reserves those for documentation.
 #
 #   2. A SUB-AGENT review of what survived. It reads the added lines and answers
 #      with the specific hunks that carry a person, a server or a private name.
@@ -76,11 +78,23 @@ if printf '%s\n' "$added" |
   non-ASCII text in an added line"
 fi
 
-# Emails, but not the ones this repo already publishes in its own manifests and
-# trailers — those were there before the rule and are the maintainer's own.
+# Emails. Two kinds are cleared, and only two:
+#
+#   - the ones this repo already publishes in its own manifests and trailers,
+#     which were there before the rule and are the maintainer's own;
+#   - addresses under `example.com`, `example.net` and `example.org`, which
+#     RFC 6761 and the IANA special-use registry reserve for documentation, so
+#     they cannot name anyone. A fixture needs *an* address, and this is the
+#     only kind that is guaranteed not to be someone's.
+#
+# The domain is matched whole, subdomains included (`shop.example.com` is
+# reserved too), and never as a suffix: `example.com.evil.net` is a real
+# domain that merely starts with a reserved one, and `notexample.com` is not
+# reserved at all.
 if printf '%s\n' "$added" |
 	grep -oE '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}' |
 	grep -vE '^<[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+>$' |
+	grep -ivE '@([A-Za-z0-9-]+\.)*example\.(com|net|org)\.?$' |
 	grep -q .; then
 	problems="$problems
   an email address in an added line"

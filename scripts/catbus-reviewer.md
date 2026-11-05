@@ -36,6 +36,13 @@ names above are cleared, and only because they are already published.
 Also not findings: invented example values that are obviously placeholders,
 ordinary code, and commentary about the design.
 
+Addresses under `example.com`, `example.net` and `example.org` are not personal
+data. RFC 6761 and the IANA special-use registry reserve those three domains for
+documentation, so no one can hold one: an address there identifies nobody, and a
+fixture needs an address. Subdomains are covered too — `shop.example.com` is
+reserved — but a domain that merely starts with a reserved one is not: treat
+`example.com.attacker.net` and `notexample.com` as ordinary domains.
+
 Do not comment on style, wording, formatting, naming, spelling or design. A false
 alarm blocks a colleague's work, so silence is the correct answer when none of the
 above is present.
