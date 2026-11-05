@@ -634,6 +634,7 @@ impl Store {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::collections::BTreeSet;
 
     /// The real thing, copied from a live request body.
     ///
@@ -840,6 +841,126 @@ mod tests {
         back.clear().expect("clear");
         assert!(back.recent().is_empty());
         assert!(!back.path().exists(), "clearing removes the file, not just the memory");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A capture whose only distinguishing part is its timestamp.
+    ///
+    /// The store's tests below assert on ids and on the ring's bounds, so they
+    /// need a capture and nothing about the caller: the account is deliberately
+    /// left blank rather than carrying a plausible-looking address into a
+    /// fixture that never reads one.
+    fn fixture_capture(n: usize) -> Capture {
+        capture(&Outgoing {
+            ts: format!("2026-09-10T12:00:{n:02}Z"),
+            account_id: "id",
+            account_email: "",
+            method: "POST",
+            path: "/v1/messages",
+            provider: "anthropic",
+            kind: crate::classifier::Kind::Work,
+            headers: &[],
+            origin: None,
+            wire: crate::provider::Wire::Anthropic,
+            body: br#"{"model":"m"}"#,
+        })
+    }
+
+    /// The panel lists captures with their bodies withheld and asks for one at a
+    /// time, so a row has to name a capture that a later request can still find.
+    /// Position in the ring cannot do that: it shifts as soon as the next call is
+    /// recorded, and the row the operator clicked would open someone else's.
+    #[test]
+    fn every_capture_gets_an_id_a_row_can_name_it_by() {
+        let dir = tmp("ids");
+        let mut s = Store::load(&dir);
+        for n in 0..3 {
+            s.push(fixture_capture(n));
+        }
+
+        let ids: Vec<u64> = s.recent().iter().map(|c| c.id).collect();
+        assert_eq!(ids.len(), 3);
+        let unique: BTreeSet<u64> = ids.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            3,
+            "two captures sharing an id is a row opening the wrong one"
+        );
+
+        // The id resolves back to the right capture, which is the whole purpose.
+        let second = ids[1];
+        assert_eq!(s.find(second).map(|c| c.ts.as_str()), Some("2026-09-10T12:00:01Z"));
+        assert!(s.find(9_999).is_none(), "an id the ring never handed out is absent");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A capture the ring has displaced is gone, and the panel has to say so
+    /// rather than answer with a different request.
+    #[test]
+    fn a_displaced_capture_cannot_be_found_by_its_old_id() {
+        let dir = tmp("displaced");
+        let mut s = Store::load(&dir);
+        s.push(fixture_capture(0));
+        let first = s.recent()[0].id;
+        assert!(s.find(first).is_some());
+
+        // Enough further captures to push the first out of the ring.
+        for n in 1..=KEEP {
+            s.push(fixture_capture(n % 60));
+        }
+
+        assert!(s.find(first).is_none(), "a displaced capture must not resolve");
+        // And the ids still in the ring are the later ones, each still unique.
+        let ids: Vec<u64> = s.recent().iter().map(|c| c.id).collect();
+        let unique: BTreeSet<u64> = ids.iter().copied().collect();
+        assert_eq!(unique.len(), ids.len());
+        assert!(!ids.contains(&first));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A capture written before the id existed reads back as `0` on every line.
+    /// Loading has to renumber, or several captures would share one id and the
+    /// panel's "open the one I clicked" becomes a guess.
+    #[test]
+    fn a_reloaded_store_renumbers_the_captures_it_reads_back() {
+        let dir = tmp("renumber");
+        let mut s = Store::load(&dir);
+        for n in 0..3 {
+            s.push(fixture_capture(n));
+        }
+
+        // Rewrite the file as an older build would have left it: no id at all.
+        let path = s.path().to_path_buf();
+        let rewritten: String = std::fs::read_to_string(&path)
+            .expect("read")
+            .lines()
+            .map(|line| {
+                let mut value: serde_json::Value = serde_json::from_str(line).expect("parse");
+                value["id"] = serde_json::Value::from(0);
+                value.to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, format!("{rewritten}\n")).expect("write");
+
+        let mut back = Store::load(&dir);
+        let ids: Vec<u64> = back.recent().iter().map(|c| c.id).collect();
+        assert_eq!(ids.len(), 3, "the captures still load");
+        let unique: BTreeSet<u64> = ids.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            3,
+            "and they must not all share the id they were written with"
+        );
+
+        // A capture recorded after the reload cannot collide with them either.
+        back.push(fixture_capture(9));
+        let ids: Vec<u64> = back.recent().iter().map(|c| c.id).collect();
+        let unique: BTreeSet<u64> = ids.iter().copied().collect();
+        assert_eq!(unique.len(), ids.len());
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
