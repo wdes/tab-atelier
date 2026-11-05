@@ -145,7 +145,62 @@ const TaApi = {
         scheduler: {},
       }),
     },
-    inspect: { get: async () => ({ armed: false, armed_until: 0, seconds_left: 0, max_arm_minutes: 60, captures: [] }), arm: async () => {}, disarm: async () => {} },
+    // A capture with a real body, so the inspect panel's views are exercised
+    // rather than skipped. It carries what the conversation view needs and
+    // nothing else: a breakpoint part-way through, a request whose blocks do
+    // not add up to the billed total, and a recorded price. The mismatch is
+    // deliberate — the reconciliation is the feature, and a fixture where the
+    // numbers happen to agree would never render its failing path.
+    inspect: {
+      get: async () => ({
+        armed: true,
+        armed_until: 0,
+        seconds_left: 600,
+        max_arm_minutes: 60,
+        captures: [
+          {
+            ts: "2026-09-15T12:04:11Z",
+            account_id: "acc-1",
+            // No address here on purpose: this view never reads one, and a
+            // fixture is not the place to spell out a shape that looks like a
+            // real account. The other fixtures carry one because they assert on
+            // it; this one asserts on blocks and money.
+            account_email: "",
+            method: "POST",
+            path: "/v1/messages",
+            provider: "deepseek",
+            model: "deepseek-flash",
+            origin: "cli",
+            wire: "anthropic",
+            status: 200,
+            request_headers: [["content-type", "application/json"]],
+            response_headers: [["content-type", "application/json"]],
+            request_body: JSON.stringify({
+              model: "deepseek-flash",
+              tools: [{ name: "read", description: "Read a file", input_schema: { type: "object" } }],
+              system: [{ type: "text", text: "You are a careful assistant.", cache_control: { type: "ephemeral" } }],
+              messages: [
+                { role: "user", content: [{ type: "text", text: "Read the config please." }] },
+                { role: "assistant", content: [{ type: "text", text: "Sure." }, { type: "tool_use", name: "read", input: { path: "a.toml" } }] },
+                { role: "user", content: [{ type: "tool_result", content: "key = 1" }] },
+              ],
+            }),
+            response_body: "{}",
+            response_truncated: false,
+            tokens: { input: 120, cache_read: 900, cache_write: 40, output: 30 },
+            // Self-consistent with `rate` and `tokens`, not arbitrary: at
+            // 20,000 micro/1M for a cache read and 200,000 for a miss,
+            // 940 cached + 120 new is 43 micro, and 30 output at 1,200,000 is
+            // 36. A fixture whose money disagreed with its own rate would make
+            // the view look broken when it was the fixture that was wrong.
+            cost: { in_micro: 43, out_micro: 36, tools_micro: 0 },
+            rate: { cache_hit: 20000, input: 200000, output: 1200000 },
+          },
+        ],
+      }),
+      arm: async () => {},
+      disarm: async () => {},
+    },
   },
 };
 
@@ -235,6 +290,50 @@ check(/ada@example\.org/.test(text), "the account email appears");
 check(/\$0\.003/.test(text), "a model's cache-hit rate is drawn as $0.003, not rounded to $0.00");
 check(/\$0\.15/.test(text), "a model's input rate is drawn as $0.15");
 check(/5b91b78b/.test(text), "the session id appears in the users panel");
+
+// --- the conversation cost view ------------------------------------------------
+//
+// Driven the way a person drives it: open a capture, then pick the view. The
+// fixture above is shaped so the reconciliation *fails*, because that is the
+// branch the feature exists for and the one a passing fixture would never
+// render. Asserting on the rendered text is the only check available — the
+// tokens are attributed in the template's own arithmetic, and a unit test of
+// that arithmetic would not prove it reaches the screen.
+const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
+const clickText = (label) => {
+  for (const el of dom.document.querySelectorAll("button")) {
+    if (el.textContent.trim() === label && !el.disabled) {
+      el.click();
+      return true;
+    }
+  }
+  return false;
+};
+
+// The inspect list is not loaded by the initial page load — it sits behind an
+// explicit button, because captures arrive on their own cadence and polling them
+// would be noise. Before the first load that button reads "Open"; only after it
+// becomes "Refresh". Clicking "Refresh" first instead finds the *usage* panel's
+// button of the same name, which is why this is specific.
+check(clickText("Open"), "the inspect panel can be opened");
+await settle();
+check(clickText("JSON"), "a capture can be opened from the inspect panel");
+await settle();
+check(clickText("Conversation"), "the conversation view is offered once a capture is open");
+await settle();
+
+const convo = [...dom.document.querySelectorAll(".ta-conv")].map((el) => el.textContent.replace(/\s+/g, " ")).join(" ");
+check(convo.length > 0, "the conversation view rendered");
+// The three things the view is for: the measured side, the attributed side, and
+// the fact that they disagree.
+check(/billed/.test(convo), "the billed totals are shown");
+check(/cache read 940/.test(convo), "the measured cache-read count is shown, cache writes folded in");
+check(/rebuilt/.test(convo), "the rebuilt sum is shown");
+check(/totals agree/.test(convo) || /rebuilt is \d+%/.test(convo), "the two are compared, in one direction or the other");
+// The separator is the other reason the view exists, so its absence would be a
+// silent regression: the fixture puts one on the system block.
+check(/cache separator/.test(convo), "the cache separator is marked");
+check(/no cache_control breakpoint at all/.test(convo) === false, "a body with a breakpoint is not reported as having none");
 
 if (failures.length > 0) {
   console.error("smoke: the dashboard did not render correctly");

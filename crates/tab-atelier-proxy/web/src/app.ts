@@ -237,7 +237,7 @@ const AdminApp = Vue.defineComponent({
       // Per-panel, for the same reason as the chart flags: a fetch that greys
       // out unrelated controls reads as the page being broken.
       providersBusy: false,
-      bodyView: "structure" as "structure" | "raw",
+      bodyView: "structure" as "structure" | "conversation" | "raw",
       /**
        * The key dialog, when open.
        *
@@ -327,6 +327,276 @@ const AdminApp = Vue.defineComponent({
     inspectRows(): JsonRow[] | null {
       const body = this.inspectOpen ? this.inspectOpen.request_body : "";
       return body ? this.jsonRows(body) : null;
+    },
+    /**
+     * The captured conversation, with an attributed size and cost per block.
+     *
+     * The question this answers is "which part of this conversation is costing
+     * me money, and where does the cache stop" — which neither of the other two
+     * views can, because they answer "what bytes were sent".
+     *
+     * # Everything per block is attributed, and the view says so
+     *
+     * A provider bills per request and never per block. The only measured
+     * numbers a capture holds are the request totals, which is why `check`
+     * compares the sum of the blocks against them and prints the difference
+     * instead of hiding it. An estimate that quietly did not add up would be
+     * worse than no estimate.
+     *
+     * # The token rule is copied, not simplified
+     *
+     * `budget::estimate_input` excludes an image's base64 from the byte count
+     * and charges `IMAGE_TOKENS` for the image itself. That is not a nicety: a
+     * screenshot's base64 divided by four scored ~500,000 tokens, which made the
+     * proxy refuse the request as too long and sent the client into a compaction
+     * loop. A simplified bytes/4 here would put the same wrong figure on screen.
+     *
+     * # Render order, not JSON order
+     *
+     * Groups come out `tools` -> `system` -> `messages` because that is the order
+     * the prefix is assembled in, and the order decides what a byte change
+     * invalidates. `docs/proxy-compaction.md` is the reference.
+     */
+    conversation(): ConversationView | null {
+      const capture = this.inspectOpen;
+      if (!capture || !capture.request_body) return null;
+      let body: unknown;
+      try {
+        body = JSON.parse(capture.request_body);
+      } catch {
+        return null;
+      }
+      if (!body || typeof body !== "object" || Array.isArray(body)) return null;
+      const root = body as Record<string, unknown>;
+      const rate = capture.rate ?? null;
+
+      // Every block, in render order, so the breakpoints can be located before
+      // anything is priced. Cost depends on which side of the separator a block
+      // falls on, which is not known until the whole request has been walked.
+      const flat: ConversationBlock[] = [];
+
+      const bytesOf = (value: unknown): { bytes: number; media: number; images: number } => {
+        const json = JSON.stringify(value) ?? "";
+        let media = 0;
+        let images = 0;
+        // Walk for image payloads, which are base64 rather than text and are
+        // charged a flat figure instead of by length.
+        const walk = (v: unknown) => {
+          if (!v || typeof v !== "object") return;
+          if (Array.isArray(v)) {
+            for (const item of v) walk(item);
+            return;
+          }
+          const o = v as Record<string, unknown>;
+          const source = o.source as Record<string, unknown> | undefined;
+          if (o.type === "image" && source && typeof source.data === "string") {
+            images += 1;
+            media += source.data.length;
+          }
+          for (const key of Object.keys(o)) walk(o[key]);
+        };
+        walk(value);
+        return { bytes: json.length, media, images };
+      };
+
+      const blockOf = (value: unknown, where: string): ConversationBlock => {
+        const measured = bytesOf(value);
+        const o = (value && typeof value === "object" ? value : {}) as Record<string, unknown>;
+        const kind = typeof o.type === "string" ? o.type : Array.isArray(value) ? "array" : typeof value;
+        return {
+          kind,
+          preview: this.blockPreview(o),
+          where,
+          bytes: measured.bytes,
+          // The server's own estimator, block by block: text by length, media by
+          // a flat charge. Summing these reproduces `estimate_input`.
+          tokens: Math.max(0, measured.bytes - measured.media + measured.images * 1600 * 4) / 4,
+          micro: 0,
+          breakpoint: this.hasBreakpoint(value),
+          separator: false,
+          after: false,
+        };
+      };
+
+      const groups: ConversationGroup[] = [];
+      const group = (key: string, title: string): ConversationGroup => ({
+        key,
+        title,
+        count: 0,
+        bytes: 0,
+        tokens: 0,
+        micro: 0,
+        note: null,
+        blocks: [],
+        messages: [],
+        breakpoint: false,
+        separator: false,
+      });
+
+      // -- tools ------------------------------------------------------------
+      if (Array.isArray(root.tools) && root.tools.length > 0) {
+        const g = group("tools", "Tools");
+        root.tools.forEach((tool, i) => {
+          const b = blockOf(tool, `tools[${i}]`);
+          g.blocks.push(b);
+          flat.push(b);
+        });
+        g.count = g.blocks.length;
+        g.note =
+          g.blocks.length > 0
+            ? "First in the prefix, so ahead of every breakpoint: editing any tool description invalidates the whole cache."
+            : null;
+        groups.push(g);
+      }
+
+      // -- system -----------------------------------------------------------
+      if (root.system !== undefined && root.system !== null) {
+        const g = group("system", "System");
+        if (typeof root.system === "string") {
+          const b = blockOf({ type: "text", text: root.system }, "system");
+          g.blocks.push(b);
+          flat.push(b);
+        } else if (Array.isArray(root.system)) {
+          root.system.forEach((block, i) => {
+            const b = blockOf(block, `system[${i}]`);
+            g.blocks.push(b);
+            flat.push(b);
+          });
+        }
+        g.count = g.blocks.length;
+        groups.push(g);
+      }
+
+      // -- messages ---------------------------------------------------------
+      if (Array.isArray(root.messages)) {
+        const g = group("messages", "Messages");
+        root.messages.forEach((message, i) => {
+          const m = (message && typeof message === "object" ? message : {}) as Record<string, unknown>;
+          const role = typeof m.role === "string" ? m.role : "?";
+          const content = m.content;
+          const raw: unknown[] = Array.isArray(content) ? content : [content];
+          const blocks: ConversationBlock[] = [];
+          raw.forEach((value, j) => {
+            if (value === undefined) return;
+            const where = Array.isArray(content) ? `messages[${i}].content[${j}]` : `messages[${i}].content`;
+            const b = blockOf(value, where);
+            blocks.push(b);
+            flat.push(b);
+          });
+          const kinds = [...new Set(blocks.map((b) => b.kind))].join(", ");
+          g.messages.push({
+            index: i + 1,
+            role,
+            kinds,
+            bytes: 0,
+            tokens: 0,
+            micro: 0,
+            breakpoint: false,
+            separator: false,
+            after: false,
+            blocks,
+          });
+        });
+        g.count = g.messages.length;
+        groups.push(g);
+      }
+
+      // -- the separator, and the price on each side of it ------------------
+      //
+      // The last breakpoint is the one that decides the bill: everything up to
+      // and including it is a cache read, everything after is billed at the full
+      // input rate. A request with no breakpoint caches nothing, so all of it is
+      // at the full rate — which is the case worth seeing, because it is usually
+      // a mistake.
+      let lastBreak = -1;
+      flat.forEach((b, i) => {
+        if (b.breakpoint) lastBreak = i;
+      });
+      flat.forEach((b, i) => {
+        b.separator = i === lastBreak;
+        b.after = lastBreak >= 0 && i > lastBreak;
+        if (!rate) return;
+        // Cache writes are charged at the cache-hit rate, matching `charge()` in
+        // relay.rs. `CaptureRate` documents that there is no separate write rate.
+        const perMillion = b.after ? rate.input : rate.cache_hit;
+        b.micro = (b.tokens * perMillion) / 1_000_000;
+      });
+      const separatorBlock = lastBreak >= 0 ? flat[lastBreak] : undefined;
+
+      // Roll the blocks up, now that each one is priced.
+      for (const g of groups) {
+        g.bytes = g.blocks.reduce((sum, b) => sum + b.bytes, 0);
+        g.tokens = g.blocks.reduce((sum, b) => sum + b.tokens, 0);
+        g.micro = g.blocks.reduce((sum, b) => sum + b.micro, 0);
+        g.breakpoint = g.blocks.some((b) => b.breakpoint);
+        g.separator = g.blocks.some((b) => b.separator);
+        for (const m of g.messages) {
+          m.bytes = m.blocks.reduce((sum, b) => sum + b.bytes, 0);
+          m.tokens = m.blocks.reduce((sum, b) => sum + b.tokens, 0);
+          m.micro = m.blocks.reduce((sum, b) => sum + b.micro, 0);
+          m.breakpoint = m.blocks.some((b) => b.breakpoint);
+          m.separator = m.blocks.some((b) => b.separator);
+          m.after = m.blocks.length > 0 && m.blocks.every((b) => b.after);
+          g.bytes += m.bytes;
+          g.tokens += m.tokens;
+          g.micro += m.micro;
+          if (m.breakpoint) g.breakpoint = true;
+          if (m.separator) g.separator = true;
+        }
+      }
+
+      // -- the check: the parts against the measured whole ------------------
+      const tokens = capture.tokens;
+      let check: ConversationCheck | null = null;
+      if (tokens) {
+        // Cache writes count towards the prompt: the provider processed those
+        // tokens, it just charged to keep them rather than to read them.
+        const billedTokens = tokens.input + tokens.cache_read + tokens.cache_write;
+        const rebuiltTokens = flat.reduce((sum, b) => sum + b.tokens, 0);
+        const deltaTokens = rebuiltTokens - billedTokens;
+        const deltaPct = billedTokens > 0 ? Math.round((deltaTokens / billedTokens) * 100) : 0;
+        const rebuiltMicro = flat.reduce((sum, b) => sum + b.micro, 0);
+        check = {
+          billedTokens,
+          billedInput: tokens.input,
+          billedCacheRead: tokens.cache_read + tokens.cache_write,
+          billedOutput: tokens.output,
+          rebuiltTokens,
+          deltaTokens,
+          deltaPct,
+          // Five percent is the threshold for "agrees": below it the split is
+          // usable for comparing blocks, and pretending to more precision than
+          // that would be the only thing the number could be used for.
+          ok: billedTokens > 0 && Math.abs(deltaTokens) / billedTokens <= 0.05,
+          short: deltaTokens < 0,
+          billedMicro: capture.cost ? capture.cost.in_micro : null,
+          rebuiltMicro: rate ? rebuiltMicro : null,
+        };
+      }
+
+      const separatorWhere = separatorBlock
+        ? `${separatorBlock.where} — the last of ${flat.filter((b) => b.breakpoint).length} breakpoint(s)`
+        : null;
+
+      return {
+        model: capture.model || "(not reported)",
+        provider: capture.provider || "(not recorded)",
+        wire: capture.wire || "?",
+        capturedAt: capture.ts,
+        groups,
+        check,
+        noCost: !capture.cost || !rate,
+        messageCount: root.messages && Array.isArray(root.messages) ? root.messages.length : 0,
+        breakpointCount: flat.filter((b) => b.breakpoint).length,
+        separatorWhere,
+        // The OpenAI wire strips `cache_control` on the way out and prefix-caches
+        // implicitly, so on that wire the markers show what the client asked for,
+        // not a structure the endpoint obeyed.
+        wireNote:
+          capture.wire === "openai"
+            ? "This account egresses on the OpenAI wire, which has no cache_control: the markers show the client's intent, and that endpoint caches prefixes implicitly."
+            : null,
+      };
     },
     plan(): Plan | Record<string, never> {
       return this.pressure?.plan || {};
@@ -704,6 +974,84 @@ const AdminApp = Vue.defineComponent({
       };
       const p = m.price;
       return `${rate(p.cache_hit)} / ${rate(p.input)} / ${rate(p.output)} per 1M`;
+    },
+    /**
+     * Whether a block, or anything inside it, carries `cache_control`.
+     *
+     * Searched rather than read off the block's own top level because a
+     * breakpoint can sit on any content block, and on the system prompt it
+     * arrives as an array of blocks. `budget` and the compaction pass both treat
+     * the marker as "somewhere in this subtree", so the view has to look the
+     * same way or it would disagree with what the proxy did.
+     */
+    hasBreakpoint(value: unknown): boolean {
+      if (!value || typeof value !== "object") return false;
+      if (Array.isArray(value)) return value.some((item) => this.hasBreakpoint(item));
+      const o = value as Record<string, unknown>;
+      if (o.cache_control !== undefined && o.cache_control !== null) return true;
+      return Object.values(o).some((inner) => (inner && typeof inner === "object" ? this.hasBreakpoint(inner) : false));
+    },
+    /**
+     * One line of a block's own content, for its accordion summary.
+     *
+     * A summary has to be recognisable at a glance, so each kind shows the thing
+     * a reader would look for: the text of a text block, the name of a tool
+     * call, the tool's name on its result. Nothing here is exhaustive — the
+     * expanded body is the full block.
+     */
+    blockPreview(o: Record<string, unknown>): string {
+      const clip = (text: string): string => {
+        const clean = text.replace(/\s+/g, " ").trim();
+        return clean.length > 120 ? `${clean.slice(0, 117)}…` : clean;
+      };
+      if (typeof o.text === "string") return clip(o.text);
+      // A tool *definition* — name plus its description, which is what a reader
+      // is scanning for. Falls through to JSON for a definition that carries
+      // neither, because an empty line would hide a tool that exists.
+      if (typeof o.name === "string" && o.input_schema !== undefined) {
+        const description = typeof o.description === "string" ? ` — ${o.description}` : "";
+        return clip(`${o.name}${description}`);
+      }
+      if (typeof o.name === "string" && o.type === "tool_use") {
+        return clip(o.name);
+      }
+      if (o.type === "tool_result") {
+        const content = o.content;
+        const text = typeof content === "string" ? content : Array.isArray(content) ? content.map((c) => (c && typeof c === "object" && typeof (c as Record<string, unknown>).text === "string" ? (c as Record<string, string>).text : "")).join(" ") : "";
+        return clip(text);
+      }
+      if (o.type === "image") return "image";
+      if (typeof o.content === "string") return clip(o.content);
+      return clip(JSON.stringify(o) ?? "");
+    },
+    /**
+     * A micro-USD amount, at a precision that does not round it to nothing.
+     *
+     * Micro-dollars, so the unit is already a millionth; three significant
+     * places keeps a $0.0004 block visible instead of rendering it as `$0.00`,
+     * which is the same trap `priceLabel` documents for rates.
+     */
+    microUsd(micro: number | null): string {
+      if (micro === null || !Number.isFinite(micro)) return "—";
+      const usd = micro / 1_000_000;
+      if (usd === 0) return "$0";
+      if (usd >= 0.01) return `$${usd.toFixed(2)}`;
+      if (usd >= 0.0001) return `$${usd.toFixed(4)}`;
+      return `$${usd.toExponential(1)}`;
+    },
+    /** A count and its noun, pluralised — `1 block`, `3 blocks`. */
+    plural(n: number, one: string): string {
+      return `${n} ${one}${n === 1 ? "" : "s"}`;
+    },
+    /** A token count with thousands separators, rounded from the estimate. */
+    tok(n: number): string {
+      return Math.round(n).toLocaleString("en-US");
+    },
+    /** A byte count in the largest unit that keeps it readable. */
+    bytesLabel(n: number): string {
+      if (n < 1024) return `${n} B`;
+      if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+      return `${(n / 1024 / 1024).toFixed(1)} MB`;
     },
     // Load everything the page shows, and treat success as proof the token is
     // good — there is no separate check to make, and a second round trip could

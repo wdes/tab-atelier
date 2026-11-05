@@ -146,7 +146,7 @@ impl Tokens {
 // lint would either break history or need a rename mapping, which is a worse
 // trade than this line.
 #[allow(clippy::struct_field_names)]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, tab_atelier_api::schemars::JsonSchema)]
 pub struct Cost {
     pub in_micro: i128,
     pub out_micro: i128,

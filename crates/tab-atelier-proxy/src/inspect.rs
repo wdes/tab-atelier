@@ -150,6 +150,38 @@ pub struct Capture {
     /// the request that produced them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tokens: Option<crate::usage::Tokens>,
+    /// What those tokens cost, in the same shape the usage ledger stores.
+    ///
+    /// The same numbers, from the same computation, as the ones folded into the
+    /// hour bucket — `relay::charge` is called once and its result is used by
+    /// both. Recording it rather than re-deriving it in the panel is the rule
+    /// the ledger already follows: a figure worked out at read time is
+    /// multiplied by whatever the rate table says *now*, so a capture from last
+    /// month would be re-priced at today's rates.
+    ///
+    /// `None` when the round's price is unknown — an unpriced model, or a tool
+    /// call on a hop with no tool price — because a missing price is not a zero
+    /// price there either.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost: Option<crate::usage::Cost>,
+    /// The rate those tokens were priced at, per 1M, with any peak window
+    /// already applied.
+    ///
+    /// Beside the cost because the panel prices individual blocks, and it must
+    /// use the rate the request was actually billed at. The client cannot
+    /// recompute that: `Price` is the *base* triple and applying a peak window
+    /// is arithmetic the server owns (see `Provider::price_at`), so a panel
+    /// that multiplied by the exposed price would be wrong by the peak
+    /// multiplier for half of every weekday on hops that have one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate: Option<crate::provider::Price>,
+    /// The dialect this request left on, as a plain string.
+    ///
+    /// `None` in a capture written before the field existed, which the
+    /// conversation view reads as "unknown" and says nothing about rather than
+    /// assuming Anthropic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wire: Option<String>,
     /// What compaction removed from this request, when it ran.
     ///
     /// Otherwise invisible: the panel shows the body AS SENT, so a compacted
@@ -297,6 +329,16 @@ pub struct Outgoing<'a> {
     /// the header it was asked to read. What was missing was the value that
     /// actually arrived, and the peer it arrived from.
     pub origin: Option<Origin>,
+    /// The dialect the request left on.
+    ///
+    /// Recorded rather than looked up later because it is what decides whether
+    /// the `cache_control` breakpoints in the captured body mean anything: on
+    /// the Anthropic wire they are honoured, and on the `OpenAI` wire they are
+    /// stripped on the way out because that endpoint prefix-caches implicitly.
+    /// A reader comparing breakpoints to a bill needs to know which of the two
+    /// they are looking at, and the provider's configuration can be changed
+    /// after the capture was taken.
+    pub wire: crate::provider::Wire,
 }
 
 /// Unpack `metadata.user_id`, if the body has one.
@@ -403,6 +445,19 @@ pub fn capture(o: &Outgoing<'_>) -> Capture {
         response_truncated: false,
         status: None,
         tokens: None,
+        // Priced by the caller, which is where the rate table and the response
+        // meet. See `relay::finish_capture`.
+        cost: None,
+        rate: None,
+        // Named, not derived: `Wire` has no `Serialize`, and the string is what
+        // the panel compares against.
+        wire: Some(
+            match o.wire {
+                crate::provider::Wire::Anthropic => "anthropic",
+                crate::provider::Wire::Openai => "openai",
+            }
+            .to_owned(),
+        ),
         // Filled in by the caller, which is the only thing that knows whether
         // a compaction pass ran on this request at all.
         compaction: None,
@@ -659,6 +714,7 @@ mod tests {
             kind: crate::classifier::Kind::Work,
             headers: &headers,
             origin: None,
+            wire: crate::provider::Wire::Anthropic,
             body: br#"{"model":"claude-haiku-5-5"}"#,
         });
         let names: Vec<_> = c.request_headers.iter().map(|(k, _)| k.to_ascii_lowercase()).collect();
@@ -710,6 +766,7 @@ mod tests {
                 kind: crate::classifier::Kind::Work,
                 headers: &[],
                 origin: None,
+                wire: crate::provider::Wire::Anthropic,
                 body: br#"{"model":"m"}"#,
             })
         };
@@ -763,6 +820,7 @@ mod tests {
             kind: crate::classifier::Kind::Work,
             headers: &[],
             origin: None,
+            wire: crate::provider::Wire::Anthropic,
             body: big.as_bytes(),
         });
         assert!(c.request_truncated, "truncation must be declared, not silent");

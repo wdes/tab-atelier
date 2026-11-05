@@ -189,6 +189,155 @@
       :root:not([data-bs-theme=dark]) .ta-j-str { color: #146c43; }
       :root:not([data-bs-theme=dark]) .ta-j-num { color: #a61e4d; }
       :root:not([data-bs-theme=dark]) .ta-j-lit { color: #b02a37; }
+
+      /* -- The conversation cost view --------------------------------------
+
+         Every figure in this view is an attribution, so the layout puts the
+         reconciliation first and keeps the per-block numbers monospaced and
+         right-aligned: a column of numbers that lines up invites comparison,
+         which is the whole point, and one that does not invites nothing. */
+
+      .ta-conv { font-size: .8125rem; }
+      .ta-conv details { margin: 0; }
+      .ta-conv summary {
+        cursor: pointer;
+        padding: .15rem .35rem;
+        border-radius: .25rem;
+        display: flex;
+        gap: .5rem;
+        align-items: baseline;
+        white-space: nowrap;
+        overflow: hidden;
+      }
+      .ta-conv summary:hover { background: var(--bs-secondary-bg, rgb(0 0 0 / .05)); }
+      /* The native marker is kept, because it is the affordance that says
+         "this opens" — removing it to look tidier trades away the only cue
+         that these rows are clickable. */
+      .ta-conv-group { margin-bottom: .35rem; }
+      .ta-conv-group > summary { font-size: .875rem; }
+      .ta-conv-msg > summary, .ta-conv-block > summary { padding-left: 1.1rem; }
+      .ta-conv-blocks {
+        margin: .15rem 0 .4rem 1.6rem;
+        border-left: 2px solid var(--bs-border-color, #dee2e6);
+        padding-left: .5rem;
+      }
+
+      /* The numbers column: fixed and tabular so it can be scanned down. */
+      .ta-conv-nums {
+        margin-left: auto;
+        font-family: var(--bs-font-monospace);
+        font-variant-numeric: tabular-nums;
+        font-size: .75rem;
+        color: var(--bs-secondary-color);
+        flex: none;
+      }
+      .ta-conv-idx {
+        font-family: var(--bs-font-monospace);
+        font-size: .7rem;
+        color: var(--bs-secondary-color);
+        min-width: 1.8rem;
+        text-align: right;
+        flex: none;
+      }
+      .ta-conv-role { font-weight: 600; min-width: 4.2rem; flex: none; }
+      .ta-conv-kind {
+        font-family: var(--bs-font-monospace);
+        font-size: .7rem;
+        color: var(--bs-secondary-color);
+        flex: none;
+      }
+      /* The only column allowed to give way when the row is narrow — it is
+         context, whereas the numbers are the content. */
+      .ta-conv-preview {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        min-width: 0;
+        flex: 1 1 auto;
+        color: var(--bs-secondary-color);
+      }
+      .ta-conv-where {
+        font-family: var(--bs-font-monospace);
+        font-size: .7rem;
+        color: var(--bs-secondary-color);
+        min-width: 11rem;
+        flex: none;
+      }
+      .ta-conv-row {
+        display: flex;
+        gap: .5rem;
+        align-items: baseline;
+        padding: .1rem .35rem;
+        white-space: nowrap;
+        overflow: hidden;
+      }
+
+      .ta-badge-bp, .ta-badge-sep, .ta-badge-hot {
+        font-size: .65rem;
+        padding: 0 .35rem;
+        border-radius: .2rem;
+        border: 1px solid currentColor;
+        flex: none;
+      }
+      :root:not([data-bs-theme=dark]) .ta-badge-bp { color: #664d03; }
+      :root:not([data-bs-theme=dark]) .ta-badge-sep { color: #084298; }
+      :root:not([data-bs-theme=dark]) .ta-badge-hot { color: #842029; }
+
+      /* A rule across the list where the effective separator falls, so the
+         boundary between cached and full-rate is visible without opening
+         anything. */
+      .ta-sep-line {
+        margin: .35rem 0;
+        padding: .15rem .5rem;
+        border-top: 2px solid currentColor;
+        border-bottom: 2px solid currentColor;
+        font-size: .7rem;
+        font-family: var(--bs-font-monospace);
+        color: var(--bs-primary-text-emphasis, #052c65);
+      }
+
+      .ta-conv-note {
+        font-size: .7rem;
+        color: var(--bs-secondary-color);
+        padding-left: .35rem;
+      }
+
+      /* The check. Two verdicts, and the failing one is deliberately the
+         louder: an estimate that misses its own total by a third is the thing
+         a reader most needs to see, and a green tick everywhere would make the
+         column of numbers look more authoritative than it is. */
+      .ta-check {
+        border: 1px solid var(--bs-border-color, #dee2e6);
+        border-radius: .25rem;
+        padding: .3rem .5rem;
+        font-size: .75rem;
+      }
+      .ta-check-ok { border-color: #198754; }
+      .ta-check-bad { border-color: #dc3545; }
+      .ta-check-row {
+        display: flex;
+        gap: .5rem;
+        align-items: baseline;
+        white-space: nowrap;
+        overflow: hidden;
+      }
+      .ta-check-label {
+        min-width: 4rem;
+        font-size: .7rem;
+        text-transform: uppercase;
+        letter-spacing: .02em;
+        color: var(--bs-secondary-color);
+        flex: none;
+      }
+      .ta-check-verdict {
+        margin-top: .2rem;
+        padding-top: .2rem;
+        border-top: 1px dashed var(--bs-border-color, #dee2e6);
+        flex-wrap: wrap;
+        white-space: normal;
+      }
+      :root:not([data-bs-theme=dark]) .ta-check-ok .ta-check-verdict { color: #0f5132; }
+      :root:not([data-bs-theme=dark]) .ta-check-bad .ta-check-verdict { color: #842029; }
     </style>
   </head>
   <body class="bg-body-tertiary">
@@ -786,6 +935,14 @@
                             :class="{ active: bodyView === 'structure' && inspectRows !== null }"
                             :disabled="inspectRows === null"
                             @click="bodyView = 'structure'">Structure</button>
+                    <!-- The cost view. Third rather than first because it is the
+                         narrower question: what the bytes *are* matters more often
+                         than what they cost, and it only renders when the body
+                         parses. -->
+                    <button type="button" class="btn btn-outline-secondary"
+                            :class="{ active: bodyView === 'conversation' && conversation !== null }"
+                            :disabled="conversation === null"
+                            @click="bodyView = 'conversation'">Conversation</button>
                     <button type="button" class="btn btn-outline-secondary"
                             :class="{ active: bodyView === 'raw' }"
                             @click="bodyView = 'raw'">Raw</button>
@@ -796,6 +953,152 @@
                   <button class="btn btn-sm btn-outline-secondary" @click="copy(prettyJson(inspectOpen.request_body))">
                     {{ copied ? 'Copied' : 'Copy JSON' }}
                   </button>
+                </div>
+              </div>
+              <!-- The cost view: the same request, in the order the prefix is
+                   actually assembled, with an attributed size and price per
+                   block and the cache separator marked. Accordions are native
+                   `<details>`, so open/closed state needs no bookkeeping here
+                   and a reader can tab through them. -->
+              <div v-if="bodyView === 'conversation' && conversation !== null"
+                   class="ta-conv" style="max-height: 34rem; overflow:auto">
+                <div class="small text-body-secondary mb-1">
+                  <span class="font-monospace">{{ conversation.model }}</span> via
+                  <span class="font-monospace">{{ conversation.provider }}</span>
+                  &middot; {{ conversation.wire }} wire &middot; {{ conversation.capturedAt }}
+                  &middot; {{ plural(conversation.messageCount, "message") }}
+                </div>
+
+                <!-- Worth saying before the numbers, not after: on this wire the
+                     markers below are the client's intent, not a structure the
+                     endpoint obeyed. -->
+                <div v-if="conversation.wireNote" class="ta-conv-note mb-2">{{ conversation.wireNote }}</div>
+
+                <!-- THE CHECK. The reason this view can be trusted at all: the
+                     per-block figures are estimates, so they are added up and
+                     compared against what the provider actually counted. A miss
+                     is reported as a size, in both directions. -->
+                <div v-if="conversation.check !== null" class="ta-check mb-2"
+                     :class="conversation.check.ok ? 'ta-check-ok' : 'ta-check-bad'">
+                  <div class="ta-check-row">
+                    <span class="ta-check-label">billed</span>
+                    <span class="font-monospace">
+                      in {{ tok(conversation.check.billedInput) }}
+                      &middot; cache read {{ tok(conversation.check.billedCacheRead) }}
+                      &middot; out {{ tok(conversation.check.billedOutput) }}
+                    </span>
+                    <span class="ms-auto font-monospace">
+                      {{ tok(conversation.check.billedTokens) }} tok
+                      <template v-if="conversation.check.billedMicro !== null">
+                        &middot; {{ microUsd(conversation.check.billedMicro) }}
+                      </template>
+                    </span>
+                  </div>
+                  <div class="ta-check-row">
+                    <span class="ta-check-label">rebuilt</span>
+                    <span class="text-body-secondary">&Sigma; of every block below</span>
+                    <span class="ms-auto font-monospace">
+                      {{ tok(conversation.check.rebuiltTokens) }} tok
+                      <template v-if="conversation.check.rebuiltMicro !== null">
+                        &middot; {{ microUsd(conversation.check.rebuiltMicro) }}
+                      </template>
+                    </span>
+                  </div>
+                  <div class="ta-check-row ta-check-verdict">
+                    <span v-if="conversation.check.ok">&#10003; totals agree</span>
+                    <span v-else>
+                      &#10007; rebuilt is {{ Math.abs(conversation.check.deltaPct) }}%
+                      {{ conversation.check.short ? 'BELOW' : 'ABOVE' }} billed
+                      ({{ conversation.check.deltaTokens > 0 ? '+' : '' }}{{ tok(conversation.check.deltaTokens) }} tok,
+                      {{ conversation.check.deltaTokens > 0 ? '+' : '' }}{{ microUsd((conversation.check.rebuiltMicro ?? 0) - (conversation.check.billedMicro ?? 0)) }})
+                    </span>
+                    <span class="ms-auto fw-normal text-body-secondary">
+                      the split between blocks is an estimate; the billed totals are not
+                    </span>
+                  </div>
+                  <div v-if="conversation.noCost" class="ta-check-row ta-check-verdict">
+                    <span>no recorded price for this round, so money is shown for tokens only</span>
+                  </div>
+                </div>
+                <div v-else class="ta-conv-note mb-2">
+                  The provider reported no token counts for this round, so there is nothing to check the blocks against.
+                </div>
+
+                <!-- Groups, in prefix order. A change anywhere invalidates every
+                     breakpoint after it, which is why this order is load-bearing
+                     and not merely tidy. -->
+                <details v-for="g in conversation.groups" :key="g.key" class="ta-conv-group" open>
+                  <summary>
+                    <span class="fw-semibold">{{ g.title }}</span>
+                    <span class="text-body-secondary">
+                      &middot; {{ plural(g.count, g.key === 'messages' ? 'message' : 'block') }}
+                      &middot; {{ bytesLabel(g.bytes) }}
+                      &middot; {{ tok(g.tokens) }} tok
+                      <template v-if="!conversation.noCost"> &middot; {{ microUsd(g.micro) }}</template>
+                    </span>
+                    <span v-if="g.separator" class="ta-badge-sep">separator here</span>
+                  </summary>
+                  <div v-if="g.note" class="ta-conv-note">{{ g.note }}</div>
+
+                  <!-- tools and system: their blocks, inline. -->
+                  <details v-for="(b, i) in g.blocks" :key="g.key + i" class="ta-conv-block">
+                    <summary>
+                      <span class="ta-conv-kind">{{ b.kind }}</span>
+                      <span class="ta-conv-preview">{{ b.preview }}</span>
+                      <span class="ta-conv-nums">
+                        {{ bytesLabel(b.bytes) }} &middot; {{ tok(b.tokens) }} tok
+                        <template v-if="!conversation.noCost"> &middot; {{ microUsd(b.micro) }}</template>
+                      </span>
+                      <span v-if="b.separator" class="ta-badge-sep">cache separator</span>
+                      <span v-else-if="b.breakpoint" class="ta-badge-bp">cache_control</span>
+                    </summary>
+                    <div class="ta-conv-where">{{ b.where }}</div>
+                  </details>
+
+                  <!-- messages: each one an accordion over its own blocks. -->
+                  <template v-for="m in g.messages" :key="g.key + m.index">
+                    <!-- The separator is drawn as a row between messages when it
+                         falls exactly on a message boundary, so it is not hidden
+                         inside a collapsed message. -->
+                    <div v-if="m.separator" class="ta-sep-line">{{ conversation.separatorWhere }}</div>
+                    <details class="ta-conv-msg">
+                      <summary>
+                        <span class="ta-conv-idx">{{ m.index }}</span>
+                        <span class="ta-conv-role">{{ m.role }}</span>
+                        <span class="ta-conv-kind">{{ m.kinds }}</span>
+                        <span class="ta-conv-preview"></span>
+                        <span class="ta-conv-nums">
+                          {{ bytesLabel(m.bytes) }} &middot; {{ tok(m.tokens) }} tok
+                          <template v-if="!conversation.noCost"> &middot; {{ microUsd(m.micro) }}</template>
+                        </span>
+                        <span v-if="m.separator" class="ta-badge-sep">cache separator</span>
+                        <span v-else-if="m.breakpoint" class="ta-badge-bp">cache_control</span>
+                        <span v-else-if="m.after" class="ta-badge-hot">full rate</span>
+                      </summary>
+                      <div class="ta-conv-blocks">
+                        <div v-for="(b, i) in m.blocks" :key="i" class="ta-conv-row">
+                          <span class="ta-conv-where">{{ b.where }}</span>
+                          <span class="ta-conv-kind">{{ b.kind }}</span>
+                          <span class="ta-conv-preview">{{ b.preview }}</span>
+                          <span class="ta-conv-nums">
+                            {{ bytesLabel(b.bytes) }} &middot; {{ tok(b.tokens) }} tok
+                            <template v-if="!conversation.noCost"> &middot; {{ microUsd(b.micro) }}</template>
+                          </span>
+                          <span v-if="b.separator" class="ta-badge-sep">separator</span>
+                          <span v-else-if="b.breakpoint" class="ta-badge-bp">cache_control</span>
+                        </div>
+                      </div>
+                    </details>
+                  </template>
+                </details>
+
+                <div class="ta-conv-note mt-2">
+                  &asymp; tokens are attributed from each block's byte length, with an image charged a flat 1,600 rather
+                  than its base64 size. Output tokens cannot be attributed to a block — the request carries none —
+                  and a cache write is priced at the cache-read rate, which is what the ledger charges.
+                  <template v-if="conversation.breakpointCount === 0">
+                    This request carries no cache_control breakpoint at all, so nothing in it was cached.
+                  </template>
                 </div>
               </div>
               <!-- Fields, indented, one per row: the view for "what model did it

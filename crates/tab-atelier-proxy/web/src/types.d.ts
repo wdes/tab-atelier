@@ -438,6 +438,33 @@ interface CaptureTokens {
 /** The `service_tier` a call was billed under. */
 type TokenTier = "standard" | "priority" | "batch" | "other";
 
+/**
+ * What a captured round cost, in micro-USD, as the ledger recorded it.
+ *
+ * Three parts because the proxy bills three things separately: input, output,
+ * and server-side tool runs (a web search is a per-request charge on the
+ * provider, not a token count). Mirrors `usage::Cost`.
+ */
+interface CaptureCost {
+    in_micro: number;
+    out_micro: number;
+    tools_micro: number;
+}
+
+/**
+ * The rate a round was priced at, per 1M tokens, in micro-USD.
+ *
+ * `cache_hit` is the cached-input rate and is also what a cache *write* is
+ * charged at — the proxy has no separate write rate, so a model whose provider
+ * charges more to fill the cache than to read from it cannot be expressed here.
+ * Mirrors `provider::Price`.
+ */
+interface CaptureRate {
+    cache_hit: number;
+    input: number;
+    output: number;
+}
+
 interface Capture {
     ts: string;
     account_id: string;
@@ -478,6 +505,35 @@ interface Capture {
     request_truncated: boolean;
     status?: number;
     tokens?: CaptureTokens;
+    /**
+     * What those tokens cost, in micro-USD, in the same shape the usage ledger
+     * stores — computed once, at the moment the response was read.
+     *
+     * Absent when the round could not be priced at all (an unpriced model, or
+     * server tools used on a hop that prices none). That is not a zero: the
+     * conversation view shows tokens without money rather than inventing a
+     * figure. Captures written before the field existed have it too.
+     */
+    cost?: CaptureCost;
+    /**
+     * The rate `cost` was worked out at, per 1M tokens, with any peak window
+     * already applied.
+     *
+     * Sent with the capture rather than read from the provider list because
+     * the client must not re-apply a peak window: that arithmetic belongs to
+     * the server, and the provider list exposes the base triple. Absent in the
+     * same cases as `cost`.
+     */
+    rate?: CaptureRate;
+    /**
+     * The dialect the request left on — `anthropic` or `openai`.
+     *
+     * Absent in captures written before the field existed, and read as unknown
+     * rather than assumed. It is what decides whether the `cache_control`
+     * markers in the body mean anything: the OpenAI wire strips them at egress
+     * and prefix-caches implicitly, so on that wire they show intent only.
+     */
+    wire?: string;
     /** What compaction removed, when a level was in force for this request. */
     compaction?: CaptureCompaction;
     /**
@@ -711,6 +767,138 @@ interface JsonRow {
 }
 
 /**
+ * One block of a conversation, with its attributed size and cost.
+ *
+ * Every figure here is **attributed**, not measured: a provider bills per
+ * request and never per block, so the only real numbers a capture has are the
+ * request totals. `tokens` comes from the block's byte length, and `micro` is
+ * that estimate multiplied by the rate the round was actually billed at. See
+ * {@link ConversationCheck}, which reports how far the estimates miss.
+ */
+interface ConversationBlock {
+    /** `text`, `tool_use`, `tool_result`, `image`, … — the block's own `type`. */
+    kind: string;
+    /** One line of the block's own content, clipped for the summary line. */
+    preview: string;
+    /** Where it sits, as a human would cite it — `messages[7].content[1]`. */
+    where: string;
+    bytes: number;
+    /** Attributed tokens; fractional, rounded only when displayed. */
+    tokens: number;
+    /** Attributed cost in micro-USD, at the round's billed rate. */
+    micro: number;
+    /** The block carries `cache_control`. */
+    breakpoint: boolean;
+    /** The single breakpoint that decides the bill: the last one, in order. */
+    separator: boolean;
+    /** The block sits after the separator, and so is billed at the full rate. */
+    after: boolean;
+}
+
+/** One message of the conversation, drawn as an accordion. */
+interface ConversationMessage {
+    /** 1-based position, so it matches what a human counts. */
+    index: number;
+    role: string;
+    /** Distinct block kinds, for the collapsed summary line. */
+    kinds: string;
+    bytes: number;
+    tokens: number;
+    micro: number;
+    breakpoint: boolean;
+    separator: boolean;
+    /** The message begins after the separator. */
+    after: boolean;
+    blocks: ConversationBlock[];
+}
+
+/**
+ * A group of the request, in the order the prefix is actually built.
+ *
+ * `tools` -> `system` -> `messages` is not the order the JSON happens to have; it
+ * is the order the vendor assembles the prefix in, which is what decides where a
+ * cache breakpoint can sit and what a byte change invalidates.
+ */
+interface ConversationGroup {
+    /** `tools`, `system`, or `messages`. */
+    key: string;
+    title: string;
+    /** How many entries the group holds — tools, system blocks, or messages. */
+    count: number;
+    bytes: number;
+    tokens: number;
+    micro: number;
+    /** A caveat that applies to the whole group, when there is one. */
+    note: string | null;
+    /** The group's blocks. Empty for `messages`, whose rows are in `messages`. */
+    blocks: ConversationBlock[];
+    /** The group's messages. Empty for `tools` and `system`. */
+    messages: ConversationMessage[];
+    /** A breakpoint sits inside this group. */
+    breakpoint: boolean;
+    /** The deciding breakpoint sits inside this group. */
+    separator: boolean;
+}
+
+/**
+ * The sum of the parts against the measured totals.
+ *
+ * The point of the whole view: it exists so the per-block estimates are checked
+ * rather than trusted. `billed` is the provider's own count of what it
+ * processed; `rebuilt` is the sum of every block drawn above it. They will
+ * usually differ — JSON syntax, media payloads and tokeniser behaviour are not
+ * linear in bytes — and the difference is reported as a size, in both
+ * directions, rather than absorbed.
+ */
+interface ConversationCheck {
+    billedTokens: number;
+    /** The measured parts of `billedTokens`, so the sum can be seen to add up. */
+    billedInput: number;
+    billedCacheRead: number;
+    billedOutput: number;
+    rebuiltTokens: number;
+    /** `rebuilt - billed`; negative means the estimate undershoots. */
+    deltaTokens: number;
+    /** The same difference as a percentage of billed, signed and rounded. */
+    deltaPct: number;
+    /** Whether the two are close enough to call agreement. */
+    ok: boolean;
+    /** Whether the rebuild fell short, which changes how the miss is worded. */
+    short: boolean;
+    /** The recorded amount, when the round could be priced. */
+    billedMicro: number | null;
+    /** The sum of the per-block estimates, when the round could be priced. */
+    rebuiltMicro: number | null;
+}
+
+/**
+ * A captured conversation, shaped for the cost view.
+ *
+ * `null` comes back from the computed when the body does not parse as JSON —
+ * the same rule the Structure view follows, so a clamped or truncated capture
+ * degrades to Raw instead of drawing half a conversation as though it were
+ * whole.
+ */
+interface ConversationView {
+    model: string;
+    provider: string;
+    wire: string;
+    capturedAt: string;
+    groups: ConversationGroup[];
+    /** `null` when the provider reported no token counts for the round. */
+    check: ConversationCheck | null;
+    /** True when the capture predates cost recording, or could not be priced. */
+    noCost: boolean;
+    messageCount: number;
+    /** How many blocks carry `cache_control`. */
+    breakpointCount: number;
+    /** Where the deciding breakpoint falls, in words; `null` if there is none. */
+    separatorWhere: string | null;
+    /** The wire's own caveat about `cache_control`, when it has one. */
+    wireNote: string | null;
+}
+
+/**
  * Anything the shared hover/label mixins can plot.
  *
  * The mixins genuinely depend on their host providing `points`, so they
@@ -778,7 +966,7 @@ interface AppState {
      * with is "what did it actually ask for", and answering that by scanning
      * braces is the thing this exists to stop.
      */
-    bodyView: "structure" | "raw";
+    bodyView: "structure" | "conversation" | "raw";
     /**
      * The provider key dialog, when open.
      *

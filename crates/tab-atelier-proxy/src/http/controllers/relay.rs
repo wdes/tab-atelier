@@ -597,8 +597,9 @@ pub(crate) async fn shape_and_admit(
         )
         .with_header("retry-after", retry_after.to_string());
         // A refused call still happened, and an operator looking at a quiet
-        // graph should see the refusals.
-        record(state, &account.id, None, None, usage::Tokens::default(), 429);
+        // graph should see the refusals. Nothing to capture: this returns before
+        // the response is read, so the round has no tokens and no price.
+        let _ = record(state, &account.id, None, None, usage::Tokens::default(), 429);
         return Err(resp);
     }
     Ok((body, route, compaction, local))
@@ -952,6 +953,7 @@ pub(crate) fn begin_capture(
     path: &str,
     body: &[u8],
     hdrs: &[(String, String)],
+    wire: provider::Wire,
 ) -> Option<inspect::Capture> {
     // Read the flag and release the lock before building anything: the guard
     // must not be alive across the scrub-and-clamp below, let alone the send.
@@ -977,26 +979,81 @@ pub(crate) fn begin_capture(
         headers: hdrs,
         body,
         origin: Some(f.origin.clone()),
+        wire,
     }))
 }
 
-pub(crate) fn finish_capture(
-    f: &Forward,
-    pending: Option<inspect::Capture>,
-    status: u16,
-    tokens: &usage::Tokens,
-    excerpt: &[u8],
-    dropped: usize,
-    model: Option<&str>,
-) {
+/// What reading a response produced, gathered so it can be recorded in one go.
+///
+/// One struct rather than six parameters because the pieces are only ever passed
+/// together and always to the same two functions [`record`] and
+/// [`finish_capture`] — and because they have to agree. Splitting them invites a
+/// caller that prices one round and captures another, which would show a
+/// plausible conversation under the wrong total.
+///
+/// `Copy` because every field is: borrowing it instead would only move the
+/// question to the caller.
+#[derive(Clone, Copy)]
+pub(crate) struct Outcome<'a> {
+    pub(crate) status: u16,
+    pub(crate) tokens: usage::Tokens,
+    /// What the round cost, when it could be priced at all.
+    pub(crate) charge: Option<Charge>,
+    /// The reply as it went to the client, capped by `tap`.
+    pub(crate) excerpt: &'a [u8],
+    /// How much of the reply was dropped past the cap.
+    pub(crate) dropped: usize,
+    /// What upstream *reported* the model as, which can differ from the request.
+    pub(crate) model: Option<&'a str>,
+}
+
+impl Forward {
+    /// Book a finished round: charge it to the ledger and write the one-line
+    /// summary, returning what was charged so the capture can record the same
+    /// amount.
+    ///
+    /// Together because they are the same event read two ways — the ledger
+    /// aggregates it, the log line records it once. Splitting them is how a
+    /// round ends up in one and not the other.
+    fn book(&self, status: u16, model: Option<&str>, tokens: &usage::Tokens, excerpt: &[u8]) -> Option<Charge> {
+        let charge = record(
+            &self.state,
+            &self.account_id,
+            Some(self.route.provider_id.as_str()),
+            model,
+            *tokens,
+            status,
+        );
+        log::info!(
+            "proxy: {status} for {}: {} in / {} out ({} cache read, {} cache write) reply: {}",
+            model.unwrap_or(&self.route.model_id),
+            tokens.input,
+            tokens.output,
+            tokens.cache_read,
+            tokens.cache_write,
+            one_line(excerpt)
+        );
+        charge
+    }
+}
+
+pub(crate) fn finish_capture(f: &Forward, pending: Option<inspect::Capture>, o: Outcome<'_>) {
     let Some(mut c) = pending else { return };
-    c.status = Some(status);
-    c.tokens = Some(*tokens);
+    c.status = Some(o.status);
+    c.tokens = Some(o.tokens);
+    // The amount and the rate it was worked out at, both taken from the same
+    // `Charge` the ledger just recorded. Present only when the round could be
+    // priced at all: an unpriced model leaves both unset, and the panel says so
+    // rather than drawing a zero.
+    if let Some(charge) = o.charge {
+        c.cost = Some(charge.cost);
+        c.rate = Some(charge.rate);
+    }
     // The reply as it went to the client, capped by `tap`. Kept verbatim --
     // newlines and all -- because the panel is where a reply is read
     // properly, and reflowing it here would destroy the shape being read.
-    c.response_excerpt = (!excerpt.is_empty()).then(|| String::from_utf8_lossy(excerpt).into_owned());
-    c.response_truncated = dropped > 0;
+    c.response_excerpt = (!o.excerpt.is_empty()).then(|| String::from_utf8_lossy(o.excerpt).into_owned());
+    c.response_truncated = o.dropped > 0;
     // What compaction removed from THIS request, so the panel can show the
     // saving rather than only the compacted result.
     c.compaction.clone_from(&f.compaction);
@@ -1006,7 +1063,7 @@ pub(crate) fn finish_capture(
     // What upstream REPORTED the model as, when it was the routing that chose
     // it. Usually the same as what we sent; different means the far end
     // substituted, which is worth seeing.
-    if let Some(m) = model
+    if let Some(m) = o.model
         && c.model.as_deref() != Some(m)
     {
         c.model = Some(m.to_owned());
@@ -1175,6 +1232,35 @@ pub(crate) fn upstream_headers(
     hdrs
 }
 
+/// Send the request upstream, POST with a body or GET without one.
+///
+/// Extracted from `forward` only because both arms repeat the header loop, and
+/// repeating it is how a header ends up on one verb and not the other.
+///
+/// The two verbs cannot share a builder — `ureq` carries the presence of a body
+/// in the type — so the loop is generic over the builder instead, which is the
+/// only place the duplication actually was.
+fn with_headers<T>(mut rb: ureq::RequestBuilder<T>, hdrs: &[(String, String)]) -> ureq::RequestBuilder<T> {
+    for (k, v) in hdrs {
+        rb = rb.header(k.as_str(), v);
+    }
+    rb
+}
+
+fn dispatch(
+    agent: &ureq::Agent,
+    url: &str,
+    hdrs: &[(String, String)],
+    is_post: bool,
+    body: &[u8],
+) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
+    if is_post {
+        with_headers(agent.post(url), hdrs).send(body)
+    } else {
+        with_headers(agent.get(url), hdrs).call()
+    }
+}
+
 pub(crate) fn forward(
     f: &Forward,
     // By value: a oneshot Sender is consumed by `send`, which is also what
@@ -1199,21 +1285,9 @@ pub(crate) fn forward(
     // after the beta flags were merged, with the proxy's credential in place.
     // That is the thing nobody can otherwise see, and it is the whole reason
     // inspection exists. Scrubbing happens inside `inspect::capture`.
-    let mut pending = begin_capture(f, &path, &body, &hdrs);
+    let mut pending = begin_capture(f, &path, &body, &hdrs, wire);
 
-    let sent = if f.is_post {
-        let mut rb = agent.post(&url);
-        for (k, v) in &hdrs {
-            rb = rb.header(k.as_str(), v);
-        }
-        rb.send(&body[..])
-    } else {
-        let mut rb = agent.get(&url);
-        for (k, v) in &hdrs {
-            rb = rb.header(k.as_str(), v);
-        }
-        rb.call()
-    };
+    let sent = dispatch(&agent, &url, &hdrs, f.is_post, &body);
     let mut resp = match sent {
         Ok(r) => r,
         Err(e) => {
@@ -1265,35 +1339,41 @@ pub(crate) fn forward(
     if meta_tx.send(Ok((status, ctype))).is_err() {
         // The client is gone, but the call was still made and still cost
         // tokens — so it is recorded anyway, just without a body to read.
-        record(&f.state, &f.account_id, None, None, usage::Tokens::default(), status);
+        let _ = record(&f.state, &f.account_id, None, None, usage::Tokens::default(), status);
         // The capture is still filed: the request WAS made and the client
         // hanging up does not unmake it. No token counts, because the
         // response was never read.
-        finish_capture(f, pending.take(), status, &usage::Tokens::default(), &[], 0, None);
+        finish_capture(
+            f,
+            pending.take(),
+            Outcome {
+                status,
+                tokens: usage::Tokens::default(),
+                charge: None,
+                excerpt: &[],
+                dropped: 0,
+                model: None,
+            },
+        );
         return;
     }
     let mut reader = resp.body_mut().as_reader();
     let mut excerpt = Vec::new();
     let dropped = pump(&mut reader, wire, is_sse, status, &mut sniffer, &mut excerpt, body_tx);
     let (model, tokens) = sniffer.finish();
-    record(
-        &f.state,
-        &f.account_id,
-        Some(f.route.provider_id.as_str()),
-        model.as_deref(),
-        tokens,
-        status,
+    let charge = f.book(status, model.as_deref(), &tokens, &excerpt);
+    finish_capture(
+        f,
+        pending.take(),
+        Outcome {
+            status,
+            tokens,
+            charge,
+            excerpt: &excerpt,
+            dropped,
+            model: model.as_deref(),
+        },
     );
-    log::info!(
-        "proxy: {status} for {}: {} in / {} out ({} cache read, {} cache write) reply: {}",
-        model.as_deref().unwrap_or(&f.route.model_id),
-        tokens.input,
-        tokens.output,
-        tokens.cache_read,
-        tokens.cache_write,
-        one_line(&excerpt)
-    );
-    finish_capture(f, pending.take(), status, &tokens, &excerpt, dropped, model.as_deref());
     if f.metered {
         // Replace the estimate with what it really cost. An underestimate is
         // owed back out of the next turn; an overestimate is credited, or a
@@ -1405,6 +1485,22 @@ pub(crate) fn observe_upstream(
     }
 }
 
+/// A round's cost, and the rate it was worked out at.
+///
+/// The pair travels together because two readers need different halves of it and
+/// must agree: the usage ledger wants [`Charge::cost`], the inspect capture wants
+/// both — the amount for its headline, the rate to price the individual blocks of
+/// the conversation. Computing them separately would be two lookups of a table
+/// that can be edited in between, so a capture could show blocks priced at one
+/// rate under a total priced at another.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Charge {
+    pub(crate) cost: usage::Cost,
+    /// Per 1M tokens, peak already applied — the number the amount was actually
+    /// multiplied by.
+    pub(crate) rate: provider::Price,
+}
+
 pub(crate) fn record(
     state: &State,
     account_id: &str,
@@ -1412,13 +1508,20 @@ pub(crate) fn record(
     model: Option<&str>,
     tokens: usage::Tokens,
     status: u16,
-) {
+) -> Option<Charge> {
     // Priced before the usage lock is taken, and with the registry guard
     // released in between: the lock order here is store, then registry, then
     // store, and holding both at once would invite a deadlock.
-    let cost = charge(state, provider, model, &tokens);
+    let charge = charge(state, provider, model, &tokens);
     let mut u = state.usage.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    u.record(account_id, model, tokens, (200..300).contains(&status), cost);
+    u.record(
+        account_id,
+        model,
+        tokens,
+        (200..300).contains(&status),
+        charge.map(|c| c.cost),
+    );
+    charge
 }
 
 /// What a batch of tokens cost, at the rates in force when it arrived.
@@ -1431,7 +1534,7 @@ pub(crate) fn record(
 ///
 /// Same formula the live view uses, so the stored total and the number under a
 /// chart at read time agree; the only difference is *when* the rate is read.
-fn charge(state: &State, provider: Option<&str>, model: Option<&str>, tokens: &usage::Tokens) -> Option<usage::Cost> {
+fn charge(state: &State, provider: Option<&str>, model: Option<&str>, tokens: &usage::Tokens) -> Option<Charge> {
     if tokens.is_zero() {
         return None;
     }
@@ -1443,7 +1546,7 @@ fn charge(state: &State, provider: Option<&str>, model: Option<&str>, tokens: &u
     // whole round unknown rather than reporting the tokens and quietly leaving the
     // searches out. That is the same rule the token part already follows: a
     // missing price is not a zero price.
-    let (price, tool_price) = {
+    let (rate, tool_price) = {
         let registry = state.registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         (
             registry.billing_price(provider, model)?.at(now),
@@ -1453,16 +1556,19 @@ fn charge(state: &State, provider: Option<&str>, model: Option<&str>, tokens: &u
         )
     };
     let cache_read = tokens.cache_read.saturating_add(tokens.cache_write);
-    let (in_micro, out_micro) = price.split_micro(cache_read, tokens.input, tokens.output);
+    let (in_micro, out_micro) = rate.split_micro(cache_read, tokens.input, tokens.output);
     // `None` from this means the round's total is unknown — the tools were used and
     // nobody said what they cost — so no cost is recorded rather than a token-only
     // figure. See `ServerToolPrice::server_tool_charge_micro` for the three states.
     let tools_micro =
         provider::ServerToolPrice::server_tool_charge_micro(tool_price, tokens.web_search, tokens.web_fetch, now)?;
-    Some(usage::Cost {
-        in_micro,
-        out_micro,
-        tools_micro,
+    Some(Charge {
+        cost: usage::Cost {
+            in_micro,
+            out_micro,
+            tools_micro,
+        },
+        rate,
     })
 }
 

@@ -251,7 +251,39 @@ A capture carries the request as sent, the status that came back, and the
 **token counts** — input, output and cache — read off the same response parse
 the billing path uses, so the panel and the usage graph cannot disagree. That
 pairing is the point: "why was that turn expensive" is answered by four numbers
-beside the request that produced them.
+beside the request that produced them. A capture also carries what the round
+**cost** and the rate it was priced at, recorded once by the same function that
+feeds the usage ledger, so a capture from last month is never re-priced at
+today's rates.
+
+### The conversation view
+
+Three views read the same body. *Structure* flattens it, *Raw* shows it whole,
+and *Conversation* renders it in **prefix order** — `tools`, `system`,
+`messages` — with a size, an attributed token count and an attributed cost per
+block, and a mark on every `cache_control` breakpoint. The last breakpoint is
+the one that decides the bill: everything up to it is a cache read, everything
+after is charged at the full input rate.
+
+Every per-block figure is an attribution, not a measurement — a provider bills
+per request and returns one aggregate, so there is no per-block truth to show.
+The view therefore **adds its blocks back up and compares them against what the
+provider actually counted**, and prints the difference as a size. It will
+usually disagree, often substantially: JSON syntax, media payloads and
+tokeniser behaviour are not linear in bytes. That is the honest result, and a
+figure that reconciled perfectly would mean the estimator had been fitted to the
+answer.
+
+Two traps the view is careful about. An image is charged a **flat 1,600 tokens**
+rather than its base64 size, matching `budget::estimate_input` — a screenshot's
+base64 divided by four scores roughly 500,000 tokens, which is exactly how a
+request gets refused as too long. And output tokens cannot be attributed to any
+block, because the request contains none; they appear once at the top.
+
+On the **OpenAI wire** the `cache_control` markers are the client's intent and
+not a structure the endpoint obeyed: that wire has no such field, and the proxy
+strips it on the way out while the provider prefix-caches implicitly. The view
+says so when the capture was taken on that wire.
 
 It is off, and it turns itself off. A capture is a prompt, and a prompt is
 whatever someone was working on, so:
