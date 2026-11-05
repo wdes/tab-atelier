@@ -1137,6 +1137,52 @@ impl Provider {
         }
     }
 
+    /// Add the models the catalogue lists for this hop and the row does not.
+    ///
+    /// The third thing a row loses by being saved, and the only one that cannot
+    /// be repaired a field at a time, because a model the row has never heard of
+    /// is not a missing value on an existing entry — it is an entry that is not
+    /// there.
+    ///
+    /// The cause is the same as the two above. A preset builds a whole row the
+    /// first time it is added, and from then on the row is the operator's file:
+    /// the panel saves the model list as text, never the preset name, so a new
+    /// generation added to the catalogue reaches a fresh install and no other.
+    /// A row that was configured before GPT-6 existed would go on serving the
+    /// fixed list it was written with, and the models would be absent from the
+    /// pin dropdown with nothing to say they had ever been published.
+    ///
+    /// Matched on `base_url`, like [`published_peak`], so this is a claim about
+    /// who serves the tokens rather than about what the row is called. A
+    /// provider pointed somewhere else is untouched, which matters: a row
+    /// pointed at a compatible server has a model list the catalogue knows
+    /// nothing about, and adding `OpenAI`'s ids to it would be an invention.
+    ///
+    /// # This can bring back a model the operator removed
+    ///
+    /// Only appends, never removes or reorders, so a row that already lists a
+    /// model keeps its own class and cost for it. The consequence is that a
+    /// model deliberately deleted from a catalogue-backed row returns — the
+    /// adoption cannot tell "never had it" from "took it out", and choosing the
+    /// other way would make the catalogue's additions reach nobody. Withdrawn
+    /// models are skipped, so the deprecated entries the catalogue carries as
+    /// documentation do not come back, and the panel drops them from the text
+    /// anyway.
+    ///
+    /// Nothing is written here. `Registry::load` repairs in memory, so a row on
+    /// disk is exactly as the operator left it until something saves it.
+    pub fn adopt_published_models(&mut self) {
+        let Some(published) = published_models(&self.base_url) else {
+            return;
+        };
+        for model in published {
+            if model.deprecated || self.models.iter().any(|m| m.id == model.id) {
+                continue;
+            }
+            self.models.push(model);
+        }
+    }
+
     /// Whether not one model it serves carries a rate.
     ///
     /// Not a fault on its own: the subscription hop is unpriced by design, since
@@ -1310,23 +1356,67 @@ impl Preset {
                     ),
                 ],
             },
-            // GPT-5.6 ships as three models rather than one with a dial. They
-            // are listed separately, by their real ids, so each can be pinned
-            // per user with a plain model override — which is also what makes
-            // a per-person default possible (see `Account::model`).
+            // OpenAI ships each tier as its own model rather than one with a
+            // dial. They are listed separately, by their real ids, so each can
+            // be pinned per user with a plain model override — which is also
+            // what makes a per-person default possible (see `Account::model`).
+            //
+            // # Two generations, and why the older one is still here
+            //
+            // The GPT-6 line is what routing now reaches, because in every class
+            // it is the cheaper of the two. GPT-5.6 stays listed because OpenAI
+            // still serves it — it is not under the catalogue's deprecated
+            // models — and a person pinned to it must keep the pin. Listing it
+            // is what keeps `serves`, `canonical_model` and the repair in
+            // `published_price` answering for an id that still takes traffic.
             //
             // # Prices are OpenAI's, as published
             //
-            // Per 1M tokens, Standard tier: Sol $4 in / $0.40 cached / $20 out,
-            // Terra $2 / $0.20 / $12, Luna $0.20 / $0.02 / $1.20. Same
-            // convention as `DeepSeek` above: cache-MISS input as integers
-            // against Anthropic Haiku at 100, which is the figure that actually
-            // decides a reroute. So Luna 20, Terra 200, Sol 400.
+            // Per 1M tokens, Standard tier. GPT-6: Astra $10 in / $50 out, 6.1
+            // Sol $2 / $10, 6.1 Terra $1 / $5, 6 Luna $0.10 / $0.50. GPT-5.6:
+            // Sol $4 / $20, Terra $2 / $12, Luna $0.20 / $1.20.
             //
-            // The figures previously here were Sol $5/$30, Terra $2.50/$15,
-            // Luna $1/$6 — a generation behind, and transcribed as though the
-            // cache column did not exist. Two of the three were out by more than
-            // the cache discount they were meant to avoid.
+            // Same convention as `DeepSeek` above: cache-MISS input as integers
+            // against Anthropic Haiku at 100, which is the figure that actually
+            // decides a reroute. So Astra 1_000, 6.1 Sol 200, 6.1 Terra 100,
+            // 6 Luna 10, Sol 400, Terra 200, Luna 20.
+            //
+            // # The cached-input column is derived, and only for GPT-6
+            //
+            // The catalogue page publishes two price columns, not three, and its
+            // GPT-6 block gives no cached-input figure. Recording the two and
+            // leaving the third blank is not an option: `Price` is one triple, so
+            // a model without one is a model `billing_price` cannot price, and it
+            // then falls back to the provider's cheapest billable model — which
+            // would bill Astra's traffic at Luna's rate, understating it fortyfold
+            // and warning about it in the log.
+            //
+            // So the third column follows the ratio OpenAI's own table has held
+            // for this family: cached input is a tenth of input. The GPT-5.6
+            // rows below are that ratio exactly, and the cached-input test in
+            // this module holds the whole preset to it, so a generation that
+            // breaks the pattern fails a test rather than mispricing cache hits
+            // — which, on agent traffic, is most of the input there is.
+            //
+            // # Astra is Heavy but is not what Heavy resolves to
+            //
+            // `Provider::model_for` takes the cheapest model in a class, so Heavy
+            // answers with 6.1 Sol. That is deliberate: Astra is five times Sol
+            // for the same class, so it is reachable by an exact pin or a route
+            // and never by being the default for every heavy request.
+            //
+            // The cache discount does not reach `relative_cost`: OpenAI's
+            // `prompt_tokens_details.cached_tokens` is surfaced to the client in
+            // `cache_read_input_tokens`, but `relative_cost` models only input
+            // and output, exactly as it does for every other provider. It does
+            // reach `Price`, below.
+            //
+            // Context windows need no `with_context`: all seven publish 1.05M,
+            // which is the file's `DEFAULT_CONTEXT_WINDOW` because that is
+            // 1_048_576 rounded the way the vendor rounds it. The 128K output
+            // ceiling is not a figure this file records — `budget` works from
+            // the window and a completion request it clamps, not from a per-model
+            // maximum.
             //
             // The cache discount does not reach `relative_cost`: OpenAI's
             // `prompt_tokens_details.cached_tokens` is surfaced to the client in
@@ -1357,6 +1447,10 @@ impl Preset {
                 peak: None,
                 server_tools: None,
                 models: vec![
+                    Model::new("gpt-6-astra", Class::Heavy, 1_000).priced(1_000_000, 10_000_000, 50_000_000),
+                    Model::new("gpt-6.1-sol", Class::Heavy, 200).priced(200_000, 2_000_000, 10_000_000),
+                    Model::new("gpt-6.1-terra", Class::Balanced, 100).priced(100_000, 1_000_000, 5_000_000),
+                    Model::new("gpt-6-luna", Class::Fast, 10).priced(10_000, 100_000, 500_000),
                     Model::new("gpt-5.6-sol", Class::Heavy, 400).priced(400_000, 4_000_000, 20_000_000),
                     Model::new("gpt-5.6-terra", Class::Balanced, 200).priced(200_000, 2_000_000, 12_000_000),
                     Model::new("gpt-5.6-luna", Class::Fast, 20).priced(20_000, 200_000, 1_200_000),
@@ -1409,6 +1503,21 @@ pub fn published_peak(base_url: &str) -> Option<Peak> {
         .map(|preset| preset.provider_named(Path::new(""), "catalogue"))
         .find(|provider| provider.base_url == base_url)
         .and_then(|provider| provider.peak)
+}
+
+/// The model list the shipped catalogue records for a provider at `base_url`.
+///
+/// The third question asked of the same table, and answered the same way: by
+/// host rather than by name, so a renamed row is still recognised as the vendor
+/// it points at, and a row pointed anywhere else gets nothing. See
+/// [`Provider::adopt_published_models`] for what it is used for.
+#[must_use]
+pub fn published_models(base_url: &str) -> Option<Vec<Model>> {
+    Preset::ALL
+        .iter()
+        .map(|preset| preset.provider_named(Path::new(""), "catalogue"))
+        .find(|provider| provider.base_url == base_url)
+        .map(|provider| provider.models)
 }
 
 /// A civil date, falling over only on an impossible one.
@@ -1725,6 +1834,13 @@ impl Registry {
                     // "no peak" — the windows survive, so every holiday that
                     // falls on a weekday bills at double until it is put back.
                     p.adopt_published_peak();
+                    // And the models: a preset builds the list once, when it is
+                    // first added, and the panel saves a model list as text
+                    // rather than a preset name — so a generation added to the
+                    // catalogue afterwards would reach a fresh install and no
+                    // other. A row configured before that model existed would
+                    // simply never offer it.
+                    p.adopt_published_models();
                 }
                 // Loud at LOAD, not only at the first request that would have
                 // used it. A provider that can never be used still sits in the
@@ -3211,6 +3327,25 @@ mod tests {
         assert_eq!(luna.input, 200_000, "$0.20/1M");
         assert_eq!(luna.output, 1_200_000, "$1.20/1M");
 
+        // The GPT-6 line. Its input and output are what the catalogue page
+        // publishes; its cached-input column is the tenth below, which that page
+        // does not state — see the reasoning above the preset.
+        let astra = rate("gpt-6-astra");
+        assert_eq!(astra.input, 10_000_000, "$10.00/1M");
+        assert_eq!(astra.output, 50_000_000, "$50.00/1M");
+
+        let sol6 = rate("gpt-6.1-sol");
+        assert_eq!(sol6.input, 2_000_000, "$2.00/1M");
+        assert_eq!(sol6.output, 10_000_000, "$10.00/1M");
+
+        let terra6 = rate("gpt-6.1-terra");
+        assert_eq!(terra6.input, 1_000_000, "$1.00/1M");
+        assert_eq!(terra6.output, 5_000_000, "$5.00/1M");
+
+        let luna6 = rate("gpt-6-luna");
+        assert_eq!(luna6.input, 100_000, "$0.10/1M");
+        assert_eq!(luna6.output, 500_000, "$0.50/1M");
+
         // One rate, not a schedule: OpenAI publishes no peak window, so an hour
         // costs the same whenever it runs. A `peak` here — copied from the
         // DeepSeek preset, which needs one — would silently double every figure
@@ -3219,6 +3354,62 @@ mod tests {
             openai.peak.is_none(),
             "OpenAI publishes one rate per model, not a peak schedule"
         );
+    }
+
+    /// Every `OpenAI` model is priced, and caches at a tenth of its input rate.
+    ///
+    /// Two claims, both about what a missing or invented figure costs, and both
+    /// of them holes the test above leaves open because it `continue`s past a
+    /// model with no price.
+    ///
+    /// A model with no `price` cannot be billed: `billing_price` skips it and
+    /// bills the hour at the provider's cheapest priced model, which here is
+    /// `gpt-6-luna` — fortyfold below Astra's. And a cache-hit rate guessed at
+    /// anything other than the ratio `OpenAI` uses would misprice cache reads
+    /// silently, because no published table is consulted at runtime. That is the
+    /// one column the GPT-6 block of the catalogue page does not state.
+    ///
+    /// Held over the whole preset rather than the models above, so a generation
+    /// added later fails here instead of shipping unpriced. `relative_cost`
+    /// against `price.input` is checked by the test above and not repeated.
+    #[test]
+    fn every_openai_model_is_priced_and_caches_at_a_tenth() {
+        // A directory, not an installation: this test reads the preset's model
+        // list and never touches a file, so naming the packaged state directory
+        // would only put an install path in a source line that has no use for
+        // one.
+        let openai = Preset::Openai.provider(Path::new("/nonexistent"));
+        assert!(!openai.models.is_empty());
+        for model in &openai.models {
+            let price = model
+                .price
+                .unwrap_or_else(|| panic!("{} must carry a rate, or its traffic cannot be billed", model.id));
+            assert_eq!(
+                price.cache_hit * 10,
+                price.input,
+                "{} caches at a tenth of its input rate",
+                model.id
+            );
+        }
+    }
+
+    /// Heavy resolves to Sol, not Astra, and the cheaper generation wins.
+    ///
+    /// `model_for` answers with the cheapest model in a class, so this is the
+    /// whole routing consequence of listing two generations: GPT-5.6 stays
+    /// reachable by pin only, and Astra — five times Sol for the same class — is
+    /// never what an unpinned heavy request gets. A preset edited so the
+    /// flagship became the default would multiply the cost of every hard request
+    /// and pass every other test in this file.
+    #[test]
+    fn heavy_defaults_to_the_cheaper_of_the_two_flagships() {
+        let openai = Preset::Openai.provider(Path::new("/nonexistent"));
+        let cheapest = |class| openai.model_for(class, 0).map(|m| m.id.as_str());
+        assert_eq!(cheapest(Class::Heavy), Some("gpt-6.1-sol"));
+        assert_eq!(cheapest(Class::Balanced), Some("gpt-6.1-terra"));
+        assert_eq!(cheapest(Class::Fast), Some("gpt-6-luna"));
+        // And the flagship is still listed, so an exact pin finds it.
+        assert!(openai.serves("gpt-6-astra").is_some());
     }
 
     /// A `user_id` the vendor would reject is caught when the config is read.
@@ -3650,6 +3841,12 @@ mod tests {
             "gpt-5.6-sol",
             "gpt-5.6-terra",
             "gpt-5.6-luna",
+            // The generation that replaced them, which a row written before it
+            // existed must be able to adopt.
+            "gpt-6-astra",
+            "gpt-6.1-sol",
+            "gpt-6.1-terra",
+            "gpt-6-luna",
         ] {
             assert!(
                 published_price(priced).is_some(),
@@ -3723,6 +3920,91 @@ mod tests {
         assert!(
             anthropic.has_no_recorded_rate(),
             "the subscription hop records no rate, and none is invented for it"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A row written before a model was published gains it on the way in.
+    ///
+    /// The case this exists for: a provider configured when the catalogue listed
+    /// three models, upgraded to a build whose catalogue lists seven. The panel
+    /// saves a model list as text and never a preset name, so nothing else would
+    /// ever hand the row the new ids — they would be missing from the pin
+    /// dropdown with nothing to say why.
+    ///
+    /// Also pins the two limits. Adoption appends and never reorders, so a row
+    /// that already lists a model keeps its own class and cost for it; and it is
+    /// claimed on `base_url`, so a provider pointed somewhere else is left
+    /// exactly as written rather than being handed a vendor's catalogue.
+    #[test]
+    fn a_row_gains_the_models_the_catalogue_publishes_for_its_host() {
+        let dir = std::env::temp_dir().join(format!("ta-proxy-models-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("providers.json");
+
+        let mut openai = Preset::Openai.provider(&dir);
+        let published = openai.models.len();
+        // The row as an older build wrote it: the generation before this one.
+        // Selected by id rather than by position, because the catalogue's order
+        // is not part of what this test is asserting and a fixture that reads
+        // "the third model" silently becomes a different model when a
+        // generation is inserted above it.
+        openai.models.retain(|m| m.id.starts_with("gpt-5.6-"));
+        assert_eq!(openai.models.len(), 3);
+        // With one of them classed and costed by hand, which must survive.
+        let luna = openai
+            .models
+            .iter_mut()
+            .find(|m| m.id == "gpt-5.6-luna")
+            .expect("the older generation lists it");
+        luna.relative_cost = 999;
+        luna.class = Class::Balanced;
+
+        let mut by_hand = Provider {
+            user_id: None,
+            id: "elsewhere".to_owned(),
+            wire: Wire::Openai,
+            base_url: "https://llm.internal.example/v1".to_owned(),
+            auth: Auth::ApiKeyEnv { var: "K".to_owned() },
+            models: vec![Model::new("house-model", Class::Balanced, 5)],
+            preference: 10,
+            enabled: true,
+            peak: None,
+            server_tools: None,
+        };
+        by_hand.adopt_published_models();
+
+        let mut r = Registry::default();
+        r.providers.push(openai);
+        r.providers.push(by_hand);
+        r.save(&path).expect("save");
+
+        let back = Registry::load(&path);
+        let row = back.providers.iter().find(|p| p.id == "openai").expect("the row");
+        assert_eq!(row.models.len(), published, "every published model is on the row");
+        for model in Preset::Openai.provider(&dir).models {
+            assert!(
+                row.models.iter().any(|m| m.id == model.id),
+                "{} must be offered once the row is loaded",
+                model.id
+            );
+        }
+        let touched = row
+            .models
+            .iter()
+            .find(|m| m.id == "gpt-5.6-luna")
+            .expect("still listed");
+        assert_eq!(touched.relative_cost, 999, "a cost set by hand is not the adoption's");
+        assert_eq!(touched.class, Class::Balanced, "nor is the class it was given");
+
+        // The catalogue says nothing about this host, and nothing is invented
+        // for it — one model in, one model out.
+        let other = back.providers.iter().find(|p| p.id == "elsewhere").expect("the row");
+        assert_eq!(
+            other.models.len(),
+            1,
+            "{:?}",
+            other.models.iter().map(|m| &m.id).collect::<Vec<_>>()
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

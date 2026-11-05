@@ -119,11 +119,20 @@ impl Proxy {
 
         // A port is picked, then released, then handed to the child — and any
         // test running in parallel can take it in that window, which is a
-        // `free_port` race and not a defect in the proxy. It shows up as the
-        // child exiting before it listens, so the failure is visible and the
-        // only sane response is another port. Three attempts: a port lost three
-        // times in a row means something other than scheduling, and the real
-        // diagnostics are more useful than a fourth try.
+        // `free_port` race and not a defect in the proxy. Three attempts: a port
+        // lost three times in a row means something other than scheduling, and
+        // the real diagnostics are more useful than a fourth try.
+        //
+        // Two ways to lose it, and the louder one is `wait_until_listening`
+        // seeing our child die before it binds. The quiet one is worse: another
+        // test binary's proxy — a `--workspace` run has several at once — binds
+        // the port first and answers, so the connect succeeds and every request
+        // in this test then goes to a server holding a *different* admin token.
+        // The wrong tokens are still refused, so the loop below passes, and the
+        // real one is refused too: `a_wrong_token_is_refused` failed exactly
+        // that way, on the one assertion that expects 200. Proving the server is
+        // ours is therefore part of starting it, and the token is the proof:
+        // only a proxy reading this scratch directory accepts it.
         let mut attempt = 0;
         let (port, child) = loop {
             attempt += 1;
@@ -147,7 +156,14 @@ impl Proxy {
 
             let mut child = Serving(child);
             match wait_until_listening(port, &mut child.0) {
-                Ok(()) => break (port, child),
+                Ok(()) if answers_with(port, &token) => break (port, child),
+                Ok(()) if attempt < 3 => {
+                    eprintln!("attempt {attempt} on port {port} lost: it answers, but not with our token");
+                }
+                Ok(()) => panic!(
+                    "three ports running answered with a credential that is not this installation's; \
+                     something other than a lost port is going on"
+                ),
                 Err(why) if attempt < 3 => {
                     eprintln!("attempt {attempt} on port {port} lost: {why}; retrying");
                 }
@@ -248,6 +264,16 @@ fn body(response: &str) -> String {
         .split_once("\r\n\r\n")
         .map(|(_, b)| b.to_owned())
         .unwrap_or_default()
+}
+
+/// Whether the server on `port` accepts `token`.
+///
+/// Lenient on purpose, unlike [`status`]: this runs against a socket that may
+/// belong to something other than our proxy, and a harness asking "is this
+/// mine?" must answer no rather than panic when the answer is a truncated or
+/// unparseable response.
+fn answers_with(port: u16, token: &str) -> bool {
+    get_authed(port, "/api/users", token).split_whitespace().nth(1) == Some("200")
 }
 
 // ── the decision this file pins ──────────────────────────────────────────────
