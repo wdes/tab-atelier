@@ -203,7 +203,28 @@ pub(crate) fn rotate_key(
     if let Some(reason) = auth.no_key_reason(id) {
         return Err(Failure::problem(400, reason));
     }
-    let path = provider::provider_key_path(&registry_dir(state), id);
+    // **Write where the entry READS, not where we would put a new file.**
+    //
+    // `credential_ready` checks the path stored in `auth`, so writing the
+    // canonical `provider-{id}.key` while the entry names something else leaves
+    // the provider reporting "missing" no matter how many times a key is saved —
+    // the write succeeds, lands in a file nobody consults, and the dialog comes
+    // back unchanged. A hand-edited config, an imported provider, or a config
+    // directory that has since moved all produce exactly that split.
+    let canonical = provider::provider_key_path(&registry_dir(state), id);
+    let path = match &auth {
+        provider::Auth::ApiKeyFile { path } if !path.is_empty() => std::path::PathBuf::from(path),
+        _ => canonical.clone(),
+    };
+    if path != canonical {
+        // Worth saying out loud, because it is invisible otherwise: the entry is
+        // reading a file that is not the one this proxy would name.
+        log::info!(
+            "proxy: provider {id} keeps its key at {}, not the default {} — writing there",
+            path.display(),
+            canonical.display(),
+        );
+    }
     if let Err(e) = provider::write_provider_key(&path, &request.key) {
         return Err(Failure::problem(500, format!("key file: {e}")));
     }
@@ -988,6 +1009,52 @@ mod tests {
     }
 
     // ── rotating a key ──────────────────────────────────────────────────────
+
+    /// **The regression.** A key is written where the ENTRY reads it.
+    ///
+    /// `credential_ready` checks the path stored in `auth`. Rotation used to
+    /// compute the canonical `provider-{id}.key` instead, so when the two differed
+    /// the save succeeded into a file nothing consults: the provider went on
+    /// reporting "missing", the dialog re-read the same empty path, and pasting
+    /// again changed nothing. A provider whose path is not canonical is not
+    /// exotic — a hand-edited config, an imported entry, or a registry directory
+    /// that moved all produce it.
+    #[test]
+    fn a_key_is_written_where_the_entry_reads_it() {
+        let state = state_for("rotate-elsewhere");
+        let dir = state.registry_path.parent().expect("dir");
+
+        // An entry deliberately pointing away from the canonical name.
+        let elsewhere = dir.join("custom-location.key");
+        let mut p = Preset::Deepseek.provider_named(dir, "moved");
+        p.auth = crate::provider::Auth::ApiKeyFile {
+            path: elsewhere.display().to_string(),
+        };
+        seed(&state, p);
+        assert!(
+            !state.registry.lock().unwrap().get("moved").unwrap().credential_ready(),
+            "starts out missing, which is what the operator sees",
+        );
+
+        let reply = rotate_key(
+            "moved",
+            &RotateProviderKey {
+                key: "sk-pasted-here".to_owned(),
+            },
+            &state,
+        );
+        assert_eq!(answered(reply), 200);
+
+        assert!(elsewhere.exists(), "written to the path the entry names");
+        assert!(
+            !dir.join("provider-moved.key").exists(),
+            "and not to the canonical name, which nothing here reads",
+        );
+        assert!(
+            state.registry.lock().unwrap().get("moved").unwrap().credential_ready(),
+            "so the provider stops reporting missing",
+        );
+    }
 
     #[test]
     fn rotating_the_key_of_a_provider_that_is_not_there_is_a_404() {
