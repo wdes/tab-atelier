@@ -1533,8 +1533,11 @@ const AdminApp = Vue.defineComponent({
         } else if (typeof value === "string") {
           const oneLine = value.length > 160 ? `${value.slice(0, 160)}…` : value;
           // A newline inside a string would break the row into several lines and
-          // destroy the alignment the tree depends on.
-          out.push({ pad, key, kind: "str", text: oneLine.replace(/\n/g, "⏎"), title: value });
+          // destroy the alignment the tree depends on. Shown as the literal `\n`
+          // rather than a symbol, because that is how the value reads in the raw
+          // view next door — and because it keeps this file pure ASCII, which the
+          // commit gate enforces on every added line.
+          out.push({ pad, key, kind: "str", text: oneLine.replace(/\n/g, "\\n"), title: value });
         } else if (typeof value === "number" || typeof value === "boolean") {
           out.push({ pad, key, kind: "num", text: String(value) });
         } else if (Array.isArray(value)) {

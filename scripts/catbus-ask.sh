@@ -74,6 +74,19 @@ tool_args=''
 # Run from an empty directory: a `.catbus/tools.toml` in the working tree can
 # WIDEN a tool set, so an agent that must not act cannot be started inside a repo.
 rundir=$(mktemp -d) || exit 1
+
+# Session transcripts go inside that directory, via the agent's own `--session-dir`.
+#
+# Their default home is `~/.claude/projects/<escaped cwd>`, and for a one-shot run
+# the transcript IS the prompt — a diff, a commit message. So the default put
+# review material into the user's Claude history, a directory a person reads and
+# resumes from, and added one entry per commit and per push to a list they browse.
+#
+# Pointing it at a directory this script created means the cleanup below removes
+# only what it made: no glob over `~/.claude/projects`, and no chance of deleting a
+# real session.
+session_dir="$rundir/sessions"
+mkdir -p "$session_dir" || exit 1
 trap 'rm -rf "$rundir"' EXIT INT TERM
 
 cd "$rundir" || exit 1
@@ -81,4 +94,4 @@ cd "$rundir" || exit 1
 # whether it was slow or stuck, and `timeout(1)` is not on every machine the hooks
 # run on.
 "$agent" --no-tui --once --prompt-file - --ansi=false --timeout "$timeout_s" \
-	$id_args $tool_args
+	--session-dir "$session_dir" $id_args $tool_args

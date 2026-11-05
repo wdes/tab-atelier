@@ -144,6 +144,17 @@ struct Args {
     #[arg(long, value_name = "SECONDS", default_value_t = 180)]
     timeout: u64,
 
+    /// Write session transcripts and sockets here instead of `~/.claude/projects`.
+    ///
+    /// For a one-shot run the transcript holds the prompt, and for a review that
+    /// prompt is the diff. Putting it under `~/.claude/projects` deposits review
+    /// material in the user's Claude history — a directory a person reads and
+    /// resumes from — and adds one entry per run to a list they browse. A caller
+    /// that throws the answer away should say where the record goes, and point it
+    /// at something it deletes itself.
+    #[arg(long, value_name = "DIR")]
+    session_dir: Option<PathBuf>,
+
     /// Start in this permission mode: `open` (everything allowed, the default),
     /// `auto` (a judge checks each write/edit/bash first), or `plan` (write,
     /// edit, bash and spawn propose instead of acting).
@@ -476,33 +487,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // After the cwd, because a project's `.catbus/identity.md` is found *at* it.
     let (tool_set, identity) = resolve_tools(&args, &cwd)?;
 
-    // The relay must resolve *before* we open the socket — no point
-    // accepting prompts we can't service. Relay resolution only reads
-    // this machine's own preferences and token; the subscription login
-    // stays on the proxy, so catbus works on a box with no Claude Code
-    // credentials at all.
-    let provider =
-        if let (Some(url), Some(token), Some(model)) = (args.openai_url, args.openai_token, args.openai_model) {
-            agent::Provider::OpenAiCompat(openai::Config {
-                chat_url: openai::chat_url_from_base(&url),
-                token,
-                model,
-                reasoning_effort: args.openai_reasoning_effort,
-            })
-        } else if let (Some(product_id), Some(token)) = (args.infomaniak_product_id, args.infomaniak_token) {
-            agent::Provider::OpenAiCompat(openai::Config {
-                chat_url: openai::infomaniak_chat_url(&product_id),
-                token,
-                model: args.infomaniak_model,
-                // Infomaniak's models are not the reasoning family, and the field
-                // is refused by models that do not know it.
-                reasoning_effort: None,
-            })
-        } else {
-            let relay = relay::Relay::resolve(args.relay_url.as_deref(), args.relay_token.as_deref())?;
-            log::info!("relaying to {}", relay.base_url());
-            agent::Provider::Relay(relay)
-        };
+    let provider = resolve_provider(&args)?;
+
+    // Before the session opens, because that is the only moment the choice can be
+    // honoured: a transcript written to the default location cannot be moved
+    // afterwards without leaving the entry behind.
+    if let Some(dir) = args.session_dir.as_ref() {
+        redirect_transcripts(dir);
+    }
     let session = session::open(&cwd, args.resume.as_deref(), args.new_session)?;
 
     // Apply --name if provided (also works as a rename on resume).
@@ -683,6 +675,66 @@ fn gate_command(input: &str) -> Option<tools::Gate> {
         "noplan" | "noauto" => Some(tools::Gate::Open),
         other => tools::parse_gate(other),
     }
+}
+
+/// Which endpoint this run talks to, from the flags that name one.
+///
+/// Resolved before the socket opens: there is no point accepting prompts that
+/// cannot be serviced. Only this machine's own preferences and token are read; the
+/// subscription login stays on the proxy, so catbus works on a box with no Claude
+/// Code credentials at all.
+///
+/// Extracted from `run`, which is the caller's process setup rather than a place
+/// to pick a transport.
+fn resolve_provider(args: &Args) -> Result<agent::Provider, Box<dyn std::error::Error>> {
+    // Only this machine's own preferences and token are read here. The subscription
+    // login stays on the proxy, so catbus works on a box with no Claude Code
+    // credentials at all.
+    //
+    // Borrowed rather than moved: this takes `&Args` so the caller keeps its
+    // arguments, and the names are cloned only where a `Config` needs to own them.
+    let provider = if let (Some(url), Some(token), Some(model)) = (
+        args.openai_url.as_deref(),
+        args.openai_token.as_deref(),
+        args.openai_model.as_deref(),
+    ) {
+        agent::Provider::OpenAiCompat(openai::Config {
+            chat_url: openai::chat_url_from_base(url),
+            token: token.to_owned(),
+            model: model.to_owned(),
+            reasoning_effort: args.openai_reasoning_effort.clone(),
+        })
+    } else if let (Some(product_id), Some(token)) =
+        (args.infomaniak_product_id.as_deref(), args.infomaniak_token.as_deref())
+    {
+        agent::Provider::OpenAiCompat(openai::Config {
+            chat_url: openai::infomaniak_chat_url(product_id),
+            token: token.to_owned(),
+            model: args.infomaniak_model.clone(),
+            // Infomaniak's models are not the reasoning family, and the field is
+            // refused by models that do not know it.
+            reasoning_effort: None,
+        })
+    } else {
+        let relay = relay::Relay::resolve(args.relay_url.as_deref(), args.relay_token.as_deref())?;
+        log::info!("relaying to {}", relay.base_url());
+        agent::Provider::Relay(relay)
+    };
+    Ok(provider)
+}
+
+/// Send this process's session transcripts to a chosen directory.
+///
+/// The default is `~/.claude/projects/<escaped cwd>`, right for a session a human
+/// will resume and wrong for a one-shot run whose transcript is the prompt: a
+/// review would deposit the diff in the user's Claude history and add an entry to
+/// a list they browse, once per commit and per push.
+///
+/// A second call is ignored by `set_session_root`, so this cannot scatter one
+/// session across two directories.
+fn redirect_transcripts(dir: &std::path::Path) {
+    session::set_session_root(dir.to_path_buf());
+    log::info!("session transcripts go to {}", dir.display());
 }
 
 /// One prompt from a file or stdin, answered and printed, then done.

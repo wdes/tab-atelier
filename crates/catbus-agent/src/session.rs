@@ -54,11 +54,17 @@ pub struct Session {
 /// whichever conversation was last in that directory, and two agents in one directory silently shared
 /// a history. Continuing an earlier session is only ever explicit, through `resume_id`.
 pub fn open(cwd: &Path, resume_id: Option<&str>, _new_session: bool) -> Result<Session, SessionError> {
-    let home = std::env::var_os("HOME").ok_or(SessionError::NoHome)?;
-    let project_dir = PathBuf::from(home)
-        .join(".claude")
-        .join("projects")
-        .join(escape_cwd(cwd));
+    // The override wins when it is set; otherwise the conventional project
+    // directory, which is where a human looks for the session they can resume.
+    let project_dir = if let Some(root) = SESSION_ROOT.get() {
+        root.join(escape_cwd(cwd))
+    } else {
+        let home = std::env::var_os("HOME").ok_or(SessionError::NoHome)?;
+        PathBuf::from(home)
+            .join(".claude")
+            .join("projects")
+            .join(escape_cwd(cwd))
+    };
     std::fs::create_dir_all(&project_dir)?;
     // An explicit id is the only way to continue an earlier session, and it wins even when
     // `--new-session` is also passed: a caller that names a session means that session, and every
@@ -312,6 +318,9 @@ pub fn first_prompt(path: &Path, max_chars: usize) -> Option<String> {
 /// sidecars for `cwd` live. Returns `None` if `HOME` isn't set.
 #[must_use]
 pub fn project_dir_for(cwd: &Path) -> Option<PathBuf> {
+    if let Some(root) = SESSION_ROOT.get() {
+        return Some(root.join(escape_cwd(cwd)));
+    }
     let home = std::env::var_os("HOME")?;
     Some(
         PathBuf::from(home)
@@ -319,6 +328,24 @@ pub fn project_dir_for(cwd: &Path) -> Option<PathBuf> {
             .join("projects")
             .join(escape_cwd(cwd)),
     )
+}
+
+/// Where transcripts go, when the caller says so instead of `~/.claude/projects`.
+///
+/// Set once from `--session-dir`. For a one-shot run the transcript holds the
+/// prompt — which for a review is the diff — so writing it into the user's Claude
+/// project directory both leaks the material somewhere it was never meant to live
+/// and litters that directory with one entry per run. `~/.claude/projects` is the
+/// right home for a session a human will resume; it is the wrong home for an
+/// answer that is thrown away.
+static SESSION_ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Redirect transcripts for the rest of this process.
+///
+/// Silently ignores a second call: the first one wins, because changing where
+/// transcripts live mid-run would scatter one session across two directories.
+pub fn set_session_root(dir: PathBuf) {
+    let _ = SESSION_ROOT.set(dir);
 }
 
 /// All session ids in this cwd, newest first. Used by the
