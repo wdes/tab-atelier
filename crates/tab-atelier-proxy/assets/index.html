@@ -777,19 +777,51 @@
               </table>
               <div class="d-flex justify-content-between align-items-center mb-1">
                 <div class="small text-body-secondary">Body</div>
-                <!-- Copies the pretty form — the same string the viewer cuts
-                     into coloured runs below, so what lands on the clipboard is
-                     what is on screen. -->
-                <button class="btn btn-sm btn-outline-secondary" @click="copy(prettyJson(inspectOpen.request_body))">
-                  {{ copied ? 'Copied' : 'Copy JSON' }}
-                </button>
+                <div class="d-flex gap-2">
+                  <!-- Two ways to read the same bytes. Structure is for finding a
+                       field; Raw is for copying exactly what was sent, which is
+                       why both stay. -->
+                  <div class="btn-group btn-group-sm" role="group" aria-label="Body view">
+                    <button type="button" class="btn btn-outline-secondary"
+                            :class="{ active: bodyView === 'structure' && inspectRows !== null }"
+                            :disabled="inspectRows === null"
+                            @click="bodyView = 'structure'">Structure</button>
+                    <button type="button" class="btn btn-outline-secondary"
+                            :class="{ active: bodyView === 'raw' }"
+                            @click="bodyView = 'raw'">Raw</button>
+                  </div>
+                  <!-- Copies the pretty form — the same string the viewer cuts
+                       into coloured runs below, so what lands on the clipboard is
+                       what is on screen. -->
+                  <button class="btn btn-sm btn-outline-secondary" @click="copy(prettyJson(inspectOpen.request_body))">
+                    {{ copied ? 'Copied' : 'Copy JSON' }}
+                  </button>
+                </div>
+              </div>
+              <!-- Fields, indented, one per row: the view for "what model did it
+                   ask for" without hunting through braces. Values keep their
+                   untruncated form in `title`, so hovering shows what the row
+                   shortened. -->
+              <div v-if="bodyView === 'structure' && inspectRows !== null"
+                   class="small bg-body-tertiary p-2 rounded mb-0 font-monospace"
+                   style="max-height: 30rem; overflow:auto">
+                <div v-for="(row, i) in inspectRows" :key="i"
+                     class="ta-jrow" :title="row.title">
+                  <span :style="{ paddingLeft: (row.pad * 1.1) + 'rem' }"></span>
+                  <span v-if="row.key" class="ta-j-key">{{ row.key }}</span>
+                  <span v-if="row.key && row.kind !== 'open'" class="text-body-secondary">: </span>
+                  <span v-if="row.kind === 'open'" class="text-body-secondary">{{ row.text }}</span>
+                  <span v-else-if="row.kind === 'str'" class="ta-j-str">{{ row.text }}</span>
+                  <span v-else-if="row.kind === 'num'" class="ta-j-num">{{ row.text }}</span>
+                  <span v-else class="ta-j-lit">{{ row.text }}</span>
+                </div>
               </div>
               <!-- Runs, interpolated, never `v-html`. The body is written by
                    whoever holds an API key, and this viewer is where a
                    prompt-injection payload would be on display; interpolation
                    escapes it, `v-html` would execute a `<img onerror=…>`
                    sitting in a system prompt. -->
-              <pre class="small bg-body-tertiary p-2 rounded mb-0" style="max-height: 30rem; overflow:auto"><span v-for="t in jsonTokens(inspectOpen.request_body)" :class="t.cls">{{ t.text }}</span></pre>
+              <pre v-else class="small bg-body-tertiary p-2 rounded mb-0" style="max-height: 30rem; overflow:auto"><span v-for="t in jsonTokens(inspectOpen.request_body)" :class="t.cls">{{ t.text }}</span></pre>
 
               <!-- The other half of the call. Captured apart from the request
                    because they fail to different places: a 400 says the request
@@ -1134,9 +1166,18 @@
             <p class="small text-body-secondary mb-3">
               When this person's traffic matches a rule, it is served by that
               rule's destination instead — even when they are pinned to another
-              provider. A rule left on <em>work</em> leaves auto-mode and
-              plan-mode traffic alone. Clearing a destination removes the rule.
+              provider. A rule left on <em>work</em> leaves auto-mode traffic
+              alone. Clearing a destination removes the rule.
             </p>
+
+            <!-- Nothing to show yet. Said plainly rather than with a blank row:
+                 a pre-filled row reads as a rule that already exists, and one
+                 waiting at the bottom invites saving nothing. -->
+            <div v-if="routes.rows.length === 0"
+                 class="border rounded p-4 mb-3 text-center text-body-secondary small">
+              No rules yet. This person is served by their provider and model pins,
+              and by normal routing.
+            </div>
 
             <div v-for="(r, i) in routes.rows" :key="i" class="border rounded p-3 mb-3">
               <div class="d-flex justify-content-between align-items-center mb-2">
@@ -1161,9 +1202,14 @@
                 <div class="col-sm-4 text-sm-end"><label class="form-label mb-0 small">and the traffic is</label></div>
                 <div class="col-sm-8">
                   <select class="form-select form-select-sm" v-model="r.kind" :disabled="busy">
-                    <option value="">work (default)</option>
-                    <option value="classifier">auto mode</option>
+                    <option value="">work — normal requests</option>
+                    <option value="classifier">auto mode — the safety judgement</option>
                   </select>
+                  <div class="form-text" style="font-size:.75rem">
+                    A rule left on <em>work</em> never moves auto-mode traffic:
+                    that call carries Anthropic's monitor prompt to whoever serves
+                    it, and a rule that did not name it must not send it elsewhere.
+                  </div>
                 </div>
 
                 <div class="col-sm-4 text-sm-end"><label class="form-label mb-0 small">and it is heading for</label></div>

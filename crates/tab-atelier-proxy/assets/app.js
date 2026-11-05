@@ -228,6 +228,7 @@ const AdminApp = Vue.defineComponent({
             // Per-panel, for the same reason as the chart flags: a fetch that greys
             // out unrelated controls reads as the page being broken.
             providersBusy: false,
+            bodyView: "structure",
             /**
              * The key dialog, when open.
              *
@@ -293,6 +294,21 @@ const AdminApp = Vue.defineComponent({
         };
     },
     computed: {
+        /**
+         * The open capture's body as tree rows, parsed once.
+         *
+         * A computed rather than a call in the template: the template asks for it
+         * three times per render — for the toggle's disabled state, for the row count
+         * and for the list — and `jsonRows` parses the whole body on each call. A
+         * multi-megabyte capture would re-parse it several times per keystroke.
+         *
+         * Cached on the body string, so it re-parses exactly when the selection
+         * changes and not when anything else on the page does.
+         */
+        inspectRows() {
+            const body = this.inspectOpen ? this.inspectOpen.request_body : "";
+            return body ? this.jsonRows(body) : null;
+        },
         plan() {
             return this.pressure?.plan || {};
         },
@@ -1020,10 +1036,18 @@ const AdminApp = Vue.defineComponent({
             }
             return out;
         },
+        /**
+         * Open the editor on this account's rules.
+         *
+         * No blank row is appended. A pre-filled row reads as "this account already
+         * has an empty rule", and one waiting at the bottom of the list invites a save
+         * of nothing — so the editor shows what exists and offers a button to add the
+         * first one.
+         */
         openRoutes(u) {
             this.routes = {
                 id: u.id,
-                rows: [...(u.routes ?? []).map(draftFrom), blankRoute()],
+                rows: (u.routes ?? []).map(draftFrom),
             };
         },
         addRouteRow() {
@@ -1057,9 +1081,10 @@ const AdminApp = Vue.defineComponent({
                 return;
             // Never stored, so nothing to undo on the server.
             if (!row.saved) {
+                // Just drop it. Replacing it with a fresh blank would make removing the
+                // last row look like nothing happened, and puts a row the operator did not
+                // ask for back in front of them.
                 this.routes.rows.splice(i, 1);
-                if (this.routes.rows.length === 0)
-                    this.routes.rows.push(blankRoute());
                 return;
             }
             const accountId = this.routes.id;
@@ -1079,7 +1104,7 @@ const AdminApp = Vue.defineComponent({
                 });
                 const editor = this.routes;
                 if (editor && editor.id === accountId) {
-                    editor.rows = [...(updated.routes ?? []).map(draftFrom), blankRoute()];
+                    editor.rows = (updated.routes ?? []).map(draftFrom);
                 }
                 this.error = "";
                 await this.refresh();
@@ -1130,7 +1155,7 @@ const AdminApp = Vue.defineComponent({
                 // request was in flight — the save still happened, the form is just gone.
                 const editor = this.routes;
                 if (editor && editor.id === accountId) {
-                    editor.rows = [...(updated.routes ?? []).map(draftFrom), blankRoute()];
+                    editor.rows = (updated.routes ?? []).map(draftFrom);
                 }
                 this.error = "";
                 await this.refresh();
@@ -1519,6 +1544,74 @@ const AdminApp = Vue.defineComponent({
             }
             if (last < pretty.length)
                 out.push({ cls: "", text: pretty.slice(last) });
+            return out;
+        },
+        /**
+         * The request body as readable rows, for the Structure view.
+         *
+         * Flattened into a list with a depth per row rather than nested markup: a
+         * recursive component per level is a lot of machinery for what amounts to an
+         * outline, and a flat list keeps the whole body in one scroll container so the
+         * browser does not have to lay out thousands of nested boxes.
+         *
+         * Two limits, both for the same reason — a capture can be megabytes and JSON
+         * that large is not read by eye:
+         *   - `depth` stops at 8, and anything below says so rather than vanishing;
+         *   - strings are cut to 160 characters, with the full value in the row's
+         *     `title` so hovering shows the rest.
+         *
+         * Returns `null` when the body is not JSON: the caller then shows the raw
+         * text alone, because a parse failure is worth seeing rather than hiding
+         * behind an empty tree.
+         */
+        jsonRows(body) {
+            let parsed;
+            try {
+                parsed = JSON.parse(body);
+            }
+            catch {
+                return null;
+            }
+            const out = [];
+            const walk = (value, key, depth) => {
+                const pad = depth;
+                if (depth > 8) {
+                    out.push({ pad, key, kind: "more", text: "… deeper than this view shows" });
+                    return;
+                }
+                if (value === null) {
+                    out.push({ pad, key, kind: "null", text: "null" });
+                }
+                else if (typeof value === "string") {
+                    const oneLine = value.length > 160 ? `${value.slice(0, 160)}…` : value;
+                    // A newline inside a string would break the row into several lines and
+                    // destroy the alignment the tree depends on.
+                    out.push({ pad, key, kind: "str", text: oneLine.replace(/\n/g, "⏎"), title: value });
+                }
+                else if (typeof value === "number" || typeof value === "boolean") {
+                    out.push({ pad, key, kind: "num", text: String(value) });
+                }
+                else if (Array.isArray(value)) {
+                    out.push({ pad, key, kind: "open", text: `[ ${value.length} ]` });
+                    value.forEach((v, i) => walk(v, String(i), pad + 1));
+                }
+                else if (typeof value === "object") {
+                    const n = Object.keys(value).length;
+                    out.push({ pad, key, kind: "open", text: `{ ${n} ${n === 1 ? "field" : "fields"} }` });
+                    for (const [k, v] of Object.entries(value)) {
+                        walk(v, k, pad + 1);
+                    }
+                }
+            };
+            // The top level is an object in practice; walking it directly keeps the
+            // first row from being a pointless `{ 12 fields }` above its own contents.
+            if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+                for (const [k, v] of Object.entries(parsed))
+                    walk(v, k, 0);
+            }
+            else {
+                walk(parsed, "", 0);
+            }
             return out;
         },
         /**

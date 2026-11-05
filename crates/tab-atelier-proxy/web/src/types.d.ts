@@ -696,6 +696,20 @@ interface JsonToken {
     text: string;
 }
 
+/** One row of the flattened JSON tree in the Structure view. */
+interface JsonRow {
+    /** Indent level; the renderer turns it into padding, not nested elements. */
+    pad: number;
+    /** The field name or array index. Empty for the root. */
+    key: string;
+    /** How to draw the value: colour, and whether it opens a container. */
+    kind: "open" | "str" | "num" | "null" | "more";
+    /** The value as shown — already truncated, already free of newlines. */
+    text: string;
+    /** The untruncated value, for a tooltip. Absent when nothing was cut. */
+    title?: string;
+}
+
 /**
  * Anything the shared hover/label mixins can plot.
  *
@@ -757,6 +771,14 @@ interface AppState {
      * server, so one bad destination must not hold the others hostage.
      */
     routes: { id: string; rows: DraftRoute[] } | null;
+    /**
+     * How the capture body is drawn: as a field tree, or as the exact bytes.
+     *
+     * Structure is the default because the question an operator opens this panel
+     * with is "what did it actually ask for", and answering that by scanning
+     * braces is the thing this exists to stop.
+     */
+    bodyView: "structure" | "raw";
     /**
      * The provider key dialog, when open.
      *
