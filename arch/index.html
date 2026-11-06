@@ -1,0 +1,37 @@
+<!DOCTYPE html><meta charset=utf-8><title>tab-atelier Arch repo</title>
+<style>body{font-family:system-ui;max-width:48em;margin:3em auto;padding:0 1em}
+code{background:#f4f4f4;padding:.1em .3em;border-radius:3px}
+pre{background:#f4f4f4;padding:.6em .8em;border-radius:4px;overflow-x:auto;white-space:pre-wrap;overflow-wrap:anywhere}
+.note{background:#fff8d6;border-left:3px solid #d9a900;padding:.6em .9em;margin:1em 0;font-size:.95em}</style>
+<h1>tab-atelier Arch Linux repo</h1>
+<p>A signed-optional pacman repository (rolling; newest build wins). Add it to <code>/etc/pacman.conf</code>:</p>
+<pre>[tab-atelier]
+SigLevel = Optional TrustAll
+Server = https://deb.tab-atelier.wdes.eu/arch</pre>
+<p>Then install (the two packages conflict — pick one):</p>
+<pre>sudo pacman -Sy tab-atelier            # desktop GUI
+sudo pacman -Sy tab-atelier-headless   # display-less daemon</pre>
+<div class="note">Prefer building from source? The AUR-style <code>PKGBUILD</code> lives in <a href="https://github.com/wdes/tab-atelier/tree/main/packaging/arch">packaging/arch/</a>.</div>
+<h2>Packages</h2><ul>
+<li><a href="tab-atelier-headless-0.6.0.r1319.gd18b0c7-1-x86_64.pkg.tar.zst">tab-atelier-headless-0.6.0.r1319.gd18b0c7-1-x86_64.pkg.tar.zst</a> &mdash; 8.5M</li>
+<li><a href="tab-atelier-0.6.0.r1319.gd18b0c7-1-x86_64.pkg.tar.zst">tab-atelier-0.6.0.r1319.gd18b0c7-1-x86_64.pkg.tar.zst</a> &mdash; 15M</li>
+<li><a href="tab-atelier-headless-0.6.0.r1318.g5eedc25-1-x86_64.pkg.tar.zst">tab-atelier-headless-0.6.0.r1318.g5eedc25-1-x86_64.pkg.tar.zst</a> &mdash; 8.5M</li>
+<li><a href="tab-atelier-headless-0.6.0.r1317.g7ddce40-1-x86_64.pkg.tar.zst">tab-atelier-headless-0.6.0.r1317.g7ddce40-1-x86_64.pkg.tar.zst</a> &mdash; 8.5M</li>
+<li><a href="tab-atelier-headless-0.6.0.r1315.g1c957b9-1-x86_64.pkg.tar.zst">tab-atelier-headless-0.6.0.r1315.g1c957b9-1-x86_64.pkg.tar.zst</a> &mdash; 8.5M</li>
+<li><a href="tab-atelier-headless-0.6.0.r1314.ga6e9f14-1-x86_64.pkg.tar.zst">tab-atelier-headless-0.6.0.r1314.ga6e9f14-1-x86_64.pkg.tar.zst</a> &mdash; 8.5M</li>
+<li><a href="tab-atelier-headless-0.6.0.r1313.gd79f21f-1-x86_64.pkg.tar.zst">tab-atelier-headless-0.6.0.r1313.gd79f21f-1-x86_64.pkg.tar.zst</a> &mdash; 8.5M</li>
+<li><a href="tab-atelier-headless-0.6.0.r1312.gec06c0f-1-x86_64.pkg.tar.zst">tab-atelier-headless-0.6.0.r1312.gec06c0f-1-x86_64.pkg.tar.zst</a> &mdash; 8.5M</li>
+<li><a href="tab-atelier-headless-0.6.0.r1311.gf3d88ac-1-x86_64.pkg.tar.zst">tab-atelier-headless-0.6.0.r1311.gf3d88ac-1-x86_64.pkg.tar.zst</a> &mdash; 8.5M</li>
+<li><a href="tab-atelier-headless-0.6.0.r1309.gfa7e6be-1-x86_64.pkg.tar.zst">tab-atelier-headless-0.6.0.r1309.gfa7e6be-1-x86_64.pkg.tar.zst</a> &mdash; 8.5M</li>
+<li><a href="tab-atelier-headless-0.6.0.r1308.g31f0edc-1-x86_64.pkg.tar.zst">tab-atelier-headless-0.6.0.r1308.g31f0edc-1-x86_64.pkg.tar.zst</a> &mdash; 8.5M</li>
+<li><a href="tab-atelier-0.6.0.r1318.g5eedc25-1-x86_64.pkg.tar.zst">tab-atelier-0.6.0.r1318.g5eedc25-1-x86_64.pkg.tar.zst</a> &mdash; 15M</li>
+<li><a href="tab-atelier-0.6.0.r1317.g7ddce40-1-x86_64.pkg.tar.zst">tab-atelier-0.6.0.r1317.g7ddce40-1-x86_64.pkg.tar.zst</a> &mdash; 15M</li>
+<li><a href="tab-atelier-0.6.0.r1315.g1c957b9-1-x86_64.pkg.tar.zst">tab-atelier-0.6.0.r1315.g1c957b9-1-x86_64.pkg.tar.zst</a> &mdash; 15M</li>
+<li><a href="tab-atelier-0.6.0.r1314.ga6e9f14-1-x86_64.pkg.tar.zst">tab-atelier-0.6.0.r1314.ga6e9f14-1-x86_64.pkg.tar.zst</a> &mdash; 15M</li>
+<li><a href="tab-atelier-0.6.0.r1313.gd79f21f-1-x86_64.pkg.tar.zst">tab-atelier-0.6.0.r1313.gd79f21f-1-x86_64.pkg.tar.zst</a> &mdash; 15M</li>
+<li><a href="tab-atelier-0.6.0.r1312.gec06c0f-1-x86_64.pkg.tar.zst">tab-atelier-0.6.0.r1312.gec06c0f-1-x86_64.pkg.tar.zst</a> &mdash; 15M</li>
+<li><a href="tab-atelier-0.6.0.r1311.gf3d88ac-1-x86_64.pkg.tar.zst">tab-atelier-0.6.0.r1311.gf3d88ac-1-x86_64.pkg.tar.zst</a> &mdash; 15M</li>
+<li><a href="tab-atelier-0.6.0.r1309.gfa7e6be-1-x86_64.pkg.tar.zst">tab-atelier-0.6.0.r1309.gfa7e6be-1-x86_64.pkg.tar.zst</a> &mdash; 15M</li>
+<li><a href="tab-atelier-0.6.0.r1308.g31f0edc-1-x86_64.pkg.tar.zst">tab-atelier-0.6.0.r1308.g31f0edc-1-x86_64.pkg.tar.zst</a> &mdash; 15M</li>
+</ul>
+<p><a href="../">&larr; back to the apt repo</a></p>
