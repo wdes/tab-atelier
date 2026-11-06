@@ -31,6 +31,24 @@ function splitNames(text: string): string[] {
 }
 
 /**
+ * A small amount as plain decimal digits, never scientific notation.
+ *
+ * `toFixed` is the only built-in that cannot produce exponent form, and how many
+ * digits it needs depends on how small the value is: the decimal exponent says
+ * where the first significant digit starts, plus two so the figure does not
+ * round away to zero. Trailing zeros are trimmed, so a third of a micro-dollar
+ * reads `0.00000037` rather than `0.000000370`.
+ */
+function plainDecimal(value: number): string {
+  const exponent = Math.floor(Math.log10(Math.abs(value)));
+  const digits = Math.min(100, Math.max(2, -exponent + 2));
+  const text = value.toFixed(digits);
+  // Only a fractional part has zeros worth trimming: on "10" this would
+  // otherwise leave "1".
+  return text.includes(".") ? text.replace(/0+$/, "").replace(/\.$/, "") : text;
+}
+
+/**
  * One rewrite rule per line: a tool name, then `dates`, `provider`, or a
  * `find -> replace` pair.
  *
@@ -1028,8 +1046,14 @@ const AdminApp = Vue.defineComponent({
       if (!m.price) return "";
       const rate = (micro: number): string => {
         const usd = micro / 1_000_000;
-        const text = usd >= 1 ? usd.toFixed(2) : usd.toFixed(4).replace(/0+$/, "").replace(/\.$/, "");
-        return `$${text}`;
+        if (usd >= 1) return `$${usd.toFixed(2)}`;
+        // Below a ten-thousandth of a dollar, four decimals round the rate away
+        // to `$0`, so fall through to the full-decimal form instead of claiming
+        // a model is free.
+        if (usd >= 0.0001) {
+          return `$${usd.toFixed(4).replace(/0+$/, "").replace(/\.$/, "")}`;
+        }
+        return `$${plainDecimal(usd)}`;
       };
       const p = m.price;
       return `${rate(p.cache_hit)} / ${rate(p.input)} / ${rate(p.output)} per 1M`;
@@ -1117,7 +1141,11 @@ const AdminApp = Vue.defineComponent({
       if (usd === 0) return "$0";
       if (usd >= 0.01) return `$${usd.toFixed(2)}`;
       if (usd >= 0.0001) return `$${usd.toFixed(4)}`;
-      return `$${usd.toExponential(1)}`;
+      // Never scientific notation. `3.7e-7` is how a language prints a small
+      // number, not how a person reads a price: it cannot be compared at a
+      // glance with the figure above it, which is the one thing a per-block
+      // cost column exists for.
+      return `$${plainDecimal(usd)}`;
     },
     /** A count and its noun, pluralised — `1 block`, `3 blocks`. */
     plural(n: number, one: string): string {

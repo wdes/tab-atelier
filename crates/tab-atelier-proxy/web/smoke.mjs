@@ -435,6 +435,15 @@ check(blockLabels.includes("object") === false, "no block is labelled object");
 // firing there would tell the reader a comparison was impossible when it was
 // not.
 check(/not comparable/.test(convo) === false, "a complete body is compared, not excused for being clamped");
+// Money is written out. The fixture's round costs 43 and 36 micro-dollars, which
+// a scientific form renders as $4.3e-5: readable to a language, not to someone
+// comparing two blocks. 4.3e-5 is also what the check above would then be
+// comparing against.
+check(/\$0\.000043/.test(convo), "a sub-cent cost is written out in full");
+check(
+  /\$[\d.]*e[+-]?\d/.test(convo) === false,
+  "no price is rendered in scientific notation",
+);
 check(/no cache_control breakpoint at all/.test(convo) === false, "a body with a breakpoint is not reported as having none");
 // Nothing is clipped. The block below the summary used to be a 120-character
 // preview with an ellipsis; the tail of a long tool result is the proof it is
