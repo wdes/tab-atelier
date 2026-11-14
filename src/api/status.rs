@@ -97,6 +97,10 @@ pub(super) fn run(request: &Request<'_>, state: &Arc<Mutex<TabSnapshot>>) -> Res
         session_id.as_deref().unwrap_or("-"),
         agent_kind.as_deref().unwrap_or("-")
     );
+    let alert_state = if wipe_attachment { None } else { agent_state };
+    if snap.agent_alerts.record(&id, alert_state, label.as_deref()) {
+        snap.generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     snap.pending_status_updates.push(PendingStatusUpdate {
         tab_id: id.to_string(),
         state: agent_state,

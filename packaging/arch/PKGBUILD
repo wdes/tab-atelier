@@ -70,7 +70,8 @@ package_tab-atelier() {
            'libxkbcommon-x11' 'ttf-dejavu')
   # Emoji in a few UI spots (🐾 pet menu, 🔒 lock marker, ⛑/✅ status). DejaVu
   # carries none; without it they render as tofu. Cosmetic → optional.
-  optdepends=('noto-fonts-emoji: colour emoji in the UI (menus, status markers)')
+  optdepends=('noto-fonts-emoji: colour emoji in the UI (menus, status markers)'
+              'libnotify: desktop notifications when an agent finishes or asks for something')
   conflicts=('tab-atelier-headless')
   # /etc files pacman must preserve across upgrades (deb `conf-files`).
   backup=('etc/tab-atelier/preferences.json'

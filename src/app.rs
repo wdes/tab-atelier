@@ -646,6 +646,13 @@ struct AppState {
     /// Show the per-tab RAM mini gauge in the tab bar (#28 S5). Mirrors
     /// `Preferences::show_tab_gauge`; toggled from a tab's right-click menu.
     show_tab_gauge: bool,
+    /// Mirrors `Preferences::desktop_notifications`; set from the preferences.
+    desktop_notifications: bool,
+    /// Whether the window has keyboard focus, so a tab you are looking at does
+    /// not notify you about itself.
+    window_active: bool,
+    /// Newest `api::AgentAlerts` sequence already turned into a notification.
+    last_alert_seq: u64,
     /// Force Claude-only mode: new tabs launch `claude` (auto mode) instead of
     /// a shell. Mirrors [`crate::CLAUDE_ONLY`] / `Preferences::claude_only`;
     /// the right-click "New bash tab" item cancels it.
@@ -1477,6 +1484,7 @@ impl AppState {
             activity: activity_signal.clone(),
             activity_waker: std::sync::Arc::new((std::sync::Mutex::new(()), std::sync::Condvar::new())),
             generation: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            agent_alerts: api::AgentAlerts::default(),
         }));
         let api_read_only = crate::read_only();
         api::start_api_server(api_state.clone(), api_token.clone(), api_read_only, api_addr.clone());
@@ -1540,7 +1548,8 @@ impl AppState {
         // render caches every time the window GAINS focus so the first frame
         // rebuilds every row from the live grid.
         cx.observe_window_activation(window, |app, window, cx| {
-            if !window.is_window_active() {
+            app.window_active = window.is_window_active();
+            if !app.window_active {
                 return;
             }
             let view = app.tabs.get(app.active).map(|t| t.view.clone());
@@ -1597,6 +1606,9 @@ impl AppState {
             cursor_style,
             opacity,
             show_tab_gauge: prefs.show_tab_gauge,
+            desktop_notifications: prefs.desktop_notifications,
+            window_active: true,
+            last_alert_seq: 0,
             claude_only,
             relay_mode,
             hotkeys,
@@ -2514,6 +2526,9 @@ impl AppState {
             let inputs: Vec<(usize, Vec<u8>)> = snapshot.pending_input.drain(..).collect();
             let renames: Vec<(usize, String)> = snapshot.pending_renames.drain(..).collect();
             let status_updates: Vec<api::PendingStatusUpdate> = snapshot.pending_status_updates.drain(..).collect();
+            let agent_alerts: Vec<api::AgentAlertEvent> =
+                snapshot.agent_alerts.after(self.last_alert_seq).cloned().collect();
+            self.last_alert_seq = snapshot.agent_alerts.seq();
             let lock_changes: Vec<(String, bool)> = snapshot.pending_lock_changes.drain(..).collect();
             let net_changes: Vec<(String, bool)> = snapshot.pending_net_changes.drain(..).collect();
             let bg_color_changes: Vec<(String, Option<String>)> = snapshot.pending_bg_color_changes.drain(..).collect();
@@ -2753,6 +2768,29 @@ impl AppState {
                     tab.view.read(cx).set_locked(want);
                     tab.last_pushed_locked = Some(want);
                 }
+            }
+            for alert in agent_alerts {
+                let Some(idx) = self.tabs.iter().position(|t| *t.id == *alert.tab_id) else {
+                    continue;
+                };
+                let watched = idx == self.active && self.visible && self.window_active;
+                if !self.desktop_notifications || watched {
+                    continue;
+                }
+                let tab = &self.tabs[idx];
+                let t = locale::strings(self.lang);
+                let (verb, critical) = match alert.alert {
+                    crate::AgentAlert::Finished => (t.agent_finished, false),
+                    crate::AgentAlert::Asking => (t.agent_asking, true),
+                };
+                let cwd = tab.last_known_cwd.as_ref().map(|p| p.display().to_string());
+                let body = alert
+                    .label
+                    .as_deref()
+                    .or(tab.context.as_deref())
+                    .or(cwd.as_deref())
+                    .unwrap_or_default();
+                crate::desktop_notify::send(&format!("{} {verb}", tab.name), body, critical);
             }
             for upd in status_updates {
                 let Some(tab) = self.tabs.iter_mut().find(|t| *t.id == upd.tab_id) else {
@@ -5593,6 +5631,29 @@ impl AppState {
             );
         }
 
+        let mut notification_options = div().flex().flex_col().gap(px(4.0)).mt(px(8.0));
+        for (on, label) in [(true, t.notifications_on), (false, t.notifications_off)] {
+            let is_active = on == self.desktop_notifications;
+            notification_options = notification_options.child(
+                div()
+                    .id(SharedString::from(format!("pref-notifications-{on}")))
+                    .px(px(12.0))
+                    .py(px(6.0))
+                    .rounded(px(3.0))
+                    .cursor_pointer()
+                    .bg(if is_active { option_active } else { option_bg })
+                    .hover(|s| s.bg(if is_active { option_active } else { btn_hover }))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
+                            this.desktop_notifications = on;
+                            cx.notify();
+                        }),
+                    )
+                    .child(label),
+            );
+        }
+
         let opacity_pct = (self.opacity as f32 / 255.0 * 100.0).round() as u8;
         let mut opacity_slider = div().flex().flex_row().items_center().gap(px(8.0)).mt(px(8.0));
         let mut track = div().flex().flex_row().h(px(20.0)).rounded(px(3.0)).overflow_hidden();
@@ -6097,6 +6158,7 @@ impl AppState {
                                         .child(div().child(t.font_size).child(font_size_row))
                                         .child(div().child(t.toggle_hotkeys).child(hotkey_list))
                                         .child(div().child(t.language).child(lang_options))
+                                        .child(div().child(t.desktop_notifications).child(notification_options))
                                         .child(div().child(t.browser).child(browser_input)),
                                 )
                                 .child(
@@ -6250,6 +6312,7 @@ impl AppState {
                                                 // on-disk value through so saving prefs doesn't
                                                 // wipe the gauge setting.
                                                 show_tab_gauge: this.show_tab_gauge,
+                                                desktop_notifications: this.desktop_notifications,
                                                 // Menu-toggled / headless-only knobs the dialog
                                                 // doesn't surface — carry the live or on-disk
                                                 // value through so a GUI save doesn't wipe them.
