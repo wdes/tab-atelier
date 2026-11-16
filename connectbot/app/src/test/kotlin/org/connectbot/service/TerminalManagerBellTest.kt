@@ -17,6 +17,7 @@
 
 package org.connectbot.service
 
+import android.net.NetworkInfo
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.advanceUntilIdle
@@ -31,6 +32,7 @@ import org.mockito.Mockito.doReturn
 import org.mockito.Mockito.mock
 import org.mockito.Mockito.never
 import org.mockito.Mockito.spy
+import org.mockito.Mockito.times
 import org.mockito.Mockito.verify
 import org.mockito.Mockito.`when`
 import org.robolectric.RobolectricTestRunner
@@ -122,6 +124,34 @@ class TerminalManagerBellTest {
         verify(manager).sendActivityNotification(hostA)
         verify(manager, never()).sendActivityNotification(hostB)
         verify(manager).playBeep()
+    }
+
+    /**
+     * Pressing Reconnect repeatedly while the network is down must reconnect the bridge once.
+     *
+     * Each press used to queue the bridge again, so when the network came back it started
+     * the session once per press. Every extra transport had its own relay writing into the
+     * same emulator at a different offset, which showed as the output repeating in pieces.
+     */
+    @Test
+    fun reconnectingWhileOfflineStartsTheSessionOnce() {
+        val bridge = bridge(hostA)
+        `when`(bridge.isUsingNetwork()).thenReturn(true)
+        val monitor = mock(ConnectivityMonitor::class.java)
+        `when`(monitor.getCurrentNetworkInfo()).thenReturn(null)
+        manager.connectivityMonitor = monitor
+
+        manager.requestReconnect(bridge)
+        manager.requestReconnect(bridge)
+        manager.requestReconnect(bridge)
+        verify(bridge, never()).startConnection()
+
+        val online = mock(NetworkInfo::class.java)
+        `when`(online.isConnected).thenReturn(true)
+        `when`(monitor.getCurrentNetworkInfo()).thenReturn(online)
+        manager.requestReconnect(bridge)
+
+        verify(bridge, times(1)).startConnection()
     }
 
     private fun bridge(host: Host): TerminalBridge {

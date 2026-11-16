@@ -732,6 +732,13 @@ class TerminalBridge {
         }
         connecting = true
 
+        // A reconnect replaces the transport, and the one it replaces must end first. A
+        // tab-atelier session that is still redialling keeps its own relay reading into this
+        // emulator, so the new relay would write the same replay at a second offset. Closing
+        // it ends that relay's read. Only tab-atelier is closed here: SSH defers its close
+        // during a network grace period, and that deferral belongs to SSH.
+        (transport as? TabAtelier)?.close()
+
         transport = newTransport
         newTransport.bridge = this
         newTransport.manager = manager
