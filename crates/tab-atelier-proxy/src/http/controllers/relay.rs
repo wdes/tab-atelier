@@ -666,6 +666,15 @@ pub fn shape_body(
         v["model"] = serde_json::Value::String(model.to_owned());
     }
     let before = body.len();
+    if vendor == crate::identity::Vendor::Deepseek {
+        let dropped = crate::media::drop_unreadable_documents(&mut v);
+        if dropped > 0 {
+            log::info!(
+                "proxy: {dropped} attached document(s) replaced by a note on {}: it reads only text and file sources",
+                route.provider_id
+            );
+        }
+    }
     let elided = crate::compact::apply(&mut v, level);
     // After compaction, deliberately. Compaction walks `messages[]` and the
     // tool policy's pin rule reads that same array to decide what is still

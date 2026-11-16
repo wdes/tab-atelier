@@ -39,6 +39,7 @@ pub mod http;
 pub mod identity;
 pub mod inspect;
 pub mod localtool;
+pub mod media;
 pub mod openai;
 pub mod provider;
 pub mod qos;
