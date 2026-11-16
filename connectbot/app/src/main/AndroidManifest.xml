@@ -50,7 +50,8 @@
 		android:memtagMode="${memtagMode}"
 		android:roundIcon="@mipmap/icon_round"
 		android:supportsRtl="true"
-		android:theme="@style/AppTheme">
+		android:theme="@style/AppTheme"
+		android:usesCleartextTraffic="true">
 
 		<activity
 			android:name=".ui.MainActivity"

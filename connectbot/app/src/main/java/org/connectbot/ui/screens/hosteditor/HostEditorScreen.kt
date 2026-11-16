@@ -203,7 +203,10 @@ fun HostEditorScreenContent(
     }
     val canSave = when {
         uiState.protocol == "local" -> true
-        isTabAtelier -> tabAtelierBase != null &&
+        // The fallbacks count too: saving drops any that does not parse, so letting an
+        // invalid one through deleted the address the user had just typed — a bare
+        // `192.168.1.10:8443` most often — without a word.
+        isTabAtelier -> tabAtelierBase != null && tabAtelierUrlsValid &&
             (uiState.tabAtelierToken.isNotBlank() || uiState.hasExistingToken)
         else -> uiState.hostname.isNotBlank()
     }

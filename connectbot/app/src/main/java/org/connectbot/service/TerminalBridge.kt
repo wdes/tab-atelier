@@ -1062,6 +1062,14 @@ class TerminalBridge {
      */
     fun switchTab(tabKey: String): Boolean {
         val tabatelier = transport as? TabAtelier ?: return false
+        if (disconnected) {
+            // The session ended — the reconnect overlay is up — so there is no Relay to
+            // read a new socket and a switch would change the title over a frozen screen.
+            // Reconnecting builds a fresh transport, which opens the tab chosen here.
+            manager.chooseTabKey(host.id, tabKey)
+            manager.requestReconnect(this)
+            return true
+        }
         return tabatelier.switchTab(tabKey)
     }
 

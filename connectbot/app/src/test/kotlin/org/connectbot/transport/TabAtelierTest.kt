@@ -362,14 +362,32 @@ class TabAtelierTest {
         val text = presented.decodeToString()
 
         assertTrue(
-            "the erase must come first, not last: ${presented.toList()}",
-            text.startsWith(erase),
+            "the erase must come before the frame: ${presented.toList()}",
+            text.endsWith(erase + frame.decodeToString()),
         )
-        assertEquals(
-            "the frame must follow the erase untouched",
-            frame.decodeToString(),
-            text.substring(erase.length),
-        )
+    }
+
+    /**
+     * The modes are put back before the erase, the alternate screen first.
+     *
+     * An erase clears only the buffer that is showing. A tab left inside a full-screen
+     * program kept the alternate screen up and its own shell output behind it, so the next
+     * tab's replay was drawn there and fell through to the previous tab's shell the moment
+     * a program in its history left the alternate screen. Order is asserted because leaving
+     * the alternate screen *after* the erase would uncover exactly what was meant to go.
+     */
+    @Test
+    fun theModesAreResetBeforeTheErase() {
+        val text = TabAtelier.Reconnect.presentedFrame(ByteArray(0), screenStateUnknown = true).decodeToString()
+
+        val leaveAltScreen = text.indexOf("\u001b[?1049l")
+        val erase = text.indexOf("\u001b[2J")
+        assertTrue("must leave the alternate screen: $text", leaveAltScreen >= 0)
+        assertTrue("and before erasing: $text", leaveAltScreen < erase)
+        assertTrue("must drop the scroll region: $text", text.contains("\u001b[r"))
+        assertTrue("must show the cursor: $text", text.contains("\u001b[?25h"))
+        // A full reset would also discard the tab's background colour.
+        assertTrue("must not be a full reset: $text", !text.contains("\u001bc"))
     }
 
     /**

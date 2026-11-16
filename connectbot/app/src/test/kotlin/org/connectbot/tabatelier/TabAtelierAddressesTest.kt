@@ -56,6 +56,22 @@ class TabAtelierAddressesTest {
     }
 
     /**
+     * The local addresses are worked out from what was typed, with nothing passed in.
+     *
+     * Both places that build this from a host pass only the addresses. While `local`
+     * defaulted to empty the preference above was never applied to a real host: at home
+     * every connect still waited out the remote address first.
+     */
+    @Test
+    fun theLocalAddressesAreDerivedFromTheAddressesThemselves() {
+        val addresses = TabAtelierAddresses(primary = remote, fallbacks = listOf(lan))
+
+        assertEquals(setOf(lan), addresses.local)
+        assertEquals(listOf(lan, remote), addresses.candidates(onLocalNetwork = true))
+        assertEquals(listOf(remote, lan), addresses.candidates(onLocalNetwork = false))
+    }
+
+    /**
      * Off a local network, the configured order is kept.
      *
      * A LAN address is unreachable from a train, so trying it first would cost a timeout

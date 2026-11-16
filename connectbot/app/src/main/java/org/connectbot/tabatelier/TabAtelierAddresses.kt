@@ -48,7 +48,7 @@ data class TabAtelierAddresses(
      * address this session was established on, and re-classifying it mid-session would
      * move the session between networks for no reason the user asked for.
      */
-    val local: Set<String> = emptySet(),
+    val local: Set<String> = (listOfNotNull(primary) + fallbacks).filter { isLocalAddress(it) }.toSet(),
 ) {
     /** Everything, in the order it should be tried with nothing known about the network. */
     val all: List<String> get() = listOfNotNull(primary?.takeIf { it.isNotBlank() }) + fallbacks
