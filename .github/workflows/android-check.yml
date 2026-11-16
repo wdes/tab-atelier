@@ -1,0 +1,85 @@
+name: android-check
+
+# Test and build the Android client on pull requests, without signing or publishing.
+#
+# android-apk.yml is the release path: it signs with the production key and publishes
+# to /android/, so it only ever runs for pushes to android-app. This workflow is the
+# pre-merge check. It holds no secrets, uploads nothing to the site, and never signs
+# with a release key (--debug uses upstream's debug key), so a branch can be verified
+# here without its APK reaching anyone.
+
+on:
+    pull_request:
+        branches: [android-app]
+    workflow_dispatch:
+
+# A newer push to the same PR supersedes the run in progress.
+concurrency:
+    group: android-check-${{ github.ref }}
+    cancel-in-progress: true
+
+permissions:
+    contents: read
+
+jobs:
+    check:
+        name: Unit tests and debug build
+        runs-on: ubuntu-latest
+        env:
+            ANDROID_HOME: /usr/local/lib/android/sdk
+            ANDROID_NDK_VERSION: "26.1.10909125"
+        steps:
+            # Full history, for the same reason android-apk.yml gives: the About
+            # screen reads the upstream commit from the subtree trailer.
+            - uses: actions/checkout@v7
+              with:
+                  fetch-depth: 0
+
+            - uses: actions/setup-java@v6
+              with:
+                  distribution: temurin
+                  java-version: '21'
+
+            - uses: android-actions/setup-android@v4
+              with:
+                  packages: platform-tools
+
+            - name: Restore the NDK
+              id: ndk-cache
+              uses: actions/cache/restore@v6
+              with:
+                  path: ${{ env.ANDROID_HOME }}/ndk/${{ env.ANDROID_NDK_VERSION }}
+                  key: android-ndk-${{ env.ANDROID_NDK_VERSION }}-${{ runner.os }}
+
+            - name: Install SDK platform and NDK
+              run: |
+                  yes | sdkmanager --licenses > /dev/null 2>&1 || true
+                  sdkmanager "platforms;android-37.0" "ndk;${ANDROID_NDK_VERSION}"
+
+            - name: Save the NDK
+              if: steps.ndk-cache.outputs.cache-hit != 'true'
+              uses: actions/cache/save@v6
+              with:
+                  path: ${{ env.ANDROID_HOME }}/ndk/${{ env.ANDROID_NDK_VERSION }}
+                  key: android-ndk-${{ env.ANDROID_NDK_VERSION }}-${{ runner.os }}
+
+            - uses: gradle/actions/setup-gradle@v6
+
+            - name: Unit tests
+              run: |
+                  cd connectbot
+                  ./gradlew --no-daemon :app:testOssDebugUnitTest
+
+            - name: Upload the test report
+              if: failure()
+              uses: actions/upload-artifact@v7
+              with:
+                  name: unit-test-report
+                  path: |
+                      connectbot/app/build/reports/tests/
+                      connectbot/app/build/test-results/
+
+            # The same debug build path build-apk.sh offers, so a change that breaks
+            # the APK's build fails here rather than on the release run.
+            - name: Build the debug APK
+              run: scripts/build-apk.sh --debug
