@@ -599,7 +599,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .and_then(|depth| depth.parse().ok())
         .unwrap_or(0);
-    if !applink::owns_the_tab(args.prompt_file.is_some(), args.once, spawn_depth) {
+    let on_terminal = std::io::IsTerminal::is_terminal(&std::io::stdin());
+    if !applink::owns_the_tab(args.prompt_file.is_some(), args.once, spawn_depth, on_terminal) {
         applink::stay_silent();
     }
     announce_to_app(&agent);
