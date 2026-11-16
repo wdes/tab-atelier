@@ -116,28 +116,97 @@ pub fn clear_env() -> bool {
     CLEAR_ENV.load(Ordering::SeqCst)
 }
 
-/// "Claude-only" forced mode: every new tab launches `claude`.
-///
-/// New tabs run `claude` (auto-accept-edits) instead of a shell. Unlike
-/// [`READ_ONLY`]/[`CLEAR_ENV`] this is **runtime-mutable** — the right-click
-/// "New bash tab" item cancels it live — and seeded from either the
-/// `--claude-only` flag or the `claude_only` preference. The GUI mirrors it
-/// onto its own struct field for the menu.
-pub static CLAUDE_ONLY: AtomicBool = AtomicBool::new(false);
-
-#[must_use]
-pub fn claude_only() -> bool {
-    CLAUDE_ONLY.load(Ordering::SeqCst)
+/// Which agent "agent-only" mode launches in every new tab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentOnly {
+    Claude,
+    Catbus,
 }
 
-pub fn set_claude_only(on: bool) {
-    CLAUDE_ONLY.store(on, Ordering::SeqCst);
+impl AgentOnly {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Catbus => "catbus",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(word: &str) -> Option<Self> {
+        match word {
+            "claude" => Some(Self::Claude),
+            "catbus" => Some(Self::Catbus),
+            _ => None,
+        }
+    }
+
+    /// Command a fresh agent-only tab runs: the exec target under cleared-env,
+    /// and the string typed into the shell otherwise.
+    ///
+    /// `claude` starts in `auto` permission mode — the classifier-based
+    /// "⏵⏵ auto mode on" mode (distinct from `acceptEdits`; see the README).
+    #[must_use]
+    pub const fn fresh_command(self) -> &'static str {
+        match self {
+            Self::Claude => "claude --permission-mode auto",
+            Self::Catbus => "catbus-agent",
+        }
+    }
+
+    const fn code(agent: Option<Self>) -> u8 {
+        match agent {
+            None => 0,
+            Some(Self::Claude) => 1,
+            Some(Self::Catbus) => 2,
+        }
+    }
+}
+
+/// A queued change to agent-only mode: which agent to force, or none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentOnlyChange {
+    Off,
+    On(AgentOnly),
+}
+
+impl AgentOnlyChange {
+    #[must_use]
+    pub const fn agent(self) -> Option<AgentOnly> {
+        match self {
+            Self::Off => None,
+            Self::On(agent) => Some(agent),
+        }
+    }
+}
+
+/// "Agent-only" forced mode: every new tab launches the chosen agent instead
+/// of a shell.
+///
+/// Unlike [`READ_ONLY`]/[`CLEAR_ENV`] this is **runtime-mutable** — the
+/// right-click "New bash tab" item cancels it live — and seeded from either
+/// the `--agent-only` flag or the `agent_only` preference. The GUI mirrors it
+/// onto its own struct field for the menu. Stored as [`AgentOnly::code`].
+static AGENT_ONLY: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+#[must_use]
+pub fn agent_only() -> Option<AgentOnly> {
+    match AGENT_ONLY.load(Ordering::SeqCst) {
+        1 => Some(AgentOnly::Claude),
+        2 => Some(AgentOnly::Catbus),
+        _ => None,
+    }
+}
+
+pub fn set_agent_only(agent: Option<AgentOnly>) {
+    AGENT_ONLY.store(AgentOnly::code(agent), Ordering::SeqCst);
 }
 
 /// Relay mode: forward this instance's Claude tabs' Anthropic API calls
 /// through a configured remote tab-atelier (see `src/relay.rs`).
 ///
-/// Runtime-mutable like [`CLAUDE_ONLY`]; seeded from the `--relay` flag or the
+/// Runtime-mutable like agent-only mode; seeded from the `--relay` flag or the
 /// `relay_mode` preference. When on, [`tab_env_extras`] injects
 /// `ANTHROPIC_BASE_URL`/`ANTHROPIC_API_KEY` so every claude tab talks to the
 /// local relay listener instead of `api.anthropic.com` directly.
@@ -944,26 +1013,18 @@ pub fn api_url_for_local_clients(api_addr: &str) -> String {
 /// so this needs nothing on PATH and works in the cleared-env minimal shell.
 pub const AGENT_LAUNCH_CLEAR: &str = r"printf '\033[3J\033[H\033[2J'; ";
 
-/// Command a fresh Claude-only tab runs.
-///
-/// `claude` started directly in `auto` permission mode — the classifier-based
-/// "⏵⏵ auto mode on" mode (distinct from `acceptEdits`; see the README).
-/// Used both as the exec target under cleared-env and as the string typed
-/// into the shell otherwise. See [`crate::CLAUDE_ONLY`].
-pub const FRESH_CLAUDE_AUTO_CMD: &str = "claude --permission-mode auto";
-
-/// Shell args that make a fresh Claude-only tab `exec` the agent directly.
+/// Shell args that make a fresh agent-only tab `exec` the agent directly.
 ///
 /// The no-session analogue of [`agent_launch_shell_suffix`] (same
-/// `-i -c 'exec …'` shape, so the tab's foreground process *is* claude,
-/// running [`FRESH_CLAUDE_AUTO_CMD`]). Only used under cleared-env; the
+/// `-i -c 'exec …'` shape, so the tab's foreground process *is* the agent,
+/// running [`AgentOnly::fresh_command`]). Only used under cleared-env; the
 /// normal env types the command in via `pending_agent_resume`.
 #[must_use]
-pub fn fresh_claude_launch_suffix() -> Vec<String> {
+pub fn fresh_agent_launch_suffix(agent: AgentOnly) -> Vec<String> {
     vec![
         "-i".to_string(),
         "-c".to_string(),
-        format!("{AGENT_LAUNCH_CLEAR}exec {FRESH_CLAUDE_AUTO_CMD}"),
+        format!("{AGENT_LAUNCH_CLEAR}exec {}", agent.fresh_command()),
     ]
 }
 
@@ -1059,6 +1120,21 @@ pub fn build_agent_resume_command(kind: &str, session_id: &str, plan: Option<boo
 #[must_use]
 pub fn kind_report_wins(current: Option<&str>, incoming: &str) -> bool {
     !(current == Some("catbus") && incoming == "claude")
+}
+
+/// Whether a status report may touch the tab's durable attachment at all — the
+/// session id, kind and plan mode it resumes with, or their removal.
+///
+/// A report that names a kind the tab's own kind outranks (see
+/// [`kind_report_wins`]) comes from an agent running *inside* the tab's agent:
+/// a `claude` started from a catbus session fires the system-wide Claude hooks,
+/// whose `SessionStart` carries claude's session id and whose `SessionEnd` asks
+/// for the attachment to be wiped. Taking either leaves a catbus tab that
+/// resumes the wrong session, or none. A report with no kind is the tab's own
+/// word and always applies.
+#[must_use]
+pub fn report_may_touch_attachment(current: Option<&str>, reporter: Option<&str>) -> bool {
+    reporter.is_none_or(|kind| kind_report_wins(current, kind))
 }
 
 /// How a (re)spawn brings an agent tab back.
@@ -2857,11 +2933,12 @@ pub struct Preferences {
     /// cheap and opt-in. Toggled from a tab's right-click menu.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub show_tab_gauge: bool,
-    /// Force "Claude-only" mode: every new tab launches `claude` in `auto`
-    /// mode instead of a shell. Toggled from the right-click menu (the
-    /// "New bash tab" item cancels it). Off by default.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub claude_only: bool,
+    /// Force "agent-only" mode: every new tab launches this agent (`claude`
+    /// in `auto` mode, or `catbus-agent`) instead of a shell. Toggled from the
+    /// right-click menu (the "New bash tab" item cancels it). Off by default.
+    /// A file still carrying the old `claude_only: true` is read as `claude`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_only: Option<AgentOnly>,
     /// Relay mode: forward claude tabs' Anthropic API calls through the remote
     /// tab-atelier named by `relay_endpoint_id`. Off by default. See
     /// [`crate::RELAY_MODE`].
@@ -3734,7 +3811,22 @@ pub fn load_preferences(config_base: &std::path::Path) -> Preferences {
 
 fn read_preferences_file(path: &std::path::Path) -> Option<Preferences> {
     let data = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&data).ok()
+    let mut value: serde_json::Value = serde_json::from_str(&data).ok()?;
+    migrate_claude_only(&mut value);
+    serde_json::from_value(value).ok()
+}
+
+/// Carry the retired `claude_only: true` over to `agent_only: "claude"`.
+///
+/// The old key is dropped either way, so the next save writes only the new one.
+fn migrate_claude_only(prefs: &mut serde_json::Value) {
+    let Some(map) = prefs.as_object_mut() else {
+        return;
+    };
+    let was_on = map.remove("claude_only").and_then(|v| v.as_bool()) == Some(true);
+    if was_on && map.get("agent_only").is_none_or(serde_json::Value::is_null) {
+        map.insert("agent_only".into(), serde_json::Value::String("claude".into()));
+    }
 }
 
 pub fn save_preferences(config_base: &std::path::Path, prefs: &Preferences) {
@@ -4395,11 +4487,10 @@ mod tests {
     }
 
     #[test]
-    fn fresh_claude_suffix_execs_claude_in_auto_mode() {
-        // Claude-only mode launches a fresh `claude` in `auto` mode (the
+    fn fresh_agent_suffix_execs_the_chosen_agent() {
+        // Agent-only mode launches a fresh `claude` in `auto` mode (the
         // ⏵⏵ auto mode footer) — no --resume, since there's no session yet.
-        assert_eq!(FRESH_CLAUDE_AUTO_CMD, "claude --permission-mode auto");
-        let s = fresh_claude_launch_suffix();
+        let s = fresh_agent_launch_suffix(AgentOnly::Claude);
         assert_eq!(
             s,
             vec![
@@ -4410,7 +4501,36 @@ mod tests {
         );
         // Same clear-then-exec shape as the resume path.
         assert!(s.last().unwrap().starts_with(AGENT_LAUNCH_CLEAR));
-        assert!(s.last().unwrap().contains(FRESH_CLAUDE_AUTO_CMD));
+        assert_eq!(
+            fresh_agent_launch_suffix(AgentOnly::Catbus).last().unwrap(),
+            r"printf '\033[3J\033[H\033[2J'; exec catbus-agent"
+        );
+    }
+
+    #[test]
+    fn a_retired_claude_only_preference_becomes_agent_only() {
+        let mut old = serde_json::json!({"claude_only": true, "lang": "fr"});
+        migrate_claude_only(&mut old);
+        assert_eq!(old, serde_json::json!({"agent_only": "claude", "lang": "fr"}));
+        let prefs: Preferences = serde_json::from_value(old).unwrap();
+        assert_eq!(prefs.agent_only, Some(AgentOnly::Claude));
+
+        // Off stays off, and an explicit new choice is never overridden.
+        let mut off = serde_json::json!({"claude_only": false});
+        migrate_claude_only(&mut off);
+        assert_eq!(off, serde_json::json!({}));
+        let mut both = serde_json::json!({"claude_only": true, "agent_only": "catbus"});
+        migrate_claude_only(&mut both);
+        assert_eq!(both, serde_json::json!({"agent_only": "catbus"}));
+
+        // The old key is never written back.
+        let saved = serde_json::to_value(Preferences {
+            agent_only: Some(AgentOnly::Catbus),
+            ..Preferences::default()
+        })
+        .unwrap();
+        assert_eq!(saved["agent_only"], "catbus");
+        assert!(saved.get("claude_only").is_none());
     }
 
     #[test]
@@ -6540,6 +6660,18 @@ mod state_writer_tests {
 
     /// A catbus tab stays a catbus when claude reports in.
     ///
+    /// A claude inside a catbus tab may light the LED, never move the anchor.
+    #[test]
+    fn a_wrapped_agent_cannot_touch_the_attachment() {
+        assert!(!crate::report_may_touch_attachment(Some("catbus"), Some("claude")));
+        // The tab's own reports, kind-less reports, and upgrades all apply.
+        assert!(crate::report_may_touch_attachment(Some("catbus"), Some("catbus")));
+        assert!(crate::report_may_touch_attachment(Some("catbus"), None));
+        assert!(crate::report_may_touch_attachment(Some("claude"), Some("claude")));
+        assert!(crate::report_may_touch_attachment(Some("claude"), Some("catbus")));
+        assert!(crate::report_may_touch_attachment(None, Some("claude")));
+    }
+
     /// catbus wraps claude, so claude's hooks fire inside every catbus session
     /// and announce `claude`. Before this rule the report overwrote the kind,
     /// and the next daemon restart relaunched the tab as a bare

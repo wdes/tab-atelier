@@ -761,41 +761,40 @@ pub fn limit_default(memory: Option<&str>, cpu: Option<u32>, tasks: Option<u64>,
     }
 }
 
-/// `claude-only on|off` — toggle forced Claude-only mode on the running
-/// instance (POST `/claude-only`).
+/// `agent-only claude|catbus|off` — switch forced agent-only mode on the
+/// running instance (POST `/agent-only`).
 ///
-/// When on, every new tab launches `claude` in `auto` mode instead of a shell;
-/// off restores normal shell tabs. Applies live (no restart) and persists, the
-/// same as the right-click menu toggle / `--claude-only` flag.
+/// With an agent named, every new tab launches it (`claude` in `auto` mode, or
+/// `catbus-agent`) instead of a shell; `off` restores normal shell tabs.
+/// Applies live (no restart) and persists, the same as the right-click menu
+/// entries / `--agent-only` flag.
 #[must_use]
-pub fn claude_only(args: &[String]) -> i32 {
-    let on = match args.first().map(String::as_str) {
-        Some("on") => true,
-        Some("off") => false,
+pub fn agent_only(args: &[String]) -> i32 {
+    let word = match args.first().map(String::as_str) {
+        Some(w) if w == "off" || crate::AgentOnly::parse(w).is_some() => w,
         _ => {
-            eprintln!("claude-only: pass `on` or `off`");
+            eprintln!("agent-only: pass `claude`, `catbus` or `off`");
             return 2;
         }
     };
     let ep = match discover_endpoint() {
         Ok(e) => e,
         Err(e) => {
-            eprintln!("claude-only: {e}");
+            eprintln!("agent-only: {e}");
             return 1;
         }
     };
-    let payload = format!(r#"{{"on":{on}}}"#);
-    match super::client::authed_post(&ep, "/claude-only").send(payload.as_bytes()) {
+    let payload = format!(r#"{{"agent":"{word}"}}"#);
+    match super::client::authed_post(&ep, "/agent-only").send(payload.as_bytes()) {
         Ok(_) => {
-            if on {
-                println!("claude-only mode enabled (new tabs launch claude in auto mode)");
-            } else {
-                println!("claude-only mode disabled (new tabs open a shell)");
+            match crate::AgentOnly::parse(word) {
+                Some(agent) => println!("agent-only mode enabled (new tabs launch `{}`)", agent.fresh_command()),
+                None => println!("agent-only mode disabled (new tabs open a shell)"),
             }
             0
         }
         Err(e) => {
-            eprintln!("claude-only: {e}");
+            eprintln!("agent-only: {e}");
             1
         }
     }
@@ -2419,15 +2418,27 @@ mod tests {
     }
 
     #[test]
-    fn claude_only_toggle_is_explicit() {
+    fn agent_only_switch_is_explicit() {
         with_server(|state| {
-            assert_eq!(claude_only(&args(&["on"])), 0);
-            assert_eq!(claude_only(&args(&["off"])), 0);
+            assert_eq!(agent_only(&args(&["claude"])), 0);
+            assert_eq!(agent_only(&args(&["catbus"])), 0);
             let s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            assert_eq!(s.pending_claude_only, Some(false), "last write wins");
+            assert_eq!(
+                s.pending_agent_only,
+                Some(crate::AgentOnlyChange::On(crate::AgentOnly::Catbus)),
+                "last write wins"
+            );
             drop(s);
-            assert_eq!(claude_only(&args(&["maybe"])), 2);
-            assert_eq!(claude_only(&args(&[])), 2);
+            assert_eq!(agent_only(&args(&["off"])), 0);
+            let s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(
+                s.pending_agent_only,
+                Some(crate::AgentOnlyChange::Off),
+                "off is a choice, not an absence"
+            );
+            drop(s);
+            assert_eq!(agent_only(&args(&["on"])), 2);
+            assert_eq!(agent_only(&args(&[])), 2);
         });
     }
 

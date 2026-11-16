@@ -595,6 +595,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     fetch_prices_in_background(&agent);
 
+    let spawn_depth = std::env::var("CATBUS_SPAWN_DEPTH")
+        .ok()
+        .and_then(|depth| depth.parse().ok())
+        .unwrap_or(0);
+    if !applink::owns_the_tab(args.prompt_file.is_some(), args.once, spawn_depth) {
+        applink::stay_silent();
+    }
     announce_to_app(&agent);
 
     apply_launch_gate(&agent, args.gate.as_deref()).await?;

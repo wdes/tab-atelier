@@ -8,12 +8,12 @@ use serde::Serialize;
 
 use log::{debug, error, info};
 
+mod agent_only;
 mod assets;
 mod blackboard_route;
 #[cfg(feature = "catbus")]
 mod catbus;
 mod claims_route;
-mod claude_only;
 // The decision journal, appended to from here and read by the Kiosk — the same crate,
 // so the two cannot drift on the format or on what a re-post is allowed to change.
 mod decisions_route;
@@ -782,10 +782,11 @@ pub struct TabSnapshot {
     /// which resizes the PTY + grid and persists the pin — so a web viewer of a
     /// tab on a large desktop window can be capped to a phone-friendly size.
     pub pending_resizes: Vec<(String, Option<(u16, u16)>)>,
-    /// Forced Claude-only mode toggle queued by `POST /claude-only` (the CLI
-    /// `claude-only on|off`). `Some(true/false)` sets the mode live; the owner
-    /// mirrors it onto [`crate::CLAUDE_ONLY`] + its struct field and persists.
-    pub pending_claude_only: Option<bool>,
+    /// Forced agent-only mode switch queued by `POST /agent-only` (the CLI
+    /// `agent-only claude|catbus|off`). `Some(change)` sets the mode live;
+    /// the owner mirrors it onto
+    /// [`crate::set_agent_only`] + its struct field and persists.
+    pub pending_agent_only: Option<crate::AgentOnlyChange>,
     /// Relay-mode toggle queued by `POST /relay-mode` (the CLI `relay on|off`).
     /// The owner mirrors it onto [`crate::RELAY_MODE`] + its struct field.
     pub pending_relay_mode: Option<bool>,
@@ -1972,8 +1973,8 @@ fn handle_connection<S: Read + Write>(
             "POST" => write_reply(stream, limits::set_default(&envelope, state).into()),
             _ => method_not_allowed(stream),
         },
-        "/claude-only" => match method.as_str() {
-            "POST" => write_reply(stream, claude_only::set(&envelope, state).into()),
+        "/agent-only" => match method.as_str() {
+            "POST" => write_reply(stream, agent_only::set(&envelope, state).into()),
             _ => method_not_allowed(stream),
         },
         "/relay-mode" => match method.as_str() {
@@ -3153,7 +3154,7 @@ pub fn test_snapshot(tabs: Vec<SnapshotTab>) -> TabSnapshot {
         pending_limit_changes: Vec::new(),
         pending_default_limits: None,
         pending_resizes: Vec::new(),
-        pending_claude_only: None,
+        pending_agent_only: None,
         pending_relay_mode: None,
         pending_env_changes: Vec::new(),
         pending_meta_changes: Vec::new(),
@@ -5327,7 +5328,7 @@ mod tests {
                 "no body at all — validated before any lookup",
             ),
             ("POST /tabs/by-id/tab-a/resize HTTP/1.1", "", 400, "no body"),
-            ("POST /claude-only HTTP/1.1", "", 400, "no body"),
+            ("POST /agent-only HTTP/1.1", "", 400, "no body"),
             ("POST /claims HTTP/1.1", "", 400, "no body"),
         ];
         for (line, body_text, want, why) in cases {
@@ -7451,7 +7452,11 @@ mod tests {
         assert!(wipe);
         assert_eq!(label, None, "the sentinel is a verb, not text");
         assert_eq!(session_id, None);
-        assert_eq!(kind, None);
+        assert_eq!(
+            kind.as_deref(),
+            Some("claude"),
+            "who asked survives, so a wrapped agent's wipe can be refused"
+        );
         assert_eq!(state_now, None, "and the indicator comes down");
     }
 }

@@ -110,7 +110,7 @@ Always pass `-p tab-atelier` — a bare `cargo deb` in this workspace can packag
 - Language (English, French)
 - Configurable toggle hotkeys (press any key to register, applied immediately)
 - Configurable browser and code editor for opening links
-- **Claude-only mode** (right-click → *Claude-only mode*): forces every new tab to launch `claude` in `auto` mode; right-click → *New bash tab* cancels it and drops back to a shell. Also settable at launch with `--claude-only`, or live on a running instance with `tab-atelier claude-only on|off`.
+- **Agent-only mode** (right-click → *Agent-only mode: Claude* or *Agent-only mode: catbus*): forces every new tab to launch that agent — `claude` in `auto` mode, or `catbus-agent`; right-click → *New bash tab* cancels it and drops back to a shell. Also settable at launch with `--agent-only claude|catbus`, or live on a running instance with `tab-atelier agent-only claude|catbus|off`. Stored as `agent_only` in `preferences.json`; an older `claude_only: true` is read as `claude`.
 
 **Monitoring**
 - Per-tab CPU usage, power draw (watts), energy consumption (Wh), and uptime

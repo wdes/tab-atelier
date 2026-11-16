@@ -242,13 +242,15 @@ pub fn run_with_payload(args: &[String], stdin_buf: &str) -> i32 {
         argv.push("--label".into());
         argv.push(l);
     }
-    if with_attachment {
+    // session-end names its kind too: it asks for the attachment to be wiped,
+    // and a claude that ran inside a catbus tab must not wipe the catbus one.
+    if with_attachment || event == "session-end" {
         argv.push("--kind".into());
         argv.push("claude".into());
-        if let Some(sid) = session_id {
-            argv.push("--session".into());
-            argv.push(sid);
-        }
+    }
+    if with_attachment && let Some(sid) = session_id {
+        argv.push("--session".into());
+        argv.push(sid);
     }
     let code = crate::cli::set_status::run(&argv);
     // Never propagate a failure to Claude Code — a hook that exits

@@ -60,11 +60,11 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub check: bool,
 
-    /// Start in forced Claude-only mode: every new tab launches `claude` in
-    /// `auto` mode instead of a shell (the right-click "New bash tab" item
-    /// cancels it). GUI only.
-    #[arg(long, global = true)]
-    pub claude_only: bool,
+    /// Start in forced agent-only mode: every new tab launches the named agent
+    /// (`claude` in `auto` mode, or `catbus-agent`) instead of a shell (the
+    /// right-click "New bash tab" item cancels it). GUI only.
+    #[arg(long, global = true, value_name = "AGENT", value_parser = ["claude", "catbus"])]
+    pub agent_only: Option<String>,
 
     /// Start in relay mode: claude tabs' Anthropic API calls are forwarded
     /// through the configured remote tab-atelier (`relay_endpoint_id`).
@@ -284,15 +284,16 @@ pub enum Commands {
         ro: bool,
     },
 
-    /// Toggle forced Claude-only mode on the running instance (live, no restart).
+    /// Switch forced agent-only mode on the running instance (live, no restart).
     ///
-    /// `on` makes every new tab launch `claude` in `auto` mode instead of a
-    /// shell; `off` restores normal shell tabs. Persists like the right-click
-    /// menu toggle and the `--claude-only` launch flag. (Tab forcing is GUI-only;
-    /// against a headless daemon this just records the flag.)
-    ClaudeOnly {
-        /// `on` to force claude tabs, `off` to restore shells.
-        #[arg(value_parser = ["on", "off"])]
+    /// `claude` makes every new tab launch `claude` in `auto` mode instead of a
+    /// shell, `catbus` launches `catbus-agent`; `off` restores normal shell
+    /// tabs. Persists like the right-click menu entries and the `--agent-only`
+    /// launch flag. (Tab forcing is GUI-only; against a headless daemon this
+    /// just records the choice.)
+    AgentOnly {
+        /// The agent to force, or `off` to restore shells.
+        #[arg(value_parser = ["claude", "catbus", "off"])]
         state: String,
     },
 
@@ -874,7 +875,7 @@ fn command_exit_code(cli: Cli) -> Option<i32> {
             }
             crate::cli::client::run("share-link", &args)
         }
-        Commands::ClaudeOnly { state } => crate::cli::share_link::claude_only(&[state]),
+        Commands::AgentOnly { state } => crate::cli::share_link::agent_only(&[state]),
         Commands::Relay { action, arg } => crate::cli::share_link::relay(&action, arg.as_deref()),
         Commands::Doctor { fix } => crate::cli::doctor::run(fix),
         Commands::Env {
@@ -1139,7 +1140,7 @@ mod tests {
                 &["tab-atelier-headless", "net-stats"],
                 &["tab-atelier-headless", "net-dns"],
                 &["tab-atelier-headless", "net-allow", "0", "--clear"],
-                &["tab-atelier-headless", "claude-only", "on"],
+                &["tab-atelier-headless", "agent-only", "claude"],
                 &["tab-atelier-headless", "relay", "status"],
                 &["tab-atelier-headless", "ssh-agent", "0", "--off"],
                 &["tab-atelier-headless", "style", "--list"],
@@ -1208,8 +1209,8 @@ mod tests {
                 &["tab-atelier-headless", "bg-color", "--tab", "0", "clear"],
                 "bg-color --tab clear",
             ),
-            (&["tab-atelier-headless", "claude-only", "on"], "claude-only on"),
-            (&["tab-atelier-headless", "claude-only", "off"], "claude-only off"),
+            (&["tab-atelier-headless", "agent-only", "catbus"], "agent-only catbus"),
+            (&["tab-atelier-headless", "agent-only", "off"], "agent-only off"),
             (&["tab-atelier-headless", "relay", "on"], "relay on"),
             (&["tab-atelier-headless", "relay", "off"], "relay off"),
             (&["tab-atelier-headless", "relay", "via", "box"], "relay via"),
@@ -1360,23 +1361,30 @@ mod tests {
     }
 
     #[test]
-    fn claude_only_is_a_global_flag() {
+    fn agent_only_is_a_global_flag() {
         // Off by default, settable before any subcommand (GUI launch path).
-        assert!(!Cli::try_parse_from(["tab-atelier"]).unwrap().claude_only);
-        assert!(
-            Cli::try_parse_from(["tab-atelier", "--claude-only"])
+        assert_eq!(Cli::try_parse_from(["tab-atelier"]).unwrap().agent_only, None);
+        assert_eq!(
+            Cli::try_parse_from(["tab-atelier", "--agent-only", "catbus"])
                 .unwrap()
-                .claude_only
+                .agent_only
+                .as_deref(),
+            Some("catbus")
         );
+        assert!(Cli::try_parse_from(["tab-atelier", "--agent-only", "bash"]).is_err());
+        // The retired spelling is gone, not aliased.
+        assert!(Cli::try_parse_from(["tab-atelier", "--claude-only"]).is_err());
     }
 
     #[test]
-    fn claude_only_subcommand_accepts_on_off_only() {
-        assert!(Cli::try_parse_from(["tab-atelier-headless", "claude-only", "on"]).is_ok());
-        assert!(Cli::try_parse_from(["tab-atelier-headless", "claude-only", "off"]).is_ok());
-        // Anything else is a parse error (value_parser = ["on","off"]).
-        assert!(Cli::try_parse_from(["tab-atelier-headless", "claude-only", "maybe"]).is_err());
-        assert!(Cli::try_parse_from(["tab-atelier-headless", "claude-only"]).is_err());
+    fn agent_only_subcommand_accepts_an_agent_or_off() {
+        for word in ["claude", "catbus", "off"] {
+            assert!(Cli::try_parse_from(["tab-atelier-headless", "agent-only", word]).is_ok());
+        }
+        // Anything else is a parse error (value_parser).
+        assert!(Cli::try_parse_from(["tab-atelier-headless", "agent-only", "on"]).is_err());
+        assert!(Cli::try_parse_from(["tab-atelier-headless", "agent-only"]).is_err());
+        assert!(Cli::try_parse_from(["tab-atelier-headless", "claude-only", "on"]).is_err());
     }
 
     /// `resize` needs both `--cols` and `--rows` unless `--clear`, and `--clear`
@@ -1534,7 +1542,7 @@ mod tests {
                 vec!["schedule", "tab-a", "--clear"],
                 vec!["flags"],
                 vec!["logs", "--lines", "1"],
-                vec!["claude-only", "off"],
+                vec!["agent-only", "off"],
                 vec!["relay", "status"],
                 vec!["style", "--list"],
                 vec!["peek", "tab-a", "--lines", "2"],
