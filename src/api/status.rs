@@ -71,16 +71,18 @@ pub(super) fn run(request: &Request<'_>, state: &Arc<Mutex<TabSnapshot>>) -> Res
     } else {
         None
     };
-    let (session_id, agent_kind, plan_mode, daemon) = if wipe_attachment {
-        (None, None, None, None)
+    // Kept on a wipe too: there it names who is asking, so the owner can refuse
+    // a wrapped agent's `SessionEnd` (see `report_may_touch_attachment`).
+    let agent_kind = parsed
+        .get("agentKind")
+        .and_then(|v| v.as_str())
+        .map(std::string::ToString::to_string);
+    let (session_id, plan_mode, daemon) = if wipe_attachment {
+        (None, None, None)
     } else {
         (
             parsed
                 .get("sessionId")
-                .and_then(|v| v.as_str())
-                .map(std::string::ToString::to_string),
-            parsed
-                .get("agentKind")
                 .and_then(|v| v.as_str())
                 .map(std::string::ToString::to_string),
             parsed.get("planMode").and_then(serde_json::Value::as_bool),

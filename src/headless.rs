@@ -1043,7 +1043,7 @@ pub fn run() -> std::io::Result<()> {
         pending_limit_changes: Vec::new(),
         pending_default_limits: None,
         pending_resizes: Vec::new(),
-        pending_claude_only: None,
+        pending_agent_only: None,
         pending_relay_mode: None,
         pending_env_changes: Vec::new(),
         pending_meta_changes: Vec::new(),
@@ -1969,7 +1969,7 @@ fn drain_pending(
     let limit_changes: Vec<(String, crate::TabResourceLimits, bool)> = s.pending_limit_changes.drain(..).collect();
     let default_limit_change: Option<(crate::TabResourceLimits, bool)> = s.pending_default_limits.take();
     let resize_changes: Vec<(String, Option<(u16, u16)>)> = s.pending_resizes.drain(..).collect();
-    let claude_only_change: Option<bool> = s.pending_claude_only.take();
+    let agent_only_change: Option<crate::AgentOnlyChange> = s.pending_agent_only.take();
     let relay_mode_change: Option<bool> = s.pending_relay_mode.take();
     let relay_config_change = s.pending_relay_config.take();
     let env_changes: Vec<crate::api::EnvChange> = s.pending_env_changes.drain(..).collect();
@@ -1995,7 +1995,7 @@ fn drain_pending(
         && limit_changes.is_empty()
         && default_limit_change.is_none()
         && resize_changes.is_empty()
-        && claude_only_change.is_none()
+        && agent_only_change.is_none()
         && relay_mode_change.is_none()
         && relay_config_change.is_none()
         && env_changes.is_empty()
@@ -2191,16 +2191,17 @@ fn drain_pending(
         }
     }
 
-    // Forced Claude-only toggle (`claude-only on|off` / POST /claude-only).
+    // Forced agent-only switch (`agent-only …` / POST /agent-only).
     // Headless doesn't launch GUI tabs, so it just records the flag: set the
     // process-global and persist the preference (unless read-only) so a desktop
     // GUI sharing the same config picks it up. New-tab forcing is GUI-only.
-    if let Some(on) = claude_only_change {
-        crate::set_claude_only(on);
+    if let Some(change) = agent_only_change {
+        let agent = change.agent();
+        crate::set_agent_only(agent);
         if !crate::read_only() {
             let dir = crate::platform::config_dir();
             let mut prefs = crate::load_preferences(&dir);
-            prefs.claude_only = on;
+            prefs.agent_only = agent;
             crate::save_preferences(&dir, &prefs);
         }
     }
@@ -2264,11 +2265,14 @@ fn drain_pending(
         let Some(tab) = tabs.iter_mut().find(|t| *t.id == upd.tab_id) else {
             continue;
         };
+        let anchor = crate::report_may_touch_attachment(tab.agent_kind.as_deref(), upd.agent_kind.as_deref());
         if upd.wipe_attachment {
-            tab.agent_state = None;
-            tab.agent_session_id = None;
-            tab.agent_kind = None;
-            tab.agent_plan_mode = None;
+            if anchor {
+                tab.agent_state = None;
+                tab.agent_session_id = None;
+                tab.agent_kind = None;
+                tab.agent_plan_mode = None;
+            }
         } else {
             // `state: None` (the wire's "idle") takes the indicator down;
             // the metadata below applies either way, so an update that
@@ -2279,21 +2283,20 @@ fn drain_pending(
                 label: upd.label.clone(),
                 updated_at: Instant::now(),
             });
-            if upd.session_id.is_some() {
-                tab.agent_session_id = upd.session_id.map(Arc::from);
-            }
-            if let Some(kind) = upd.agent_kind.as_deref() {
-                // A claude hook firing inside a catbus session reports
-                // `claude` — the wrapped agent, not this tab's kind. Taking it
-                // would relabel the tab, and the next restart would bring it
-                // back as a bare `claude --resume`, the catbus wrapper gone.
-                // See `kind_report_wins`.
-                if crate::kind_report_wins(tab.agent_kind.as_deref(), kind) {
-                    tab.agent_kind = Some(Arc::from(kind));
+            // A claude hook firing inside a catbus session reports `claude`
+            // and claude's session — the wrapped agent, not this tab's. Taking
+            // them would bring the tab back as a bare `claude --resume`, or as
+            // a catbus resuming an id it never had. The LED above still moves.
+            if anchor {
+                if upd.session_id.is_some() {
+                    tab.agent_session_id = upd.session_id.map(Arc::from);
                 }
-            }
-            if upd.plan_mode.is_some() {
-                tab.agent_plan_mode = upd.plan_mode;
+                if upd.agent_kind.is_some() {
+                    tab.agent_kind = upd.agent_kind.map(Arc::from);
+                }
+                if upd.plan_mode.is_some() {
+                    tab.agent_plan_mode = upd.plan_mode;
+                }
             }
             if let Some(d) = upd.daemon {
                 tab.agent_daemon = d;

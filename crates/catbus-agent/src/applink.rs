@@ -29,7 +29,28 @@
 //! one is logged at `debug` and nothing else happens, because an app that is not running, busy, or
 //! gone must not affect a turn.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+
+/// Set once at start-up by a process that is in a tab without being the tab's agent.
+static SILENT: AtomicBool = AtomicBool::new(false);
+
+/// Whether this process is the agent its tab should resume.
+///
+/// A tab has one agent: the session a person types into. Everything else that runs there is a
+/// passer-by — a `--prompt-file` review started by a git hook, a `--once` child answering one
+/// prompt, a sub-agent this agent spawned. Each inherits the tab's environment and mints its own
+/// session id, so one that reported would replace the id the app resumes with by one that names a
+/// transcript nobody will open again, or none at all.
+#[must_use]
+pub const fn owns_the_tab(one_shot: bool, once: bool, spawn_depth: u32) -> bool {
+    !one_shot && !once && spawn_depth == 0
+}
+
+/// Report nothing for the rest of this process. See [`owns_the_tab`].
+pub fn stay_silent() {
+    SILENT.store(true, Ordering::Relaxed);
+}
 
 /// How long a status POST may take. Short: this runs while a turn is starting, and the app is on the
 /// same machine — anything that takes longer than this is not going to succeed usefully.
@@ -117,6 +138,9 @@ impl Endpoint {
 /// be wrong. Even a mistaken one cannot send a session id off this machine.
 #[must_use]
 pub fn endpoint() -> Option<Endpoint> {
+    if SILENT.load(Ordering::Relaxed) {
+        return None;
+    }
     let tab_id = std::env::var("_TAB_ID").ok().filter(|id| !id.is_empty())?;
     let api = std::env::var("TAB_ATELIER_API_URL")
         .ok()
@@ -200,6 +224,19 @@ mod tests {
         assert_eq!(blank, None, "an empty `_TAB_ID` must read as absent");
         // And a real local relay is a candidate, which is what `endpoint` would pair it with.
         assert!(local_base("http://127.0.0.1:7890").is_some());
+    }
+
+    /// Only the session a person types into speaks for the tab.
+    ///
+    /// The bug this pins: a commit made from a catbus tab ran the repository's review hook, the
+    /// hook's one-shot agent reported its own session id, and the tab came back from a restart
+    /// resuming a review instead of the conversation.
+    #[test]
+    fn only_the_interactive_session_owns_the_tab() {
+        assert!(owns_the_tab(false, false, 0));
+        assert!(!owns_the_tab(true, false, 0), "a --prompt-file run is a passer-by");
+        assert!(!owns_the_tab(false, true, 0), "so is a --once run");
+        assert!(!owns_the_tab(false, false, 1), "and a spawned sub-agent");
     }
 
     /// Only a local address is a candidate, whatever it is called.

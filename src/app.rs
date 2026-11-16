@@ -646,10 +646,10 @@ struct AppState {
     /// Show the per-tab RAM mini gauge in the tab bar (#28 S5). Mirrors
     /// `Preferences::show_tab_gauge`; toggled from a tab's right-click menu.
     show_tab_gauge: bool,
-    /// Force Claude-only mode: new tabs launch `claude` (auto mode) instead of
-    /// a shell. Mirrors [`crate::CLAUDE_ONLY`] / `Preferences::claude_only`;
+    /// Forced agent-only mode: new tabs launch this agent instead of a shell.
+    /// Mirrors [`crate::agent_only`] / `Preferences::agent_only`;
     /// the right-click "New bash tab" item cancels it.
-    claude_only: bool,
+    agent_only: Option<crate::AgentOnly>,
     /// Relay mode: claude tabs' Anthropic calls go through the configured
     /// remote. Mirrors [`crate::RELAY_MODE`] / `Preferences::relay_mode`;
     /// toggled from the right-click menu.
@@ -907,11 +907,11 @@ impl AppState {
             .as_deref()
             .and_then(CursorStyle::from_id)
             .unwrap_or_default();
-        // Claude-only mode is on if either the `--claude-only` flag (already in
-        // the global) or the persisted preference asked for it; sync the global
-        // so both agree from the first tab.
-        let claude_only = crate::claude_only() || prefs.claude_only;
-        crate::set_claude_only(claude_only);
+        // Agent-only mode comes from the `--agent-only` flag (already in the
+        // global), else the persisted preference; sync the global so both agree
+        // from the first tab.
+        let agent_only = crate::agent_only().or(prefs.agent_only);
+        crate::set_agent_only(agent_only);
         // Relay mode: on if the `--relay` flag (already in the global) or the
         // preference asked for it; sync the global. Seed the global tab-env map
         // from the preference so `env set --global` values apply from boot.
@@ -1465,7 +1465,7 @@ impl AppState {
             pending_limit_changes: Vec::new(),
             pending_default_limits: None,
             pending_resizes: Vec::new(),
-            pending_claude_only: None,
+            pending_agent_only: None,
             pending_relay_mode: None,
             pending_env_changes: Vec::new(),
             pending_meta_changes: Vec::new(),
@@ -1597,7 +1597,7 @@ impl AppState {
             cursor_style,
             opacity,
             show_tab_gauge: prefs.show_tab_gauge,
-            claude_only,
+            agent_only,
             relay_mode,
             hotkeys,
             show_preferences: false,
@@ -1763,15 +1763,15 @@ impl AppState {
         );
     }
 
-    /// Flip forced Claude-only mode on/off: update the struct field, the
+    /// Set forced agent-only mode (`None` = off): update the struct field, the
     /// process-global (read by `insert_tab`), and persist the preference so it
     /// survives a restart. The caller opens tabs / clears the menu as needed.
-    fn set_claude_only_mode(&mut self, on: bool) {
-        self.claude_only = on;
-        crate::set_claude_only(on);
+    fn set_agent_only_mode(&mut self, agent: Option<crate::AgentOnly>) {
+        self.agent_only = agent;
+        crate::set_agent_only(agent);
         if !crate::read_only() {
             let mut prefs = load_preferences(&platform::config_dir());
-            prefs.claude_only = on;
+            prefs.agent_only = agent;
             save_preferences(&platform::config_dir(), &prefs);
         }
     }
@@ -1856,15 +1856,15 @@ impl AppState {
         // `focus` false means the API asked for this tab, so it launches with
         // colour output off — see `new_tab_env`.
         env.extend(crate::new_tab_env(!focus));
-        // Claude-only mode: a fresh tab launches `claude` in `auto` permission
-        // mode instead of a plain shell. Under cleared-env we can `exec`
+        // Agent-only mode: a fresh tab launches the chosen agent instead of a
+        // plain shell. Under cleared-env we can `exec`
         // it directly via the shell suffix; otherwise we type the command into
         // the shell once its prompt appears (`pending_agent_resume`, below) —
         // the same two mechanisms the restore path uses for agents. Read-only
-        // never force-launches. See `crate::FRESH_CLAUDE_AUTO_CMD`.
-        let force_claude = self.claude_only && !crate::read_only();
-        let exec_claude = force_claude && crate::clear_env();
-        let agent_launch = exec_claude.then(crate::fresh_claude_launch_suffix);
+        // never force-launches. See `crate::AgentOnly::fresh_command`.
+        let force_agent = self.agent_only.filter(|_| !crate::read_only());
+        let exec_agent = force_agent.filter(|_| crate::clear_env());
+        let agent_launch = exec_agent.map(crate::fresh_agent_launch_suffix);
         let view = cx.new(|cx| {
             let mut tv = TerminalView::new_with_colors_and_env(
                 cwd.as_deref(),
@@ -1884,11 +1884,13 @@ impl AppState {
             tv
         });
         let idx = at.min(self.tabs.len());
-        // Non-exec claude launch: queue the command to be typed into the shell
+        // Non-exec agent launch: queue the command to be typed into the shell
         // once it prints its first prompt (`flush_pending_agent_resume`).
-        let pending_claude = (force_claude && !exec_claude).then(|| crate::FRESH_CLAUDE_AUTO_CMD.to_string());
-        let name = if force_claude {
-            format!("claude {}", self.tabs.len())
+        let pending_agent = force_agent
+            .filter(|_| exec_agent.is_none())
+            .map(|agent| agent.fresh_command().to_string());
+        let name = if let Some(agent) = force_agent {
+            format!("{} {}", agent.as_str(), self.tabs.len())
         } else {
             format!("{} {}", self.t().terminal_n, self.tabs.len())
         };
@@ -1903,7 +1905,7 @@ impl AppState {
             ..TabState::default()
         };
         self.tabs
-            .insert(idx, Tab::from_state(view, &seed, cwd, None, pending_claude, focus));
+            .insert(idx, Tab::from_state(view, &seed, cwd, None, pending_agent, focus));
         if focus {
             self.active = idx;
         } else if idx <= self.active {
@@ -2529,7 +2531,7 @@ impl AppState {
                 snapshot.pending_limit_changes.drain(..).collect();
             let default_limit_change: Option<(crate::TabResourceLimits, bool)> = snapshot.pending_default_limits.take();
             let resize_changes: Vec<(String, Option<(u16, u16)>)> = snapshot.pending_resizes.drain(..).collect();
-            let claude_only_change: Option<bool> = snapshot.pending_claude_only.take();
+            let agent_only_change: Option<crate::AgentOnlyChange> = snapshot.pending_agent_only.take();
             let relay_mode_change: Option<bool> = snapshot.pending_relay_mode.take();
             let relay_config_change = snapshot.pending_relay_config.take();
             let env_changes: Vec<crate::api::EnvChange> = snapshot.pending_env_changes.drain(..).collect();
@@ -2586,11 +2588,11 @@ impl AppState {
                     crate::apply_meta_change(&mut tab.meta, &ch.key, ch.value);
                 }
             }
-            // Forced Claude-only toggle from the CLI/API (`claude-only on|off`).
+            // Forced agent-only switch from the CLI/API (`agent-only …`).
             // Mirror onto the struct field + global (read by `insert_tab`) and
             // persist, so the change survives a restart like the menu toggle.
-            if let Some(on) = claude_only_change {
-                self.set_claude_only_mode(on);
+            if let Some(change) = agent_only_change {
+                self.set_agent_only_mode(change.agent());
             }
             // Per-tab fixed-size pins (`tab-atelier resize`): set the view's
             // pinned grid (applies immediately) + mirror onto the runtime Tab so
@@ -2758,11 +2760,14 @@ impl AppState {
                 let Some(tab) = self.tabs.iter_mut().find(|t| *t.id == upd.tab_id) else {
                     continue;
                 };
+                let anchor = crate::report_may_touch_attachment(tab.agent_kind.as_deref(), upd.agent_kind.as_deref());
                 if upd.wipe_attachment {
-                    tab.agent_state = None;
-                    tab.agent_session_id = None;
-                    tab.agent_kind = None;
-                    tab.agent_plan_mode = None;
+                    if anchor {
+                        tab.agent_state = None;
+                        tab.agent_session_id = None;
+                        tab.agent_kind = None;
+                        tab.agent_plan_mode = None;
+                    }
                 } else {
                     // `state: None` (the wire's "idle") takes the indicator
                     // down. The metadata below still applies either way, so
@@ -2774,14 +2779,19 @@ impl AppState {
                         label: upd.label.clone(),
                         updated_at: std::time::Instant::now(),
                     });
-                    if upd.session_id.is_some() {
-                        tab.agent_session_id = upd.session_id.map(std::sync::Arc::from);
-                    }
-                    if upd.agent_kind.is_some() {
-                        tab.agent_kind = upd.agent_kind.map(std::sync::Arc::from);
-                    }
-                    if upd.plan_mode.is_some() {
-                        tab.agent_plan_mode = upd.plan_mode;
+                    // A claude started inside a catbus session fires the
+                    // system hooks with the tab's env; its session and kind
+                    // are not this tab's. See `report_may_touch_attachment`.
+                    if anchor {
+                        if upd.session_id.is_some() {
+                            tab.agent_session_id = upd.session_id.map(std::sync::Arc::from);
+                        }
+                        if upd.agent_kind.is_some() {
+                            tab.agent_kind = upd.agent_kind.map(std::sync::Arc::from);
+                        }
+                        if upd.plan_mode.is_some() {
+                            tab.agent_plan_mode = upd.plan_mode;
+                        }
                     }
                     if let Some(d) = upd.daemon {
                         tab.agent_daemon = d;
@@ -4585,38 +4595,48 @@ impl AppState {
             )
             // App section
             .child(sep())
-            // Claude-only mode. When off, this enables it (new tabs launch
-            // `claude` in auto mode). When on, it flips to a "New bash tab"
-            // escape hatch that cancels the mode AND opens a plain shell.
-            .child({
-                let label = if self.claude_only {
-                    "🐚 New bash tab"
+            // Agent-only mode. When off, one entry per agent enables it (new
+            // tabs launch that agent). When on, a single "New bash tab" escape
+            // hatch cancels the mode AND opens a plain shell.
+            .children({
+                let entries: Vec<(&'static str, &'static str, Option<crate::AgentOnly>)> = if self.agent_only.is_some()
+                {
+                    vec![("menu-agent-only-off", "🐚 New bash tab", None)]
                 } else {
-                    "🤖 Claude-only mode"
+                    vec![
+                        (
+                            "menu-agent-only-claude",
+                            "🤖 Agent-only mode: Claude",
+                            Some(crate::AgentOnly::Claude),
+                        ),
+                        (
+                            "menu-agent-only-catbus",
+                            "🚌 Agent-only mode: catbus",
+                            Some(crate::AgentOnly::Catbus),
+                        ),
+                    ]
                 };
-                div()
-                    .id("menu-claude-only")
-                    .px(px(12.0))
-                    .py(px(4.0))
-                    .cursor_pointer()
-                    .hover(|s| s.bg(menu_hover))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _ev: &MouseDownEvent, window, cx| {
-                            if this.claude_only {
-                                // Cancel the mode, then open a shell tab (now
-                                // that force-claude is off, `add_tab` yields bash).
-                                this.set_claude_only_mode(false);
+                entries.into_iter().map(|(id, label, agent)| {
+                    div()
+                        .id(id)
+                        .px(px(12.0))
+                        .py(px(4.0))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(menu_hover))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _ev: &MouseDownEvent, window, cx| {
+                                this.set_agent_only_mode(agent);
                                 this.context_menu = None;
-                                this.add_tab(window, cx);
-                            } else {
-                                this.set_claude_only_mode(true);
-                                this.context_menu = None;
-                            }
-                            cx.notify();
-                        }),
-                    )
-                    .child(label)
+                                if agent.is_none() {
+                                    // Force-agent is off now, so `add_tab` yields bash.
+                                    this.add_tab(window, cx);
+                                }
+                                cx.notify();
+                            }),
+                        )
+                        .child(label)
+                })
             })
             .child(
                 div()
@@ -6253,7 +6273,7 @@ impl AppState {
                                                 // Menu-toggled / headless-only knobs the dialog
                                                 // doesn't surface — carry the live or on-disk
                                                 // value through so a GUI save doesn't wipe them.
-                                                claude_only: this.claude_only,
+                                                agent_only: this.agent_only,
                                                 relay_mode: this.relay_mode,
                                                 relay_endpoint_id: on_disk_prefs.relay_endpoint_id,
                                                 relay_egress: on_disk_prefs.relay_egress,

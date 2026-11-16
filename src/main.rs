@@ -53,7 +53,7 @@ fn main() {
     }
 
     let read_only = cli_args.read_only;
-    let claude_only = cli_args.claude_only;
+    let agent_only = cli_args.agent_only.as_deref().and_then(tab_atelier::AgentOnly::parse);
     let relay = cli_args.relay;
 
     // A subcommand runs against a live instance's local API and exits inside
@@ -64,10 +64,10 @@ fn main() {
     }
 
     READ_ONLY.store(read_only, Ordering::SeqCst);
-    // Seed forced Claude-only mode from the flag; App::new ORs in the persisted
-    // preference and re-syncs the global.
-    if claude_only {
-        tab_atelier::set_claude_only(true);
+    // Seed forced agent-only mode from the flag; App::new falls back to the
+    // persisted preference and re-syncs the global.
+    if agent_only.is_some() {
+        tab_atelier::set_agent_only(agent_only);
     }
     // Seed relay mode from the flag; App::new ORs in the persisted preference.
     if relay {
