@@ -1132,7 +1132,12 @@ class TerminalManager :
      */
     fun requestReconnect(bridge: TerminalBridge) {
         synchronized(pendingReconnect) {
-            pendingReconnect.add(WeakReference(bridge))
+            // Each tap on Reconnect asks again for the same session. Queuing it every time
+            // made reconnectPending start that session once per tap, so a bridge opened
+            // several transports, each with a relay writing into the same emulator.
+            if (pendingReconnect.none { it.get() === bridge }) {
+                pendingReconnect.add(WeakReference(bridge))
+            }
             if (!bridge.isUsingNetwork() ||
                 connectivityMonitor.getCurrentNetworkInfo()?.isConnected == true
             ) {
