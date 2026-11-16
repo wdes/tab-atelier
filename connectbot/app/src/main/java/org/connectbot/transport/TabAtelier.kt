@@ -259,6 +259,36 @@ class TabAtelier : AbsTransport() {
     @Volatile
     private var currentAttempt: Any? = null
 
+    /**
+     * Which dial is still wanted. Bumped by everything that makes the dials before it
+     * pointless: a tab switch, a suspend, the session closing.
+     *
+     * A dial blocks for up to [CONNECT_TIMEOUT_SECONDS] per address and cannot be
+     * cancelled while it does, so cancelling the retry job does not stop one that is
+     * already inside [openSocket]. Without this, a resume still dialling the tab being
+     * left on an address that no longer answers would outlive a switch to another tab,
+     * reach its next address, and take the session's socket back — the terminal then
+     * showed the old tab under the new tab's title, and only a disconnect cured it.
+     *
+     * Read and written under [dialLock] together with [currentAttempt], so a stale dial
+     * cannot slip between the check and becoming current.
+     */
+    private var dialGeneration = 0
+    private val dialLock = Any()
+
+    /** Makes every dial started before this call give up at its next step. */
+    private fun abandonDials() {
+        synchronized(dialLock) {
+            dialGeneration++
+            currentAttempt = null
+        }
+    }
+
+    private fun currentGeneration(): Int = synchronized(dialLock) { dialGeneration }
+
+    /** A dial that was overtaken — not a failure of the address it was trying. */
+    private class StaleDialException : IOException("This dial was replaced by a newer one")
+
     override fun connect() {
         val host = host
         val service = manager
@@ -330,7 +360,7 @@ class TabAtelier : AbsTransport() {
         setSocketState(ConnectionState.RECONNECTING)
 
         try {
-            openSocket(tabKey)
+            openSocket(tabKey, currentGeneration())
         } catch (e: IOException) {
             // A dial that never opened has nothing to keep alive, and the retry the
             // failed socket started is aimed at a session that does not exist yet:
@@ -366,7 +396,7 @@ class TabAtelier : AbsTransport() {
      * @throws IOException when the daemon did not accept the socket, which is what
      *   [retryLoop] retries and what [connect] lets the bridge report.
      */
-    private fun openSocket(tabKey: String) {
+    private fun openSocket(tabKey: String, generation: Int) {
         val host = host ?: throw IOException("No host to open a tab-atelier session for")
         val client = client ?: throw IOException("No connection to open a tab-atelier session on")
         val reachable = bases
@@ -381,7 +411,7 @@ class TabAtelier : AbsTransport() {
         var lastFailure: IOException? = null
         for (base in ordered) {
             try {
-                openSocketAt(base, tabKey)
+                openSocketAt(base, tabKey, generation)
                 // Remembered so the next dial — a tab switch, or a redial after a drop —
                 // starts where this one succeeded rather than re-walking a list whose
                 // first entries have just proved unreachable. Moving between networks
@@ -389,6 +419,10 @@ class TabAtelier : AbsTransport() {
                 // works keeps its place at the front.
                 activeBase = base
                 return
+            } catch (e: StaleDialException) {
+                // Not this address's fault, and not a reason to try the next one: nobody
+                // wants this dial any more.
+                throw e
             } catch (e: IOException) {
                 // One address being down is the expected case, not an error: it is why
                 // there is more than one. The last one's reason is the one reported, as
@@ -426,8 +460,19 @@ class TabAtelier : AbsTransport() {
             reachable.filterKeys { it !in candidates }.values
 
         if (active == null || active !in ordered) return ordered
-        return listOf(active) + ordered.filter { it !== active }
+        // The local addresses the network offers stay ahead of the active one. Without
+        // this a session that came up on the remote address stayed on it for good, at
+        // home included, because the address that last worked always went first.
+        val localFirst = if (onLocalNetwork(manager)) {
+            ordered.filter { it !== active && isLocal(reachable, it) }
+        } else {
+            emptyList()
+        }
+        return localFirst + active + ordered.filter { it !== active && it !in localFirst }
     }
+
+    private fun isLocal(reachable: Map<String, TabAtelierBase>, base: TabAtelierBase): Boolean =
+        reachable.entries.any { it.value === base && it.key in addresses.local }
 
     /**
      * Opening a socket has to know the phone's networks, which is a platform call, so it
@@ -443,7 +488,7 @@ class TabAtelier : AbsTransport() {
      * caller can move on to the next address. Splitting them is what makes a fallback a
      * fallback rather than a retry of the same thing.
      */
-    private fun openSocketAt(base: TabAtelierBase, tabKey: String) {
+    private fun openSocketAt(base: TabAtelierBase, tabKey: String, generation: Int) {
         val host = host ?: throw IOException("No host to open a tab-atelier session for")
         val client = client ?: throw IOException("No connection to open a tab-atelier session on")
 
@@ -458,8 +503,14 @@ class TabAtelier : AbsTransport() {
         // Set before the socket exists, so a listener that runs before
         // newWebSocket returns still finds itself current. See [currentAttempt].
         val attempt = Any()
-        currentAttempt = attempt
+        synchronized(dialLock) {
+            if (generation != dialGeneration) throw StaleDialException()
+            currentAttempt = attempt
+        }
         open = false
+        // The address before this one in the walk may have left its reason here, and it
+        // is read below to decide whether *this* socket failed.
+        failure = null
 
         // Set before the socket is created, so there is no window in which the
         // daemon's first bytes could be rendered onto a screen that still holds
@@ -481,8 +532,22 @@ class TabAtelier : AbsTransport() {
         var handedOver = false
         try {
             val webSocket = client.clientFor(host.id, base, progress)
-                .newWebSocket(request, Listener(opened, attempt, progress))
-            socket = webSocket
+                .newWebSocket(request, Listener(opened, attempt, progress, walking = true))
+            // Only the dial that is still current may own the session's socket. One that
+            // was overtaken between the check above and here lets go of what it opened
+            // instead of replacing — and leaking — the socket that overtook it.
+            val stale = synchronized(dialLock) {
+                if (currentAttempt === attempt) {
+                    socket = webSocket
+                    false
+                } else {
+                    true
+                }
+            }
+            if (stale) {
+                webSocket.cancel()
+                throw StaleDialException()
+            }
 
             if (!opened.await(CONNECT_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
                 webSocket.cancel()
@@ -605,6 +670,10 @@ class TabAtelier : AbsTransport() {
      *   session instead.
      */
     fun switchTab(tabKey: String): Boolean {
+        // A session that has ended has no Relay left to read a new socket, so a switch
+        // would retitle the console and leave the old tab's screen under it. The caller
+        // reconnects instead — see [TerminalBridge.switchTab].
+        if (closed) return false
         if (tabKey.isBlank() || tabKey == currentTabKey) return false
 
         // A session can exist without a client and a base. They are set by connect(),
@@ -662,8 +731,11 @@ class TabAtelier : AbsTransport() {
         // than carried into the new tab.
         attempts = 0
 
+        // Before the old socket goes, so a dial still in flight for the tab being left
+        // cannot become current again once this one has replaced it.
+        abandonDials()
+        val generation = currentGeneration()
         val previous = socket
-        currentAttempt = null
         socket = null
         previous?.close(CLOSE_NORMAL, null)
 
@@ -702,11 +774,20 @@ class TabAtelier : AbsTransport() {
         // second tap on the same tab during that retry a no-op, which is right — the
         // retry is already on it.
         currentTabKey = tabKey
+        // Recorded for the app's own reconnect, which builds a new transport and asks the
+        // manager which tab to open. Without it that reconnect went back to the tab of the
+        // last fresh connect rather than the one on screen.
+        host?.let { manager?.rememberTabKey(it.id, tabKey) }
 
         return try {
-            openSocket(tabKey)
+            openSocket(tabKey, generation)
             // The socket reports CONNECTED from its own onOpen; nothing to do here.
             Timber.d("Moved the tab-atelier session to tab %s", tabKey)
+            true
+        } catch (e: StaleDialException) {
+            // A later switch, or the session closing, overtook this one. Whatever did
+            // that is in charge of the socket now, so this is neither a failure to
+            // report nor one to retry.
             true
         } catch (e: IOException) {
             Timber.w(e, "Could not move the tab-atelier session to tab %s", tabKey)
@@ -757,6 +838,12 @@ class TabAtelier : AbsTransport() {
         private val attempt: Any,
         /** The reporter for this socket's attach phases, if one is recording them. */
         private val progress: ConnectionProgress?,
+        /**
+         * True until the socket opens: it is one address of a walk [openSocket] is still
+         * making. A failure then is that walk's to handle — it moves to the next address —
+         * and starting a redial for it would race the walk for the session's socket.
+         */
+        @Volatile private var walking: Boolean = false,
     ) : WebSocketListener() {
 
         /** Whether the daemon's meta frame — tab name and grid — has been seen. */
@@ -798,8 +885,25 @@ class TabAtelier : AbsTransport() {
          */
         private fun isCurrent(): Boolean = currentAttempt === attempt
 
+        /**
+         * Handles the end of a socket that never opened, when a walk is waiting on it.
+         *
+         * Only records the reason and wakes the walk. [handleDrop] would start a redial
+         * as well, and that redial dialled the same addresses two seconds later while the
+         * walk was still on the next one: whichever finished second replaced the other's
+         * socket, so a fallback that worked could time out, or be attached twice.
+         */
+        private fun failedWhileWalking(cause: IOException): Boolean {
+            if (!walking) return false
+            failure = cause
+            open = false
+            opened.countDown()
+            return true
+        }
+
         override fun onOpen(webSocket: WebSocket, response: Response) {
             if (!isCurrent()) return
+            walking = false
             // Adopted here as well as by openSocket, because this can run before
             // newWebSocket returns and the first frames below must not be
             // dropped for want of a socket to send them on.
@@ -842,6 +946,10 @@ class TabAtelier : AbsTransport() {
                         // when the text changes — a large scrollback is thousands of frames.
                         progress?.addReplayBytes(frame.bytes.size.toLong())
                     }
+                    // Asked again, because decoding takes time and a switch can land during
+                    // it: a frame of the tab being left, queued after the switch cleared the
+                    // queue, would be drawn into the tab being opened.
+                    if (!isCurrent()) return
                     inbound.offer(frame.bytes.toByteArray())
                     // The tab's own bytes are here, which is the honest moment to call the
                     // connect finished: not the upgrade, which happens seconds earlier on a
@@ -910,6 +1018,7 @@ class TabAtelier : AbsTransport() {
                 return
             }
             Timber.d("tab-atelier session closed: %d %s", code, reason)
+            if (failedWhileWalking(IOException("the tab-atelier connection closed ($code $reason)"))) return
             // Before the latch, not after. `handleDrop` stops the dial's progress reporter and
             // then writes "Reconnecting…"; counting the latch down first would let the dial
             // thread wake and reach its cleanup *between* those two, clearing the message the
@@ -935,6 +1044,7 @@ class TabAtelier : AbsTransport() {
                 return
             }
             Timber.w(t, "tab-atelier session failed")
+            if (failedWhileWalking(IOException(t.message ?: "tab-atelier connection failed", t))) return
             // See the ordering note in onClosed.
             handleDrop(IOException(t.message ?: "tab-atelier connection failed", t))
             opened.countDown()
@@ -1045,10 +1155,15 @@ class TabAtelier : AbsTransport() {
         // back, or the user picked the phone up — so making them watch a two-second pause
         // would be an artefact of the retry design rather than a fact about the network.
         var waitFirst = !dialFirst
+        // The dials this loop makes are wanted only until something overtakes it — see
+        // [dialGeneration].
+        val generation = currentGeneration()
         try {
             while (true) {
                 if (waitFirst) delay(Reconnect.delayMillis(attempts))
                 waitFirst = true
+
+                if (generation != currentGeneration()) return
 
                 // Closed while we were waiting — the user is done with this session.
                 if (closed) return
@@ -1060,11 +1175,15 @@ class TabAtelier : AbsTransport() {
 
                 attempts++
                 try {
-                    openSocket(attemptKey)
+                    openSocket(attemptKey, generation)
                     target = currentTabKey
                     Timber.i("Reconnected the tab-atelier session for tab %s after %d tr%s",
                         attemptKey, attempts, if (attempts == 1) "y" else "ies")
                     failure = null
+                    return
+                } catch (e: StaleDialException) {
+                    // A switch, a suspend or a close overtook this loop while it was
+                    // dialling. Whatever did that owns the session's socket now.
                     return
                 } catch (e: IOException) {
                     // Expected while the server is down, and not the user's news:
@@ -1113,6 +1232,7 @@ class TabAtelier : AbsTransport() {
     internal fun suspendSession() {
         if (!established) return
         cancelRetry()
+        abandonDials()
         stopProgress()
         open = false
         closeSocketQuietly()
@@ -1394,6 +1514,7 @@ class TabAtelier : AbsTransport() {
      */
     override fun close() {
         cancelRetry()
+        abandonDials()
         stopProgress()
         open = false
         established = false
@@ -1428,6 +1549,16 @@ class TabAtelier : AbsTransport() {
      * connection and the PTY are genuinely two.
      */
     override fun isConnected(): Boolean = !closed && established
+
+    /**
+     * False: this transport redials and suspends itself.
+     *
+     * The default is ConnectBot's answer for SSH — when the network is lost for a minute,
+     * or the phone's address changes, close the transport and let the app reconnect. Here
+     * that closed a session whose own retry loop was already bringing it back, and left a
+     * bridge with no Relay: the next tab tapped changed the title and nothing else.
+     */
+    override fun resetOnConnectionChange(): Boolean = false
 
     override fun isSessionOpen(): Boolean = !closed && established
 
@@ -1759,7 +1890,27 @@ class TabAtelier : AbsTransport() {
          * and then to the relay, and a shared array is a mutable thing in two threads for no
          * benefit.
          */
-        internal fun screenErase(): ByteArray = "\u001b[2J\u001b[H\u001b[3J".toByteArray(Charsets.US_ASCII)
+        internal fun screenErase(): ByteArray = (MODE_RESET + "\u001b[2J\u001b[H\u001b[3J").toByteArray(Charsets.US_ASCII)
+
+        /**
+         * Puts the emulator back in the state a replay expects to start from.
+         *
+         * An erase clears the buffer that is showing and nothing else. A tab left while a
+         * full-screen program had the alternate screen up kept that mode — and, behind it,
+         * the primary buffer with the tab's earlier output — so the next tab was replayed
+         * into the alternate screen, and the first program in its history to leave it
+         * dropped the user onto the previous tab's shell. So the modes go first: leave the
+         * alternate screen, then undo what a program may have left set (scroll region,
+         * origin and insert modes, attributes, character set, cursor keys, mouse reporting,
+         * bracketed paste), re-enable wrapping and show the cursor.
+         *
+         * Spelled out rather than a full reset (`ESC c`): that would also discard the tab's
+         * background, which this app sets on the emulator itself.
+         */
+        private const val MODE_RESET =
+            "\u001b[?1049l\u001b[?47l\u001b[r\u001b[?6l\u001b[4l\u001b[m\u001b(B\u000f" +
+                "\u001b[?1l\u001b>\u001b[?1000l\u001b[?1002l\u001b[?1003l\u001b[?1006l" +
+                "\u001b[?2004l\u001b[?7h\u001b[?25h"
 
         /**
          * How long a read waits while the session is suspended.

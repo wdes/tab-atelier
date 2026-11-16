@@ -42,11 +42,13 @@ import org.connectbot.di.CoroutineDispatchers
 import org.connectbot.service.ConnectionState
 import org.connectbot.service.ServiceError
 import org.connectbot.service.TerminalManager
+import org.connectbot.tabatelier.TabAtelierAddresses
 import org.connectbot.tabatelier.TabAtelierClient
 import org.connectbot.tabatelier.TabAtelierTab
 import org.connectbot.tabatelier.tabAtelierErrorMessage
 import org.connectbot.transport.TabAtelier
 import org.connectbot.util.PreferenceConstants
+import java.io.IOException
 import javax.inject.Inject
 
 /**
@@ -534,11 +536,40 @@ class HostListViewModel @Inject constructor(
                         // the scheme — http is not upgraded to https — and any
                         // path prefix. A URL that does not parse is reported as
                         // this server's error rather than fetched from a guess.
-                        val base = tabAtelierClient.base(host.tabAtelierUrl)
-                            ?: throw IllegalStateException(
+                        //
+                        // Every address of the host is tried, in the order a session
+                        // would dial them. Asking only the first meant a server whose
+                        // public name does not answer from inside its own network
+                        // showed an error and no tabs — so there was nothing to tap,
+                        // and the fallback a session would have used was never reached.
+                        val addresses = TabAtelierAddresses(
+                            primary = host.tabAtelierUrl,
+                            fallbacks = TabAtelierAddresses.parseFallbacks(host.tabAtelierUrls),
+                        )
+                        val bases = addresses
+                            .candidates(terminalManager?.isOnLocalNetwork == true)
+                            .mapNotNull { tabAtelierClient.base(it) }
+                        if (bases.isEmpty()) {
+                            throw IllegalStateException(
                                 context.getString(R.string.tabatelier_url_invalid),
                             )
-                        tabAtelierClient.fetchTabs(host.id, base, tabAtelierClient.token(host.id))
+                        }
+                        val token = tabAtelierClient.token(host.id)
+                        var tabs: List<TabAtelierTab>? = null
+                        var unreachable: IOException? = null
+                        for (base in bases) {
+                            try {
+                                tabs = tabAtelierClient.fetchTabs(host.id, base, token)
+                                break
+                            } catch (e: IOException) {
+                                // Only "could not reach it" moves on. An answer the
+                                // server gave — a refused token, say — is the answer.
+                                unreachable = e
+                            }
+                        }
+                        tabs ?: throw unreachable ?: IllegalStateException(
+                            context.getString(R.string.tabatelier_url_invalid),
+                        )
                     },
                 )
             } catch (e: CancellationException) {

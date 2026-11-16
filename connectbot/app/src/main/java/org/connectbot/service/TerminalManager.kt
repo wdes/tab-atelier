@@ -561,6 +561,9 @@ class TerminalManager :
      */
     fun lastTabKey(hostId: Long): String? = tabKeys.resumeKey(hostId)
 
+    /** Makes [tabKey] the tab the next connection for [hostId] opens. */
+    fun chooseTabKey(hostId: Long, tabKey: String) = tabKeys.choose(hostId, tabKey)
+
     /** Records the tab a live session has moved to, so a later reopen lands there. */
     fun rememberTabKey(hostId: Long, tabKey: String) = tabKeys.remember(hostId, tabKey)
 

@@ -665,6 +665,24 @@ Two things about *where* this is done:
 The flag is set in `openSocket` *before* the socket is created, so there is no window in
 which the daemon's first bytes could land on a screen that still holds something else.
 
+**The erase is preceded by a mode reset.** An erase clears the buffer that is showing and
+nothing else, so a tab left inside a full-screen program kept the alternate screen — and its
+own shell output behind it — and the next tab's replay fell through to that the moment a
+program in its history left the alternate screen. The prefix now leaves the alternate
+screen and undoes scroll region, attributes, character set, mouse and paste modes first.
+Spelled out rather than `ESC c`, which would also discard the tab's background.
+
+**A dial that has been overtaken gives up.** A dial blocks for up to fifteen seconds per
+address and cannot be cancelled meanwhile, so a resume still dialling the tab being left
+could outlive a switch, reach its next address and take the session's socket back: the old
+tab under the new tab's title. Every dial now carries the generation it was started in;
+a switch, a suspend and a close bump it, and a stale dial stops at its next step.
+
+**The transport does not reset on a connectivity change.** ConnectBot's default closes a
+transport when the network is lost for a minute or the phone's address changes. This one
+redials and suspends itself, and being closed underneath that left a bridge with no Relay.
+A tab tapped while a session *is* over reconnects it on that tab rather than switching.
+
 ### The drop message goes to the console's snackbar, not into the terminal
 
 The daemon replays the tab's scrollback when the redial lands, so a line printed into the
@@ -756,6 +774,25 @@ The address that last worked is remembered and kept at the front, or a redial fr
 phone would re-walk an unreachable primary and pay a connect timeout before reaching the
 address that works. Moving to a network where a local address is available re-orders ahead
 of it again, so a session does not stay pinned to the address it happened to come up on.
+
+Four things had to be true for any of that to work, and were not:
+
+- **The local set is derived, not passed.** `TabAtelierAddresses.local` defaulted to empty
+  and both places that build it from a host passed only the addresses, so the preference
+  was never applied to a real host. It is now worked out from the addresses themselves.
+- **The tab list walks the addresses too.** It asked only the primary, so a server whose
+  public name does not answer from inside its own network showed an error and no tabs —
+  nothing to tap, and the fallback a session would have used was never reached. Only a
+  failure to *reach* an address moves on; an HTTP answer, such as a refused token, stands.
+- **An invalid fallback blocks the save.** Saving drops entries that do not parse, and the
+  editor let them through, so a bare `192.168.1.10:8443` was deleted without a word.
+- **Cleartext is permitted** (`usesCleartextTraffic`). `http://` is a real choice for this
+  app, and at this target SDK the platform refuses it unless the manifest says otherwise —
+  as an `IOException`, so the walk moved on in silence and the LAN address never worked.
+
+While a walk is in progress, a socket that fails before opening only wakes the walk. It used
+to start a redial as well, which dialled the same addresses two seconds later and raced the
+walk for the session's socket.
 
 ### Ten minutes idle, and no network, let go of the socket
 
