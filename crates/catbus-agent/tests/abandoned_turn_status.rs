@@ -137,7 +137,8 @@ fn spawn_stalling_model() -> (u16, mpsc::Receiver<()>) {
 /// exits cleanly on it (socket.rs installs a handler), and a clean exit is what
 /// lets a coverage-instrumented binary flush its profile to disk. SIGKILL only
 /// if it has not exited within 5 s.
-struct KillOnDrop(Child);
+/// The agent, and the terminal it was started on — held so the terminal outlives it.
+struct KillOnDrop(Child, #[allow(dead_code)] std::os::fd::OwnedFd);
 
 impl Drop for KillOnDrop {
     fn drop(&mut self) {
@@ -161,7 +162,12 @@ impl Drop for KillOnDrop {
 /// removed so the status report goes to `TAB_ATELIER_API_URL` — the direct path,
 /// which is the one under test.
 fn spawn_agent(dir: &Path, socket: &Path, model_port: u16, app_port: u16) -> KillOnDrop {
+    // On a terminal, as a tab's own process always is. Only a session holding the tab's terminal
+    // speaks for the tab (`applink::owns_the_tab`), so one started with whatever stdin the test
+    // runner has would rightly report nothing.
+    let pty = nix::pty::openpty(None, None).expect("openpty");
     let child = Command::new(env!("CARGO_BIN_EXE_catbus-agent"))
+        .stdin(std::process::Stdio::from(pty.slave))
         .args([
             "--no-tui",
             "--new-session",
@@ -201,7 +207,7 @@ fn spawn_agent(dir: &Path, socket: &Path, model_port: u16, app_port: u16) -> Kil
         )
         .spawn()
         .unwrap();
-    KillOnDrop(child)
+    KillOnDrop(child, pty.master)
 }
 
 /// Poll until the agent's socket accepts, then complete the handshake.
