@@ -17,7 +17,6 @@
 
 package org.connectbot.service
 
-import android.net.NetworkInfo
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.advanceUntilIdle
@@ -146,8 +145,12 @@ class TerminalManagerBellTest {
         manager.requestReconnect(bridge)
         verify(bridge, never()).startConnection()
 
-        val online = mock(NetworkInfo::class.java)
-        `when`(online.isConnected).thenReturn(true)
+        val online = ConnectivityMonitor.NetworkInfo(
+            isConnected = true,
+            ipAddresses = emptySet(),
+            networkId = "wifi",
+            networkType = 1,
+        )
         `when`(monitor.getCurrentNetworkInfo()).thenReturn(online)
         manager.requestReconnect(bridge)
 
