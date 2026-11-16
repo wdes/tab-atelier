@@ -667,13 +667,7 @@ pub fn shape_body(
     }
     let before = body.len();
     if vendor == crate::identity::Vendor::Deepseek {
-        let dropped = crate::media::drop_unreadable_documents(&mut v);
-        if dropped > 0 {
-            log::info!(
-                "proxy: {dropped} attached document(s) replaced by a note on {}: it reads only text and file sources",
-                route.provider_id
-            );
-        }
+        crate::media::drop_unreadable_documents(&mut v);
     }
     let elided = crate::compact::apply(&mut v, level);
     // After compaction, deliberately. Compaction walks `messages[]` and the

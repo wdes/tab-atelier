@@ -25,11 +25,17 @@ pub fn drop_unreadable_documents(body: &mut Value) -> usize {
     let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
         return 0;
     };
-    messages
+    let replaced = messages
         .iter_mut()
         .filter_map(|message| message.get_mut("content").and_then(Value::as_array_mut))
         .map(|blocks| replace_in(blocks))
-        .sum()
+        .sum();
+    if replaced > 0 {
+        log::info!(
+            "proxy: {replaced} attached document(s) replaced by a note: DeepSeek reads only text and file sources"
+        );
+    }
+    replaced
 }
 
 fn replace_in(blocks: &mut [Value]) -> usize {
