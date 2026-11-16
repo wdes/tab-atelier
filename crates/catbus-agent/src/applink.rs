@@ -42,9 +42,20 @@ static SILENT: AtomicBool = AtomicBool::new(false);
 /// prompt, a sub-agent this agent spawned. Each inherits the tab's environment and mints its own
 /// session id, so one that reported would replace the id the app resumes with by one that names a
 /// transcript nobody will open again, or none at all.
+///
+/// `on_terminal` — whether stdin is a terminal — is what tells the tab's own process from one
+/// started behind it. A `--no-tui` session a person launched in the tab has the tab's terminal
+/// and is its agent; one an agent started from a tool call has a pipe or nothing, and would
+/// otherwise trade the tab's session id back and forth with the session in front of it, each
+/// taking it on its next turn.
+///
+/// What this does not settle is two sessions that both hold the terminal (one put in the
+/// background with `&`): the last to report wins. And sessions run one after another are simply
+/// last-started-wins, which is the right answer — but the app resumes with `--resume <id>` alone,
+/// so a `--no-tui` session comes back with its conversation and a TUI.
 #[must_use]
-pub const fn owns_the_tab(one_shot: bool, once: bool, spawn_depth: u32) -> bool {
-    !one_shot && !once && spawn_depth == 0
+pub const fn owns_the_tab(one_shot: bool, once: bool, spawn_depth: u32, on_terminal: bool) -> bool {
+    !one_shot && !once && spawn_depth == 0 && on_terminal
 }
 
 /// Report nothing for the rest of this process. See [`owns_the_tab`].
@@ -233,10 +244,17 @@ mod tests {
     /// resuming a review instead of the conversation.
     #[test]
     fn only_the_interactive_session_owns_the_tab() {
-        assert!(owns_the_tab(false, false, 0));
-        assert!(!owns_the_tab(true, false, 0), "a --prompt-file run is a passer-by");
-        assert!(!owns_the_tab(false, true, 0), "so is a --once run");
-        assert!(!owns_the_tab(false, false, 1), "and a spawned sub-agent");
+        assert!(owns_the_tab(false, false, 0, true));
+        assert!(
+            !owns_the_tab(true, false, 0, true),
+            "a --prompt-file run is a passer-by"
+        );
+        assert!(!owns_the_tab(false, true, 0, true), "so is a --once run");
+        assert!(!owns_the_tab(false, false, 1, true), "and a spawned sub-agent");
+        assert!(
+            !owns_the_tab(false, false, 0, false),
+            "and a session started behind the tab's own, with no terminal"
+        );
     }
 
     /// Only a local address is a candidate, whatever it is called.
