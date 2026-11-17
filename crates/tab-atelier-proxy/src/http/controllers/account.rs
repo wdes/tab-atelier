@@ -276,7 +276,7 @@ pub(crate) fn set_compact(
     // the only way in — this API is authenticated, not private.
     if !level.is_none() {
         let store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(why) = compact_refusal_for(state, &store, who) {
+        if let Some(why) = compact_refusal_for(state, &store, who, level) {
             return Err(failure(400, &why));
         }
     }
@@ -291,11 +291,17 @@ pub(crate) fn set_compact(
 ///
 /// A property of the destination, not of the request: the same level is fine
 /// here and refused there, so the answer has to be asked of the registry.
-pub(crate) fn compact_refusal_for(state: &Arc<State>, store: &Store, who: &str) -> Option<String> {
+pub(crate) fn compact_refusal_for(
+    state: &Arc<State>,
+    store: &Store,
+    who: &str,
+    level: crate::compact::Compact,
+) -> Option<String> {
     let reg = state.registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    // The hop's objection is level-independent — it is the breaker on
-    // `compact != none` — so any non-`none` level stands in for the rest.
-    let ask = |p: &crate::provider::Provider| p.compact_refusal(crate::compact::Compact::Tools);
+    // The level is asked with, not assumed: a hop that requires its thinking
+    // blocks back can still take `tools`, which only rewrites tool results, and
+    // refusing that too would take away a level that works.
+    let ask = |p: &crate::provider::Provider| p.compact_refusal(level);
     store.find(who).and_then(|a| a.provider.as_deref()).map_or_else(
         || reg.providers.iter().filter(|p| p.enabled).find_map(ask),
         |id| reg.get(id).and_then(ask),
@@ -1059,7 +1065,7 @@ mod tests {
         let store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         // Whichever way the default registry answers, the function has to answer
         // at all rather than panicking on a missing provider.
-        let _ = compact_refusal_for(&state, &store, "compact-hop@example.com");
+        let _ = compact_refusal_for(&state, &store, "compact-hop@example.com", crate::compact::Compact::All);
     }
 
     // ── the switches ────────────────────────────────────────────────────────

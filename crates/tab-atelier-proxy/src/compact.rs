@@ -644,8 +644,13 @@ fn is_banner(message: &serde_json::Value) -> bool {
 /// arrived: this is a best-effort rewrite of a request the proxy did not
 /// author, and refusing one over a shape it does not have would turn a size
 /// optimisation into an outage.
+///
+/// `may_drop_thinking` is false when the far end requires the thinking blocks
+/// back: the level then still elides tool results and drops banners, but leaves
+/// `thinking` alone. Dropping them there does not shrink the bill, it makes the
+/// request fail — see [`crate::identity::Vendor::keeps_thinking`].
 #[must_use]
-pub fn apply(body: &mut serde_json::Value, level: Compact) -> Stats {
+pub fn apply(body: &mut serde_json::Value, level: Compact, may_drop_thinking: bool) -> Stats {
     let mut stats = Stats::default();
     if level.is_none() {
         return stats;
@@ -657,7 +662,7 @@ pub fn apply(body: &mut serde_json::Value, level: Compact) -> Stats {
     if level.does_tools() {
         elide_tool_results(messages, &mut stats);
     }
-    if level.does_thinking() {
+    if level.does_thinking() && may_drop_thinking {
         drop_thinking(messages, &mut stats);
     }
     if level.does_notices() {
@@ -793,7 +798,7 @@ mod tests {
 
     fn apply_to(level: Compact) -> (serde_json::Value, Stats) {
         let mut b = body();
-        let stats = apply(&mut b, level);
+        let stats = apply(&mut b, level, true);
         (b, stats)
     }
 
@@ -801,7 +806,7 @@ mod tests {
     fn none_leaves_the_body_exactly_as_it_arrived() {
         let mut b = body();
         let before = serialized(&b);
-        let stats = apply(&mut b, Compact::None);
+        let stats = apply(&mut b, Compact::None, true);
         assert_eq!(serialized(&b), before, "the default must be the identity");
         assert!(!stats.changed());
         assert_eq!(stats, Stats::default());
@@ -867,7 +872,7 @@ mod tests {
         let mut rewrote_on: Vec<usize> = Vec::new();
 
         for turn in 0..GROWN {
-            let _ = apply(&mut body, Compact::Tools);
+            let _ = apply(&mut body, Compact::Tools, true);
             let now: Vec<Vec<u8>> = messages(&body).iter().map(serialized).collect();
 
             if sent
@@ -935,7 +940,7 @@ mod tests {
     fn a_small_stale_region_is_left_completely_alone() {
         let mut b = small_body();
         let before = serialized(&b);
-        let stats = apply(&mut b, Compact::Tools);
+        let stats = apply(&mut b, Compact::Tools, true);
 
         assert_eq!(serialized(&b), before, "the body must come back byte-identical");
         assert_eq!(stats.tool_results_elided, 0);
@@ -953,10 +958,60 @@ mod tests {
     #[test]
     fn the_floor_does_not_gate_thinking() {
         let mut b = small_body();
-        let stats = apply(&mut b, Compact::ToolsThinking);
+        let stats = apply(&mut b, Compact::ToolsThinking, true);
         assert_eq!(stats.tool_results_elided, 0);
         assert_eq!(stats.thinking_dropped, TURNS - KEEP_TURNS);
         assert!(stats.changed());
+    }
+
+    /// A hop that requires its thinking blocks back keeps every one of them.
+    ///
+    /// `DeepSeek`'s Anthropic-shaped endpoint answers a thinking-mode request whose
+    /// earlier assistant turns no longer carry their blocks with a 400 saying the
+    /// blocks must be passed back, and it answers that on every later turn of the
+    /// conversation. So the level may not drop them there — but it must still do
+    /// the rest of its work, or the setting would be silently ignored instead of
+    /// partly applied.
+    #[test]
+    fn thinking_is_kept_when_the_hop_requires_it_back() {
+        let mut b = body();
+        let thinking_before = count_thinking(&b);
+        assert!(thinking_before > 0, "the fixture must carry thinking to keep");
+
+        let stats = apply(&mut b, Compact::All, false);
+
+        assert_eq!(stats.thinking_dropped, 0, "not one thinking block may go");
+        assert_eq!(count_thinking(&b), thinking_before);
+        assert!(
+            stats.tool_results_elided > 0,
+            "the level still elides tool results, so it is applied and not ignored"
+        );
+    }
+
+    /// The same body on a hop that accepts the drop still loses them, so the flag
+    /// is what decides rather than the level alone.
+    #[test]
+    fn thinking_is_dropped_when_the_hop_accepts_it() {
+        let mut b = body();
+        let thinking_before = count_thinking(&b);
+
+        let stats = apply(&mut b, Compact::All, true);
+
+        assert_eq!(stats.thinking_dropped, TURNS - KEEP_TURNS);
+        assert!(count_thinking(&b) < thinking_before);
+    }
+
+    /// How many `thinking` blocks the body still carries, at any depth of the
+    /// content arrays it uses.
+    fn count_thinking(body: &serde_json::Value) -> usize {
+        body["messages"].as_array().map_or(0, |messages| {
+            messages
+                .iter()
+                .filter_map(|m| m["content"].as_array())
+                .flatten()
+                .filter(|block| block_type(block) == Some("thinking"))
+                .count()
+        })
     }
 
     /// The stub names the call that produced it.
@@ -977,7 +1032,7 @@ mod tests {
             "name": "Read",
             "input": {"file_path": long_path},
         });
-        let stats = apply(&mut b, Compact::Tools);
+        let stats = apply(&mut b, Compact::Tools, true);
         let text = tool_results(&b)[0]["content"].as_str().expect("a stub").to_owned();
 
         assert_eq!(stats.tool_results_elided, TURNS - KEEP_TURNS);
@@ -1008,7 +1063,7 @@ mod tests {
             "name": "TodoWrite",
             "input": {"todos": []},
         });
-        let _ = apply(&mut b, Compact::Tools);
+        let _ = apply(&mut b, Compact::Tools, true);
         let named = tool_results(&b)[0]["content"].as_str().expect("a stub").to_owned();
         assert_eq!(named, format!("[elided:{}B; TodoWrite]", stubbed_bytes(0)));
 
@@ -1017,7 +1072,7 @@ mod tests {
         // forwarding megabytes to save a naming we cannot do.
         let mut b = body();
         b["messages"][1]["content"][1]["id"] = json!("call_99");
-        let _ = apply(&mut b, Compact::Tools);
+        let _ = apply(&mut b, Compact::Tools, true);
         let bare = tool_results(&b)[0]["content"].as_str().expect("a stub").to_owned();
         assert_eq!(bare, format!("[elided:{}B]", stubbed_bytes(0)));
     }
@@ -1029,7 +1084,7 @@ mod tests {
         // Make the OLDEST tool result an error — well outside the window, so
         // only the is_error rule can save it.
         b["messages"][0]["content"][0]["is_error"] = json!(true);
-        let stats = apply(&mut b, Compact::Tools);
+        let stats = apply(&mut b, Compact::Tools, true);
 
         assert_eq!(stats.tool_results_elided, TURNS - KEEP_TURNS - 1);
         assert_eq!(stats.tool_results_kept_for_error, 1);
@@ -1060,7 +1115,7 @@ mod tests {
         // The oldest result is the one layer A reaches for first.
         b["messages"][0]["content"][0]["content"] = json!(ack);
 
-        let stats = apply(&mut b, Compact::Tools);
+        let stats = apply(&mut b, Compact::Tools, true);
 
         assert_eq!(stats.tool_results_elided, TURNS - KEEP_TURNS - 1);
         assert_eq!(stats.tool_results_kept_small, 1);
@@ -1105,7 +1160,7 @@ mod tests {
             "role": "assistant",
             "content": [{"type": "thinking", "thinking": "alone", "signature": "s"}],
         });
-        let _ = apply(&mut b, Compact::ToolsThinking);
+        let _ = apply(&mut b, Compact::ToolsThinking, true);
         assert_eq!(messages(&b).len(), TURNS * 2, "the turn is kept");
         assert!(
             b["messages"][1]["content"].as_array().expect("array").is_empty(),
@@ -1126,7 +1181,7 @@ mod tests {
         }
         b["messages"] = json!(msgs);
 
-        let stats = apply(&mut b, Compact::All);
+        let stats = apply(&mut b, Compact::All, true);
         assert_eq!(stats.notices_dropped, 2);
         let banners: Vec<&str> = messages(&b)
             .iter()
@@ -1141,7 +1196,7 @@ mod tests {
         let mut msgs = messages(&b).clone();
         msgs.insert(0, json!({"role": "system", "content": "a real instruction"}));
         b["messages"] = json!(msgs);
-        let stats = apply(&mut b, Compact::All);
+        let stats = apply(&mut b, Compact::All, true);
         assert_eq!(stats.notices_dropped, 0);
         assert_eq!(messages(&b)[0]["content"], "a real instruction");
     }
@@ -1163,7 +1218,7 @@ mod tests {
         }
         let mut b = json!({"model": "claude-opus-5-5", "max_tokens": 4096, "messages": msgs});
 
-        let stats = apply(&mut b, Compact::All);
+        let stats = apply(&mut b, Compact::All, true);
         assert_eq!(stats.notices_dropped, 4);
 
         let kept: Vec<&str> = messages(&b)
@@ -1191,7 +1246,7 @@ mod tests {
             }
             b["messages"] = json!(msgs);
 
-            let stats = apply(&mut b, level);
+            let stats = apply(&mut b, level, true);
             assert_eq!(stats.notices_dropped, 0, "{level:?} dropped a notice");
             assert_eq!(
                 messages(&b).iter().filter(|m| m["role"] == "system").count(),
@@ -1249,10 +1304,10 @@ mod tests {
     #[test]
     fn the_pass_is_deterministic() {
         let mut first = body();
-        let _ = apply(&mut first, Compact::All);
+        let _ = apply(&mut first, Compact::All, true);
         for _ in 0..3 {
             let mut again = body();
-            let _ = apply(&mut again, Compact::All);
+            let _ = apply(&mut again, Compact::All, true);
             assert_eq!(serialized(&first), serialized(&again));
         }
         // And on an already-compacted body. This is not a hypothetical: a
@@ -1262,7 +1317,7 @@ mod tests {
         // number in the message shrank on every pass and the size of the
         // result it replaced was gone.
         let mut twice = first.clone();
-        let stats = apply(&mut twice, Compact::All);
+        let stats = apply(&mut twice, Compact::All, true);
         assert_eq!(serialized(&twice), serialized(&first), "idempotent");
         assert_eq!(stats.tool_results_elided, 0, "and reports nothing to do");
 
@@ -1294,7 +1349,7 @@ mod tests {
             json!(null),
         ] {
             let mut b = odd.clone();
-            let stats = apply(&mut b, Compact::All);
+            let stats = apply(&mut b, Compact::All, true);
             assert_eq!(serialized(&b), serialized(&odd));
             assert!(!stats.changed());
         }
@@ -1310,7 +1365,7 @@ mod tests {
             ],
         });
         let before = serialized(&b);
-        let stats = apply(&mut b, Compact::All);
+        let stats = apply(&mut b, Compact::All, true);
         assert_eq!(serialized(&b), before);
         assert!(!stats.changed());
     }

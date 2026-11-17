@@ -890,7 +890,21 @@ impl Provider {
     /// `None` when the level is acceptable, including `none` on any provider.
     #[must_use]
     pub fn compact_refusal(&self, wanted: crate::compact::Compact) -> Option<String> {
-        if wanted.is_none() || !matches!(self.auth, Auth::ClaudeOauth) {
+        if wanted.is_none() {
+            return None;
+        }
+        // A level that drops thinking blocks cannot be served by a hop that
+        // requires them back. Refused per level rather than wholesale, because
+        // `tools` alone is fine there: it only rewrites tool results.
+        if wanted.does_thinking() && crate::identity::Vendor::of(self).keeps_thinking() {
+            return Some(format!(
+                "provider {} refuses a request whose earlier assistant turns no longer carry their `thinking` \
+                 blocks (400: \"The `content[].thinking` in the thinking mode must be passed back to the API\"), \
+                 so a level that drops them cannot be served here. Use `tools` to elide tool results, or `none`.",
+                self.id
+            ));
+        }
+        if !matches!(self.auth, Auth::ClaudeOauth) {
             return None;
         }
         Some(format!(
@@ -3794,11 +3808,19 @@ mod tests {
         deepseek.auth = Auth::ApiKeyFile {
             path: "/tmp/k".to_owned(),
         };
-        for level in crate::compact::Compact::ALL {
-            assert!(
-                deepseek.compact_refusal(level).is_none(),
-                "{level:?} must be allowed on a keyed provider"
-            );
+        // `tools` alone only rewrites tool results, so it is served there.
+        assert!(deepseek.compact_refusal(crate::compact::Compact::None).is_none());
+        assert!(deepseek.compact_refusal(crate::compact::Compact::Tools).is_none());
+
+        // Anything that drops thinking blocks is not: DeepSeek demands them back
+        // on the next turn and answers 400, so the level cannot be served rather
+        // than merely being expensive.
+        for level in [crate::compact::Compact::ToolsThinking, crate::compact::Compact::All] {
+            let why = deepseek
+                .compact_refusal(level)
+                .unwrap_or_else(|| panic!("{level:?} must be refused on deepseek"));
+            assert!(why.contains("thinking"), "{why}");
+            assert!(why.contains("tools"), "the refusal names the level that works: {why}");
         }
         r.providers.push(deepseek);
     }

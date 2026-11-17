@@ -87,6 +87,28 @@ missing forever. That rules out anything time-based or random.
 | B | `+thinking` | drops `thinking` blocks on older assistant turns | last **6** assistant turns |
 | C | `+notices` | drops stale injected system notices — the `<total_tokens>` banner, `[SYSTEM NOTIFICATION …]`, PostToolUse notes, "user sent a new message" | the newest banner, plus the last **6** notices |
 
+### Layer B cannot run on a hop that demands its thinking back
+
+DeepSeek's Anthropic-shaped endpoint refuses a thinking-mode request whose earlier
+assistant turns no longer carry their blocks:
+
+```
+400 The `content[].thinking` in the thinking mode must be passed back to the API.
+```
+
+Not once, either — every later turn of that conversation fails the same way, so
+the account is stuck until the history is abandoned. Layer B is therefore **skipped
+when the vendor requires the blocks back** (`identity::Vendor::keeps_thinking`),
+and A and C still run: eliding tool results costs nobody anything.
+
+Choosing such a level on such a provider is refused at the settings endpoint
+rather than silently downgraded, and `tools` remains offered because it never
+touches `thinking`. The check keys on the vendor, not the wire: DeepSeek speaks
+`Wire::Anthropic` too, and the wire cannot tell you this.
+
+The table above, measured on a `deepseek-flash` body, credited layer B with
+19 of the 25 thinking blocks dropped — on that hop those bytes cannot be taken.
+
 There used to be a fourth layer, `+writes`, and it was **removed**. It stubbed
 the long string arguments (`content`, `new_string`, `old_string`, …) of old
 write-tool calls, and in doing so it let a stub be written into a file: a marker

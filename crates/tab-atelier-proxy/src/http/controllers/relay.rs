@@ -669,7 +669,7 @@ pub fn shape_body(
     if vendor == crate::identity::Vendor::Deepseek {
         crate::media::drop_unreadable_documents(&mut v);
     }
-    let elided = crate::compact::apply(&mut v, level);
+    let elided = crate::compact::apply(&mut v, level, !vendor.keeps_thinking());
     // After compaction, deliberately. Compaction walks `messages[]` and the
     // tool policy's pin rule reads that same array to decide what is still
     // live; running the policy first would pin tools against history that

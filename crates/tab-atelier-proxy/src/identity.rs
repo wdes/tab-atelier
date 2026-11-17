@@ -59,6 +59,23 @@ impl Vendor {
         }
     }
 
+    /// Whether an assistant turn's `thinking` blocks must be sent back with the
+    /// conversation.
+    ///
+    /// `DeepSeek`'s Anthropic-shaped endpoint refuses a thinking-mode request
+    /// whose earlier assistant turns no longer carry their blocks, with
+    /// ``400 The `content[].thinking` in the thinking mode must be passed back
+    /// to the API``. So compaction may not drop them there — the request can
+    /// only fail, and it fails on every later turn of that conversation rather
+    /// than once.
+    ///
+    /// Stated as a property of the vendor rather than of the wire because the
+    /// wire cannot answer it: `DeepSeek` speaks `Wire::Anthropic` too.
+    #[must_use]
+    pub const fn keeps_thinking(self) -> bool {
+        matches!(self, Self::Deepseek)
+    }
+
     /// The trailer line to credit instead, or `None` to leave the original.
     ///
     /// `DeepSeek` and `OpenAI` name their vendor; `OpenAI` also names the model,

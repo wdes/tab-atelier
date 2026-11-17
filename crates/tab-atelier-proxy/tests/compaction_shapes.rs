@@ -152,7 +152,7 @@ fn fixtures_clear_the_elision_floor() {
     // assumption it exists to check. The fixture is the thing that has to clear
     // the floor, so the fixture is what gets measured.
     let mut body = long_session(4, OLD_RESULT_BYTES);
-    let stats = apply(&mut body, Compact::Tools);
+    let stats = apply(&mut body, Compact::Tools, true);
     assert_eq!(
         stats.tool_results_kept_under_budget, 0,
         "layer A declined the fixture whole: its stale results are under the \
@@ -186,7 +186,7 @@ fn fixtures_are_generated_not_stored() {
 #[test]
 fn old_tool_results_are_replaced_by_a_stub() {
     let mut body = long_session(4, OLD_RESULT_BYTES);
-    let stats = apply(&mut body, Compact::Tools);
+    let stats = apply(&mut body, Compact::Tools, true);
 
     assert!(stats.tool_results_elided > 0, "nothing was elided");
     let text = body.to_string();
@@ -220,7 +220,7 @@ fn a_legacy_stub_survives_the_pass_unchanged() {
     }
     assert!(planted, "the fixture has no tool_result to plant a legacy stub in");
 
-    let _ = apply(&mut body, Compact::Tools);
+    let _ = apply(&mut body, Compact::Tools, true);
 
     assert_eq!(
         body.to_string().matches(&legacy).count(),
@@ -241,7 +241,7 @@ fn the_trailing_keep_window_is_left_alone() {
     let before = all_strings(&body).iter().filter(|s| **s == recent).count();
     assert!(before > 0, "the fixture has no recent payload to protect");
 
-    let _ = apply(&mut body, Compact::All);
+    let _ = apply(&mut body, Compact::All, true);
 
     let after = all_strings(&body).iter().filter(|s| **s == recent).count();
     assert_eq!(after, before, "the trailing window was modified");
@@ -252,7 +252,7 @@ fn tool_use_and_tool_result_stay_paired() {
     // The one invariant the compaction module documents as sacred: dropping a
     // `tool_result` leaves its `tool_use` unanswered, which is a 400.
     let mut body = long_session(4, OLD_RESULT_BYTES);
-    let _ = apply(&mut body, Compact::All);
+    let _ = apply(&mut body, Compact::All, true);
 
     let mut calls: Vec<String> = Vec::new();
     let mut results: Vec<String> = Vec::new();
@@ -291,7 +291,7 @@ fn a_marker_that_reached_a_write_is_never_re_stubbed() {
         ]
     });
 
-    let _ = apply(&mut body, Compact::All);
+    let _ = apply(&mut body, Compact::All, true);
 
     let text = body.to_string();
     assert!(
@@ -318,7 +318,7 @@ fn no_write_payload_is_ever_replaced_by_a_marker() {
     let authored = filler(4_000);
     body["messages"][0]["content"][0]["input"]["content"] = Value::String(authored.clone());
 
-    let stats = apply(&mut body, Compact::All);
+    let stats = apply(&mut body, Compact::All, true);
 
     let text = body.to_string();
     assert!(
@@ -364,7 +364,7 @@ fn a_real_captured_body_gains_no_marker() {
     // stubs of the requests it was recorded from, so the property is that THIS
     // pass adds none — not that none exist.
     let before = raw.matches(WRITE_STUB).count();
-    let _ = apply(&mut body, Compact::All);
+    let _ = apply(&mut body, Compact::All, true);
     let after = body.to_string().matches(WRITE_STUB).count();
 
     assert_eq!(
