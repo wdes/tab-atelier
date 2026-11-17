@@ -631,6 +631,7 @@ const AdminApp = Vue.defineComponent({
                     short: deltaTokens < 0,
                     billedMicro: capture.cost ? capture.cost.in_micro : null,
                     rebuiltMicro: rate ? rebuiltMicro : null,
+                    deltaMicro: rate && capture.cost ? rebuiltMicro - capture.cost.in_micro : null,
                 };
             }
             const separatorWhere = separatorBlock
@@ -1149,6 +1150,24 @@ const AdminApp = Vue.defineComponent({
             // glance with the figure above it, which is the one thing a per-block
             // cost column exists for.
             return `$${plainDecimal(usd)}`;
+        },
+        /**
+         * A micro-USD delta, the sign in front of the currency symbol.
+         *
+         * The check line prints a difference, and a difference carries its own
+         * sign. Keying that sign off the token delta instead printed
+         * `+$-0.00000409` — two signs and neither of them the reader's — whenever
+         * the two moved in opposite directions.
+         */
+        signedUsd(micro) {
+            if (micro === null || !Number.isFinite(micro))
+                return "—";
+            const amount = this.microUsd(Math.abs(micro));
+            if (micro > 0)
+                return `+${amount}`;
+            if (micro < 0)
+                return `-${amount}`;
+            return amount;
         },
         /** A count and its noun, pluralised — `1 block`, `3 blocks`. */
         plural(n, one) {

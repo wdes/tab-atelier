@@ -1061,8 +1061,8 @@
                     <span v-else>
                       &#10007; rebuilt is {{ Math.abs(conversation.check.deltaPct) }}%
                       {{ conversation.check.short ? 'BELOW' : 'ABOVE' }} billed
-                      ({{ conversation.check.deltaTokens > 0 ? '+' : '' }}{{ tok(conversation.check.deltaTokens) }} tok,
-                      {{ conversation.check.deltaTokens > 0 ? '+' : '' }}{{ microUsd((conversation.check.rebuiltMicro ?? 0) - (conversation.check.billedMicro ?? 0)) }})
+                      ({{ conversation.check.deltaTokens > 0 ? '+' : '' }}{{ tok(conversation.check.deltaTokens) }} tok<template v-if="conversation.check.deltaMicro !== null">,
+                      {{ signedUsd(conversation.check.deltaMicro) }}</template>)
                     </span>
                     <span class="ms-auto fw-normal text-body-secondary">
                       the split between blocks is an estimate; the billed totals are not

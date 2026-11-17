@@ -444,6 +444,18 @@ check(
   /\$[\d.]*e[+-]?\d/.test(convo) === false,
   "no price is rendered in scientific notation",
 );
+// A difference carries one sign, and it goes in front of the currency symbol.
+// The verdict used to take the money's sign from the token delta and then print
+// the money's own sign as well, giving `+$-0.00000409` on a round where the two
+// moved apart — they are independent, since the rebuilt split decides how many
+// tokens sit after the separator. Even with both signs agreeing, `$-0.0003` is
+// not how a person writes a negative amount.
+const verdict = [...dom.document.querySelectorAll(".ta-check-verdict")]
+  .map((el) => el.textContent)
+  .join(" ");
+check(/\+\$|-\$/.test(verdict), "a cost difference carries its own sign");
+check(/[+-]\$-/.test(verdict) === false, "and not a second one");
+check(/\$-[0-9]/.test(verdict) === false, "the sign sits before the symbol, not after it");
 check(/no cache_control breakpoint at all/.test(convo) === false, "a body with a breakpoint is not reported as having none");
 // Nothing is clipped. The block below the summary used to be a 120-character
 // preview with an ellipsis; the tail of a long tool result is the proof it is

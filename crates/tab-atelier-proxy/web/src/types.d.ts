@@ -937,6 +937,14 @@ interface ConversationCheck {
     billedMicro: number | null;
     /** The sum of the per-block estimates, when the round could be priced. */
     rebuiltMicro: number | null;
+    /**
+     * `rebuiltMicro - billedMicro`; null when either side is unpriced.
+     *
+     * Its sign is its own and does not follow `deltaTokens`: the rebuilt split
+     * can put more tokens after the separator than the measured request did, so
+     * a positive token delta can arrive with a negative cost one.
+     */
+    deltaMicro: number | null;
 }
 
 /**
